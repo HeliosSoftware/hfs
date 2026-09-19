@@ -18,8 +18,10 @@ use helios_persistence::core::{
     is_include_truncation_marker, resolve_includes_iterate_continuation,
     resolve_includes_iterative,
 };
+use helios_persistence::error::SearchError;
+use helios_persistence::search::param_requires_terminology;
 use helios_persistence::types::{
-    IncludeDirective, SearchBundle, SearchParamType, StoredResource, TotalMode,
+    IncludeDirective, SearchBundle, SearchModifier, SearchParamType, StoredResource, TotalMode,
 };
 use tracing::{debug, warn};
 
@@ -247,6 +249,11 @@ where
         // `:in` is token-only, so it always needs terminology; `:above`/`:below`
         // also apply to reference/uri, which resolve locally — only reject those
         // when the parameter is a token. See assessment item A2c.
+        //
+        // This sees direct parameters only. The terminal parameter of a chained
+        // or `_has` search is typed by the chain resolver, which asks the same
+        // question (`param_requires_terminology`) and raises the same error
+        // (#1317) — see `resolve_chains_with` below.
         {
             let reg = state.storage().search_param_registry(tenant.context());
             let registry = reg.read();
@@ -254,22 +261,15 @@ where
                 let Some((base, modifier)) = key.split_once(':') else {
                     continue;
                 };
-                let needs_terminology = match modifier {
-                    "in" => true,
-                    "above" | "below" => registry
-                        .get_param(resource_type, base)
-                        .or_else(|| registry.get_param("Resource", base))
-                        .map(|p| p.param_type == SearchParamType::Token)
-                        .unwrap_or(false),
-                    _ => false,
+                let Some(parsed) = SearchModifier::parse(modifier) else {
+                    continue;
                 };
-                if needs_terminology {
-                    return Err(RestError::NotImplemented {
-                        feature: format!(
-                            "search modifier ':{modifier}' on token parameter '{base}' requires a \
-                             configured terminology server (set HFS_TERMINOLOGY_SERVER)"
-                        ),
-                    });
+                if param_requires_terminology(&registry, resource_type, base, &parsed) {
+                    return Err(SearchError::TerminologyRequired {
+                        modifier: modifier.to_string(),
+                        param: base.to_string(),
+                    }
+                    .into());
                 }
             }
         }
@@ -407,12 +407,24 @@ where
     // Resolve chained / reverse-chained (`_has`) parameters into an `_id` filter
     // via application-side joins, so any backend's `search()` can execute them.
     let query = if helios_persistence::search::query_has_chains(&query) {
-        helios_persistence::search::resolve_chains(state.storage(), tenant.context(), &query)
-            .await
-            .map_err(|e| {
-                warn!(error = %e, "Chained search resolution failed");
-                RestError::from(e)
-            })?
+        // With a terminology server, `expand_terminology_params` above has
+        // already rewritten the terminology-backed modifiers, chained ones
+        // included; without one the resolver rejects them on a chain's terminal
+        // parameter just as the guard above does on a direct one.
+        let options = helios_persistence::search::ChainResolveOptions {
+            terminology_available: state.terminology_server_url().is_some(),
+        };
+        helios_persistence::search::resolve_chains_with(
+            state.storage(),
+            tenant.context(),
+            &query,
+            options,
+        )
+        .await
+        .map_err(|e| {
+            warn!(error = %e, "Chained search resolution failed");
+            RestError::from(e)
+        })?
     } else {
         query
     };
@@ -626,7 +638,13 @@ fn drain_truncation_markers(included: &mut Vec<StoredResource>) -> Vec<String> {
 ///
 /// FHIR allows an unsupported parameter to be ignored only if the server says
 /// so; the self link already omits it, and this outcome names it explicitly.
-fn append_ignored_params_outcome(bundle_json: &mut serde_json::Value, ignored: &[String]) {
+///
+/// Shared with [`crate::handlers::compartment`], whose searchsets report
+/// ignored parameters exactly the same way.
+pub(crate) fn append_ignored_params_outcome(
+    bundle_json: &mut serde_json::Value,
+    ignored: &[String],
+) {
     append_warning_outcome(
         bundle_json,
         &format!(

@@ -53,6 +53,7 @@ use crate::core::{
     TypeHistoryProvider, VersionedStorage,
 };
 use crate::error::{BackendError, ResourceError, StorageError, StorageResult, TransactionError};
+use crate::search::ChainResolveOptions;
 use crate::tenant::TenantContext;
 use crate::types::{
     IncludeDirective, Pagination, ReverseChainedParameter, SearchParamType, SearchParameter,
@@ -193,47 +194,23 @@ impl CompositeStorage {
             .is_some()
     }
 
-    fn parse_simple_search_params(params: &str) -> Vec<(String, String)> {
-        params
-            .split('&')
-            .filter_map(|pair| {
-                let parts: Vec<&str> = pair.splitn(2, '=').collect();
-                if parts.len() == 2 {
-                    Some((parts[0].to_string(), parts[1].to_string()))
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    fn infer_conditional_param_type(name: &str) -> SearchParamType {
-        crate::search::fallback_param_type(name)
-    }
-
     async fn find_conditional_matches(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         search_params: &str,
     ) -> StorageResult<Vec<StoredResource>> {
-        let parsed_params = Self::parse_simple_search_params(search_params);
-        if parsed_params.is_empty() {
+        // The one criteria builder every backend shares, so criteria mean what
+        // they mean as a direct search (#1312). The guard is dropped before
+        // the first await.
+        let query = {
+            let registry_arc = self.search_param_registry(tenant);
+            let registry = registry_arc.read();
+            crate::search::build_conditional_query(&registry, resource_type, search_params)?
+        };
+        let Some(query) = query else {
             return Ok(Vec::new());
-        }
-
-        let mut query = SearchQuery::new(resource_type);
-        query.count = Some(1000);
-        for (name, value) in parsed_params {
-            query = query.with_parameter(SearchParameter {
-                name: name.clone(),
-                param_type: Self::infer_conditional_param_type(&name),
-                modifier: None,
-                values: vec![SearchValue::parse(&value)],
-                chain: vec![],
-                components: vec![],
-            });
-        }
+        };
 
         // The criteria resolve against the search index, which on a
         // composite is the secondary: without this, an `If-None-Exist`
@@ -1958,92 +1935,6 @@ impl IncludeProvider for CompositeStorage {
     }
 }
 
-impl CompositeStorage {
-    /// Extracts references from a resource for a given search parameter.
-    ///
-    /// Resolution order:
-    /// 1. Look up the search parameter in the registry and evaluate its
-    ///    FHIRPath `expression` via `SearchParameterExtractor` — the canonical
-    ///    FHIR source of truth for every standard parameter and any custom
-    ///    parameter the user has registered.
-    /// 2. Fall back to the prior heuristic (look for the search-param name as
-    ///    a JSON field, plus a small alias map for `patient`/`subject`/etc.)
-    ///    only when the registry doesn't know about the parameter at all.
-    ///    That keeps unregistered custom parameters working as they did
-    ///    before this change.
-    fn extract_references(
-        &self,
-        tenant: &TenantContext,
-        resource: &StoredResource,
-        search_param: &str,
-    ) -> Vec<String> {
-        let content = resource.content();
-        let resource_type = resource.resource_type();
-
-        let registry_arc = self.search_param_registry(tenant);
-        let registered = {
-            let registry = registry_arc.read();
-            registry
-                .get_param(resource_type, search_param)
-                .or_else(|| registry.get_param("Resource", search_param))
-        };
-
-        if let Some(param_def) = registered {
-            let extractor = crate::search::SearchParameterExtractor::new(Arc::clone(&registry_arc));
-            if let Ok(values) = extractor.extract_for_param(content, &param_def) {
-                // Trust the registry: if the param is registered, return what
-                // the FHIRPath expression yields (even if empty) rather than
-                // also running the heuristic — otherwise an _include against
-                // a resource that genuinely has no matching reference would
-                // accidentally match an unrelated JSON field with the same
-                // name.
-                return values
-                    .into_iter()
-                    .filter_map(|v| match v.value {
-                        crate::search::IndexValue::Reference { reference, .. } => Some(reference),
-                        _ => None,
-                    })
-                    .collect();
-            }
-        }
-
-        // Heuristic fallback for unregistered custom parameters.
-        let mut refs = Vec::new();
-        if let Some(value) = content.get(search_param) {
-            Self::extract_reference_values(value, &mut refs);
-        }
-        let alias = match search_param {
-            "patient" | "subject" => Some("subject"),
-            "encounter" => Some("encounter"),
-            "performer" => Some("performer"),
-            _ => None,
-        };
-        if let Some(field) = alias {
-            if let Some(value) = content.get(field) {
-                Self::extract_reference_values(value, &mut refs);
-            }
-        }
-        refs
-    }
-
-    /// Recursively extracts reference values.
-    fn extract_reference_values(value: &Value, refs: &mut Vec<String>) {
-        match value {
-            Value::Object(obj) => {
-                if let Some(Value::String(reference)) = obj.get("reference") {
-                    refs.push(reference.clone());
-                }
-            }
-            Value::Array(arr) => {
-                for item in arr {
-                    Self::extract_reference_values(item, refs);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
 #[async_trait]
 impl RevincludeProvider for CompositeStorage {
     async fn resolve_revincludes(
@@ -2097,8 +1988,26 @@ impl ChainedSearchProvider for CompositeStorage {
         chain: &str,
         value: &str,
     ) -> StorageResult<Vec<String>> {
-        self.resolve_chain_via_search(tenant, base_type, chain, value)
-            .await
+        // Delegates to the shared application-side resolver — the one REST
+        // uses — running its iterative plain searches through composite's own
+        // search routing. It types the terminal parameter from the registry
+        // and parses the value like a direct search: comparator prefix,
+        // comma-separated OR list, every target type of an untyped hop (#1304).
+        let Some(param) = parse_chain_path(chain, value) else {
+            // A single segment is not a chain.
+            return Ok(Vec::new());
+        };
+        // The trait API carries no terminology server, so a terminology-backed
+        // modifier on the terminal is rejected rather than searched literally
+        // (the resolver's default, as for `resolve_chains`; #1317).
+        crate::search::chain_resolver::resolve_forward_chain(
+            self,
+            tenant,
+            base_type,
+            &param,
+            ChainResolveOptions::default(),
+        )
+        .await
     }
 
     async fn resolve_reverse_chain(
@@ -2107,174 +2016,59 @@ impl ChainedSearchProvider for CompositeStorage {
         base_type: &str,
         reverse_chain: &ReverseChainedParameter,
     ) -> StorageResult<Vec<String>> {
-        // Find resources of source_type that match the parameter,
-        // then return IDs of base_type resources they reference
-        let values = match &reverse_chain.value {
-            Some(v) => vec![v.clone()],
-            None => vec![],
-        };
-        let query = SearchQuery::new(&reverse_chain.source_type).with_parameter(
-            crate::types::SearchParameter {
-                name: reverse_chain.search_param.clone(),
-                param_type: crate::types::SearchParamType::Token,
-                modifier: None,
-                values,
-                chain: vec![],
-                components: vec![],
-            },
-        );
-
-        let result = self.search(tenant, &query).await?;
-
-        // Extract references to base_type
-        let mut ids = Vec::new();
-        for resource in result.resources.items {
-            let refs = self.extract_references(tenant, &resource, &reverse_chain.reference_param);
-            for reference in refs {
-                if let Some((ref_type, ref_id)) = reference.split_once('/') {
-                    if ref_type == base_type {
-                        ids.push(ref_id.to_string());
-                    }
-                }
-            }
-        }
-
-        Ok(ids)
+        // Same delegation as `resolve_chain`. The terminal used to be searched
+        // as a hardcoded `Token` holding the raw value — prefix and commas
+        // included — and a nested `_has` was ignored outright (#1304).
+        crate::search::chain_resolver::resolve_reverse_chain(
+            self,
+            tenant,
+            base_type,
+            reverse_chain,
+            ChainResolveOptions::default(),
+        )
+        .await
     }
 }
 
-impl CompositeStorage {
-    /// Resolves a forward chain by issuing iterative SearchQueries against
-    /// composite's regular search routing.
-    ///
-    /// For `Observation?subject.organization.name=Hospital`:
-    ///   1. Parse the chain via the registry: links = [(subject -> Patient),
-    ///      (organization -> Organization)], terminal = name.
-    ///   2. Search Organization for `name=Hospital` — collect refs.
-    ///   3. Search Patient for `organization=<refs>` — collect refs.
-    ///   4. Search Observation for `subject=<refs>` — return resource IDs.
-    ///
-    /// Each step issues exactly one SearchQuery, so the cost is proportional
-    /// to the chain depth, not the result-set fan-out (the inner backend
-    /// applies the multi-value `OR` semantics natively).
-    async fn resolve_chain_via_search(
-        &self,
-        tenant: &TenantContext,
-        base_type: &str,
-        chain: &str,
-        value: &str,
-    ) -> StorageResult<Vec<String>> {
-        use crate::types::{SearchParameter, SearchQuery, SearchValue};
-
-        let parts: Vec<&str> = chain.split('.').collect();
-        if parts.len() < 2 {
-            return Ok(Vec::new());
-        }
-
-        // Resolve target type per chain link from the registry. Mirrors
-        // chain_builder::resolve_target_type so composite agrees with SQLite
-        // and Postgres on ambiguous reference disambiguation.
-        let target_types: Vec<String> = {
-            let reg = self.search_param_registry(tenant);
-            let registry = reg.read();
-            let mut types = Vec::with_capacity(parts.len() - 1);
-            let mut current = base_type.to_string();
-            for ref_param in parts.iter().take(parts.len() - 1) {
-                let next = registry
-                    .get_param(&current, ref_param)
-                    .and_then(|def| {
-                        def.target.as_ref().and_then(|t| {
-                            if t.len() == 1 {
-                                Some(t[0].clone())
-                            } else {
-                                None
-                            }
-                        })
-                    })
-                    .unwrap_or_else(|| crate::search::chain_resolver::infer_target_type(ref_param));
-                types.push(next.clone());
-                current = next;
-            }
-            types
-        };
-
-        // Innermost: search the deepest target type for the terminal param.
-        let terminal_param = parts[parts.len() - 1];
-        let deepest_type = target_types.last().map(String::as_str).unwrap_or(base_type);
-
-        let terminal_query = SearchQuery::new(deepest_type).with_parameter(SearchParameter {
-            name: terminal_param.to_string(),
-            param_type: {
-                let reg = self.search_param_registry(tenant);
-                let registry = reg.read();
-                crate::search::resolve_param_type(
-                    &registry,
-                    deepest_type,
-                    terminal_param,
-                    &[SearchValue::eq(value)],
-                )
-            },
-            modifier: None,
-            values: vec![SearchValue::eq(value)],
-            chain: vec![],
-            components: vec![],
-        });
-
-        let result = self.search(tenant, &terminal_query).await?;
-        let mut current_refs: Vec<String> = result
-            .resources
-            .items
-            .into_iter()
-            .map(|r| format!("{}/{}", r.resource_type(), r.id()))
-            .collect();
-
-        if current_refs.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Walk back: for each link from deepest to outermost, search the
-        // parent type for resources whose reference param matches the
-        // accumulated refs.
-        for i in (0..parts.len() - 1).rev() {
-            let ref_param = parts[i];
-            let parent_type = if i == 0 {
-                base_type
-            } else {
-                &target_types[i - 1]
-            };
-
-            let values: Vec<SearchValue> = current_refs.iter().map(SearchValue::eq).collect();
-            let query = SearchQuery::new(parent_type).with_parameter(SearchParameter {
-                name: ref_param.to_string(),
-                param_type: crate::types::SearchParamType::Reference,
-                modifier: None,
-                values,
-                chain: vec![],
-                components: vec![],
-            });
-
-            let r = self.search(tenant, &query).await?;
-            current_refs = r
-                .resources
-                .items
-                .into_iter()
-                .map(|res| {
-                    if i == 0 {
-                        // Outermost: caller wants raw IDs, not refs.
-                        res.id().to_string()
-                    } else {
-                        format!("{}/{}", res.resource_type(), res.id())
-                    }
-                })
-                .collect();
-
-            if current_refs.is_empty() {
-                return Ok(Vec::new());
-            }
-        }
-
-        Ok(current_refs)
+/// Parses a trait-API chain path (`subject:Patient.organization.name`) and its
+/// raw value into the chained [`SearchParameter`] the shared resolver takes:
+/// one hop per reference segment, each with its optional `:Type` qualifier,
+/// and the value split into its raw OR alternatives. The resolver types and
+/// parses those once it knows the terminal parameter.
+///
+/// Returns `None` when `chain` has no reference hop.
+fn parse_chain_path(chain: &str, value: &str) -> Option<SearchParameter> {
+    let segments: Vec<(&str, Option<&str>)> = chain
+        .split('.')
+        .map(|segment| match segment.split_once(':') {
+            Some((name, target_type)) => (name, Some(target_type)),
+            None => (segment, None),
+        })
+        .collect();
+    if segments.len() < 2 {
+        return None;
     }
+
+    let hops = segments
+        .windows(2)
+        .map(|pair| crate::types::ChainedParameter {
+            reference_param: pair[0].0.to_string(),
+            target_type: pair[0].1.map(str::to_string),
+            target_param: pair[1].0.to_string(),
+        })
+        .collect();
+
+    Some(SearchParameter {
+        name: segments[0].0.to_string(),
+        param_type: SearchParamType::Reference,
+        modifier: None,
+        values: crate::search::split_unescaped_commas(value)
+            .into_iter()
+            .map(SearchValue::eq)
+            .collect(),
+        chain: hops,
+        components: vec![],
+    })
 }
 
 #[async_trait]
@@ -4527,204 +4321,6 @@ mod tests {
         assert!(composite.search_providers.contains_key("primary"));
     }
 
-    // ── extract_reference_values (static method) ──────────────────
-
-    #[test]
-    fn test_extract_reference_values_object_with_reference() {
-        let obj = serde_json::json!({"reference": "Patient/123"});
-        let mut refs = Vec::new();
-        CompositeStorage::extract_reference_values(&obj, &mut refs);
-        assert_eq!(refs, vec!["Patient/123"]);
-    }
-
-    #[test]
-    fn test_extract_reference_values_object_without_reference() {
-        let obj = serde_json::json!({"display": "John Smith"});
-        let mut refs = Vec::new();
-        CompositeStorage::extract_reference_values(&obj, &mut refs);
-        assert!(refs.is_empty());
-    }
-
-    #[test]
-    fn test_extract_reference_values_array() {
-        let arr = serde_json::json!([
-            {"reference": "Patient/1"},
-            {"reference": "Patient/2"},
-            {"display": "no ref here"}
-        ]);
-        let mut refs = Vec::new();
-        CompositeStorage::extract_reference_values(&arr, &mut refs);
-        assert_eq!(refs.len(), 2);
-        assert!(refs.contains(&"Patient/1".to_string()));
-        assert!(refs.contains(&"Patient/2".to_string()));
-    }
-
-    #[test]
-    fn test_extract_reference_values_primitive_ignored() {
-        let val = serde_json::json!("just a string");
-        let mut refs = Vec::new();
-        CompositeStorage::extract_reference_values(&val, &mut refs);
-        assert!(refs.is_empty());
-    }
-
-    /// `extract_references` should consult the registry first and use the
-    /// FHIRPath `expression` from the registered SearchParameter, not the
-    /// hardcoded JSON-field-name heuristic. This exercises the new wiring
-    /// from PR #2 of the load-bearing-stub-fixes plan.
-    #[test]
-    fn test_extract_references_uses_registry_expression() {
-        use crate::search::{SearchParameterDefinition, SearchParameterRegistry};
-        use crate::tenant::TenantId;
-        use crate::types::SearchParamType;
-
-        // Composite wrapped around a backend whose registry has been seeded
-        // with an Encounter.subject param whose FHIRPath expression points at
-        // a JSON field name that is *different* from the search-param name —
-        // proving the registry's expression is what's evaluated, not the
-        // hardcoded "patient" -> "subject" alias.
-        let registry = Arc::new(parking_lot::RwLock::new(SearchParameterRegistry::new()));
-        registry
-            .write()
-            .register(
-                SearchParameterDefinition::new(
-                    "http://hl7.org/fhir/SearchParameter/Encounter-subject",
-                    "subject",
-                    SearchParamType::Reference,
-                    "Encounter.subject",
-                )
-                .with_base(vec!["Encounter"])
-                .with_targets(vec!["Patient", "Group"]),
-            )
-            .unwrap();
-
-        struct MockWithRegistry {
-            registry: Arc<parking_lot::RwLock<SearchParameterRegistry>>,
-        }
-
-        #[async_trait::async_trait]
-        impl ResourceStorage for MockWithRegistry {
-            fn backend_name(&self) -> &'static str {
-                "mock-with-registry"
-            }
-            async fn create(
-                &self,
-                _tenant: &TenantContext,
-                _resource_type: &str,
-                _resource: serde_json::Value,
-                _fhir_version: FhirVersion,
-            ) -> StorageResult<crate::types::StoredResource> {
-                unimplemented!()
-            }
-            async fn create_or_update(
-                &self,
-                _tenant: &TenantContext,
-                _resource_type: &str,
-                _id: &str,
-                _resource: serde_json::Value,
-                _fhir_version: FhirVersion,
-            ) -> StorageResult<(crate::types::StoredResource, bool)> {
-                unimplemented!()
-            }
-            async fn read(
-                &self,
-                _tenant: &TenantContext,
-                _resource_type: &str,
-                _id: &str,
-            ) -> StorageResult<Option<crate::types::StoredResource>> {
-                Ok(None)
-            }
-            async fn update(
-                &self,
-                _tenant: &TenantContext,
-                _current: &crate::types::StoredResource,
-                _resource: serde_json::Value,
-            ) -> StorageResult<crate::types::StoredResource> {
-                unimplemented!()
-            }
-            async fn delete(
-                &self,
-                _tenant: &TenantContext,
-                _resource_type: &str,
-                _id: &str,
-            ) -> StorageResult<()> {
-                Ok(())
-            }
-            async fn count(
-                &self,
-                _tenant: &TenantContext,
-                _resource_type: Option<&str>,
-            ) -> StorageResult<u64> {
-                Ok(0)
-            }
-        }
-
-        #[async_trait::async_trait]
-        impl SearchProvider for MockWithRegistry {
-            async fn search(
-                &self,
-                _tenant: &TenantContext,
-                _query: &crate::types::SearchQuery,
-            ) -> StorageResult<SearchResult> {
-                use crate::types::Page;
-                Ok(SearchResult::new(Page::empty()))
-            }
-            async fn search_count(
-                &self,
-                _tenant: &TenantContext,
-                _query: &crate::types::SearchQuery,
-            ) -> StorageResult<u64> {
-                Ok(0)
-            }
-            fn search_param_registry(
-                &self,
-                _tenant: &TenantContext,
-            ) -> Arc<parking_lot::RwLock<SearchParameterRegistry>> {
-                Arc::clone(&self.registry)
-            }
-        }
-
-        let config = CompositeConfig::builder()
-            .primary("primary", BackendKind::Sqlite)
-            .build()
-            .unwrap();
-        let backend = Arc::new(MockWithRegistry {
-            registry: Arc::clone(&registry),
-        });
-        let mut backends = HashMap::new();
-        backends.insert("primary".to_string(), backend.clone() as DynStorage);
-        let mut providers = HashMap::new();
-        providers.insert("primary".to_string(), backend.clone() as DynSearchProvider);
-        let composite = CompositeStorage::new(config, backends)
-            .unwrap()
-            .with_search_providers(providers);
-
-        // Encounter resource referencing Patient/p1 via subject.
-        let content = serde_json::json!({
-            "resourceType": "Encounter",
-            "id": "e1",
-            "subject": {"reference": "Patient/p1"},
-        });
-        let resource = crate::types::StoredResource::new(
-            "Encounter",
-            "e1",
-            TenantId::new("t"),
-            content,
-            FhirVersion::default(),
-        );
-
-        let tenant = TenantContext::new(TenantId::new("test"), TenantPermissions::full_access());
-        let refs = composite.extract_references(&tenant, &resource, "subject");
-        assert_eq!(refs, vec!["Patient/p1".to_string()]);
-    }
-
-    #[test]
-    fn test_extract_reference_values_null_ignored() {
-        let val = serde_json::Value::Null;
-        let mut refs = Vec::new();
-        CompositeStorage::extract_reference_values(&val, &mut refs);
-        assert!(refs.is_empty());
-    }
-
     // ── CRUD delegation to primary ────────────────────────────────
 
     #[tokio::test]
@@ -4910,6 +4506,360 @@ mod tests {
             .await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // #1304: typed terminal values through the `ChainedSearchProvider` trait
+    // API. These run against a real SQLite primary built WITH the spec data
+    // dir: without it only the 5 embedded params load, date/quantity params
+    // index nothing, and every assertion below would be vacuous.
+    // ------------------------------------------------------------------
+
+    #[cfg(feature = "sqlite")]
+    async fn make_seeded_chain_composite() -> (CompositeStorage, TenantContext) {
+        use crate::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
+
+        let data_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("data"))
+            .unwrap();
+        let sqlite = Arc::new(
+            SqliteBackend::with_config(
+                ":memory:",
+                SqliteBackendConfig {
+                    data_dir: Some(data_dir),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        sqlite.init_schema().unwrap();
+
+        let tenant = make_tenant();
+        let resources = [
+            json!({ "resourceType": "Practitioner", "id": "pr1" }),
+            json!({ "resourceType": "Practitioner", "id": "pr2" }),
+            json!({ "resourceType": "Patient", "id": "p1", "birthDate": "1980-05-06",
+                    "name": [{ "family": "Smith" }],
+                    "generalPractitioner": [{ "reference": "Practitioner/pr1" }] }),
+            json!({ "resourceType": "Patient", "id": "p2", "birthDate": "1990-01-01",
+                    "name": [{ "family": "Jones" }],
+                    "generalPractitioner": [{ "reference": "Practitioner/pr2" }] }),
+            json!({ "resourceType": "Patient", "id": "p3", "birthDate": "1970-01-01",
+                    "name": [{ "family": "Brown" }] }),
+            json!({ "resourceType": "Observation", "id": "o1", "status": "final",
+                    "subject": { "reference": "Patient/p1" },
+                    "effectiveDateTime": "2021-06-15T10:00:00Z",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "8867-4" }] },
+                    "valueQuantity": { "value": 7.2, "unit": "mg",
+                        "system": "http://unitsofmeasure.org", "code": "mg" } }),
+            json!({ "resourceType": "Observation", "id": "o2", "status": "final",
+                    "subject": { "reference": "Patient/p2" },
+                    "effectiveDateTime": "2019-03-01T10:00:00Z",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "1234-5" }] },
+                    "valueQuantity": { "value": 3.0, "unit": "mg",
+                        "system": "http://unitsofmeasure.org", "code": "mg" } }),
+            json!({ "resourceType": "Provenance", "id": "prov1",
+                    "target": [{ "reference": "Observation/o1" }],
+                    "recorded": "2021-06-16T00:00:00Z",
+                    "agent": [{ "who": { "reference": "Practitioner/pr1" } }] }),
+        ];
+        for resource in resources {
+            let resource_type = resource["resourceType"].as_str().unwrap().to_string();
+            sqlite
+                .create(&tenant, &resource_type, resource, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+
+        let config = CompositeConfig::builder()
+            .primary("primary", BackendKind::Sqlite)
+            .build()
+            .unwrap();
+        let mut backends = HashMap::new();
+        backends.insert("primary".to_string(), sqlite.clone() as DynStorage);
+        let mut providers = HashMap::new();
+        providers.insert("primary".to_string(), sqlite as DynSearchProvider);
+        let composite = CompositeStorage::new(config, backends)
+            .unwrap()
+            .with_search_providers(providers);
+        (composite, tenant)
+    }
+
+    /// Positive control: a direct, non-chained typed search through the
+    /// composite finds exactly `expected`. Proves the param is registered and
+    /// indexed, so a chain test over the same param cannot pass vacuously.
+    #[cfg(feature = "sqlite")]
+    async fn assert_direct_search(
+        composite: &CompositeStorage,
+        tenant: &TenantContext,
+        resource_type: &str,
+        param: &str,
+        raw: &str,
+        expected: &[&str],
+    ) {
+        let (param_type, values) = {
+            let reg = composite.search_param_registry(tenant);
+            let registry = reg.read();
+            assert!(
+                registry.get_param(resource_type, param).is_some(),
+                "{resource_type}.{param} must be registered (data dir not loaded?)"
+            );
+            crate::search::parse_typed_values(
+                &registry,
+                resource_type,
+                param,
+                &crate::search::split_unescaped_commas(raw),
+            )
+        };
+        let query = SearchQuery::new(resource_type).with_parameter(SearchParameter {
+            name: param.to_string(),
+            param_type,
+            modifier: None,
+            values,
+            chain: vec![],
+            components: vec![],
+        });
+        let mut ids: Vec<String> = composite
+            .search(tenant, &query)
+            .await
+            .unwrap()
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, expected, "control {resource_type}?{param}={raw}");
+    }
+
+    /// `base_type?_has:source_type:reference_param:search_param=raw` through
+    /// the trait API, sorted and de-duplicated.
+    #[cfg(feature = "sqlite")]
+    async fn has_ids(
+        composite: &CompositeStorage,
+        tenant: &TenantContext,
+        base_type: &str,
+        (source_type, reference_param, search_param): (&str, &str, &str),
+        raw: &str,
+    ) -> StorageResult<Vec<String>> {
+        use crate::core::ChainedSearchProvider;
+        let rc = ReverseChainedParameter::terminal(
+            source_type,
+            reference_param,
+            search_param,
+            SearchValue::eq(raw),
+        );
+        let mut ids = composite
+            .resolve_reverse_chain(tenant, base_type, &rc)
+            .await?;
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    #[cfg(feature = "sqlite")]
+    async fn chain_ids(
+        composite: &CompositeStorage,
+        tenant: &TenantContext,
+        chain: &str,
+        raw: &str,
+    ) -> StorageResult<Vec<String>> {
+        use crate::core::ChainedSearchProvider;
+        let mut ids = composite
+            .resolve_chain(tenant, "Observation", chain, raw)
+            .await?;
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    /// (a) `_has:Observation:subject:date=ge…/lt…`
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn test_reverse_chain_date_terminal_with_prefix() {
+        let (c, t) = make_seeded_chain_composite().await;
+        assert_direct_search(&c, &t, "Observation", "date", "ge2020-01-01", &["o1"]).await;
+        assert_direct_search(&c, &t, "Observation", "date", "lt2020-01-01", &["o2"]).await;
+
+        let has = ("Observation", "subject", "date");
+        let ge = has_ids(&c, &t, "Patient", has, "ge2020-01-01").await;
+        let lt = has_ids(&c, &t, "Patient", has, "lt2020-01-01").await;
+        assert_eq!(ge.unwrap(), vec!["p1"]);
+        assert_eq!(lt.unwrap(), vec!["p2"]);
+    }
+
+    /// (b) unprefixed day-precision date must cover the whole day.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn test_reverse_chain_date_terminal_day_precision() {
+        let (c, t) = make_seeded_chain_composite().await;
+        assert_direct_search(&c, &t, "Observation", "date", "2021-06-15", &["o1"]).await;
+
+        let ids = has_ids(
+            &c,
+            &t,
+            "Patient",
+            ("Observation", "subject", "date"),
+            "2021-06-15",
+        )
+        .await;
+        assert_eq!(ids.unwrap(), vec!["p1"]);
+    }
+
+    /// (c) quantity terminal with comparator prefix.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn test_reverse_chain_quantity_terminal_with_prefix() {
+        let (c, t) = make_seeded_chain_composite().await;
+        let raw = "gt5.4|http://unitsofmeasure.org|mg";
+        assert_direct_search(&c, &t, "Observation", "value-quantity", raw, &["o1"]).await;
+
+        let ids = has_ids(
+            &c,
+            &t,
+            "Patient",
+            ("Observation", "subject", "value-quantity"),
+            raw,
+        )
+        .await;
+        assert_eq!(ids.unwrap(), vec!["p1"]);
+    }
+
+    /// (d) a comma-separated value is an OR list.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn test_reverse_chain_comma_separated_or_list() {
+        let (c, t) = make_seeded_chain_composite().await;
+        assert_direct_search(
+            &c,
+            &t,
+            "Observation",
+            "code",
+            "8867-4,1234-5",
+            &["o1", "o2"],
+        )
+        .await;
+
+        let tokens = has_ids(
+            &c,
+            &t,
+            "Patient",
+            ("Observation", "subject", "code"),
+            "8867-4,1234-5",
+        )
+        .await;
+        let dates = has_ids(
+            &c,
+            &t,
+            "Patient",
+            ("Observation", "subject", "date"),
+            "2021-06-15,2019-03-01",
+        )
+        .await;
+        assert_eq!(tokens.unwrap(), vec!["p1", "p2"]);
+        assert_eq!(dates.unwrap(), vec!["p1", "p2"]);
+    }
+
+    /// (e) string terminal keeps default starts-with, case-insensitive matching.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn test_reverse_chain_string_terminal_prefix_match() {
+        let (c, t) = make_seeded_chain_composite().await;
+        assert_direct_search(&c, &t, "Patient", "family", "smi", &["p1"]).await;
+
+        let ids = has_ids(
+            &c,
+            &t,
+            "Practitioner",
+            ("Patient", "general-practitioner", "family"),
+            "smi",
+        )
+        .await;
+        assert_eq!(ids.unwrap(), vec!["pr1"]);
+    }
+
+    /// (f) regression guard: a token terminal still works.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn test_reverse_chain_token_terminal_still_works() {
+        let (c, t) = make_seeded_chain_composite().await;
+        assert_direct_search(&c, &t, "Observation", "code", "8867-4", &["o1"]).await;
+
+        let has = ("Observation", "subject", "code");
+        let bare = has_ids(&c, &t, "Patient", has, "8867-4").await;
+        let system = has_ids(&c, &t, "Patient", has, "http://loinc.org|1234-5").await;
+        assert_eq!(bare.unwrap(), vec!["p1"]);
+        assert_eq!(system.unwrap(), vec!["p2"]);
+    }
+
+    /// Nested `_has` is resolved recursively rather than searched as an
+    /// empty-named parameter.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn test_reverse_chain_nested_has() {
+        use crate::core::ChainedSearchProvider;
+        let (c, t) = make_seeded_chain_composite().await;
+        assert_direct_search(&c, &t, "Provenance", "recorded", "ge2021-01-01", &["prov1"]).await;
+        // Patient?_has:Observation:subject:_has:Provenance:target:recorded=ge2021-01-01
+        let rc = ReverseChainedParameter::nested(
+            "Observation",
+            "subject",
+            ReverseChainedParameter::terminal(
+                "Provenance",
+                "target",
+                "recorded",
+                SearchValue::eq("ge2021-01-01"),
+            ),
+        );
+        let ids = c.resolve_reverse_chain(&t, "Patient", &rc).await;
+        assert_eq!(ids.unwrap(), vec!["p1"]);
+    }
+
+    /// An unregistered terminal param behaves exactly as it does in the shared
+    /// resolver (typed by the value-shape fallback, never a hardcoded Token).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn test_reverse_chain_unknown_terminal_param_matches_shared_resolver() {
+        let (c, t) = make_seeded_chain_composite().await;
+        let has = ("Observation", "subject", "no-such-param");
+        let ids = has_ids(&c, &t, "Patient", has, "x").await;
+
+        let mut query = SearchQuery::new("Patient");
+        query.reverse_chains.push(ReverseChainedParameter::terminal(
+            has.0,
+            has.1,
+            has.2,
+            SearchValue::eq("x"),
+        ));
+        let shared = crate::search::resolve_chains(&c, &t, &query).await;
+        assert_eq!(ids.is_ok(), shared.is_ok());
+        if let Ok(ids) = ids {
+            assert!(ids.is_empty());
+        }
+    }
+
+    /// Forward chain: prefixed date terminal, comma OR list, `:Type` qualifier.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn test_forward_chain_typed_terminal_values() {
+        let (c, t) = make_seeded_chain_composite().await;
+        assert_direct_search(&c, &t, "Patient", "birthdate", "ge1985-01-01", &["p2"]).await;
+
+        let ge = chain_ids(&c, &t, "subject.birthdate", "ge1985-01-01").await;
+        let lt = chain_ids(&c, &t, "subject:Patient.birthdate", "lt1985-01-01").await;
+        let day = chain_ids(&c, &t, "subject.birthdate", "1980-05-06").await;
+        let dates = chain_ids(&c, &t, "subject.birthdate", "1980-05-06,1990-01-01").await;
+        let strings = chain_ids(&c, &t, "subject.family", "smi,jon").await;
+        let literal = chain_ids(&c, &t, "subject.family", "smith").await;
+
+        assert_eq!(ge.unwrap(), vec!["o2"]);
+        assert_eq!(lt.unwrap(), vec!["o1"]);
+        assert_eq!(day.unwrap(), vec!["o1"]);
+        assert_eq!(dates.unwrap(), vec!["o1", "o2"]);
+        assert_eq!(strings.unwrap(), vec!["o1", "o2"]);
+        assert_eq!(literal.unwrap(), vec!["o1"]);
     }
 
     // SearchProvider impl for MockStorage (must live inside test module).

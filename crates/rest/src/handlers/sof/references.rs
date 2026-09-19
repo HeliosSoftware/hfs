@@ -6,6 +6,7 @@
 //! handlers stay in sync.
 
 use helios_persistence::core::search::SearchProvider;
+use helios_persistence::error::{BackendError, StorageError};
 use helios_persistence::tenant::TenantContext;
 use helios_persistence::types::{
     SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
@@ -94,14 +95,23 @@ where
         });
     }
 
-    let result =
-        state
-            .storage()
-            .search(tenant, &query)
-            .await
-            .map_err(|e| RestError::InternalError {
+    let result = match state.storage().search(tenant, &query).await {
+        Ok(result) => result,
+        // A backend without a search index (standalone S3) cannot answer
+        // `url=`. That used to surface as a 500 for every SQL View and SQL
+        // Query Library — their `depends-on` entries are canonicals — and for
+        // any `subjectCanonical` (#1228). Such a backend offers a scan of the
+        // type instead; definitions are few, so matching them in process is
+        // cheap.
+        Err(StorageError::Backend(BackendError::UnsupportedCapability { .. })) => {
+            return resolve_by_scan(state, tenant, resource_type, url).await;
+        }
+        Err(e) => {
+            return Err(RestError::InternalError {
                 message: format!("canonical lookup failed for {resource_type} url={url}: {e}"),
-            })?;
+            });
+        }
+    };
 
     // The search already filters by `url=`/`version=`, but a backend could in
     // principle return an approximate match (e.g. tokenized full-text search);
@@ -131,6 +141,56 @@ where
             message: "unreachable: candidates was non-empty".into(),
         })?;
     Ok(chosen.content().clone())
+}
+
+/// Resolves a canonical on a backend that has no search, by scanning the
+/// resource type and applying [`canonical_matches`] in process.
+///
+/// A backend with neither search nor scan cannot resolve canonicals at all;
+/// that is a capability gap and answers `501` with the reason, never a `500`.
+async fn resolve_by_scan<S>(
+    state: &AppState<S>,
+    tenant: &TenantContext,
+    resource_type: &str,
+    url: &str,
+) -> Result<Value, RestError>
+where
+    S: SearchProvider + Send + Sync + 'static,
+{
+    let Some(scan) = state.storage().resource_scan() else {
+        return Err(RestError::NotImplemented {
+            feature: format!(
+                "resolving the canonical reference '{url}': this storage backend has no search \
+                 index, so canonical references cannot be resolved on it; reference the \
+                 {resource_type} by id instead"
+            ),
+        });
+    };
+    let resources = scan
+        .scan_resources(tenant, resource_type)
+        .await
+        .map_err(|e| RestError::InternalError {
+            message: format!("canonical lookup failed for {resource_type} url={url}: {e}"),
+        })?;
+    newest_canonical_match(resources, url).ok_or_else(|| RestError::NotFound {
+        resource_type: resource_type.to_string(),
+        id: url.to_string(),
+    })
+}
+
+/// Picks, among scanned `resources`, the one [`canonical_matches`] selects for
+/// `url` — the most recently updated when several versions match, which is
+/// the rule the search path applies through `last_modified`.
+fn newest_canonical_match(resources: Vec<Value>, url: &str) -> Option<Value> {
+    resources
+        .into_iter()
+        .filter(|resource| canonical_matches(resource, url))
+        .max_by_key(|resource| {
+            resource
+                .pointer("/meta/lastUpdated")
+                .and_then(Value::as_str)
+                .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
+        })
 }
 
 /// The one canonical-matching rule shared by storage lookups
@@ -175,8 +235,24 @@ fn split_canonical_version(url: &str) -> (String, Option<String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{canonical_matches, split_canonical_version};
-    use serde_json::json;
+    use super::{
+        canonical_matches, newest_canonical_match, resolve_by_canonical_url,
+        split_canonical_version,
+    };
+    use crate::config::ServerConfig;
+    use crate::error::RestError;
+    use crate::state::AppState;
+    use async_trait::async_trait;
+    use helios_fhir::FhirVersion;
+    use helios_persistence::core::ResourceStorage;
+    use helios_persistence::core::search::{SearchProvider, SearchResult};
+    use helios_persistence::core::sof_runner::SofError;
+    use helios_persistence::error::{BackendError, StorageError, StorageResult};
+    use helios_persistence::sof::in_process::ResourceScan;
+    use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
+    use helios_persistence::types::{SearchQuery, StoredResource};
+    use serde_json::{Value, json};
+    use std::sync::Arc;
 
     #[test]
     fn bare_url_has_no_version() {
@@ -214,6 +290,30 @@ mod tests {
         assert_eq!(v.as_deref(), Some("2.0"));
     }
 
+    /// #1228: on a backend without search the canonical is matched over a scan.
+    /// The pick must follow the search path's rules — a pinned version selects
+    /// that version, an unpinned canonical the most recently updated match.
+    #[test]
+    fn newest_canonical_match_follows_the_search_paths_rules() {
+        let scanned = vec![
+            json!({"resourceType": "ViewDefinition", "id": "other", "url": "http://example.org/other",
+                   "meta": {"lastUpdated": "2026-09-17T12:00:00Z"}}),
+            json!({"resourceType": "ViewDefinition", "id": "old", "url": "http://example.org/vd", "version": "1.0.0",
+                   "meta": {"lastUpdated": "2026-09-01T00:00:00Z"}}),
+            json!({"resourceType": "ViewDefinition", "id": "new", "url": "http://example.org/vd", "version": "2.0.0",
+                   "meta": {"lastUpdated": "2026-09-10T00:00:00Z"}}),
+        ];
+        let pick = |url: &str| {
+            newest_canonical_match(scanned.clone(), url)
+                .and_then(|r| r.get("id").and_then(Value::as_str).map(str::to_string))
+        };
+        assert_eq!(pick("http://example.org/vd").as_deref(), Some("new"));
+        assert_eq!(pick("http://example.org/vd|1.0.0").as_deref(), Some("old"));
+        assert_eq!(pick("http://example.org/vd@2.0.0").as_deref(), Some("new"));
+        assert_eq!(pick("http://example.org/vd|9.9.9"), None);
+        assert_eq!(pick("http://example.org/missing"), None);
+    }
+
     #[test]
     fn canonical_matches_a_bare_url_regardless_of_the_resource_version() {
         let resource = json!({"resourceType": "ViewDefinition", "url": "http://example.org/vd"});
@@ -243,5 +343,273 @@ mod tests {
     fn canonical_matches_rejects_a_different_canonical_url() {
         let resource = json!({"resourceType": "ViewDefinition", "url": "http://example.org/other"});
         assert!(!canonical_matches(&resource, "http://example.org/vd"));
+    }
+
+    /// How the stub answers `search`, standing in for a backend with (S3)
+    /// and without a search index.
+    enum Search {
+        Unsupported,
+        Broken,
+    }
+
+    /// A storage that cannot search — the standalone S3 shape from #1228 —
+    /// optionally offering a whole-type scan instead.
+    struct ScanOnly {
+        search: Search,
+        scan: Option<Scan>,
+    }
+
+    /// What the stub's scan does: answer with these resources, or fail.
+    #[derive(Clone)]
+    enum Scan {
+        Of(Vec<Value>),
+        Broken,
+    }
+
+    #[async_trait]
+    impl ResourceStorage for ScanOnly {
+        fn backend_name(&self) -> &'static str {
+            "scan-only"
+        }
+
+        async fn create(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _resource: Value,
+            _fhir_version: FhirVersion,
+        ) -> StorageResult<StoredResource> {
+            unimplemented!()
+        }
+
+        async fn create_or_update(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+            _resource: Value,
+            _fhir_version: FhirVersion,
+        ) -> StorageResult<(StoredResource, bool)> {
+            unimplemented!()
+        }
+
+        async fn read(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<Option<StoredResource>> {
+            unimplemented!()
+        }
+
+        async fn update(
+            &self,
+            _tenant: &TenantContext,
+            _current: &StoredResource,
+            _resource: Value,
+        ) -> StorageResult<StoredResource> {
+            unimplemented!()
+        }
+
+        async fn delete(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<()> {
+            unimplemented!()
+        }
+
+        async fn count(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: Option<&str>,
+        ) -> StorageResult<u64> {
+            unimplemented!()
+        }
+
+        fn resource_scan(&self) -> Option<Arc<dyn ResourceScan>> {
+            self.scan
+                .clone()
+                .map(|scan| Arc::new(scan) as Arc<dyn ResourceScan>)
+        }
+    }
+
+    #[async_trait]
+    impl SearchProvider for ScanOnly {
+        async fn search(
+            &self,
+            _tenant: &TenantContext,
+            _query: &SearchQuery,
+        ) -> StorageResult<SearchResult> {
+            Err(StorageError::Backend(match self.search {
+                Search::Unsupported => BackendError::UnsupportedCapability {
+                    backend_name: "scan-only".to_string(),
+                    capability: "search".to_string(),
+                },
+                Search::Broken => BackendError::Internal {
+                    backend_name: "scan-only".to_string(),
+                    message: "index offline".to_string(),
+                    source: None,
+                },
+            }))
+        }
+
+        async fn search_count(
+            &self,
+            _tenant: &TenantContext,
+            _query: &SearchQuery,
+        ) -> StorageResult<u64> {
+            unimplemented!()
+        }
+
+        fn search_param_registry(
+            &self,
+            _tenant: &TenantContext,
+        ) -> Arc<parking_lot::RwLock<helios_persistence::search::SearchParameterRegistry>> {
+            unimplemented!()
+        }
+    }
+
+    #[async_trait]
+    impl ResourceScan for Scan {
+        async fn scan_resources(
+            &self,
+            _tenant: &TenantContext,
+            resource_type: &str,
+        ) -> Result<Vec<Value>, SofError> {
+            match self {
+                Scan::Of(resources) => Ok(resources
+                    .iter()
+                    .filter(|r| {
+                        r.get("resourceType").and_then(Value::as_str) == Some(resource_type)
+                    })
+                    .cloned()
+                    .collect()),
+                Scan::Broken => Err(SofError::Storage("bucket unreachable".to_string())),
+            }
+        }
+    }
+
+    fn tenant() -> TenantContext {
+        TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access())
+    }
+
+    fn definitions() -> Vec<Value> {
+        vec![
+            json!({"resourceType": "ViewDefinition", "id": "old", "url": "http://example.org/vd",
+                   "version": "1.0.0", "meta": {"lastUpdated": "2026-09-01T00:00:00Z"}}),
+            json!({"resourceType": "ViewDefinition", "id": "new", "url": "http://example.org/vd",
+                   "version": "2.0.0", "meta": {"lastUpdated": "2026-09-10T00:00:00Z"}}),
+            json!({"resourceType": "Library", "id": "lib", "url": "http://example.org/vd"}),
+        ]
+    }
+
+    async fn resolve(
+        storage: ScanOnly,
+        resource_type: &str,
+        url: &str,
+    ) -> Result<Value, RestError> {
+        let state = AppState::new(Arc::new(storage), ServerConfig::default());
+        resolve_by_canonical_url(&state, &tenant(), resource_type, url).await
+    }
+
+    fn id(resource: Value) -> String {
+        resource["id"].as_str().unwrap().to_string()
+    }
+
+    /// #1228: when the backend refuses `url=` searches the canonical is
+    /// resolved over the type's scan, honouring version pins and never
+    /// crossing resource types.
+    #[tokio::test]
+    async fn unsupported_search_resolves_the_canonical_over_the_scan() {
+        let scan_only = || ScanOnly {
+            search: Search::Unsupported,
+            scan: Some(Scan::Of(definitions())),
+        };
+        let picked = resolve(scan_only(), "ViewDefinition", "http://example.org/vd").await;
+        assert_eq!(id(picked.unwrap()), "new");
+        let pinned = resolve(scan_only(), "ViewDefinition", "http://example.org/vd|1.0.0").await;
+        assert_eq!(id(pinned.unwrap()), "old");
+        let library = resolve(scan_only(), "Library", "http://example.org/vd").await;
+        assert_eq!(id(library.unwrap()), "lib");
+    }
+
+    #[tokio::test]
+    async fn a_scan_without_a_match_is_not_found() {
+        for (storage, url) in [
+            (
+                ScanOnly {
+                    search: Search::Unsupported,
+                    scan: Some(Scan::Of(definitions())),
+                },
+                "http://example.org/vd|9.9.9",
+            ),
+            (
+                ScanOnly {
+                    search: Search::Unsupported,
+                    scan: Some(Scan::Of(Vec::new())),
+                },
+                "http://example.org/vd",
+            ),
+        ] {
+            match resolve(storage, "ViewDefinition", url).await {
+                Err(RestError::NotFound { resource_type, id }) => {
+                    assert_eq!(resource_type, "ViewDefinition");
+                    assert_eq!(id, url);
+                }
+                other => panic!("expected NotFound, got {other:?}"),
+            }
+        }
+    }
+
+    /// A backend with neither a search index nor a scan answers 501 with a
+    /// reason, not a 500 (#1228).
+    #[tokio::test]
+    async fn unsupported_search_without_a_scan_is_not_implemented() {
+        let storage = ScanOnly {
+            search: Search::Unsupported,
+            scan: None,
+        };
+        match resolve(storage, "Library", "http://example.org/lib").await {
+            Err(RestError::NotImplemented { feature }) => {
+                assert!(feature.contains("http://example.org/lib"), "{feature}");
+                assert!(feature.contains("reference the Library by id"), "{feature}");
+            }
+            other => panic!("expected NotImplemented, got {other:?}"),
+        }
+    }
+
+    /// A scan that fails is reported as the internal error it is, naming the
+    /// canonical it was resolving.
+    #[tokio::test]
+    async fn a_failing_scan_is_an_internal_error() {
+        let storage = ScanOnly {
+            search: Search::Unsupported,
+            scan: Some(Scan::Broken),
+        };
+        match resolve(storage, "ViewDefinition", "http://example.org/vd").await {
+            Err(RestError::InternalError { message }) => {
+                assert!(message.contains("bucket unreachable"), "{message}");
+                assert!(message.contains("url=http://example.org/vd"), "{message}");
+            }
+            other => panic!("expected InternalError, got {other:?}"),
+        }
+    }
+
+    /// Only the missing-capability error falls back; any other search failure
+    /// is still reported as the internal error it is.
+    #[tokio::test]
+    async fn other_search_failures_stay_internal_errors() {
+        let storage = ScanOnly {
+            search: Search::Broken,
+            scan: Some(Scan::Of(definitions())),
+        };
+        match resolve(storage, "ViewDefinition", "http://example.org/vd").await {
+            Err(RestError::InternalError { message }) => {
+                assert!(message.contains("index offline"), "{message}");
+            }
+            other => panic!("expected InternalError, got {other:?}"),
+        }
     }
 }

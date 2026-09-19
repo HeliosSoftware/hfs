@@ -308,6 +308,12 @@ pub struct SearchParameter {
     pub param_type: SearchParamType,
 
     /// Modifier, if any.
+    ///
+    /// For a chained parameter (non-empty [`chain`](Self::chain)) this is the
+    /// modifier of the chain's *terminal* parameter — the `:exact` of
+    /// `subject:Patient.name:exact` — since that is the only place a chain can
+    /// carry one; the `:Type` qualifiers of its reference hops live in
+    /// [`ChainedParameter::target_type`].
     #[serde(default)]
     pub modifier: Option<SearchModifier>,
 
@@ -476,7 +482,9 @@ pub struct ReverseChainedParameter {
     /// The reference parameter on the source type.
     pub reference_param: String,
 
-    /// The search parameter on the source type.
+    /// The search parameter on the source type, optionally followed by a
+    /// search modifier in FHIR syntax (`code`, `code:not`, `date:missing`) —
+    /// see [`terminal_param`](Self::terminal_param).
     /// For nested `_has`, this may be empty or "_has" indicating nesting.
     pub search_param: String,
 
@@ -516,6 +524,20 @@ impl ReverseChainedParameter {
             search_param: String::new(),
             value: None,
             nested: Some(Box::new(inner)),
+        }
+    }
+
+    /// Splits [`search_param`](Self::search_param) into the parameter name and
+    /// its modifier suffix, still unparsed: `code:not` is `("code", Some("not"))`.
+    ///
+    /// `_has:Observation:subject:code:not=1234-5` puts a modifier on the
+    /// terminal parameter exactly as `Observation?code:not=1234-5` does. It is
+    /// carried inside `search_param`, as written, rather than in a field of its
+    /// own; parse it with [`SearchModifier::parse`].
+    pub fn terminal_param(&self) -> (&str, Option<&str>) {
+        match self.search_param.split_once(':') {
+            Some((name, modifier)) => (name, Some(modifier)),
+            None => (&self.search_param, None),
         }
     }
 

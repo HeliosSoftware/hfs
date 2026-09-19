@@ -592,7 +592,12 @@ pub trait ResourceStorage: Send + Sync {
     ///
     /// # Returns
     ///
-    /// A vector of found resources (missing/deleted resources are omitted).
+    /// A vector of found resources. A missing id (`Ok(None)`) and a
+    /// soft-deleted id (`Err(Gone)`) are both omitted rather than failing the
+    /// batch — one deleted target must not sink the reads of every other id, so
+    /// callers resolving a set of references (`$everything` supporting resources,
+    /// SOF reference resolution, the ingest index sink) get the resources that
+    /// do exist. Any other error still propagates.
     async fn read_batch(
         &self,
         tenant: &TenantContext,
@@ -601,8 +606,11 @@ pub trait ResourceStorage: Send + Sync {
     ) -> StorageResult<Vec<StoredResource>> {
         let mut results = Vec::with_capacity(ids.len());
         for id in ids {
-            if let Some(resource) = self.read(tenant, resource_type, id).await? {
-                results.push(resource);
+            match self.read(tenant, resource_type, id).await {
+                Ok(Some(resource)) => results.push(resource),
+                Ok(None) => {}
+                Err(StorageError::Resource(ResourceError::Gone { .. })) => {}
+                Err(e) => return Err(e),
             }
         }
         Ok(results)
@@ -632,6 +640,20 @@ pub trait ResourceStorage: Send + Sync {
     ///
     /// The default implementation returns `None`.
     fn sof_runner(&self) -> Option<Arc<dyn SofRunner>> {
+        None
+    }
+
+    /// Returns a whole-type scan for backends that have no search index.
+    ///
+    /// A backend without search cannot answer `url=` lookups, yet the
+    /// SQL-on-FHIR operations must still resolve a canonical — a
+    /// `subjectCanonical`, or the `relatedArtifact.depends-on` of every SQL
+    /// View / SQL Query Library. Such a backend returns `Some`, and callers
+    /// that get `UnsupportedCapability` from `search` fall back to scanning
+    /// the (small, operator-authored) definition type and matching in process
+    /// (#1228). Backends with a search index keep the default `None`: their
+    /// index answers the lookup and a scan would only be slower.
+    fn resource_scan(&self) -> Option<Arc<dyn crate::sof::in_process::ResourceScan>> {
         None
     }
 

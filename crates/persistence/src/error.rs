@@ -358,6 +358,22 @@ pub enum SearchError {
     /// Text search not available.
     #[error("full-text search not available")]
     TextSearchNotAvailable,
+
+    /// The modifier needs a terminology server (value-set membership, or code
+    /// subsumption on a token) and none is configured. Raised for a direct
+    /// parameter and for the terminal parameter of a chained / `_has` search
+    /// alike, so both forms report it identically.
+    #[error(
+        "search modifier ':{modifier}' on token parameter '{param}' requires a \
+         configured terminology server (set HFS_TERMINOLOGY_SERVER)"
+    )]
+    TerminologyRequired {
+        /// Modifier name (e.g., `in`, `below`).
+        modifier: String,
+        /// The parameter as the client wrote it (`code`, `subject.gender`,
+        /// `_has:Observation:subject:code`).
+        param: String,
+    },
 }
 
 /// Errors related to transactions.

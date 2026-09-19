@@ -28,7 +28,9 @@ use crate::search::converters::IndexValue;
 use crate::search::extractor::ExtractedValue;
 use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
 use crate::tenant::{Operation, TenantContext};
-use crate::types::{CursorValue, Page, PageCursor, PageInfo, SearchQuery, StoredResource};
+use crate::types::{
+    CursorValue, Page, PageCursor, PageInfo, SearchParamType, SearchQuery, StoredResource,
+};
 
 use super::MongoBackend;
 
@@ -195,7 +197,7 @@ async fn collect_documents(mut cursor: Cursor<Document>) -> StorageResult<Vec<Do
     Ok(docs)
 }
 
-async fn collect_session_documents(
+pub(super) async fn collect_session_documents(
     mut cursor: SessionCursor<Document>,
     session: &mut ClientSession,
 ) -> StorageResult<Vec<Document>> {
@@ -413,23 +415,6 @@ fn parse_history_row(
         deleted_at,
         fhir_version,
     })
-}
-
-fn parse_simple_bundle_search_params(params: &str) -> Vec<(String, String)> {
-    params
-        .split('&')
-        .filter_map(|pair| {
-            let mut iter = pair.splitn(2, '=');
-            let key = iter.next()?.trim();
-            let value = iter.next()?.trim();
-
-            if key.is_empty() || value.is_empty() {
-                return None;
-            }
-
-            Some((key.to_string(), value.to_string()))
-        })
-        .collect()
 }
 
 pub(super) fn document_to_stored_resource(
@@ -797,11 +782,15 @@ impl ResourceStorage for MongoBackend {
         self.index_resource(&db, tenant_id, resource_type, &id, &resource, &mut session)
             .await?;
 
+        commit_best_effort_multi_write_session(&mut session, transaction_active, "create").await?;
+
         // An overlay-affecting SearchParameter write: refresh the stored-param
         // cache (which the per-tenant loader reads) and drop the cached
-        // registries. Seeded spec copies never affect the overlay (see
-        // `create_affects_overlay`), which keeps bulk seeding from triggering
-        // an O(n²) reload storm.
+        // registries. This must run after the commit above: `reload_stored_cache`
+        // reads the `resources` collection without the session, so while the
+        // transaction is still open the write above is invisible to it. Seeded
+        // spec copies never affect the overlay (see `create_affects_overlay`),
+        // which keeps bulk seeding from triggering an O(n²) reload storm.
         if resource_type == "SearchParameter"
             && self.tenant_registries().create_affects_overlay(&resource)
         {
@@ -809,8 +798,6 @@ impl ResourceStorage for MongoBackend {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
             }
         }
-
-        commit_best_effort_multi_write_session(&mut session, transaction_active, "create").await?;
 
         Ok(StoredResource::from_storage(
             resource_type,
@@ -1092,15 +1079,18 @@ impl ResourceStorage for MongoBackend {
         self.index_resource(&db, tenant_id, resource_type, id, &resource, &mut session)
             .await?;
 
+        commit_best_effort_multi_write_session(&mut session, transaction_active, "update").await?;
+
         // A SearchParameter update may change a tenant's overlay (status flips,
         // expression edits): refresh the stored-param cache and drop registries.
+        // This must run after the commit above: `reload_stored_cache` reads the
+        // `resources` collection without the session, so it cannot observe the
+        // update while the transaction is still open.
         if resource_type == "SearchParameter" {
             if let Err(e) = self.reload_stored_cache().await {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
             }
         }
-
-        commit_best_effort_multi_write_session(&mut session, transaction_active, "update").await?;
 
         Ok(StoredResource::from_storage(
             resource_type,
@@ -1253,15 +1243,18 @@ impl ResourceStorage for MongoBackend {
         self.delete_search_index(&db, tenant_id, resource_type, id, &mut session)
             .await?;
 
+        commit_best_effort_multi_write_session(&mut session, transaction_active, "delete").await?;
+
         // A SearchParameter delete may remove a tenant's overlay entry: refresh
-        // the stored-param cache and drop registries.
+        // the stored-param cache and drop registries. This must run after the
+        // commit above: `reload_stored_cache` reads the `resources` collection
+        // without the session, so it cannot observe the delete while the
+        // transaction is still open.
         if resource_type == "SearchParameter" {
             if let Err(e) = self.reload_stored_cache().await {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
             }
         }
-
-        commit_best_effort_multi_write_session(&mut session, transaction_active, "delete").await?;
 
         Ok(())
     }
@@ -1298,8 +1291,14 @@ impl ResourceStorage for MongoBackend {
         let mut resources = Vec::with_capacity(ids.len());
 
         for id in ids {
-            if let Some(resource) = self.read(tenant, resource_type, id).await? {
-                resources.push(resource);
+            // A missing or soft-deleted (Gone) id is omitted, not fatal — one
+            // deleted target must not fail the whole batch (matches the default
+            // impl / #1119).
+            match self.read(tenant, resource_type, id).await {
+                Ok(Some(resource)) => resources.push(resource),
+                Ok(None) => {}
+                Err(StorageError::Resource(ResourceError::Gone { .. })) => {}
+                Err(e) => return Err(e),
             }
         }
 
@@ -2078,15 +2077,18 @@ impl MongoBackend {
         self.index_resource(&db, tenant_id, resource_type, id, &resource, &mut session)
             .await?;
 
+        commit_best_effort_multi_write_session(&mut session, transaction_active, "restore").await?;
+
         // A restored SearchParameter re-enters a tenant's overlay: refresh the
-        // stored-param cache and drop registries.
+        // stored-param cache and drop registries. This must run after the
+        // commit above: `reload_stored_cache` reads the `resources` collection
+        // without the session, so it cannot observe the restore while the
+        // transaction is still open.
         if resource_type == "SearchParameter" {
             if let Err(e) = self.reload_stored_cache().await {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
             }
         }
-
-        commit_best_effort_multi_write_session(&mut session, transaction_active, "restore").await?;
 
         Ok(StoredResource::from_storage(
             resource_type,
@@ -3791,7 +3793,7 @@ impl MongoBackend {
         resource_type: &str,
         search_params: &str,
     ) -> StorageResult<Vec<StoredResource>> {
-        let parsed_params = parse_simple_bundle_search_params(search_params);
+        let parsed_params = crate::search::parse_conditional_criteria(search_params);
         if parsed_params.is_empty() {
             return Ok(Vec::new());
         }
@@ -3802,7 +3804,12 @@ impl MongoBackend {
                 .await;
         }
 
-        let typed_params = self.build_search_parameters(tenant, resource_type, &parsed_params);
+        let typed_params = self.build_search_parameters(tenant, resource_type, &parsed_params)?;
+        // Result-shaping names (`_format`, …) are not criteria; with nothing
+        // left, an empty filter would match the whole type.
+        if typed_params.is_empty() {
+            return Ok(Vec::new());
+        }
         let index_params: Vec<_> = typed_params
             .iter()
             .filter(|p| !matches!(p.name.as_str(), "_id" | "_lastUpdated"))
@@ -3840,32 +3847,60 @@ impl MongoBackend {
         const PROBE_LIMIT: i64 = 2;
         const BATCH_SIZE: i64 = 128;
 
+        // #1206: cache each composite's driver-arm probe (component filters +
+        // counts already resolved) so the winning index, if composite,
+        // doesn't re-probe below — mirrors `matching_resource_ids` in
+        // `search_impl.rs`.
+        let mut composite_probes: HashMap<usize, (Document, i64)> = HashMap::new();
+
         let driver_idx = {
             let mut best: Option<(usize, i64)> = None;
             for (i, param) in index_params.iter().enumerate() {
-                let filter = self.build_search_index_filter(tenant_id, resource_type, param)?;
-                let pipeline = vec![
-                    doc! { "$match": filter },
-                    doc! { "$limit": PROBE_LIMIT },
-                    doc! { "$group": { "_id": "$resource_id" } },
-                    doc! { "$count": "n" },
-                ];
-                let cursor = search_index
-                    .aggregate(pipeline)
-                    .session(&mut *session)
-                    .await
-                    .map_err(|e| {
-                        internal_error(format!("Failed probe for ifNoneExist driver: {}", e))
-                    })?;
-                let probe_docs = collect_session_documents(cursor, session).await?;
-                let count = probe_docs
-                    .first()
-                    .and_then(|d| d.get_i32("n").ok())
-                    .map(|n| n as i64)
-                    .unwrap_or(0);
-                if count == 0 {
-                    return Ok(Vec::new());
-                }
+                let count = if param.param_type == SearchParamType::Composite {
+                    match self
+                        .composite_driver_probe(
+                            &search_index,
+                            tenant_id,
+                            resource_type,
+                            param,
+                            PROBE_LIMIT as u64,
+                            Some(&mut *session),
+                        )
+                        .await?
+                    {
+                        None => return Ok(Vec::new()),
+                        Some((filter, count)) => {
+                            let count = count as i64;
+                            composite_probes.insert(i, (filter, count));
+                            count
+                        }
+                    }
+                } else {
+                    let filter = self.build_search_index_filter(tenant_id, resource_type, param)?;
+                    let pipeline = vec![
+                        doc! { "$match": filter },
+                        doc! { "$limit": PROBE_LIMIT },
+                        doc! { "$group": { "_id": "$resource_id" } },
+                        doc! { "$count": "n" },
+                    ];
+                    let cursor = search_index
+                        .aggregate(pipeline)
+                        .session(&mut *session)
+                        .await
+                        .map_err(|e| {
+                            internal_error(format!("Failed probe for ifNoneExist driver: {}", e))
+                        })?;
+                    let probe_docs = collect_session_documents(cursor, session).await?;
+                    let count = probe_docs
+                        .first()
+                        .and_then(|d| d.get_i32("n").ok())
+                        .map(|n| n as i64)
+                        .unwrap_or(0);
+                    if count == 0 {
+                        return Ok(Vec::new());
+                    }
+                    count
+                };
                 if best.is_none_or(|(_, prev)| count < prev) {
                     best = Some((i, count));
                 }
@@ -3873,8 +3908,14 @@ impl MongoBackend {
             best.map(|(i, _)| i).unwrap_or(0)
         };
 
-        let driver_filter =
-            self.build_search_index_filter(tenant_id, resource_type, index_params[driver_idx])?;
+        // Every composite index visited above has its probe result cached,
+        // so `driver_idx` pointing at a composite always finds an entry
+        // here; a plain param never has one and falls through as before.
+        let driver_filter = if let Some((filter, _)) = composite_probes.remove(&driver_idx) {
+            filter
+        } else {
+            self.build_search_index_filter(tenant_id, resource_type, index_params[driver_idx])?
+        };
 
         let mut last_index_id: Option<Bson> = None;
         let mut matches: Vec<StoredResource> = Vec::with_capacity(2);
@@ -3924,7 +3965,28 @@ impl MongoBackend {
             }
 
             for (i, param) in index_params.iter().enumerate() {
-                if i == driver_idx || candidate_ids.is_empty() {
+                if candidate_ids.is_empty() {
+                    continue;
+                }
+                // Same reasoning as `matching_resource_ids`: a composite's
+                // driver arm only proves its most selective component
+                // matched, so every composite here — including the driver —
+                // still needs the grouped pair check (#1206).
+                if param.param_type == SearchParamType::Composite {
+                    let passing = self
+                        .composite_pair_check(
+                            &search_index,
+                            tenant_id,
+                            resource_type,
+                            param,
+                            &candidate_ids,
+                            Some(&mut *session),
+                        )
+                        .await?;
+                    candidate_ids.retain(|id| passing.contains(id));
+                    continue;
+                }
+                if i == driver_idx {
                     continue;
                 }
                 let param_filter =

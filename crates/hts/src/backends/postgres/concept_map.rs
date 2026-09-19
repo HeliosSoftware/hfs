@@ -16,7 +16,7 @@ use crate::types::{
 };
 
 use super::code_system::build_synthetic_resource;
-use super::{PG_TRANSLATE_RESPONSE_CACHE_MAX, PostgresTerminologyBackend};
+use super::{PG_TRANSLATE_RESPONSE_CACHE_MAX, PostgresTerminologyBackend, error_chain};
 
 /// Build the $translate response cache key. Folds every TranslateRequest
 /// field that affects the output rows.
@@ -55,7 +55,7 @@ impl ConceptMapOperations for PostgresTerminologyBackend {
             .pool
             .get()
             .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
 
         // Reverse mode is set explicitly via `reverse=true`, *or* implicitly
         // when the caller supplied `targetCode` instead of `sourceCode` (R5).
@@ -137,7 +137,7 @@ impl ConceptMapOperations for PostgresTerminologyBackend {
             .pool
             .get()
             .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
 
         let mut by_system: HashMap<String, Vec<String>> = HashMap::new();
         for concept in &req.concept {
@@ -157,7 +157,7 @@ impl ConceptMapOperations for PostgresTerminologyBackend {
             let id_rows = client
                 .query(&sql, &[system_url])
                 .await
-                .map_err(|e| HtsError::StorageError(format!("DB error: {e}")))?;
+                .map_err(|e| HtsError::StorageError(format!("DB error: {}", error_chain(&e))))?;
 
             let system_id: String = match id_rows.into_iter().next() {
                 Some(r) => r.get(0),
@@ -232,7 +232,7 @@ impl ConceptMapOperations for PostgresTerminologyBackend {
             .pool
             .get()
             .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
 
         if !string_search.is_empty() {
             return super::search_resources(
@@ -270,7 +270,7 @@ impl ConceptMapOperations for PostgresTerminologyBackend {
                 ],
             )
             .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
         let mut results = Vec::new();
         for row in rows {
@@ -366,7 +366,7 @@ async fn query_translate_elements(
     let rows = client
         .query(&sql, &[&code, &system, &other_side_sys, &map_url, &date])
         .await
-        .map_err(|e| HtsError::StorageError(format!("Query error: {e}")))?;
+        .map_err(|e| HtsError::StorageError(format!("Query error: {}", error_chain(&e))))?;
 
     Ok(rows
         .into_iter()
@@ -408,7 +408,7 @@ async fn is_ancestor_of(
             &[&system_id, &descendant_code, &ancestor_code],
         )
         .await
-        .map_err(|e| HtsError::StorageError(format!("DB error: {e}")))?;
+        .map_err(|e| HtsError::StorageError(format!("DB error: {}", error_chain(&e))))?;
 
     Ok(!rows.is_empty())
 }

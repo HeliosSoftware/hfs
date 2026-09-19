@@ -1282,11 +1282,24 @@ impl PostgresBackend {
     }
 }
 
+/// A `_cursor` that decoded but carries a sort value of the wrong type for its
+/// sort key. A client-crafted bad request (400), not a server fault (#1120).
+fn invalid_cursor(cursor: &PageCursor) -> StorageError {
+    StorageError::Search(SearchError::InvalidCursor {
+        cursor: cursor.encode(),
+    })
+}
+
 // Helper methods for search implementations
 impl PostgresBackend {
     /// Extract timestamp and ID from a cursor for keyset pagination.
     /// Binds the cursor's boundary sort value as `$3`, typed per the sort key
     /// kind so PostgreSQL compares it correctly against the sort expression.
+    ///
+    /// A cursor that decoded but carries a sort value of the wrong type (or an
+    /// unparseable timestamp string) for its sort key is a bad request (400),
+    /// not a server fault: cursors are unkeyed base64 JSON any client can craft
+    /// (#1120).
     fn bind_cursor_value(
         params: &mut Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
         kind: SortValueKind,
@@ -1298,12 +1311,8 @@ impl PostgresBackend {
                 let dt = match value {
                     Some(CursorValue::String(s)) => chrono::DateTime::parse_from_rfc3339(s)
                         .map(|d| d.with_timezone(&Utc))
-                        .map_err(|_| internal_error("Invalid cursor timestamp".to_string()))?,
-                    _ => {
-                        return Err(internal_error(
-                            "Invalid cursor: expected timestamp".to_string(),
-                        ));
-                    }
+                        .map_err(|_| invalid_cursor(cursor))?,
+                    _ => return Err(invalid_cursor(cursor)),
                 };
                 params.push(Box::new(dt));
             }
@@ -1312,20 +1321,14 @@ impl PostgresBackend {
                     Some(CursorValue::Decimal(f)) => *f,
                     Some(CursorValue::Number(i)) => *i as f64,
                     Some(CursorValue::String(s)) => s.parse().unwrap_or(0.0),
-                    _ => {
-                        return Err(internal_error(
-                            "Invalid cursor: expected number".to_string(),
-                        ));
-                    }
+                    _ => return Err(invalid_cursor(cursor)),
                 };
                 params.push(Box::new(n));
             }
             SortValueKind::Text => match value {
                 Some(CursorValue::String(s)) => params.push(Box::new(s.clone())),
                 Some(CursorValue::Null) | None => params.push(Box::new(Option::<String>::None)),
-                _ => {
-                    return Err(internal_error("Invalid cursor: expected text".to_string()));
-                }
+                _ => return Err(invalid_cursor(cursor)),
             },
         }
         Ok(())
@@ -1482,5 +1485,45 @@ mod fast_path_tests {
     fn refused_without_a_filter() {
         let q = SearchQuery::new("Encounter");
         assert!(fast_index_pred(&q, None, IndexLayout::Denormalized, false).is_none());
+    }
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+
+    #[test]
+    fn a_type_mismatched_cursor_sort_value_is_a_client_error() {
+        // Crafted: a boolean where the Timestamp sort key expects an RFC3339
+        // string. Must surface as a 400 InvalidCursor, not a 500 (#1120).
+        let cursor = PageCursor::new(vec![CursorValue::Boolean(true)], "p1");
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+        let err =
+            PostgresBackend::bind_cursor_value(&mut params, SortValueKind::Timestamp, &cursor)
+                .expect_err("a boolean is not a timestamp");
+        match err {
+            StorageError::Search(SearchError::InvalidCursor { cursor: c }) => {
+                assert_eq!(c, cursor.encode())
+            }
+            other => panic!("expected InvalidCursor, got {other:?}"),
+        }
+
+        // An unparseable timestamp string is equally a client error, not a 500.
+        let bad_ts = PageCursor::new(vec![CursorValue::String("not-a-date".to_string())], "p1");
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+        assert!(matches!(
+            PostgresBackend::bind_cursor_value(&mut params, SortValueKind::Timestamp, &bad_ts),
+            Err(StorageError::Search(SearchError::InvalidCursor { .. }))
+        ));
+
+        // A well-typed cursor still binds.
+        let ok = PageCursor::new(
+            vec![CursorValue::String("2024-01-01T00:00:00Z".to_string())],
+            "p1",
+        );
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+        assert!(
+            PostgresBackend::bind_cursor_value(&mut params, SortValueKind::Timestamp, &ok).is_ok()
+        );
     }
 }

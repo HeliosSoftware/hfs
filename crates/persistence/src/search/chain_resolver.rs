@@ -12,13 +12,31 @@
 use std::collections::HashSet;
 
 use crate::core::SearchProvider;
-use crate::error::StorageResult;
+use crate::error::{SearchError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
 use crate::types::{
-    ReverseChainedParameter, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+    ReverseChainedParameter, SearchModifier, SearchParamType, SearchParameter, SearchPrefix,
+    SearchQuery, SearchValue,
 };
 
-use super::{IndexValue, SearchParameterExtractor, resolve_param_type};
+use super::{
+    IndexValue, SearchParameterExtractor, SearchParameterRegistry, param_requires_terminology,
+    parse_typed_values, resolve_param_type, split_unescaped_commas, validate_modifier,
+};
+
+/// What the caller can do for the resolver.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChainResolveOptions {
+    /// Whether the caller has a terminology server and has already expanded the
+    /// terminology-backed modifiers (`:in`, token `:above` / `:below`) with it,
+    /// as the REST search handler does when `HFS_TERMINOLOGY_SERVER` is set.
+    ///
+    /// When false — the default — such a modifier on a chain's terminal
+    /// parameter is rejected with [`SearchError::TerminologyRequired`], as it
+    /// is on a direct parameter: no backend can answer it, and the terminal
+    /// search would otherwise match literally or not at all (#1317).
+    pub terminology_available: bool,
+}
 
 /// Returns true if the query contains any chained or reverse-chained parameter.
 pub fn query_has_chains(query: &SearchQuery) -> bool {
@@ -31,10 +49,25 @@ pub fn query_has_chains(query: &SearchQuery) -> bool {
 /// Multiple chains are intersected (`AND`). If any chain resolves to no
 /// resources the rewritten query is forced to match nothing. Queries without
 /// chains are returned unchanged.
+///
+/// Uses the default [`ChainResolveOptions`]; see [`resolve_chains_with`].
 pub async fn resolve_chains<S>(
     storage: &S,
     tenant: &TenantContext,
     query: &SearchQuery,
+) -> StorageResult<SearchQuery>
+where
+    S: SearchProvider + ?Sized,
+{
+    resolve_chains_with(storage, tenant, query, ChainResolveOptions::default()).await
+}
+
+/// [`resolve_chains`], told what the caller can do for it.
+pub async fn resolve_chains_with<S>(
+    storage: &S,
+    tenant: &TenantContext,
+    query: &SearchQuery,
+    options: ChainResolveOptions,
 ) -> StorageResult<SearchQuery>
 where
     S: SearchProvider + ?Sized,
@@ -64,12 +97,7 @@ where
                 },
             ));
         }
-        let value = param
-            .values
-            .first()
-            .map(|v| v.value.clone())
-            .unwrap_or_default();
-        let ids = resolve_forward_chain(storage, tenant, &base_type, param, &value).await?;
+        let ids = resolve_forward_chain(storage, tenant, &base_type, param, options).await?;
         id_sets.push(ids.into_iter().collect());
     }
 
@@ -86,7 +114,8 @@ where
                 },
             ));
         }
-        let ids = resolve_reverse_chain(storage, tenant, &base_type, reverse_chain).await?;
+        let ids =
+            resolve_reverse_chain(storage, tenant, &base_type, reverse_chain, options).await?;
         id_sets.push(ids.into_iter().collect());
     }
 
@@ -183,12 +212,12 @@ where
 /// reference like `Patient.general-practitioner` fans out to Practitioner,
 /// Organization, and PractitionerRole rather than guessing one. The name
 /// heuristic remains only for parameters the registry does not know.
-async fn resolve_forward_chain<S>(
+pub(crate) async fn resolve_forward_chain<S>(
     storage: &S,
     tenant: &TenantContext,
     base_type: &str,
     param: &SearchParameter,
-    value: &str,
+    options: ChainResolveOptions,
 ) -> StorageResult<Vec<String>>
 where
     S: SearchProvider + ?Sized,
@@ -199,8 +228,9 @@ where
     }
     let terminal_param = &hops[hops.len() - 1].target_param;
 
-    // Candidate parent/target types per hop, and the terminal param's type.
-    let (parent_types_per_hop, terminal_types, terminal_type) = {
+    // Candidate parent/target types per hop, and the terminal param's type
+    // and parsed values.
+    let (parent_types_per_hop, terminal_types, terminal_type, terminal_values) = {
         let reg = storage.search_param_registry(tenant);
         let registry = reg.read();
 
@@ -239,13 +269,30 @@ where
             .cloned()
             .collect();
         let terminal_types = if defined.is_empty() { current } else { defined };
-        let terminal_type = resolve_param_type(
+        // The chained parameter arrives typed as its *reference* hop, so its
+        // values are still raw (already comma-split into the OR list). Only
+        // here is the terminal param's type known, so this is where they are
+        // parsed — all of them, not just the first (#1292).
+        let (terminal_type, terminal_values) = parse_terminal_values(
             &registry,
             &terminal_types[0],
             terminal_param,
-            &[SearchValue::eq(value)],
+            &param.values,
+            param.modifier.as_ref(),
+            false,
         );
-        (parents, terminal_types, terminal_type)
+        // Likewise the modifier: a chained parameter's modifier belongs to the
+        // terminal param, and only now can it be checked against that type.
+        check_terminal_modifier(
+            &registry,
+            &terminal_types[0],
+            terminal_param,
+            terminal_type,
+            param.modifier.as_ref(),
+            || forward_chain_display(param),
+            options,
+        )?;
+        (parents, terminal_types, terminal_type, terminal_values)
     };
 
     // Deepest hop: search each candidate terminal type, union the refs.
@@ -254,8 +301,10 @@ where
         let terminal_query = SearchQuery::new(terminal_target).with_parameter(SearchParameter {
             name: terminal_param.clone(),
             param_type: terminal_type,
-            modifier: None,
-            values: vec![SearchValue::eq(value)],
+            // Set on the terminal search itself, so every check a backend runs
+            // on a direct `name:exact` / `birthdate:missing` sees this one too.
+            modifier: param.modifier.clone(),
+            values: terminal_values.clone(),
             chain: vec![],
             components: vec![],
         });
@@ -323,11 +372,12 @@ where
 /// Nested `_has` (`_has:Source:refParam:_has:...`) is resolved recursively: the
 /// inner chain selects the qualifying `Source` resources by id, then this level
 /// collects the references those resources make to `base_type`.
-async fn resolve_reverse_chain<S>(
+pub(crate) async fn resolve_reverse_chain<S>(
     storage: &S,
     tenant: &TenantContext,
     base_type: &str,
     reverse_chain: &ReverseChainedParameter,
+    options: ChainResolveOptions,
 ) -> StorageResult<Vec<String>>
 where
     S: SearchProvider + ?Sized,
@@ -341,6 +391,7 @@ where
             tenant,
             &reverse_chain.source_type,
             inner,
+            options,
         ))
         .await?;
         if inner_ids.is_empty() {
@@ -355,25 +406,53 @@ where
             components: vec![],
         })
     } else {
-        // Terminal: match source resources by `search_param=value`.
-        let values = match &reverse_chain.value {
-            Some(v) => vec![v.clone()],
-            None => vec![],
+        // Terminal: match source resources by `search_param=value`. A `_has`
+        // carries its value as one raw string, so the OR list is split here
+        // too, then parsed for the terminal param's type (#1292).
+        //
+        // `search_param` may end in a modifier (`code:not`), which applies to
+        // the terminal search as it would to a direct one (#1302).
+        let raw: Vec<SearchValue> = reverse_chain.value.iter().cloned().collect();
+        let (search_param, modifier) = reverse_chain.terminal_param();
+        let modifier = match modifier {
+            Some(m) => Some(SearchModifier::parse(m).ok_or_else(|| {
+                query_error(format!(
+                    "unknown search modifier ':{m}' on _has parameter '{search_param}'"
+                ))
+            })?),
+            None => None,
         };
-        let search_param_type = {
+        let (search_param_type, values) = {
             let reg = storage.search_param_registry(tenant);
             let registry = reg.read();
-            resolve_param_type(
+            let (search_param_type, values) = parse_terminal_values(
                 &registry,
                 &reverse_chain.source_type,
-                &reverse_chain.search_param,
-                &values,
-            )
+                search_param,
+                &raw,
+                modifier.as_ref(),
+                true,
+            );
+            check_terminal_modifier(
+                &registry,
+                &reverse_chain.source_type,
+                search_param,
+                search_param_type,
+                modifier.as_ref(),
+                || {
+                    format!(
+                        "_has:{}:{}:{search_param}",
+                        reverse_chain.source_type, reverse_chain.reference_param
+                    )
+                },
+                options,
+            )?;
+            (search_param_type, values)
         };
         SearchQuery::new(&reverse_chain.source_type).with_parameter(SearchParameter {
-            name: reverse_chain.search_param.clone(),
+            name: search_param.to_string(),
             param_type: search_param_type,
-            modifier: None,
+            modifier,
             values,
             chain: vec![],
             components: vec![],
@@ -401,6 +480,104 @@ where
         }
     }
     Ok(ids)
+}
+
+/// Parses the values of a chain's terminal parameter exactly as a direct search
+/// on that parameter would, via [`parse_typed_values`]: a comparator prefix is
+/// split off for date/number/quantity terminals only, so `birthdate=ge1980` is a
+/// comparison while `family=Lee` stays the literal "Lee".
+///
+/// `values` are raw — the query builder cannot type them, since it only knows
+/// the reference hop. Forward-chain values arrive already split into their OR
+/// alternatives (and unescaped), so `split_commas` is false for them; a `_has`
+/// value arrives as a single unsplit string, so it is split here.
+///
+/// A value that already carries a non-`eq` prefix was parsed by the caller
+/// (programmatic queries, or an unregistered reference hop whose date-shaped
+/// value the type heuristic claimed) and is passed through untouched.
+///
+/// With the `:missing` modifier the value is the boolean `true` / `false`
+/// whatever the parameter's type, so it is neither prefix-parsed nor split.
+fn parse_terminal_values(
+    registry: &SearchParameterRegistry,
+    resource_type: &str,
+    param_name: &str,
+    values: &[SearchValue],
+    modifier: Option<&SearchModifier>,
+    split_commas: bool,
+) -> (SearchParamType, Vec<SearchValue>) {
+    if matches!(modifier, Some(SearchModifier::Missing))
+        || values.iter().any(|v| v.prefix != SearchPrefix::Eq)
+    {
+        let param_type = resolve_param_type(registry, resource_type, param_name, values);
+        return (param_type, values.to_vec());
+    }
+    let raw_values: Vec<String> = values
+        .iter()
+        .flat_map(|v| {
+            if split_commas {
+                split_unescaped_commas(&v.value)
+            } else {
+                vec![v.value.clone()]
+            }
+        })
+        .collect();
+    parse_typed_values(registry, resource_type, param_name, &raw_values)
+}
+
+/// Rejects a modifier the terminal parameter cannot take, with the same checks
+/// — and the same wording — a direct search on it gets:
+///
+/// * one that needs a terminology server the caller does not have
+///   ([`param_requires_terminology`]), which the REST layer maps to a `501`.
+///   Checked first, as the REST handler's guard on a direct parameter is;
+/// * one the parameter's type does not define ([`validate_modifier`]), which
+///   the REST layer maps to a `400`.
+///
+/// `display` names the parameter as the client wrote it, for the first error.
+fn check_terminal_modifier(
+    registry: &SearchParameterRegistry,
+    resource_type: &str,
+    param_name: &str,
+    param_type: SearchParamType,
+    modifier: Option<&SearchModifier>,
+    display: impl FnOnce() -> String,
+    options: ChainResolveOptions,
+) -> StorageResult<()> {
+    let Some(m) = modifier else {
+        return Ok(());
+    };
+    if !options.terminology_available
+        && param_requires_terminology(registry, resource_type, param_name, m)
+    {
+        return Err(StorageError::Search(SearchError::TerminologyRequired {
+            modifier: m.to_string(),
+            param: display(),
+        }));
+    }
+    validate_modifier(registry, resource_type, param_name, param_type, m).map_err(query_error)
+}
+
+/// A forward chain as the client wrote it, less the terminal modifier:
+/// `subject:Patient.general-practitioner.name`.
+fn forward_chain_display(param: &SearchParameter) -> String {
+    let mut path = String::new();
+    for hop in &param.chain {
+        path.push_str(&hop.reference_param);
+        if let Some(t) = &hop.target_type {
+            path.push(':');
+            path.push_str(t);
+        }
+        path.push('.');
+    }
+    if let Some(last) = param.chain.last() {
+        path.push_str(&last.target_param);
+    }
+    path
+}
+
+fn query_error(message: String) -> StorageError {
+    StorageError::Search(SearchError::QueryParseError { message })
 }
 
 /// Extracts reference values for `search_param` from a resource, using the
@@ -634,6 +811,590 @@ mod tests {
         let rewritten = resolve_chains(&b, &t, &query).await.unwrap();
         let result = b.search(&t, &rewritten).await.unwrap();
         assert!(result.resources.items.is_empty(), "no patient named Nobody");
+    }
+
+    // ---- #1292: the terminal parameter is parsed like a direct parameter ----
+
+    /// Two patients (born 1980-05-06 "Lee" and 1990-01-01 "Gert"), two
+    /// Procedures each, plus an Encounter/Observation/DiagnosticReport/
+    /// RiskAssessment per patient for the multi-hop, quantity and number cases.
+    async fn seed_dated(b: &SqliteBackend, t: &TenantContext) {
+        let resources = [
+            json!({ "resourceType": "Patient", "id": "p80", "birthDate": "1980-05-06",
+                    "name": [{ "family": "Lee" }] }),
+            json!({ "resourceType": "Patient", "id": "p90", "birthDate": "1990-01-01",
+                    "name": [{ "family": "Gert" }] }),
+            json!({ "resourceType": "Procedure", "id": "pr1", "status": "completed",
+                    "subject": { "reference": "Patient/p80" },
+                    "performedDateTime": "2013-04-05T09:20:00-04:00" }),
+            json!({ "resourceType": "Procedure", "id": "pr2", "status": "completed",
+                    "subject": { "reference": "Patient/p80" },
+                    "performedDateTime": "2013-04-05" }),
+            json!({ "resourceType": "Procedure", "id": "pr3", "status": "completed",
+                    "subject": { "reference": "Patient/p90" },
+                    "performedDateTime": "2020-06-01T10:00:00+05:30" }),
+            json!({ "resourceType": "Procedure", "id": "pr4", "status": "completed",
+                    "subject": { "reference": "Patient/p90" },
+                    "performedDateTime": "2021-02-03" }),
+            json!({ "resourceType": "Encounter", "id": "e80", "status": "finished",
+                    "class": { "code": "AMB" },
+                    "subject": { "reference": "Patient/p80" } }),
+            json!({ "resourceType": "Encounter", "id": "e90", "status": "finished",
+                    "class": { "code": "AMB" },
+                    "subject": { "reference": "Patient/p90" } }),
+            json!({ "resourceType": "Observation", "id": "ob80", "status": "final",
+                    "code": { "text": "hr" },
+                    "subject": { "reference": "Patient/p80" },
+                    "encounter": { "reference": "Encounter/e80" },
+                    "valueQuantity": { "value": 60, "unit": "bpm" } }),
+            json!({ "resourceType": "Observation", "id": "ob90", "status": "final",
+                    "code": { "text": "hr" },
+                    "subject": { "reference": "Patient/p90" },
+                    "encounter": { "reference": "Encounter/e90" },
+                    "valueQuantity": { "value": 90, "unit": "bpm" } }),
+            json!({ "resourceType": "DiagnosticReport", "id": "dr80", "status": "final",
+                    "code": { "text": "panel" },
+                    "result": [{ "reference": "Observation/ob80" }] }),
+            json!({ "resourceType": "DiagnosticReport", "id": "dr90", "status": "final",
+                    "code": { "text": "panel" },
+                    "result": [{ "reference": "Observation/ob90" }] }),
+            json!({ "resourceType": "RiskAssessment", "id": "ra80", "status": "final",
+                    "subject": { "reference": "Patient/p80" },
+                    "prediction": [{ "probabilityDecimal": 0.2 }] }),
+            json!({ "resourceType": "RiskAssessment", "id": "ra90", "status": "final",
+                    "subject": { "reference": "Patient/p90" },
+                    "prediction": [{ "probabilityDecimal": 0.8 }] }),
+        ];
+        for resource in resources {
+            let resource_type = resource["resourceType"].as_str().unwrap().to_string();
+            b.create(t, &resource_type, resource, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+    }
+
+    /// A forward-chained parameter exactly as the REST query builder emits it:
+    /// typed as the reference hop, values raw and already comma-split.
+    fn forward(base: &str, hops: &[(&str, &str, &str)], raw_values: &[&str]) -> SearchQuery {
+        SearchQuery::new(base).with_parameter(SearchParameter {
+            name: hops[0].0.to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: raw_values.iter().map(|v| SearchValue::eq(*v)).collect(),
+            chain: hops
+                .iter()
+                .map(|(reference, target_type, target_param)| ChainedParameter {
+                    reference_param: reference.to_string(),
+                    target_type: Some(target_type.to_string()),
+                    target_param: target_param.to_string(),
+                })
+                .collect(),
+            components: vec![],
+        })
+    }
+
+    /// A `_has` exactly as the REST query builder emits it: one raw value.
+    fn has(base: &str, source: &str, reference: &str, param: &str, raw: &str) -> SearchQuery {
+        let mut query = SearchQuery::new(base);
+        query.reverse_chains.push(ReverseChainedParameter::terminal(
+            source,
+            reference,
+            param,
+            SearchValue::eq(raw),
+        ));
+        query
+    }
+
+    async fn run(b: &SqliteBackend, t: &TenantContext, query: &SearchQuery) -> Vec<String> {
+        let rewritten = resolve_chains(b, t, query).await.unwrap();
+        let result = b.search(t, &rewritten).await.unwrap();
+        let mut ids: Vec<String> = result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    fn pairs(values: &[SearchValue]) -> Vec<(SearchPrefix, &str)> {
+        values
+            .iter()
+            .map(|v| (v.prefix, v.value.as_str()))
+            .collect()
+    }
+
+    const SUBJECT_BIRTHDATE: &[(&str, &str, &str)] = &[("subject", "Patient", "birthdate")];
+
+    #[tokio::test]
+    async fn forward_chain_date_prefixes() {
+        let b = backend();
+        let t = tenant();
+        seed_dated(&b, &t).await;
+
+        // Procedure?subject:Patient.birthdate=ge1980-01-01
+        let q = forward("Procedure", SUBJECT_BIRTHDATE, &["ge1980-01-01"]);
+        assert_eq!(run(&b, &t, &q).await, ["pr1", "pr2", "pr3", "pr4"]);
+
+        let q = forward("Procedure", SUBJECT_BIRTHDATE, &["ge1985-01-01"]);
+        assert_eq!(run(&b, &t, &q).await, ["pr3", "pr4"]);
+
+        let q = forward("Procedure", SUBJECT_BIRTHDATE, &["lt1985-01-01"]);
+        assert_eq!(run(&b, &t, &q).await, ["pr1", "pr2"]);
+
+        // An explicit `eq` is a prefix too, not part of the date.
+        let q = forward("Procedure", SUBJECT_BIRTHDATE, &["eq1980-05-06"]);
+        assert_eq!(run(&b, &t, &q).await, ["pr1", "pr2"]);
+
+        // Unprefixed values keep working.
+        let q = forward("Procedure", SUBJECT_BIRTHDATE, &["1980-05-06"]);
+        assert_eq!(run(&b, &t, &q).await, ["pr1", "pr2"]);
+
+        // A prefixed value nobody satisfies still yields the empty result.
+        let q = forward("Procedure", SUBJECT_BIRTHDATE, &["gt2000-01-01"]);
+        assert!(run(&b, &t, &q).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn forward_chain_or_list_returns_the_union() {
+        let b = backend();
+        let t = tenant();
+        seed_dated(&b, &t).await;
+
+        // Procedure?subject:Patient.birthdate=1980-05-06,1990-01-01
+        let q = forward(
+            "Procedure",
+            SUBJECT_BIRTHDATE,
+            &["1980-05-06", "1990-01-01"],
+        );
+        assert_eq!(run(&b, &t, &q).await, ["pr1", "pr2", "pr3", "pr4"]);
+
+        // Prefixes apply per alternative.
+        let q = forward("Procedure", SUBJECT_BIRTHDATE, &["lt1970", "ge1990"]);
+        assert_eq!(run(&b, &t, &q).await, ["pr3", "pr4"]);
+    }
+
+    #[tokio::test]
+    async fn forward_chain_quantity_prefix() {
+        let b = backend();
+        let t = tenant();
+        seed_dated(&b, &t).await;
+
+        // DiagnosticReport?result.value-quantity=gt70
+        let hops = &[("result", "Observation", "value-quantity")];
+        let q = forward("DiagnosticReport", hops, &["gt70"]);
+        assert_eq!(run(&b, &t, &q).await, ["dr90"]);
+
+        let q = forward("DiagnosticReport", hops, &["le60"]);
+        assert_eq!(run(&b, &t, &q).await, ["dr80"]);
+    }
+
+    #[tokio::test]
+    async fn forward_multi_hop_chain_with_prefix() {
+        let b = backend();
+        let t = tenant();
+        seed_dated(&b, &t).await;
+
+        // Observation?encounter.subject.birthdate=ge1985-01-01
+        let hops = &[
+            ("encounter", "Encounter", "subject"),
+            ("subject", "Patient", "birthdate"),
+        ];
+        let q = forward("Observation", hops, &["ge1985-01-01"]);
+        assert_eq!(run(&b, &t, &q).await, ["ob90"]);
+
+        let q = forward("Observation", hops, &["lt1985-01-01", "ge1990-01-01"]);
+        assert_eq!(run(&b, &t, &q).await, ["ob80", "ob90"]);
+    }
+
+    #[tokio::test]
+    async fn forward_chain_last_updated_prefix() {
+        let b = backend();
+        let t = tenant();
+        seed_dated(&b, &t).await;
+
+        // Procedure?subject:Patient._lastUpdated=ge2000-01-01
+        let hops = &[("subject", "Patient", "_lastUpdated")];
+        let q = forward("Procedure", hops, &["ge2000-01-01"]);
+        assert_eq!(run(&b, &t, &q).await, ["pr1", "pr2", "pr3", "pr4"]);
+
+        let q = forward("Procedure", hops, &["lt2000-01-01"]);
+        assert!(run(&b, &t, &q).await.is_empty());
+    }
+
+    /// Prefix parsing is type-aware: a string or token terminal that merely
+    /// starts with the letters of a comparator keeps them.
+    #[tokio::test]
+    async fn string_terminal_starting_with_prefix_letters_is_untouched() {
+        let b = backend();
+        let t = tenant();
+        seed_dated(&b, &t).await;
+
+        let hops = &[("subject", "Patient", "family")];
+        let q = forward("Procedure", hops, &["Lee"]);
+        assert_eq!(run(&b, &t, &q).await, ["pr1", "pr2"]);
+
+        let q = forward("Procedure", hops, &["gert"]);
+        assert_eq!(run(&b, &t, &q).await, ["pr3", "pr4"]);
+
+        // Same for a `_has` token terminal: not `ne` + "cessary".
+        let (ty, values) = {
+            let reg = b.search_param_registry(&t);
+            let registry = reg.read();
+            parse_terminal_values(
+                &registry,
+                "Procedure",
+                "status",
+                &[SearchValue::eq("necessary")],
+                None,
+                true,
+            )
+        };
+        assert_eq!(ty, SearchParamType::Token);
+        assert_eq!(pairs(&values), [(SearchPrefix::Eq, "necessary")]);
+    }
+
+    #[tokio::test]
+    async fn has_date_prefix() {
+        let b = backend();
+        let t = tenant();
+        seed_dated(&b, &t).await;
+
+        // Patient?_has:Procedure:subject:date=ge2013-01-01
+        let q = has("Patient", "Procedure", "subject", "date", "ge2013-01-01");
+        assert_eq!(run(&b, &t, &q).await, ["p80", "p90"]);
+
+        let q = has("Patient", "Procedure", "subject", "date", "ge2020-01-01");
+        assert_eq!(run(&b, &t, &q).await, ["p90"]);
+
+        let q = has("Patient", "Procedure", "subject", "date", "lt2014");
+        assert_eq!(run(&b, &t, &q).await, ["p80"]);
+
+        let q = has("Patient", "Procedure", "subject", "date", "eq2013-04-05");
+        assert_eq!(run(&b, &t, &q).await, ["p80"]);
+    }
+
+    #[tokio::test]
+    async fn has_or_list() {
+        let b = backend();
+        let t = tenant();
+        seed_dated(&b, &t).await;
+
+        // Patient?_has:Procedure:subject:date=2013-04-05T09:20:00-04:00,2020
+        let q = has(
+            "Patient",
+            "Procedure",
+            "subject",
+            "date",
+            "2013-04-05T09:20:00-04:00,2020",
+        );
+        assert_eq!(run(&b, &t, &q).await, ["p80", "p90"]);
+
+        // Prefixes apply per alternative.
+        let q = has("Patient", "Procedure", "subject", "date", "lt2000,ge2021");
+        assert_eq!(run(&b, &t, &q).await, ["p90"]);
+
+        // An escaped comma is part of the value, not an OR separator.
+        let (_, values) = {
+            let reg = b.search_param_registry(&t);
+            let registry = reg.read();
+            parse_terminal_values(
+                &registry,
+                "Patient",
+                "family",
+                &[SearchValue::eq("Lee\\, Jr,Gert")],
+                None,
+                true,
+            )
+        };
+        assert_eq!(
+            pairs(&values),
+            [(SearchPrefix::Eq, "Lee, Jr"), (SearchPrefix::Eq, "Gert")]
+        );
+    }
+
+    #[tokio::test]
+    async fn has_number_and_quantity_prefixes() {
+        let b = backend();
+        let t = tenant();
+        seed_dated(&b, &t).await;
+
+        // Patient?_has:RiskAssessment:subject:probability=gt0.5
+        let q = has(
+            "Patient",
+            "RiskAssessment",
+            "subject",
+            "probability",
+            "gt0.5",
+        );
+        assert_eq!(run(&b, &t, &q).await, ["p90"]);
+        let q = has(
+            "Patient",
+            "RiskAssessment",
+            "subject",
+            "probability",
+            "le0.5",
+        );
+        assert_eq!(run(&b, &t, &q).await, ["p80"]);
+
+        // Patient?_has:Observation:subject:value-quantity=gt70
+        let q = has(
+            "Patient",
+            "Observation",
+            "subject",
+            "value-quantity",
+            "gt70",
+        );
+        assert_eq!(run(&b, &t, &q).await, ["p90"]);
+    }
+
+    /// `forward`, with the modifier the REST query builder takes from the
+    /// chain's terminal parameter (`subject:Patient.family:exact`).
+    fn forward_modified(
+        base: &str,
+        hops: &[(&str, &str, &str)],
+        modifier: SearchModifier,
+        raw_values: &[&str],
+    ) -> SearchQuery {
+        let mut query = forward(base, hops, raw_values);
+        query.parameters[0].modifier = Some(modifier);
+        query
+    }
+
+    /// #1302: a chained parameter's modifier applies to the terminal search.
+    #[tokio::test]
+    async fn forward_chain_terminal_modifier() {
+        let b = backend();
+        let t = tenant();
+        seed_dated(&b, &t).await;
+        let family = &[("subject", "Patient", "family")];
+        let all = ["pr1", "pr2", "pr3", "pr4"];
+
+        // Default string matching is a prefix match; :exact is not.
+        let q = forward("Procedure", family, &["Le"]);
+        assert_eq!(run(&b, &t, &q).await, ["pr1", "pr2"]);
+        let q = forward_modified("Procedure", family, SearchModifier::Exact, &["Le"]);
+        assert!(run(&b, &t, &q).await.is_empty());
+        let q = forward_modified("Procedure", family, SearchModifier::Exact, &["Lee"]);
+        assert_eq!(run(&b, &t, &q).await, ["pr1", "pr2"]);
+
+        // "er" is a prefix of neither name.
+        let q = forward("Procedure", family, &["er"]);
+        assert!(run(&b, &t, &q).await.is_empty());
+        let q = forward_modified("Procedure", family, SearchModifier::Contains, &["er"]);
+        assert_eq!(run(&b, &t, &q).await, ["pr3", "pr4"]);
+
+        // :missing on a date terminal: the value is a boolean, not a date.
+        let birthdate = &[("subject", "Patient", "birthdate")];
+        let q = forward_modified("Procedure", birthdate, SearchModifier::Missing, &["false"]);
+        assert_eq!(run(&b, &t, &q).await, all);
+        let q = forward_modified("Procedure", birthdate, SearchModifier::Missing, &["true"]);
+        assert!(run(&b, &t, &q).await.is_empty());
+
+        // Multi-hop.
+        let hops = &[
+            ("encounter", "Encounter", "subject"),
+            ("subject", "Patient", "family"),
+        ];
+        let q = forward_modified("Observation", hops, SearchModifier::Exact, &["Gert"]);
+        assert_eq!(run(&b, &t, &q).await, ["ob90"]);
+        let q = forward_modified("Observation", hops, SearchModifier::Exact, &["Ger"]);
+        assert!(run(&b, &t, &q).await.is_empty());
+    }
+
+    /// #1302: `_has:…:param:modifier`, carried in `search_param`.
+    #[tokio::test]
+    async fn has_terminal_modifier() {
+        let b = backend();
+        let t = tenant();
+        seed_dated(&b, &t).await;
+
+        // Patient?_has:Procedure:subject:status:not=completed
+        let q = has("Patient", "Procedure", "subject", "status", "completed");
+        assert_eq!(run(&b, &t, &q).await, ["p80", "p90"]);
+        let q = has("Patient", "Procedure", "subject", "status:not", "completed");
+        assert!(run(&b, &t, &q).await.is_empty());
+        let q = has("Patient", "Procedure", "subject", "status:not", "stopped");
+        assert_eq!(run(&b, &t, &q).await, ["p80", "p90"]);
+
+        // Patient?_has:Observation:subject:encounter:missing=true
+        let q = has(
+            "Patient",
+            "Observation",
+            "subject",
+            "encounter:missing",
+            "false",
+        );
+        assert_eq!(run(&b, &t, &q).await, ["p80", "p90"]);
+        let q = has(
+            "Patient",
+            "Observation",
+            "subject",
+            "encounter:missing",
+            "true",
+        );
+        assert!(run(&b, &t, &q).await.is_empty());
+    }
+
+    /// #1302: with `:missing` the value is `true`/`false`, whatever the
+    /// terminal's type — it is never prefix-parsed.
+    #[tokio::test]
+    async fn missing_terminal_value_is_not_prefix_parsed() {
+        let b = backend();
+        let t = tenant();
+        let reg = b.search_param_registry(&t);
+        let registry = reg.read();
+        for split_commas in [false, true] {
+            let (ty, values) = parse_terminal_values(
+                &registry,
+                "Patient",
+                "birthdate",
+                &[SearchValue::eq("true")],
+                Some(&SearchModifier::Missing),
+                split_commas,
+            );
+            assert_eq!(ty, SearchParamType::Date);
+            assert_eq!(pairs(&values), [(SearchPrefix::Eq, "true")]);
+        }
+    }
+
+    /// #1302: a modifier the terminal's type does not define is the same
+    /// error a direct search gets, not a silently unmodified search.
+    #[tokio::test]
+    async fn terminal_modifier_invalid_for_type_is_rejected() {
+        let b = backend();
+        let t = tenant();
+        seed_dated(&b, &t).await;
+
+        let message = |q: SearchQuery| {
+            let (b, t) = (&b, &t);
+            async move {
+                match resolve_chains(b, t, &q).await {
+                    Err(StorageError::Search(SearchError::QueryParseError { message })) => message,
+                    other => panic!("expected a query parse error, got {other:?}"),
+                }
+            }
+        };
+
+        // Procedure?subject:Patient.birthdate:exact=1980-05-06
+        let q = forward_modified(
+            "Procedure",
+            &[("subject", "Patient", "birthdate")],
+            SearchModifier::Exact,
+            &["1980-05-06"],
+        );
+        assert_eq!(
+            message(q).await,
+            "search modifier ':exact' is not supported for date parameter 'birthdate'"
+        );
+
+        // Patient?_has:Procedure:subject:status:exact=completed
+        let q = has(
+            "Patient",
+            "Procedure",
+            "subject",
+            "status:exact",
+            "completed",
+        );
+        assert_eq!(
+            message(q).await,
+            "search modifier ':exact' is not supported for token parameter 'status'"
+        );
+
+        // Not a modifier at all.
+        let q = has(
+            "Patient",
+            "Procedure",
+            "subject",
+            "status:bogus",
+            "completed",
+        );
+        assert!(
+            message(q)
+                .await
+                .contains("unknown search modifier ':bogus'")
+        );
+    }
+
+    /// #1317: a terminology-backed modifier on the terminal parameter is
+    /// rejected unless the caller has a terminology server — the terminal
+    /// search would otherwise run it literally. `:above` / `:below` count only
+    /// on a token terminal.
+    #[tokio::test]
+    async fn terminal_modifier_needing_terminology_is_rejected() {
+        let b = backend();
+        let t = tenant();
+        seed_dated(&b, &t).await;
+
+        let required = |q: SearchQuery| {
+            let (b, t) = (&b, &t);
+            async move {
+                match resolve_chains(b, t, &q).await {
+                    Err(StorageError::Search(SearchError::TerminologyRequired {
+                        modifier,
+                        param,
+                    })) => (modifier, param),
+                    other => panic!("expected a terminology-required error, got {other:?}"),
+                }
+            }
+        };
+        let of = |m: &str, p: &str| (m.to_string(), p.to_string());
+
+        // Procedure?subject:Patient.gender:in=… / :below=…
+        let q = forward_modified(
+            "Procedure",
+            &[("subject", "Patient", "gender")],
+            SearchModifier::In,
+            &["http://example.org/vs"],
+        );
+        assert_eq!(required(q).await, of("in", "subject:Patient.gender"));
+        let q = forward_modified(
+            "Procedure",
+            &[("subject", "Patient", "gender")],
+            SearchModifier::Below,
+            &["http://hl7.org/fhir/administrative-gender|male"],
+        );
+        assert_eq!(required(q).await, of("below", "subject:Patient.gender"));
+
+        // Patient?_has:Procedure:subject:status:in=… / :above=…
+        let q = has("Patient", "Procedure", "subject", "status:in", "http://vs");
+        assert_eq!(required(q).await, of("in", "_has:Procedure:subject:status"));
+        let q = has("Patient", "Procedure", "subject", "status:above", "s|c");
+        assert_eq!(
+            required(q).await,
+            of("above", "_has:Procedure:subject:status")
+        );
+
+        // With terminology available the modifier is the caller's business
+        // (REST has expanded it away by now); whatever is left resolves.
+        let q = has("Patient", "Procedure", "subject", "status:in", "http://vs");
+        let options = ChainResolveOptions {
+            terminology_available: true,
+        };
+        assert!(resolve_chains_with(&b, &t, &q, options).await.is_ok());
+
+        // Structural on a reference terminal: never needs terminology.
+        // Procedure?subject:Patient.general-practitioner:below=Practitioner/x
+        let q = forward_modified(
+            "Procedure",
+            &[("subject", "Patient", "general-practitioner")],
+            SearchModifier::Below,
+            &["Practitioner/x"],
+        );
+        assert!(resolve_chains(&b, &t, &q).await.is_ok());
+    }
+
+    /// Values a caller already parsed (non-`eq` prefix) pass through as given.
+    #[tokio::test]
+    async fn pre_parsed_values_pass_through() {
+        let b = backend();
+        let t = tenant();
+        seed_dated(&b, &t).await;
+
+        let mut q = forward("Procedure", SUBJECT_BIRTHDATE, &[]);
+        q.parameters[0].values = vec![SearchValue::new(SearchPrefix::Ge, "1985-01-01")];
+        assert_eq!(run(&b, &t, &q).await, ["pr3", "pr4"]);
     }
 
     /// A two-level chain over a wide intermediate set used to 500 with
