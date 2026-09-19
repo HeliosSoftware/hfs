@@ -14,7 +14,7 @@ use crate::core::bulk_export::{
 use crate::core::bulk_export_output::{ExportPartKey, FinalizedPart};
 use crate::core::bulk_export_worker::{
     ExportClaimStrategy, ExportJobLease, ExportWorkerStorage, LeaseError, WorkerId, WorkerJobView,
-    abandoned_export_message,
+    abandoned_export_message, export_lease_expiry,
 };
 use crate::error::{BackendError, BulkExportError, StorageError, StorageResult};
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
@@ -593,14 +593,7 @@ impl ExportClaimStrategy for PostgresBackend {
     ) -> StorageResult<Option<ExportJobLease>> {
         let mut client = self.get_client().await?;
         let now = Utc::now();
-        // The 60s here is a `std -> chrono` conversion fallback, not a lease
-        // policy: it only fires for a configured duration too large for
-        // `chrono::Duration` (hundreds of millions of years). It stays, and it
-        // deliberately matches `ExportJobLease::renewed_expiry`, so an absurd
-        // configuration degrades to the same value on claim and on renewal.
-        let lease_expiry = now
-            + chrono::Duration::from_std(lease_duration)
-                .unwrap_or_else(|_| chrono::Duration::seconds(60));
+        let lease_expiry = export_lease_expiry(now, lease_duration);
 
         let txn = client
             .transaction()
@@ -756,7 +749,7 @@ impl ExportClaimStrategy for PostgresBackend {
         // `HFS_BULK_EXPORT_LEASE_DURATION` inert: the first heartbeat shrank
         // every lease back to a minute, so a slow batch still outlived its
         // lease and the job got reclaimed in a loop (#1152, #1041).
-        let new_expiry = lease.renewed_expiry();
+        let new_expiry = export_lease_expiry(now, lease.lease_duration);
         let affected = client
             .execute(
                 "UPDATE bulk_export_jobs

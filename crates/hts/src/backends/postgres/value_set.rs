@@ -14,8 +14,8 @@ use crate::types::{
     ValidateCodeResponse,
 };
 
-use super::PostgresTerminologyBackend;
 use super::code_system::build_synthetic_resource;
+use super::{PostgresTerminologyBackend, error_chain};
 
 // ── Iter 7k+: process-global cache for the closure COUNT(*) query ──────────
 // `SELECT COUNT(*) FROM concept_closure WHERE (system_id, ancestor_code) =
@@ -279,7 +279,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             .pool
             .get()
             .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
 
         let mut compose_is_enumerated = false;
         let all_codes: Vec<ExpansionContains> = if let Some(url) = req.url.as_deref() {
@@ -385,7 +385,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                             &[&system_id, &root_code, &prefix_limit],
                         )
                         .await
-                        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
                     let complete = rows.len() <= CLOSURE_PREFIX_LEN;
                     let prefix: Vec<(String, Option<String>)> = rows
@@ -409,7 +409,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                                 &[&system_id, &root_code],
                             )
                             .await
-                            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
                         let c: i64 = total_row.get(0);
                         c.max(0) as u32
                     };
@@ -814,7 +814,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                                         &[&system_id_isa, &root_code_isa],
                                     )
                                     .await
-                                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                                    .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
                                 let c: i64 = total_row.get(0);
                                 let c = c.max(0) as u32;
                                 closure_count_put(&system_id_isa, &root_code_isa, c);
@@ -853,7 +853,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                             let rows = client
                                 .query(page_sql, &[&system_id_isa, &root_code_isa, &limit, &offset])
                                 .await
-                                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                                .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
                             let contains: Vec<ExpansionContains> = rows
                                 .into_iter()
@@ -1035,7 +1035,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             .pool
             .get()
             .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
         Ok(lookup_value_set_version(&client, url).await)
     }
 
@@ -1064,7 +1064,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             .pool
             .get()
             .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
 
         // ?fhir_vs URLs: a persisted stub VS with one of those canonical URLs
         // would expand to zero codes and force result=false for every input —
@@ -1767,7 +1767,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             .pool
             .get()
             .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
 
         if !string_search.is_empty() {
             return super::search_resources(
@@ -1805,7 +1805,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                 ],
             )
             .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
         let mut results = Vec::new();
         for row in rows {
@@ -1863,7 +1863,7 @@ async fn resolve_value_set_versioned(
     let rows = client
         .query(&sql, &[&url, &date])
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     if rows.is_empty() {
         let qualified = match version {
@@ -1904,7 +1904,7 @@ async fn fetch_cache(
             &[&vs_id],
         )
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     Ok(rows
         .into_iter()
@@ -2363,7 +2363,7 @@ async fn compute_expansion_inner_body(
                             &[&system_id, &code],
                         )
                         .await
-                        .map_err(|e| HtsError::StorageError(e.to_string()))?
+                        .map_err(|e| HtsError::StorageError(error_chain(&e)))?
                     {
                         Some(r) => r,
                         None => continue,
@@ -2414,7 +2414,7 @@ async fn compute_expansion_inner_body(
                             &[&system_id, &parent_code],
                         )
                         .await
-                        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
                     for row in child_rows {
                         let child_code: String = row.get(0);
                         let child_display: Option<String> = row.get(1);
@@ -2450,7 +2450,7 @@ async fn compute_expansion_inner_body(
                         &[&system_id],
                     )
                     .await
-                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                    .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
                 code_rows
                     .into_iter()
                     .map(|row| ExpansionContains {
@@ -2674,7 +2674,7 @@ async fn compute_expansion_inner_body(
                             &[&exc_system_id],
                         )
                         .await
-                        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
                     rows.into_iter().map(|r| r.get::<_, String>(0)).collect()
                 };
                 for code in codes_to_deny {
@@ -3055,7 +3055,7 @@ async fn pg_filter_property_eq(
             &[&system_id, &property_aliases, &value],
         )
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     Ok(rows
         .into_iter()
@@ -3092,7 +3092,7 @@ async fn pg_filter_property_ne(
             &[&system_id, &property_aliases, &value],
         )
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     Ok(rows
         .into_iter()
@@ -3134,7 +3134,7 @@ async fn pg_filter_is_a(
             &[&system_id, &root_code],
         )
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     Ok(rows
         .into_iter()
@@ -3167,7 +3167,7 @@ async fn pg_filter_child_of(
             &[&system_id, &parent_code],
         )
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     Ok(rows
         .into_iter()
@@ -3201,7 +3201,7 @@ async fn pg_filter_regex(
                     &[&system_id, &anchored_sql],
                 )
                 .await
-                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
             Ok(rows
                 .into_iter()
                 .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
@@ -3215,7 +3215,7 @@ async fn pg_filter_regex(
                     &[&system_id, &anchored_sql],
                 )
                 .await
-                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
             Ok(rows
                 .into_iter()
                 .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
@@ -3246,7 +3246,7 @@ async fn pg_filter_regex(
                     &[&system_id, &property],
                 )
                 .await
-                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
             // A concept may have multiple values for the same property; keep
             // it if any value matches. Dedupe by code in case more than one
@@ -3288,7 +3288,7 @@ async fn resolve_compose_system_id(
     let rows = client
         .query(&sql, &[&url])
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     let candidates: Vec<(String, Option<String>)> = rows
         .into_iter()
@@ -3356,7 +3356,7 @@ async fn find_cs_for_implicit_vs(
             &[&vs_url, &date],
         )
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     rows.into_iter()
         .next()
@@ -3398,7 +3398,7 @@ async fn build_hierarchical_expansion(
         let rows = client
             .query(&sql, &[sys_url])
             .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
         if let Some(row) = rows.into_iter().next() {
             system_id_map.insert(sys_url.clone(), row.get(0));
         }
@@ -3414,7 +3414,7 @@ async fn build_hierarchical_expansion(
                 &[sys_id],
             )
             .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
         for row in edge_rows {
             let parent_code: String = row.get(0);
@@ -3482,14 +3482,14 @@ async fn populate_cache(
     let tx = client
         .transaction()
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     tx.execute(
         "DELETE FROM value_set_expansions WHERE value_set_id = $1",
         &[&vs_id],
     )
     .await
-    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     // Bulk-insert via UNNEST over four parallel arrays. Replaces 5,975
     // per-row roundtrips with one query for a typical VSAC VS — measurable
@@ -3517,12 +3517,12 @@ async fn populate_cache(
             &[&vs_id, &systems, &codes_arr, &displays, &versions],
         )
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
     }
 
     tx.commit()
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     Ok(())
 }
@@ -3659,7 +3659,7 @@ async fn resolve_system_id_pg(
     let row = client
         .query_opt(&sql, &[&cs_url])
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
     Ok(row.map(|r| r.get::<_, String>(0)))
 }
 
@@ -3700,7 +3700,7 @@ async fn validate_fhir_vs(
                     &[&system_id, &code],
                 )
                 .await
-                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
             Ok(row.map(|r| ExpansionContains {
                 system: cs_url.to_owned(),
@@ -3730,7 +3730,7 @@ async fn validate_fhir_vs(
                     &[&system_id, &root_code, &code],
                 )
                 .await
-                .map_err(|e| HtsError::StorageError(e.to_string()))?
+                .map_err(|e| HtsError::StorageError(error_chain(&e)))?
                 .get(0);
 
             if !is_member {
@@ -3743,7 +3743,7 @@ async fn validate_fhir_vs(
                     &[&system_id, &code],
                 )
                 .await
-                .map_err(|e| HtsError::StorageError(e.to_string()))?
+                .map_err(|e| HtsError::StorageError(error_chain(&e)))?
                 .and_then(|r| r.get::<_, Option<String>>(0));
 
             Ok(Some(ExpansionContains {
@@ -5112,7 +5112,7 @@ async fn compose_page_fast_pg(
                         &[&sid, &code],
                     )
                     .await
-                    .map_err(|e| HtsError::StorageError(e.to_string()))?
+                    .map_err(|e| HtsError::StorageError(error_chain(&e)))?
                     .and_then(|r| r.get::<_, Option<String>>(0))
             } else {
                 None

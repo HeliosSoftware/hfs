@@ -50,3 +50,13 @@ A binary from before generation 3 reads contained matches from `search_index` on
 That script also resets the `schema_version` generation record, so rolling forward again re-runs the contained-row move instead of skipping it.
 
 All four scripts are generated from `crates/persistence/src/backends/mongodb/search_index_catalog.rs`; a unit test fails if they drift.
+
+## Composite parameters
+
+Composite search (`code-value-quantity`, `component-code-value-quantity`, ...) needs no index of its own (#1206). The extractor writes one `search_index` row per component value, all sharing `param_name` = the composite's own code and a `composite_group` (the base-instance index) — the same layout the generation-2 value indexes already cover per component type, so a component predicate is index-bounded exactly like a plain parameter of that type.
+
+The driver arm for a composite value is its most selective component's filter (lowest probe count); a resource that matches the driver arm has only proven *one* component, so every batch of candidates is re-checked by fetching `(resource_id, composite_group)` pairs per component, bounded to that batch, and intersecting them — a resource matches only if every component is satisfied by a row in the *same* `composite_group`. This mirrors SQLite's `GROUP BY resource_id, composite_group HAVING ...`.
+
+Because no slot is stored per component, a composite whose two components share the same type is ambiguous in the rows themselves: 24 of the 46 R4 composites pair two Token components (e.g. `code-value-concept` and `component-code-value-concept`), so a query value `A$B` also matches a resource whose code is `B` and value is `A` — the rows for both components look alike and only differ by which row's `composite_group` they land in, not by which component they came from. SQLite shares this ambiguity (same non-slotted layout); Postgres does not, because it stores a per-component slot.
+
+An arity mismatch — a value with fewer or more `$`-separated parts than the parameter declares (e.g. `code-value-quantity=8302-2`, one part for a two-component parameter) — is a 400 (`InvalidComposite`) on MongoDB. SQLite and Postgres instead return an empty page for the same query.

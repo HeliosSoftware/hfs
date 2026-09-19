@@ -1670,7 +1670,19 @@ where
                         .map(|d| format!("{}/exports", d.display()))
                 })
                 .unwrap_or_else(|| "./data/exports".to_string());
-            Arc::new(LocalFsOutputStore::new(output_dir, config.base_url.clone()))
+            // The served file endpoint enforces a token only when auth is on, so
+            // the manifest's requiresAccessToken must follow the auth state under
+            // `auto`; an explicit true/false override still wins (#1269). `false`
+            // is rejected for local-fs by config validation (no pre-signing).
+            let requires_token = match cfg.requires_access_token.as_str() {
+                "true" => true,
+                "false" => false,
+                _ => AuthConfig::from_env().enabled,
+            };
+            Arc::new(
+                LocalFsOutputStore::new(output_dir, config.base_url.clone())
+                    .with_access_token_required(requires_token),
+            )
         }
         "s3" => {
             #[cfg(feature = "s3")]
@@ -1917,13 +1929,15 @@ fn spawn_export_workers<Dp>(
 /// raw primary is used instead. Fast-load without a reindex hook still needs
 /// the wrapper, otherwise the data never reaches Elasticsearch.
 ///
-/// With `HFS_BULK_SUBMIT_INDEX_DURING_INGEST=true` (#1127) the wrapper is
+/// With `HFS_BULK_SUBMIT_DEFER_INDEXING=false` (#1127, #1242) the wrapper is
 /// itself wrapped in [`IndexingSubmitJobs`]: every committed batch is handed to
 /// an [`IngestIndexSink`] writing into `search_targets` (the Elasticsearch
 /// secondary, not the primary's own offloaded index), and the manifest's sync
 /// drains that sink instead of re-reading the manifest. The deferred reindex
 /// then rebuilds only the types the sink rejected. `source` is the primary the
-/// sink reads resources back from for engines that do not hand them over.
+/// sink reads resources back from for engines that do not hand them over. On
+/// this ES-composite path `false` always means the sink; the operator no longer
+/// names the mechanism (the old `HFS_BULK_SUBMIT_INDEX_DURING_INGEST` is gone).
 ///
 /// [`CompositeSubmitJobs`]: helios_persistence::composite::CompositeSubmitJobs
 /// [`IndexingSubmitJobs`]: helios_persistence::composite::IndexingSubmitJobs
@@ -1949,7 +1963,10 @@ fn composite_submit_jobs(
         CompositeSubmitJobs, IndexingSubmitJobs, IngestIndexSink, IngestIndexSinkConfig,
     };
 
-    if cfg.index_during_ingest {
+    if !cfg.defer_indexing {
+        // Search is offloaded to Elasticsearch here (this fn is the ES-composite
+        // path), so "index as the manifest ingests" means the batch-by-batch
+        // sink (#1127, #1242).
         let sink_config = IngestIndexSinkConfig {
             queue: cfg.index_queue as usize,
             concurrency: cfg.index_concurrency as usize,
@@ -1961,16 +1978,24 @@ fn composite_submit_jobs(
             concurrency = sink_config.concurrency,
             coalesce = sink_config.coalesce,
             max_wait_secs = cfg.index_max_wait_secs,
-            "Bulk submit indexes into Elasticsearch during ingest; the deferred \
-             reindex runs only for types the search index rejected"
+            "Bulk submit indexes into Elasticsearch during ingest (DEFER_INDEXING=false); \
+             the deferred reindex runs only for types the search index rejected"
         );
         let sink = Arc::new(IngestIndexSink::new(source, search_targets, sink_config));
         let inner: Arc<dyn BulkSubmitJobStore> =
             Arc::new(CompositeSubmitJobs::new(primary, composite));
         Arc::new(IndexingSubmitJobs::new(inner, sink))
-    } else if cfg.defer_indexing && has_reindex_hook {
+    } else if has_reindex_hook {
+        info!(
+            "Bulk submit defers indexing (DEFER_INDEXING=true); Elasticsearch is rebuilt \
+             per type after each manifest"
+        );
         primary
     } else {
+        info!(
+            "Bulk submit syncs each finished manifest into Elasticsearch (no reindex hook); \
+             set DEFER_INDEXING=false to index batch by batch instead"
+        );
         Arc::new(CompositeSubmitJobs::new(primary, composite))
     }
 }

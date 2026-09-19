@@ -4,13 +4,25 @@
 //! `cargo test -p helios-persistence --features mongodb --test mongodb_tests`
 //!
 //! The integration tests provision MongoDB automatically: when Docker is
-//! available they start an ephemeral standalone Mongo testcontainer (so the
-//! suite runs in CI), and they otherwise use `HFS_TEST_MONGODB_URL` if set
-//! (e.g. `HFS_TEST_MONGODB_URL=mongodb://localhost:27017` to target a specific
+//! available they start an ephemeral **single-node replica set** Mongo
+//! testcontainer (so the suite runs in CI), and they otherwise use
+//! `HFS_TEST_MONGODB_URL` if set (e.g.
+//! `HFS_TEST_MONGODB_URL=mongodb://localhost:27017` to target a specific
 //! instance). When neither is available the integration tests skip.
 //!
-//! Multi-document transaction tests additionally require a replica set; against
-//! a standalone server they skip only the transaction-specific assertions.
+//! Multi-document transactions need the oplog, which only a replica set has —
+//! a plain standalone `mongod` cannot run them. The harness's own container is
+//! therefore always initiated as a one-member replica set (`rs0`), so
+//! transaction Bundle code paths actually execute in CI instead of vacuously
+//! skipping. Because that member advertises `localhost:27017` (its own
+//! in-container address, not the host-mapped port), the connection string sets
+//! `directConnection=true` to stop the driver from attempting replica-set
+//! discovery through an address it can't reach. Skips on
+//! `TransactionError::UnsupportedIsolationLevel` only remain possible when
+//! `HFS_TEST_MONGODB_URL` points at someone's own standalone server; against
+//! the harness's own container that error is a test *failure* (see
+//! [`transactions_required`]), because it can only mean the harness itself
+//! failed to bring the replica set up.
 
 #![cfg(feature = "mongodb")]
 
@@ -29,13 +41,13 @@ use helios_persistence::core::{
     SearchProvider, SettingsStore, SystemHistoryProvider, TypeHistoryProvider, VersionedStorage,
 };
 use helios_persistence::error::{
-    BackendError, ConcurrencyError, ResourceError, StorageError, TransactionError,
+    BackendError, ConcurrencyError, ResourceError, SearchError, StorageError, TransactionError,
 };
 use helios_persistence::search::SearchParameterStatus;
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{
-    IncludeDirective, IncludeType, SearchModifier, SearchParamType, SearchParameter, SearchPrefix,
-    SearchQuery, SearchValue, SortDirective, TotalMode,
+    CompositeSearchComponent, IncludeDirective, IncludeType, SearchModifier, SearchParamType,
+    SearchParameter, SearchPrefix, SearchQuery, SearchValue, SortDirective, TotalMode,
 };
 use mongodb::Client;
 use mongodb::bson::{Document, doc};
@@ -175,6 +187,13 @@ async fn mongodb_integration_transaction_bundle_topology_behavior() {
         .await
     {
         Ok(bundle_result) => assert!(bundle_result.entries.is_empty()),
+        Err(TransactionError::UnsupportedIsolationLevel { .. }) if transactions_required() => {
+            panic!(
+                "mongodb_integration_transaction_bundle_topology_behavior: the harness's own \
+                 Mongo container is a replica set and must support transactions; \
+                 UnsupportedIsolationLevel here means the harness itself is broken"
+            );
+        }
         Err(TransactionError::UnsupportedIsolationLevel { .. }) => {
             eprintln!(
                 "Skipping mongodb_integration_transaction_bundle_topology_behavior (MongoDB topology does not support transactions)"
@@ -182,6 +201,16 @@ async fn mongodb_integration_transaction_bundle_topology_behavior() {
         }
         Err(other) => panic!("Unexpected transaction result: {}", other),
     }
+}
+
+/// Whether the transaction-specific portion of a test must succeed rather
+/// than skip: true whenever the suite is using its own harness-started Mongo
+/// container, which is always initiated as a replica set (see
+/// [`shared_mongo`]) and therefore always supports multi-document
+/// transactions. Only an externally supplied `HFS_TEST_MONGODB_URL` (which
+/// may point at a standalone server) still gets the old skip behaviour.
+fn transactions_required() -> bool {
+    test_mongo_url().is_none()
 }
 
 async fn process_transaction_or_skip(
@@ -195,6 +224,13 @@ async fn process_transaction_or_skip(
         .await
     {
         Ok(result) => Some(result),
+        Err(TransactionError::UnsupportedIsolationLevel { .. }) if transactions_required() => {
+            panic!(
+                "{test_name}: the harness's own Mongo container is a replica set and must \
+                 support transactions; UnsupportedIsolationLevel here means the harness \
+                 itself is broken"
+            );
+        }
         Err(TransactionError::UnsupportedIsolationLevel { .. }) => {
             eprintln!(
                 "Skipping {} (MongoDB topology does not support transactions)",
@@ -214,18 +250,28 @@ fn test_mongo_url() -> Option<String> {
 ///
 /// Prefers an externally supplied server (`HFS_TEST_MONGODB_URL`, e.g. for local
 /// runs against a specific instance) and otherwise starts a single ephemeral
-/// **standalone** Mongo testcontainer shared across the whole test binary, so the
-/// suite runs in CI (where Docker is available) instead of silently skipping.
-/// Each test still uses a unique database name, so they don't collide on the
-/// shared server.
+/// **single-node replica set** Mongo testcontainer shared across the whole test
+/// binary, so the suite runs in CI (where Docker is available) instead of
+/// silently skipping. Each test still uses a unique database name, so they
+/// don't collide on the shared server.
 ///
-/// Multi-document transactions require a replica set, which a standalone server
-/// does not provide; the transaction tests detect this and skip that portion
-/// (see [`process_transaction_or_skip`]). Everything else — CRUD, search,
-/// history, pagination, tenancy, conditional ops — runs. If neither a URL nor
-/// Docker is available the tests skip.
+/// Multi-document transactions need the oplog, which only a replica set has.
+/// The harness-started container is always initiated as a one-member replica
+/// set (`rs0`) so the transaction tests really exercise those code paths (see
+/// [`super::transactions_required`] / [`super::process_transaction_or_skip`]);
+/// a skip on `TransactionError::UnsupportedIsolationLevel` is only possible
+/// against an external, standalone `HFS_TEST_MONGODB_URL`. The replica set's
+/// member address is fixed to `localhost:27017` (its own in-container
+/// address), so the returned connection string carries
+/// `directConnection=true` — otherwise the driver would try to discover the
+/// replica set topology through that unreachable address instead of using the
+/// mapped port directly. If neither a URL nor Docker is available the tests
+/// skip.
 mod shared_mongo {
+    use std::time::{Duration, Instant};
+
     use testcontainers::ImageExt;
+    use testcontainers::core::ExecCommand;
     use testcontainers::runners::AsyncRunner;
     use testcontainers_modules::mongo::Mongo;
     use tokio::sync::OnceCell;
@@ -240,6 +286,77 @@ mod shared_mongo {
 
     static SHARED: OnceCell<Option<SharedMongo>> = OnceCell::const_new();
 
+    /// Runs `rs.initiate` with an explicit member list so the single-node
+    /// replica set advertises `localhost:27017` — its own in-container
+    /// address — instead of letting it pick a random hostname the host could
+    /// never resolve through the mapped port.
+    ///
+    /// We don't use `testcontainers_modules::mongo::Mongo::repl_set()` for
+    /// this: its `Image::cmd()` (`--replSet rs`) is fully *replaced*, not
+    /// merged, by the `with_cmd([...])` below — see
+    /// `ImageExt::with_cmd` in testcontainers 0.27
+    /// (`core/image/image_ext.rs`: `ContainerRequest { overridden_cmd: cmd,
+    /// ..container_req }`) — so it wouldn't contribute anything once we
+    /// supply our own full command. Its `exec_after_start` also just runs a
+    /// bare `rs.initiate()`, which lets the node self-select the container's
+    /// hostname as the sole member — unreachable from the host. Initiating
+    /// explicitly here, then polling for a writable primary ourselves, gives
+    /// full control over both.
+    async fn initiate_replica_set(container: &testcontainers::ContainerAsync<Mongo>) {
+        let exec_result = container
+            .exec(ExecCommand::new([
+                "mongosh",
+                "--quiet",
+                "--eval",
+                "rs.initiate({_id:\"rs0\",members:[{_id:0,host:\"localhost:27017\"}]})",
+            ]))
+            .await;
+        match exec_result {
+            // `stdout_to_vec` blocks until the eval finishes; the actual
+            // success signal is the writable-primary poll below, since
+            // rs.initiate() returns before the node has finished electing
+            // itself primary.
+            Ok(mut exec_result) => {
+                let _ = exec_result.stdout_to_vec().await;
+            }
+            Err(err) => panic!(
+                "shared_mongo: failed to exec `rs.initiate` on the Mongo testcontainer: {err}"
+            ),
+        }
+    }
+
+    /// Polls `db.hello().isWritablePrimary` until the single-node replica set
+    /// has elected itself primary, so callers never race a connection attempt
+    /// against a node still in `STARTUP2`/`SECONDARY`. Panics after 60s: at
+    /// that point the harness's own container is broken, and letting every
+    /// dependent test silently report "skip: no Docker" would hide that.
+    async fn wait_for_writable_primary(container: &testcontainers::ContainerAsync<Mongo>) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let exec_result = container
+                .exec(ExecCommand::new([
+                    "mongosh",
+                    "--quiet",
+                    "--eval",
+                    "db.hello().isWritablePrimary",
+                ]))
+                .await;
+            if let Ok(mut exec_result) = exec_result
+                && let Ok(stdout) = exec_result.stdout_to_vec().await
+                && String::from_utf8_lossy(&stdout).trim() == "true"
+            {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "shared_mongo: replica set rs0 did not report a writable primary within \
+                     60s of `rs.initiate` — the harness's Mongo container is broken"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
     async fn shared() -> Option<&'static SharedMongo> {
         SHARED
             .get_or_init(|| async {
@@ -250,8 +367,9 @@ mod shared_mongo {
                         _container: None,
                     });
                 }
-                // Otherwise start an ephemeral standalone Mongo container; if
-                // Docker is unavailable, `start()` errors and the suite skips.
+                // Otherwise start an ephemeral single-node replica-set Mongo
+                // container; if Docker is unavailable, `start()` errors and
+                // the suite skips.
                 let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
                 // `SHARED` is a static and never dropped; the cleanup label
                 // lets the exit hook remove the container.
@@ -268,6 +386,16 @@ mod shared_mongo {
                         // suite's tiny datasets. `--bind_ip_all` matches the stock
                         // image default and keeps the mapped port reachable once we
                         // supply our own command.
+                        //
+                        // `--replSet rs0` turns this into a (single-node) replica
+                        // set: multi-document transactions need the oplog, which a
+                        // standalone mongod does not have — every transaction test
+                        // used to detect `UnsupportedIsolationLevel` and skip,
+                        // vacuously "passing" without ever exercising the
+                        // transaction Bundle code paths. `--oplogSize 128` (MB)
+                        // keeps that oplog small on CI disks; mongod's own default
+                        // sizing (a percentage of free disk) is unnecessary for
+                        // this suite's tiny datasets.
                         .with_cmd([
                             "mongod",
                             "--bind_ip_all",
@@ -277,6 +405,10 @@ mod shared_mongo {
                             // is only registered when test commands are enabled.
                             "--setParameter",
                             "enableTestCommands=1",
+                            "--replSet",
+                            "rs0",
+                            "--oplogSize",
+                            "128",
                         ])
                         // Every test creates its own uniquely-named database, and
                         // WiredTiger holds file handles open per collection/index
@@ -290,10 +422,20 @@ mod shared_mongo {
                 .start()
                 .await
                 .ok()?;
+
+                initiate_replica_set(&container).await;
+                wait_for_writable_primary(&container).await;
+
                 let host = container.get_host().await.ok()?;
                 let port = container.get_host_port_ipv4(27017).await.ok()?;
                 Some(SharedMongo {
-                    connection_string: format!("mongodb://{host}:{port}/"),
+                    // The replica set's sole member advertises
+                    // `localhost:27017` (its address inside the container),
+                    // which is unreachable from the host through the mapped
+                    // port — `directConnection=true` stops the driver from
+                    // trying to discover the topology through it and pins it
+                    // to this one endpoint instead.
+                    connection_string: format!("mongodb://{host}:{port}/?directConnection=true"),
                     _container: Some(container),
                 })
             })
@@ -694,10 +836,43 @@ async fn create_backend_with_search_offloaded(
     build_backend(config).await
 }
 
+/// Appends `param` (`key=value`) to `url`'s query string, using `?` if it has
+/// none yet or `&` if it already does.
+fn append_query_param(url: &str, param: &str) -> String {
+    if url.contains('?') {
+        format!("{url}&{param}")
+    } else {
+        format!("{url}?{param}")
+    }
+}
+
+#[test]
+fn test_append_query_param() {
+    assert_eq!(
+        append_query_param("mongodb://h:1/", "retryWrites=false"),
+        "mongodb://h:1/?retryWrites=false"
+    );
+    assert_eq!(
+        append_query_param("mongodb://h:1/?directConnection=true", "retryWrites=false"),
+        "mongodb://h:1/?directConnection=true&retryWrites=false"
+    );
+}
+
 /// A backend whose driver connections carry `app_name`, so a `failCommand`
 /// failpoint configured with `data.appName` hits only this backend.
+///
+/// Used exclusively by the bulk-submit `failCommand` retry tests below, which
+/// assert on *this module's own* bounded retry/attempt counting against a
+/// fail point's `times` budget. Against a replica set the driver's own
+/// retryable-writes support (on by default) transparently retries a dropped
+/// single-statement write once before the error ever reaches this module's
+/// code, silently spending part of the fail point's budget and changing (or
+/// erasing) the attempt counts these tests assert on — so `retryWrites=false`
+/// is forced here to restore the semantics they were written against: every
+/// dropped command must reach this module's own retry loop.
 async fn create_backend_with_app_name(test_name: &str, app_name: &str) -> Option<MongoBackend> {
     let connection_string = shared_mongo::connection_string().await?;
+    let connection_string = append_query_param(&connection_string, "retryWrites=false");
     let config = MongoBackendConfig {
         connection_string,
         database_name: build_test_database_name(test_name),
@@ -1526,7 +1701,7 @@ async fn mongodb_integration_transaction_bundle_mixed_operations_and_idempotent_
 
 #[tokio::test]
 async fn mongodb_integration_transaction_if_none_exist_match_resolves_urn_references() {
-    let Some(backend) = create_backend("if_none_exist_urn").await else {
+    let Some(backend) = create_backend_with_full_registry("if_none_exist_urn").await else {
         eprintln!(
             "Skipping mongodb_integration_transaction_if_none_exist_match_resolves_urn_references (requires Docker or HFS_TEST_MONGODB_URL)"
         );
@@ -1610,7 +1785,8 @@ async fn mongodb_integration_transaction_if_none_exist_match_resolves_urn_refere
 
 #[tokio::test]
 async fn mongodb_integration_transaction_bundle_conditional_headers() {
-    let Some(backend) = create_backend("bundle_conditional_headers").await else {
+    let Some(backend) = create_backend_with_full_registry("bundle_conditional_headers").await
+    else {
         eprintln!(
             "Skipping mongodb_integration_transaction_bundle_conditional_headers (requires Docker or HFS_TEST_MONGODB_URL)"
         );
@@ -1723,6 +1899,14 @@ async fn mongodb_integration_transaction_bundle_conditional_headers() {
         .process_transaction(&tenant, bad_if_match, FhirVersion::default())
         .await
     {
+        Err(TransactionError::UnsupportedIsolationLevel { .. }) if transactions_required() => {
+            panic!(
+                "mongodb_integration_transaction_bundle_conditional_headers/if-match-bad: the \
+                 harness's own Mongo container is a replica set and must support \
+                 transactions; UnsupportedIsolationLevel here means the harness itself is \
+                 broken"
+            );
+        }
         Err(TransactionError::UnsupportedIsolationLevel { .. }) => {
             eprintln!(
                 "Skipping mongodb_integration_transaction_bundle_conditional_headers/if-match-bad (MongoDB topology does not support transactions)"
@@ -1803,6 +1987,13 @@ async fn mongodb_integration_transaction_bundle_rolls_back_on_failure() {
         .process_transaction(&tenant, entries, FhirVersion::default())
         .await
     {
+        Err(TransactionError::UnsupportedIsolationLevel { .. }) if transactions_required() => {
+            panic!(
+                "mongodb_integration_transaction_bundle_rolls_back_on_failure: the harness's \
+                 own Mongo container is a replica set and must support transactions; \
+                 UnsupportedIsolationLevel here means the harness itself is broken"
+            );
+        }
         Err(TransactionError::UnsupportedIsolationLevel { .. }) => {
             eprintln!(
                 "Skipping mongodb_integration_transaction_bundle_rolls_back_on_failure (MongoDB topology does not support transactions)"
@@ -9240,6 +9431,13 @@ mod bulk_submit {
                     .await
                     .unwrap();
                 options.app_name = Some(app_name);
+                // Against a replica set the driver's own retryable-writes
+                // support would transparently retry the dropped `insert`
+                // once, on a fresh connection, before this test ever sees an
+                // error — defeating the one-shot failpoint this test exists
+                // to pin down. Force it off so the failpoint's single hit is
+                // what this client actually observes.
+                options.retry_writes = Some(false);
                 Client::with_options(options).unwrap()
             }
         };
@@ -12741,6 +12939,15 @@ async fn mongodb_integration_if_none_exist_multiple_matches_rolls_back() {
         .process_transaction(&tenant, entries, FhirVersion::default())
         .await
     {
+        Err(helios_persistence::error::TransactionError::UnsupportedIsolationLevel { .. })
+            if transactions_required() =>
+        {
+            panic!(
+                "mongodb_integration_if_none_exist_multiple_matches_rolls_back: the harness's \
+                 own Mongo container is a replica set and must support transactions; \
+                 UnsupportedIsolationLevel here means the harness itself is broken"
+            );
+        }
         Err(helios_persistence::error::TransactionError::UnsupportedIsolationLevel { .. }) => {
             eprintln!("Skipping multiple_matches_rolls_back (replica-set required)");
             return;
@@ -13974,4 +14181,907 @@ async fn mongodb_integration_missing_false_search_is_a_covered_v2_scan() {
         "idx_search_token_v2",
     )
     .await;
+}
+
+// ============================================================================
+// Composite Search Parameter Tests (#1206)
+// ============================================================================
+//
+// Composite rows are stored one `search_index` document per component value,
+// sharing `param_name` = the composite's own code plus a `composite_group`
+// (the base-instance index) -- the same layout SQLite queries
+// (`sqlite_tests.rs`'s `code_value_quantity_query`/`test_composite_search_basic`
+// are the reference). These tests build the `SearchParameter` directly with
+// explicit `components`, mirroring the REST layer's registry-driven wiring,
+// so they need `create_backend_with_full_registry` only to make sure the
+// *extractor* decomposes composites into per-component rows the same way the
+// real R4 registry does on write.
+
+/// Builds a `code-value-quantity` composite query with the component types
+/// the registry supplies for `Observation` (Token code, Quantity value).
+fn code_value_quantity_query(value: &str) -> SearchQuery {
+    code_value_quantity_query_values(&[value])
+}
+
+/// Same as [`code_value_quantity_query`] but with multiple OR'd composite
+/// values — the REST layer (`search_query_builder.rs`'s
+/// `split_unescaped_commas`) splits a comma-separated composite query into
+/// separate `SearchValue` entries *before* it reaches storage, so a
+/// persistence-layer comma-OR test must build `values` the same way rather
+/// than pass one string containing a literal `,` (which would instead be
+/// mistaken for an extra `$`-separated component here).
+fn code_value_quantity_query_values(values: &[&str]) -> SearchQuery {
+    SearchQuery::new("Observation").with_parameter(SearchParameter {
+        name: "code-value-quantity".to_string(),
+        param_type: SearchParamType::Composite,
+        modifier: None,
+        values: values.iter().map(|v| SearchValue::eq(*v)).collect(),
+        chain: vec![],
+        components: vec![
+            CompositeSearchComponent {
+                param_type: SearchParamType::Token,
+                param_name: "code".to_string(),
+            },
+            CompositeSearchComponent {
+                param_type: SearchParamType::Quantity,
+                param_name: "value-quantity".to_string(),
+            },
+        ],
+    })
+}
+
+/// Builds a `component-code-value-quantity` composite query (blood-pressure
+/// style panels, where each vital sign lives in its own `component` entry
+/// and hence its own `composite_group`).
+fn component_code_value_quantity_query(value: &str) -> SearchQuery {
+    SearchQuery::new("Observation").with_parameter(SearchParameter {
+        name: "component-code-value-quantity".to_string(),
+        param_type: SearchParamType::Composite,
+        modifier: None,
+        values: vec![SearchValue::eq(value)],
+        chain: vec![],
+        components: vec![
+            CompositeSearchComponent {
+                param_type: SearchParamType::Token,
+                param_name: "component-code".to_string(),
+            },
+            CompositeSearchComponent {
+                param_type: SearchParamType::Quantity,
+                param_name: "component-value-quantity".to_string(),
+            },
+        ],
+    })
+}
+
+async fn seed_height_weight_observations(backend: &MongoBackend, tenant: &TenantContext) {
+    for (id, code, value) in [
+        ("height-150", "8302-2", 150.0_f64),
+        ("height-170", "8302-2", 170.0_f64),
+        ("weight-180", "29463-7", 180.0_f64),
+    ] {
+        backend
+            .create(
+                tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": id,
+                    "status": "final",
+                    "code": {"coding": [{"system": "http://loinc.org", "code": code}]},
+                    "valueQuantity": {
+                        "value": value,
+                        "unit": "cm",
+                        "system": "http://unitsofmeasure.org"
+                    }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+}
+
+/// Body Height observations at two values plus an unrelated Body Weight:
+/// `code-value-quantity` must match only the composite instance where BOTH
+/// the code and the quantity threshold are satisfied together, with or
+/// without the `system|` qualifier on the token component.
+#[tokio::test]
+async fn mongodb_integration_composite_quantity_search() {
+    let Some(backend) = create_backend_with_full_registry("composite_quantity").await else {
+        eprintln!(
+            "Skipping mongodb_integration_composite_quantity_search (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-composite-quantity");
+    seed_height_weight_observations(&backend, &tenant).await;
+
+    let with_system = backend
+        .search(
+            &tenant,
+            &code_value_quantity_query("http://loinc.org|8302-2$gt160"),
+        )
+        .await
+        .expect("composite search with system|code");
+    assert_eq!(
+        with_system.resources.items.len(),
+        1,
+        "only the 170cm height satisfies code=8302-2 AND value>160"
+    );
+    assert_eq!(with_system.resources.items[0].id(), "height-170");
+
+    let bare_code = backend
+        .search(&tenant, &code_value_quantity_query("8302-2$gt160"))
+        .await
+        .expect("composite search with bare code");
+    assert_eq!(
+        bare_code.resources.items.len(),
+        1,
+        "the bare-code form must match the same resource as system|code"
+    );
+    assert_eq!(bare_code.resources.items[0].id(), "height-170");
+
+    let above_all = backend
+        .search(
+            &tenant,
+            &code_value_quantity_query("http://loinc.org|8302-2$gt200"),
+        )
+        .await
+        .expect("composite search above every height");
+    assert!(
+        above_all.resources.items.is_empty(),
+        "no Body Height exceeds 200"
+    );
+}
+
+/// A blood-pressure panel where `component[0]` is systolic (8480-6 = 120)
+/// and `component[1]` is diastolic (8462-4 = 80): each lives in its own
+/// `composite_group`, so a query pairing one component's code with the
+/// *other* component's value must not match even though both values exist
+/// somewhere on the resource -- this is the regression a non-grouped (plain
+/// AND) implementation would get wrong.
+#[tokio::test]
+async fn mongodb_integration_composite_component_code_value_quantity_respects_group() {
+    let Some(backend) = create_backend_with_full_registry("composite_component_bp").await else {
+        eprintln!(
+            "Skipping mongodb_integration_composite_component_code_value_quantity_respects_group (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-composite-bp");
+
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "bp-1",
+                "status": "final",
+                "code": {"coding": [{"system": "http://loinc.org", "code": "85354-9"}]},
+                "component": [
+                    {
+                        "code": {"coding": [{"system": "http://loinc.org", "code": "8480-6"}]},
+                        "valueQuantity": {
+                            "value": 120,
+                            "unit": "mmHg",
+                            "system": "http://unitsofmeasure.org"
+                        }
+                    },
+                    {
+                        "code": {"coding": [{"system": "http://loinc.org", "code": "8462-4"}]},
+                        "valueQuantity": {
+                            "value": 80,
+                            "unit": "mmHg",
+                            "system": "http://unitsofmeasure.org"
+                        }
+                    }
+                ]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let systolic_match = backend
+        .search(
+            &tenant,
+            &component_code_value_quantity_query("8480-6$gt100"),
+        )
+        .await
+        .expect("systolic composite search");
+    assert_eq!(
+        systolic_match.resources.items.len(),
+        1,
+        "systolic 120 > 100 must match code=8480-6"
+    );
+
+    let cross_group = backend
+        .search(
+            &tenant,
+            &component_code_value_quantity_query("8462-4$gt100"),
+        )
+        .await
+        .expect("diastolic composite search");
+    assert!(
+        cross_group.resources.items.is_empty(),
+        "8462-4 (diastolic, value 80) must not match value>100 just because the \
+         *other* component (systolic, 120) happens to satisfy it -- they are in \
+         different composite_group instances"
+    );
+}
+
+/// Comma-separated composite values are OR'd, same as any other parameter
+/// (#1062's semantics, extended to composites).
+#[tokio::test]
+async fn mongodb_integration_composite_comma_or() {
+    let Some(backend) = create_backend_with_full_registry("composite_comma_or").await else {
+        eprintln!(
+            "Skipping mongodb_integration_composite_comma_or (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-composite-comma-or");
+    seed_height_weight_observations(&backend, &tenant).await;
+
+    let query = code_value_quantity_query_values(&[
+        "http://loinc.org|8302-2$gt160",
+        "http://loinc.org|29463-7$gt170",
+    ]);
+    let result = backend
+        .search(&tenant, &query)
+        .await
+        .expect("comma-OR composite search");
+    assert_eq!(
+        result.resources.items.len(),
+        2,
+        "both the 170cm height and the 180 weight must match the OR'd values"
+    );
+    let ids: std::collections::HashSet<&str> =
+        result.resources.items.iter().map(|r| r.id()).collect();
+    assert!(ids.contains("height-170"));
+    assert!(ids.contains("weight-180"));
+}
+
+/// A composite parameter combined with a plain token parameter, in both
+/// directions: intersecting with a matching value keeps the composite's
+/// result, intersecting with a non-matching value empties it. Also checks
+/// that `search_count` agrees with `search()` on the same query.
+#[tokio::test]
+async fn mongodb_integration_composite_combined_with_plain_param() {
+    let Some(backend) = create_backend_with_full_registry("composite_plus_plain").await else {
+        eprintln!(
+            "Skipping mongodb_integration_composite_combined_with_plain_param (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-composite-plus-plain");
+    seed_height_weight_observations(&backend, &tenant).await;
+
+    let matching_status = SearchParameter {
+        name: "status".to_string(),
+        param_type: SearchParamType::Token,
+        values: vec![SearchValue::eq("final")],
+        ..Default::default()
+    };
+    let query =
+        code_value_quantity_query("http://loinc.org|8302-2$gt160").with_parameter(matching_status);
+    let result = backend
+        .search(&tenant, &query)
+        .await
+        .expect("composite + matching plain param");
+    assert_eq!(result.resources.items.len(), 1);
+
+    let count = backend
+        .search_count(&tenant, &query)
+        .await
+        .expect("search_count for composite + plain param");
+    assert_eq!(
+        count as usize,
+        result.resources.items.len(),
+        "search_count must agree with search() on the same query"
+    );
+
+    let non_matching_status = SearchParameter {
+        name: "status".to_string(),
+        param_type: SearchParamType::Token,
+        values: vec![SearchValue::eq("cancelled")],
+        ..Default::default()
+    };
+    let empty_query = code_value_quantity_query("http://loinc.org|8302-2$gt160")
+        .with_parameter(non_matching_status);
+    let empty = backend
+        .search(&tenant, &empty_query)
+        .await
+        .expect("composite + non-matching plain param");
+    assert!(
+        empty.resources.items.is_empty(),
+        "no observation has status=cancelled, so intersecting with it must empty the result"
+    );
+}
+
+/// A composite value whose `$`-separated part count does not match the
+/// parameter's declared component count is a structural error
+/// (`SearchError::InvalidComposite`), not a silent empty result or a panic.
+#[tokio::test]
+async fn mongodb_integration_composite_arity_mismatch_errors() {
+    let Some(backend) = create_backend_with_full_registry("composite_arity").await else {
+        eprintln!(
+            "Skipping mongodb_integration_composite_arity_mismatch_errors (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-composite-arity");
+
+    // "8302-2" has no "$"-separated second part, but the parameter declares
+    // two components (code, value-quantity).
+    let query = code_value_quantity_query("8302-2");
+    let err = backend
+        .search(&tenant, &query)
+        .await
+        .expect_err("arity mismatch must error, not silently empty");
+    assert!(
+        matches!(
+            err,
+            StorageError::Search(SearchError::InvalidComposite { .. })
+        ),
+        "expected InvalidComposite, got {err:?}"
+    );
+}
+
+// ============================================================================
+// #1206 review fixes
+// ============================================================================
+
+/// Fix 1 (blocking): a composite quantity component's `ne` must not be
+/// satisfied by a *sibling* component's row sharing the same
+/// `param_name`/envelope. height-150's own quantity row (value=150) must
+/// fail `ne150`; before the fix, height-150's *token* row (which has no
+/// `value_quantity_value` field at all) would satisfy an unguarded `$not`
+/// and let height-150 through anyway.
+#[tokio::test]
+async fn mongodb_integration_composite_quantity_ne_excludes_matching_value() {
+    let Some(backend) = create_backend_with_full_registry("composite_quantity_ne").await else {
+        eprintln!(
+            "Skipping mongodb_integration_composite_quantity_ne_excludes_matching_value (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-composite-quantity-ne");
+    seed_height_weight_observations(&backend, &tenant).await;
+
+    let result = backend
+        .search(
+            &tenant,
+            &code_value_quantity_query("http://loinc.org|8302-2$ne150"),
+        )
+        .await
+        .expect("composite ne search");
+    assert_eq!(
+        result.resources.items.len(),
+        1,
+        "height-150 (value=150) must be excluded by ne150; only height-170 remains"
+    );
+    assert_eq!(result.resources.items[0].id(), "height-170");
+}
+
+/// #1206 follow-up: when every component of a composite value uses the
+/// `ne` prefix, MongoDB has no component filter left that is bounded by
+/// anything other than "field exists" -- there is no candidate to drive
+/// from, and probing an unbounded `ne` arm is itself the hazard this guard
+/// exists to avoid (measured: 18.7 minutes over 5.9M keys/docs unbounded on
+/// a 228M-row corpus, vs 11ms once bounded to a batch). This must be caught
+/// in planning (`composite_driver_probe`) before any row is read, so no
+/// seed data is needed. `code-value-quantity`'s components are hand-declared
+/// here as two Quantity components (rather than the registry's real
+/// Token+Quantity shape) purely to get two `ne`-eligible parts; this
+/// backend's only registry lookup for a composite component is for
+/// reference-typed components, which neither of these is.
+#[tokio::test]
+async fn mongodb_integration_composite_all_ne_components_errors() {
+    let Some(backend) = create_backend_with_full_registry("composite_all_ne").await else {
+        eprintln!(
+            "Skipping mongodb_integration_composite_all_ne_components_errors (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-composite-all-ne");
+
+    let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+        name: "code-value-quantity".to_string(),
+        param_type: SearchParamType::Composite,
+        modifier: None,
+        values: vec![SearchValue::eq("ne1$ne2")],
+        chain: vec![],
+        components: vec![
+            CompositeSearchComponent {
+                param_type: SearchParamType::Quantity,
+                param_name: "value-quantity".to_string(),
+            },
+            CompositeSearchComponent {
+                param_type: SearchParamType::Quantity,
+                param_name: "value-quantity-2".to_string(),
+            },
+        ],
+    });
+
+    let err = backend
+        .search(&tenant, &query)
+        .await
+        .expect_err("a composite value with every component 'ne' must error, not silently scan");
+    assert!(
+        matches!(
+            err,
+            StorageError::Search(SearchError::InvalidComposite { .. })
+        ),
+        "expected InvalidComposite, got {err:?}"
+    );
+}
+
+/// Fix 2 (blocking): `build_search_parameters` (used by `If-None-Exist` and
+/// the non-transactional conditional operations) must populate a
+/// composite's `components` from the registry, the same way
+/// `search_query_builder.rs` does for a REST-originated query -- otherwise
+/// `split_composite_value` sees no declared components and 400s with "has
+/// no declared components" instead of ever reaching the match/create
+/// decision.
+#[tokio::test]
+async fn mongodb_integration_composite_if_none_exist_resolves_or_creates() {
+    let Some(backend) = create_backend_with_full_registry("composite_if_none_exist").await else {
+        eprintln!(
+            "Skipping mongodb_integration_composite_if_none_exist_resolves_or_creates (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-composite-if-none-exist");
+    seed_height_weight_observations(&backend, &tenant).await;
+
+    // $gt160 matches the existing height-170: the conditional create must
+    // resolve to it and create nothing.
+    let match_entries = vec![BundleEntry {
+        method: BundleMethod::Post,
+        url: "Observation".to_string(),
+        resource: Some(json!({
+            "resourceType": "Observation",
+            "status": "final",
+            "code": {"coding": [{"system": "http://loinc.org", "code": "8302-2"}]},
+            "valueQuantity": {
+                "value": 165.0,
+                "unit": "cm",
+                "system": "http://unitsofmeasure.org"
+            }
+        })),
+        if_match: None,
+        if_none_match: None,
+        if_none_exist: Some("code-value-quantity=http://loinc.org|8302-2$gt160".to_string()),
+        full_url: Some("urn:uuid:should-not-be-created".to_string()),
+    }];
+    let Some(match_result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        match_entries,
+        "mongodb_integration_composite_if_none_exist_resolves_or_creates/match",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(
+        match_result.entries[0].status, 200,
+        "the composite ifNoneExist match must be answered, not duplicated"
+    );
+    assert_eq!(match_result.entries[0].effect, BundleEntryEffect::NoOp);
+    let matched = match_result.entries[0]
+        .resource
+        .as_ref()
+        .expect("matched resource is echoed");
+    assert_eq!(matched["id"], json!("height-170"));
+
+    // $gt300 matches nothing: the conditional create must actually create.
+    let create_entries = vec![BundleEntry {
+        method: BundleMethod::Post,
+        url: "Observation".to_string(),
+        resource: Some(json!({
+            "resourceType": "Observation",
+            "status": "final",
+            "code": {"coding": [{"system": "http://loinc.org", "code": "8302-2"}]},
+            "valueQuantity": {
+                "value": 310.0,
+                "unit": "cm",
+                "system": "http://unitsofmeasure.org"
+            }
+        })),
+        if_match: None,
+        if_none_match: None,
+        if_none_exist: Some("code-value-quantity=http://loinc.org|8302-2$gt300".to_string()),
+        full_url: Some("urn:uuid:should-be-created".to_string()),
+    }];
+    let Some(create_result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        create_entries,
+        "mongodb_integration_composite_if_none_exist_resolves_or_creates/create",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(create_result.entries[0].status, 201);
+    assert_eq!(create_result.entries[0].effect, BundleEntryEffect::Created);
+}
+
+/// Fix 2, non-transactional path: `conditional_create` routes through
+/// `find_matching_resources` -> `build_search_parameters`, the same
+/// function the transactional ifNoneExist matcher (`storage.rs`) calls, so
+/// this exercises the same fix outside a transaction/session.
+#[tokio::test]
+async fn mongodb_integration_composite_conditional_create_matches_existing() {
+    let Some(backend) = create_backend_with_full_registry("composite_conditional_create").await
+    else {
+        eprintln!(
+            "Skipping mongodb_integration_composite_conditional_create_matches_existing (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-composite-conditional-create");
+    seed_height_weight_observations(&backend, &tenant).await;
+
+    let result = backend
+        .conditional_create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "status": "final",
+                "code": {"coding": [{"system": "http://loinc.org", "code": "8302-2"}]},
+                "valueQuantity": {
+                    "value": 165.0,
+                    "unit": "cm",
+                    "system": "http://unitsofmeasure.org"
+                }
+            }),
+            "code-value-quantity=http://loinc.org|8302-2$gt160",
+            FhirVersion::default(),
+        )
+        .await
+        .expect("conditional_create with a composite search_params string must not 400");
+
+    match result {
+        ConditionalCreateResult::Exists(existing) => {
+            assert_eq!(existing.id(), "height-170");
+        }
+        other => panic!("expected Exists(height-170), got {other:?}"),
+    }
+}
+
+/// Fix 3 (blocking): `_contained` combined with a composite parameter must
+/// be a clear 400, not a silent partial filter -- `matching_contained`
+/// skips `Composite` params entirely, so `_contained=both` would otherwise
+/// filter only its top-level half by the composite and let the contained
+/// half ignore it.
+#[tokio::test]
+async fn mongodb_integration_contained_rejects_composite_parameter() {
+    use helios_persistence::types::ContainedMode;
+
+    let Some(backend) = create_backend_with_full_registry("contained_composite").await else {
+        eprintln!(
+            "Skipping mongodb_integration_contained_rejects_composite_parameter (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-contained-composite");
+
+    let mut query = code_value_quantity_query("http://loinc.org|8302-2$gt150");
+    query.contained = ContainedMode::Both;
+
+    let err = backend
+        .search(&tenant, &query)
+        .await
+        .expect_err("composite + _contained=both must be rejected, not silently under-filtered");
+    assert!(
+        matches!(
+            err,
+            StorageError::Search(SearchError::InvalidComposite { .. })
+        ),
+        "expected InvalidComposite, got {err:?}"
+    );
+
+    let count_err = backend
+        .search_count(&tenant, &query)
+        .await
+        .expect_err("search_count must reject the same combination");
+    assert!(matches!(
+        count_err,
+        StorageError::Search(SearchError::InvalidComposite { .. })
+    ));
+}
+
+/// Fix 5 test gap: `:not` on a composite parameter must be rejected by
+/// `validate_query_support`, not reach the composite builder (there is no
+/// defined composite semantics for "no value of the parameter matches").
+#[tokio::test]
+async fn mongodb_integration_composite_not_modifier_rejected() {
+    let Some(backend) = create_backend_with_full_registry("composite_not_modifier").await else {
+        eprintln!(
+            "Skipping mongodb_integration_composite_not_modifier_rejected (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-composite-not");
+
+    let mut query = code_value_quantity_query("http://loinc.org|8302-2$gt150");
+    query.parameters[0].modifier = Some(SearchModifier::Not);
+
+    let err = backend
+        .search(&tenant, &query)
+        .await
+        .expect_err(":not on a composite must be rejected");
+    assert!(
+        matches!(
+            err,
+            StorageError::Search(SearchError::UnsupportedModifier { .. })
+        ),
+        "expected UnsupportedModifier, got {err:?}"
+    );
+}
+
+/// Fix 5 test gap: tenant isolation. Composite rows are scoped by
+/// `tenant_id` exactly like every other `search_index` row, but this pins
+/// it explicitly for the composite path specifically.
+#[tokio::test]
+async fn mongodb_integration_composite_tenant_isolation() {
+    let Some(backend) = create_backend_with_full_registry("composite_tenant_isolation").await
+    else {
+        eprintln!(
+            "Skipping mongodb_integration_composite_tenant_isolation (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant_a = create_tenant("tenant-composite-iso-a");
+    let tenant_b = create_tenant("tenant-composite-iso-b");
+    seed_height_weight_observations(&backend, &tenant_a).await;
+
+    let result = backend
+        .search(
+            &tenant_b,
+            &code_value_quantity_query("http://loinc.org|8302-2$gt150"),
+        )
+        .await
+        .expect("composite search must not error across tenants");
+    assert!(
+        result.resources.items.is_empty(),
+        "tenant B must not see tenant A's composite rows"
+    );
+}
+
+/// Fix 5 test gap: the composite always won the driver probe in
+/// `mongodb_integration_composite_combined_with_plain_param` (2 rows vs 3).
+/// This second phase adds a `status=amended` observation held by exactly
+/// one resource -- fewer rows than either composite component arm -- so the
+/// *plain* parameter wins the driver probe this time, and the composite
+/// (checked via the grouped pair check regardless of which param drives)
+/// must still filter the smaller candidate set correctly.
+#[tokio::test]
+async fn mongodb_integration_composite_combined_with_plain_param_plain_wins_driver() {
+    let Some(backend) = create_backend_with_full_registry("composite_plus_plain_driver").await
+    else {
+        eprintln!(
+            "Skipping mongodb_integration_composite_combined_with_plain_param_plain_wins_driver (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-composite-plus-plain-driver");
+    seed_height_weight_observations(&backend, &tenant).await;
+
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "height-190-amended",
+                "status": "amended",
+                "code": {"coding": [{"system": "http://loinc.org", "code": "8302-2"}]},
+                "valueQuantity": {
+                    "value": 190.0,
+                    "unit": "cm",
+                    "system": "http://unitsofmeasure.org"
+                }
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    // Token arm (code=8302-2): height-150, height-170, height-190-amended = 3.
+    // Quantity arm (value>160, shared param_name across every Observation's
+    // code-value-quantity rows): height-170, height-190-amended, weight-180
+    // = 3. status=amended: exactly 1 -- fewer than either composite arm.
+    let amended_status = SearchParameter {
+        name: "status".to_string(),
+        param_type: SearchParamType::Token,
+        values: vec![SearchValue::eq("amended")],
+        ..Default::default()
+    };
+    let query =
+        code_value_quantity_query("http://loinc.org|8302-2$gt160").with_parameter(amended_status);
+    let result = backend
+        .search(&tenant, &query)
+        .await
+        .expect("composite + plain param where the plain param wins the driver probe");
+    assert_eq!(
+        result.resources.items.len(),
+        1,
+        "only height-190-amended has status=amended AND satisfies the composite"
+    );
+    assert_eq!(result.resources.items[0].id(), "height-190-amended");
+}
+
+/// Fix 5 test gap: the quantity component arm must be able to win the
+/// driver probe over the token arm (not merely tie or lose), and the result
+/// must still be correct when it does. Five observations share
+/// code=8302-2 (token arm count 5); only one exceeds the quantity
+/// threshold (quantity arm count 1).
+#[tokio::test]
+async fn mongodb_integration_composite_quantity_arm_wins_driver_probe() {
+    let Some(backend) = create_backend_with_full_registry("composite_quantity_arm_driver").await
+    else {
+        eprintln!(
+            "Skipping mongodb_integration_composite_quantity_arm_wins_driver_probe (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-composite-quantity-arm-driver");
+
+    for (id, value) in [
+        ("h1", 100.0_f64),
+        ("h2", 110.0),
+        ("h3", 120.0),
+        ("h4", 130.0),
+        ("h5", 170.0),
+    ] {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": id,
+                    "status": "final",
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "8302-2"}]},
+                    "valueQuantity": {
+                        "value": value,
+                        "unit": "cm",
+                        "system": "http://unitsofmeasure.org"
+                    }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let result = backend
+        .search(
+            &tenant,
+            &code_value_quantity_query("http://loinc.org|8302-2$gt160"),
+        )
+        .await
+        .expect("composite search where the quantity arm wins the driver probe");
+    assert_eq!(result.resources.items.len(), 1);
+    assert_eq!(result.resources.items[0].id(), "h5");
+}
+
+/// Fix 5 test gap (multi-batch): the composite's *winning* (driver) arm
+/// itself has more than `CANDIDATE_BATCH_SIZE` (512) rows, so the per-batch
+/// pair check in `matching_resource_ids` must run more than once to exhaust
+/// the driver cursor and accumulate `confirmed` across batches. 600
+/// Observations satisfy `$gt160` (the quantity arm, 600 rows) and only 10 do
+/// not (the token arm — all 610 share code=8302-2 — therefore loses the
+/// driver-probe comparison to the quantity arm's 600, but the quantity arm
+/// still exceeds one batch on its own). Seeded via batched transaction
+/// Bundles (50 entries per batch, the same shape
+/// `mongodb_integration_search_paged_intersection_correctness` uses for its
+/// 600-row setup) rather than 610 sequential single creates.
+#[tokio::test]
+async fn mongodb_integration_composite_multi_batch_driver_paging() {
+    const MATCHING: usize = 600; // 8302-2 @ 170 (satisfies $gt160; exceeds CANDIDATE_BATCH_SIZE)
+    const NON_MATCHING: usize = 10; // 8302-2 @ 150 (does not satisfy $gt160)
+
+    let Some(backend) = create_backend_with_full_registry("composite_multi_batch").await else {
+        eprintln!(
+            "Skipping mongodb_integration_composite_multi_batch_driver_paging (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-composite-multi-batch");
+
+    for chunk_start in (0..MATCHING).step_by(50) {
+        let end = (chunk_start + 50).min(MATCHING);
+        let entries: Vec<BundleEntry> = (chunk_start..end)
+            .map(|i| BundleEntry {
+                method: BundleMethod::Post,
+                url: "Observation".to_string(),
+                resource: Some(json!({
+                    "resourceType": "Observation",
+                    "status": "final",
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "8302-2"}]},
+                    "valueQuantity": {
+                        "value": 170.0,
+                        "unit": "cm",
+                        "system": "http://unitsofmeasure.org"
+                    }
+                })),
+                if_match: None,
+                if_none_match: None,
+                if_none_exist: None,
+                full_url: Some(format!("urn:uuid:matching-{i}")),
+            })
+            .collect();
+        let Some(r) = process_transaction_or_skip(
+            &backend,
+            &tenant,
+            entries,
+            "mongodb_integration_composite_multi_batch_driver_paging (matching setup)",
+        )
+        .await
+        else {
+            return;
+        };
+        assert!(
+            r.entries.iter().all(|e| e.status == 201),
+            "matching batch create failed"
+        );
+    }
+
+    for chunk_start in (0..NON_MATCHING).step_by(10) {
+        let end = (chunk_start + 10).min(NON_MATCHING);
+        let entries: Vec<BundleEntry> = (chunk_start..end)
+            .map(|i| BundleEntry {
+                method: BundleMethod::Post,
+                url: "Observation".to_string(),
+                resource: Some(json!({
+                    "resourceType": "Observation",
+                    "status": "final",
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "8302-2"}]},
+                    "valueQuantity": {
+                        "value": 150.0,
+                        "unit": "cm",
+                        "system": "http://unitsofmeasure.org"
+                    }
+                })),
+                if_match: None,
+                if_none_match: None,
+                if_none_exist: None,
+                full_url: Some(format!("urn:uuid:non-matching-{i}")),
+            })
+            .collect();
+        let Some(r) = process_transaction_or_skip(
+            &backend,
+            &tenant,
+            entries,
+            "mongodb_integration_composite_multi_batch_driver_paging (non-matching setup)",
+        )
+        .await
+        else {
+            return;
+        };
+        assert!(
+            r.entries.iter().all(|e| e.status == 201),
+            "non-matching batch create failed"
+        );
+    }
+
+    let query = code_value_quantity_query("http://loinc.org|8302-2$gt160").with_count(1000);
+    let result = backend
+        .search(&tenant, &query)
+        .await
+        .expect("composite search across a driver larger than CANDIDATE_BATCH_SIZE");
+    assert_eq!(result.resources.items.len(), MATCHING);
+
+    let count = backend
+        .search_count(&tenant, &query)
+        .await
+        .expect("search_count must agree with search on the same multi-batch query");
+    assert_eq!(count as usize, MATCHING);
 }

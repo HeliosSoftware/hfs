@@ -370,6 +370,36 @@ pub(super) fn missing_presence_filter(
     filter
 }
 
+/// Rejects `_contained=true|both` combined with a composite search parameter
+/// (#1206 review finding 3).
+///
+/// The top-level half of `_contained=both` is filtered by
+/// `matching_resource_ids` (composite-aware), but the contained half is
+/// resolved by `matching_contained`, which `continue`s straight past
+/// `Composite`/`Special` parameters (they are never indexed under
+/// `contained_type` rows the way a plain parameter is). Left unguarded,
+/// `_contained=both` would silently filter only its top-level half by the
+/// composite and let the contained half ignore it entirely. Composite
+/// parameters could in principle gain `_contained` support by teaching
+/// `matching_contained` the grouped pair check too, but that is unbuilt
+/// today, so this is a clear 400 rather than a silent under- or
+/// over-match.
+fn reject_contained_composite(query: &SearchQuery) -> StorageResult<()> {
+    if query.contained != crate::types::ContainedMode::Off
+        && query
+            .parameters
+            .iter()
+            .any(|p| p.param_type == SearchParamType::Composite)
+    {
+        return Err(StorageError::Search(SearchError::InvalidComposite {
+            message: "composite search parameters are not supported together with _contained on \
+                 MongoDB"
+                .to_string(),
+        }));
+    }
+    Ok(())
+}
+
 /// The resource-document field a cursor pages over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CursorKeysetField {
@@ -443,6 +473,8 @@ impl SearchProvider for MongoBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
+        reject_contained_composite(query)?;
+
         // `_contained` search uses a dedicated path (separate index rows and
         // heterogeneous result types); standard search handles `_contained=false`
         // (contained rows carry the container's resource_type, so the standard
@@ -625,6 +657,7 @@ impl SearchProvider for MongoBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<u64> {
+        reject_contained_composite(query)?;
         self.validate_query_support(query)?;
 
         let db = self.get_database().await?;
@@ -763,6 +796,18 @@ impl ConditionalStorage for MongoBackend {
             capability: "conditional_patch".to_string(),
         }))
     }
+}
+
+/// One composite component's scoped `search_index` filter, plus whether its
+/// parsed value used the `Ne` prefix. `negated` components are
+/// existence-bounded only (see `MongoBackend::composite_component_filters`),
+/// so they must never be probed or chosen as a composite's driver arm —
+/// `composite_driver_probe` filters on this; `composite_pair_check` uses
+/// `filter` alone, same as before this flag existed.
+#[derive(Debug)]
+struct ComponentFilter {
+    filter: Document,
+    negated: bool,
 }
 
 impl MongoBackend {
@@ -1150,13 +1195,32 @@ impl MongoBackend {
             // rejected for token/reference: token `:above`/`:below` need
             // terminology subsumption and reference `:above`/`:below` need
             // hierarchy resolution, neither of which is implemented here.
+            // Every modifier on a composite (#1206) is rejected here except
+            // `:missing`: `composite_search::component_param` hardcodes
+            // `modifier: None` when building each component's filter, so any
+            // other modifier (`:not`, `:exact`, `:above`, ...) would be
+            // silently dropped rather than honoured if it reached the
+            // composite planner. `:not` specifically also has no defined
+            // composite semantics yet — unlike token `:not`, there is no
+            // single positive filter whose complement is the right answer.
+            // `:missing` is the one exception: `matching_resource_ids` routes
+            // it into the separate `missing` list before `normal` params
+            // (which is what feeds the composite driver/pair-check planner
+            // this function guards) are even considered, so it is handled by
+            // `missing_presence_filter` and never reaches this composite
+            // guard's concern.
             let modifier_unsupported = matches!(
                 param.modifier,
                 Some(SearchModifier::In) | Some(SearchModifier::NotIn)
             ) || (matches!(
                 param.modifier,
                 Some(SearchModifier::Above) | Some(SearchModifier::Below)
-            ) && param.param_type != SearchParamType::Uri);
+            ) && param.param_type != SearchParamType::Uri)
+                || (param.param_type == SearchParamType::Composite
+                    && param
+                        .modifier
+                        .as_ref()
+                        .is_some_and(|m| !matches!(m, SearchModifier::Missing)));
             if modifier_unsupported {
                 return Err(StorageError::Search(SearchError::UnsupportedModifier {
                     modifier: param
@@ -1599,20 +1663,50 @@ impl MongoBackend {
                 .await;
         }
 
-        let driver_idx = if normal.len() == 1 {
+        // #1206: a composite's probe must run over its component filters
+        // regardless of how many normal params there are — unlike a plain
+        // param, its own filter isn't a single document to count, and the
+        // most-selective-arm choice inside the composite still matters even
+        // when it is the only normal param. Probes are cached here so the
+        // composite driver, if chosen, doesn't re-run them below.
+        let mut composite_probes: HashMap<usize, (Document, u64)> = HashMap::new();
+
+        let driver_idx = if normal.len() == 1 && normal[0].param_type != SearchParamType::Composite
+        {
             0
         } else {
             let mut best: Option<(usize, u64)> = None;
             for (i, param) in normal.iter().enumerate() {
-                let filter = self.build_search_index_filter(tenant_id, resource_type, param)?;
-                let count = search_index
-                    .count_documents(filter)
-                    .limit(PROBE_ROW_LIMIT)
-                    .await
-                    .or_query_error("Failed to probe search_index for driver selection")?;
-                if count == 0 {
-                    return Ok(Some(HashSet::new()));
-                }
+                let count = if param.param_type == SearchParamType::Composite {
+                    match self
+                        .composite_driver_probe(
+                            &search_index,
+                            tenant_id,
+                            resource_type,
+                            param,
+                            PROBE_ROW_LIMIT,
+                            None,
+                        )
+                        .await?
+                    {
+                        None => return Ok(Some(HashSet::new())),
+                        Some((filter, count)) => {
+                            composite_probes.insert(i, (filter, count));
+                            count
+                        }
+                    }
+                } else {
+                    let filter = self.build_search_index_filter(tenant_id, resource_type, param)?;
+                    let count = search_index
+                        .count_documents(filter)
+                        .limit(PROBE_ROW_LIMIT)
+                        .await
+                        .or_query_error("Failed to probe search_index for driver selection")?;
+                    if count == 0 {
+                        return Ok(Some(HashSet::new()));
+                    }
+                    count
+                };
                 if best.is_none_or(|(_, prev)| count < prev) {
                     best = Some((i, count));
                 }
@@ -1620,8 +1714,15 @@ impl MongoBackend {
             best.map(|(i, _)| i).unwrap_or(0)
         };
 
-        let driver_filter =
-            self.build_search_index_filter(tenant_id, resource_type, normal[driver_idx])?;
+        // Every composite index visited by the loop above has its probe
+        // result cached, so `driver_idx` pointing at a composite always finds
+        // an entry here; a plain param never has one and falls through to
+        // the ordinary per-value filter builder.
+        let driver_filter = if let Some((filter, _)) = composite_probes.remove(&driver_idx) {
+            filter
+        } else {
+            self.build_search_index_filter(tenant_id, resource_type, normal[driver_idx])?
+        };
 
         let mut driver_cursor = search_index
             .find(driver_filter)
@@ -1647,7 +1748,29 @@ impl MongoBackend {
             }
 
             for (i, param) in normal.iter().enumerate() {
-                if i == driver_idx || candidates.is_empty() {
+                if candidates.is_empty() {
+                    continue;
+                }
+                // A composite's driver arm only proves ONE component
+                // matched (its most selective one) — every composite in
+                // `normal`, including the driver, still needs the grouped
+                // pair check to confirm every component matched within the
+                // same `composite_group` (#1206).
+                if param.param_type == SearchParamType::Composite {
+                    let passing = self
+                        .composite_pair_check(
+                            &search_index,
+                            tenant_id,
+                            resource_type,
+                            param,
+                            &candidates,
+                            None,
+                        )
+                        .await?;
+                    candidates.retain(|id| passing.contains(id));
+                    continue;
+                }
+                if i == driver_idx {
                     continue;
                 }
                 let param_filter =
@@ -1909,6 +2032,15 @@ impl MongoBackend {
         resource_type: &str,
         param: &SearchParameter,
     ) -> StorageResult<Document> {
+        if param.param_type == SearchParamType::Composite {
+            return Err(internal_error(format!(
+                "build_search_index_filter must never be called with a composite parameter \
+                 ('{}'); composite parameters are planned by composite_component_filters/ \
+                 composite_driver_probe/composite_pair_check instead",
+                param.name
+            )));
+        }
+
         if param.values.is_empty() {
             return Err(StorageError::Search(SearchError::QueryParseError {
                 message: format!("Search parameter '{}' has no values", param.name),
@@ -1975,6 +2107,365 @@ impl MongoBackend {
         Ok(filter)
     }
 
+    /// Builds every component's scoped `search_index` filter for a composite
+    /// parameter (#1206) — outer index is the (comma-OR'd) value, inner index
+    /// is the component, in declaration order.
+    ///
+    /// Each returned document is a *full* filter (`tenant_id`,
+    /// `resource_type`, `param_name` = the composite's own name, plus the
+    /// component's typed predicate) — every row for every component of a
+    /// composite shares `param_name` with the composite itself, since the
+    /// extractor never stores a per-component slot.
+    ///
+    /// Every predicate is additionally ANDed with `{value_field: {"$ne":
+    /// null}}` for the component's own value field (review finding: an
+    /// absence-shaped predicate like `Ne` — `build_quantity_filter`/
+    /// `build_number_filter` emit `{field: {"$not": {...}}}`,
+    /// `build_date_filter_doc` emits `{field: {"$ne": start}}` for an
+    /// instant — is satisfied by a document where `field` does not exist at
+    /// all. Unlike a plain parameter (where `param_name` alone already
+    /// scopes a filter to rows of one value type, see
+    /// `ne_filter_stays_scoped_to_tenant_resource_and_param`), every
+    /// component of a composite shares the *same* `param_name`, so without
+    /// this conjunct a `ne` component filter would also be satisfied by a
+    /// sibling component's row in the same `composite_group` — e.g.
+    /// `code-value-quantity=http://loinc.org|8302-2$ne150` would match the
+    /// token row for a resource whose value IS 150, because that token row
+    /// has no `value_quantity_value` field to fail the `$not`. `$ne: null`
+    /// (not `$exists`) is required: it is what the generation-2 partial
+    /// value indexes are built to cover, and applying it uniformly (not only
+    /// for `Ne`) keeps every component type on one code path. A component
+    /// type with no indexed value field (`Composite`, `Special` — neither
+    /// occurs today, since the registry does not nest composites and
+    /// `Special` cannot be a composite's declared sub-parameter type) is
+    /// rejected explicitly rather than silently skipping the conjunct.
+    ///
+    /// Errors from the typed builders (e.g. a malformed quantity component)
+    /// propagate: a malformed composite value is a 400, same as a malformed
+    /// plain value.
+    ///
+    /// Also returns, per component, whether its parsed value used the `Ne`
+    /// prefix (`negated`) — quantity/number `Ne` builds `{field: {"$not":
+    /// ...}}` and date `Ne` builds `{field: {"$ne": ...}}`, both of which are
+    /// bounded only by "field exists", not by the value itself. Callers use
+    /// this to keep an unbounded `ne` arm out of the driver-probe role; see
+    /// `composite_driver_probe`.
+    fn composite_component_filters(
+        &self,
+        tenant_id: &str,
+        resource_type: &str,
+        param: &SearchParameter,
+    ) -> StorageResult<Vec<Vec<ComponentFilter>>> {
+        if param.values.is_empty() {
+            return Err(StorageError::Search(SearchError::QueryParseError {
+                message: format!("Search parameter '{}' has no values", param.name),
+            }));
+        }
+
+        let mut result = Vec::with_capacity(param.values.len());
+        for value in &param.values {
+            let component_values =
+                super::composite_search::split_composite_value(&value.value, &param.components)?;
+
+            let mut per_component = Vec::with_capacity(param.components.len());
+            for (component, component_value) in param.components.iter().zip(component_values) {
+                let negated = component_value.prefix == SearchPrefix::Ne;
+                let value_field = value_field_for(component.param_type).ok_or_else(|| {
+                    StorageError::Search(SearchError::InvalidComposite {
+                        message: format!(
+                            "composite component '{}' of parameter '{}' has type {:?}, which \
+                             has no indexed value field and cannot be scoped as a composite \
+                             predicate",
+                            component.param_name, param.name, component.param_type
+                        ),
+                    })
+                })?;
+
+                let targets: Vec<String> = if component.param_type == SearchParamType::Reference {
+                    let registry = self.tenant_registry(tenant_id);
+                    let registry = registry.read();
+                    crate::search::resolve_param_targets(
+                        &registry,
+                        resource_type,
+                        &component.param_name,
+                    )
+                } else {
+                    Vec::new()
+                };
+
+                let synthetic = super::composite_search::component_param(
+                    param,
+                    component,
+                    component_value.clone(),
+                );
+                let predicate =
+                    self.build_index_value_filter(&synthetic, &component_value, &targets)?;
+
+                let mut scoped = doc! {
+                    "tenant_id": tenant_id,
+                    "resource_type": resource_type,
+                    "param_name": &param.name,
+                };
+                scoped.insert(
+                    "$and",
+                    vec![
+                        Bson::Document(doc! { value_field: { "$ne": Bson::Null } }),
+                        Bson::Document(predicate),
+                    ],
+                );
+                per_component.push(ComponentFilter {
+                    filter: scoped,
+                    negated,
+                });
+            }
+            result.push(per_component);
+        }
+        Ok(result)
+    }
+
+    /// Counts documents matching `filter`, bounded by `limit`, using
+    /// `count_documents` outside a transaction or an aggregate
+    /// `$match/$limit/$group/$count` probe inside one — MongoDB's `count`
+    /// command cannot run inside a multi-document transaction, which is
+    /// exactly why the ifNoneExist matcher in `storage.rs` already uses the
+    /// aggregate form when it has a session.
+    ///
+    /// The two branches count different things and are NOT interchangeable:
+    /// the session branch `$group`s by `$resource_id` before `$count`, so it
+    /// counts distinct *resource ids* — matching what the ifNoneExist
+    /// matcher's own probe (`storage.rs`, same `$group`/`$count` shape)
+    /// compares against; the no-session branch's `count_documents` counts
+    /// `search_index` *rows*, matching what `matching_resource_ids`'s plain
+    /// per-param probe (`search_index.count_documents(filter)`, no
+    /// grouping) compares against. A composite's driver-arm probe can
+    /// return more rows than resources (a composite_group's several
+    /// component rows share one resource_id), so each caller must compare
+    /// this count only against its own kind of probe, never mix the two.
+    async fn probe_count(
+        &self,
+        search_index: &mongodb::Collection<Document>,
+        filter: Document,
+        limit: u64,
+        session: Option<&mut mongodb::ClientSession>,
+    ) -> StorageResult<u64> {
+        match session {
+            Some(s) => {
+                let pipeline = vec![
+                    doc! { "$match": filter },
+                    doc! { "$limit": limit as i64 },
+                    doc! { "$group": { "_id": "$resource_id" } },
+                    doc! { "$count": "n" },
+                ];
+                let cursor = search_index
+                    .aggregate(pipeline)
+                    .session(&mut *s)
+                    .await
+                    .or_query_error(
+                        "Failed to probe search_index for composite driver (session)",
+                    )?;
+                let docs = super::storage::collect_session_documents(cursor, s).await?;
+                Ok(docs
+                    .first()
+                    .and_then(|d| d.get_i32("n").ok())
+                    .map(|n| n as u64)
+                    .unwrap_or(0))
+            }
+            None => search_index
+                .count_documents(filter)
+                .limit(limit)
+                .await
+                .or_query_error("Failed to probe search_index for composite driver"),
+        }
+    }
+
+    /// Selects the most selective *non-`ne`* component filter for each value
+    /// of a composite parameter and returns the combined driver filter plus
+    /// its total probe count — or `Ok(None)` when every value has at least
+    /// one zero-count component, meaning the composite can match nothing at
+    /// all.
+    ///
+    /// Only non-negated (`prefix != Ne`) components are probed and eligible
+    /// as a value's driver arm. Measured on a 228M-row corpus: an unbounded
+    /// `ne` component predicate is index-bounded only by "field exists" and
+    /// needs a FETCH per row, so scanning it as a driver arm (or even just
+    /// probing it with a limit) took 18.7 minutes over 5.9M keys/docs; the
+    /// same predicate costs 11ms once bounded to a batch of candidate ids in
+    /// `composite_pair_check`. A value's driver arm is otherwise its
+    /// lowest-count eligible component filter: if that minimum is zero, no
+    /// `composite_group` can satisfy every component of that value (one
+    /// component never occurs at all), so the value contributes nothing and
+    /// is dropped. If a value has no non-negated component at all (every
+    /// component of it uses `Ne`, e.g. `ne5$ne7` on a number+number
+    /// composite), there is no bounded arm to drive from and this returns
+    /// `SearchError::InvalidComposite`. The composite's overall driver filter
+    /// is the `$or` of the surviving values' arms (or the single arm when
+    /// there is one); the returned count is the sum of their probe counts,
+    /// used only to compete with other parameters for the driver slot in
+    /// `matching_resource_ids`.
+    pub(super) async fn composite_driver_probe(
+        &self,
+        search_index: &mongodb::Collection<Document>,
+        tenant_id: &str,
+        resource_type: &str,
+        param: &SearchParameter,
+        probe_limit: u64,
+        mut session: Option<&mut mongodb::ClientSession>,
+    ) -> StorageResult<Option<(Document, u64)>> {
+        let per_value_filters =
+            self.composite_component_filters(tenant_id, resource_type, param)?;
+
+        let mut arms: Vec<Document> = Vec::new();
+        let mut total: u64 = 0;
+        for component_filters in per_value_filters {
+            let mut best: Option<(Document, u64)> = None;
+            let mut has_driver_candidate = false;
+            for component_filter in component_filters {
+                if component_filter.negated {
+                    continue;
+                }
+                has_driver_candidate = true;
+                let count = self
+                    .probe_count(
+                        search_index,
+                        component_filter.filter.clone(),
+                        probe_limit,
+                        session.as_deref_mut(),
+                    )
+                    .await?;
+                if best.as_ref().is_none_or(|(_, prev)| count < *prev) {
+                    best = Some((component_filter.filter, count));
+                }
+            }
+            if !has_driver_candidate {
+                return Err(StorageError::Search(SearchError::InvalidComposite {
+                    message: format!(
+                        "composite value for parameter '{}' has every component using the \
+                         'ne' prefix; MongoDB needs at least one non-'ne' component to bound \
+                         the search (an unbounded 'ne' arm is an existence-bounded index scan \
+                         with a fetch per row)",
+                        param.name
+                    ),
+                }));
+            }
+            if let Some((filter_doc, count)) = best {
+                if count > 0 {
+                    arms.push(filter_doc);
+                    total += count;
+                }
+            }
+        }
+
+        if arms.is_empty() {
+            return Ok(None);
+        }
+
+        let filter = if arms.len() == 1 {
+            arms.into_iter().next().expect("checked non-empty above")
+        } else {
+            doc! { "$or": Bson::Array(arms.into_iter().map(Bson::Document).collect()) }
+        };
+        Ok(Some((filter, total)))
+    }
+
+    /// Checks a candidate batch against a composite parameter: for each
+    /// value, for each component, fetches `(resource_id, composite_group)`
+    /// pairs bounded to the batch, intersects them across components
+    /// (`composite_search::intersect_component_pairs`), and unions the
+    /// surviving ids across values (comma is OR). Every component is used
+    /// here regardless of its `negated` flag — unlike `composite_driver_probe`,
+    /// which must never probe or drive off an unbounded `ne` arm, this
+    /// function only ever queries a component's filter ANDed with
+    /// `resource_id: {"$in": candidates}`, so even a `ne` component's
+    /// existence-bounded predicate is cheap: measured at 11ms bounded to a
+    /// batch, versus 18.7 minutes unbounded on a 228M-row corpus.
+    ///
+    /// `candidates` bounds every query issued here — this is the per-batch
+    /// check reused by both `matching_resource_ids` (no session) and the
+    /// ifNoneExist matcher in `storage.rs` (with a transaction session).
+    pub(super) async fn composite_pair_check(
+        &self,
+        search_index: &mongodb::Collection<Document>,
+        tenant_id: &str,
+        resource_type: &str,
+        param: &SearchParameter,
+        candidates: &HashSet<String>,
+        mut session: Option<&mut mongodb::ClientSession>,
+    ) -> StorageResult<HashSet<String>> {
+        if candidates.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let per_value_filters =
+            self.composite_component_filters(tenant_id, resource_type, param)?;
+        let candidate_ids: Vec<Bson> = candidates.iter().cloned().map(Bson::String).collect();
+        let projection = doc! { "resource_id": 1, "composite_group": 1, "_id": 0 };
+
+        let mut matched: HashSet<String> = HashSet::new();
+        for component_filters in per_value_filters {
+            let mut per_component_pairs: Vec<HashSet<(String, i32)>> =
+                Vec::with_capacity(component_filters.len());
+
+            for component_filter in component_filters {
+                let bounded = doc! {
+                    "$and": [
+                        component_filter.filter,
+                        { "resource_id": { "$in": candidate_ids.clone() } }
+                    ]
+                };
+
+                let pairs: HashSet<(String, i32)> = match session.as_deref_mut() {
+                    Some(s) => {
+                        let mut cursor = search_index
+                            .find(bounded)
+                            .projection(projection.clone())
+                            .session(&mut *s)
+                            .await
+                            .or_query_error("Failed to query composite component rows (session)")?;
+                        let mut out = HashSet::new();
+                        while cursor
+                            .advance(&mut *s)
+                            .await
+                            .or_query_error("Failed to advance composite component cursor")?
+                        {
+                            let doc = cursor
+                                .deserialize_current()
+                                .or_query_error("Failed to deserialize composite component row")?;
+                            if let (Ok(rid), Ok(grp)) =
+                                (doc.get_str("resource_id"), doc.get_i32("composite_group"))
+                            {
+                                out.insert((rid.to_string(), grp));
+                            }
+                        }
+                        out
+                    }
+                    None => {
+                        let cursor = search_index
+                            .find(bounded)
+                            .projection(projection.clone())
+                            .await
+                            .or_query_error("Failed to query composite component rows")?;
+                        collect_documents(cursor)
+                            .await?
+                            .into_iter()
+                            .filter_map(|d| {
+                                let rid = d.get_str("resource_id").ok()?.to_string();
+                                let grp = d.get_i32("composite_group").ok()?;
+                                Some((rid, grp))
+                            })
+                            .collect()
+                    }
+                };
+                per_component_pairs.push(pairs);
+            }
+
+            let value_matches =
+                super::composite_search::intersect_component_pairs(per_component_pairs);
+            matched.extend(value_matches);
+        }
+
+        Ok(matched)
+    }
+
     fn build_index_value_filter(
         &self,
         param: &SearchParameter,
@@ -2007,9 +2498,20 @@ impl MongoBackend {
             SearchParamType::Uri => self.build_uri_filter(param, value),
             SearchParamType::Quantity => self.build_quantity_filter(value),
             SearchParamType::Composite => {
-                Err(StorageError::Search(SearchError::InvalidComposite {
-                    message: "Composite search is not supported in MongoDB Phase 4".to_string(),
-                }))
+                // Composite parameters are planned by `composite_component_filters`
+                // (each component gets its own scoped filter document) and never
+                // flow through the per-value dispatcher: there is no single
+                // "composite value" predicate to build here. Reaching this arm
+                // means a composite parameter escaped that planning path (e.g.
+                // via `build_search_index_filter`, which now guards against it
+                // too) — #1206. This is a genuine internal error (a bug in this
+                // backend, not a bad request), so it maps to 500 like the guard
+                // in `build_search_index_filter`, not `InvalidComposite` (400).
+                Err(internal_error(format!(
+                    "composite parameter '{}' reached the per-value filter dispatcher; it must \
+                     be planned via composite_component_filters",
+                    param.name
+                )))
             }
             SearchParamType::Special => Err(StorageError::Search(
                 SearchError::UnsupportedParameterType {
@@ -3156,6 +3658,7 @@ mod date_filter_tests {
 mod query_support_tests {
     use super::*;
     use crate::backends::mongodb::MongoBackendConfig;
+    use crate::types::CompositeSearchComponent;
 
     /// `birthdate:missing=true` carries the value `true`, which is not a
     /// date — `:missing` must be accepted as presence-only (#881) rather
@@ -3252,6 +3755,62 @@ mod query_support_tests {
                 "http://example.org",
             ] } }
         );
+    }
+
+    fn composite_param(modifier: Option<SearchModifier>) -> SearchParameter {
+        SearchParameter {
+            name: "code-value-quantity".to_string(),
+            param_type: SearchParamType::Composite,
+            modifier,
+            values: vec![SearchValue::eq("http://loinc.org|8302-2$gt150")],
+            chain: vec![],
+            components: vec![
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "code".to_string(),
+                },
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Quantity,
+                    param_name: "value-quantity".to_string(),
+                },
+            ],
+        }
+    }
+
+    /// #1206 widened gate: `composite_search::component_param` hardcodes
+    /// `modifier: None` for each component filter, so *any* modifier other
+    /// than `:missing` on a composite would be silently dropped rather than
+    /// honoured if it reached the composite planner. `:exact` stands in for
+    /// the broader class (`:not` already has its own dedicated test).
+    #[test]
+    fn exact_on_a_composite_is_rejected() {
+        let backend = MongoBackend::new(MongoBackendConfig::default()).unwrap();
+        let query = SearchQuery::new("Observation")
+            .with_parameter(composite_param(Some(SearchModifier::Exact)));
+
+        let error = backend.validate_query_support(&query).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                StorageError::Search(SearchError::UnsupportedModifier { .. })
+            ),
+            "expected UnsupportedModifier, got {error:?}"
+        );
+    }
+
+    /// `:missing` on a composite is the one modifier the gate still lets
+    /// through: `matching_resource_ids` routes it into the separate
+    /// `missing` list before `normal` params reach the composite
+    /// driver/pair-check planner, so it never hits
+    /// `composite_search::component_param`'s hardcoded `modifier: None` and
+    /// is instead served by `missing_presence_filter`.
+    #[test]
+    fn missing_on_a_composite_passes_the_gate() {
+        let backend = MongoBackend::new(MongoBackendConfig::default()).unwrap();
+        let query = SearchQuery::new("Observation")
+            .with_parameter(composite_param(Some(SearchModifier::Missing)));
+
+        assert!(backend.validate_query_support(&query).is_ok());
     }
 }
 
@@ -3659,6 +4218,186 @@ mod number_quantity_precision_tests {
                 .expect("value_number condition")
                 .contains_key("$not"),
             "ne is a value_number-scoped $not, sitting alongside the tenant/resource/param keys: {filter:?}"
+        );
+    }
+}
+
+/// #1206 review finding 1: every component's scoped filter must exclude
+/// rows where its own value field is absent — otherwise a `ne`-shaped
+/// predicate (satisfied by absence, not merely by a not-equal value) is
+/// wrongly satisfied by a *sibling* component's row, since every component
+/// of a composite shares the same `param_name`. These pin the exact
+/// document `composite_component_filters` builds for a token component and
+/// for a quantity `ne` component.
+#[cfg(test)]
+mod composite_component_filter_tests {
+    use super::*;
+    use crate::backends::mongodb::MongoBackendConfig;
+    use crate::types::CompositeSearchComponent;
+
+    fn backend() -> MongoBackend {
+        MongoBackend::new(MongoBackendConfig::default()).unwrap()
+    }
+
+    fn code_value_quantity_param(value: &str) -> SearchParameter {
+        SearchParameter {
+            name: "code-value-quantity".to_string(),
+            param_type: SearchParamType::Composite,
+            modifier: None,
+            values: vec![SearchValue::eq(value)],
+            chain: vec![],
+            components: vec![
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "code".to_string(),
+                },
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Quantity,
+                    param_name: "value-quantity".to_string(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn token_component_filter_scoped_to_tenant_resource_param_and_not_null() {
+        let backend = backend();
+        let param = code_value_quantity_param("8302-2$150");
+        let per_value = backend
+            .composite_component_filters("t1", "Observation", &param)
+            .expect("valid composite filters");
+        assert_eq!(per_value.len(), 1, "one composite value");
+        let components = &per_value[0];
+        assert_eq!(components.len(), 2, "two declared components");
+
+        assert!(
+            !components[0].negated,
+            "an Eq token component must not be flagged negated"
+        );
+        let token_filter = &components[0].filter;
+        assert_eq!(token_filter.get_str("tenant_id").unwrap(), "t1");
+        assert_eq!(
+            token_filter.get_str("resource_type").unwrap(),
+            "Observation"
+        );
+        // Every component's row shares `param_name` with the composite
+        // itself -- there is no per-component slot.
+        assert_eq!(
+            token_filter.get_str("param_name").unwrap(),
+            "code-value-quantity"
+        );
+        let and_arms = token_filter.get_array("$and").expect("$and conjunction");
+        assert_eq!(and_arms.len(), 2, "not-null guard + typed predicate");
+        let not_null = and_arms[0].as_document().expect("not-null arm");
+        assert_eq!(
+            not_null
+                .get_document("value_token_code")
+                .expect("value_token_code not-null guard")
+                .get("$ne"),
+            Some(&Bson::Null),
+            "the not-null guard must be Bson::Null, not $exists: {not_null:?}"
+        );
+        let predicate = and_arms[1].as_document().expect("typed predicate arm");
+        assert_eq!(predicate.get_str("value_token_code").unwrap(), "8302-2");
+    }
+
+    #[test]
+    fn quantity_ne_component_filter_excludes_absent_value_field() {
+        let backend = backend();
+        let param = code_value_quantity_param("8302-2$ne150");
+        let per_value = backend
+            .composite_component_filters("t1", "Observation", &param)
+            .expect("valid composite filters");
+        assert!(
+            per_value[0][1].negated,
+            "an ne quantity component must be flagged negated"
+        );
+        let quantity_filter = &per_value[0][1].filter;
+
+        assert_eq!(
+            quantity_filter.get_str("param_name").unwrap(),
+            "code-value-quantity"
+        );
+        let and_arms = quantity_filter.get_array("$and").expect("$and conjunction");
+        assert_eq!(and_arms.len(), 2);
+
+        let not_null = and_arms[0].as_document().expect("not-null arm");
+        assert_eq!(
+            not_null
+                .get_document("value_quantity_value")
+                .expect("value_quantity_value not-null guard")
+                .get("$ne"),
+            Some(&Bson::Null),
+            "the not-null guard must be Bson::Null, not $exists: {not_null:?}"
+        );
+
+        // The typed predicate is quantity's `Ne` shape: a `$not` wrapping the
+        // implicit-precision range. Without the not-null guard above, a
+        // sibling row lacking `value_quantity_value` entirely would also
+        // satisfy this `$not` -- this pins that the guard is present
+        // alongside it, not merged into a single top-level key that a
+        // sibling absence could still slip past.
+        let predicate = and_arms[1].as_document().expect("typed predicate arm");
+        assert!(
+            predicate
+                .get_document("value_quantity_value")
+                .expect("value_quantity_value condition")
+                .contains_key("$not"),
+            "quantity ne must build a $not-wrapped range predicate: {predicate:?}"
+        );
+    }
+
+    /// #1206 follow-up: `composite_driver_probe` must never probe or drive
+    /// off an unbounded `ne` component arm, so `composite_component_filters`
+    /// must report, per component, whether its parsed prefix was `Ne`.
+    #[test]
+    fn negated_flag_marks_only_the_ne_component() {
+        let backend = backend();
+
+        let ne_param = code_value_quantity_param("8302-2$ne150");
+        let per_value = backend
+            .composite_component_filters("t1", "Observation", &ne_param)
+            .expect("valid composite filters");
+        assert!(
+            !per_value[0][0].negated,
+            "the token component (code=8302-2) is not 'ne'"
+        );
+        assert!(
+            per_value[0][1].negated,
+            "the quantity component (ne150) is 'ne'"
+        );
+
+        let gt_param = code_value_quantity_param("8302-2$gt150");
+        let per_value = backend
+            .composite_component_filters("t1", "Observation", &gt_param)
+            .expect("valid composite filters");
+        assert!(
+            !per_value[0][0].negated,
+            "the token component (code=8302-2) is not 'ne'"
+        );
+        assert!(
+            !per_value[0][1].negated,
+            "'gt' is not 'ne', so the quantity component must not be flagged negated"
+        );
+    }
+
+    #[test]
+    fn composite_with_empty_values_errors_like_plain_param() {
+        let backend = backend();
+        let param = SearchParameter {
+            values: vec![],
+            ..code_value_quantity_param("unused")
+        };
+        let err = backend
+            .composite_component_filters("t1", "Observation", &param)
+            .expect_err("empty values must error");
+        assert!(
+            matches!(
+                err,
+                StorageError::Search(SearchError::QueryParseError { .. })
+            ),
+            "expected QueryParseError like build_search_index_filter's own empty-values guard, \
+             got {err:?}"
         );
     }
 }
@@ -4162,6 +4901,90 @@ mod trim_probe_row_tests {
         let mut rows: Vec<i32> = Vec::new();
         assert_eq!(trim_probe_row(&mut rows, 3, true, true), (false, false));
         assert!(rows.is_empty());
+    }
+}
+
+/// #1206 review: `build_search_parameters` must resolve the parameter type
+/// from the *parsed* value for anything the registry doesn't declare as
+/// Composite, so the registry-miss fallback still sees a stripped
+/// comparator prefix, exactly as it did before the composite path existed.
+#[cfg(test)]
+mod build_search_parameters_tests {
+    use super::*;
+    use crate::backends::mongodb::MongoBackendConfig;
+    use crate::tenant::{TenantId, TenantPermissions};
+
+    fn tenant() -> TenantContext {
+        TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access())
+    }
+
+    /// A parameter the registry has never heard of falls back to
+    /// `infer_param_type_from_value`, which assumes the comparator prefix
+    /// has already been stripped. With the default (embedded-only)
+    /// registry, `foo` is unregistered, so `gt2020-01-01` must still be
+    /// read as `Date` with prefix `Gt` and value `2020-01-01` — the
+    /// pre-#1206 behaviour that a raw-string probe silently broke.
+    #[test]
+    fn unregistered_parameter_resolves_type_from_the_stripped_value() {
+        let backend = MongoBackend::new(MongoBackendConfig::default()).unwrap();
+        let params = backend
+            .build_search_parameters(
+                &tenant(),
+                "Patient",
+                &[("foo".to_string(), "gt2020-01-01".to_string())],
+            )
+            .expect("criteria build");
+
+        assert_eq!(params.len(), 1);
+        let param = &params[0];
+        assert_eq!(param.param_type, SearchParamType::Date);
+        assert!(param.components.is_empty());
+        assert_eq!(param.values.len(), 1);
+        assert_eq!(param.values[0].prefix, SearchPrefix::Gt);
+        assert_eq!(param.values[0].value, "2020-01-01");
+    }
+
+    /// With the full R4 registry loaded, a registry-declared composite
+    /// parameter is the one case that keeps the raw `$`-joined string
+    /// (`parse` would strip a prefix off the whole composite when its
+    /// first component is itself ordered) and populates `components` from
+    /// the registry's declared sub-parameters.
+    #[test]
+    fn registered_composite_parameter_keeps_the_raw_value_and_components() {
+        let data_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("data"))
+            .expect("workspace data dir");
+        let backend = MongoBackend::new(MongoBackendConfig {
+            data_dir: Some(data_dir),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let params = backend
+            .build_search_parameters(
+                &tenant(),
+                "Observation",
+                &[(
+                    "code-value-quantity".to_string(),
+                    "http://loinc.org|8302-2$gt150".to_string(),
+                )],
+            )
+            .expect("criteria build");
+
+        assert_eq!(params.len(), 1);
+        let param = &params[0];
+        assert_eq!(param.param_type, SearchParamType::Composite);
+        assert_eq!(param.values.len(), 1);
+        assert_eq!(param.values[0].prefix, SearchPrefix::Eq);
+        assert_eq!(param.values[0].value, "http://loinc.org|8302-2$gt150");
+
+        assert_eq!(param.components.len(), 2);
+        assert_eq!(param.components[0].param_type, SearchParamType::Token);
+        assert_eq!(param.components[0].param_name, "code");
+        assert_eq!(param.components[1].param_type, SearchParamType::Quantity);
+        assert_eq!(param.components[1].param_name, "value-quantity");
     }
 }
 
