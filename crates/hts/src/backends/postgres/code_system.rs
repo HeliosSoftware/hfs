@@ -22,7 +22,7 @@ use super::value_set::{
 };
 use super::{
     PG_LOOKUP_RESPONSE_CACHE_MAX, PG_SUBSUMES_RESPONSE_CACHE_MAX, PostgresTerminologyBackend,
-    ResolvedMetaCache,
+    ResolvedMetaCache, error_chain,
 };
 
 /// Cache wrapper around [`resolve_code_system`]. The free function is
@@ -107,7 +107,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             .pool
             .get()
             .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
 
         let (system_id, cs_name, cs_version) = resolve_code_system_cached(
             &self.cs_resolved_meta_cache,
@@ -237,7 +237,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             .pool
             .get()
             .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
 
         // Location strings depend on the FHIR input form. Mirrors
         // `postgres/value_set.rs:447-454` and is rewritten by the operations
@@ -688,7 +688,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             .pool
             .get()
             .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
 
         let (system_id, _, _) = resolve_code_system_cached(
             &self.cs_resolved_meta_cache,
@@ -736,7 +736,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             .pool
             .get()
             .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
         let sql = format!(
             "SELECT version FROM code_systems WHERE url = $1 ORDER BY {} LIMIT 1",
             crate::backends::cs_precedence_order_by("code_systems")
@@ -744,7 +744,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         let row = client
             .query_opt(&sql, &[&url])
             .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
         Ok(row.and_then(|r| r.get::<_, Option<String>>(0)))
     }
 
@@ -760,14 +760,14 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             .pool
             .get()
             .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
         let row = client
             .query_one(
                 "SELECT EXISTS(SELECT 1 FROM code_systems WHERE url = $1)",
                 &[&url],
             )
             .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
         Ok(row.get::<_, bool>(0))
     }
 
@@ -780,7 +780,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             .pool
             .get()
             .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
         let sql = format!(
             "SELECT resource_json->>'language' FROM code_systems \
              WHERE url = $1 ORDER BY {} LIMIT 1",
@@ -789,7 +789,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         let row = client
             .query_opt(&sql, &[&url])
             .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
         Ok(row.and_then(|r| r.get::<_, Option<String>>(0)))
     }
 
@@ -803,7 +803,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             .pool
             .get()
             .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
         // Mirror the SQLite implementation: hierarchyMeaning='is-a' AND at least
         // one materialised parent/child edge. `$2 IS NULL` lets an unpinned
         // request match any version of the URL.
@@ -818,7 +818,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                 &[&url, &version],
             )
             .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
         Ok(row.is_some())
     }
 
@@ -835,7 +835,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             .pool
             .get()
             .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
         let rows = client
             .query(
                 "SELECT c.code, cd.language, cd.use_system, cd.use_code, cd.value
@@ -847,7 +847,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                 &[&system_url, &codes],
             )
             .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
         let mut out: std::collections::HashMap<String, Vec<ConceptDesignation>> =
             std::collections::HashMap::new();
         for row in rows {
@@ -877,7 +877,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             .pool
             .get()
             .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
         let rows = client
             .query(
                 "SELECT c.code, cp.property, cp.value
@@ -890,7 +890,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                 &[&system_url, &codes, &properties],
             )
             .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
         let mut out: std::collections::HashMap<String, Vec<(String, String)>> =
             std::collections::HashMap::new();
         for row in rows {
@@ -918,7 +918,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                     &[&system_url, &codes],
                 )
                 .await
-                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
             for row in def_rows {
                 let code: String = row.get(0);
                 let definition: String = row.get(1);
@@ -945,7 +945,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             .pool
             .get()
             .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
 
         // Per FHIR concept-properties IG, the standard `notSelectable` and
         // `inactive` properties' local CodeSystem.property.code can be ANY
@@ -974,7 +974,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                 &[&system_url, &codes, &abstract_codes, &inactive_codes],
             )
             .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
         let mut out: std::collections::HashMap<String, ConceptExpansionFlags> =
             std::collections::HashMap::new();
@@ -1014,7 +1014,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             .pool
             .get()
             .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
 
         if !string_search.is_empty() {
             return super::search_resources(
@@ -1052,7 +1052,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                 ],
             )
             .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
         let mut results = Vec::new();
         for row in rows {
@@ -1098,7 +1098,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             .pool
             .get()
             .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
 
         // Read the base CodeSystem's resource_json (highest version), then
         // walk concept[] picking entries whose code is in the requested set.
@@ -1112,7 +1112,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         let row = client
             .query_opt(&sql, &[&system_url])
             .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
         let mut out: std::collections::HashMap<String, serde_json::Value> =
             std::collections::HashMap::new();
@@ -1137,7 +1137,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             .pool
             .get()
             .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
 
         // Mirrors sqlite/code_system.rs:1477-1532.
         let rows = client
@@ -1147,7 +1147,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                 &[&supplement_urls],
             )
             .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
         let mut out: std::collections::HashMap<String, Vec<serde_json::Value>> =
             std::collections::HashMap::new();
@@ -1177,7 +1177,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             .pool
             .get()
             .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
 
         let sql = format!(
             "SELECT content, version, resource_json->>'supplements' \
@@ -1189,7 +1189,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         let row = client
             .query_opt(&sql, &[&supplement_url])
             .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
         let Some(r) = row else { return Ok(None) };
         let content: String = r.get(0);
         if content != "supplement" {
@@ -1223,7 +1223,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             .pool
             .get()
             .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
 
         // Mirrors sqlite/code_system.rs:1261-1345.
         let rows = client
@@ -1239,7 +1239,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                 &[&supplement_urls, &codes],
             )
             .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
         let mut out: std::collections::HashMap<String, Vec<ConceptDesignation>> =
             std::collections::HashMap::new();
@@ -1280,7 +1280,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             .pool
             .get()
             .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
 
         // Empty `properties` slice = "every property" (lookup wildcard mode).
         // Mirrors sqlite/code_system.rs:1347-1434.
@@ -1298,7 +1298,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                     &[&supplement_urls, &codes],
                 )
                 .await
-                .map_err(|e| HtsError::StorageError(e.to_string()))?
+                .map_err(|e| HtsError::StorageError(error_chain(&e)))?
         } else {
             client
                 .query(
@@ -1313,7 +1313,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                     &[&supplement_urls, &codes, &properties],
                 )
                 .await
-                .map_err(|e| HtsError::StorageError(e.to_string()))?
+                .map_err(|e| HtsError::StorageError(error_chain(&e)))?
         };
 
         let mut out: std::collections::HashMap<String, Vec<(String, String)>> =
@@ -1402,7 +1402,7 @@ async fn resolve_code_system(
     let rows = client
         .query(&sql, &[&url, &date])
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     if rows.is_empty() {
         return Err(HtsError::NotFound(format!("CodeSystem not found: {url}")));
@@ -1582,7 +1582,7 @@ async fn find_concept(
             &[&system_id, &code],
         )
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     let row = rows
         .into_iter()
@@ -1604,7 +1604,7 @@ async fn fetch_properties(
             &[&concept_id],
         )
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     Ok(rows
         .into_iter()
@@ -1650,7 +1650,7 @@ async fn fetch_synthesised_properties(
             &[&system_id, &code],
         )
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
     for row in parent_rows {
         let parent_code: String = row.get(0);
         if stored_parent_codes.contains(parent_code.as_str()) {
@@ -1676,7 +1676,7 @@ async fn fetch_synthesised_properties(
             &[&system_id, &code],
         )
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
     for row in child_rows {
         out.push(PropertyValue {
             code: "child".into(),
@@ -1701,7 +1701,7 @@ async fn fetch_synthesised_properties(
                 &[&system_id, &code],
             )
             .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
         let inactive: bool = row.get(0);
         out.push(PropertyValue {
             code: "inactive".into(),
@@ -1726,7 +1726,7 @@ async fn fetch_designations(
             &[&concept_id],
         )
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     Ok(rows
         .into_iter()
@@ -1764,7 +1764,7 @@ async fn fetch_designations_cross_version(
     let rows = client
         .query(&sql, &[&url, &code, &exclude_system_id])
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     // Language matching happens here rather than in SQL so the RFC 4647
     // fallback rules (`de-DE` → `de`, `de` → `de-CH`) apply.
@@ -1815,7 +1815,7 @@ pub(super) async fn check_ancestor(
             &[&system_id, &ancestor_code, &descendant_code],
         )
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     Ok(!rows.is_empty())
 }

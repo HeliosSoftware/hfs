@@ -28,10 +28,10 @@ issue and replace the `☐` cells.
 | `sqlite-es` (SQLite + Elasticsearch) | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ |
 | `postgres` | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ |
 | `pg-es` (PostgreSQL + Elasticsearch) | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ |
-| `mongodb` | ☐ | ☐ | ☐ | ☐ | ☐ (4.8, 4.13 N/A) | ☐ | ☐ | ☐ | ☐ | ☐ |
+| `mongodb` | ☐ | ☐ | ☐ | ☐ | ☐ (4.13 N/A) | ☐ | ☐ | ☐ | ☐ | ☐ |
 | `mongo-es` (MongoDB + Elasticsearch) | ☐ | ☐ | ☐ | ☐ | ☐ | N/A (501) | ☐ | ☐ | ☐ | ☐ |
 | `s3` (MinIO) | ☐ | ☐ | ☐ (batch only) | ☐ | N/A (no search) | N/A (501) | ☐ | ☐ | ☐ | ☐ |
-| `s3-es` (MinIO + Elasticsearch) | ☐ | ☐ | ☐ (batch only) | ☐ | ☐ | N/A (501) | ☐ | ☐ | ☐ | ☐ |
+| `s3-es` (MinIO + Elasticsearch) | ☐ | ☐ | ☐ (batch only) | ☐ | ☐ | ☐ (5.8: 0 Patient) | ☐ | ☐ | ☐ | ☐ |
 
 Tester: ______  Commit: ______  Date: ______  OS/arch: ______
 
@@ -47,7 +47,7 @@ that is a failure.
 | Search | yes | yes (ES) | yes | yes (ES) | yes | yes (ES) | **no** | yes (ES) |
 | Chained and `_has` search | yes | yes | yes | yes | yes | yes | no | yes |
 | Transaction Bundles | yes | yes | yes | yes | yes (replica set) | yes (replica set) | **no** (batch only) | **no** (batch only) |
-| Bulk Data `$export` (job store) | yes | yes | yes | yes | yes | no (501) | no (501) | no (501) |
+| Bulk Data `$export` (job store) | yes | yes | yes | yes | yes | no (501) | no (501) | yes (SQLite sidecar) |
 | `$bulk-submit` ingestion (Import page) | yes | yes | yes | yes | yes | yes | yes¹ | yes¹ |
 | `$sql-run` / `$sql-export` runner | in-DB | in-DB (primary) | in-DB | in-DB (primary) | in-DB (aggregation) | in-DB (primary) | in-process scan | in-process scan |
 | Subscriptions engine | yes | yes | yes | yes | yes | yes | yes | yes |
@@ -541,7 +541,7 @@ issues a `PUT` and the ids are known in advance.
 | 4.5 | **quantity** | `GET /Observation?code=8302-2&value-quantity=gt150` · `GET /Observation?code=8302-2&value-quantity=gt150\|\|cm` · `GET /Observation?code=8302-2&value-quantity=lt50\|http://unitsofmeasure.org\|cm` | first two > 0 and equal (every corpus height is in cm); open a row and check `valueQuantity.value` > 150; the third is a strict subset (infant heights) |
 | 4.6 | **reference** | `GET /Observation?subject=Patient/PID` · `GET /Condition?patient=PID` · `GET /Encounter?subject=PID&_include=Encounter:subject` | **165** · **15** · **24 results · 1 included** (the included Patient is not shown as a row; the raw Bundle via **Open in New Tab** has one entry with `search.mode = include`) |
 | 4.7 | **uri** | `GET /ValueSet?url=http://example.org/fhir/ValueSet/manual-test` · `GET /ValueSet?url:below=http://example.org/fhir` | **1 result** · ≥ 1 |
-| 4.8 | **composite** | `GET /Observation?code-value-quantity=http://loinc.org\|8302-2$gt150` | > 0; equals the first count in 4.5; every row is a Body Height with value > 150 **N/A on `mongodb`** (composite search is not implemented there; expect a clear 400, not a 500) |
+| 4.8 | **composite** | `GET /Observation?code-value-quantity=http://loinc.org\|8302-2$gt150` | > 0; equals the first count in 4.5; every row is a Body Height with value > 150 |
 | 4.9 | **special** (`_id`) | `GET /Patient?_id=PID` · `GET /Patient?_id=PID,<LPID from T2>` | **1** · **2** |
 | 4.10 | **chained** | `GET /Observation?subject.identifier=http://hl7.org/fhir/sid/us-ssn\|999-33-3920` · `GET /Observation?subject:Patient.family=Parker433&_count=5` | **165 results** (same as 4.6) · > 165, every row's `subject.display` ends in Parker433. |
 | 4.11 | **reverse chained** | `GET /Patient?_has:Observation:patient:code=http://loinc.org\|8302-2&_count=5` | > 0; pick a row, then `GET /Observation?patient=<that id>&code=8302-2` is > 0. |
@@ -564,7 +564,7 @@ shows up twice, while the patient and everything under it exist only once.
 | 4.18 | **reference + `_include`** through references the transaction resolved | `GET /Encounter?patient=LPID&_include=Encounter:service-provider` · `GET /Encounter?patient=LPID&_include=Encounter:participant` | **49 results · 4 included** (the four batch Organizations) · **49 results · 4 included** (the four batch Practitioners). In the raw Bundle (**Open in New Tab**) every `serviceProvider.reference` is a literal `Organization/<id>` |
 | 4.19 | **chained** through the batch reference data | `GET /Encounter?patient=LPID&service-provider.name=ENCOMPASS` · `GET /Encounter?patient=LPID&participant.identifier=http://hl7.org/fhir/sid/us-npi\|9999989798` | **38** · **38** (38 of the 49 encounters are at ENCOMPASS HEALTH BRAINTREE with Dr. Nickolas58 Schumm995). |
 | 4.20 | **batch reference data**, duplicated by the corpus | `GET /Organization?name=TIMOTHY DANIELS HOUSE` · `GET /Organization?address-city=HOLLISTON` · `GET /Practitioner?identifier=http://hl7.org/fhir/sid/us-npi\|9999888693` · `GET /Practitioner?family=Torphy630&given=Laine739&gender=female` · `GET /Location?name=A&A HEALTHCARE LLC` | **2 results** each (one created by the T2 batch with a server-assigned id, one imported by T3 with the Synthea id) |
-| 4.21 | **clinical data** under the patient | `GET /Condition?patient=LPID&clinical-status=active` · `GET /Condition?patient=LPID&code=http://snomed.info/sct\|72892002` · `GET /Observation?patient=LPID&code=29463-7&value-quantity=gt60` · `GET /Observation?patient=LPID&code-value-quantity=http://loinc.org\|8302-2$gt160` · `GET /Immunization?patient=LPID&vaccine-code=http://hl7.org/fhir/sid/cvx\|140` · `GET /MedicationRequest?patient=LPID&status=stopped` · `GET /MedicationRequest?patient=LPID&code=http://www.nlm.nih.gov/research/umls/rxnorm\|757594` | **6** · **3** (Normal pregnancy) · **2** (60.2 kg and 64.5 kg) · **3** (all 164.1 cm; **N/A on `mongodb`**, composite) · **3** (seasonal influenza) · **9** · **4** (Jolivette 28 Day Pack) |
+| 4.21 | **clinical data** under the patient | `GET /Condition?patient=LPID&clinical-status=active` · `GET /Condition?patient=LPID&code=http://snomed.info/sct\|72892002` · `GET /Observation?patient=LPID&code=29463-7&value-quantity=gt60` · `GET /Observation?patient=LPID&code-value-quantity=http://loinc.org\|8302-2$gt160` · `GET /Immunization?patient=LPID&vaccine-code=http://hl7.org/fhir/sid/cvx\|140` · `GET /MedicationRequest?patient=LPID&status=stopped` · `GET /MedicationRequest?patient=LPID&code=http://www.nlm.nih.gov/research/umls/rxnorm\|757594` | **6** · **3** (Normal pregnancy) · **2** (60.2 kg and 64.5 kg) · **3** (all 164.1 cm) · **3** (seasonal influenza) · **9** · **4** (Jolivette 28 Day Pack) |
 | 4.22 | **`_revinclude` / `_has` / `_sort`** | `GET /Patient?_id=LPID&_revinclude=Immunization:patient` · `GET /Patient?_has:Condition:patient:code=http://snomed.info/sct\|706893006&_count=50` · `GET /Observation?patient=LPID&code=29463-7&_sort=date` | **1 result · 8 included** · `LPID` is among the rows · **4 results** whose values read 55.4, 58.5, 60.2, 64.5 from top to bottom (open each row). |
 
 ### 8.4 Searches over the data loaded by the bulk import (T3)
@@ -661,10 +661,16 @@ HFS_BULK_EXPORT_REQUIRES_ACCESS_TOKEN=false` plus the MinIO credentials from sec
 
 Pass criteria: 5.1–5.4 and 5.7–5.11 complete with the stated files and line counts;
 5.5 cancels; 5.6 and 5.12 are rejected; 5.13 fails, retries, and deletes as
-described; the ZIP download works. On `mongo-es`, `s3`, `s3-es` the
+described; the ZIP download works. On `mongo-es` and standalone `s3` the
 card appears immediately as **Failed** with
 `kick-off answered 501: bulk export not supported by this backend` — record N/A, and
 check that **Delete** removes the failed card.
+
+On `s3-es` `$export` runs (a SQLite sidecar job store at
+`$HFS_BULK_EXPORT_OUTPUT_DIR/bulk_export.db`), so 5.1–5.13 apply as written, with
+one caveat: on the S3-family rows the T2 **transaction** Bundle is refused, so the
+patient it would have created is absent. Step 5.8's *until-import* export therefore
+returns **0 Patient lines**, not the Larkin patient.
 
 ---
 
@@ -1068,10 +1074,12 @@ For each backend row, attach to the release issue:
 
 ## 15. Known expectations and gotchas
 
-- **Bulk export on `mongo-es`/S3** returns `501`: the Export page shows a **Failed** card
-  reading `kick-off answered 501: bulk export not supported by this backend`. Expected —
-  the composite and S3-backed rows have no bulk-export job store. Standalone `mongodb`
-  supports `$export` (a SQLite sidecar job store).
+- **Bulk export on `mongo-es` and standalone `s3`** returns `501`: the Export page shows a
+  **Failed** card reading `kick-off answered 501: bulk export not supported by this backend`.
+  Expected — those rows have no bulk-export job store. Standalone `mongodb` and `s3-es`
+  both support `$export` via a SQLite sidecar job store
+  (`$HFS_BULK_EXPORT_OUTPUT_DIR/bulk_export.db`). (Whether standalone `s3` and `mongo-es`
+  gain the sidecar too is unverified as of #1167 — re-check when running those rows.)
 - **S3 standalone has no search**: the Resources page cannot run queries on the `s3`
   row (T4 is N/A); `s3-es` searches through Elasticsearch.
 - **Transaction Bundles on S3** are refused by design; batch Bundles work.

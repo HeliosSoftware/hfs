@@ -312,6 +312,32 @@ fn get_bundle_total(body: &Value) -> Option<i64> {
     body["total"].as_i64()
 }
 
+/// Returns the bundle's `self` link URL.
+fn self_link(body: &Value) -> String {
+    body["link"]
+        .as_array()
+        .and_then(|links| links.iter().find(|l| l["relation"] == "self"))
+        .and_then(|l| l["url"].as_str())
+        .expect("searchset must carry a self link")
+        .to_string()
+}
+
+/// Returns the `search.mode = outcome` entries of a searchset bundle.
+fn outcome_entries(body: &Value) -> Vec<&Value> {
+    get_bundle_entries(body)
+        .into_iter()
+        .filter(|e| e["search"]["mode"] == "outcome")
+        .collect()
+}
+
+/// Returns the `search.mode = match` entries of a searchset bundle.
+fn match_entries(body: &Value) -> Vec<&Value> {
+    get_bundle_entries(body)
+        .into_iter()
+        .filter(|e| e["search"]["mode"] == "match")
+        .collect()
+}
+
 // =============================================================================
 // Basic Search Tests
 // =============================================================================
@@ -404,24 +430,6 @@ mod basic_search {
             )
             .await;
         ok.assert_status_ok();
-    }
-
-    /// Returns the bundle's `self` link URL.
-    fn self_link(body: &Value) -> String {
-        body["link"]
-            .as_array()
-            .and_then(|links| links.iter().find(|l| l["relation"] == "self"))
-            .and_then(|l| l["url"].as_str())
-            .expect("searchset must carry a self link")
-            .to_string()
-    }
-
-    /// Returns the `search.mode = outcome` entries of a searchset bundle.
-    fn outcome_entries(body: &Value) -> Vec<&Value> {
-        get_bundle_entries(body)
-            .into_iter()
-            .filter(|e| e["search"]["mode"] == "outcome")
-            .collect()
     }
 
     #[tokio::test]
@@ -897,6 +905,110 @@ mod string_search {
                 .unwrap()
                 .contains("above")
         );
+    }
+
+    /// #1318: an unknown modifier on a direct parameter used to be dropped, so
+    /// `name:exat=Smith` ran as `name=Smith`. It is a 400 over GET and POST,
+    /// under either `Prefer: handling` mode — the parameter is one the server
+    /// understands, so there is nothing to leniently ignore.
+    #[tokio::test]
+    async fn test_unknown_modifier_on_direct_param_returns_400() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        // Positive control: the unmodified search finds seeded patients, so a
+        // dropped modifier would have returned 200 with these.
+        let control = server
+            .get("/Patient?name=Smith")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        control.assert_status_ok();
+        assert!(!get_bundle_entries(&control.json::<Value>()).is_empty());
+
+        let assert_rejected = |body: Value, param: &str, suffix: &str| {
+            assert_eq!(body["resourceType"], "OperationOutcome");
+            assert_eq!(body["issue"][0]["severity"], "error");
+            assert_eq!(body["issue"][0]["code"], "invalid");
+            let text = body["issue"][0]["details"]["text"].as_str().unwrap();
+            assert!(text.contains(param), "{text}");
+            assert!(text.contains(suffix), "{text}");
+        };
+
+        for handling in ["handling=lenient", "handling=strict"] {
+            for (path, key, param, suffix) in [
+                ("/Patient", "name:bogus", "name", ":bogus"),
+                ("/Patient", "name:exat", "name", ":exat"),
+                // Capitalised, but not a resource type.
+                ("/Observation", "subject:Bogus", "subject", ":Bogus"),
+            ] {
+                let response = server
+                    .get(&format!("{path}?{key}=Smith"))
+                    .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                    .add_header(
+                        HeaderName::from_static("prefer"),
+                        HeaderValue::from_static(handling),
+                    )
+                    .await;
+                response.assert_status(StatusCode::BAD_REQUEST);
+                assert_rejected(response.json(), param, suffix);
+
+                let response = server
+                    .post(&format!("{path}/_search"))
+                    .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                    .add_header(
+                        HeaderName::from_static("prefer"),
+                        HeaderValue::from_static(handling),
+                    )
+                    .form(&[(key, "Smith")])
+                    .await;
+                response.assert_status(StatusCode::BAD_REQUEST);
+                assert_rejected(response.json(), param, suffix);
+            }
+        }
+    }
+
+    /// #1318: an unknown modifier on an unknown *parameter* follows the
+    /// unknown-parameter rule — ignored and reported under lenient handling,
+    /// rejected as an unknown parameter under strict.
+    #[tokio::test]
+    async fn test_unknown_modifier_on_unknown_param_follows_unknown_param_rule() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let control = server
+            .get("/Patient")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        control.assert_status_ok();
+        let all = get_bundle_entries(&control.json::<Value>()).len();
+        assert!(all > 0);
+
+        let lenient = server
+            .get("/Patient?nosuchparam:bogus=x")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        lenient.assert_status_ok();
+        let body: Value = lenient.json();
+        let matches = get_bundle_entries(&body)
+            .into_iter()
+            .filter(|e| e["resource"]["resourceType"] == "Patient")
+            .count();
+        assert_eq!(matches, all, "the unknown parameter is ignored");
+
+        let strict = server
+            .get("/Patient?nosuchparam:bogus=x")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                HeaderName::from_static("prefer"),
+                HeaderValue::from_static("handling=strict"),
+            )
+            .await;
+        strict.assert_status(StatusCode::BAD_REQUEST);
+        let text = strict.json::<Value>()["issue"][0]["details"]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(text.contains("unknown search parameter"), "{text}");
     }
 }
 
@@ -1691,6 +1803,182 @@ mod compartment_search {
                 "compartment all-types must not include resources of another patient"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_compartment_unknown_param_lenient_ignored_strict_rejected() {
+        // Compartment search used to hand an unrecognized parameter straight to
+        // the backend: no 400 under strict handling, and under lenient handling
+        // a silent empty result set whose self link still claimed the filter.
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let lenient = server
+            .get("/Patient/patient-1/Observation?nonsense-param=foo")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        lenient.assert_status_ok();
+
+        let strict = server
+            .get("/Patient/patient-1/Observation?nonsense-param=foo")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                HeaderName::from_static("prefer"),
+                HeaderValue::from_static("handling=strict"),
+            )
+            .await;
+        assert_eq!(
+            strict.status_code(),
+            StatusCode::BAD_REQUEST,
+            "unknown compartment parameter must be rejected under Prefer: handling=strict"
+        );
+
+        // A parameter the target type does know is accepted even under strict.
+        let ok = server
+            .get("/Patient/patient-1/Observation?code=8867-4")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                HeaderName::from_static("prefer"),
+                HeaderValue::from_static("handling=strict"),
+            )
+            .await;
+        ok.assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn test_compartment_unknown_underscore_param_rejected_under_strict() {
+        // `_`-prefixed names are not a bypass here either (#524 for the
+        // type-level path).
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        for param in ["_typo=foo", "_whatever=foo"] {
+            let strict = server
+                .get(&format!("/Patient/patient-1/Observation?{param}"))
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .add_header(
+                    HeaderName::from_static("prefer"),
+                    HeaderValue::from_static("handling=strict"),
+                )
+                .await;
+            assert_eq!(
+                strict.status_code(),
+                StatusCode::BAD_REQUEST,
+                "{param} must be rejected under Prefer: handling=strict"
+            );
+        }
+
+        // Global parameters the server does honour still pass.
+        for param in ["_id=obs-1", "_lastUpdated=gt2000-01-01"] {
+            let ok = server
+                .get(&format!("/Patient/patient-1/Observation?{param}"))
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .add_header(
+                    HeaderName::from_static("prefer"),
+                    HeaderValue::from_static("handling=strict"),
+                )
+                .await;
+            ok.assert_status_ok();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_compartment_ignored_param_dropped_from_self_link_and_reported() {
+        // Under lenient handling an unsupported parameter may be ignored only if
+        // the server says so: it must not appear in the self link, it must be
+        // reported as an OperationOutcome entry, and "ignored" must be literal —
+        // the compartment result set is the same as without it.
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let unfiltered: Value = server
+            .get("/Patient/patient-1/Observation")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await
+            .json();
+        let total = match_entries(&unfiltered).len();
+        assert!(total > 0, "fixture should seed patient-1 observations");
+
+        for query in ["_typo=foo", "nonsense-param=foo"] {
+            let response = server
+                .get(&format!("/Patient/patient-1/Observation?{query}"))
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            response.assert_status_ok();
+            let body: Value = response.json();
+
+            let link = self_link(&body);
+            assert!(
+                !link.contains("typo") && !link.contains("nonsense-param"),
+                "self link must not echo the ignored parameter ({query}): {link}"
+            );
+
+            let outcomes = outcome_entries(&body);
+            assert_eq!(
+                outcomes.len(),
+                1,
+                "ignored parameter must be reported ({query})"
+            );
+            let issue = &outcomes[0]["resource"]["issue"][0];
+            assert_eq!(issue["severity"], "warning");
+            assert_eq!(issue["code"], "not-supported");
+            let text = issue["details"]["text"].as_str().unwrap_or_default();
+            assert!(
+                text.contains(query.split('=').next().unwrap()),
+                "outcome must name the ignored parameter: {text}"
+            );
+
+            assert_eq!(
+                match_entries(&body).len(),
+                total,
+                "ignored parameter must not filter the compartment ({query})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_compartment_all_types_unknown_param() {
+        // `GET [compartment]/[id]/*` applies the same rule, but a parameter only
+        // counts as unknown when NO member type knows it.
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let strict = server
+            .get("/Patient/patient-1/*?nonsense-param=foo")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                HeaderName::from_static("prefer"),
+                HeaderValue::from_static("handling=strict"),
+            )
+            .await;
+        assert_eq!(strict.status_code(), StatusCode::BAD_REQUEST);
+
+        // `code` is not a Patient parameter, but it is an Observation one, and
+        // the member types that cannot satisfy it are simply skipped. Rejecting
+        // it here would break `*` for a parameter the single-type search accepts.
+        let known_to_one_member = server
+            .get("/Patient/patient-1/*?code=8867-4")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                HeaderName::from_static("prefer"),
+                HeaderValue::from_static("handling=strict"),
+            )
+            .await;
+        known_to_one_member.assert_status_ok();
+
+        // Lenient: ignored, reported, and absent from the self link.
+        let response = server
+            .get("/Patient/patient-1/*?nonsense-param=foo")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        assert!(
+            !self_link(&body).contains("nonsense-param"),
+            "self link must not echo the ignored parameter: {}",
+            self_link(&body)
+        );
+        assert_eq!(outcome_entries(&body).len(), 1);
     }
 }
 

@@ -638,7 +638,13 @@ fn drain_truncation_markers(included: &mut Vec<StoredResource>) -> Vec<String> {
 ///
 /// FHIR allows an unsupported parameter to be ignored only if the server says
 /// so; the self link already omits it, and this outcome names it explicitly.
-fn append_ignored_params_outcome(bundle_json: &mut serde_json::Value, ignored: &[String]) {
+///
+/// Shared with [`crate::handlers::compartment`], whose searchsets report
+/// ignored parameters exactly the same way.
+pub(crate) fn append_ignored_params_outcome(
+    bundle_json: &mut serde_json::Value,
+    ignored: &[String],
+) {
     append_warning_outcome(
         bundle_json,
         &format!(

@@ -344,7 +344,7 @@ fn parse_search_parameter(
     let (base_name, chain, modifier) = if name.contains('.') {
         parse_chain(name)?
     } else {
-        let (base_name, modifier) = parse_parameter_name(name);
+        let (base_name, modifier) = parse_parameter_name(name)?;
         (base_name, vec![], modifier)
     };
 
@@ -422,29 +422,46 @@ fn parse_search_parameter(
     Ok(param)
 }
 
-/// Parses a parameter name into the base name and optional modifier.
+/// Parses a direct (unchained) parameter name into the base name and optional
+/// modifier.
+///
+/// A `:suffix` that is neither a search modifier nor a resource-type qualifier
+/// is an error: dropping it would run a different search than the one asked
+/// for (`name:exat=Smith` would widen an exact match into a prefix match).
 ///
 /// Examples:
 /// - "name" -> ("name", None)
 /// - "name:exact" -> ("name", Some(Exact))
 /// - "subject:Patient" -> ("subject", Some(Type("Patient")))
-fn parse_parameter_name(name: &str) -> (&str, Option<SearchModifier>) {
-    if let Some(colon_pos) = name.find(':') {
-        let param_name = &name[..colon_pos];
-        let modifier_str = &name[colon_pos + 1..];
+/// - "name:bogus" -> error
+fn parse_parameter_name(name: &str) -> Result<(&str, Option<SearchModifier>), RestError> {
+    let (param_name, suffix) = split_qualifier(name);
+    let modifier = suffix
+        .map(|s| {
+            parse_modifier(s).ok_or_else(|| RestError::InvalidParameter {
+                param: name.to_string(),
+                message: format!(
+                    "unknown search modifier ':{s}' on parameter '{param_name}'; it is neither a \
+                     search modifier nor a resource type"
+                ),
+            })
+        })
+        .transpose()?;
+    Ok((param_name, modifier))
+}
 
-        // Check if there's a chain after the modifier
-        // e.g., "subject:Patient.name" -> modifier is "Patient", then chain follows
-        let modifier_str = if let Some(dot_pos) = modifier_str.find('.') {
-            &modifier_str[..dot_pos]
-        } else {
-            modifier_str
-        };
-
-        let modifier = SearchModifier::parse(modifier_str);
-        (param_name, modifier)
-    } else {
-        (name, None)
+/// Parses a `:suffix` as a search modifier, or as the `:[type]` qualifier of a
+/// reference parameter.
+///
+/// `SearchModifier::parse` reads any capitalised suffix as a type qualifier, so
+/// the name is checked against the resource types of the enabled FHIR versions
+/// here — `subject:Bogus` is no more a modifier than `subject:bogus`. Whether
+/// the modifier suits the parameter's *type* (a `:[type]` qualifier is only
+/// defined for references) is `validate_modifier`'s job.
+fn parse_modifier(suffix: &str) -> Option<SearchModifier> {
+    match SearchModifier::parse(suffix)? {
+        SearchModifier::Type(t) if !crate::fhir_types::is_valid_resource_type(&t) => None,
+        modifier => Some(modifier),
     }
 }
 
@@ -516,7 +533,7 @@ fn parse_terminal_modifier(
     terminal_param: &str,
     suffix: &str,
 ) -> Result<SearchModifier, RestError> {
-    SearchModifier::parse(suffix).ok_or_else(|| RestError::InvalidParameter {
+    parse_modifier(suffix).ok_or_else(|| RestError::InvalidParameter {
         param: name.to_string(),
         message: format!(
             "unknown search modifier ':{suffix}' on '{terminal_param}', the last parameter of \
@@ -792,7 +809,7 @@ mod tests {
 
     #[test]
     fn test_parse_parameter_name_simple() {
-        let (name, modifier) = parse_parameter_name("name");
+        let (name, modifier) = parse_parameter_name("name").unwrap();
         assert_eq!(name, "name");
         assert!(modifier.is_none());
     }
@@ -827,16 +844,136 @@ mod tests {
 
     #[test]
     fn test_parse_parameter_name_with_modifier() {
-        let (name, modifier) = parse_parameter_name("name:exact");
+        let (name, modifier) = parse_parameter_name("name:exact").unwrap();
         assert_eq!(name, "name");
         assert_eq!(modifier, Some(SearchModifier::Exact));
     }
 
     #[test]
     fn test_parse_parameter_name_with_type_modifier() {
-        let (name, modifier) = parse_parameter_name("subject:Patient");
+        let (name, modifier) = parse_parameter_name("subject:Patient").unwrap();
         assert_eq!(name, "subject");
         assert_eq!(modifier, Some(SearchModifier::Type("Patient".to_string())));
+    }
+
+    /// #1318: a suffix that is neither a modifier nor a resource type is a 400
+    /// naming the parameter and the suffix — not a search without the modifier.
+    #[test]
+    fn test_unknown_modifier_on_direct_parameter_is_rejected() {
+        let reg = test_registry();
+        for (resource_type, name, suffix) in [
+            ("Patient", "name:bogus", ":bogus"),
+            // A typo must not widen an exact match into a prefix match.
+            ("Patient", "name:exat", ":exat"),
+            ("Patient", "name:", ":"),
+            ("Patient", "name:exact:extra", ":exact:extra"),
+            // Capitalised, but not a resource type.
+            ("Observation", "subject:Bogus", ":Bogus"),
+            ("Observation", "subject:bogus", ":bogus"),
+            // Global parameters are direct parameters too.
+            ("Patient", "_id:bogus", ":bogus"),
+            // An unregistered parameter reaching the builder gets no pass: the
+            // suffix is not a modifier whatever the parameter turns out to be.
+            ("Patient", "custom:bogus", ":bogus"),
+        ] {
+            match parse_search_parameter(resource_type, name, "x", &reg) {
+                Err(RestError::InvalidParameter { param, message }) => {
+                    assert_eq!(param, name);
+                    assert!(message.contains(&format!("'{suffix}'")), "{message}");
+                    let base = name.split(':').next().unwrap();
+                    assert!(message.contains(&format!("'{base}'")), "{message}");
+                }
+                other => panic!("{name}: expected InvalidParameter, got {other:?}"),
+            }
+        }
+    }
+
+    /// #1318: the `:[type]` qualifier stays valid on a reference parameter, is
+    /// a wrong-type modifier anywhere else, and needs a real resource type.
+    #[test]
+    fn test_type_qualifier_needs_a_reference_parameter_and_a_resource_type() {
+        let reg = test_registry();
+        let p = parse_search_parameter("Observation", "subject:Patient", "123", &reg).unwrap();
+        assert_eq!(p.name, "subject");
+        assert_eq!(
+            p.modifier,
+            Some(SearchModifier::Type("Patient".to_string()))
+        );
+
+        assert!(matches!(
+            parse_search_parameter("Patient", "birthdate:Patient", "1980", &reg),
+            Err(RestError::InvalidParameter { .. })
+        ));
+        // Case-sensitive, like every resource type name.
+        assert!(parse_search_parameter("Observation", "subject:PATIENT", "123", &reg).is_err());
+        // The same rule holds on the terminal of a chain.
+        assert!(parse_chain("subject.general-practitioner:Bogus").is_err());
+        assert!(parse_chain("subject.general-practitioner:Practitioner").is_ok());
+    }
+
+    /// #1318: every modifier in `SearchModifier` is still accepted on a
+    /// parameter type it is defined for.
+    #[test]
+    fn test_every_known_modifier_is_still_accepted() {
+        let reg = test_registry();
+        for (resource_type, name, value, expected) in [
+            ("Patient", "name:exact", "x", SearchModifier::Exact),
+            ("Patient", "name:contains", "x", SearchModifier::Contains),
+            ("Patient", "name:text", "x", SearchModifier::Text),
+            ("Patient", "name:missing", "true", SearchModifier::Missing),
+            ("Observation", "code:not", "x", SearchModifier::Not),
+            ("Observation", "code:text", "x", SearchModifier::Text),
+            ("Observation", "code:above", "x", SearchModifier::Above),
+            ("Observation", "code:below", "x", SearchModifier::Below),
+            ("Observation", "code:in", "x", SearchModifier::In),
+            ("Observation", "code:not-in", "x", SearchModifier::NotIn),
+            (
+                "Observation",
+                "code:of-type",
+                "a|b|c",
+                SearchModifier::OfType,
+            ),
+            (
+                "Observation",
+                "code:ofType",
+                "a|b|c",
+                SearchModifier::OfType,
+            ),
+            (
+                "Observation",
+                "code:code-text",
+                "x",
+                SearchModifier::CodeText,
+            ),
+            (
+                "Observation",
+                "code:text-advanced",
+                "x",
+                SearchModifier::TextAdvanced,
+            ),
+            (
+                "Observation",
+                "subject:identifier",
+                "s|v",
+                SearchModifier::Identifier,
+            ),
+            (
+                "Observation",
+                "subject:Patient",
+                "1",
+                SearchModifier::Type("Patient".to_string()),
+            ),
+            (
+                "Observation",
+                "date:missing",
+                "false",
+                SearchModifier::Missing,
+            ),
+        ] {
+            let p = parse_search_parameter(resource_type, name, value, &reg)
+                .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            assert_eq!(p.modifier, Some(expected), "{name}");
+        }
     }
 
     #[test]

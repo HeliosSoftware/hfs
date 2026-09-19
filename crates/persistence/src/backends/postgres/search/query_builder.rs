@@ -1282,7 +1282,7 @@ impl PostgresQueryBuilder {
                 .zip(param.components.iter())
                 .zip(component_slots.iter())
             {
-                let cv = Self::parse_component_value(part);
+                let cv = Self::parse_component_value(part, component.param_type);
                 match Self::build_composite_component(&cv, component.param_type, next, *slot) {
                     Some((sql, params)) => {
                         next += params.len();
@@ -1439,7 +1439,7 @@ impl PostgresQueryBuilder {
             let mut ok = true;
 
             for (idx, (part, component)) in parts.iter().zip(param.components.iter()).enumerate() {
-                let cv = Self::parse_component_value(part);
+                let cv = Self::parse_component_value(part, component.param_type);
                 // 1-based, and the same order the extractor assigns slots from.
                 let slot = (idx + 1).min(u8::MAX as usize) as u8;
                 match Self::build_composite_component_transitional(
@@ -1500,8 +1500,26 @@ impl PostgresQueryBuilder {
         ))
     }
 
-    /// Parses a composite component value, stripping any comparison prefix.
-    fn parse_component_value(part: &str) -> SearchValue {
+    /// Parses a composite component value, stripping a comparison prefix.
+    ///
+    /// Comparison prefixes (`ne`/`gt`/`lt`/`ge`/`le`/`sa`/`eb`/`ap`/`eq`) exist
+    /// only for number, date and quantity search values, so they are recognised
+    /// **only** for those component types. A token, string, reference or uri
+    /// component is taken verbatim — otherwise a code that merely begins with one
+    /// of those letter pairs (`left`, `negative`, `ge123`) would be mangled into
+    /// `ft`/`gative`/`123` and never match (#1236). Matches Elasticsearch and
+    /// MongoDB, which parse prefixes only in their Number/Date/Quantity arms.
+    fn parse_component_value(part: &str, param_type: SearchParamType) -> SearchValue {
+        if !matches!(
+            param_type,
+            SearchParamType::Number | SearchParamType::Date | SearchParamType::Quantity
+        ) {
+            return SearchValue {
+                prefix: SearchPrefix::Eq,
+                value: part.to_string(),
+            };
+        }
+
         let prefixes = [
             ("ne", SearchPrefix::Ne),
             ("gt", SearchPrefix::Gt),
@@ -2320,21 +2338,16 @@ impl PostgresQueryBuilder {
     ///
     /// Handles partial dates (year, year-month, date) and full date-times.
     fn parse_date_value(value: &str) -> DateTime<Utc> {
-        let normalized = if value.contains('T') {
-            if value.contains('+') || value.contains('Z') || value.ends_with("-00:00") {
-                value.to_string()
-            } else {
-                format!("{}+00:00", value)
-            }
-        } else if value.len() == 10 {
-            format!("{}T00:00:00+00:00", value)
-        } else if value.len() == 7 {
-            format!("{}-01T00:00:00+00:00", value)
-        } else if value.len() == 4 {
-            format!("{}-01-01T00:00:00+00:00", value)
-        } else {
-            value.to_string()
-        };
+        // Normalized by the same function the index writer uses, so a search
+        // value and the stored value it should match can never be zoned
+        // differently. This used to carry its own zone test, which recognized
+        // only `+`, `Z` and `-00:00`: every other negative offset
+        // (`2013-04-05T09:20:00-04:00`) was taken for zone-less, had `+00:00`
+        // appended, failed to parse, and fell through to `Utc::now()` below —
+        // so the search silently compared against the current time and
+        // matched nothing. The writer's copy of that bug was fixed; this one
+        // was not.
+        let normalized = super::writer::normalize_date_for_pg(value);
 
         DateTime::parse_from_rfc3339(&normalized)
             .map(|dt| dt.with_timezone(&Utc))
@@ -2889,6 +2902,33 @@ mod tests {
     }
 
     #[test]
+    fn composite_prefix_is_only_parsed_for_numeric_component_types() {
+        // A token/string/reference/uri code that begins with a prefix's letters
+        // must be taken verbatim (#1236): `left` is not `le` + `ft`.
+        for (code, ty) in [
+            ("left", SearchParamType::Token),
+            ("negative", SearchParamType::String),
+            ("ge123", SearchParamType::Token),
+            ("http://x/y", SearchParamType::Uri),
+        ] {
+            let cv = PostgresQueryBuilder::parse_component_value(code, ty);
+            assert!(
+                matches!(cv.prefix, SearchPrefix::Eq),
+                "{code}: prefix stripped"
+            );
+            assert_eq!(cv.value, code, "{code}: value corrupted");
+        }
+
+        // …while number, date and quantity still parse theirs.
+        let q = PostgresQueryBuilder::parse_component_value("lt60", SearchParamType::Quantity);
+        assert!(matches!(q.prefix, SearchPrefix::Lt));
+        assert_eq!(q.value, "60");
+        let d = PostgresQueryBuilder::parse_component_value("ge2024", SearchParamType::Date);
+        assert!(matches!(d.prefix, SearchPrefix::Ge));
+        assert_eq!(d.value, "2024");
+    }
+
+    #[test]
     fn every_composite_quantity_prefix_is_a_strict_operator() {
         // `WHERE value_quantity_value IS NOT NULL` on the composite index is
         // only provable from a STRICT operator over that column. Every prefix
@@ -3048,6 +3088,59 @@ mod tests {
                 assert_eq!(ts.to_rfc3339(), "2026-09-02T00:00:00+00:00");
             }
             other => panic!("must bind the period end as a timestamp: {other:?}"),
+        }
+    }
+
+    /// A search value carrying a non-UTC offset must bind the instant it
+    /// names. The query-side zone test recognized only `+`, `Z` and `-00:00`,
+    /// so any other negative offset was mangled into invalid RFC3339 and the
+    /// parse fell back to `Utc::now()`: `date=2013-04-05T09:20:00-04:00`
+    /// compared against the current time and matched nothing. Found by the
+    /// Inferno US Quality Core suite, where it hid as six *skipped* (not
+    /// failed) date-search tests on the postgres leg only.
+    #[test]
+    fn date_with_negative_offset_binds_the_named_instant() {
+        let query = SearchQuery::new("Procedure").with_parameter(date_param(
+            "date",
+            SearchPrefix::Eq,
+            "2013-04-05T09:20:00-04:00",
+        ));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+
+        assert!(frag.sql.contains("value_date = $3"), "{}", frag.sql);
+        assert_eq!(frag.params.len(), 1);
+        match &frag.params[0] {
+            SqlParam::Timestamp(ts) => {
+                assert_eq!(ts.to_rfc3339(), "2013-04-05T13:20:00+00:00");
+            }
+            other => panic!("must bind a timestamp: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_date_value_honors_every_zone_form() {
+        let cases = [
+            ("2013-04-05T09:20:00-04:00", "2013-04-05T13:20:00+00:00"),
+            ("2013-04-05T09:20:00+05:30", "2013-04-05T03:50:00+00:00"),
+            ("2013-04-05T09:20:00Z", "2013-04-05T09:20:00+00:00"),
+            ("2013-04-05T09:20:00-00:00", "2013-04-05T09:20:00+00:00"),
+            // Sub-second precision with a negative offset, as Inferno sends.
+            (
+                "2021-11-10T16:48:57.246958-08:00",
+                "2021-11-11T00:48:57.246958+00:00",
+            ),
+            // Zone-less and partial values are read as UTC.
+            ("2013-04-05T09:20:00", "2013-04-05T09:20:00+00:00"),
+            ("2013-04-05", "2013-04-05T00:00:00+00:00"),
+            ("2013-04", "2013-04-01T00:00:00+00:00"),
+            ("2013", "2013-01-01T00:00:00+00:00"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                PostgresQueryBuilder::parse_date_value(input).to_rfc3339(),
+                expected,
+                "input {input}"
+            );
         }
     }
 

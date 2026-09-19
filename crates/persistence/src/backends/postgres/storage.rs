@@ -29,8 +29,8 @@ use crate::error::{
 use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
 use crate::tenant::{Operation, TenantContext};
 use crate::types::Pagination;
+use crate::types::SearchQuery;
 use crate::types::{CursorValue, Page, PageCursor, PageInfo, StoredResource};
-use crate::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
 
 use super::PostgresBackend;
 use super::cached::{execute_cached, query_opt_cached};
@@ -3056,22 +3056,6 @@ impl PurgableStorage for PostgresBackend {
 // ConditionalStorage Implementation
 // ============================================================================
 
-// Helper function to parse simple search parameters
-// Supports basic formats like: identifier=X, _id=Y, name=Z
-fn parse_simple_search_params(params: &str) -> Vec<(String, String)> {
-    params
-        .split('&')
-        .filter_map(|pair| {
-            let parts: Vec<&str> = pair.splitn(2, '=').collect();
-            if parts.len() == 2 {
-                Some((parts[0].to_string(), parts[1].to_string()))
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
 #[async_trait]
 impl ConditionalStorage for PostgresBackend {
     async fn conditional_create(
@@ -3268,73 +3252,19 @@ impl PostgresBackend {
     /// Builds the search a conditional interaction's criteria describe, or
     /// `None` when the criteria are empty — matching everything would be the
     /// literal reading, but no conditional interaction means that.
+    ///
+    /// The parsing is [`crate::search::build_conditional_query`], shared by
+    /// every backend so criteria mean what they mean as a direct search
+    /// (#1312).
     fn conditional_query(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         search_params_str: &str,
     ) -> StorageResult<Option<SearchQuery>> {
-        // Parse search parameters into (name, value) pairs
-        let parsed_params = parse_simple_search_params(search_params_str);
-
-        if parsed_params.is_empty() {
-            return Ok(None);
-        }
-
-        // Build SearchParameter objects by looking up types from the registry
-        let search_params = self.build_search_parameters(tenant, resource_type, &parsed_params)?;
-
-        Ok(Some(SearchQuery {
-            resource_type: resource_type.to_string(),
-            parameters: search_params,
-            count: Some(1000),
-            ..Default::default()
-        }))
-    }
-
-    /// Builds SearchParameter objects from parsed (name, value) pairs.
-    fn build_search_parameters(
-        &self,
-        tenant: &TenantContext,
-        resource_type: &str,
-        params: &[(String, String)],
-    ) -> StorageResult<Vec<SearchParameter>> {
         let registry_arc = self.tenant_registry(tenant.tenant_id().as_str());
         let registry = registry_arc.read();
-        let mut search_params = Vec::with_capacity(params.len());
-
-        for (name, value) in params {
-            let param_type = self
-                .lookup_param_type(&registry, resource_type, name)
-                .unwrap_or_else(|| crate::search::fallback_param_type(name));
-
-            search_params.push(SearchParameter {
-                name: name.clone(),
-                param_type,
-                modifier: None,
-                values: vec![SearchValue::parse(value)],
-                chain: vec![],
-                components: vec![],
-            });
-        }
-
-        Ok(search_params)
-    }
-
-    /// Looks up a search parameter type from the registry.
-    fn lookup_param_type(
-        &self,
-        registry: &crate::search::SearchParameterRegistry,
-        resource_type: &str,
-        param_name: &str,
-    ) -> Option<SearchParamType> {
-        if let Some(def) = registry.get_param(resource_type, param_name) {
-            return Some(def.param_type);
-        }
-        if let Some(def) = registry.get_param("Resource", param_name) {
-            return Some(def.param_type);
-        }
-        None
+        crate::search::build_conditional_query(&registry, resource_type, search_params_str)
     }
 
     // ========================================================================

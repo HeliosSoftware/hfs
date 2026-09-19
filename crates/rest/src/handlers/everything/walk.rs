@@ -1,6 +1,5 @@
 use helios_fhir::FhirVersion;
 use helios_persistence::core::{ResourceStorage, SearchProvider};
-use helios_persistence::error::{ResourceError, StorageError};
 use helios_persistence::tenant::TenantContext;
 use helios_persistence::types::{SearchQuery, StoredResource};
 
@@ -142,18 +141,25 @@ where
 {
     let refs = collect_supporting_refs(version, matches);
     let truncated = refs.len() > limit;
-    let mut included = Vec::new();
+
+    // Group the capped refs by type so each type costs one batched read
+    // instead of one round trip per reference (#1119). `read_batch` omits a
+    // missing (`Ok(None)`) or soft-deleted (`Gone`) target, so a supporting
+    // resource deleted since the matching resource referenced it is simply
+    // absent — exactly as the former per-id path handled it, and never a 410
+    // for the whole $everything response. First-seen type order is preserved.
+    let mut by_type: Vec<(String, Vec<String>)> = Vec::new();
     for (rt, id) in refs.into_iter().take(limit) {
-        match state.storage().read(tenant, &rt, &id).await {
-            Ok(Some(res)) => included.push(res),
-            Ok(None) => {}
-            // A supporting resource that has been soft-deleted since the
-            // matching resource referenced it is simply omitted, mirroring
-            // how a missing reference target is handled — not surfaced as a
-            // 410 for the whole $everything response.
-            Err(StorageError::Resource(ResourceError::Gone { .. })) => {}
-            Err(e) => return Err(e.into()),
+        match by_type.iter_mut().find(|(t, _)| *t == rt) {
+            Some((_, ids)) => ids.push(id),
+            None => by_type.push((rt, vec![id])),
         }
+    }
+
+    let mut included = Vec::new();
+    for (rt, ids) in by_type {
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        included.extend(state.storage().read_batch(tenant, &rt, &id_refs).await?);
     }
     Ok((included, truncated))
 }
