@@ -55,7 +55,8 @@ use crate::core::{
 use crate::error::{BackendError, ResourceError, StorageError, StorageResult, TransactionError};
 use crate::tenant::TenantContext;
 use crate::types::{
-    IncludeDirective, Pagination, ReverseChainedParameter, SearchQuery, StoredResource,
+    IncludeDirective, Pagination, ReverseChainedParameter, SearchParamType, SearchParameter,
+    SearchQuery, SearchValue, StoredResource,
 };
 
 use super::config::{CompositeConfig, SyncMode};
