@@ -92,8 +92,21 @@ fn component_conditions(param_type: SearchParamType, part: &str) -> Option<Vec<V
             Some(v)
         }
         SearchParamType::Date => {
+            // The same precision range a standalone date parameter gets. This
+            // used to send the value as written under a scalar comparison, so
+            // `2024-01-15` was midnight rather than the day, and `ne` was
+            // treated as `eq`. `None` — not a date — makes the caller emit a
+            // clause that never matches.
             let (op, val) = split_prefix(part);
-            Some(vec![range_condition(&field("date"), op, json!(val))])
+            let prefix = op.parse().unwrap_or_default();
+            Some(vec![
+                match super::date::field_range(&field("date"), val, prefix)? {
+                    super::date::DateRange::Within(range) => range,
+                    super::date::DateRange::Outside(range) => {
+                        json!({ "bool": { "must_not": [range] } })
+                    }
+                },
+            ])
         }
         SearchParamType::Reference => Some(vec![json!({ "term": { field("reference"): part } })]),
         SearchParamType::Uri => Some(vec![json!({ "term": { field("uri"): part } })]),
@@ -124,17 +137,6 @@ fn numeric_condition(field: &str, op: &str, num: f64) -> Value {
         "ge" => json!({ "range": { field: { "gte": num } } }),
         "le" => json!({ "range": { field: { "lte": num } } }),
         _ => json!({ "term": { field: num } }),
-    }
-}
-
-/// Builds a date range condition honoring the comparison prefix.
-fn range_condition(field: &str, op: &str, val: Value) -> Value {
-    match op {
-        "gt" | "sa" => json!({ "range": { field: { "gt": val } } }),
-        "lt" | "eb" => json!({ "range": { field: { "lt": val } } }),
-        "ge" => json!({ "range": { field: { "gte": val } } }),
-        "le" => json!({ "range": { field: { "lte": val } } }),
-        _ => json!({ "range": { field: { "gte": val, "lte": val } } }),
     }
 }
 
@@ -180,6 +182,44 @@ mod tests {
         assert!(s.contains("token_code"));
         assert!(s.contains("quantity_value"));
         assert!(s.contains("gte"));
+    }
+
+    fn code_date_param() -> SearchParameter {
+        composite_param(vec![
+            CompositeSearchComponent {
+                param_type: SearchParamType::Token,
+                param_name: "code".to_string(),
+            },
+            CompositeSearchComponent {
+                param_type: SearchParamType::Date,
+                param_name: "date".to_string(),
+            },
+        ])
+    }
+
+    #[test]
+    fn date_component_is_a_precision_range() {
+        let clause = build_clause(&code_date_param(), "8867-4$ge2013-04-05T09:20").unwrap();
+        let must = &clause["nested"]["query"]["bool"]["must"];
+        assert_eq!(
+            must[2]["range"]["search_params.composite.date"],
+            json!({ "gte": "2013-04-05T09:20:00.000Z" })
+        );
+
+        let clause = build_clause(&code_date_param(), "8867-4$2024-01-15").unwrap();
+        let must = &clause["nested"]["query"]["bool"]["must"];
+        assert_eq!(
+            must[2]["range"]["search_params.composite.date"],
+            json!({ "gte": "2024-01-15", "lt": "2024-01-16" })
+        );
+    }
+
+    #[test]
+    fn date_component_that_is_not_a_date_never_matches() {
+        for value in ["8867-4$2024-02-30", "8867-4$gtnot-a-date", "8867-4$"] {
+            let clause = build_clause(&code_date_param(), value).unwrap();
+            assert!(clause.to_string().contains("group_id"), "{value}");
+        }
     }
 
     #[test]

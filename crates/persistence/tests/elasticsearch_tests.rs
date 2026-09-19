@@ -659,6 +659,11 @@ mod parameter_handler_tests {
 #[path = "search/date_boundary_suite.rs"]
 mod date_boundary_suite;
 
+/// The backend-agnostic sub-day precision and date-validation suite (#1293,
+/// #1295, #1296, #1297). Same `#[path]` arrangement.
+#[path = "search/date_precision_suite.rs"]
+mod date_precision_suite;
+
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
 
@@ -926,6 +931,22 @@ mod es_integration {
     async fn es_day_precision_date_boundaries() {
         let backend = create_backend().await;
         super::date_boundary_suite::day_precision_boundaries(&backend, "date-boundary-519").await;
+    }
+
+    /// #1293: a value that is not a date was read as the year 2000 and could
+    /// match every resource; here it must be an error. Also pins that a
+    /// second-precision value still covers a stored fraction now that the
+    /// range is explicit instead of resting on `lte` round-up (#1297), and
+    /// that a form-decoded `+` offset no longer reaches Elasticsearch as a
+    /// `parse_exception` (#1296).
+    #[tokio::test]
+    async fn es_sub_day_date_precision_and_validation() {
+        let backend = create_backend().await;
+        super::date_precision_suite::sub_day_precision_and_validation(
+            &backend,
+            "date-precision-1293",
+        )
+        .await;
     }
 
     // ========================================================================
