@@ -53,9 +53,11 @@ use crate::core::{
     TypeHistoryProvider, VersionedStorage,
 };
 use crate::error::{BackendError, ResourceError, StorageError, StorageResult, TransactionError};
+use crate::search::ChainResolveOptions;
 use crate::tenant::TenantContext;
 use crate::types::{
-    IncludeDirective, Pagination, ReverseChainedParameter, SearchQuery, StoredResource,
+    IncludeDirective, Pagination, ReverseChainedParameter, SearchParamType, SearchParameter,
+    SearchQuery, SearchValue, StoredResource,
 };
 
 use super::config::{CompositeConfig, SyncMode};
@@ -1995,7 +1997,17 @@ impl ChainedSearchProvider for CompositeStorage {
             // A single segment is not a chain.
             return Ok(Vec::new());
         };
-        crate::search::chain_resolver::resolve_forward_chain(self, tenant, base_type, &param).await
+        // The trait API carries no terminology server, so a terminology-backed
+        // modifier on the terminal is rejected rather than searched literally
+        // (the resolver's default, as for `resolve_chains`; #1317).
+        crate::search::chain_resolver::resolve_forward_chain(
+            self,
+            tenant,
+            base_type,
+            &param,
+            ChainResolveOptions::default(),
+        )
+        .await
     }
 
     async fn resolve_reverse_chain(
@@ -2007,8 +2019,14 @@ impl ChainedSearchProvider for CompositeStorage {
         // Same delegation as `resolve_chain`. The terminal used to be searched
         // as a hardcoded `Token` holding the raw value — prefix and commas
         // included — and a nested `_has` was ignored outright (#1304).
-        crate::search::chain_resolver::resolve_reverse_chain(self, tenant, base_type, reverse_chain)
-            .await
+        crate::search::chain_resolver::resolve_reverse_chain(
+            self,
+            tenant,
+            base_type,
+            reverse_chain,
+            ChainResolveOptions::default(),
+        )
+        .await
     }
 }
 

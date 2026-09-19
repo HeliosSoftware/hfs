@@ -20,9 +20,23 @@ use crate::types::{
 };
 
 use super::{
-    IndexValue, SearchParameterExtractor, SearchParameterRegistry, parse_typed_values,
-    resolve_param_type, split_unescaped_commas, validate_modifier,
+    IndexValue, SearchParameterExtractor, SearchParameterRegistry, param_requires_terminology,
+    parse_typed_values, resolve_param_type, split_unescaped_commas, validate_modifier,
 };
+
+/// What the caller can do for the resolver.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChainResolveOptions {
+    /// Whether the caller has a terminology server and has already expanded the
+    /// terminology-backed modifiers (`:in`, token `:above` / `:below`) with it,
+    /// as the REST search handler does when `HFS_TERMINOLOGY_SERVER` is set.
+    ///
+    /// When false — the default — such a modifier on a chain's terminal
+    /// parameter is rejected with [`SearchError::TerminologyRequired`], as it
+    /// is on a direct parameter: no backend can answer it, and the terminal
+    /// search would otherwise match literally or not at all (#1317).
+    pub terminology_available: bool,
+}
 
 /// Returns true if the query contains any chained or reverse-chained parameter.
 pub fn query_has_chains(query: &SearchQuery) -> bool {
@@ -35,10 +49,25 @@ pub fn query_has_chains(query: &SearchQuery) -> bool {
 /// Multiple chains are intersected (`AND`). If any chain resolves to no
 /// resources the rewritten query is forced to match nothing. Queries without
 /// chains are returned unchanged.
+///
+/// Uses the default [`ChainResolveOptions`]; see [`resolve_chains_with`].
 pub async fn resolve_chains<S>(
     storage: &S,
     tenant: &TenantContext,
     query: &SearchQuery,
+) -> StorageResult<SearchQuery>
+where
+    S: SearchProvider + ?Sized,
+{
+    resolve_chains_with(storage, tenant, query, ChainResolveOptions::default()).await
+}
+
+/// [`resolve_chains`], told what the caller can do for it.
+pub async fn resolve_chains_with<S>(
+    storage: &S,
+    tenant: &TenantContext,
+    query: &SearchQuery,
+    options: ChainResolveOptions,
 ) -> StorageResult<SearchQuery>
 where
     S: SearchProvider + ?Sized,
@@ -68,7 +97,7 @@ where
                 },
             ));
         }
-        let ids = resolve_forward_chain(storage, tenant, &base_type, param).await?;
+        let ids = resolve_forward_chain(storage, tenant, &base_type, param, options).await?;
         id_sets.push(ids.into_iter().collect());
     }
 
@@ -85,7 +114,8 @@ where
                 },
             ));
         }
-        let ids = resolve_reverse_chain(storage, tenant, &base_type, reverse_chain).await?;
+        let ids =
+            resolve_reverse_chain(storage, tenant, &base_type, reverse_chain, options).await?;
         id_sets.push(ids.into_iter().collect());
     }
 
@@ -187,6 +217,7 @@ pub(crate) async fn resolve_forward_chain<S>(
     tenant: &TenantContext,
     base_type: &str,
     param: &SearchParameter,
+    options: ChainResolveOptions,
 ) -> StorageResult<Vec<String>>
 where
     S: SearchProvider + ?Sized,
@@ -258,6 +289,8 @@ where
             terminal_param,
             terminal_type,
             param.modifier.as_ref(),
+            || forward_chain_display(param),
+            options,
         )?;
         (parents, terminal_types, terminal_type, terminal_values)
     };
@@ -344,6 +377,7 @@ pub(crate) async fn resolve_reverse_chain<S>(
     tenant: &TenantContext,
     base_type: &str,
     reverse_chain: &ReverseChainedParameter,
+    options: ChainResolveOptions,
 ) -> StorageResult<Vec<String>>
 where
     S: SearchProvider + ?Sized,
@@ -357,6 +391,7 @@ where
             tenant,
             &reverse_chain.source_type,
             inner,
+            options,
         ))
         .await?;
         if inner_ids.is_empty() {
@@ -404,6 +439,13 @@ where
                 search_param,
                 search_param_type,
                 modifier.as_ref(),
+                || {
+                    format!(
+                        "_has:{}:{}:{search_param}",
+                        reverse_chain.source_type, reverse_chain.reference_param
+                    )
+                },
+                options,
             )?;
             (search_param_type, values)
         };
@@ -483,21 +525,55 @@ fn parse_terminal_values(
     parse_typed_values(registry, resource_type, param_name, &raw_values)
 }
 
-/// Rejects a modifier the terminal parameter's type does not define, with the
-/// same check — and the same wording — a direct search on it gets
-/// ([`validate_modifier`]). The REST layer maps the error to a `400`.
+/// Rejects a modifier the terminal parameter cannot take, with the same checks
+/// — and the same wording — a direct search on it gets:
+///
+/// * one that needs a terminology server the caller does not have
+///   ([`param_requires_terminology`]), which the REST layer maps to a `501`.
+///   Checked first, as the REST handler's guard on a direct parameter is;
+/// * one the parameter's type does not define ([`validate_modifier`]), which
+///   the REST layer maps to a `400`.
+///
+/// `display` names the parameter as the client wrote it, for the first error.
 fn check_terminal_modifier(
     registry: &SearchParameterRegistry,
     resource_type: &str,
     param_name: &str,
     param_type: SearchParamType,
     modifier: Option<&SearchModifier>,
+    display: impl FnOnce() -> String,
+    options: ChainResolveOptions,
 ) -> StorageResult<()> {
-    match modifier {
-        Some(m) => validate_modifier(registry, resource_type, param_name, param_type, m)
-            .map_err(query_error),
-        None => Ok(()),
+    let Some(m) = modifier else {
+        return Ok(());
+    };
+    if !options.terminology_available
+        && param_requires_terminology(registry, resource_type, param_name, m)
+    {
+        return Err(StorageError::Search(SearchError::TerminologyRequired {
+            modifier: m.to_string(),
+            param: display(),
+        }));
     }
+    validate_modifier(registry, resource_type, param_name, param_type, m).map_err(query_error)
+}
+
+/// A forward chain as the client wrote it, less the terminal modifier:
+/// `subject:Patient.general-practitioner.name`.
+fn forward_chain_display(param: &SearchParameter) -> String {
+    let mut path = String::new();
+    for hop in &param.chain {
+        path.push_str(&hop.reference_param);
+        if let Some(t) = &hop.target_type {
+            path.push(':');
+            path.push_str(t);
+        }
+        path.push('.');
+    }
+    if let Some(last) = param.chain.last() {
+        path.push_str(&last.target_param);
+    }
+    path
 }
 
 fn query_error(message: String) -> StorageError {
@@ -1239,6 +1315,74 @@ mod tests {
                 .await
                 .contains("unknown search modifier ':bogus'")
         );
+    }
+
+    /// #1317: a terminology-backed modifier on the terminal parameter is
+    /// rejected unless the caller has a terminology server — the terminal
+    /// search would otherwise run it literally. `:above` / `:below` count only
+    /// on a token terminal.
+    #[tokio::test]
+    async fn terminal_modifier_needing_terminology_is_rejected() {
+        let b = backend();
+        let t = tenant();
+        seed_dated(&b, &t).await;
+
+        let required = |q: SearchQuery| {
+            let (b, t) = (&b, &t);
+            async move {
+                match resolve_chains(b, t, &q).await {
+                    Err(StorageError::Search(SearchError::TerminologyRequired {
+                        modifier,
+                        param,
+                    })) => (modifier, param),
+                    other => panic!("expected a terminology-required error, got {other:?}"),
+                }
+            }
+        };
+        let of = |m: &str, p: &str| (m.to_string(), p.to_string());
+
+        // Procedure?subject:Patient.gender:in=… / :below=…
+        let q = forward_modified(
+            "Procedure",
+            &[("subject", "Patient", "gender")],
+            SearchModifier::In,
+            &["http://example.org/vs"],
+        );
+        assert_eq!(required(q).await, of("in", "subject:Patient.gender"));
+        let q = forward_modified(
+            "Procedure",
+            &[("subject", "Patient", "gender")],
+            SearchModifier::Below,
+            &["http://hl7.org/fhir/administrative-gender|male"],
+        );
+        assert_eq!(required(q).await, of("below", "subject:Patient.gender"));
+
+        // Patient?_has:Procedure:subject:status:in=… / :above=…
+        let q = has("Patient", "Procedure", "subject", "status:in", "http://vs");
+        assert_eq!(required(q).await, of("in", "_has:Procedure:subject:status"));
+        let q = has("Patient", "Procedure", "subject", "status:above", "s|c");
+        assert_eq!(
+            required(q).await,
+            of("above", "_has:Procedure:subject:status")
+        );
+
+        // With terminology available the modifier is the caller's business
+        // (REST has expanded it away by now); whatever is left resolves.
+        let q = has("Patient", "Procedure", "subject", "status:in", "http://vs");
+        let options = ChainResolveOptions {
+            terminology_available: true,
+        };
+        assert!(resolve_chains_with(&b, &t, &q, options).await.is_ok());
+
+        // Structural on a reference terminal: never needs terminology.
+        // Procedure?subject:Patient.general-practitioner:below=Practitioner/x
+        let q = forward_modified(
+            "Procedure",
+            &[("subject", "Patient", "general-practitioner")],
+            SearchModifier::Below,
+            &["Practitioner/x"],
+        );
+        assert!(resolve_chains(&b, &t, &q).await.is_ok());
     }
 
     /// Values a caller already parsed (non-`eq` prefix) pass through as given.

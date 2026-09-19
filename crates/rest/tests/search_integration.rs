@@ -2804,6 +2804,215 @@ mod chaining {
         );
     }
 
+    /// The `501` a search gets, as (status, OperationOutcome text).
+    async fn outcome(server: &TestServer, url: &str) -> (StatusCode, String) {
+        let response = server
+            .get(url)
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        let body: Value = response.json();
+        (response.status_code(), body["issue"][0].to_string())
+    }
+
+    /// #1317: with no terminology server configured, a terminology-backed
+    /// modifier is a `501` on a direct parameter. On the terminal parameter of
+    /// a typed chain or a `_has` it used to slip past that guard — which reads
+    /// the modifier off the query key's first `:` segment — and the terminal
+    /// search then ran without terminology: `:in` matched the ValueSet URL as a
+    /// literal code (an empty `200`), `:above` / `:below` matched the code
+    /// alone.
+    #[tokio::test]
+    async fn test_chained_terminology_modifier_without_terminology_server() {
+        let (server, backend) = create_test_server().await;
+        seed_chain_name_data(&backend).await;
+
+        // Positive controls: the chains themselves resolve.
+        assert_eq!(ids(&server, "/Encounter?subject.gender=male").await, ["es"]);
+        assert_eq!(
+            ids(&server, "/Patient?_has:Observation:subject:code=1234-5").await,
+            ["ps"]
+        );
+
+        // The direct form, for reference.
+        let (direct_status, direct_text) =
+            outcome(&server, "/Observation?code:in=http://example.org/vs").await;
+        assert_eq!(direct_status, StatusCode::NOT_IMPLEMENTED);
+        assert!(
+            direct_text.contains("requires a configured terminology server"),
+            "{direct_text}"
+        );
+
+        let gender = "http://hl7.org/fhir/administrative-gender|male";
+        for url in [
+            // Forward chains: untyped, typed, multi-hop, typed multi-hop.
+            "/Encounter?subject.gender:in=http://example.org/vs".to_string(),
+            "/Encounter?subject:Patient.gender:in=http://example.org/vs".to_string(),
+            "/Observation?encounter.subject.gender:in=http://example.org/vs".to_string(),
+            "/Observation?encounter:Encounter.subject:Patient.gender:in=http://example.org/vs"
+                .to_string(),
+            format!("/Encounter?subject.gender:below={gender}"),
+            format!("/Encounter?subject.gender:above={gender}"),
+            format!("/Encounter?subject:Patient.gender:below={gender}"),
+            format!("/Observation?encounter.subject:Patient.gender:above={gender}"),
+            // `_has`, plain and nested.
+            "/Patient?_has:Observation:subject:code:in=http://example.org/vs".to_string(),
+            "/Patient?_has:Observation:subject:code:below=http://loinc.org|1234-5".to_string(),
+            "/Patient?_has:Observation:subject:code:above=http://loinc.org|1234-5".to_string(),
+            "/Patient?_has:Encounter:subject:_has:Observation:encounter:code:in=http://example.org/vs"
+                .to_string(),
+            "/Patient?_has:Encounter:subject:_has:Observation:encounter:code:below=http://loinc.org|1234-5"
+                .to_string(),
+        ] {
+            let (status, text) = outcome(&server, &url).await;
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{url}: {text}");
+            assert!(
+                text.contains("requires a configured terminology server"),
+                "{url}: {text}"
+            );
+        }
+
+        // The wording is the direct form's, naming the parameter as written.
+        let (_, text) = outcome(
+            &server,
+            "/Encounter?subject:Patient.gender:below=http://hl7.org/fhir/administrative-gender|male",
+        )
+        .await;
+        assert!(
+            text.contains(
+                "search modifier ':below' on token parameter 'subject:Patient.gender' requires \
+                 a configured terminology server (set HFS_TERMINOLOGY_SERVER)"
+            ),
+            "{text}"
+        );
+        let (_, text) = outcome(
+            &server,
+            "/Patient?_has:Observation:subject:code:in=http://example.org/vs",
+        )
+        .await;
+        assert!(
+            text.contains("':in' on token parameter '_has:Observation:subject:code'"),
+            "{text}"
+        );
+
+        // `:not-in` stays the `501` it already was.
+        for url in [
+            "/Encounter?subject.gender:not-in=http://example.org/vs",
+            "/Patient?_has:Observation:subject:code:not-in=http://example.org/vs",
+        ] {
+            assert_eq!(
+                status(&server, url).await,
+                StatusCode::NOT_IMPLEMENTED,
+                "{url}"
+            );
+        }
+    }
+
+    /// #1317: the same over `POST [type]/_search`.
+    #[tokio::test]
+    async fn test_chained_terminology_modifier_without_terminology_server_post() {
+        let (server, backend) = create_test_server().await;
+        seed_chain_name_data(&backend).await;
+
+        for (resource_type, key, value) in [
+            (
+                "Encounter",
+                "subject:Patient.gender:in",
+                "http://example.org/vs",
+            ),
+            (
+                "Patient",
+                "_has:Observation:subject:code:below",
+                "http://loinc.org|1234-5",
+            ),
+        ] {
+            let response = server
+                .post(&format!("/{resource_type}/_search"))
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .form(&[(key, value)])
+                .await;
+            response.assert_status(StatusCode::NOT_IMPLEMENTED);
+            let body: Value = response.json();
+            assert!(
+                body["issue"][0]
+                    .to_string()
+                    .contains("requires a configured terminology server"),
+                "{key}: {body}"
+            );
+        }
+
+        // Positive control: a chained POST search works.
+        let response = server
+            .post("/Encounter/_search")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .form(&[("subject:Patient.gender", "male")])
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        assert_eq!(get_bundle_entries(&body).len(), 1);
+    }
+
+    /// #1317: `:above` / `:below` are terminology-backed on a token only. On a
+    /// uri or reference terminal they are structural, need no terminology
+    /// server, and must keep resolving.
+    #[tokio::test]
+    async fn test_chained_structural_hierarchy_modifier_needs_no_terminology_server() {
+        let (server, backend) = create_test_server().await;
+        seed_chain_name_data(&backend).await;
+        let tenant = test_tenant();
+        for resource in [
+            json!({"resourceType": "Patient", "id": "pp",
+                   "meta": {"profile": ["http://example.org/profiles/special-patient"]},
+                   "name": [{"family": "Profiled"}]}),
+            json!({"resourceType": "Observation", "id": "op", "status": "final",
+                   "code": {"coding": [{"system": "http://loinc.org", "code": "1234-5"}]},
+                   "subject": {"reference": "Patient/pp"}}),
+        ] {
+            let resource_type = resource["resourceType"].as_str().unwrap().to_string();
+            backend
+                .create(&tenant, &resource_type, resource, FhirVersion::R4)
+                .await
+                .unwrap();
+        }
+
+        // Positive control: the direct uri `:below`.
+        assert_eq!(
+            ids(
+                &server,
+                "/Patient?_profile:below=http://example.org/profiles"
+            )
+            .await,
+            ["pp"]
+        );
+        // Uri terminal, forward (untyped and typed) and `_has`.
+        for url in [
+            "/Observation?subject._profile:below=http://example.org/profiles",
+            "/Observation?subject:Patient._profile:below=http://example.org/profiles",
+        ] {
+            assert_eq!(ids(&server, url).await, ["op"], "{url}");
+        }
+        assert_eq!(
+            ids(
+                &server,
+                "/Patient?_has:Observation:subject:_profile:below=http://loinc.org"
+            )
+            .await,
+            Vec::<String>::new()
+        );
+        // Reference terminal.
+        assert_eq!(
+            ids(&server, "/Observation?encounter.subject:below=Patient/ps").await,
+            ["os"]
+        );
+        assert_eq!(
+            ids(
+                &server,
+                "/Patient?_has:Observation:subject:encounter:below=Encounter/es"
+            )
+            .await,
+            ["ps"]
+        );
+    }
+
     #[tokio::test]
     async fn test_multiple_chain_levels() {
         let (server, backend) = create_test_server().await;
