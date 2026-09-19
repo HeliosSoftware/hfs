@@ -139,10 +139,70 @@ pub fn validate_modifier(
     Ok(())
 }
 
+/// Whether `modifier` on a parameter of type `param_type` can only be answered
+/// with the help of a terminology server. `None` is a parameter the registry
+/// does not know.
+///
+/// `:in` / `:not-in` test value-set membership, so they always do. `:above` /
+/// `:below` do on a **token** (code-system subsumption); on a uri or reference
+/// they are structural and the backends resolve them natively.
+pub fn modifier_requires_terminology(
+    modifier: &SearchModifier,
+    param_type: Option<SearchParamType>,
+) -> bool {
+    match modifier {
+        SearchModifier::In | SearchModifier::NotIn => true,
+        SearchModifier::Above | SearchModifier::Below => param_type == Some(SearchParamType::Token),
+        _ => false,
+    }
+}
+
+/// [`modifier_requires_terminology`] for the parameter `name` of
+/// `resource_type`, typed by the registry (resource-level parameters such as
+/// `_tag` are declared on `Resource`).
+///
+/// Like [`validate_modifier`], this is shared by direct parameters (the REST
+/// search handler's guard) and the terminal parameter of a chained / `_has`
+/// search (the [chain resolver](super::chain_resolver) — the only place that
+/// terminal's type is known), so a server without terminology answers
+/// `subject:Patient.gender:below` exactly as it answers `Patient?gender:below`.
+pub fn param_requires_terminology(
+    registry: &SearchParameterRegistry,
+    resource_type: &str,
+    name: &str,
+    modifier: &SearchModifier,
+) -> bool {
+    let declared = registry
+        .get_param(resource_type, name)
+        .or_else(|| registry.get_param("Resource", name))
+        .map(|p| p.param_type);
+    modifier_requires_terminology(modifier, declared)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::SearchPrefix;
+
+    #[test]
+    fn terminology_is_needed_by_in_and_by_token_hierarchy_only() {
+        use SearchModifier as M;
+        use SearchParamType as T;
+        for m in [M::In, M::NotIn, M::Below, M::Above] {
+            assert!(modifier_requires_terminology(&m, Some(T::Token)), "{m}");
+        }
+        // Structural on uri / reference: the backends resolve these natively.
+        for t in [T::Uri, T::Reference] {
+            assert!(!modifier_requires_terminology(&M::Below, Some(t)), "{t}");
+            assert!(!modifier_requires_terminology(&M::Above, Some(t)), "{t}");
+        }
+        // An unregistered parameter: value-set membership still needs
+        // terminology, a hierarchy modifier is not known to.
+        assert!(modifier_requires_terminology(&M::In, None));
+        assert!(!modifier_requires_terminology(&M::Below, None));
+        assert!(!modifier_requires_terminology(&M::Not, Some(T::Token)));
+        assert!(!modifier_requires_terminology(&M::Exact, Some(T::String)));
+    }
 
     #[test]
     fn splits_on_unescaped_commas_only() {
