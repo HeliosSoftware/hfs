@@ -28,7 +28,9 @@ use crate::search::converters::IndexValue;
 use crate::search::extractor::ExtractedValue;
 use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
 use crate::tenant::{Operation, TenantContext};
-use crate::types::{CursorValue, Page, PageCursor, PageInfo, SearchQuery, StoredResource};
+use crate::types::{
+    CursorValue, Page, PageCursor, PageInfo, SearchParamType, SearchQuery, StoredResource,
+};
 
 use super::MongoBackend;
 
@@ -195,7 +197,7 @@ async fn collect_documents(mut cursor: Cursor<Document>) -> StorageResult<Vec<Do
     Ok(docs)
 }
 
-async fn collect_session_documents(
+pub(super) async fn collect_session_documents(
     mut cursor: SessionCursor<Document>,
     session: &mut ClientSession,
 ) -> StorageResult<Vec<Document>> {
@@ -3840,32 +3842,60 @@ impl MongoBackend {
         const PROBE_LIMIT: i64 = 2;
         const BATCH_SIZE: i64 = 128;
 
+        // #1206: cache each composite's driver-arm probe (component filters +
+        // counts already resolved) so the winning index, if composite,
+        // doesn't re-probe below — mirrors `matching_resource_ids` in
+        // `search_impl.rs`.
+        let mut composite_probes: HashMap<usize, (Document, i64)> = HashMap::new();
+
         let driver_idx = {
             let mut best: Option<(usize, i64)> = None;
             for (i, param) in index_params.iter().enumerate() {
-                let filter = self.build_search_index_filter(tenant_id, resource_type, param)?;
-                let pipeline = vec![
-                    doc! { "$match": filter },
-                    doc! { "$limit": PROBE_LIMIT },
-                    doc! { "$group": { "_id": "$resource_id" } },
-                    doc! { "$count": "n" },
-                ];
-                let cursor = search_index
-                    .aggregate(pipeline)
-                    .session(&mut *session)
-                    .await
-                    .map_err(|e| {
-                        internal_error(format!("Failed probe for ifNoneExist driver: {}", e))
-                    })?;
-                let probe_docs = collect_session_documents(cursor, session).await?;
-                let count = probe_docs
-                    .first()
-                    .and_then(|d| d.get_i32("n").ok())
-                    .map(|n| n as i64)
-                    .unwrap_or(0);
-                if count == 0 {
-                    return Ok(Vec::new());
-                }
+                let count = if param.param_type == SearchParamType::Composite {
+                    match self
+                        .composite_driver_probe(
+                            &search_index,
+                            tenant_id,
+                            resource_type,
+                            param,
+                            PROBE_LIMIT as u64,
+                            Some(&mut *session),
+                        )
+                        .await?
+                    {
+                        None => return Ok(Vec::new()),
+                        Some((filter, count)) => {
+                            let count = count as i64;
+                            composite_probes.insert(i, (filter, count));
+                            count
+                        }
+                    }
+                } else {
+                    let filter = self.build_search_index_filter(tenant_id, resource_type, param)?;
+                    let pipeline = vec![
+                        doc! { "$match": filter },
+                        doc! { "$limit": PROBE_LIMIT },
+                        doc! { "$group": { "_id": "$resource_id" } },
+                        doc! { "$count": "n" },
+                    ];
+                    let cursor = search_index
+                        .aggregate(pipeline)
+                        .session(&mut *session)
+                        .await
+                        .map_err(|e| {
+                            internal_error(format!("Failed probe for ifNoneExist driver: {}", e))
+                        })?;
+                    let probe_docs = collect_session_documents(cursor, session).await?;
+                    let count = probe_docs
+                        .first()
+                        .and_then(|d| d.get_i32("n").ok())
+                        .map(|n| n as i64)
+                        .unwrap_or(0);
+                    if count == 0 {
+                        return Ok(Vec::new());
+                    }
+                    count
+                };
                 if best.is_none_or(|(_, prev)| count < prev) {
                     best = Some((i, count));
                 }
@@ -3873,8 +3903,14 @@ impl MongoBackend {
             best.map(|(i, _)| i).unwrap_or(0)
         };
 
-        let driver_filter =
-            self.build_search_index_filter(tenant_id, resource_type, index_params[driver_idx])?;
+        // Every composite index visited above has its probe result cached,
+        // so `driver_idx` pointing at a composite always finds an entry
+        // here; a plain param never has one and falls through as before.
+        let driver_filter = if let Some((filter, _)) = composite_probes.remove(&driver_idx) {
+            filter
+        } else {
+            self.build_search_index_filter(tenant_id, resource_type, index_params[driver_idx])?
+        };
 
         let mut last_index_id: Option<Bson> = None;
         let mut matches: Vec<StoredResource> = Vec::with_capacity(2);
@@ -3924,7 +3960,28 @@ impl MongoBackend {
             }
 
             for (i, param) in index_params.iter().enumerate() {
-                if i == driver_idx || candidate_ids.is_empty() {
+                if candidate_ids.is_empty() {
+                    continue;
+                }
+                // Same reasoning as `matching_resource_ids`: a composite's
+                // driver arm only proves its most selective component
+                // matched, so every composite here — including the driver —
+                // still needs the grouped pair check (#1206).
+                if param.param_type == SearchParamType::Composite {
+                    let passing = self
+                        .composite_pair_check(
+                            &search_index,
+                            tenant_id,
+                            resource_type,
+                            param,
+                            &candidate_ids,
+                            Some(&mut *session),
+                        )
+                        .await?;
+                    candidate_ids.retain(|id| passing.contains(id));
+                    continue;
+                }
+                if i == driver_idx {
                     continue;
                 }
                 let param_filter =
