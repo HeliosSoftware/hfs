@@ -8,7 +8,7 @@
 //! (the [chain resolver](super::chain_resolver)) both go through it, so a
 //! chained `birthdate=ge1980-01-01` means exactly what the direct one does.
 
-use crate::types::{SearchParamType, SearchValue};
+use crate::types::{SearchModifier, SearchParamType, SearchValue};
 
 use super::registry::{SearchParameterRegistry, resolve_param_type};
 
@@ -85,6 +85,58 @@ pub fn parse_typed_values(
     };
 
     (param_type, values)
+}
+
+/// Checks that `modifier` can be applied to the parameter `name` of
+/// `resource_type`, whose resolved type is `param_type`. The error is the
+/// reason, worded for the client.
+///
+/// Like [`parse_typed_values`], this is shared by direct parameters (the REST
+/// query builder) and the terminal parameter of a chained / `_has` search (the
+/// [chain resolver](super::chain_resolver)), so `subject:Patient.birthdate:exact`
+/// is rejected for the same reason `Patient?birthdate:exact` is.
+///
+/// Two rules:
+///
+/// * `:missing` needs an ordinary presence row in the search index. Full-text
+///   and other computed `_` parameters have none, and treating them as
+///   index-backed would make `:missing=true` match every resource.
+/// * A modifier must be defined for the parameter's type (`:exact` is not, on
+///   a token; `:contains` is not, on a date) — see
+///   [`SearchModifier::is_valid_for`], which reflects what this server honors.
+///   Scoped to registry-known, non-special params: an unregistered custom
+///   param gets a value-shape heuristic type, so gating it could falsely reject
+///   a legitimate custom modifier; and the `special` full-text params (`_text`,
+///   `_content`, …) carry server-specific modifier semantics outside the typed
+///   modifier table.
+pub fn validate_modifier(
+    registry: &SearchParameterRegistry,
+    resource_type: &str,
+    name: &str,
+    param_type: SearchParamType,
+    modifier: &SearchModifier,
+) -> Result<(), String> {
+    let registered = registry.get_param(resource_type, name).is_some()
+        || registry.get_param("Resource", name).is_some();
+
+    if matches!(modifier, SearchModifier::Missing) && name.starts_with('_') {
+        let has_presence_index = matches!(name, "_id" | "_lastUpdated")
+            || registered
+                && matches!(
+                    name,
+                    "_tag" | "_profile" | "_security" | "_source" | "_language"
+                );
+        if !has_presence_index {
+            return Err(format!(":missing is not supported for parameter '{name}'"));
+        }
+    }
+
+    if registered && param_type != SearchParamType::Special && !modifier.is_valid_for(param_type) {
+        return Err(format!(
+            "search modifier ':{modifier}' is not supported for {param_type} parameter '{name}'"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

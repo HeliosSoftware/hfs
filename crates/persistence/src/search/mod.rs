@@ -103,5 +103,5 @@ pub use seeder::{
 pub use tenant_registries::{StoredParamLoader, TenantSearchRegistries};
 pub use text_fold::fold_text;
 pub use uri::compute_parent_uris;
-pub use value_parser::{parse_typed_values, split_unescaped_commas};
+pub use value_parser::{parse_typed_values, split_unescaped_commas, validate_modifier};
 pub use writer::SearchIndexWriter;

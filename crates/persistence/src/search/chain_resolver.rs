@@ -12,16 +12,16 @@
 use std::collections::HashSet;
 
 use crate::core::SearchProvider;
-use crate::error::StorageResult;
+use crate::error::{SearchError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
 use crate::types::{
-    ReverseChainedParameter, SearchParamType, SearchParameter, SearchPrefix, SearchQuery,
-    SearchValue,
+    ReverseChainedParameter, SearchModifier, SearchParamType, SearchParameter, SearchPrefix,
+    SearchQuery, SearchValue,
 };
 
 use super::{
     IndexValue, SearchParameterExtractor, SearchParameterRegistry, parse_typed_values,
-    resolve_param_type, split_unescaped_commas,
+    resolve_param_type, split_unescaped_commas, validate_modifier,
 };
 
 /// Returns true if the query contains any chained or reverse-chained parameter.
@@ -247,8 +247,18 @@ where
             &terminal_types[0],
             terminal_param,
             &param.values,
+            param.modifier.as_ref(),
             false,
         );
+        // Likewise the modifier: a chained parameter's modifier belongs to the
+        // terminal param, and only now can it be checked against that type.
+        check_terminal_modifier(
+            &registry,
+            &terminal_types[0],
+            terminal_param,
+            terminal_type,
+            param.modifier.as_ref(),
+        )?;
         (parents, terminal_types, terminal_type, terminal_values)
     };
 
@@ -258,7 +268,9 @@ where
         let terminal_query = SearchQuery::new(terminal_target).with_parameter(SearchParameter {
             name: terminal_param.clone(),
             param_type: terminal_type,
-            modifier: None,
+            // Set on the terminal search itself, so every check a backend runs
+            // on a direct `name:exact` / `birthdate:missing` sees this one too.
+            modifier: param.modifier.clone(),
             values: terminal_values.clone(),
             chain: vec![],
             components: vec![],
@@ -362,22 +374,43 @@ where
         // Terminal: match source resources by `search_param=value`. A `_has`
         // carries its value as one raw string, so the OR list is split here
         // too, then parsed for the terminal param's type (#1292).
+        //
+        // `search_param` may end in a modifier (`code:not`), which applies to
+        // the terminal search as it would to a direct one (#1302).
         let raw: Vec<SearchValue> = reverse_chain.value.iter().cloned().collect();
+        let (search_param, modifier) = reverse_chain.terminal_param();
+        let modifier = match modifier {
+            Some(m) => Some(SearchModifier::parse(m).ok_or_else(|| {
+                query_error(format!(
+                    "unknown search modifier ':{m}' on _has parameter '{search_param}'"
+                ))
+            })?),
+            None => None,
+        };
         let (search_param_type, values) = {
             let reg = storage.search_param_registry(tenant);
             let registry = reg.read();
-            parse_terminal_values(
+            let (search_param_type, values) = parse_terminal_values(
                 &registry,
                 &reverse_chain.source_type,
-                &reverse_chain.search_param,
+                search_param,
                 &raw,
+                modifier.as_ref(),
                 true,
-            )
+            );
+            check_terminal_modifier(
+                &registry,
+                &reverse_chain.source_type,
+                search_param,
+                search_param_type,
+                modifier.as_ref(),
+            )?;
+            (search_param_type, values)
         };
         SearchQuery::new(&reverse_chain.source_type).with_parameter(SearchParameter {
-            name: reverse_chain.search_param.clone(),
+            name: search_param.to_string(),
             param_type: search_param_type,
-            modifier: None,
+            modifier,
             values,
             chain: vec![],
             components: vec![],
@@ -420,14 +453,20 @@ where
 /// A value that already carries a non-`eq` prefix was parsed by the caller
 /// (programmatic queries, or an unregistered reference hop whose date-shaped
 /// value the type heuristic claimed) and is passed through untouched.
+///
+/// With the `:missing` modifier the value is the boolean `true` / `false`
+/// whatever the parameter's type, so it is neither prefix-parsed nor split.
 fn parse_terminal_values(
     registry: &SearchParameterRegistry,
     resource_type: &str,
     param_name: &str,
     values: &[SearchValue],
+    modifier: Option<&SearchModifier>,
     split_commas: bool,
 ) -> (SearchParamType, Vec<SearchValue>) {
-    if values.iter().any(|v| v.prefix != SearchPrefix::Eq) {
+    if matches!(modifier, Some(SearchModifier::Missing))
+        || values.iter().any(|v| v.prefix != SearchPrefix::Eq)
+    {
         let param_type = resolve_param_type(registry, resource_type, param_name, values);
         return (param_type, values.to_vec());
     }
@@ -442,6 +481,27 @@ fn parse_terminal_values(
         })
         .collect();
     parse_typed_values(registry, resource_type, param_name, &raw_values)
+}
+
+/// Rejects a modifier the terminal parameter's type does not define, with the
+/// same check — and the same wording — a direct search on it gets
+/// ([`validate_modifier`]). The REST layer maps the error to a `400`.
+fn check_terminal_modifier(
+    registry: &SearchParameterRegistry,
+    resource_type: &str,
+    param_name: &str,
+    param_type: SearchParamType,
+    modifier: Option<&SearchModifier>,
+) -> StorageResult<()> {
+    match modifier {
+        Some(m) => validate_modifier(registry, resource_type, param_name, param_type, m)
+            .map_err(query_error),
+        None => Ok(()),
+    }
+}
+
+fn query_error(message: String) -> StorageError {
+    StorageError::Search(SearchError::QueryParseError { message })
 }
 
 /// Extracts reference values for `search_param` from a resource, using the
@@ -911,6 +971,7 @@ mod tests {
                 "Procedure",
                 "status",
                 &[SearchValue::eq("necessary")],
+                None,
                 true,
             )
         };
@@ -967,6 +1028,7 @@ mod tests {
                 "Patient",
                 "family",
                 &[SearchValue::eq("Lee\\, Jr,Gert")],
+                None,
                 true,
             )
         };
@@ -1009,6 +1071,174 @@ mod tests {
             "gt70",
         );
         assert_eq!(run(&b, &t, &q).await, ["p90"]);
+    }
+
+    /// `forward`, with the modifier the REST query builder takes from the
+    /// chain's terminal parameter (`subject:Patient.family:exact`).
+    fn forward_modified(
+        base: &str,
+        hops: &[(&str, &str, &str)],
+        modifier: SearchModifier,
+        raw_values: &[&str],
+    ) -> SearchQuery {
+        let mut query = forward(base, hops, raw_values);
+        query.parameters[0].modifier = Some(modifier);
+        query
+    }
+
+    /// #1302: a chained parameter's modifier applies to the terminal search.
+    #[tokio::test]
+    async fn forward_chain_terminal_modifier() {
+        let b = backend();
+        let t = tenant();
+        seed_dated(&b, &t).await;
+        let family = &[("subject", "Patient", "family")];
+        let all = ["pr1", "pr2", "pr3", "pr4"];
+
+        // Default string matching is a prefix match; :exact is not.
+        let q = forward("Procedure", family, &["Le"]);
+        assert_eq!(run(&b, &t, &q).await, ["pr1", "pr2"]);
+        let q = forward_modified("Procedure", family, SearchModifier::Exact, &["Le"]);
+        assert!(run(&b, &t, &q).await.is_empty());
+        let q = forward_modified("Procedure", family, SearchModifier::Exact, &["Lee"]);
+        assert_eq!(run(&b, &t, &q).await, ["pr1", "pr2"]);
+
+        // "er" is a prefix of neither name.
+        let q = forward("Procedure", family, &["er"]);
+        assert!(run(&b, &t, &q).await.is_empty());
+        let q = forward_modified("Procedure", family, SearchModifier::Contains, &["er"]);
+        assert_eq!(run(&b, &t, &q).await, ["pr3", "pr4"]);
+
+        // :missing on a date terminal: the value is a boolean, not a date.
+        let birthdate = &[("subject", "Patient", "birthdate")];
+        let q = forward_modified("Procedure", birthdate, SearchModifier::Missing, &["false"]);
+        assert_eq!(run(&b, &t, &q).await, all);
+        let q = forward_modified("Procedure", birthdate, SearchModifier::Missing, &["true"]);
+        assert!(run(&b, &t, &q).await.is_empty());
+
+        // Multi-hop.
+        let hops = &[
+            ("encounter", "Encounter", "subject"),
+            ("subject", "Patient", "family"),
+        ];
+        let q = forward_modified("Observation", hops, SearchModifier::Exact, &["Gert"]);
+        assert_eq!(run(&b, &t, &q).await, ["ob90"]);
+        let q = forward_modified("Observation", hops, SearchModifier::Exact, &["Ger"]);
+        assert!(run(&b, &t, &q).await.is_empty());
+    }
+
+    /// #1302: `_has:…:param:modifier`, carried in `search_param`.
+    #[tokio::test]
+    async fn has_terminal_modifier() {
+        let b = backend();
+        let t = tenant();
+        seed_dated(&b, &t).await;
+
+        // Patient?_has:Procedure:subject:status:not=completed
+        let q = has("Patient", "Procedure", "subject", "status", "completed");
+        assert_eq!(run(&b, &t, &q).await, ["p80", "p90"]);
+        let q = has("Patient", "Procedure", "subject", "status:not", "completed");
+        assert!(run(&b, &t, &q).await.is_empty());
+        let q = has("Patient", "Procedure", "subject", "status:not", "stopped");
+        assert_eq!(run(&b, &t, &q).await, ["p80", "p90"]);
+
+        // Patient?_has:Observation:subject:encounter:missing=true
+        let q = has(
+            "Patient",
+            "Observation",
+            "subject",
+            "encounter:missing",
+            "false",
+        );
+        assert_eq!(run(&b, &t, &q).await, ["p80", "p90"]);
+        let q = has(
+            "Patient",
+            "Observation",
+            "subject",
+            "encounter:missing",
+            "true",
+        );
+        assert!(run(&b, &t, &q).await.is_empty());
+    }
+
+    /// #1302: with `:missing` the value is `true`/`false`, whatever the
+    /// terminal's type — it is never prefix-parsed.
+    #[tokio::test]
+    async fn missing_terminal_value_is_not_prefix_parsed() {
+        let b = backend();
+        let t = tenant();
+        let reg = b.search_param_registry(&t);
+        let registry = reg.read();
+        for split_commas in [false, true] {
+            let (ty, values) = parse_terminal_values(
+                &registry,
+                "Patient",
+                "birthdate",
+                &[SearchValue::eq("true")],
+                Some(&SearchModifier::Missing),
+                split_commas,
+            );
+            assert_eq!(ty, SearchParamType::Date);
+            assert_eq!(pairs(&values), [(SearchPrefix::Eq, "true")]);
+        }
+    }
+
+    /// #1302: a modifier the terminal's type does not define is the same
+    /// error a direct search gets, not a silently unmodified search.
+    #[tokio::test]
+    async fn terminal_modifier_invalid_for_type_is_rejected() {
+        let b = backend();
+        let t = tenant();
+        seed_dated(&b, &t).await;
+
+        let message = |q: SearchQuery| {
+            let (b, t) = (&b, &t);
+            async move {
+                match resolve_chains(b, t, &q).await {
+                    Err(StorageError::Search(SearchError::QueryParseError { message })) => message,
+                    other => panic!("expected a query parse error, got {other:?}"),
+                }
+            }
+        };
+
+        // Procedure?subject:Patient.birthdate:exact=1980-05-06
+        let q = forward_modified(
+            "Procedure",
+            &[("subject", "Patient", "birthdate")],
+            SearchModifier::Exact,
+            &["1980-05-06"],
+        );
+        assert_eq!(
+            message(q).await,
+            "search modifier ':exact' is not supported for date parameter 'birthdate'"
+        );
+
+        // Patient?_has:Procedure:subject:status:exact=completed
+        let q = has(
+            "Patient",
+            "Procedure",
+            "subject",
+            "status:exact",
+            "completed",
+        );
+        assert_eq!(
+            message(q).await,
+            "search modifier ':exact' is not supported for token parameter 'status'"
+        );
+
+        // Not a modifier at all.
+        let q = has(
+            "Patient",
+            "Procedure",
+            "subject",
+            "status:bogus",
+            "completed",
+        );
+        assert!(
+            message(q)
+                .await
+                .contains("unknown search modifier ':bogus'")
+        );
     }
 
     /// Values a caller already parsed (non-`eq` prefix) pass through as given.

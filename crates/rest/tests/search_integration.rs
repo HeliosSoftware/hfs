@@ -2296,6 +2296,15 @@ mod chaining {
         }
     }
 
+    /// Status of a search, whatever it is.
+    async fn status(server: &TestServer, url: &str) -> StatusCode {
+        server
+            .get(url)
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await
+            .status_code()
+    }
+
     /// #1303: a `:Type` qualifier on a middle hop constrains that hop's
     /// reference, so a polymorphic reference resolves only to the named type.
     #[tokio::test]
@@ -2353,6 +2362,157 @@ mod chaining {
             )
             .await,
             ["ol"]
+        );
+    }
+
+    /// #1302: a modifier on the terminal parameter of a forward chain applies
+    /// exactly as it does on the same parameter in a direct search.
+    #[tokio::test]
+    async fn test_chained_terminal_modifier() {
+        let (server, backend) = create_test_server().await;
+        seed_chain_name_data(&backend).await;
+
+        // Baseline: default string matching is a prefix match.
+        assert_eq!(
+            ids(&server, "/Observation?subject:Patient.family=Smith").await,
+            ["ol", "os"]
+        );
+        assert_eq!(ids(&server, "/Patient?family:exact=Smith").await, ["ps"]);
+
+        assert_eq!(
+            ids(&server, "/Observation?subject:Patient.family:exact=Smith").await,
+            ["os"]
+        );
+        assert_eq!(
+            ids(&server, "/Observation?subject.family:exact=Smith").await,
+            ["os"]
+        );
+        // `mith` is no prefix of either name; only :contains finds it.
+        assert!(
+            ids(&server, "/Observation?subject:Patient.family=mith")
+                .await
+                .is_empty()
+        );
+        assert_eq!(
+            ids(&server, "/Observation?subject:Patient.family:contains=mith").await,
+            ["ol", "os"]
+        );
+        assert_eq!(
+            ids(&server, "/Observation?subject:Patient.family:contains=thso").await,
+            ["ol"]
+        );
+        // :missing on a date terminal — the value is a boolean, not a date.
+        assert_eq!(
+            ids(
+                &server,
+                "/Observation?subject:Patient.birthdate:missing=true"
+            )
+            .await,
+            ["ol"]
+        );
+        assert_eq!(
+            ids(
+                &server,
+                "/Observation?subject:Patient.birthdate:missing=false"
+            )
+            .await,
+            ["os"]
+        );
+        // :not on a token terminal.
+        assert_eq!(
+            ids(&server, "/Observation?subject:Patient.gender:not=male").await,
+            ["ol"]
+        );
+        // Multi-hop, with a middle-hop qualifier next to the modifier.
+        assert_eq!(
+            ids(
+                &server,
+                "/Observation?encounter:Encounter.subject:Patient.family:exact=Smith"
+            )
+            .await,
+            ["os"]
+        );
+        assert_eq!(
+            ids(
+                &server,
+                "/Observation?subject:Patient.general-practitioner:Organization.name:exact=Smith"
+            )
+            .await,
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            ids(
+                &server,
+                "/Observation?subject:Patient.general-practitioner:Organization.name:contains=clin"
+            )
+            .await,
+            ["ol"]
+        );
+    }
+
+    /// #1302: what a direct search rejects, a chained terminal rejects too.
+    #[tokio::test]
+    async fn test_chained_terminal_modifier_rejections() {
+        let (server, backend) = create_test_server().await;
+        seed_chain_name_data(&backend).await;
+
+        for url in [
+            // Modifier not defined for the terminal's type.
+            "/Observation?subject:Patient.birthdate:exact=1980-01-01",
+            "/Observation?subject:Patient.gender:contains=mal",
+            "/Observation?encounter.subject:Patient.birthdate:exact=1980-01-01",
+            "/Patient?_has:Observation:subject:code:exact=1234-5",
+            // Not a modifier at all.
+            "/Observation?subject:Patient.family:bogus=Smith",
+            "/Patient?_has:Observation:subject:code:bogus=1234-5",
+            // A resource type is not a modifier of a string parameter.
+            "/Observation?subject:Patient.family:Patient=Smith",
+            // :missing takes exactly true|false.
+            "/Observation?subject:Patient.birthdate:missing=yes",
+            "/Patient?_has:Observation:subject:code:missing=yes",
+        ] {
+            assert_eq!(status(&server, url).await, StatusCode::BAD_REQUEST, "{url}");
+        }
+    }
+
+    /// #1302: same for the terminal parameter of `_has`.
+    #[tokio::test]
+    async fn test_has_terminal_modifier() {
+        let (server, backend) = create_test_server().await;
+        seed_chain_name_data(&backend).await;
+
+        assert_eq!(
+            ids(&server, "/Patient?_has:Observation:subject:code=1234-5").await,
+            ["ps"]
+        );
+        assert_eq!(
+            ids(&server, "/Patient?_has:Observation:subject:code:not=1234-5").await,
+            ["pl"]
+        );
+        assert_eq!(
+            ids(
+                &server,
+                "/Patient?_has:Observation:subject:encounter:missing=false"
+            )
+            .await,
+            ["pl", "ps"]
+        );
+        assert!(
+            ids(
+                &server,
+                "/Patient?_has:Observation:subject:encounter:missing=true"
+            )
+            .await
+            .is_empty()
+        );
+        // Nested: the modifier sits on the innermost terminal.
+        assert_eq!(
+            ids(
+                &server,
+                "/Patient?_has:Encounter:subject:_has:Observation:encounter:code:not=1234-5"
+            )
+            .await,
+            ["pl"]
         );
     }
 
