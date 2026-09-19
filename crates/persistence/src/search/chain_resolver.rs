@@ -182,7 +182,7 @@ where
 /// reference like `Patient.general-practitioner` fans out to Practitioner,
 /// Organization, and PractitionerRole rather than guessing one. The name
 /// heuristic remains only for parameters the registry does not know.
-async fn resolve_forward_chain<S>(
+pub(crate) async fn resolve_forward_chain<S>(
     storage: &S,
     tenant: &TenantContext,
     base_type: &str,
@@ -327,7 +327,7 @@ where
 /// Nested `_has` (`_has:Source:refParam:_has:...`) is resolved recursively: the
 /// inner chain selects the qualifying `Source` resources by id, then this level
 /// collects the references those resources make to `base_type`.
-async fn resolve_reverse_chain<S>(
+pub(crate) async fn resolve_reverse_chain<S>(
     storage: &S,
     tenant: &TenantContext,
     base_type: &str,
