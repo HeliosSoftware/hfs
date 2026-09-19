@@ -206,6 +206,15 @@ pub fn build_search_query(
         query.parameters.push(param);
     }
 
+    // Reject a date value that is not a date here, before `_list` and chain
+    // resolution run, with the one grammar every storage backend enforces
+    // again at its own gate (that gate is what covers conditional operations
+    // and chain terminals, which never pass through this function). Backends
+    // used to disagree on such a value: PostgreSQL searched for the current
+    // time instead (#1289), Elasticsearch for the year 2000 (#1293), and
+    // SQLite rolled `2024-02-30` over into March (#1295).
+    helios_persistence::search::validate_date_values(&query)?;
+
     Ok(query)
 }
 
@@ -468,35 +477,6 @@ fn parse_search_parameter(
             .collect()
     };
 
-    // Reject a value that is not a date for a registry-known date parameter,
-    // rather than handing it to a storage backend. Backends disagree on what
-    // to do with one — MongoDB errors, SQLite compares against NULL, and
-    // PostgreSQL used to substitute the current time, so `date=ltnot-a-date`
-    // returned nearly every resource with a plain 200 (#1289). Scoped like the
-    // modifier check above: an unregistered param only has a guessed type.
-    // Skipped for `:missing` (its value is a boolean), for chains (the value
-    // belongs to the chain's last link, whose type is not resolved here), and
-    // for an empty value, which is left to the backend as before.
-    if registered
-        && param_type == SearchParamType::Date
-        && chain.is_empty()
-        && !matches!(modifier, Some(SearchModifier::Missing))
-    {
-        if let Some(bad) = values
-            .iter()
-            .find(|v| !v.value.is_empty() && !is_date_search_value(&v.value))
-        {
-            return Err(RestError::InvalidParameter {
-                param: name.to_string(),
-                message: format!(
-                    "'{}' is not a valid date (expected YYYY, YYYY-MM, YYYY-MM-DD or \
-                     YYYY-MM-DDThh:mm[:ss[.fff]][Z|(+|-)hh:mm])",
-                    bad.value
-                ),
-            });
-        }
-    }
-
     let mut param = SearchParameter {
         name: base_name.to_string(),
         param_type,
@@ -528,75 +508,6 @@ fn parse_search_parameter(
     }
 
     Ok(param)
-}
-
-/// Whether `value` (comparator prefix already removed) is a FHIR date search
-/// value: `YYYY`, `YYYY-MM`, `YYYY-MM-DD`, or a full date followed by a time of
-/// at least `hh:mm`, with optional seconds, fraction and zone.
-///
-/// Deliberately the *widest* reading of the search grammar — seconds optional,
-/// zone optional, lower-case `z` tolerated — because a false rejection turns a
-/// working search into a 400. Its job is to stop values that are not dates at
-/// all (`not-a-date`, `2024-13-45`), not to police style.
-fn is_date_search_value(value: &str) -> bool {
-    let digits = |s: &str, width: usize| s.len() == width && s.bytes().all(|b| b.is_ascii_digit());
-    // A two-digit field no greater than `max`.
-    let field = |s: &str, max: u32| digits(s, 2) && s.parse::<u32>().is_ok_and(|n| n <= max);
-
-    let (date, time) = match value.split_once('T') {
-        Some((date, time)) => (date, Some(time)),
-        None => (value, None),
-    };
-
-    let fields: Vec<&str> = date.split('-').collect();
-    if fields.len() > 3 || !fields.iter().zip([4, 2, 2]).all(|(f, w)| digits(f, w)) {
-        return false;
-    }
-    // Calendar validity (month 13, February 30th); absent fields default to 1.
-    let part = |i: usize| {
-        fields
-            .get(i)
-            .and_then(|f| f.parse::<u32>().ok())
-            .unwrap_or(1)
-    };
-    if chrono::NaiveDate::from_ymd_opt(part(0) as i32, part(1), part(2)).is_none() {
-        return false;
-    }
-
-    let Some(time) = time else {
-        return true;
-    };
-    // A time can only follow a full date.
-    if fields.len() != 3 {
-        return false;
-    }
-    // Peel the zone off the end: `Z`, or a signed `hh:mm`. After `T` the only
-    // `+`/`-` the grammar allows is the offset sign.
-    let clock = if let Some(clock) = time.strip_suffix(['Z', 'z']) {
-        clock
-    } else if let Some(pos) = time.rfind(['+', '-']) {
-        match time[pos + 1..].split_once(':') {
-            Some((h, m)) if field(h, 23) && field(m, 59) => &time[..pos],
-            _ => return false,
-        }
-    } else {
-        time
-    };
-
-    let (hms, fraction) = match clock.split_once('.') {
-        Some((hms, fraction)) => (hms, Some(fraction)),
-        None => (clock, None),
-    };
-    if fraction.is_some_and(|f| f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit())) {
-        return false;
-    }
-    match hms.split(':').collect::<Vec<_>>().as_slice() {
-        // A fraction needs seconds to belong to.
-        [h, m] => fraction.is_none() && field(h, 23) && field(m, 59),
-        // 60 admits a leap second, as RFC 3339 does.
-        [h, m, s] => field(h, 23) && field(m, 59) && field(s, 60),
-        _ => false,
-    }
 }
 
 /// Parses a parameter name into the base name and optional modifier.
@@ -1138,21 +1049,47 @@ mod tests {
         }
     }
 
+    /// Builds the whole query for one `name=value` pair, which is where date
+    /// values are validated.
+    fn build_one(
+        resource_type: &str,
+        name: &str,
+        value: &str,
+        registry: &SearchParameterRegistry,
+    ) -> Result<SearchQuery, RestError> {
+        build_search_query_from_pairs(
+            resource_type,
+            &[(name.to_string(), value.to_string())],
+            registry,
+        )
+    }
+
     #[test]
     fn test_date_search_value_grammar() {
+        // The grammar itself is `helios_persistence::search::FhirDateValue`'s,
+        // and is tested exhaustively there; this pins that the REST layer
+        // applies that one and no laxer reading of its own.
+        let registry = test_registry();
+
         for value in [
             "2024",
             "2024-02",
             "2024-02-29",
+            // Minute precision is valid in search (not in the datatype).
             "2013-04-05T09:20",
             "2013-04-05T09:20:00",
             "2013-04-05T09:20:00Z",
             "2013-04-05T09:20:00-04:00",
             "2013-04-05T09:20:00+05:30",
+            // A `+` that form decoding turned into a space (#1296).
+            "2013-04-05T09:20:00 05:30",
             "2021-11-10T16:48:57.246958-08:00",
             "2016-12-31T23:59:60Z",
         ] {
-            assert!(is_date_search_value(value), "{value} is a date");
+            assert!(
+                build_one("Patient", "birthdate", value, &registry).is_ok(),
+                "{value} is a date"
+            );
         }
         for value in [
             "",
@@ -1165,14 +1102,26 @@ mod tests {
             "2024-01-15T10",
             "2024-01T10:00",
             "2024-01-15T25:00:00Z",
+            "2024-01-15T24:00:00Z",
             "2024-01-15T10:00:00.Z",
             "2024-01-15T10:00.5",
             "2024-01-15T10:00:00-99",
             "2024-01-15T10:00:00+05:3",
+            "2024-01-15T10:00:00+15:00",
             "2024-01-15 10:00:00",
+            // Lower case is not in the grammar. The validator this replaced
+            // let `z` through.
+            "2024-01-15T10:00:00z",
+            "0000",
             "now",
         ] {
-            assert!(!is_date_search_value(value), "{value:?} is not a date");
+            assert!(
+                matches!(
+                    build_one("Patient", "birthdate", value, &registry),
+                    Err(RestError::InvalidParameter { .. })
+                ),
+                "{value:?} is not a date"
+            );
         }
     }
 
@@ -1186,16 +1135,23 @@ mod tests {
             "not-a-date",
             "gtnot-a-date",
             "lt2024-13-45",
+            "lt2024-02-30",
             // One bad alternative spoils the OR-list.
             "2024-01-15,nope",
         ] {
-            let error =
-                parse_search_parameter("Patient", "birthdate", value, &registry).unwrap_err();
+            let error = build_one("Patient", "birthdate", value, &registry).unwrap_err();
             assert!(
                 matches!(&error, RestError::InvalidParameter { param, .. } if param == "birthdate"),
                 "unexpected error for {value:?}: {error:?}"
             );
         }
+
+        // `_lastUpdated` is a date whether or not the registry lists it.
+        let error = build_one("Patient", "_lastUpdated", "gtnot-a-date", &registry).unwrap_err();
+        assert!(
+            matches!(&error, RestError::InvalidParameter { param, .. } if param == "_lastUpdated"),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[test]
@@ -1211,9 +1167,9 @@ mod tests {
                 "2013-04-05T09:20:00-04:00",
             ),
         ] {
-            let param = parse_search_parameter("Patient", "birthdate", value, &registry).unwrap();
-            assert_eq!(param.values[0].prefix, prefix);
-            assert_eq!(param.values[0].value, bare);
+            let query = build_one("Patient", "birthdate", value, &registry).unwrap();
+            assert_eq!(query.parameters[0].values[0].prefix, prefix);
+            assert_eq!(query.parameters[0].values[0].value, bare);
         }
     }
 
@@ -1222,15 +1178,14 @@ mod tests {
         let registry = test_registry();
 
         // `:missing` carries a boolean, not a date.
-        parse_search_parameter("Patient", "birthdate:missing", "true", &registry).unwrap();
-        // A chain's value belongs to its last link, whose type is not known here.
-        parse_search_parameter("Observation", "patient.birthdate", "whatever", &registry).unwrap();
-        // An unregistered parameter only has a guessed type.
-        parse_search_parameter("Patient", "custom-date", "not-a-date", &registry).unwrap();
+        build_one("Patient", "birthdate:missing", "true", &registry).unwrap();
+        // A chain's value belongs to its last link, whose type is not known
+        // here; the storage gate validates the terminal query instead.
+        build_one("Observation", "patient.birthdate", "whatever", &registry).unwrap();
+        // An unregistered parameter is never typed as a date.
+        build_one("Patient", "custom-date", "not-a-date", &registry).unwrap();
         // Not a date parameter at all.
-        parse_search_parameter("Patient", "name", "2024-13-45", &registry).unwrap();
-        // An empty value is left to the backend, as before.
-        parse_search_parameter("Patient", "birthdate", "", &registry).unwrap();
+        build_one("Patient", "name", "2024-13-45", &registry).unwrap();
     }
 
     #[test]

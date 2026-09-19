@@ -1267,31 +1267,123 @@ mod date_search {
         assert!(entries.len() >= 2);
     }
 
-    /// #1289: a value that is not a date never reaches a storage backend. On
-    /// PostgreSQL it used to be replaced by the current time, so the `lt` form
-    /// here returned nearly every Patient with a plain 200.
+    /// The date values no backend may accept, with the comparator prefixes the
+    /// issues reported them under.
+    const INVALID_DATE_VALUES: &[&str] = &[
+        "not-a-date",
+        "ltnot-a-date",
+        "gtnot-a-date",
+        "gtabcd",
+        "lt2024-1x",
+        "gt2024-13-45",
+        "ne2024-13-45",
+        // SQLite's `datetime()` used to roll this over to March 1st (#1295).
+        "lt2024-02-30",
+        "ltT25:00:00Z",
+        // An hour needs minutes; minutes without seconds are fine.
+        "2013-04-05T10",
+    ];
+
+    fn assert_invalid_date_outcome(response: &axum_test::TestResponse, context: &str) {
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let body: Value = response.json();
+        assert_eq!(body["resourceType"], "OperationOutcome", "{context}");
+        assert_eq!(body["issue"][0]["code"], "invalid", "{context}");
+        let text = body["issue"][0]["diagnostics"]
+            .as_str()
+            .or_else(|| body["issue"][0]["details"]["text"].as_str())
+            .unwrap_or_default();
+        assert!(
+            text.contains("not a valid FHIR date"),
+            "{context}: the outcome should say what is wrong, got {body}"
+        );
+    }
+
+    /// #1289, #1293, #1295: a value that is not a date never reaches a storage
+    /// backend. PostgreSQL used to replace it with the current time and
+    /// Elasticsearch with the year 2000, so the client got a plausible 200.
     #[tokio::test]
     async fn test_invalid_date_value_is_a_400_not_a_search() {
         let (server, backend) = create_test_server().await;
         seed_search_test_data(&backend).await;
 
-        for query in [
-            "/Patient?birthdate=not-a-date",
-            "/Patient?birthdate=ltnot-a-date",
-            "/Patient?birthdate=gt2024-13-45",
-            "/Patient?birthdate=ne2024-13-45",
-            "/Patient?_lastUpdated=ltnot-a-date",
-        ] {
-            let response = server
-                .get(query)
-                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
-                .await;
-
-            response.assert_status(StatusCode::BAD_REQUEST);
-            let body: Value = response.json();
-            assert_eq!(body["resourceType"], "OperationOutcome", "query={query}");
-            assert_eq!(body["issue"][0]["code"], "invalid", "query={query}");
+        for value in INVALID_DATE_VALUES {
+            for param in ["birthdate", "_lastUpdated"] {
+                let query = format!("/Patient?{param}={value}");
+                let response = server
+                    .get(&query)
+                    .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                    .await;
+                assert_invalid_date_outcome(&response, &query);
+            }
         }
+    }
+
+    /// The same values through POST `_search`, which has its own form decoding.
+    #[tokio::test]
+    async fn test_invalid_date_value_is_a_400_on_post_search() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        for value in INVALID_DATE_VALUES {
+            for param in ["birthdate", "_lastUpdated"] {
+                let response = server
+                    .post("/Patient/_search")
+                    .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                    .form(&[(param, value)])
+                    .await;
+                assert_invalid_date_outcome(&response, &format!("POST {param}={value}"));
+            }
+        }
+    }
+
+    /// An invalid value is a 400 whatever the client's `Prefer: handling`:
+    /// lenient handling is for parameters the server does not know, not for
+    /// values it cannot read.
+    #[tokio::test]
+    async fn test_invalid_date_value_is_a_400_under_lenient_handling() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        for handling in ["handling=lenient", "handling=strict"] {
+            let response = server
+                .get("/Patient?birthdate=lt2024-02-30")
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .add_header(
+                    axum::http::header::HeaderName::from_static("prefer"),
+                    HeaderValue::from_static(handling),
+                )
+                .await;
+            assert_invalid_date_outcome(&response, handling);
+        }
+    }
+
+    /// A chained terminal is typed only when the chain is resolved, so it is
+    /// the storage gate that rejects it. (Valid prefixed terminals are #1292.)
+    #[tokio::test]
+    async fn test_invalid_chained_date_value_is_a_400() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let query = "/Observation?subject:Patient.birthdate=not-a-date";
+        let response = server
+            .get(query)
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        assert_invalid_date_outcome(&response, query);
+    }
+
+    /// Minute precision is valid in FHIR search, unlike the dateTime datatype.
+    #[tokio::test]
+    async fn test_minute_precision_date_value_is_accepted() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let response = server
+            .get("/Patient?birthdate=lt2013-04-05T09:20")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
     }
 }
 

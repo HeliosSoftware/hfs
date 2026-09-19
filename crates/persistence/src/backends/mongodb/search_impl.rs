@@ -1207,7 +1207,9 @@ impl MongoBackend {
             }
         }
 
-        Ok(())
+        // The shared date gate: the same values are invalid here as on every
+        // other backend, reported the same way (#1295).
+        crate::search::validate_date_values(query)
     }
 
     /// Search with `_sort` on an indexed parameter (#881): pages over the id

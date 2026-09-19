@@ -52,8 +52,13 @@ fn unavailable_error(message: String) -> crate::error::StorageError {
 /// path of its own (conditional-create criteria are resolved against the
 /// primary backend), so `search` and `search_count` below are the only
 /// entry points.
+///
+/// Every one of those paths must also refuse a date value that is not a date
+/// (#1293, #1295), so the shared date gate runs here too: an invalid value is
+/// an error, never a query the builder has to make something of.
 fn reject_unsupported_metadata_modifier(query: &SearchQuery) -> StorageResult<()> {
-    crate::search::reject_unsupported_metadata_modifier(query)
+    crate::search::reject_unsupported_metadata_modifier(query)?;
+    crate::search::validate_date_values(query)
 }
 
 /// Maximum retry attempts for transient ES search failures (in addition to the
