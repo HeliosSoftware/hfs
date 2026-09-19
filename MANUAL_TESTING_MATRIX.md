@@ -31,7 +31,7 @@ issue and replace the `☐` cells.
 | `mongodb` | ☐ | ☐ | ☐ | ☐ | ☐ (4.13 N/A) | ☐ | ☐ | ☐ | ☐ | ☐ |
 | `mongo-es` (MongoDB + Elasticsearch) | ☐ | ☐ | ☐ | ☐ | ☐ | N/A (501) | ☐ | ☐ | ☐ | ☐ |
 | `s3` (MinIO) | ☐ | ☐ | ☐ (batch only) | ☐ | N/A (no search) | N/A (501) | ☐ | ☐ | ☐ | ☐ |
-| `s3-es` (MinIO + Elasticsearch) | ☐ | ☐ | ☐ (batch only) | ☐ | ☐ | N/A (501) | ☐ | ☐ | ☐ | ☐ |
+| `s3-es` (MinIO + Elasticsearch) | ☐ | ☐ | ☐ (batch only) | ☐ | ☐ | ☐ (5.8: 0 Patient) | ☐ | ☐ | ☐ | ☐ |
 
 Tester: ______  Commit: ______  Date: ______  OS/arch: ______
 
@@ -47,7 +47,7 @@ that is a failure.
 | Search | yes | yes (ES) | yes | yes (ES) | yes | yes (ES) | **no** | yes (ES) |
 | Chained and `_has` search | yes | yes | yes | yes | yes | yes | no | yes |
 | Transaction Bundles | yes | yes | yes | yes | yes (replica set) | yes (replica set) | **no** (batch only) | **no** (batch only) |
-| Bulk Data `$export` (job store) | yes | yes | yes | yes | yes | no (501) | no (501) | no (501) |
+| Bulk Data `$export` (job store) | yes | yes | yes | yes | yes | no (501) | no (501) | yes (SQLite sidecar) |
 | `$bulk-submit` ingestion (Import page) | yes | yes | yes | yes | yes | yes | yes¹ | yes¹ |
 | `$sql-run` / `$sql-export` runner | in-DB | in-DB (primary) | in-DB | in-DB (primary) | in-DB (aggregation) | in-DB (primary) | in-process scan | in-process scan |
 | Subscriptions engine | yes | yes | yes | yes | yes | yes | yes | yes |
@@ -661,10 +661,16 @@ HFS_BULK_EXPORT_REQUIRES_ACCESS_TOKEN=false` plus the MinIO credentials from sec
 
 Pass criteria: 5.1–5.4 and 5.7–5.11 complete with the stated files and line counts;
 5.5 cancels; 5.6 and 5.12 are rejected; 5.13 fails, retries, and deletes as
-described; the ZIP download works. On `mongo-es`, `s3`, `s3-es` the
+described; the ZIP download works. On `mongo-es` and standalone `s3` the
 card appears immediately as **Failed** with
 `kick-off answered 501: bulk export not supported by this backend` — record N/A, and
 check that **Delete** removes the failed card.
+
+On `s3-es` `$export` runs (a SQLite sidecar job store at
+`$HFS_BULK_EXPORT_OUTPUT_DIR/bulk_export.db`), so 5.1–5.13 apply as written, with
+one caveat: on the S3-family rows the T2 **transaction** Bundle is refused, so the
+patient it would have created is absent. Step 5.8's *until-import* export therefore
+returns **0 Patient lines**, not the Larkin patient.
 
 ---
 
@@ -1068,10 +1074,12 @@ For each backend row, attach to the release issue:
 
 ## 15. Known expectations and gotchas
 
-- **Bulk export on `mongo-es`/S3** returns `501`: the Export page shows a **Failed** card
-  reading `kick-off answered 501: bulk export not supported by this backend`. Expected —
-  the composite and S3-backed rows have no bulk-export job store. Standalone `mongodb`
-  supports `$export` (a SQLite sidecar job store).
+- **Bulk export on `mongo-es` and standalone `s3`** returns `501`: the Export page shows a
+  **Failed** card reading `kick-off answered 501: bulk export not supported by this backend`.
+  Expected — those rows have no bulk-export job store. Standalone `mongodb` and `s3-es`
+  both support `$export` via a SQLite sidecar job store
+  (`$HFS_BULK_EXPORT_OUTPUT_DIR/bulk_export.db`). (Whether standalone `s3` and `mongo-es`
+  gain the sidecar too is unverified as of #1167 — re-check when running those rows.)
 - **S3 standalone has no search**: the Resources page cannot run queries on the `s3`
   row (T4 is N/A); `s3-es` searches through Elasticsearch.
 - **Transaction Bundles on S3** are refused by design; batch Bundles work.
