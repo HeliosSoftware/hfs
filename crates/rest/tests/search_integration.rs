@@ -898,6 +898,110 @@ mod string_search {
                 .contains("above")
         );
     }
+
+    /// #1318: an unknown modifier on a direct parameter used to be dropped, so
+    /// `name:exat=Smith` ran as `name=Smith`. It is a 400 over GET and POST,
+    /// under either `Prefer: handling` mode — the parameter is one the server
+    /// understands, so there is nothing to leniently ignore.
+    #[tokio::test]
+    async fn test_unknown_modifier_on_direct_param_returns_400() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        // Positive control: the unmodified search finds seeded patients, so a
+        // dropped modifier would have returned 200 with these.
+        let control = server
+            .get("/Patient?name=Smith")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        control.assert_status_ok();
+        assert!(!get_bundle_entries(&control.json::<Value>()).is_empty());
+
+        let assert_rejected = |body: Value, param: &str, suffix: &str| {
+            assert_eq!(body["resourceType"], "OperationOutcome");
+            assert_eq!(body["issue"][0]["severity"], "error");
+            assert_eq!(body["issue"][0]["code"], "invalid");
+            let text = body["issue"][0]["details"]["text"].as_str().unwrap();
+            assert!(text.contains(param), "{text}");
+            assert!(text.contains(suffix), "{text}");
+        };
+
+        for handling in ["handling=lenient", "handling=strict"] {
+            for (path, key, param, suffix) in [
+                ("/Patient", "name:bogus", "name", ":bogus"),
+                ("/Patient", "name:exat", "name", ":exat"),
+                // Capitalised, but not a resource type.
+                ("/Observation", "subject:Bogus", "subject", ":Bogus"),
+            ] {
+                let response = server
+                    .get(&format!("{path}?{key}=Smith"))
+                    .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                    .add_header(
+                        HeaderName::from_static("prefer"),
+                        HeaderValue::from_static(handling),
+                    )
+                    .await;
+                response.assert_status(StatusCode::BAD_REQUEST);
+                assert_rejected(response.json(), param, suffix);
+
+                let response = server
+                    .post(&format!("{path}/_search"))
+                    .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                    .add_header(
+                        HeaderName::from_static("prefer"),
+                        HeaderValue::from_static(handling),
+                    )
+                    .form(&[(key, "Smith")])
+                    .await;
+                response.assert_status(StatusCode::BAD_REQUEST);
+                assert_rejected(response.json(), param, suffix);
+            }
+        }
+    }
+
+    /// #1318: an unknown modifier on an unknown *parameter* follows the
+    /// unknown-parameter rule — ignored and reported under lenient handling,
+    /// rejected as an unknown parameter under strict.
+    #[tokio::test]
+    async fn test_unknown_modifier_on_unknown_param_follows_unknown_param_rule() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let control = server
+            .get("/Patient")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        control.assert_status_ok();
+        let all = get_bundle_entries(&control.json::<Value>()).len();
+        assert!(all > 0);
+
+        let lenient = server
+            .get("/Patient?nosuchparam:bogus=x")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        lenient.assert_status_ok();
+        let body: Value = lenient.json();
+        let matches = get_bundle_entries(&body)
+            .into_iter()
+            .filter(|e| e["resource"]["resourceType"] == "Patient")
+            .count();
+        assert_eq!(matches, all, "the unknown parameter is ignored");
+
+        let strict = server
+            .get("/Patient?nosuchparam:bogus=x")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                HeaderName::from_static("prefer"),
+                HeaderValue::from_static("handling=strict"),
+            )
+            .await;
+        strict.assert_status(StatusCode::BAD_REQUEST);
+        let text = strict.json::<Value>()["issue"][0]["details"]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(text.contains("unknown search parameter"), "{text}");
+    }
 }
 
 // =============================================================================
