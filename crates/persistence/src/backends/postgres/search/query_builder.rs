@@ -1552,7 +1552,7 @@ impl PostgresQueryBuilder {
                 .zip(param.components.iter())
                 .zip(component_slots.iter())
             {
-                let cv = Self::parse_component_value(part);
+                let cv = Self::parse_component_value(part, component.param_type);
                 match Self::build_composite_component(&cv, component.param_type, next, *slot) {
                     Some((sql, params)) => {
                         next += params.len();
@@ -1709,7 +1709,7 @@ impl PostgresQueryBuilder {
             let mut ok = true;
 
             for (idx, (part, component)) in parts.iter().zip(param.components.iter()).enumerate() {
-                let cv = Self::parse_component_value(part);
+                let cv = Self::parse_component_value(part, component.param_type);
                 // 1-based, and the same order the extractor assigns slots from.
                 let slot = (idx + 1).min(u8::MAX as usize) as u8;
                 match Self::build_composite_component_transitional(
@@ -1770,8 +1770,26 @@ impl PostgresQueryBuilder {
         ))
     }
 
-    /// Parses a composite component value, stripping any comparison prefix.
-    fn parse_component_value(part: &str) -> SearchValue {
+    /// Parses a composite component value, stripping a comparison prefix.
+    ///
+    /// Comparison prefixes (`ne`/`gt`/`lt`/`ge`/`le`/`sa`/`eb`/`ap`/`eq`) exist
+    /// only for number, date and quantity search values, so they are recognised
+    /// **only** for those component types. A token, string, reference or uri
+    /// component is taken verbatim — otherwise a code that merely begins with one
+    /// of those letter pairs (`left`, `negative`, `ge123`) would be mangled into
+    /// `ft`/`gative`/`123` and never match (#1236). Matches Elasticsearch and
+    /// MongoDB, which parse prefixes only in their Number/Date/Quantity arms.
+    fn parse_component_value(part: &str, param_type: SearchParamType) -> SearchValue {
+        if !matches!(
+            param_type,
+            SearchParamType::Number | SearchParamType::Date | SearchParamType::Quantity
+        ) {
+            return SearchValue {
+                prefix: SearchPrefix::Eq,
+                value: part.to_string(),
+            };
+        }
+
         let prefixes = [
             ("ne", SearchPrefix::Ne),
             ("gt", SearchPrefix::Gt),
@@ -3002,6 +3020,33 @@ mod tests {
             frag.sql
         );
         assert_eq!(frag.params.len(), 3);
+    }
+
+    #[test]
+    fn composite_prefix_is_only_parsed_for_numeric_component_types() {
+        // A token/string/reference/uri code that begins with a prefix's letters
+        // must be taken verbatim (#1236): `left` is not `le` + `ft`.
+        for (code, ty) in [
+            ("left", SearchParamType::Token),
+            ("negative", SearchParamType::String),
+            ("ge123", SearchParamType::Token),
+            ("http://x/y", SearchParamType::Uri),
+        ] {
+            let cv = PostgresQueryBuilder::parse_component_value(code, ty);
+            assert!(
+                matches!(cv.prefix, SearchPrefix::Eq),
+                "{code}: prefix stripped"
+            );
+            assert_eq!(cv.value, code, "{code}: value corrupted");
+        }
+
+        // …while number, date and quantity still parse theirs.
+        let q = PostgresQueryBuilder::parse_component_value("lt60", SearchParamType::Quantity);
+        assert!(matches!(q.prefix, SearchPrefix::Lt));
+        assert_eq!(q.value, "60");
+        let d = PostgresQueryBuilder::parse_component_value("ge2024", SearchParamType::Date);
+        assert!(matches!(d.prefix, SearchPrefix::Ge));
+        assert_eq!(d.value, "2024");
     }
 
     #[test]

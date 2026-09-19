@@ -664,6 +664,15 @@ pub struct BulkSubmitConfig {
     ///
     /// Set `HFS_BULK_SUBMIT_DEFER_INDEXING=false` to give up the speed and
     /// close that window.
+    ///
+    /// This is the single switch for *when* indexing happens; HFS picks the
+    /// *mechanism* from the deployment (#1242). When the primary owns search,
+    /// `false` writes the index in the batch's own transaction. When search is
+    /// offloaded to an Elasticsearch secondary, `false` selects the
+    /// `IngestIndexSink` that indexes batch by batch (#1127), and the four
+    /// `HFS_BULK_SUBMIT_INDEX_*` knobs apply. The former
+    /// `HFS_BULK_SUBMIT_INDEX_DURING_INGEST` flag, which named that mechanism
+    /// explicitly and produced a dead flag combination, is gone.
     pub defer_indexing: bool,
     /// Bulk index rebuild for the deferred reindex (SQLite): drop the
     /// `search_index` value indexes for the duration of each rebuild and
@@ -696,11 +705,6 @@ pub struct BulkSubmitConfig {
     /// replaying a manifest writes no new versions (#1127). Off by default.
     /// Set with `HFS_BULK_SUBMIT_SKIP_UNCHANGED`.
     pub skip_unchanged: bool,
-    /// Index each committed batch into the search secondary (Elasticsearch)
-    /// while ingesting, instead of rebuilding the index after the manifest
-    /// (#1127). Only meaningful with a search secondary; off by default. Set
-    /// with `HFS_BULK_SUBMIT_INDEX_DURING_INGEST`.
-    pub index_during_ingest: bool,
     /// Batches each index-during-ingest writer may hold queued before the
     /// ingest waits for it. Set with `HFS_BULK_SUBMIT_INDEX_QUEUE`.
     pub index_queue: u32,
@@ -781,7 +785,6 @@ impl Default for BulkSubmitConfig {
             batch_size: 100,
             fetch_read_timeout_secs: 60,
             skip_unchanged: false,
-            index_during_ingest: false,
             index_queue: 16,
             index_concurrency: 4,
             index_coalesce: 4,
@@ -805,6 +808,25 @@ impl Default for BulkSubmitConfig {
             poll_rate_window_secs: 60,
         }
     }
+}
+
+/// The startup error for a set-but-removed `HFS_BULK_SUBMIT_INDEX_DURING_INGEST`,
+/// or `None` when it is unset. `true`/`1` mapped to indexing during ingest, now
+/// `HFS_BULK_SUBMIT_DEFER_INDEXING=false`; anything else mapped to the deferred
+/// rebuild, now `=true` (the default). Split from `validate` so it is testable
+/// without mutating the process environment (#1242).
+fn removed_index_during_ingest_error(raw: Option<&str>) -> Option<String> {
+    let raw = raw?;
+    let equivalent = if matches!(raw.trim().to_ascii_lowercase().as_str(), "true" | "1") {
+        "false"
+    } else {
+        "true"
+    };
+    Some(format!(
+        "HFS_BULK_SUBMIT_INDEX_DURING_INGEST has been removed; set \
+         HFS_BULK_SUBMIT_DEFER_INDEXING={equivalent} instead (it now selects the \
+         index-during-ingest mechanism from the deployment)"
+    ))
 }
 
 impl BulkSubmitConfig {
@@ -899,10 +921,6 @@ impl BulkSubmitConfig {
                 d.fetch_read_timeout_secs,
             ),
             skip_unchanged: env_bool("HFS_BULK_SUBMIT_SKIP_UNCHANGED", d.skip_unchanged),
-            index_during_ingest: env_bool(
-                "HFS_BULK_SUBMIT_INDEX_DURING_INGEST",
-                d.index_during_ingest,
-            ),
             index_queue: env_u32("HFS_BULK_SUBMIT_INDEX_QUEUE", d.index_queue),
             index_concurrency: env_u32("HFS_BULK_SUBMIT_INDEX_CONCURRENCY", d.index_concurrency),
             index_coalesce: env_u32("HFS_BULK_SUBMIT_INDEX_COALESCE", d.index_coalesce),
@@ -945,6 +963,16 @@ impl BulkSubmitConfig {
     /// Validates the bulk-submit configuration.
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
+        // `HFS_BULK_SUBMIT_INDEX_DURING_INGEST` was folded into
+        // `HFS_BULK_SUBMIT_DEFER_INDEXING` (#1242). Fail loudly rather than
+        // ignore a value the operator set expecting an effect.
+        if let Some(e) = removed_index_during_ingest_error(
+            std::env::var("HFS_BULK_SUBMIT_INDEX_DURING_INGEST")
+                .ok()
+                .as_deref(),
+        ) {
+            errors.push(e);
+        }
         if !matches!(self.output_backend.as_str(), "local-fs" | "s3") {
             errors.push(format!(
                 "HFS_BULK_SUBMIT_OUTPUT_BACKEND '{}' invalid (expected local-fs|s3)",
@@ -2918,12 +2946,33 @@ mod tests {
     /// now that the knob reaches it, and the ingest-tuning knobs keep the
     /// measured defaults with index-during-ingest and skip-unchanged off.
     #[test]
+    fn removed_index_during_ingest_maps_to_the_defer_flag() {
+        // Unset: no error.
+        assert!(removed_index_during_ingest_error(None).is_none());
+        // `true`/`1` meant index during ingest → DEFER_INDEXING=false.
+        for raw in ["true", "1", " TRUE "] {
+            let e = removed_index_during_ingest_error(Some(raw)).expect("removed var errors");
+            assert!(
+                e.contains("HFS_BULK_SUBMIT_DEFER_INDEXING=false"),
+                "{raw}: {e}"
+            );
+        }
+        // anything else meant the deferred rebuild → DEFER_INDEXING=true (default).
+        for raw in ["false", "0", "no"] {
+            let e = removed_index_during_ingest_error(Some(raw)).expect("removed var errors");
+            assert!(
+                e.contains("HFS_BULK_SUBMIT_DEFER_INDEXING=true"),
+                "{raw}: {e}"
+            );
+        }
+    }
+
+    #[test]
     fn test_bulk_submit_config_ingest_tuning_defaults() {
         let cfg = BulkSubmitConfig::default();
         assert_eq!(cfg.batch_size, 100);
         assert_eq!(cfg.fetch_read_timeout_secs, 60);
         assert!(!cfg.skip_unchanged);
-        assert!(!cfg.index_during_ingest);
         assert_eq!(
             (cfg.index_queue, cfg.index_concurrency, cfg.index_coalesce),
             (16, 4, 4)

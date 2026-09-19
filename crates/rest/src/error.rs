@@ -971,7 +971,8 @@ impl From<SearchError> for RestError {
             SearchError::ChainedSearchNotSupported { .. }
             | SearchError::ReverseChainNotSupported
             | SearchError::IncludeNotSupported { .. }
-            | SearchError::TextSearchNotAvailable => RestError::NotImplemented {
+            | SearchError::TextSearchNotAvailable
+            | SearchError::TerminologyRequired { .. } => RestError::NotImplemented {
                 feature: err.to_string(),
             },
             SearchError::TooManyResults { count, max } => RestError::UnprocessableEntity {

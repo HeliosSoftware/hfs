@@ -76,7 +76,9 @@ const MAX_CONNECTION_IDLE_TIME: Duration = Duration::from_secs(60);
 /// [`crate::core::VersionedStorage`] support, and history providers.
 ///
 /// Basic search and conditional create/update/delete are available.
-/// Advanced search/composite behavior remains in later phases.
+/// Composite search parameters are served via a grouped
+/// `(resource_id, composite_group)` pair check (#1206); forward/reverse
+/// chains remain unsupported.
 pub struct MongoBackend {
     config: MongoBackendConfig,
     /// Lazily initialized MongoDB client. MongoDB clients own their connection
@@ -843,10 +845,15 @@ impl MongoBackend {
     /// `SearchModifier::is_valid_for` permits (the same gate
     /// `search_query_builder` uses to reject a modifier before it reaches any
     /// backend): `:missing` on every index-backed type (string, token, date,
-    /// number, quantity, reference, uri), `:not` on token only. Composite and
-    /// special params stay unadvertised for both — they are never indexed by
-    /// value, so `:missing` there would answer from an empty index rather
-    /// than a real absence check.
+    /// number, quantity, reference, uri), `:not` on token only. Composite
+    /// search itself is served (#1206) by the grouped `(resource_id,
+    /// composite_group)` pair check in `matching_resource_ids`;
+    /// `missing_presence_filter` would serve `:missing` on a composite for a
+    /// direct `SearchProvider` caller, but over REST every modifier on a
+    /// composite is rejected upstream by `SearchModifier::is_valid_for`; the
+    /// backend itself rejects every composite modifier other than
+    /// `:missing` in `validate_query_support`. Special params stay
+    /// unadvertised for both because they are never indexed by value.
     ///
     /// `_id` and `_lastUpdated` take a different route and are no longer
     /// imprecise here (#1055). `matching_resource_ids` skips them by name and

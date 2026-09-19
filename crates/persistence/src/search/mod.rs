@@ -62,6 +62,7 @@
 //! ```
 
 pub mod chain_resolver;
+pub mod conditional;
 pub mod converters;
 pub mod errors;
 pub mod extractor;
@@ -75,10 +76,16 @@ pub mod seeder;
 pub mod tenant_registries;
 pub mod text_fold;
 pub mod uri;
+pub mod value_parser;
 pub mod writer;
 
 // Re-export main types
-pub use chain_resolver::{query_has_chains, resolve_chains};
+pub use chain_resolver::{
+    ChainResolveOptions, query_has_chains, resolve_chains, resolve_chains_with,
+};
+pub use conditional::{
+    build_conditional_parameters, build_conditional_query, parse_conditional_criteria,
+};
 pub use converters::{IndexValue, ValueConverter};
 pub use errors::{ExtractionError, LoaderError, RegistryError, ReindexError};
 pub use extractor::{ContainedExtraction, ExtractedValue, SearchParameterExtractor};
@@ -102,4 +109,8 @@ pub use seeder::{
 pub use tenant_registries::{StoredParamLoader, TenantSearchRegistries};
 pub use text_fold::fold_text;
 pub use uri::compute_parent_uris;
+pub use value_parser::{
+    modifier_requires_terminology, param_requires_terminology, parse_typed_values,
+    split_unescaped_commas, validate_modifier,
+};
 pub use writer::SearchIndexWriter;

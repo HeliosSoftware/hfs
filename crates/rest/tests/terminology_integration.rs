@@ -224,3 +224,124 @@ async fn test_in_modifier_fails_open_on_hts_unavailable() {
     let body: Value = response.json();
     assert_eq!(body["resourceType"], "Bundle");
 }
+
+/// With a terminology server configured, a terminology-backed modifier on the
+/// terminal parameter of a chained or `_has` search is expanded like a direct
+/// one, and the chain resolves against the expanded codes (#1317: the `501` a
+/// server *without* terminology gives these must not reach this path).
+#[tokio::test]
+async fn test_chained_in_and_below_modifiers_resolve_with_terminology_server() {
+    let expansion = make_expansion("http://loinc.org", &["1234-5"]);
+    let (ts_url, requests) = start_mock_hts(expansion).await;
+
+    // The spec search parameters are needed here: the embedded fallback set
+    // knows neither `code` nor `subject`, so every chain would match nothing.
+    let data_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data");
+    let backend = SqliteBackend::with_config(
+        ":memory:",
+        helios_persistence::backends::sqlite::SqliteBackendConfig {
+            data_dir: Some(data_dir),
+            ..Default::default()
+        },
+    )
+    .expect("SQLite in-memory failed");
+    backend.init_schema().expect("Schema init failed");
+    let config = ServerConfig {
+        terminology_server: Some(ts_url),
+        ..ServerConfig::for_testing()
+    };
+    let server = TestServer::new(create_app_with_config(backend, config)).unwrap();
+
+    for resource in [
+        json!({"resourceType": "Patient", "id": "p-match"}),
+        json!({"resourceType": "Patient", "id": "p-other"}),
+        json!({"resourceType": "Observation", "id": "o-match", "status": "final",
+               "code": {"coding": [{"system": "http://loinc.org", "code": "1234-5"}]},
+               "subject": {"reference": "Patient/p-match"}}),
+        json!({"resourceType": "Observation", "id": "o-other", "status": "final",
+               "code": {"coding": [{"system": "http://loinc.org", "code": "9999-9"}]},
+               "subject": {"reference": "Patient/p-other"}}),
+        json!({"resourceType": "DiagnosticReport", "id": "d-match", "status": "final",
+               "code": {"text": "report"},
+               "result": [{"reference": "Observation/o-match"}]}),
+        json!({"resourceType": "DiagnosticReport", "id": "d-other", "status": "final",
+               "code": {"text": "report"},
+               "result": [{"reference": "Observation/o-other"}]}),
+    ] {
+        let path = format!(
+            "/{}/{}",
+            resource["resourceType"].as_str().unwrap(),
+            resource["id"].as_str().unwrap()
+        );
+        let response = server.put(&path).json(&resource).await;
+        assert!(response.status_code().is_success(), "seeding {path}");
+    }
+
+    let ids = |body: &Value| -> Vec<String> {
+        let mut ids: Vec<String> = body["entry"]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|e| e["resource"]["id"].as_str().unwrap().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        ids.sort();
+        ids
+    };
+
+    // Positive control: the plain chain finds both reports.
+    let response = server
+        .get("/DiagnosticReport")
+        .add_query_param("result.status", "final")
+        .await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+    assert_eq!(ids(&response.json()), ["d-match", "d-other"]);
+
+    for (resource_type, key, value, expected) in [
+        (
+            "DiagnosticReport",
+            "result.code:in",
+            "http://example.org/vs",
+            "d-match",
+        ),
+        (
+            "DiagnosticReport",
+            "result:Observation.code:in",
+            "http://example.org/vs",
+            "d-match",
+        ),
+        (
+            "Patient",
+            "_has:Observation:subject:code:in",
+            "http://example.org/vs",
+            "p-match",
+        ),
+        (
+            "DiagnosticReport",
+            "result:Observation.code:below",
+            "http://loinc.org|1234-5",
+            "d-match",
+        ),
+        (
+            "Patient",
+            "_has:Observation:subject:code:below",
+            "http://loinc.org|1234-5",
+            "p-match",
+        ),
+    ] {
+        let before = requests.lock().unwrap().len();
+        let response = server
+            .get(&format!("/{resource_type}"))
+            .add_query_param(key, value)
+            .await;
+        assert_eq!(response.status_code(), StatusCode::OK, "{key}");
+        assert_eq!(ids(&response.json()), [expected], "{key}");
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            before + 1,
+            "{key}: expected one $expand call"
+        );
+    }
+}

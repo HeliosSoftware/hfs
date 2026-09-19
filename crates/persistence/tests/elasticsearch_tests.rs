@@ -5497,6 +5497,127 @@ mod es_integration {
         assert!(!backend.supports(BackendCapability::InstanceHistory));
         assert!(!backend.supports(BackendCapability::Versioning));
     }
+
+    // ========================================================================
+    // Client-error classification (#1294)
+    // ========================================================================
+
+    /// An Observation whose code display `:text-advanced` can match.
+    async fn seed_glucose_observation(backend: &ElasticsearchBackend, tenant: &TenantContext) {
+        backend
+            .create(
+                tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "glucose",
+                    "status": "final",
+                    "code": { "coding": [{
+                        "system": "http://loinc.org",
+                        "code": "2339-0",
+                        "display": "Glucose"
+                    }]}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    }
+
+    fn text_advanced_query(value: &str) -> helios_persistence::types::SearchQuery {
+        use helios_persistence::types::{
+            SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+        SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "code".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::TextAdvanced),
+            values: vec![SearchValue::eq(value)],
+            chain: vec![],
+            components: vec![],
+        })
+    }
+
+    /// Lucene syntax Elasticsearch cannot parse. `:text-advanced` hands the
+    /// value to `query_string` verbatim, so this reaches the cluster and is
+    /// answered with HTTP 400 `search_phase_execution_exception` /
+    /// `query_shard_exception` — a bad request, not a cluster fault.
+    const UNPARSEABLE_LUCENE: &str = "Glucose AND (";
+
+    /// #1294: a query Elasticsearch rejects as malformed is the client's
+    /// fault. It must fail once, promptly, as a search-parse error (REST 400)
+    /// — not be retried with backoff and reported as an internal error.
+    #[tokio::test]
+    async fn es_integration_bad_query_is_not_retried_and_is_a_client_error() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::error::SearchError;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+        seed_glucose_observation(&backend, &tenant).await;
+
+        // Positive control: the same parameter and modifier, well-formed.
+        let found = backend
+            .search(&tenant, &text_advanced_query("Glucose"))
+            .await
+            .unwrap();
+        assert_eq!(found.resources.items.len(), 1, "positive control");
+
+        let started = std::time::Instant::now();
+        let err = backend
+            .search(&tenant, &text_advanced_query(UNPARSEABLE_LUCENE))
+            .await
+            .unwrap_err();
+        let elapsed = started.elapsed();
+
+        let StorageError::Search(SearchError::QueryParseError { message }) = &err else {
+            panic!("a malformed query must be a QueryParseError, got: {err:?}");
+        };
+        // The client-facing message is sanitized: no index names, no raw ES
+        // exception payload.
+        assert!(
+            !message.contains("hfs_") && !message.contains("root_cause"),
+            "message leaks Elasticsearch internals: {message}"
+        );
+        // Retrying sleeps 100ms + 200ms before giving up, so a retried query
+        // cannot finish under 300ms; one round trip to a local container
+        // takes a few milliseconds.
+        assert!(
+            elapsed < std::time::Duration::from_millis(250),
+            "a permanent client error must not be retried, took {elapsed:?}"
+        );
+    }
+
+    /// #1294: `search_count` shares the classification, so `_summary=count`
+    /// with the same bad query is a client error too.
+    #[tokio::test]
+    async fn es_integration_bad_query_count_is_a_client_error() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::error::SearchError;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+        seed_glucose_observation(&backend, &tenant).await;
+
+        let count = backend
+            .search_count(&tenant, &text_advanced_query("Glucose"))
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "positive control");
+
+        let err = backend
+            .search_count(&tenant, &text_advanced_query(UNPARSEABLE_LUCENE))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StorageError::Search(SearchError::QueryParseError { .. })
+            ),
+            "a malformed count query must be a QueryParseError, got: {err:?}"
+        );
+    }
 }
 
 // ============================================================================
