@@ -702,7 +702,7 @@ async fn start_mongodb(
     let reindex_hook = ops
         .reindex
         .clone()
-        .map(|op| automatic_reindex_hook(op, &config));
+        .map(|op| automatic_reindex_hook_with_ledger(op, &config, None));
     let submit_bundle = build_bulk_submit(
         &config,
         backend.clone(),
@@ -1759,18 +1759,21 @@ fn wire_reindex(
 }
 
 /// Builds the deferred bulk-submit hook using the existing submit-worker
-/// concurrency as the per-process automatic reindex limit.
-#[cfg(feature = "mongodb")]
-fn automatic_reindex_hook(
-    op: Arc<ReindexOperation>,
-    config: &ServerConfig,
-) -> Arc<dyn helios_persistence::core::DeferredReindexHook> {
-    automatic_reindex_hook_with_ledger(op, config, None)
-}
-
-/// The deferred-rebuild hook, plus where to clear the persisted "this manifest
-/// still owes a rebuild" marker when a generation finishes (#1125). Without a
-/// ledger nothing is recorded and a restart cannot resume, as before.
+/// concurrency as the per-process automatic reindex limit, plus where to clear
+/// the persisted "this manifest still owes a rebuild" marker when a generation
+/// finishes (#1125). Without a ledger (`None`) nothing is recorded and a restart
+/// cannot resume, as before.
+///
+/// Gated exactly like [`wire_reindex`], which produces the `op` every caller
+/// passes in: any build with a reindex target. Keep the two in step rather than
+/// naming individual backends here — a narrower gate breaks the builds that
+/// leave that backend out (#1291).
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "elasticsearch"
+))]
 fn automatic_reindex_hook_with_ledger(
     op: Arc<ReindexOperation>,
     config: &ServerConfig,
@@ -2563,7 +2566,7 @@ async fn start_postgres(
     let reindex_hook = ops
         .reindex
         .clone()
-        .map(|op| automatic_reindex_hook(op, &config));
+        .map(|op| automatic_reindex_hook_with_ledger(op, &config, None));
     let submit_bundle = build_bulk_submit(
         &config,
         backend.clone(),
@@ -2766,7 +2769,7 @@ async fn start_postgres_elasticsearch(
     let reindex_hook = ops
         .reindex
         .clone()
-        .map(|op| automatic_reindex_hook(op, &config));
+        .map(|op| automatic_reindex_hook_with_ledger(op, &config, None));
     // Wrapped like sqlite-es: finished manifests sync their ingested
     // resources into Elasticsearch, which the raw primary never does (#882),
     // unless fast-load's post-manifest reindex covers it (#903).
@@ -2995,7 +2998,7 @@ async fn start_mongodb_elasticsearch(
     let reindex_hook = ops
         .reindex
         .clone()
-        .map(|op| automatic_reindex_hook(op, &config));
+        .map(|op| automatic_reindex_hook_with_ledger(op, &config, None));
     // Bulk submit runs against the MongoDB primary, which hosts its own job
     // state, but wrapped like sqlite-es and pg-es so finished manifests sync
     // their resources into Elasticsearch (#882). The comment this replaces said
@@ -3456,7 +3459,7 @@ async fn start_s3_elasticsearch(
     let reindex_hook = ops
         .reindex
         .clone()
-        .map(|op| automatic_reindex_hook(op, &config));
+        .map(|op| automatic_reindex_hook_with_ledger(op, &config, None));
     let bulk_submit = if s3.supports_bulk_submit_worker() {
         let submit_jobs = composite_submit_jobs(
             s3.clone(),
