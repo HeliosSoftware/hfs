@@ -2248,6 +2248,114 @@ mod chaining {
         );
     }
 
+    /// Data for the chain-name parsing cases (#1302, #1303).
+    ///
+    /// `Patient.general-practitioner` is polymorphic and both of the targets
+    /// used here define `name`: patient `ps` points at a *Practitioner* named
+    /// Smith, patient `pl` at an *Organization* named Smith Clinic — so only a
+    /// middle-hop `:Type` qualifier can tell their Observations apart.
+    ///
+    /// The two patients are "Smith" and "Smithson" (default string matching is
+    /// a prefix match, so `:exact` narrows it), differ in gender, and only `ps`
+    /// has a birth date.
+    async fn seed_chain_name_data(backend: &SqliteBackend) {
+        let tenant = test_tenant();
+        let resources = [
+            json!({"resourceType": "Practitioner", "id": "gp-prac",
+                   "name": [{"family": "Smith"}]}),
+            json!({"resourceType": "Organization", "id": "gp-org",
+                   "name": "Smith Clinic"}),
+            json!({"resourceType": "Patient", "id": "ps", "gender": "male",
+                   "birthDate": "1980-01-01",
+                   "name": [{"family": "Smith"}],
+                   "generalPractitioner": [{"reference": "Practitioner/gp-prac"}]}),
+            json!({"resourceType": "Patient", "id": "pl", "gender": "female",
+                   "name": [{"family": "Smithson"}],
+                   "generalPractitioner": [{"reference": "Organization/gp-org"}]}),
+            json!({"resourceType": "Encounter", "id": "es", "status": "finished",
+                   "class": {"code": "AMB"},
+                   "subject": {"reference": "Patient/ps"}}),
+            json!({"resourceType": "Encounter", "id": "el", "status": "finished",
+                   "class": {"code": "AMB"},
+                   "subject": {"reference": "Patient/pl"}}),
+            json!({"resourceType": "Observation", "id": "os", "status": "final",
+                   "code": {"coding": [{"system": "http://loinc.org", "code": "1234-5"}]},
+                   "subject": {"reference": "Patient/ps"},
+                   "encounter": {"reference": "Encounter/es"}}),
+            json!({"resourceType": "Observation", "id": "ol", "status": "final",
+                   "code": {"coding": [{"system": "http://loinc.org", "code": "9999-9"}]},
+                   "subject": {"reference": "Patient/pl"},
+                   "encounter": {"reference": "Encounter/el"}}),
+        ];
+        for resource in resources {
+            let resource_type = resource["resourceType"].as_str().unwrap().to_string();
+            backend
+                .create(&tenant, &resource_type, resource, FhirVersion::R4)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// #1303: a `:Type` qualifier on a middle hop constrains that hop's
+    /// reference, so a polymorphic reference resolves only to the named type.
+    #[tokio::test]
+    async fn test_chained_middle_hop_type_qualifier() {
+        let (server, backend) = create_test_server().await;
+        seed_chain_name_data(&backend).await;
+
+        // Unqualified: every target type of general-practitioner is searched.
+        assert_eq!(
+            ids(
+                &server,
+                "/Observation?subject:Patient.general-practitioner.name=Smith"
+            )
+            .await,
+            ["ol", "os"]
+        );
+        assert_eq!(
+            ids(
+                &server,
+                "/Observation?subject:Patient.general-practitioner:Practitioner.name=Smith"
+            )
+            .await,
+            ["os"]
+        );
+        assert_eq!(
+            ids(
+                &server,
+                "/Observation?subject:Patient.general-practitioner:Organization.name=Smith"
+            )
+            .await,
+            ["ol"]
+        );
+        // The qualifier works without one on the first hop …
+        assert_eq!(
+            ids(
+                &server,
+                "/Observation?subject.general-practitioner:Organization.name=Smith"
+            )
+            .await,
+            ["ol"]
+        );
+        // … and on the last reference of a three-hop chain.
+        assert_eq!(
+            ids(
+                &server,
+                "/Observation?encounter.subject.general-practitioner:Practitioner.name=Smith"
+            )
+            .await,
+            ["os"]
+        );
+        assert_eq!(
+            ids(
+                &server,
+                "/Observation?encounter:Encounter.subject:Patient.general-practitioner:Organization.name=Smith"
+            )
+            .await,
+            ["ol"]
+        );
+    }
+
     #[tokio::test]
     async fn test_multiple_chain_levels() {
         let (server, backend) = create_test_server().await;

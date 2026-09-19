@@ -484,86 +484,51 @@ fn parse_parameter_name(name: &str) -> (&str, Option<SearchModifier>) {
 
 /// Parses chain elements from a parameter name.
 ///
+/// A chain `a:T0.b:T1.c` is one hop per reference parameter: hop 0 follows `a`
+/// (to a `T0`) and targets `b`; hop 1 follows `b` (to a `T1`) and targets `c`.
+/// A `:Type` qualifier constrains the reference parameter it is written on, so
+/// it belongs to the hop whose `reference_param` that is.
+///
 /// Examples:
 /// - "name" -> ("name", [])
-/// - "patient.name" -> ("patient", [ChainedParameter{...}])
-/// - "subject:Patient.organization.name" -> ("subject", [ChainedParameter{target_type: Patient, ...}])
+/// - "patient.name" -> ("patient", [{patient, None, name}])
+/// - "subject:Patient.organization:Organization.name" ->
+///   ("subject", [{subject, Patient, organization}, {organization, Organization, name}])
 fn parse_chain(name: &str) -> (&str, Vec<helios_persistence::types::ChainedParameter>) {
-    // Handle type-qualified chains like "subject:Patient.organization.name"
-    let (base_with_type, rest) = if let Some(dot_pos) = name.find('.') {
-        (&name[..dot_pos], Some(&name[dot_pos + 1..]))
-    } else {
-        (name, None)
-    };
-
-    // Extract type modifier from base if present
-    let (base_name, target_type) = if let Some(colon_pos) = base_with_type.find(':') {
-        let base = &base_with_type[..colon_pos];
-        let type_str = &base_with_type[colon_pos + 1..];
-        (base, Some(type_str.to_string()))
-    } else {
-        (base_with_type, None)
-    };
-
-    // No chain if no dot
-    let rest = match rest {
-        Some(r) => r,
-        None => return (base_name, vec![]),
-    };
+    let mut parts = name.split('.');
+    // `split` always yields at least one item.
+    let (base_name, mut qualifier) = split_qualifier(parts.next().unwrap_or(name));
+    let mut reference_param = base_name;
 
     let mut chain = Vec::new();
-    let parts: Vec<&str> = rest.split('.').collect();
-
-    // For simple chains like "patient.name", we need one ChainedParameter
-    // For complex chains like "subject.organization.name", we need multiple
-    if parts.len() == 1 {
-        // Simple chain: patient.name
+    let mut parts = parts.peekable();
+    while let Some(part) = parts.next() {
+        // Every part but the last is itself a reference parameter, whose
+        // qualifier belongs to the *next* hop. The last part is the terminal
+        // search parameter and is kept as written.
+        let (target_param, next_qualifier) = if parts.peek().is_some() {
+            split_qualifier(part)
+        } else {
+            (part, None)
+        };
         chain.push(helios_persistence::types::ChainedParameter {
-            reference_param: base_name.to_string(),
-            target_type,
-            target_param: parts[0].to_string(),
+            reference_param: reference_param.to_string(),
+            target_type: qualifier.map(str::to_string),
+            target_param: target_param.to_string(),
         });
-    } else {
-        // Complex chain: build step by step
-        // For subject.organization.name:
-        // 1. reference_param=subject, target_param=organization
-        // 2. reference_param=organization, target_param=name
-        for i in 0..parts.len() {
-            let ref_param = if i == 0 {
-                base_name.to_string()
-            } else {
-                // Get base part of previous (strip any type modifier)
-                let prev = parts[i - 1];
-                if let Some(colon_pos) = prev.find(':') {
-                    prev[..colon_pos].to_string()
-                } else {
-                    prev.to_string()
-                }
-            };
-
-            // Check if current part has type qualifier
-            let (current_param, part_type) = if let Some(colon_pos) = parts[i].find(':') {
-                (
-                    parts[i][..colon_pos].to_string(),
-                    Some(parts[i][colon_pos + 1..].to_string()),
-                )
-            } else {
-                (parts[i].to_string(), None)
-            };
-
-            chain.push(helios_persistence::types::ChainedParameter {
-                reference_param: ref_param,
-                target_type: if i == 0 {
-                    target_type.clone()
-                } else {
-                    part_type
-                },
-                target_param: current_param,
-            });
-        }
+        reference_param = target_param;
+        qualifier = next_qualifier;
     }
 
     (base_name, chain)
+}
+
+/// Splits `param:Qualifier` into the parameter and its optional qualifier.
+fn split_qualifier(part: &str) -> (&str, Option<&str>) {
+    match part.split_once(':') {
+        Some((param, qualifier)) => (param, Some(qualifier)),
+        None => (part, None),
+    }
 }
 
 /// Parses _has parameter (reverse chaining).
@@ -869,6 +834,99 @@ mod tests {
         assert_eq!(chain[0].target_param, "organization");
         assert_eq!(chain[1].reference_param, "organization");
         assert_eq!(chain[1].target_param, "name");
+    }
+
+    /// One hop of an expected chain: (reference_param, target_type, target_param).
+    type Hop = (&'static str, Option<&'static str>, &'static str);
+
+    type OwnedHop = (String, Option<String>, String);
+
+    fn hops(chain: &[helios_persistence::types::ChainedParameter]) -> Vec<OwnedHop> {
+        chain
+            .iter()
+            .map(|c| {
+                (
+                    c.reference_param.clone(),
+                    c.target_type.clone(),
+                    c.target_param.clone(),
+                )
+            })
+            .collect()
+    }
+    fn owned(expected: &[Hop]) -> Vec<OwnedHop> {
+        expected
+            .iter()
+            .map(|(r, t, p)| (r.to_string(), t.map(str::to_string), p.to_string()))
+            .collect()
+    }
+
+    /// #1303: a `:Type` qualifier constrains the reference parameter it is
+    /// written on, at every position of the chain.
+    #[test]
+    fn test_parse_chain_type_qualifier_positions() {
+        let cases: &[(&str, &[Hop])] = &[
+            ("patient.name", &[("patient", None, "name")]),
+            (
+                "subject:Patient.name",
+                &[("subject", Some("Patient"), "name")],
+            ),
+            (
+                "subject.organization.name",
+                &[
+                    ("subject", None, "organization"),
+                    ("organization", None, "name"),
+                ],
+            ),
+            (
+                "subject:Patient.organization.name",
+                &[
+                    ("subject", Some("Patient"), "organization"),
+                    ("organization", None, "name"),
+                ],
+            ),
+            (
+                "subject.organization:Organization.name",
+                &[
+                    ("subject", None, "organization"),
+                    ("organization", Some("Organization"), "name"),
+                ],
+            ),
+            (
+                "subject:Patient.organization:Organization.name",
+                &[
+                    ("subject", Some("Patient"), "organization"),
+                    ("organization", Some("Organization"), "name"),
+                ],
+            ),
+            (
+                "encounter:Encounter.subject:Patient.general-practitioner:Practitioner.name",
+                &[
+                    ("encounter", Some("Encounter"), "subject"),
+                    ("subject", Some("Patient"), "general-practitioner"),
+                    ("general-practitioner", Some("Practitioner"), "name"),
+                ],
+            ),
+            (
+                "encounter.subject.general-practitioner:Organization.name",
+                &[
+                    ("encounter", None, "subject"),
+                    ("subject", None, "general-practitioner"),
+                    ("general-practitioner", Some("Organization"), "name"),
+                ],
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (name, expected) in cases {
+            let (base, chain) = parse_chain(name);
+            if base != expected[0].0 || hops(&chain) != owned(expected) {
+                failures.push(format!(
+                    "{name}\n   got      {:?}\n   expected {:?}",
+                    hops(&chain),
+                    owned(expected)
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
     }
 
     #[test]
