@@ -891,6 +891,15 @@ impl LeaseKeeper {
                     }
                     match tokio::time::timeout(left, jobs.heartbeat(&lease)).await {
                         Ok(Ok(new_expiry)) => {
+                            tracing::debug!(
+                                submission = %lease.submission_id,
+                                manifest = %lease.manifest_id,
+                                worker = %lease.worker_id,
+                                fencing_token = lease.fencing_token,
+                                held_until = %new_expiry,
+                                now = %Utc::now(),
+                                "bulk-submit lease renewed"
+                            );
                             renewed = Some(new_expiry);
                             break;
                         }
@@ -912,6 +921,8 @@ impl LeaseKeeper {
                                     manifest = %lease.manifest_id,
                                     worker = %lease.worker_id,
                                     fencing_token = lease.fencing_token,
+                                    held_until = %expiry,
+                                    now = %Utc::now(),
                                     "bulk-submit lease lost: another worker reclaimed the \
                                      manifest; abandoning this run"
                                 );
@@ -7158,23 +7169,61 @@ mod tests {
     }
 
     /// A lost lease is declared lost and logged at `warn` (#1127); it used to
-    /// take a silent exit.
+    /// take a silent exit. The warn names the expiry the keeper believed it
+    /// held and the clock at that moment, so a reclaim can be told apart from
+    /// a lease that had genuinely run out (#1229).
     #[tokio::test]
     async fn test_lease_keeper_warns_when_the_lease_was_reclaimed() {
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let _guard = tracing::subscriber::set_default(CaptureWarnings(Arc::clone(&events)));
+        let _guard = tracing::subscriber::set_default(CaptureEvents {
+            events: Arc::clone(&events),
+            verbosity: tracing::Level::WARN,
+        });
         assert!(keeper_loses_lease(Renewal::Lost, StdDuration::from_secs(15)).await);
         let events = events.lock().unwrap();
+        let lost = events
+            .iter()
+            .find(|e: &&String| e.contains("lease lost"))
+            .unwrap_or_else(|| panic!("no warn for a reclaimed lease: {events:?}"));
+        assert!(lost.contains("held_until="), "{lost}");
+        assert!(lost.contains("now="), "{lost}");
+    }
+
+    /// Every renewal that lands is logged at `debug` with the expiry the
+    /// store granted, which is how #1229's "renewed, then rolled back by the
+    /// batch" pattern was read off a worker log.
+    #[tokio::test]
+    async fn test_lease_keeper_logs_each_renewal_with_the_expiry_it_was_granted() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _guard = tracing::subscriber::set_default(CaptureEvents {
+            events: Arc::clone(&events),
+            verbosity: tracing::Level::DEBUG,
+        });
+        assert!(!keeper_loses_lease(Renewal::Lands, StdDuration::from_secs(5)).await);
+        let events = events.lock().unwrap();
+        let renewals: Vec<&String> = events
+            .iter()
+            .filter(|e| e.contains("bulk-submit lease renewed"))
+            .collect();
+        // A two-second lease renewed at a third of what is left lands several
+        // times in five seconds.
+        assert!(renewals.len() >= 2, "renewals logged: {events:?}");
         assert!(
-            events.iter().any(|e: &String| e.contains("lease lost")),
-            "no warn for a reclaimed lease: {events:?}"
+            renewals
+                .iter()
+                .all(|e| e.contains("held_until=") && e.contains("fencing_token=1")),
+            "{renewals:?}"
         );
     }
 
-    /// Records the text of every `warn` or `error` event on the current thread.
-    struct CaptureWarnings(Arc<std::sync::Mutex<Vec<String>>>);
+    /// Records the text of every event at `verbosity` or louder on the
+    /// current thread.
+    struct CaptureEvents {
+        events: Arc<std::sync::Mutex<Vec<String>>>,
+        verbosity: tracing::Level,
+    }
 
-    impl tracing::Subscriber for CaptureWarnings {
+    impl tracing::Subscriber for CaptureEvents {
         fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
             true
         }
@@ -7194,10 +7243,10 @@ mod tests {
                     self.0.push_str(&format!("{}={:?} ", field.name(), value));
                 }
             }
-            if *event.metadata().level() <= tracing::Level::WARN {
+            if *event.metadata().level() <= self.verbosity {
                 let mut text = Text(String::new());
                 event.record(&mut text);
-                self.0.lock().unwrap().push(text.0);
+                self.events.lock().unwrap().push(text.0);
             }
         }
         fn enter(&self, _: &tracing::span::Id) {}

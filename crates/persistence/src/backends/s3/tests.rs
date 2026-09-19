@@ -3257,6 +3257,150 @@ mod bulk_submit_worker {
     /// #968: an abort settles the manifest's outcome, so a worker that finishes
     /// immediately afterwards must lose rather than flip `failed` to
     /// `completed`.
+    /// Stands in for the lease keeper, whose heartbeat lands while a batch is
+    /// being written: `batch_committed` fires after the batch's entries are
+    /// stored and before `process_entries` writes the manifest counters.
+    struct MidBatch<F>(F);
+
+    #[async_trait::async_trait]
+    impl<F> crate::core::bulk_submit::BatchCommitObserver for MidBatch<F>
+    where
+        F: Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync,
+    {
+        async fn batch_committed(&self, _: &crate::core::bulk_submit::BatchCommitted<'_>) {
+            (self.0)().await;
+        }
+    }
+
+    fn one_patient(line: u64, id: &str) -> Vec<NdjsonEntry> {
+        vec![NdjsonEntry::new(
+            line,
+            "Patient",
+            json!({"resourceType": "Patient", "id": id}),
+        )]
+    }
+
+    /// #1229: `process_entries` read the manifest state before the batch and
+    /// wrote that whole copy back after it, lease fields included. On S3 a
+    /// 1,000-entry batch outlasts a heartbeat interval, so every renewal that
+    /// landed during a batch was rolled back; two batches in, the stored expiry
+    /// was in the past and the other in-process worker reclaimed a manifest
+    /// whose holder was alive — once a minute for a whole import.
+    #[tokio::test]
+    async fn a_batch_does_not_roll_back_a_lease_renewed_while_it_ran() {
+        let backend = Arc::new(make_prefix_backend(Arc::new(MockS3Client::with_buckets(
+            &["test-bucket"],
+        ))));
+        let t = tenant("tenant-a");
+        let (id, manifest_id) = seed(&backend, &t).await;
+
+        // Expired the moment it is taken: only a renewal keeps it alive, which
+        // is exactly the position a long batch puts a lease in.
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("worker-1"), Duration::from_secs(0))
+            .await
+            .expect("claim")
+            .expect("claimable");
+        let renewing = crate::core::bulk_submit_worker::ManifestLease {
+            lease_duration: lease_duration(),
+            ..lease.clone()
+        };
+
+        let keeper = Arc::clone(&backend);
+        let held = renewing.clone();
+        let options =
+            BulkProcessingOptions::new().with_batch_observer(Arc::new(MidBatch(move || {
+                let keeper = Arc::clone(&keeper);
+                let held = held.clone();
+                Box::pin(async move {
+                    keeper
+                        .heartbeat(&held)
+                        .await
+                        .expect("the holder renews mid-batch");
+                }) as futures::future::BoxFuture<'static, ()>
+            })));
+        let results = backend
+            .process_entries(&t, &id, &manifest_id, one_patient(1, "p1"), &options)
+            .await
+            .expect("ingest");
+        assert!(results[0].is_success());
+
+        assert!(
+            backend
+                .claim_next_manifest(&WorkerId::new("worker-2"), lease_duration())
+                .await
+                .expect("claim")
+                .is_none(),
+            "the batch's manifest write rolled the renewed lease back to its pre-batch expiry, \
+             so a second worker reclaimed a manifest whose holder is alive (#1229)"
+        );
+        backend
+            .heartbeat(&renewing)
+            .await
+            .expect("the holder still holds its lease after the batch");
+
+        // The batch's own share of the state did land.
+        let manifest = backend
+            .get_manifest(&t, &id, &manifest_id)
+            .await
+            .expect("get manifest")
+            .expect("manifest exists");
+        assert_eq!(manifest.total_entries, 1);
+        assert_eq!(manifest.processed_entries, 1);
+        assert_eq!(manifest.status, ManifestStatus::Processing);
+    }
+
+    /// The other half of #1229: the same whole-object write could undo a
+    /// reclaim. A worker fenced out mid-batch must not hand the manifest back
+    /// to itself when its batch ends.
+    #[tokio::test]
+    async fn a_batch_that_outlives_its_lease_does_not_undo_the_reclaim() {
+        let backend = Arc::new(make_prefix_backend(Arc::new(MockS3Client::with_buckets(
+            &["test-bucket"],
+        ))));
+        let t = tenant("tenant-a");
+        let (id, manifest_id) = seed(&backend, &t).await;
+
+        let stale = backend
+            .claim_next_manifest(&WorkerId::new("worker-1"), Duration::from_secs(0))
+            .await
+            .expect("claim")
+            .expect("claimable");
+
+        let fresh = Arc::new(tokio::sync::Mutex::new(None));
+        let claimer = Arc::clone(&backend);
+        let slot = Arc::clone(&fresh);
+        let options =
+            BulkProcessingOptions::new().with_batch_observer(Arc::new(MidBatch(move || {
+                let claimer = Arc::clone(&claimer);
+                let slot = Arc::clone(&slot);
+                Box::pin(async move {
+                    let lease = claimer
+                        .claim_next_manifest(&WorkerId::new("worker-2"), lease_duration())
+                        .await
+                        .expect("claim")
+                        .expect("an expired lease is reclaimable");
+                    *slot.lock().await = Some(lease);
+                }) as futures::future::BoxFuture<'static, ()>
+            })));
+        backend
+            .process_entries(&t, &id, &manifest_id, one_patient(1, "p1"), &options)
+            .await
+            .expect("ingest");
+
+        let fresh = fresh.lock().await.clone().expect("worker-2 claimed");
+        assert!(fresh.fencing_token > stale.fencing_token);
+        backend
+            .heartbeat(&fresh)
+            .await
+            .expect("the new holder keeps the manifest after the old holder's batch ends");
+        let lost = backend
+            .heartbeat(&stale)
+            .await
+            .expect_err("the fenced-out worker stays fenced out");
+        assert!(format!("{lost:?}").contains("LeaseLost"), "got {lost:?}");
+    }
+
     #[tokio::test]
     async fn an_abort_beats_a_late_worker_verdict() {
         let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
