@@ -898,12 +898,60 @@ impl PostgresQueryBuilder {
                 date_predicate("last_updated", value.prefix, &value.value, &mut next);
             conditions.push(SqlFragment::with_params(sql, params));
         }
-        if conditions.is_empty() {
-            return None;
+        Self::or_values("_lastUpdated", conditions)
+    }
+
+    /// Folds the per-value conditions of ONE parameter into the parameter's
+    /// condition.
+    ///
+    /// The values of a parameter are alternatives: `date=2013-04-05,2020-06-01`
+    /// is either day. The date, `_lastUpdated`, number and quantity builders
+    /// folded them with `AND`, which asks for a resource matching every value —
+    /// for two distinct days, nothing (#1300). The conjunction FHIR does define,
+    /// a *repeated* parameter (`date=ge2013-01-01&date=le2013-12-31`), reaches
+    /// this builder as separate [`SearchParameter`]s and is ANDed one level up in
+    /// [`Self::build_search_query_for`]; it never passes through here.
+    ///
+    /// When every condition is a membership test on `param_name`, the result is
+    /// ONE sublink with the predicates OR'd inside it rather than one sublink per
+    /// value OR'd together — the plan reason is on `build_token_condition`: a
+    /// sublink under an `OR` is not pulled up into a semi-join. Both forms select
+    /// the same resources (`∃row: a ∨ b` ≡ `(∃row: a) ∨ (∃row: b)`), and the
+    /// single sublink is a row predicate, so [`Self::single_index_predicate`]
+    /// may extract it — as it already does for a token or reference OR-list.
+    ///
+    /// Anything else — `_lastUpdated`, which compares a `resources` column
+    /// directly, or a bare [`match_nothing`] — is OR'd as is. `FALSE OR x` is `x`:
+    /// an uninterpretable alternative contributes nothing and no longer empties
+    /// the parameter. That cannot widen a result, because an all-`FALSE` list is
+    /// still `FALSE`, and for dates the search gate (`validate_date_values`)
+    /// rejects the whole request before a query is built.
+    ///
+    /// A single condition is returned untouched. Params are concatenated in
+    /// value order, so placeholder numbering is exactly what the caller assigned.
+    fn or_values(param_name: &str, mut conditions: Vec<SqlFragment>) -> Option<SqlFragment> {
+        if conditions.len() < 2 {
+            return conditions.pop();
         }
+
+        let membership = format!(
+            "{}param_name = '{}' AND ",
+            Self::INDEX_MEMBERSHIP_PREFIX,
+            param_name
+        );
+        let single_sublink = conditions
+            .iter()
+            .map(|c| c.sql.strip_prefix(&membership)?.strip_suffix(')'))
+            .collect::<Option<Vec<&str>>>()
+            .map(|predicates| format!("{membership}(({})))", predicates.join(") OR (")));
+        if let Some(sql) = single_sublink {
+            let params = conditions.into_iter().flat_map(|c| c.params).collect();
+            return Some(SqlFragment::with_params(sql, params));
+        }
+
         let mut combined = conditions.remove(0);
         for cond in conditions {
-            combined = combined.and(cond);
+            combined = combined.or(cond);
         }
         Some(combined)
     }
@@ -1750,14 +1798,7 @@ impl PostgresQueryBuilder {
             ));
         }
 
-        if conditions.is_empty() {
-            return None;
-        }
-        let mut combined = conditions.remove(0);
-        for cond in conditions {
-            combined = combined.and(cond);
-        }
-        Some(combined)
+        Self::or_values(&param.name, conditions)
     }
 
     fn build_number_condition(param: &SearchParameter, offset: usize) -> Option<SqlFragment> {
@@ -1781,14 +1822,7 @@ impl PostgresQueryBuilder {
             ));
         }
 
-        if conditions.is_empty() {
-            return None;
-        }
-        let mut combined = conditions.remove(0);
-        for cond in conditions {
-            combined = combined.and(cond);
-        }
-        Some(combined)
+        Self::or_values(&param.name, conditions)
     }
 
     fn build_quantity_condition(param: &SearchParameter, offset: usize) -> Option<SqlFragment> {
@@ -1935,14 +1969,7 @@ impl PostgresQueryBuilder {
             ));
         }
 
-        if conditions.is_empty() {
-            return None;
-        }
-        let mut combined = conditions.remove(0);
-        for cond in conditions {
-            combined = combined.and(cond);
-        }
-        Some(combined)
+        Self::or_values(&param.name, conditions)
     }
 
     /// Builds the `:identifier` condition: match references whose target
@@ -2348,26 +2375,245 @@ mod tests {
         assert!(PostgresQueryBuilder::single_index_predicate(&frag.sql).is_none());
     }
 
-    #[test]
-    fn repeated_values_of_one_param_are_not_extractable() {
-        // `date=gt..&date=lt..` on one parameter also ANDs at resource level: two
-        // index rows may satisfy it jointly, which a single-row predicate cannot
-        // express.
-        let param = SearchParameter {
-            name: "date".to_string(),
-            param_type: SearchParamType::Date,
+    fn multi_value_param(
+        name: &str,
+        param_type: SearchParamType,
+        values: Vec<SearchValue>,
+    ) -> SearchParameter {
+        SearchParameter {
+            name: name.to_string(),
+            param_type,
             modifier: None,
-            values: vec![
-                SearchValue::new(SearchPrefix::Gt, "2010-01-01"),
-                SearchValue::new(SearchPrefix::Lt, "2020-01-01"),
-            ],
+            values,
             chain: vec![],
             components: vec![],
-        };
-        let query = SearchQuery::new("Encounter").with_parameter(param);
+        }
+    }
+
+    /// Every `$N` in `sql`, in order of appearance.
+    fn placeholders(sql: &str) -> Vec<usize> {
+        let mut found = Vec::new();
+        let mut rest = sql;
+        while let Some(at) = rest.find('$') {
+            rest = &rest[at + 1..];
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            if let Ok(n) = digits.parse() {
+                found.push(n);
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn date_or_list_is_a_single_extractable_sublink() {
+        // `date=2013-04-05,2020-06-01`: the values of one parameter are
+        // alternatives (#1300). This test used to build the same parameter and
+        // assert it was NOT extractable, on the reading that the values AND at
+        // resource level; that reading was the bug. As an OR the match is one row
+        // satisfying either range, which is exactly what a single-row predicate
+        // expresses — the same shape a token OR-list has always extracted to.
+        let query = SearchQuery::new("Procedure").with_parameter(multi_value_param(
+            "date",
+            SearchParamType::Date,
+            vec![
+                SearchValue::new(SearchPrefix::Eq, "2013-04-05"),
+                SearchValue::new(SearchPrefix::Eq, "2020-06-01"),
+            ],
+        ));
         let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
 
+        assert_eq!(
+            frag.sql,
+            "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = 'date' AND ((value_date >= $3 AND value_date < $4) OR (value_date >= $5 AND value_date < $6)))"
+        );
+        assert_eq!(frag.sql.matches("FROM search_index").count(), 1);
+        assert_eq!(frag.params.len(), 4);
+        match frag.params.as_slice() {
+            [
+                SqlParam::Timestamp(a),
+                SqlParam::Timestamp(b),
+                SqlParam::Timestamp(c),
+                SqlParam::Timestamp(d),
+            ] => {
+                assert_eq!(a.to_rfc3339(), "2013-04-05T00:00:00+00:00");
+                assert_eq!(b.to_rfc3339(), "2013-04-06T00:00:00+00:00");
+                assert_eq!(c.to_rfc3339(), "2020-06-01T00:00:00+00:00");
+                assert_eq!(d.to_rfc3339(), "2020-06-02T00:00:00+00:00");
+            }
+            other => panic!("expected the two day ranges in value order: {other:?}"),
+        }
+
+        // The extracted predicate is spliced after `AND` on the fast path, so the
+        // alternatives must arrive parenthesized or the `OR` would escape the
+        // tenant/type scoping in front of it.
+        let pred = PostgresQueryBuilder::single_index_predicate(&frag.sql)
+            .expect("an OR list over one parameter is a single-row predicate");
+        assert_eq!(
+            pred,
+            "param_name = 'date' AND ((value_date >= $3 AND value_date < $4) OR (value_date >= $5 AND value_date < $6))"
+        );
+    }
+
+    #[test]
+    fn prefixed_date_or_list_keeps_each_prefix() {
+        // `date=lt2014-01-01,gt2020-01-01` — outside the window, which no single
+        // value can say. Under AND it was unsatisfiable for a single-valued date.
+        let query = SearchQuery::new("Procedure").with_parameter(multi_value_param(
+            "date",
+            SearchParamType::Date,
+            vec![
+                SearchValue::new(SearchPrefix::Lt, "2014-01-01"),
+                SearchValue::new(SearchPrefix::Gt, "2020-01-01"),
+            ],
+        ));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+
+        assert!(
+            frag.sql
+                .ends_with("AND ((value_date < $3) OR (value_date >= $4)))"),
+            "{}",
+            frag.sql
+        );
+        assert_eq!(frag.params.len(), 2);
+    }
+
+    #[test]
+    fn last_updated_or_list_is_a_disjunction() {
+        // `_lastUpdated` compares a `resources` column, so there is no sublink to
+        // merge: the ranges are OR'd directly, each side parenthesized.
+        let query = SearchQuery::new("Patient").with_parameter(special_param(
+            "_lastUpdated",
+            vec![
+                SearchValue::new(SearchPrefix::Eq, "2013-04-05"),
+                SearchValue::new(SearchPrefix::Eq, "2020-06-01"),
+            ],
+        ));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+
+        assert_eq!(
+            frag.sql,
+            "(last_updated >= $3 AND last_updated < $4) OR (last_updated >= $5 AND last_updated < $6)"
+        );
+        assert_eq!(frag.params.len(), 4);
         assert!(PostgresQueryBuilder::single_index_predicate(&frag.sql).is_none());
+    }
+
+    #[test]
+    fn number_and_quantity_or_lists_are_single_sublinks_with_gap_free_placeholders() {
+        // The same fold sat at the end of the number and quantity builders.
+        // Quantity is the stress case for numbering: a value with a convertible
+        // unit binds raw bounds, unit, system, canonical bounds and canonical
+        // unit, and the next value must continue from wherever that ended.
+        for (name, param_type, a, b) in [
+            ("probability", SearchParamType::Number, "0.2", "0.8"),
+            (
+                "value-quantity",
+                SearchParamType::Quantity,
+                "5|http://unitsofmeasure.org|mg",
+                "50",
+            ),
+        ] {
+            let query = SearchQuery::new("Observation").with_parameter(multi_value_param(
+                name,
+                param_type,
+                vec![
+                    SearchValue::new(SearchPrefix::Eq, a),
+                    SearchValue::new(SearchPrefix::Eq, b),
+                ],
+            ));
+            let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+
+            assert!(!frag.sql.contains(") AND (id IN"), "{name}: {}", frag.sql);
+            assert_eq!(
+                frag.sql.matches("FROM search_index").count(),
+                1,
+                "{name}: {}",
+                frag.sql
+            );
+            assert!(frag.sql.contains(") OR ("), "{name}: {}", frag.sql);
+            assert!(
+                PostgresQueryBuilder::single_index_predicate(&frag.sql).is_some(),
+                "{name}: {}",
+                frag.sql
+            );
+
+            // `$1`/`$2` are the caller's; everything after runs 3..=2+len with no
+            // gap, and first appearances are in order.
+            let mut seen: Vec<usize> = Vec::new();
+            for n in placeholders(&frag.sql) {
+                if n > 2 && !seen.contains(&n) {
+                    seen.push(n);
+                }
+            }
+            let expected: Vec<usize> = (3..3 + frag.params.len()).collect();
+            assert_eq!(seen, expected, "{name}: {}", frag.sql);
+        }
+    }
+
+    #[test]
+    fn single_value_conditions_are_unchanged_by_the_or_fold() {
+        // One value has nothing to fold; its SQL is byte-for-byte what it was.
+        let query = SearchQuery::new("Procedure").with_parameter(date_param(
+            "date",
+            SearchPrefix::Eq,
+            "2013-04-05",
+        ));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+        assert_eq!(
+            frag.sql,
+            "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = 'date' AND value_date >= $3 AND value_date < $4)"
+        );
+    }
+
+    #[test]
+    fn or_list_inside_a_conjunction_stays_parenthesized_and_unextractable() {
+        // `date=2013-04-05,2020-06-01&date=gt2019-01-01`: the repeated parameter
+        // is a second `SearchParameter`, ANDed in `build_search_query_for`. The
+        // OR belongs to the first one only, and the second one's placeholders
+        // continue after all four of the first's.
+        let query = SearchQuery::new("Procedure")
+            .with_parameter(multi_value_param(
+                "date",
+                SearchParamType::Date,
+                vec![
+                    SearchValue::new(SearchPrefix::Eq, "2013-04-05"),
+                    SearchValue::new(SearchPrefix::Eq, "2020-06-01"),
+                ],
+            ))
+            .with_parameter(date_param("date", SearchPrefix::Gt, "2019-01-01"));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+
+        let (left, right) = frag
+            .sql
+            .split_once(") AND (")
+            .expect("two parameters are a conjunction");
+        assert!(left.starts_with("(id IN ("), "{}", frag.sql);
+        assert!(left.contains(") OR (value_date >= $5"), "{}", frag.sql);
+        assert!(right.contains("value_date >= $7"), "{}", frag.sql);
+        assert!(!right.contains(" OR "), "{}", frag.sql);
+        assert_eq!(frag.params.len(), 5);
+        assert!(PostgresQueryBuilder::single_index_predicate(&frag.sql).is_none());
+    }
+
+    #[test]
+    fn a_list_of_only_unparseable_dates_still_matches_nothing() {
+        // `FALSE OR FALSE`: the OR fold must not turn defense in depth into a
+        // dropped constraint.
+        for name in ["date", "_lastUpdated"] {
+            let values = vec![
+                SearchValue::new(SearchPrefix::Lt, "not-a-date"),
+                SearchValue::new(SearchPrefix::Ne, "also-not"),
+            ];
+            let param = if name == "date" {
+                multi_value_param(name, SearchParamType::Date, values)
+            } else {
+                special_param(name, values)
+            };
+            let query = SearchQuery::new("Procedure").with_parameter(param);
+            let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+            assert_eq!(frag.sql, "(FALSE) OR (FALSE)", "{name}");
+            assert!(frag.params.is_empty(), "{name}");
+        }
     }
 
     #[test]
@@ -3282,9 +3528,19 @@ mod tests {
 
     #[test]
     fn unparseable_date_beside_a_valid_one_keeps_placeholders_gap_free() {
-        // Repeated values AND together, so one bad value empties the result. It
-        // must not consume a placeholder number it never binds: the valid value
-        // after it still starts at `$3`.
+        // The values of one parameter are alternatives (#1300), so a bad value
+        // is an alternative that matches nothing and the valid one next to it
+        // decides the result: `FALSE OR x`. This used to assert `(FALSE) AND (`
+        // — "one bad value empties the result" — which was the AND fold's
+        // behaviour, not a safety property: the builder is not what stands
+        // between a client and a bad date. `validate_date_values` rejects the
+        // whole request before any query is built (pinned against a real
+        // database by `postgres_integration_invalid_date_in_or_list_is_rejected`),
+        // and what reaches here regardless still cannot widen the result past
+        // what the valid value alone selects.
+        //
+        // The bad value must not consume a placeholder number it never binds:
+        // the valid value after it still starts at `$3`.
         let mut param = date_param("date", SearchPrefix::Lt, "not-a-date");
         param
             .values
@@ -3292,7 +3548,7 @@ mod tests {
         let query = SearchQuery::new("Procedure").with_parameter(param);
         let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
 
-        assert!(frag.sql.starts_with("(FALSE) AND ("), "{}", frag.sql);
+        assert!(frag.sql.starts_with("(FALSE) OR ("), "{}", frag.sql);
         assert!(
             frag.sql.contains("value_date >= $3 AND value_date < $4"),
             "{}",
