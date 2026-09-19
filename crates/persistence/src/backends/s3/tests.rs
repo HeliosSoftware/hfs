@@ -1545,6 +1545,154 @@ async fn tenant_registry_register_duplicate_fails() {
     ));
 }
 
+/// #1228: standalone S3 has no search, which left the SQL Views, SQL Queries
+/// and SQL Export pages empty and every canonical unresolvable. It lists the
+/// SQL-on-FHIR definition types by scan — and nothing else: a filter, or a
+/// clinical type, still answers `UnsupportedCapability`.
+#[tokio::test]
+async fn definition_types_list_by_scan_and_everything_else_stays_unsupported() {
+    use crate::core::search::SearchProvider;
+    use crate::types::{SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue};
+
+    let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+    let t = tenant("tenant-a");
+    for (id, url) in [
+        ("vd-1", "http://example.org/vd-1"),
+        ("vd-2", "http://example.org/vd-2"),
+    ] {
+        backend
+            .create(
+                &t,
+                "ViewDefinition",
+                json!({"resourceType": "ViewDefinition", "id": id, "url": url, "resource": "Patient"}),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("create ViewDefinition");
+    }
+    backend
+        .create(
+            &t,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "p1"}),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("create Patient");
+
+    // The plain listing of a definition type is served, with a total.
+    let listed = backend
+        .search(&t, &SearchQuery::new("ViewDefinition"))
+        .await
+        .expect("definition listing");
+    assert_eq!(listed.total, Some(2));
+    let mut ids: Vec<&str> = listed.resources.items.iter().map(|r| r.id()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["vd-1", "vd-2"]);
+
+    // `_count` bounds the page without changing the total.
+    let mut first = SearchQuery::new("ViewDefinition");
+    first.count = Some(1);
+    let page = backend.search(&t, &first).await.expect("bounded listing");
+    assert_eq!(page.resources.items.len(), 1);
+    assert_eq!(page.total, Some(2));
+    assert!(!page.resources.page_info.has_previous);
+
+    // `_offset` walks past the first page; the two pages cover both ids once.
+    let mut second = SearchQuery::new("ViewDefinition");
+    second.count = Some(1);
+    second.offset = Some(1);
+    let rest = backend.search(&t, &second).await.expect("offset listing");
+    assert_eq!(rest.resources.items.len(), 1);
+    assert!(rest.resources.page_info.has_previous);
+    assert_ne!(rest.resources.items[0].id(), page.resources.items[0].id());
+
+    // Past the end: an empty page that still reports the total.
+    let mut beyond = SearchQuery::new("ViewDefinition");
+    beyond.offset = Some(5);
+    let empty = backend
+        .search(&t, &beyond)
+        .await
+        .expect("listing beyond the end");
+    assert!(empty.resources.items.is_empty());
+    assert_eq!(empty.total, Some(2));
+
+    // Another tenant sees none of it.
+    let other = backend
+        .search(&tenant("tenant-b"), &SearchQuery::new("ViewDefinition"))
+        .await
+        .expect("listing");
+    assert_eq!(other.total, Some(0));
+
+    // A filter is a search, and S3 still has none — for the same type too.
+    let mut filtered = SearchQuery::new("ViewDefinition");
+    filtered.parameters.push(SearchParameter {
+        name: "url".to_string(),
+        param_type: SearchParamType::Uri,
+        modifier: None,
+        values: vec![SearchValue::new(
+            SearchPrefix::Eq,
+            "http://example.org/vd-1",
+        )],
+        chain: Vec::new(),
+        components: Vec::new(),
+    });
+    for query in [filtered, SearchQuery::new("Patient")] {
+        assert!(
+            matches!(
+                backend.search(&t, &query).await,
+                Err(StorageError::Backend(
+                    BackendError::UnsupportedCapability { .. }
+                ))
+            ),
+            "{} must stay unsupported on standalone S3",
+            query.resource_type
+        );
+    }
+}
+
+/// #1228: the hook the REST layer uses to resolve canonicals without search.
+#[tokio::test]
+async fn resource_scan_hook_returns_the_tenants_live_resources() {
+    let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+    let t = tenant("tenant-a");
+    backend
+        .create(
+            &t,
+            "Library",
+            json!({"resourceType": "Library", "id": "lib-1", "url": "http://example.org/Library/lib-1"}),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("create Library");
+    backend
+        .create(
+            &t,
+            "Library",
+            json!({"resourceType": "Library", "id": "gone", "url": "http://example.org/Library/gone"}),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("create Library");
+    backend.delete(&t, "Library", "gone").await.expect("delete");
+
+    let scan = backend
+        .resource_scan()
+        .expect("standalone S3 resolves canonicals by scan");
+    let libraries = scan.scan_resources(&t, "Library").await.expect("scan");
+    let urls: Vec<&str> = libraries
+        .iter()
+        .filter_map(|r| r.get("url").and_then(|u| u.as_str()))
+        .collect();
+    assert_eq!(urls, ["http://example.org/Library/lib-1"]);
+    assert!(
+        scan.scan_resources(&tenant("tenant-b"), "Library")
+            .await
+            .expect("scan")
+            .is_empty()
+    );
+}
+
 #[tokio::test]
 async fn tenant_registry_unsupported_without_system_bucket() {
     let mock = Arc::new(MockS3Client::with_buckets(&["bucket-a"]));

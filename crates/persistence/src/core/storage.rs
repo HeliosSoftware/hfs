@@ -635,6 +635,20 @@ pub trait ResourceStorage: Send + Sync {
         None
     }
 
+    /// Returns a whole-type scan for backends that have no search index.
+    ///
+    /// A backend without search cannot answer `url=` lookups, yet the
+    /// SQL-on-FHIR operations must still resolve a canonical — a
+    /// `subjectCanonical`, or the `relatedArtifact.depends-on` of every SQL
+    /// View / SQL Query Library. Such a backend returns `Some`, and callers
+    /// that get `UnsupportedCapability` from `search` fall back to scanning
+    /// the (small, operator-authored) definition type and matching in process
+    /// (#1228). Backends with a search index keep the default `None`: their
+    /// index answers the lookup and a scan would only be slower.
+    fn resource_scan(&self) -> Option<Arc<dyn crate::sof::in_process::ResourceScan>> {
+        None
+    }
+
     /// Counts non-deleted resources for several types in one call.
     ///
     /// Returns `(resource_type, count)` pairs in the same order as
