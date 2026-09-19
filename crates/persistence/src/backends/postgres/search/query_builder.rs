@@ -214,6 +214,93 @@ pub(crate) fn match_nothing() -> SqlFragment {
     SqlFragment::new("FALSE")
 }
 
+/// Builds the comparison of one date search value against a `TIMESTAMPTZ`
+/// column, advancing `next` by exactly the number of binds returned.
+///
+/// This is the single per-prefix table for date search on Postgres. The
+/// unchained `date` and `_lastUpdated` builders and the chain builder's
+/// terminals (`chain_builder.rs`, #1290) all call it, so they cannot drift:
+///
+/// - binds are always [`SqlParam::Timestamp`] — a text bind against
+///   `TIMESTAMPTZ` fails serialization in tokio-postgres (#871, #1290), and a
+///   `$N::timestamptz` cast does not help, it only restates the inferred type;
+/// - a value below instant precision is compared as the `[start, end)` range
+///   from [`date_precision_range`], so `eq2020-01-01` means the whole day;
+/// - a full instant (degenerate range) is a scalar comparison, with any zone
+///   offset already folded into the bound instant;
+/// - `ap` has no approximation window here: it falls through to
+///   [`PostgresQueryBuilder::prefix_to_operator`], which maps it to `=`, so it
+///   is a scalar equality with the start of the value's range at every
+///   precision. That is the pre-existing unchained behavior, kept as is rather
+///   than inventing a margin in one path.
+///
+/// `col` is interpolated verbatim and must be a trusted column expression
+/// (`value_date`, `si2.value_date`, `si2.last_updated`), never user input.
+///
+/// A value that is not a date yields [`match_nothing`]'s `FALSE` with no binds
+/// and leaves `next` untouched, under every prefix, `ne` included (#1289).
+pub(crate) fn date_predicate(
+    col: &str,
+    prefix: SearchPrefix,
+    value: &str,
+    next: &mut usize,
+) -> (String, Vec<SqlParam>) {
+    let Some((start, end)) = date_precision_range(value) else {
+        return (match_nothing().sql, Vec::new());
+    };
+    // Comparators match against the precision-range boundaries; a
+    // full-precision instant (degenerate range) falls back to scalar.
+    let degenerate = start == end;
+    match prefix {
+        SearchPrefix::Eq if !degenerate => {
+            *next += 1;
+            let a = *next;
+            *next += 1;
+            (
+                format!("{col} >= ${a} AND {col} < ${next}"),
+                vec![SqlParam::Timestamp(start), SqlParam::Timestamp(end)],
+            )
+        }
+        SearchPrefix::Ne if !degenerate => {
+            *next += 1;
+            let a = *next;
+            *next += 1;
+            (
+                format!("({col} < ${a} OR {col} >= ${next})"),
+                vec![SqlParam::Timestamp(start), SqlParam::Timestamp(end)],
+            )
+        }
+        SearchPrefix::Gt | SearchPrefix::Sa if !degenerate => {
+            *next += 1;
+            (format!("{col} >= ${next}"), vec![SqlParam::Timestamp(end)])
+        }
+        SearchPrefix::Lt | SearchPrefix::Eb if !degenerate => {
+            *next += 1;
+            (format!("{col} < ${next}"), vec![SqlParam::Timestamp(start)])
+        }
+        SearchPrefix::Ge if !degenerate => {
+            *next += 1;
+            (
+                format!("{col} >= ${next}"),
+                vec![SqlParam::Timestamp(start)],
+            )
+        }
+        SearchPrefix::Le if !degenerate => {
+            *next += 1;
+            (format!("{col} < ${next}"), vec![SqlParam::Timestamp(end)])
+        }
+        // Degenerate (full-precision) or `ap`: scalar comparison.
+        other => {
+            let op = PostgresQueryBuilder::prefix_to_operator(&other);
+            *next += 1;
+            (
+                format!("{col} {op} ${next}"),
+                vec![SqlParam::Timestamp(start)],
+            )
+        }
+    }
+}
+
 /// How a sort key's value is typed for cursor (keyset) binding and comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortValueKind {
@@ -826,69 +913,11 @@ impl PostgresQueryBuilder {
         let mut conditions = Vec::new();
         let mut next = offset;
         for value in values {
-            // Not a date: fail closed. `continue` would drop the constraint and
+            // Not a date: `date_predicate` fails closed with a bind-free
+            // `FALSE`. Skipping the value instead would drop the constraint and
             // return every resource of the type (#1289).
-            let Some((start, end)) = date_precision_range(&value.value) else {
-                conditions.push(match_nothing());
-                continue;
-            };
-            let degenerate = start == end;
-            let (sql, params): (String, Vec<SqlParam>) = match value.prefix {
-                SearchPrefix::Eq if !degenerate => {
-                    next += 1;
-                    let a = next;
-                    next += 1;
-                    (
-                        format!("last_updated >= ${a} AND last_updated < ${next}"),
-                        vec![SqlParam::Timestamp(start), SqlParam::Timestamp(end)],
-                    )
-                }
-                SearchPrefix::Ne if !degenerate => {
-                    next += 1;
-                    let a = next;
-                    next += 1;
-                    (
-                        format!("(last_updated < ${a} OR last_updated >= ${next})"),
-                        vec![SqlParam::Timestamp(start), SqlParam::Timestamp(end)],
-                    )
-                }
-                SearchPrefix::Gt | SearchPrefix::Sa if !degenerate => {
-                    next += 1;
-                    (
-                        format!("last_updated >= ${next}"),
-                        vec![SqlParam::Timestamp(end)],
-                    )
-                }
-                SearchPrefix::Lt | SearchPrefix::Eb if !degenerate => {
-                    next += 1;
-                    (
-                        format!("last_updated < ${next}"),
-                        vec![SqlParam::Timestamp(start)],
-                    )
-                }
-                SearchPrefix::Ge if !degenerate => {
-                    next += 1;
-                    (
-                        format!("last_updated >= ${next}"),
-                        vec![SqlParam::Timestamp(start)],
-                    )
-                }
-                SearchPrefix::Le if !degenerate => {
-                    next += 1;
-                    (
-                        format!("last_updated < ${next}"),
-                        vec![SqlParam::Timestamp(end)],
-                    )
-                }
-                other => {
-                    let op = Self::prefix_to_operator(&other);
-                    next += 1;
-                    (
-                        format!("last_updated {op} ${next}"),
-                        vec![SqlParam::Timestamp(start)],
-                    )
-                }
-            };
+            let (sql, params) =
+                date_predicate("last_updated", value.prefix, &value.value, &mut next);
             conditions.push(SqlFragment::with_params(sql, params));
         }
         if conditions.is_empty() {
@@ -1739,72 +1768,14 @@ impl PostgresQueryBuilder {
         let mut next = offset;
 
         for value in &param.values {
-            // Not a date: fail closed. `continue` would drop the constraint and
-            // return every resource of the type (#1289).
-            let Some((start, end)) = date_precision_range(&value.value) else {
+            // Not a date: fail closed with a bare `FALSE`, outside the
+            // `id IN (…)` wrapper as before. `continue` would drop the
+            // constraint and return every resource of the type (#1289).
+            if date_precision_range(&value.value).is_none() {
                 conditions.push(match_nothing());
                 continue;
-            };
-            // Comparators match against the precision-range boundaries; a
-            // full-precision instant (degenerate range) falls back to scalar.
-            let degenerate = start == end;
-            let (sql, params): (String, Vec<SqlParam>) = match value.prefix {
-                SearchPrefix::Eq if !degenerate => {
-                    next += 1;
-                    let a = next;
-                    next += 1;
-                    (
-                        format!("value_date >= ${a} AND value_date < ${next}"),
-                        vec![SqlParam::Timestamp(start), SqlParam::Timestamp(end)],
-                    )
-                }
-                SearchPrefix::Ne if !degenerate => {
-                    next += 1;
-                    let a = next;
-                    next += 1;
-                    (
-                        format!("(value_date < ${a} OR value_date >= ${next})"),
-                        vec![SqlParam::Timestamp(start), SqlParam::Timestamp(end)],
-                    )
-                }
-                SearchPrefix::Gt | SearchPrefix::Sa if !degenerate => {
-                    next += 1;
-                    (
-                        format!("value_date >= ${next}"),
-                        vec![SqlParam::Timestamp(end)],
-                    )
-                }
-                SearchPrefix::Lt | SearchPrefix::Eb if !degenerate => {
-                    next += 1;
-                    (
-                        format!("value_date < ${next}"),
-                        vec![SqlParam::Timestamp(start)],
-                    )
-                }
-                SearchPrefix::Ge if !degenerate => {
-                    next += 1;
-                    (
-                        format!("value_date >= ${next}"),
-                        vec![SqlParam::Timestamp(start)],
-                    )
-                }
-                SearchPrefix::Le if !degenerate => {
-                    next += 1;
-                    (
-                        format!("value_date < ${next}"),
-                        vec![SqlParam::Timestamp(end)],
-                    )
-                }
-                // Degenerate (full-precision) or unhandled: scalar comparison.
-                other => {
-                    let op = Self::prefix_to_operator(&other);
-                    next += 1;
-                    (
-                        format!("value_date {op} ${next}"),
-                        vec![SqlParam::Timestamp(start)],
-                    )
-                }
-            };
+            }
+            let (sql, params) = date_predicate("value_date", value.prefix, &value.value, &mut next);
             conditions.push(SqlFragment::with_params(
                 format!(
                     "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND {})",

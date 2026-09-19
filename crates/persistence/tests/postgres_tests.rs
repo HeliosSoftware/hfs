@@ -11440,6 +11440,310 @@ mod postgres_integration {
         assert_eq!(ids, vec!["p1".to_string()]);
     }
 
+    /// Seeds two patients and one observation each for the chained-date tests
+    /// (#1290), through the real write path so `birthdate` / `date` /
+    /// `subject` are indexed by the backend rather than hand-inserted.
+    ///
+    /// - `p-old` born 1975-03-02, observation `o-old` effective
+    ///   `2019-05-04T23:30:00-07:00` (= `2019-05-05T06:30:00Z`)
+    /// - `p-new` born 1990-01-15, observation `o-new` effective `2021-08-09`
+    ///
+    /// Asserts that an *unchained* date search finds the seeded rows, so a
+    /// chained assertion below can never pass vacuously against an empty index.
+    async fn seed_chain_date_fixture(backend: &PostgresBackend, tenant: &TenantContext) {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        for (id, birth) in [("p-old", "1975-03-02"), ("p-new", "1990-01-15")] {
+            backend
+                .create(
+                    tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": id, "birthDate": birth}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        for (id, subject, effective) in [
+            ("o-old", "Patient/p-old", "2019-05-04T23:30:00-07:00"),
+            ("o-new", "Patient/p-new", "2021-08-09"),
+        ] {
+            backend
+                .create(
+                    tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": id,
+                        "status": "final",
+                        "code": {"text": "x"},
+                        "subject": {"reference": subject},
+                        "effectiveDateTime": effective,
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let date_query = |rt: &str, name: &str, v: &str| {
+            SearchQuery::new(rt).with_parameter(SearchParameter {
+                name: name.to_string(),
+                param_type: SearchParamType::Date,
+                modifier: None,
+                values: vec![SearchValue::eq(v)],
+                chain: vec![],
+                components: vec![],
+            })
+        };
+        let found = backend
+            .search(tenant, &date_query("Patient", "birthdate", "1990-01-15"))
+            .await
+            .unwrap();
+        assert_eq!(
+            found.resources.items.len(),
+            1,
+            "fixture: birthdate must be indexed or the chained tests are vacuous"
+        );
+        let found = backend
+            .search(tenant, &date_query("Observation", "date", "2021-08-09"))
+            .await
+            .unwrap();
+        assert_eq!(
+            found.resources.items.len(),
+            1,
+            "fixture: Observation.date must be indexed or the chained tests are vacuous"
+        );
+    }
+
+    fn sorted_ids(mut ids: Vec<String>) -> Vec<String> {
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    fn expect_ids(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `Observation?subject:Patient.birthdate=<value>` through the
+    /// `ChainedSearchProvider` trait API (#1290). The chain builder bound the
+    /// raw string against `value_date TIMESTAMPTZ`.
+    #[tokio::test]
+    async fn postgres_integration_resolve_chain_date_terminal() {
+        use helios_persistence::core::ChainedSearchProvider;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("chain-date");
+        seed_chain_date_fixture(&backend, &tenant).await;
+
+        let cases: &[(&str, &[&str])] = &[
+            // Unprefixed day precision means the whole day.
+            ("1990-01-15", &["o-new"]),
+            ("1990-01", &["o-new"]),
+            ("1990", &["o-new"]),
+            ("eq1990-01-15", &["o-new"]),
+            ("ne1990-01-15", &["o-old"]),
+            ("ge1980-01-01", &["o-new"]),
+            ("ge1990-01-15", &["o-new"]),
+            ("gt1990-01-15", &[]),
+            ("gt1975-03-02", &["o-new"]),
+            ("lt1980-01-01", &["o-old"]),
+            ("lt1975-03-02", &[]),
+            ("le1975-03-02", &["o-old"]),
+            ("le1990-01-15", &["o-new", "o-old"]),
+            ("sa1975-03-02", &["o-new"]),
+            ("eb1990-01-15", &["o-old"]),
+            // Not a date: must match nothing, never widen.
+            ("not-a-date", &[]),
+            ("nenot-a-date", &[]),
+        ];
+        for (value, expected) in cases {
+            let ids = backend
+                .resolve_chain(&tenant, "Observation", "subject:Patient.birthdate", value)
+                .await
+                .unwrap_or_else(|e| panic!("birthdate={value}: {e}"));
+            assert_eq!(sorted_ids(ids), expect_ids(expected), "birthdate={value}");
+        }
+    }
+
+    /// A forward chain whose terminal is a full instant carrying a negative
+    /// offset: `DiagnosticReport?result:Observation.date=<value>`.
+    #[tokio::test]
+    async fn postgres_integration_resolve_chain_date_terminal_instant_with_offset() {
+        use helios_persistence::core::ChainedSearchProvider;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("chain-date-instant");
+        seed_chain_date_fixture(&backend, &tenant).await;
+        for (id, result) in [
+            ("dr-old", "Observation/o-old"),
+            ("dr-new", "Observation/o-new"),
+        ] {
+            backend
+                .create(
+                    &tenant,
+                    "DiagnosticReport",
+                    json!({
+                        "resourceType": "DiagnosticReport",
+                        "id": id,
+                        "status": "final",
+                        "code": {"text": "x"},
+                        "result": [{"reference": result}],
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let cases: &[(&str, &[&str])] = &[
+            // The stored instant, written in its own zone and in UTC.
+            ("2019-05-04T23:30:00-07:00", &["dr-old"]),
+            ("2019-05-05T06:30:00Z", &["dr-old"]),
+            // One second either side, in the negative-offset zone.
+            ("gt2019-05-04T23:29:59-07:00", &["dr-new", "dr-old"]),
+            ("gt2019-05-04T23:30:00-07:00", &["dr-new"]),
+            ("ge2019-05-04T23:30:00-07:00", &["dr-new", "dr-old"]),
+            ("lt2019-05-04T23:30:01-07:00", &["dr-old"]),
+            ("lt2019-05-04T23:30:00-07:00", &[]),
+            ("le2019-05-04T23:30:00-07:00", &["dr-old"]),
+            // Day precision is read in UTC: the instant falls on 05-05 there.
+            ("2019-05-05", &["dr-old"]),
+            ("2019-05-04", &[]),
+        ];
+        for (value, expected) in cases {
+            let ids = backend
+                .resolve_chain(
+                    &tenant,
+                    "DiagnosticReport",
+                    "result:Observation.date",
+                    value,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("date={value}: {e}"));
+            assert_eq!(sorted_ids(ids), expect_ids(expected), "date={value}");
+        }
+    }
+
+    /// `Patient?_has:Observation:subject:date=<value>` through the trait API.
+    #[tokio::test]
+    async fn postgres_integration_resolve_reverse_chain_date_terminal() {
+        use helios_persistence::core::ChainedSearchProvider;
+        use helios_persistence::types::{ReverseChainedParameter, SearchValue};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("reverse-chain-date");
+        seed_chain_date_fixture(&backend, &tenant).await;
+
+        let cases: &[(&str, &[&str])] = &[
+            ("2021-08-09", &["p-new"]),
+            ("2021-08", &["p-new"]),
+            ("ge2020-01-01", &["p-new"]),
+            ("lt2020-01-01", &["p-old"]),
+            ("gt2021-08-09", &[]),
+            ("le2021-08-09", &["p-new", "p-old"]),
+            ("ne2021-08-09", &["p-old"]),
+            ("2019-05-04T23:30:00-07:00", &["p-old"]),
+            ("ge2019-05-04T23:30:00-07:00", &["p-new", "p-old"]),
+            ("gt2019-05-04T23:30:00-07:00", &["p-new"]),
+            ("not-a-date", &[]),
+        ];
+        for (value, expected) in cases {
+            let rc = ReverseChainedParameter::terminal(
+                "Observation",
+                "subject",
+                "date",
+                SearchValue::parse(value),
+            );
+            let ids = backend
+                .resolve_reverse_chain(&tenant, "Patient", &rc)
+                .await
+                .unwrap_or_else(|e| panic!("_has date={value}: {e}"));
+            assert_eq!(sorted_ids(ids), expect_ids(expected), "_has date={value}");
+        }
+    }
+
+    /// Chained and reverse-chained `_lastUpdated`, which the chain builder
+    /// reads from `resources.last_updated` (also `TIMESTAMPTZ`).
+    #[tokio::test]
+    async fn postgres_integration_resolve_chain_last_updated_terminal() {
+        use helios_persistence::core::ChainedSearchProvider;
+        use helios_persistence::types::{ReverseChainedParameter, SearchValue};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("chain-last-updated");
+        seed_chain_date_fixture(&backend, &tenant).await;
+
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let cases: &[(&str, &[&str])] = &[
+            ("gt2000-01-01", &["o-new", "o-old"]),
+            ("ge2000", &["o-new", "o-old"]),
+            ("lt2000-01-01", &[]),
+            ("gt2999-01-01", &[]),
+            ("le2999-01-01T00:00:00-05:00", &["o-new", "o-old"]),
+            ("not-a-date", &[]),
+        ];
+        for (value, expected) in cases {
+            let ids = backend
+                .resolve_chain(
+                    &tenant,
+                    "Observation",
+                    "subject:Patient._lastUpdated",
+                    value,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("_lastUpdated={value}: {e}"));
+            assert_eq!(
+                sorted_ids(ids),
+                expect_ids(expected),
+                "_lastUpdated={value}"
+            );
+        }
+
+        // Day-precision eq must cover the whole (UTC) day. Skipped in the rare
+        // run that straddles midnight UTC between the writes and this line.
+        if today == chrono::Utc::now().format("%Y-%m-%d").to_string() {
+            let ids = backend
+                .resolve_chain(
+                    &tenant,
+                    "Observation",
+                    "subject:Patient._lastUpdated",
+                    &today,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("_lastUpdated={today}: {e}"));
+            assert_eq!(
+                sorted_ids(ids),
+                expect_ids(&["o-new", "o-old"]),
+                "_lastUpdated={today}"
+            );
+        }
+
+        let reverse_cases: &[(&str, &[&str])] =
+            &[("gt2000-01-01", &["p-new", "p-old"]), ("lt2000-01-01", &[])];
+        for (value, expected) in reverse_cases {
+            let rc = ReverseChainedParameter::terminal(
+                "Observation",
+                "subject",
+                "_lastUpdated",
+                SearchValue::parse(value),
+            );
+            let ids = backend
+                .resolve_reverse_chain(&tenant, "Patient", &rc)
+                .await
+                .unwrap_or_else(|e| panic!("_has _lastUpdated={value}: {e}"));
+            assert_eq!(
+                sorted_ids(ids),
+                expect_ids(expected),
+                "_has _lastUpdated={value}"
+            );
+        }
+    }
+
     // ========================================================================
     // Bulk Export — Phase 2 multi-instance job state on Postgres.
     // ========================================================================

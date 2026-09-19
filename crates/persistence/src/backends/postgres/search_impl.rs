@@ -873,9 +873,16 @@ impl ChainedSearchProvider for PostgresBackend {
         // Strip the comparator prefix only when the terminal parameter's type
         // admits one: dates/numbers/quantities compare, but a string value
         // like `family=Levine` must never be misread as le + "vine" (#258).
+        //
+        // A date terminal always takes the parsed form. Every prefix is valid
+        // for a date, and the `!= Eq` test below cannot tell "no prefix" from
+        // an explicit `eq`: it left `eq1990-01-15` unstripped, which is not a
+        // date and so matched nothing (#1290). Other types keep the narrower
+        // rule unchanged.
         let candidate = crate::types::SearchValue::parse(value);
-        let parsed_value = if candidate.prefix != crate::types::SearchPrefix::Eq
-            && candidate.prefix.is_valid_for(parsed.terminal_type)
+        let parsed_value = if parsed.terminal_type == crate::types::SearchParamType::Date
+            || (candidate.prefix != crate::types::SearchPrefix::Eq
+                && candidate.prefix.is_valid_for(parsed.terminal_type))
         {
             candidate
         } else {
