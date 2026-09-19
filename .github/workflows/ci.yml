@@ -2151,7 +2151,9 @@ jobs:
           elif [ "$SERVER_NAME" = "hfs" ]; then
             SERVICE_DESCRIPTION="Helios FHIR Server"
             SERVICE_EXEC_START="/opt/$SERVER_NAME/$SERVER_NAME --host 0.0.0.0"
-            SERVICE_ENV="Environment=\"HFS_SERVER_HOST=0.0.0.0\"\nEnvironment=\"HFS_BASE_URL=${HFS_PUBLIC_URL}\"\nEnvironment=\"HFS_TERMINOLOGY_SERVER=${TERMINOLOGY_SERVER_URL}\""
+            # HFS_SUBSCRIPTIONS_ENABLED is off by default; the release binary is built
+            # with --all-features, so the `subscriptions` feature is already compiled in.
+            SERVICE_ENV="Environment=\"HFS_SERVER_HOST=0.0.0.0\"\nEnvironment=\"HFS_BASE_URL=${HFS_PUBLIC_URL}\"\nEnvironment=\"HFS_TERMINOLOGY_SERVER=${TERMINOLOGY_SERVER_URL}\"\nEnvironment=\"HFS_SUBSCRIPTIONS_ENABLED=true\""
           elif [ "$SERVER_NAME" = "hts" ]; then
             SERVICE_DESCRIPTION="Helios Terminology Server"
             # hts uses a subcommand CLI: host/port/db flags live under `run`
