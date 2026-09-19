@@ -64,16 +64,131 @@ const MAX_SEARCH_RETRIES: u32 = 2;
 /// Initial backoff before retrying a transient ES error. Doubled per attempt.
 const RETRY_BASE_DELAY_MS: u64 = 100;
 
-/// Returns true if an ES failure response indicates a transient,
-/// safe-to-retry condition rather than a permanent error.
+/// How a non-success Elasticsearch response is handled (#1294).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EsFailureClass {
+    /// The cluster could not answer right now; the same request may succeed
+    /// shortly. Retried with backoff.
+    Retryable,
+    /// Elasticsearch understood the request and rejected the query itself as
+    /// malformed. The search value is the client's, so this is the client's
+    /// error: never retried, surfaced as a search-parse error (REST 400).
+    BadQuery,
+    /// Any other rejection: never retried, surfaced as an internal error
+    /// (REST 500). A `401`/`403` is a server misconfiguration, and a `400`
+    /// about the request *structure* (`parsing_exception`, a JSON syntax
+    /// error) is a defect in the query HFS built, not in what the client sent.
+    Permanent,
+}
+
+/// Error types that mean the cluster is overloaded or still recovering,
+/// whatever status they arrive under: a rejected thread-pool task and a tripped
+/// circuit breaker are normally `429`, a shard with no started copy is a `503`
+/// that has also been observed in CI under a `500`.
+const RETRYABLE_ES_ERROR_TYPES: &[&str] = &[
+    "es_rejected_execution_exception",
+    "circuit_breaking_exception",
+    "no_shard_available_action_exception",
+];
+
+/// Error types under which Elasticsearch 7.17 reports a query *value* it could
+/// not use, taken from real `400` responses: an unparseable date
+/// (`parse_exception` caused by `illegal_argument_exception`), a non-numeric
+/// number (`query_shard_exception` caused by `number_format_exception`),
+/// malformed `:text-advanced` Lucene syntax or a bad regexp
+/// (`query_shard_exception` caused by `parse_exception` /
+/// `illegal_argument_exception`), a field value of the wrong JSON shape
+/// (`x_content_parse_exception`), and a result window past
+/// `index.max_result_window` (`illegal_argument_exception`). All of them
+/// arrive wrapped in `search_phase_execution_exception` ("all shards failed"),
+/// which says nothing by itself — hence the wrapper is absent from this list.
+const BAD_QUERY_ES_ERROR_TYPES: &[&str] = &[
+    "parse_exception",
+    "x_content_parse_exception",
+    "illegal_argument_exception",
+    "number_format_exception",
+    "query_shard_exception",
+];
+
+/// Collects every exception `type` named in an Elasticsearch error body: the
+/// top-level error, its `root_cause` entries, the per-shard failure reasons
+/// and the `caused_by` chains below each of them.
+fn es_error_types(body: &str) -> Vec<String> {
+    fn collect(value: &Value, types: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => {
+                if let Some(Value::String(t)) = map.get("type") {
+                    types.push(t.clone());
+                }
+                map.values().for_each(|v| collect(v, types));
+            }
+            Value::Array(items) => items.iter().for_each(|v| collect(v, types)),
+            _ => {}
+        }
+    }
+
+    let mut types = Vec::new();
+    if let Ok(parsed) = serde_json::from_str::<Value>(body) {
+        if let Some(error) = parsed.get("error") {
+            collect(error, &mut types);
+        }
+    }
+    types
+}
+
+/// Decides how a non-success Elasticsearch response is handled, from its HTTP
+/// status and error body alone.
 ///
-/// `no_shard_available_action_exception` and `search_phase_execution_exception`
-/// are documented as retryable; HTTP 503 covers the general "service
-/// unavailable" case (often surfaced when shards are still recovering).
-fn is_transient_es_error(status: u16, body: &str) -> bool {
-    status == 503
-        || body.contains("no_shard_available_action_exception")
-        || body.contains("search_phase_execution_exception")
+/// - **Retryable:** `429`, `502`, `503`, `504`, and any status carrying one of
+///   [`RETRYABLE_ES_ERROR_TYPES`].
+/// - **`500` and other 5xx:** retried only when the body is a
+///   `search_phase_execution_exception` — every shard failing under a 5xx is
+///   what recovery and relocation look like. A bare `500` is how Elasticsearch
+///   reports its own bugs (a `null_pointer_exception`, say); repeating the
+///   request only repeats the failure, so it is permanent.
+/// - **Every other 4xx is permanent.** Elasticsearch answers a 4xx
+///   deterministically, so a retry cannot change the answer. It is a
+///   [`EsFailureClass::BadQuery`] when the body names one of
+///   [`BAD_QUERY_ES_ERROR_TYPES`].
+///
+/// A `search_phase_execution_exception` wrapper is deliberately not evidence of
+/// anything by itself: it used to be matched as a substring and treated as
+/// transient, which retried every malformed-query `400` (#1294).
+fn classify_es_failure(status: u16, body: &str) -> EsFailureClass {
+    let types = es_error_types(body);
+    let names_any = |wanted: &[&str]| types.iter().any(|t| wanted.contains(&t.as_str()));
+
+    if matches!(status, 429 | 502 | 503 | 504) || names_any(RETRYABLE_ES_ERROR_TYPES) {
+        EsFailureClass::Retryable
+    } else if (400..500).contains(&status) {
+        if names_any(BAD_QUERY_ES_ERROR_TYPES) {
+            EsFailureClass::BadQuery
+        } else {
+            EsFailureClass::Permanent
+        }
+    } else if names_any(&["search_phase_execution_exception"]) {
+        EsFailureClass::Retryable
+    } else {
+        EsFailureClass::Permanent
+    }
+}
+
+/// The error for a query Elasticsearch rejected as malformed.
+///
+/// REST renders `QueryParseError` as a `400` with the message verbatim, so the
+/// message is fixed text: the raw Elasticsearch body names indices, nodes and
+/// index field paths. The full body goes to the server log instead.
+fn bad_query_error(operation: &str, status: u16, body: &str) -> crate::error::StorageError {
+    tracing::warn!(
+        status,
+        body,
+        "Elasticsearch rejected the {operation} query as malformed"
+    );
+    crate::error::StorageError::Search(crate::error::SearchError::QueryParseError {
+        message: "the search index rejected a search value as malformed (for example an \
+                  unparseable date, number or :text-advanced expression)"
+            .to_string(),
+    })
 }
 
 /// Result of a single search attempt: either a parsed body, an empty
@@ -142,13 +257,17 @@ async fn send_search_once(
         return SearchAttempt::EmptyIndex;
     }
 
-    if is_transient_es_error(status, &resp_body) {
-        SearchAttempt::Transient {
+    match classify_es_failure(status, &resp_body) {
+        EsFailureClass::Retryable => SearchAttempt::Transient {
             status,
             body: resp_body,
+        },
+        EsFailureClass::BadQuery => {
+            SearchAttempt::Permanent(bad_query_error("search", status, &resp_body))
         }
-    } else {
-        SearchAttempt::Permanent(internal_error(format!("Search failed: {}", resp_body)))
+        EsFailureClass::Permanent => SearchAttempt::Permanent(internal_error(format!(
+            "Search failed (status {status}): {resp_body}"
+        ))),
     }
 }
 
@@ -545,9 +664,15 @@ impl SearchProvider for ElasticsearchBackend {
             Ok(resp) => {
                 let status = resp.status_code().as_u16();
                 let body = resp.text().await.unwrap_or_default();
-                Err(internal_error(format!(
-                    "Count failed (status {status}): {body}"
-                )))
+                // Same policy as `search`: a malformed query is the client's
+                // error (#1294). `count` has no retry loop, so a retryable
+                // failure still surfaces at once, as an internal error.
+                Err(match classify_es_failure(status, &body) {
+                    EsFailureClass::BadQuery => bad_query_error("count", status, &body),
+                    EsFailureClass::Retryable | EsFailureClass::Permanent => {
+                        internal_error(format!("Count failed (status {status}): {body}"))
+                    }
+                })
             }
             Err(e) => Err(unavailable_error(format!(
                 "Elasticsearch unreachable during count: {e}"
@@ -931,27 +1056,199 @@ fn parse_hit_to_stored_resource(
 mod tests {
     use super::*;
 
-    #[test]
-    fn transient_es_error_classification() {
-        // Real failure body observed in CI (HFS log):
-        let no_shard = r#"{"error":{"root_cause":[{"type":"no_shard_available_action_exception","reason":"..."}],"type":"search_phase_execution_exception","reason":"all shards failed"},"status":503}"#;
-        assert!(is_transient_es_error(500, no_shard));
-        assert!(is_transient_es_error(503, ""));
-        assert!(is_transient_es_error(
-            500,
-            r#"{"error":{"type":"search_phase_execution_exception"}}"#
-        ));
+    /// An error body shaped like Elasticsearch's: `top` as the error type,
+    /// `root` as its root cause and `cause` below the per-shard failure.
+    fn es_error_body(top: &str, root: &str, cause: Option<&str>) -> String {
+        let mut shard_reason = json!({ "type": root, "reason": "...", "index": "hfs_t_patient" });
+        if let Some(cause) = cause {
+            shard_reason["caused_by"] = json!({ "type": cause, "reason": "..." });
+        }
+        json!({
+            "error": {
+                "root_cause": [{ "type": root, "reason": "...", "index": "hfs_t_patient" }],
+                "type": top,
+                "reason": "all shards failed",
+                "failed_shards": [{ "shard": 0, "index": "hfs_t_patient", "reason": shard_reason }]
+            }
+        })
+        .to_string()
+    }
 
-        // Permanent failures must not be retried.
-        assert!(!is_transient_es_error(
-            400,
-            r#"{"error":{"type":"parsing_exception"}}"#
-        ));
-        assert!(!is_transient_es_error(
-            500,
-            r#"{"error":{"type":"illegal_argument_exception"}}"#
-        ));
-        assert!(!is_transient_es_error(404, "index_not_found_exception"));
+    /// #1294: status × error type → retry / client error / server error.
+    #[test]
+    fn es_failure_classification_table() {
+        use EsFailureClass::{BadQuery, Permanent, Retryable};
+        const SPEE: &str = "search_phase_execution_exception";
+
+        let cases: Vec<(u16, String, EsFailureClass)> = vec![
+            // Retryable by status alone, whatever (or nothing) the body says.
+            (429, String::new(), Retryable),
+            (502, "<html>Bad Gateway</html>".to_string(), Retryable),
+            (503, String::new(), Retryable),
+            (504, String::new(), Retryable),
+            // Retryable by error type, whatever the status.
+            (
+                429,
+                es_error_body(
+                    "es_rejected_execution_exception",
+                    "es_rejected_execution_exception",
+                    None,
+                ),
+                Retryable,
+            ),
+            (
+                500,
+                es_error_body(SPEE, "es_rejected_execution_exception", None),
+                Retryable,
+            ),
+            (
+                429,
+                es_error_body(
+                    "circuit_breaking_exception",
+                    "circuit_breaking_exception",
+                    None,
+                ),
+                Retryable,
+            ),
+            (
+                500,
+                es_error_body(
+                    "circuit_breaking_exception",
+                    "circuit_breaking_exception",
+                    None,
+                ),
+                Retryable,
+            ),
+            // The CI failure the retry loop was written for.
+            (
+                500,
+                es_error_body(SPEE, "no_shard_available_action_exception", None),
+                Retryable,
+            ),
+            // All shards failing under a 5xx: recovery/relocation.
+            (
+                500,
+                es_error_body(SPEE, "node_disconnected_exception", None),
+                Retryable,
+            ),
+            // A bare 500 is an Elasticsearch defect; retrying repeats it.
+            (
+                500,
+                es_error_body("null_pointer_exception", "null_pointer_exception", None),
+                Permanent,
+            ),
+            (500, String::new(), Permanent),
+            // Malformed query values: the shapes of real 7.17 responses.
+            (
+                400,
+                es_error_body(SPEE, "parse_exception", Some("illegal_argument_exception")),
+                BadQuery,
+            ),
+            (
+                400,
+                es_error_body(
+                    SPEE,
+                    "query_shard_exception",
+                    Some("number_format_exception"),
+                ),
+                BadQuery,
+            ),
+            (
+                400,
+                es_error_body(SPEE, "query_shard_exception", Some("parse_exception")),
+                BadQuery,
+            ),
+            (
+                400,
+                es_error_body(SPEE, "illegal_argument_exception", None),
+                BadQuery,
+            ),
+            (
+                400,
+                es_error_body(
+                    "x_content_parse_exception",
+                    "x_content_parse_exception",
+                    None,
+                ),
+                BadQuery,
+            ),
+            // Other 4xx: permanent, but a server-side problem.
+            (
+                400,
+                es_error_body("parsing_exception", "parsing_exception", None),
+                Permanent,
+            ),
+            (
+                400,
+                es_error_body("json_e_o_f_exception", "json_e_o_f_exception", None),
+                Permanent,
+            ),
+            // The wrapper alone proves nothing under a 4xx.
+            (
+                400,
+                es_error_body(SPEE, "some_future_exception", None),
+                Permanent,
+            ),
+            (400, String::new(), Permanent),
+            (
+                401,
+                es_error_body("security_exception", "security_exception", None),
+                Permanent,
+            ),
+            (
+                403,
+                es_error_body("security_exception", "security_exception", None),
+                Permanent,
+            ),
+            (404, "not json".to_string(), Permanent),
+            (409, String::new(), Permanent),
+        ];
+
+        for (status, body, expected) in cases {
+            assert_eq!(
+                classify_es_failure(status, &body),
+                expected,
+                "status {status}, body {body}"
+            );
+        }
+    }
+
+    /// The regression itself, on the body Elasticsearch 7.17.29 really sends
+    /// for malformed `:text-advanced` syntax: the old substring match on
+    /// `search_phase_execution_exception` called this transient.
+    #[test]
+    fn real_malformed_query_body_is_a_bad_query() {
+        let body = r#"{"error":{"root_cause":[{"type":"query_shard_exception","reason":"Failed to parse query [Glucose AND (]","index_uuid":"ClDA7x9ETxisY0pzQw7pNQ","index":"hfs_test-tenant_observation"}],"type":"search_phase_execution_exception","reason":"all shards failed","phase":"query","grouped":true,"failed_shards":[{"shard":0,"index":"hfs_test-tenant_observation","node":"h0Q4wuelRaW33P8ZfWU_lg","reason":{"type":"query_shard_exception","reason":"Failed to parse query [Glucose AND (]","index_uuid":"ClDA7x9ETxisY0pzQw7pNQ","index":"hfs_test-tenant_observation","caused_by":{"type":"parse_exception","reason":"Cannot parse 'Glucose AND (': Encountered \"<EOF>\" at line 1, column 13."}}}]},"status":400}"#;
+        assert_eq!(classify_es_failure(400, body), EsFailureClass::BadQuery);
+    }
+
+    /// An error type is read from the `type` fields only: a search value that
+    /// merely spells an exception name, echoed back in a `reason`, must not
+    /// change the classification.
+    #[test]
+    fn error_type_names_inside_reasons_are_ignored() {
+        let body = json!({ "error": {
+            "type": "parsing_exception",
+            "reason": "unknown query [es_rejected_execution_exception parse_exception]"
+        }})
+        .to_string();
+        assert_eq!(classify_es_failure(400, &body), EsFailureClass::Permanent);
+    }
+
+    /// The client-facing error carries none of the Elasticsearch body.
+    #[test]
+    fn bad_query_error_is_sanitized() {
+        let body = es_error_body("search_phase_execution_exception", "parse_exception", None);
+        let err = bad_query_error("search", 400, &body);
+        let crate::error::StorageError::Search(crate::error::SearchError::QueryParseError {
+            message,
+        }) = &err
+        else {
+            panic!("expected QueryParseError, got {err:?}");
+        };
+        for leak in ["hfs_t_patient", "parse_exception", "root_cause", "shard"] {
+            assert!(!message.contains(leak), "leaked {leak:?}: {message}");
+        }
     }
 
     #[test]
