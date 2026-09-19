@@ -1317,7 +1317,7 @@ impl PostgresSearchIndexWriter {
 /// - "2024-01-15" -> "2024-01-15T00:00:00+00:00"
 /// - "2024-01-15T10:30:00" -> "2024-01-15T10:30:00+00:00"
 /// - "2024-01-15T10:30:00-07:00" -> unchanged (already zoned)
-fn normalize_date_for_pg(value: &str) -> String {
+pub(super) fn normalize_date_for_pg(value: &str) -> String {
     if let Some((_, time_part)) = value.split_once('T') {
         // Already has a time component — append UTC only if it carries no zone.
         //
