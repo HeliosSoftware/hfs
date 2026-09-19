@@ -950,6 +950,598 @@ mod es_integration {
     }
 
     // ========================================================================
+    // Index-side date handling (#1314)
+    // ========================================================================
+
+    /// The ids a search returns.
+    async fn found_ids<S>(
+        backend: &S,
+        tenant: &TenantContext,
+        query: &helios_persistence::types::SearchQuery,
+    ) -> std::collections::BTreeSet<String>
+    where
+        S: helios_persistence::core::SearchProvider,
+    {
+        backend
+            .search(tenant, query)
+            .await
+            .unwrap_or_else(|e| panic!("search {query:?} failed: {e}"))
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect()
+    }
+
+    fn param_query(
+        resource_type: &str,
+        params: &[(&str, helios_persistence::types::SearchParamType, &str)],
+    ) -> helios_persistence::types::SearchQuery {
+        use helios_persistence::types::{SearchParameter, SearchQuery, SearchValue};
+        params.iter().fold(
+            SearchQuery::new(resource_type),
+            |query, (name, param_type, value)| {
+                query.with_parameter(SearchParameter {
+                    name: name.to_string(),
+                    param_type: *param_type,
+                    values: vec![SearchValue::parse(value)],
+                    ..Default::default()
+                })
+            },
+        )
+    }
+
+    /// A Patient whose `birthDate` is not a date, beside a valid
+    /// `deceasedDateTime` and a name.
+    fn patient_with_one_bad_date(id: &str, family: &str) -> serde_json::Value {
+        json!({
+            "resourceType": "Patient",
+            "id": id,
+            "name": [{ "family": family }],
+            "birthDate": "2024-02-30",
+            "deceasedDateTime": "2024-03-15T10:30:00Z"
+        })
+    }
+
+    /// #1314: Elasticsearch rejects a whole document for one value its `date`
+    /// mapping cannot parse, so a single bad date failed the write and left
+    /// the resource unfindable by anything. The bad value must be skipped and
+    /// everything else indexed — including the resource's other dates.
+    #[tokio::test]
+    async fn es_integration_unparseable_date_is_skipped_not_the_document() {
+        use helios_persistence::types::SearchParamType::{Date, String as Str, Token};
+
+        let backend = create_backend_with("1ms", WriteRefreshPolicy::WaitFor).await;
+        let tenant = create_tenant("bad-date-1314");
+
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                patient_with_one_bad_date("bad-birthdate", "Baddate"),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("a bad date must not fail the write");
+
+        // A Period with one bad end: the other end still indexes.
+        backend
+            .create(
+                &tenant,
+                "Encounter",
+                json!({
+                    "resourceType": "Encounter",
+                    "id": "bad-period-start",
+                    "status": "finished",
+                    "class": { "system": "http://terminology.hl7.org/CodeSystem/v3-ActCode", "code": "AMB" },
+                    "period": { "start": "not-a-date", "end": "2024-03-15" }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("a bad Period.start must not fail the write");
+
+        // The same through `update` and `create_or_update`.
+        backend
+            .create_or_update(
+                &tenant,
+                "Patient",
+                "bad-upsert",
+                patient_with_one_bad_date("bad-upsert", "Badupsert"),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("a bad date must not fail create_or_update");
+
+        let one = |id: &str| std::collections::BTreeSet::from([id.to_string()]);
+
+        // Positive control and the other parameters.
+        assert_eq!(
+            found_ids(
+                &backend,
+                &tenant,
+                &param_query("Patient", &[("family", Str, "Baddate")])
+            )
+            .await,
+            one("bad-birthdate"),
+            "found by a string parameter"
+        );
+        assert_eq!(
+            found_ids(
+                &backend,
+                &tenant,
+                &param_query("Patient", &[("family", Str, "Badupsert")])
+            )
+            .await,
+            one("bad-upsert"),
+        );
+        // The other, valid date of the same resource.
+        assert_eq!(
+            found_ids(
+                &backend,
+                &tenant,
+                &param_query(
+                    "Patient",
+                    &[
+                        ("family", Str, "Baddate"),
+                        ("death-date", Date, "2024-03-15")
+                    ]
+                )
+            )
+            .await,
+            one("bad-birthdate"),
+            "found by its valid date"
+        );
+        // The bad one indexed nothing: not the year 2000, not now, not March.
+        assert!(
+            found_ids(
+                &backend,
+                &tenant,
+                &param_query("Patient", &[("birthdate", Date, "ge0001")])
+            )
+            .await
+            .is_empty(),
+            "an unparseable birthDate must not be indexed as any date"
+        );
+        assert_eq!(
+            found_ids(
+                &backend,
+                &tenant,
+                &param_query("Encounter", &[("class", Token, "AMB")])
+            )
+            .await,
+            one("bad-period-start"),
+        );
+        assert_eq!(
+            found_ids(
+                &backend,
+                &tenant,
+                &param_query("Encounter", &[("date", Date, "2024-03-15")])
+            )
+            .await,
+            one("bad-period-start"),
+            "the valid end of the Period is indexed"
+        );
+        assert!(
+            found_ids(
+                &backend,
+                &tenant,
+                &param_query("Encounter", &[("date", Date, "lt2024-03-15")])
+            )
+            .await
+            .is_empty(),
+            "the bad start of the Period is not"
+        );
+    }
+
+    /// #1314: every valid FHIR date form indexes, at the instant the shared
+    /// parser gives it, and is found by `eq`/`ge`/`lt` at every precision.
+    /// Before, `:60` and a fraction longer than nine digits failed the write.
+    #[tokio::test]
+    async fn es_integration_every_fhir_date_form_indexes_and_is_searchable() {
+        use helios_persistence::types::SearchParamType::{Date, Token};
+
+        /// stored value → values that must match it, values that must not.
+        const FORMS: &[(&str, &[&str], &[&str])] = &[
+            (
+                "2024",
+                &[
+                    "2024",
+                    "2024-01",
+                    "2024-01-01",
+                    "ge2024",
+                    "le2024",
+                    "lt2025",
+                    "2024-01-01T00:00:00Z",
+                ],
+                &["2023", "2024-02", "lt2024", "gt2024"],
+            ),
+            (
+                "2024-03",
+                &["2024-03", "2024", "2024-03-01", "ge2024-03", "lt2024-04"],
+                &["2024-02", "2024-03-02", "lt2024-03", "gt2024-03"],
+            ),
+            (
+                "2024-03-15",
+                &[
+                    "2024-03-15",
+                    "2024-03",
+                    "ge2024-03-15",
+                    "lt2024-03-16",
+                    "2024-03-15T00:00:00Z",
+                ],
+                &["2024-03-14", "lt2024-03-15", "gt2024-03-15"],
+            ),
+            // Minute precision: not the dateTime datatype, but valid in search.
+            (
+                "2024-03-15T10:30",
+                &[
+                    "2024-03-15T10:30",
+                    "2024-03-15T10:30:00Z",
+                    "2024-03-15",
+                    "ge2024-03-15T10:30Z",
+                ],
+                &["2024-03-15T10:31", "lt2024-03-15T10:30Z"],
+            ),
+            (
+                "2024-03-15T10:30Z",
+                &["2024-03-15T10:30Z", "2024-03-15T10:30:00Z"],
+                &["2024-03-15T10:29Z"],
+            ),
+            // Zone-less is UTC.
+            (
+                "2024-03-15T10:30:45",
+                &[
+                    "2024-03-15T10:30:45Z",
+                    "2024-03-15T10:30",
+                    "ge2024-03-15T10:30:45Z",
+                    "lt2024-03-15T10:30:46Z",
+                ],
+                &[
+                    "2024-03-15T10:30:46Z",
+                    "lt2024-03-15T10:30:45Z",
+                    "gt2024-03-15T10:30:45Z",
+                ],
+            ),
+            (
+                "2024-03-15T10:30:45Z",
+                &["2024-03-15T10:30:45Z", "2024-03-15T16:00:45+05:30"],
+                &["2024-03-15T10:30:44Z"],
+            ),
+            (
+                "2024-03-15T10:30:45+05:30",
+                &[
+                    "2024-03-15T05:00:45Z",
+                    "2024-03-15T10:30:45+05:30",
+                    "2024-03-15",
+                ],
+                &["2024-03-15T10:30:45Z"],
+            ),
+            // 02:30 on the 16th, UTC.
+            (
+                "2024-03-15T22:30:45-04:00",
+                &["2024-03-16T02:30:45Z", "2024-03-16", "ge2024-03-16"],
+                &["2024-03-15", "lt2024-03-16"],
+            ),
+            (
+                "2024-03-15T10:30:45+14:00",
+                &["2024-03-14T20:30:45Z", "2024-03-14"],
+                &["2024-03-15"],
+            ),
+            (
+                "2024-03-15T10:30:45.1Z",
+                &[
+                    "2024-03-15T10:30:45.1Z",
+                    "2024-03-15T10:30:45.100Z",
+                    "2024-03-15T10:30:45Z",
+                ],
+                &["2024-03-15T10:30:45.2Z", "2024-03-15T10:30:45.0Z"],
+            ),
+            (
+                "2024-03-15T10:30:45.123Z",
+                &[
+                    "2024-03-15T10:30:45.123Z",
+                    "2024-03-15T10:30:45Z",
+                    "ge2024-03-15T10:30:45.123Z",
+                    "lt2024-03-15T10:30:45.124Z",
+                ],
+                &["2024-03-15T10:30:45.124Z", "lt2024-03-15T10:30:45.123Z"],
+            ),
+            // Finer than a millisecond: held at the millisecond, and found by
+            // the value it was written as.
+            (
+                "2024-03-15T10:30:45.123456Z",
+                &["2024-03-15T10:30:45.123456Z", "2024-03-15T10:30:45.123Z"],
+                &["2024-03-15T10:30:45.124Z"],
+            ),
+            (
+                "2024-03-15T10:30:45.123456789Z",
+                &["2024-03-15T10:30:45.123456789Z", "2024-03-15T10:30:45.123Z"],
+                &["2024-03-15T10:30:45.122Z"],
+            ),
+            (
+                "2024-03-15T10:30:45.1234567891Z",
+                &[
+                    "2024-03-15T10:30:45.1234567891Z",
+                    "2024-03-15T10:30:45.123Z",
+                ],
+                &["2024-03-15T10:30:45.124Z"],
+            ),
+            // A leap second is the first instant of the next second.
+            (
+                "2016-12-31T23:59:60Z",
+                &[
+                    "2017-01-01T00:00:00Z",
+                    "2017",
+                    "2016-12-31T23:59:60Z",
+                    "ge2017",
+                ],
+                &["2016-12-31", "2016", "lt2017"],
+            ),
+            (
+                "2024-03-15T10:30:60+05:30",
+                &["2024-03-15T05:01:00Z"],
+                &["2024-03-15T05:00:59Z"],
+            ),
+            // Not FHIR, but Elasticsearch took them as written and must go on
+            // indexing them where it did.
+            (
+                "2024-03-15T10Z",
+                &["2024-03-15T10:00:00Z"],
+                &["2024-03-15T11:00:00Z"],
+            ),
+            (
+                "2024-03-15T10:30:45+0530",
+                &["2024-03-15T05:00:45Z"],
+                &["2024-03-15T10:30:45Z"],
+            ),
+            (
+                "2024-03-15T10:30:45,123Z",
+                &["2024-03-15T10:30:45.123Z"],
+                &["2024-03-15T10:30:45.124Z"],
+            ),
+        ];
+
+        let backend = create_backend_with("1ms", WriteRefreshPolicy::WaitFor).await;
+        let tenant = create_tenant("date-forms-1314");
+
+        for (i, (stored, _, _)) in FORMS.iter().enumerate() {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": format!("form-{i}"),
+                        "status": "final",
+                        "code": { "coding": [{ "system": "http://loinc.org", "code": format!("form-{i}") }] },
+                        "effectiveDateTime": stored
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("effectiveDateTime {stored} failed the write: {e}"));
+        }
+
+        for (i, (stored, matching, not_matching)) in FORMS.iter().enumerate() {
+            let id = format!("form-{i}");
+            let search = |date: &'static str| {
+                let query =
+                    param_query("Observation", &[("code", Token, &id), ("date", Date, date)]);
+                let (backend, tenant) = (&backend, &tenant);
+                async move { found_ids(backend, tenant, &query).await }
+            };
+            // Positive control: the resource is there, with a date.
+            assert_eq!(
+                search("ge0001").await.len(),
+                1,
+                "stored {stored}: not indexed with a date"
+            );
+            for date in *matching {
+                assert_eq!(
+                    search(date).await.len(),
+                    1,
+                    "stored {stored}: date={date} must match"
+                );
+            }
+            for date in *not_matching {
+                assert!(
+                    search(date).await.is_empty(),
+                    "stored {stored}: date={date} must not match"
+                );
+            }
+        }
+    }
+
+    /// #1314: a date that is a composite component goes through the same
+    /// normalisation: a leap second indexes, and a value that is not a date
+    /// costs the instance its date component, not the resource its document.
+    #[tokio::test]
+    async fn es_integration_composite_date_component_is_normalised_or_skipped() {
+        use helios_persistence::types::{
+            CompositeSearchComponent, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend_with("1ms", WriteRefreshPolicy::WaitFor).await;
+        let tenant = create_tenant("composite-date-1314");
+
+        for (id, value) in [("leap", "2016-12-31T23:59:60Z"), ("garbage", "not-a-date")] {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": id,
+                        "status": "final",
+                        "code": { "coding": [{ "system": "http://loinc.org", "code": id }] },
+                        "valueDateTime": value
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("valueDateTime {value} failed the write: {e}"));
+        }
+
+        let composite = |value: &str| {
+            SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "code-value-date".to_string(),
+                param_type: SearchParamType::Composite,
+                values: vec![SearchValue::eq(value)],
+                components: vec![
+                    CompositeSearchComponent {
+                        param_type: SearchParamType::Token,
+                        param_name: "code".to_string(),
+                    },
+                    CompositeSearchComponent {
+                        param_type: SearchParamType::Date,
+                        param_name: "value-date".to_string(),
+                    },
+                ],
+                ..Default::default()
+            })
+        };
+        let one = |id: &str| std::collections::BTreeSet::from([id.to_string()]);
+
+        assert_eq!(
+            found_ids(&backend, &tenant, &composite("leap$2017-01-01T00:00:00Z")).await,
+            one("leap")
+        );
+        assert!(
+            found_ids(&backend, &tenant, &composite("leap$2016-12-31"))
+                .await
+                .is_empty()
+        );
+        assert_eq!(
+            found_ids(
+                &backend,
+                &tenant,
+                &param_query(
+                    "Observation",
+                    &[("code", SearchParamType::Token, "garbage")]
+                )
+            )
+            .await,
+            one("garbage"),
+            "a bad date component must not cost the resource its document"
+        );
+        assert!(
+            found_ids(&backend, &tenant, &composite("garbage$ge0001"))
+                .await
+                .is_empty()
+        );
+    }
+
+    /// #1314 in every `HFS_COMPOSITE_SYNC_MODE`. The composite never failed
+    /// the client's write — a secondary's rejection is only logged — so the
+    /// symptom there was a resource stored in the primary and missing from
+    /// every search, in all three modes.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn es_integration_composite_bad_date_stays_searchable_in_every_sync_mode() {
+        use std::collections::HashMap;
+
+        use helios_persistence::backends::sqlite::SqliteBackend;
+        use helios_persistence::composite::{
+            CompositeConfig, CompositeStorage, DynSearchProvider, DynStorage, SyncMode,
+        };
+        use helios_persistence::types::SearchParamType::{Date, String as Str};
+
+        let es = shared_es().await;
+        let modes = [
+            ("sync", SyncMode::Synchronous),
+            ("async", SyncMode::Asynchronous),
+            (
+                "hybrid",
+                SyncMode::Hybrid {
+                    sync_for_search: true,
+                },
+            ),
+        ];
+
+        for (label, mode) in modes {
+            let es_config = ElasticsearchConfig {
+                nodes: vec![format!("http://{}:{}", es.host, es.port)],
+                index_prefix: format!("hfs_{}", uuid::Uuid::new_v4().simple()),
+                number_of_replicas: 0,
+                refresh_interval: "1ms".to_string(),
+                write_refresh: WriteRefreshPolicy::WaitFor,
+                ..Default::default()
+            };
+            let es_backend = Arc::new(
+                ElasticsearchBackend::with_shared_registry(es_config, build_search_registry())
+                    .expect("create ES backend"),
+            );
+            es_backend
+                .initialize()
+                .await
+                .expect("initialize ES backend");
+
+            let sqlite = Arc::new(SqliteBackend::in_memory().expect("create SQLite backend"));
+            sqlite.init_schema().expect("init SQLite schema");
+
+            let composite_config = CompositeConfig::builder()
+                .primary("sqlite", BackendKind::Sqlite)
+                .search_backend("es", BackendKind::Elasticsearch)
+                .sync_mode(mode)
+                .build()
+                .expect("build composite config");
+
+            let mut backends: HashMap<String, DynStorage> = HashMap::new();
+            backends.insert("sqlite".to_string(), sqlite.clone() as DynStorage);
+            backends.insert("es".to_string(), es_backend.clone() as DynStorage);
+
+            let mut search_providers: HashMap<String, DynSearchProvider> = HashMap::new();
+            search_providers.insert("sqlite".to_string(), sqlite.clone() as DynSearchProvider);
+            search_providers.insert("es".to_string(), es_backend.clone() as DynSearchProvider);
+
+            let composite = CompositeStorage::new(composite_config, backends)
+                .expect("create composite storage")
+                .with_search_providers(search_providers)
+                .with_full_primary(sqlite)
+                .start_sync_workers();
+
+            let tenant = create_tenant("bad-date-composite-1314");
+            composite
+                .create(
+                    &tenant,
+                    "Patient",
+                    patient_with_one_bad_date("bad-birthdate", "Baddate"),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("[{label}] create through composite: {e}"));
+
+            // The asynchronous worker indexes behind the write; poll for it.
+            let by_name = param_query("Patient", &[("family", Str, "Baddate")]);
+            let mut found = std::collections::BTreeSet::new();
+            for _ in 0..50 {
+                found = found_ids(&composite, &tenant, &by_name).await;
+                if !found.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            assert_eq!(
+                found,
+                std::collections::BTreeSet::from(["bad-birthdate".to_string()]),
+                "[{label}] a resource with one bad date must stay searchable"
+            );
+            assert_eq!(
+                found_ids(
+                    &composite,
+                    &tenant,
+                    &param_query("Patient", &[("death-date", Date, "2024-03-15T10:30:00Z")])
+                )
+                .await
+                .len(),
+                1,
+                "[{label}] found by its valid date"
+            );
+        }
+    }
+
+    // ========================================================================
     // CRUD Tests
     // ========================================================================
 

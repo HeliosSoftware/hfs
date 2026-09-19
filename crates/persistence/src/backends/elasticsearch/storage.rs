@@ -12,7 +12,7 @@ use std::time::Duration;
 use futures::StreamExt;
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{SecondsFormat, Utc};
 use elasticsearch::params::Refresh;
 use elasticsearch::{BulkParts, DeleteByQueryParts, DeleteParts, GetParts, IndexParts};
 use helios_fhir::FhirVersion;
@@ -23,6 +23,7 @@ use crate::error::{BackendError, ResourceError, StorageError, StorageResult};
 use crate::search::converters::IndexValue;
 use crate::search::extractor::ExtractedValue;
 use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
+use crate::search::{FhirDateValue, StorageResolution};
 use crate::tenant::{Operation, TenantContext};
 use crate::types::StoredResource;
 
@@ -253,11 +254,102 @@ fn push_array_field(obj: &mut Value, key: &str, val: Value) {
     }
 }
 
+/// The resource and parameter a value was extracted for, for log messages.
+#[derive(Clone, Copy)]
+struct ValueOrigin<'a> {
+    resource_type: &'a str,
+    resource_id: &'a str,
+    param: &'a str,
+}
+
+/// The value indexed into a `date` field for an extracted FHIR date, or
+/// `None` when the value is not a date and the field must be left out.
+///
+/// The extracted string used to be sent as written. The `date` mapping is
+/// strict, and Elasticsearch rejects the *whole document* for one value it
+/// cannot parse (`mapper_parsing_exception`): a resource with a single bad
+/// date, in any element, could not be found by any search (#1314). That
+/// included values that are valid FHIR — a leap second (`…T23:59:60Z`), more
+/// than nine fraction digits — while a run of digits (`20240315`) was accepted
+/// through `epoch_millis` and indexed in 1970.
+///
+/// Every indexed date is a point: the start of the range the value names at
+/// its own precision, which is what [`FhirDateValue`] gives every backend and
+/// what the query side compares its `gte`/`lt` bounds against. It is written
+/// as a complete UTC instant at millisecond resolution — all an Elasticsearch
+/// `date` holds — so the mapping's format never has to interpret a partial
+/// date, an offset or a `:60`.
+///
+/// A value the FHIR grammar rejects gets one more chance through
+/// [`repair_iso_date`], which covers the ISO 8601 spellings Elasticsearch
+/// accepted as written, so that what was searchable stays searchable.
+/// Anything else is skipped with a warning, as the PostgreSQL and MongoDB
+/// writers do: the parameter then behaves as absent for this resource and the
+/// rest of the document indexes normally. Index-side code must never fail a
+/// write because of odd data.
+fn es_index_date(origin: ValueOrigin<'_>, raw: &str) -> Option<String> {
+    let parsed = FhirDateValue::parse(raw).or_else(|error| {
+        repair_iso_date(raw)
+            .and_then(|repaired| FhirDateValue::parse(&repaired).ok())
+            .ok_or(error)
+    });
+    match parsed {
+        Ok(parsed) => {
+            let (start, _) = parsed.range_at(StorageResolution::Millis);
+            Some(start.to_rfc3339_opts(SecondsFormat::Millis, true))
+        }
+        Err(error) => {
+            tracing::warn!(
+                resource_type = origin.resource_type,
+                resource_id = origin.resource_id,
+                param = origin.param,
+                "Skipping a date value in the Elasticsearch index: {error}"
+            );
+            None
+        }
+    }
+}
+
+/// Rewrites the ISO 8601 spellings that are not FHIR but that the `date`
+/// mapping's `strict_date_optional_time` accepted as written — an hour
+/// without minutes (`T10`), a bare trailing `T`, a `,` decimal mark, and a
+/// zone written `±hh` or `±hhmm` — into the FHIR grammar, so that they keep
+/// indexing at the instant they always did. The result still has to pass
+/// [`FhirDateValue::parse`]. `None` when there is nothing to rewrite.
+fn repair_iso_date(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if !raw.is_ascii() {
+        return None;
+    }
+    let (date, time) = raw.split_once('T')?;
+    if time.is_empty() {
+        return Some(date.to_string());
+    }
+    let (clock, zone) = match time.find(['Z', '+', '-']) {
+        Some(at) => time.split_at(at),
+        None => (time, ""),
+    };
+    let clock = match clock.len() {
+        2 => format!("{clock}:00"),
+        _ => clock.replacen(',', ".", 1),
+    };
+    let zone = match zone.len() {
+        3 => format!("{zone}:00"),
+        5 => format!("{}:{}", &zone[..3], &zone[3..]),
+        _ => zone.to_string(),
+    };
+    let repaired = format!("{date}T{clock}{zone}");
+    (repaired != raw).then_some(repaired)
+}
+
 /// Merges one composite component's value into the composite instance object,
 /// placing it in the array field matching the component's value type. All
 /// components of one instance share a nested object, so a single nested query
 /// can require every component to match within the same instance.
-fn merge_composite_component(entry: &mut Value, value: &IndexValue) {
+///
+/// A date component that is not a date is left out (see [`es_index_date`]);
+/// the instance keeps its other components.
+fn merge_composite_component(entry: &mut Value, origin: ValueOrigin<'_>, value: &IndexValue) {
     match value {
         IndexValue::String(s) => push_array_field(entry, "string", json!(s)),
         IndexValue::Token { system, code, .. } => {
@@ -281,7 +373,11 @@ fn merge_composite_component(entry: &mut Value, value: &IndexValue) {
                 push_array_field(entry, "quantity_system", json!(s));
             }
         }
-        IndexValue::Date { value, .. } => push_array_field(entry, "date", json!(value)),
+        IndexValue::Date { value, .. } => {
+            if let Some(value) = es_index_date(origin, value) {
+                push_array_field(entry, "date", json!(value));
+            }
+        }
         IndexValue::Reference { reference, .. } => {
             push_array_field(entry, "reference", json!(reference))
         }
@@ -313,13 +409,19 @@ pub(crate) fn build_es_document(
         std::collections::BTreeMap::new();
 
     for ev in extracted_values {
+        let origin = ValueOrigin {
+            resource_type,
+            resource_id,
+            param: &ev.param_name,
+        };
+
         // Composite component values are accumulated into their instance object
         // rather than the per-type arrays.
         if let Some(group) = ev.composite_group {
             let entry = composite_groups
                 .entry((ev.param_name.clone(), group))
                 .or_insert_with(|| json!({ "name": ev.param_name, "group_id": group }));
-            merge_composite_component(entry, &ev.value);
+            merge_composite_component(entry, origin, &ev.value);
             continue;
         }
 
@@ -357,11 +459,13 @@ pub(crate) fn build_es_document(
                 token_params.push(token);
             }
             IndexValue::Date { value, precision } => {
-                date_params.push(json!({
-                    "name": ev.param_name,
-                    "value": value,
-                    "precision": format!("{:?}", precision).to_lowercase(),
-                }));
+                if let Some(value) = es_index_date(origin, value) {
+                    date_params.push(json!({
+                        "name": ev.param_name,
+                        "value": value,
+                        "precision": format!("{:?}", precision).to_lowercase(),
+                    }));
+                }
             }
             IndexValue::Number(n) => {
                 number_params.push(json!({
@@ -2253,11 +2357,145 @@ async fn delete_by_query_scoped(
 #[cfg(test)]
 mod tests {
     use super::{
-        BULK_BACKOFF_BASE, BULK_BACKOFF_MAX, backoff_delay, chunk_ranges, describe_item_error,
-        error_detail, is_transient_bulk_status, is_unavailable,
+        BULK_BACKOFF_BASE, BULK_BACKOFF_MAX, ValueOrigin, backoff_delay, build_es_document,
+        chunk_ranges, describe_item_error, error_detail, es_index_date, is_transient_bulk_status,
+        is_unavailable,
     };
     use crate::error::{BackendError, StorageError};
+    use crate::search::converters::IndexValue;
+    use crate::search::extractor::ExtractedValue;
+    use helios_fhir::FhirVersion;
     use serde_json::json;
+
+    fn index_date(raw: &str) -> Option<String> {
+        let origin = ValueOrigin {
+            resource_type: "Patient",
+            resource_id: "p1",
+            param: "birthdate",
+        };
+        es_index_date(origin, raw)
+    }
+
+    /// #1314: every FHIR date form is indexed as the UTC instant its range
+    /// starts at, in the one spelling the mapping cannot misread.
+    #[test]
+    fn index_dates_are_complete_utc_instants() {
+        for (raw, indexed) in [
+            ("2024", "2024-01-01T00:00:00.000Z"),
+            ("2024-03", "2024-03-01T00:00:00.000Z"),
+            ("2024-03-15", "2024-03-15T00:00:00.000Z"),
+            ("2024-03-15T10:30", "2024-03-15T10:30:00.000Z"),
+            ("2024-03-15T10:30:45", "2024-03-15T10:30:45.000Z"),
+            ("2024-03-15T10:30:45Z", "2024-03-15T10:30:45.000Z"),
+            ("2024-03-15T10:30:45+05:30", "2024-03-15T05:00:45.000Z"),
+            ("2024-03-15T22:30:45-04:00", "2024-03-16T02:30:45.000Z"),
+            ("2024-03-15T10:30:45.1Z", "2024-03-15T10:30:45.100Z"),
+            ("2024-03-15T10:30:45.123456Z", "2024-03-15T10:30:45.123Z"),
+            ("2024-03-15T10:30:45.123456789Z", "2024-03-15T10:30:45.123Z"),
+            // Elasticsearch rejected both of these, and the document with them.
+            (
+                "2024-03-15T10:30:45.1234567891Z",
+                "2024-03-15T10:30:45.123Z",
+            ),
+            ("2016-12-31T23:59:60Z", "2017-01-01T00:00:00.000Z"),
+            (" 2024-03-15 ", "2024-03-15T00:00:00.000Z"),
+        ] {
+            assert_eq!(index_date(raw).as_deref(), Some(indexed), "{raw}");
+        }
+    }
+
+    /// ISO 8601 spellings outside the FHIR grammar that Elasticsearch indexed
+    /// as written keep the instant they had.
+    #[test]
+    fn index_dates_elasticsearch_used_to_accept_keep_their_instant() {
+        for (raw, indexed) in [
+            ("2024-03-15T10", "2024-03-15T10:00:00.000Z"),
+            ("2024-03-15T10Z", "2024-03-15T10:00:00.000Z"),
+            ("2024-03-15T10+05:30", "2024-03-15T04:30:00.000Z"),
+            ("2024-03-15T10:30:45+0530", "2024-03-15T05:00:45.000Z"),
+            ("2024-03-15T10:30:45-05", "2024-03-15T15:30:45.000Z"),
+            ("2024-03-15T10:30:45,123Z", "2024-03-15T10:30:45.123Z"),
+            ("2024-03-15T", "2024-03-15T00:00:00.000Z"),
+        ] {
+            assert_eq!(index_date(raw).as_deref(), Some(indexed), "{raw}");
+        }
+    }
+
+    #[test]
+    fn index_dates_that_are_not_dates_are_skipped() {
+        for raw in [
+            "",
+            "not-a-date",
+            "Tuesday",
+            "2024-02-30",
+            "2024-13-01",
+            "2024-03-15T25:00:00Z",
+            "2024-03-15T24:00:00Z",
+            "2024-03-15 10:30:45",
+            "2024-03-15T10:30:45.Z",
+            "2024-03-15T10:30:45+15:00",
+            "2024-3-5",
+            "0000-01-01",
+            // Read by the mapping as epoch milliseconds: 1970.
+            "20240315",
+            "1710498645000",
+            "2024-03-15T10:30:45+05:3é",
+        ] {
+            assert_eq!(index_date(raw), None, "{raw:?}");
+        }
+    }
+
+    /// A bad date costs the document that one entry — top-level or inside a
+    /// composite instance — and nothing else.
+    #[test]
+    fn document_leaves_out_only_the_unparseable_date() {
+        let value = |param: &str, value: IndexValue, composite_group: Option<u32>| {
+            let url = format!("http://hl7.org/fhir/SearchParameter/{param}");
+            let extracted = ExtractedValue::new(param, url, value.param_type(), value);
+            match composite_group {
+                Some(group) => extracted.with_composite_group(group),
+                None => extracted,
+            }
+        };
+        let doc = build_es_document(
+            "t1",
+            "Patient",
+            "p1",
+            "1",
+            &json!({ "resourceType": "Patient", "id": "p1" }),
+            FhirVersion::default(),
+            &[
+                value("family", IndexValue::String("Smith".into()), None),
+                value("birthdate", IndexValue::date("2024-02-30"), None),
+                value(
+                    "death-date",
+                    IndexValue::date("2024-03-15T10:30:00+05:30"),
+                    None,
+                ),
+                value("combo", IndexValue::date("not-a-date"), Some(0)),
+                value("combo", IndexValue::String("kept".into()), Some(0)),
+                value("combo", IndexValue::date("2016-12-31T23:59:60Z"), Some(1)),
+            ],
+        );
+
+        let params = &doc["search_params"];
+        assert_eq!(params["string"][0]["value"], "Smith");
+        assert_eq!(
+            params["date"],
+            json!([{
+                "name": "death-date",
+                "value": "2024-03-15T05:00:00.000Z",
+                "precision": "second",
+            }])
+        );
+        assert_eq!(
+            params["composite"],
+            json!([
+                { "name": "combo", "group_id": 0, "string": ["kept"] },
+                { "name": "combo", "group_id": 1, "date": ["2017-01-01T00:00:00.000Z"] },
+            ])
+        );
+    }
 
     #[test]
     fn chunk_ranges_caps_operations_per_request() {
