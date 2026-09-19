@@ -15,6 +15,11 @@
   </div>
 </header>
 
+{# #1245: Status below turns Completed when ingest finishes — with indexing
+   deferred, that is when the search-index rebuild starts, not when it ends.
+   The region refreshes by itself: the status card stops polling right then. #}
+{% include "partials/bulk_import_rebuild.html" %}
+
 {# Host for the failed-status-change banner (#968): an Abort or Mark completed
    whose kick-off the recipient never accepted leaves this submission running,
    and that has to survive a reload, not just scroll past in the log. Rendered
