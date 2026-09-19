@@ -876,23 +876,11 @@ impl ChainedSearchProvider for PostgresBackend {
             .parse_chain(chain)
             .map_err(|e| internal_error(format!("Failed to parse chain: {}", e)))?;
         // Strip the comparator prefix only when the terminal parameter's type
-        // admits one: dates/numbers/quantities compare, but a string value
-        // like `family=Levine` must never be misread as le + "vine" (#258).
-        //
-        // A date terminal always takes the parsed form. Every prefix is valid
-        // for a date, and the `!= Eq` test below cannot tell "no prefix" from
-        // an explicit `eq`: it left `eq1990-01-15` unstripped, which is not a
-        // date and so matched nothing (#1290). Other types keep the narrower
-        // rule unchanged.
-        let candidate = crate::types::SearchValue::parse(value);
-        let parsed_value = if parsed.terminal_type == crate::types::SearchParamType::Date
-            || (candidate.prefix != crate::types::SearchPrefix::Eq
-                && candidate.prefix.is_valid_for(parsed.terminal_type))
-        {
-            candidate
-        } else {
-            crate::types::SearchValue::eq(value)
-        };
+        // admits one — date, number and quantity, explicit `eq` included
+        // (#1290, #1307) — so a string or token value is never misread: not
+        // `family=Levine` as le + "vine" (#258), nor `family=nelson` as
+        // ne + "lson" (#1307).
+        let parsed_value = crate::types::SearchValue::parse_for_type(value, parsed.terminal_type);
         let fragment = builder.build_forward_chain_sql(&parsed, &parsed_value)?;
 
         let sql = format!(

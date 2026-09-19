@@ -11756,6 +11756,175 @@ mod postgres_integration {
         }
     }
 
+    /// Seeds the #1307 fixture through the real write path. Every terminal
+    /// value that begins with a comparator pair (`ne…`, `eq…`) has a decoy
+    /// whose value is what is left once the pair is wrongly stripped, so a
+    /// misparse shows up as the decoy being returned.
+    async fn seed_chain_prefix_fixture(backend: &PostgresBackend, tenant: &TenantContext) {
+        let patient = |id: &str, birth: &str, family: &str| {
+            json!({"resourceType": "Patient", "id": id, "birthDate": birth,
+                   "name": [{"family": family}]})
+        };
+        let sequence = |id: &str, start: i64| {
+            json!({"resourceType": "MolecularSequence", "id": id, "coordinateSystem": 0,
+                   "referenceSeq": {"windowStart": start}})
+        };
+        let observation = |id: &str, code: &str, value: f64| {
+            json!({"resourceType": "Observation", "id": id, "status": "final",
+                   "code": {"coding": [{"system": "http://example.org/c", "code": code}]},
+                   "valueQuantity": {"value": value, "unit": "mg"}})
+        };
+        let mut o_nelson = observation("o-nelson", "ne123", 5.4);
+        o_nelson["subject"] = json!({"reference": "Patient/nelson-1"});
+        o_nelson["device"] = json!({"reference": "Device/dev-news"});
+        o_nelson["derivedFrom"] = json!([{"reference": "MolecularSequence/ms-10"}]);
+        let mut o_wilson = observation("o-wilson", "123", 0.0);
+        o_wilson["subject"] = json!({"reference": "Patient/wilson-1"});
+        o_wilson["device"] = json!({"reference": "Device/dev-ws"});
+        o_wilson["derivedFrom"] = json!([{"reference": "MolecularSequence/ms-0"}]);
+        let mut o_equus = observation("o-equus", "eq77", 7.0);
+        o_equus["subject"] = json!({"reference": "Patient/equus-1"});
+
+        let resources = [
+            ("Patient", patient("nelson-1", "1950-04-12", "Nelson")),
+            ("Patient", patient("wilson-1", "1960-01-01", "Wilson")),
+            ("Patient", patient("equus-1", "1970-01-01", "Equus")),
+            (
+                "Device",
+                json!({"resourceType": "Device", "id": "dev-news", "url": "news:example/1"}),
+            ),
+            (
+                "Device",
+                json!({"resourceType": "Device", "id": "dev-ws", "url": "ws:example/1"}),
+            ),
+            ("MolecularSequence", sequence("ms-10", 10)),
+            ("MolecularSequence", sequence("ms-0", 0)),
+            ("Observation", o_nelson),
+            ("Observation", o_wilson),
+            ("Observation", o_equus),
+            ("Observation", observation("o-77", "77", 9.0)),
+        ];
+        for (resource_type, body) in resources {
+            backend
+                .create(tenant, resource_type, body, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+        for obs in ["o-nelson", "o-wilson", "o-equus", "o-77"] {
+            backend
+                .create(
+                    tenant,
+                    "DiagnosticReport",
+                    json!({
+                        "resourceType": "DiagnosticReport",
+                        "id": obs.replacen("o-", "dr-", 1),
+                        "status": "final",
+                        "code": {"text": "panel"},
+                        "result": [{"reference": format!("Observation/{obs}")}],
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    /// #1307: through the `ChainedSearchProvider` trait API a comparator
+    /// prefix is recognised only on date / number / quantity terminals —
+    /// including an explicit `eq` — and never on string / token / reference /
+    /// uri terminals, whatever the value starts with.
+    #[tokio::test]
+    async fn postgres_integration_resolve_chain_prefix_only_on_ordered_terminals() {
+        use helios_persistence::core::ChainedSearchProvider;
+
+        const WINDOW_START: &str = "derived-from:MolecularSequence.window-start";
+        const VALUE_QUANTITY: &str = "result.value-quantity";
+        const FAMILY: &str = "subject:Patient.family";
+        const BIRTHDATE: &str = "subject:Patient.birthdate";
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("chain-prefix");
+        seed_chain_prefix_fixture(&backend, &tenant).await;
+
+        let cases: &[(&str, &str, &str, &[&str])] = &[
+            // Positive controls: unprefixed values prove each terminal is
+            // indexed, so the cases below cannot pass or fail vacuously.
+            ("Observation", FAMILY, "Wilson", &["o-wilson"]),
+            ("DiagnosticReport", "result.code", "123", &["dr-wilson"]),
+            (
+                "DiagnosticReport",
+                "result.subject",
+                "wilson-1",
+                &["dr-wilson"],
+            ),
+            (
+                "Observation",
+                "device:Device.url",
+                "ws:example/1",
+                &["o-wilson"],
+            ),
+            ("DiagnosticReport", VALUE_QUANTITY, "5.4", &["dr-nelson"]),
+            ("Observation", WINDOW_START, "10", &["o-nelson"]),
+            ("Observation", BIRTHDATE, "1950-04-12", &["o-nelson"]),
+            // String terminal: `ne` + "lson" would also match Wilson.
+            ("Observation", FAMILY, "nelson", &["o-nelson"]),
+            ("Observation", FAMILY, "Nelson", &["o-nelson"]),
+            ("Observation", FAMILY, "Equus", &["o-equus"]),
+            // Token terminal: `ne` + "123" / `eq` + "77" are the decoys' codes.
+            ("DiagnosticReport", "result.code", "ne123", &["dr-nelson"]),
+            ("DiagnosticReport", "result.code", "eq77", &["dr-equus"]),
+            // Reference terminal: `ne` + "lson-1" would also match wilson-1.
+            (
+                "DiagnosticReport",
+                "result.subject",
+                "nelson-1",
+                &["dr-nelson"],
+            ),
+            // Uri terminal: `ne` + "ws:example/1" is the decoy's url.
+            (
+                "Observation",
+                "device:Device.url",
+                "news:example/1",
+                &["o-nelson"],
+            ),
+            // Quantity terminal: explicit `eq` is a prefix, as are the rest.
+            ("DiagnosticReport", VALUE_QUANTITY, "eq5.4", &["dr-nelson"]),
+            (
+                "DiagnosticReport",
+                VALUE_QUANTITY,
+                "ne5.4",
+                &["dr-77", "dr-equus", "dr-wilson"],
+            ),
+            (
+                "DiagnosticReport",
+                VALUE_QUANTITY,
+                "gt6",
+                &["dr-77", "dr-equus"],
+            ),
+            // Number terminal, likewise.
+            ("Observation", WINDOW_START, "eq10", &["o-nelson"]),
+            ("Observation", WINDOW_START, "ne10", &["o-wilson"]),
+            ("Observation", WINDOW_START, "gt5", &["o-nelson"]),
+            // Date terminal with an explicit `eq` (#1290 regression guard).
+            ("Observation", BIRTHDATE, "eq1950-04-12", &["o-nelson"]),
+        ];
+
+        let mut failures = Vec::new();
+        for (base, chain, value, expected) in cases {
+            let ids = backend
+                .resolve_chain(&tenant, base, chain, value)
+                .await
+                .unwrap_or_else(|e| panic!("{base}?{chain}={value}: {e}"));
+            let ids = sorted_ids(ids);
+            if ids != expect_ids(expected) {
+                failures.push(format!(
+                    "{base}?{chain}={value}: got {ids:?}, want {expected:?}"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
     /// Seeds the chained-numeric fixture (#1306) through the real write path.
     ///
     /// Number terminal, `MolecularSequence.referenceSeq.windowStart`, reached
@@ -12103,6 +12272,449 @@ mod postgres_integration {
                 result,
                 expected,
             );
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    // ========================================================================
+    // Unparseable number / quantity values never widen a search (#1319).
+    // ========================================================================
+
+    /// Three RiskAssessments (`ra-low` 0.2, `ra-high` 0.8, `ra-none` without a
+    /// probability) and four Observations coded 8480-6 (`uq-a` 5.4 mg, `uq-b`
+    /// 6.5 mg, `uq-pipe` 5.4 in the unit `a|b`, `uq-none` without a value).
+    /// The valueless resources are the decoys a dropped constraint returns.
+    async fn seed_unparseable_numeric_fixture(backend: &PostgresBackend, tenant: &TenantContext) {
+        for (id, probability) in [
+            ("ra-low", Some(0.2)),
+            ("ra-high", Some(0.8)),
+            ("ra-none", None),
+        ] {
+            let mut prediction = json!({"outcome": {"text": "x"}});
+            if let Some(p) = probability {
+                prediction["probabilityDecimal"] = json!(p);
+            }
+            backend
+                .create(
+                    tenant,
+                    "RiskAssessment",
+                    json!({
+                        "resourceType": "RiskAssessment",
+                        "id": id,
+                        "status": "final",
+                        "subject": {"reference": "Patient/p"},
+                        "prediction": [prediction],
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        for (id, quantity) in [
+            ("uq-a", Some((5.4, "mg"))),
+            ("uq-b", Some((6.5, "mg"))),
+            ("uq-pipe", Some((5.4, "a|b"))),
+            ("uq-none", None),
+        ] {
+            let mut observation = json!({
+                "resourceType": "Observation",
+                "id": id,
+                "status": "final",
+                "code": {"coding": [{"system": "http://loinc.org", "code": "8480-6"}]},
+            });
+            if let Some((value, unit)) = quantity {
+                observation["valueQuantity"] = json!({
+                    "value": value,
+                    "unit": unit,
+                    "system": "http://unitsofmeasure.org",
+                    "code": unit,
+                });
+            }
+            backend
+                .create(tenant, "Observation", observation, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+    }
+
+    fn result_ids(found: &helios_persistence::core::SearchResult) -> Vec<String> {
+        sorted_ids(
+            found
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect(),
+        )
+    }
+
+    /// Runs `cases` as `<resource_type>?<name>=<value>` and reports every
+    /// mismatch at once.
+    async fn check_numeric_cases(
+        backend: &PostgresBackend,
+        tenant: &TenantContext,
+        resource_type: &str,
+        name: &str,
+        param_type: helios_persistence::types::SearchParamType,
+        cases: &[(&str, &[&str])],
+    ) {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{SearchParameter, SearchQuery, SearchValue};
+
+        let mut failures = Vec::new();
+        for (value, expected) in cases {
+            let query = SearchQuery::new(resource_type).with_parameter(SearchParameter {
+                name: name.to_string(),
+                param_type,
+                modifier: None,
+                values: vec![SearchValue::parse(value)],
+                chain: vec![],
+                components: vec![],
+            });
+            match backend.search(tenant, &query).await {
+                Ok(found) => {
+                    let ids = result_ids(&found);
+                    if ids != expect_ids(expected) {
+                        failures.push(format!(
+                            "{name}={value}: got {ids:?}, expected {expected:?}"
+                        ));
+                    }
+                }
+                Err(e) => failures.push(format!("{name}={value}: error {e}")),
+            }
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    /// `RiskAssessment?probability=abc` used to be `RiskAssessment?` (#1319).
+    #[tokio::test]
+    async fn postgres_integration_unparseable_number_matches_nothing() {
+        use helios_persistence::types::SearchParamType;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("unparseable-number");
+        seed_unparseable_numeric_fixture(&backend, &tenant).await;
+
+        let cases: &[(&str, &[&str])] = &[
+            // Positive controls: the index holds the rows, in every accepted form.
+            ("0.2", &["ra-low"]),
+            ("gt0.5", &["ra-high"]),
+            ("ne0.2", &["ra-high"]),
+            ("lt1e3", &["ra-high", "ra-low"]),
+            ("gt2.5E-1", &["ra-high"]),
+            ("gt-1", &["ra-high", "ra-low"]),
+            ("+0.2", &["ra-low"]),
+            ("gt.5", &["ra-high"]),
+            // Not a number: nothing, under every prefix.
+            ("abc", &[]),
+            ("eqabc", &[]),
+            ("neabc", &[]),
+            ("gtabc", &[]),
+            ("ltabc", &[]),
+            ("geabc", &[]),
+            ("leabc", &[]),
+            ("saabc", &[]),
+            ("ebabc", &[]),
+            ("apabc", &[]),
+            ("1e", &[]),
+            ("gt", &[]),
+            ("", &[]),
+            ("0.2abc", &[]),
+            // `f64::from_str` takes these; as bounds they match every row.
+            ("ltinf", &[]),
+            ("ltinfinity", &[]),
+            ("gt-inf", &[]),
+            ("ltnan", &[]),
+            ("neNaN", &[]),
+            ("lt1e999", &[]),
+        ];
+        check_numeric_cases(
+            &backend,
+            &tenant,
+            "RiskAssessment",
+            "probability",
+            SearchParamType::Number,
+            cases,
+        )
+        .await;
+    }
+
+    /// `Observation?value-quantity=abc` and friends (#1319). "Unparseable"
+    /// means the number part; the system and code forms must keep working.
+    #[tokio::test]
+    async fn postgres_integration_unparseable_quantity_matches_nothing() {
+        use helios_persistence::types::SearchParamType;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("unparseable-quantity");
+        seed_unparseable_numeric_fixture(&backend, &tenant).await;
+
+        let cases: &[(&str, &[&str])] = &[
+            // Positive controls.
+            ("5.4", &["uq-a", "uq-pipe"]),
+            ("5.4|http://unitsofmeasure.org|mg", &["uq-a"]),
+            ("5.4||mg", &["uq-a"]),
+            ("5.4|mg", &["uq-a"]),
+            ("gt6", &["uq-b"]),
+            ("gt6|http://unitsofmeasure.org|mg", &["uq-b"]),
+            ("lt1e3||mg", &["uq-a", "uq-b"]),
+            ("gt5.5E0||mg", &["uq-b"]),
+            ("gt-1||mg", &["uq-a", "uq-b"]),
+            ("+5.4||mg", &["uq-a"]),
+            // An escaped `|` is part of the code, not a separator.
+            ("5.4|http://unitsofmeasure.org|a\\|b", &["uq-pipe"]),
+            ("5.4||a\\|b", &["uq-pipe"]),
+            ("5.4|a\\|b", &["uq-pipe"]),
+            // Number part is not a number.
+            ("abc", &[]),
+            ("neabc", &[]),
+            ("apabc", &[]),
+            ("abc|http://unitsofmeasure.org|mg", &[]),
+            ("neabc|http://unitsofmeasure.org|mg", &[]),
+            ("gt|http://unitsofmeasure.org|mg", &[]),
+            ("|http://unitsofmeasure.org|mg", &[]),
+            ("||mg", &[]),
+            ("", &[]),
+            ("1e||mg", &[]),
+            ("ltinf||mg", &[]),
+            ("nenan||mg", &[]),
+        ];
+        check_numeric_cases(
+            &backend,
+            &tenant,
+            "Observation",
+            "value-quantity",
+            SearchParamType::Quantity,
+            cases,
+        )
+        .await;
+    }
+
+    /// An unparseable value beside valid parameters: the bad one must still
+    /// constrain, and the placeholders around it must stay bindable.
+    #[tokio::test]
+    async fn postgres_integration_unparseable_number_beside_valid_params() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("unparseable-number-mixed");
+        seed_unparseable_numeric_fixture(&backend, &tenant).await;
+
+        let code = SearchParameter {
+            name: "code".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("8480-6")],
+            chain: vec![],
+            components: vec![],
+        };
+        let quantity = |value: &str| SearchParameter {
+            name: "value-quantity".to_string(),
+            param_type: SearchParamType::Quantity,
+            modifier: None,
+            values: vec![SearchValue::parse(value)],
+            chain: vec![],
+            components: vec![],
+        };
+        let cases: Vec<(&str, Vec<SearchParameter>, &[&str])> = vec![
+            (
+                "code=8480-6 (positive control)",
+                vec![code.clone()],
+                &["uq-a", "uq-b", "uq-none", "uq-pipe"],
+            ),
+            (
+                "value-quantity=gt6&code=8480-6 (positive control)",
+                vec![quantity("gt6"), code.clone()],
+                &["uq-b"],
+            ),
+            (
+                "value-quantity=abc&code=8480-6",
+                vec![quantity("abc"), code.clone()],
+                &[],
+            ),
+            (
+                "code=8480-6&value-quantity=gtabc&value-quantity=gt6",
+                vec![code.clone(), quantity("gtabc"), quantity("gt6")],
+                &[],
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (label, params, expected) in cases {
+            let mut query = SearchQuery::new("Observation");
+            query.parameters = params;
+            match backend.search(&tenant, &query).await {
+                Ok(found) => {
+                    let ids = result_ids(&found);
+                    if ids != expect_ids(expected) {
+                        failures.push(format!("{label}: got {ids:?}, expected {expected:?}"));
+                    }
+                }
+                Err(e) => failures.push(format!("{label}: error {e}")),
+            }
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    /// `code-value-quantity=8480-6$abc`: a composite whose numeric component
+    /// does not parse.
+    #[tokio::test]
+    async fn postgres_integration_unparseable_composite_quantity_matches_nothing() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            CompositeSearchComponent, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("unparseable-composite");
+        seed_unparseable_numeric_fixture(&backend, &tenant).await;
+
+        let cases: &[(&str, &[&str])] = &[
+            ("8480-6$5.4", &["uq-a", "uq-pipe"]),
+            ("8480-6$gt6", &["uq-b"]),
+            ("8480-6$abc", &[]),
+            ("8480-6$neabc", &[]),
+            ("8480-6$gt", &[]),
+            ("8480-6$ltinf", &[]),
+            ("8480-6$nenan", &[]),
+            ("8480-6$abc|http://unitsofmeasure.org|mg", &[]),
+        ];
+        let mut failures = Vec::new();
+        for (value, expected) in cases {
+            let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "code-value-quantity".to_string(),
+                param_type: SearchParamType::Composite,
+                modifier: None,
+                values: vec![SearchValue::eq(*value)],
+                chain: vec![],
+                components: vec![
+                    CompositeSearchComponent {
+                        param_type: SearchParamType::Token,
+                        param_name: "code".to_string(),
+                    },
+                    CompositeSearchComponent {
+                        param_type: SearchParamType::Quantity,
+                        param_name: "value-quantity".to_string(),
+                    },
+                ],
+            });
+            match backend.search(&tenant, &query).await {
+                Ok(found) => {
+                    let ids = result_ids(&found);
+                    if ids != expect_ids(expected) {
+                        failures.push(format!(
+                            "code-value-quantity={value}: got {ids:?}, expected {expected:?}"
+                        ));
+                    }
+                }
+                Err(e) => failures.push(format!("code-value-quantity={value}: error {e}")),
+            }
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    /// `_contained=true` reuses the composite component builder, and skips a
+    /// component that comes back `None` — so an unparseable number or quantity
+    /// beside a valid parameter used to be dropped there too.
+    #[tokio::test]
+    async fn postgres_integration_unparseable_contained_number_is_not_dropped() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            ContainedMode, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("unparseable-contained");
+        backend
+            .create(
+                &tenant,
+                "DiagnosticReport",
+                json!({
+                    "resourceType": "DiagnosticReport",
+                    "id": "dr-container",
+                    "status": "final",
+                    "code": {"text": "x"},
+                    "result": [{"reference": "#o1"}],
+                    "contained": [
+                        {
+                            "resourceType": "Observation",
+                            "id": "o1",
+                            "status": "final",
+                            "code": {"coding": [{"system": "http://loinc.org", "code": "8480-6"}]},
+                            "valueQuantity": {
+                                "value": 5.4,
+                                "unit": "mg",
+                                "system": "http://unitsofmeasure.org",
+                                "code": "mg",
+                            },
+                        },
+                        {
+                            "resourceType": "RiskAssessment",
+                            "id": "r1",
+                            "status": "final",
+                            "subject": {"reference": "Patient/p"},
+                            "prediction": [{"probabilityDecimal": 0.2}],
+                        },
+                    ],
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let param = |name: &str, ty: SearchParamType, value: &str| SearchParameter {
+            name: name.to_string(),
+            param_type: ty,
+            modifier: None,
+            values: vec![SearchValue::parse(value)],
+            chain: vec![],
+            components: vec![],
+        };
+        let observation = ("Observation", "code", SearchParamType::Token, "8480-6");
+        let risk = (
+            "RiskAssessment",
+            "subject",
+            SearchParamType::Reference,
+            "Patient/p",
+        );
+        // (contained type, companion param, its type, its value)
+        type Target = (&'static str, &'static str, SearchParamType, &'static str);
+        let cases: &[(Target, &str, &[&str])] = &[
+            // Positive and negative controls, then the unparseable values.
+            (observation, "ge5", &["dr-container"]),
+            (observation, "ge6", &[]),
+            (observation, "abc", &[]),
+            (observation, "neabc||mg", &[]),
+            (observation, "ltinf", &[]),
+            (risk, "lt0.5", &["dr-container"]),
+            (risk, "gt0.5", &[]),
+            (risk, "abc", &[]),
+            (risk, "neabc", &[]),
+            (risk, "ltinf", &[]),
+        ];
+        let mut failures = Vec::new();
+        for ((resource_type, other, other_type, other_value), numeric, expected) in cases {
+            let (name, ty) = if *resource_type == "Observation" {
+                ("value-quantity", SearchParamType::Quantity)
+            } else {
+                ("probability", SearchParamType::Number)
+            };
+            let mut query = SearchQuery::new(*resource_type);
+            query.contained = ContainedMode::On;
+            query.parameters = vec![
+                param(other, *other_type, other_value),
+                param(name, ty, numeric),
+            ];
+            let found = backend.search(&tenant, &query).await.unwrap();
+            let ids = result_ids(&found);
+            if ids != expect_ids(expected) {
+                failures.push(format!(
+                    "{resource_type}?_contained=true&{other}={other_value}&{name}={numeric}: \
+                     got {ids:?}, expected {expected:?}"
+                ));
+            }
         }
         assert!(failures.is_empty(), "\n{}", failures.join("\n"));
     }
