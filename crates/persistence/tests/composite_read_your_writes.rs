@@ -343,3 +343,100 @@ async fn synchronous_mode_needs_no_queue_barrier() {
     assert_eq!(found.resources.items.len(), 1);
     assert_eq!(found.resources.items[0].id(), created.id());
 }
+
+/// #1312: the composite used to build conditional criteria for itself, typing
+/// every value with the comparator-stripping `SearchValue::parse` — so
+/// `identifier=ne123` searched for `123` and `name=Neal` for `al`. It now
+/// goes through the builder every backend shares. The decoy carries exactly
+/// what the old parse would have searched for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conditional_criteria_with_prefix_like_values_name_the_right_resource() {
+    use helios_persistence::core::ConditionalDeleteResult;
+
+    let composite = composite(SyncMode::Synchronous);
+    let t = tenant();
+
+    let named = |identifier: &str, name: &str| {
+        json!({
+            "resourceType": "Organization",
+            "identifier": [{"system": "urn:zzz:probe", "value": identifier}],
+            "name": name
+        })
+    };
+    let target = composite
+        .create(
+            &t,
+            "Organization",
+            named("ne123", "Neal Clinic"),
+            FhirVersion::R4,
+        )
+        .await
+        .expect("target");
+    let decoy = composite
+        .create(
+            &t,
+            "Organization",
+            named("123", "Allen Clinic"),
+            FhirVersion::R4,
+        )
+        .await
+        .expect("decoy");
+
+    // The first criterion is the positive control: a system-qualified token
+    // that no comparator letters can disturb.
+    for criteria in [
+        "identifier=urn:zzz:probe|ne123",
+        "identifier=ne123",
+        "name=Neal",
+    ] {
+        match composite
+            .conditional_create(
+                &t,
+                "Organization",
+                named("incoming", "Incoming"),
+                criteria,
+                FhirVersion::R4,
+            )
+            .await
+            .expect("conditional create")
+        {
+            ConditionalCreateResult::Exists(existing) => {
+                assert_eq!(
+                    existing.id(),
+                    target.id(),
+                    "{criteria} matched the wrong one"
+                )
+            }
+            ConditionalCreateResult::Created(_) => panic!("{criteria}: created a duplicate"),
+            ConditionalCreateResult::MultipleMatches(n) => panic!("{criteria}: {n} matches"),
+        }
+    }
+
+    match composite
+        .conditional_delete(&t, "Organization", "name=Neal")
+        .await
+        .expect("conditional delete")
+    {
+        ConditionalDeleteResult::Deleted(deleted) => assert_eq!(deleted.id(), target.id()),
+        ConditionalDeleteResult::NoMatch => panic!("name=Neal matched nothing"),
+        ConditionalDeleteResult::MultipleMatches(n) => panic!("name=Neal: {n} matches"),
+    }
+
+    // The target is gone; the same criteria must now match nothing — least of
+    // all the decoy.
+    assert!(matches!(
+        composite
+            .conditional_delete(&t, "Organization", "identifier=ne123")
+            .await
+            .expect("conditional delete"),
+        ConditionalDeleteResult::NoMatch
+    ));
+    assert!(
+        composite
+            .read(&t, "Organization", decoy.id())
+            .await
+            .expect("read decoy")
+            .is_some(),
+        "the decoy must survive"
+    );
+}
