@@ -466,6 +466,28 @@ mod tenant_id_fidelity_suite;
 #[path = "search/date_boundary_suite.rs"]
 mod date_boundary_suite;
 
+/// The backend-agnostic conditional-criteria suite (#1312). Same `#[path]`
+/// arrangement.
+#[path = "search/conditional_criteria_suite.rs"]
+mod conditional_criteria_suite;
+
+/// #1312: `family=Neal` / `identifier=ne123` name the right resource on every
+/// conditional interaction. Needs the full registry: with only the embedded
+/// parameters `family` and `identifier` are unknown and nothing ever matches.
+#[tokio::test]
+async fn mongodb_conditional_criteria_with_prefix_like_values() {
+    let Some(backend) = create_backend_with_full_registry("cond_criteria_1312").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    conditional_criteria_suite::prefix_like_criteria_name_the_right_resource(
+        &backend,
+        "cond-criteria-1312",
+        true,
+    )
+    .await;
+}
+
 /// #519: MongoDB's date handler was explicitly unverified. Needs the full
 /// registry so `birthdate` extracts into the search index at write time.
 #[tokio::test]

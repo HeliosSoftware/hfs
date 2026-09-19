@@ -20,10 +20,9 @@ use crate::core::{
 use crate::error::{BackendError, QueryErrorExt, SearchError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
 use crate::types::{
-    CompartmentMembership, CompositeSearchComponent, CursorDirection, CursorValue,
-    IncludeDirective, IncludeType, Page, PageCursor, PageInfo, SearchModifier, SearchParamType,
-    SearchParameter, SearchPrefix, SearchQuery, SearchValue, StoredResource,
-    strip_reference_version,
+    CompartmentMembership, CursorDirection, CursorValue, IncludeDirective, IncludeType, Page,
+    PageCursor, PageInfo, SearchModifier, SearchParamType, SearchParameter, SearchPrefix,
+    SearchQuery, SearchValue, StoredResource, strip_reference_version,
 };
 
 use super::MongoBackend;
@@ -320,16 +319,6 @@ fn build_contained_stored(
         None,
         container.fhir_version(),
     )
-}
-
-fn parse_simple_search_params(params: &str) -> Vec<(String, String)> {
-    params
-        .split('&')
-        .filter_map(|pair| {
-            let (name, value) = pair.split_once('=')?;
-            Some((name.to_string(), value.to_string()))
-        })
-        .collect()
 }
 
 /// The `search_index` field a parameter type's value lives in. `None` for
@@ -3249,96 +3238,41 @@ impl MongoBackend {
         resource_type: &str,
         search_params_str: &str,
     ) -> StorageResult<Vec<StoredResource>> {
-        let parsed_params = parse_simple_search_params(search_params_str);
-
-        if parsed_params.is_empty() {
+        let Some(query) = self.conditional_query(tenant, resource_type, search_params_str)? else {
             return Ok(Vec::new());
-        }
-
-        let search_params = self.build_search_parameters(tenant, resource_type, &parsed_params);
-
-        let query = SearchQuery {
-            resource_type: resource_type.to_string(),
-            parameters: search_params,
-            count: Some(1000),
-            ..Default::default()
         };
 
         let result = <Self as SearchProvider>::search(self, tenant, &query).await?;
         Ok(result.resources.items)
     }
 
+    /// Builds the search a conditional interaction's criteria describe, or
+    /// `None` when they select nothing. The parsing is
+    /// [`crate::search::build_conditional_query`], shared by every backend so
+    /// criteria mean what they mean as a direct search (#1312).
+    fn conditional_query(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        criteria: &str,
+    ) -> StorageResult<Option<SearchQuery>> {
+        let registry_arc = self.tenant_registry(tenant.tenant_id().as_str());
+        let registry = registry_arc.read();
+        crate::search::build_conditional_query(&registry, resource_type, criteria)
+    }
+
+    /// Types already-split criteria pairs, for the in-transaction
+    /// `ifNoneExist` resolver, which drives the `search_index` collection
+    /// parameter by parameter instead of running a [`SearchQuery`].
     pub(super) fn build_search_parameters(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         params: &[(String, String)],
-    ) -> Vec<SearchParameter> {
+    ) -> StorageResult<Vec<SearchParameter>> {
         let registry_arc = self.tenant_registry(tenant.tenant_id().as_str());
         let registry = registry_arc.read();
-
-        params
-            .iter()
-            .map(|(name, value)| {
-                // Resolve the type from the *parsed* value, exactly as
-                // before this function grew a composite path: the
-                // registry-miss fallback (`infer_param_type_from_value`)
-                // assumes a comparator prefix has already been stripped, so
-                // resolving from an unparsed probe silently changes the
-                // inferred type for parameters the registry doesn't know
-                // (e.g. plain conditional create/update/delete params).
-                // Composite is the one type only the registry can produce
-                // this way, so it's safe to special-case below and keep the
-                // raw `$`-joined string there — `parse` would otherwise
-                // strip a prefix off the whole composite when its first
-                // component is itself ordered (#1206 review).
-                let parsed = SearchValue::parse(value);
-                let param_type = crate::search::resolve_param_type(
-                    &registry,
-                    resource_type,
-                    name,
-                    std::slice::from_ref(&parsed),
-                );
-
-                let (values, components) = if param_type == SearchParamType::Composite {
-                    // Mirrors `search_query_builder.rs`'s composite handling
-                    // (~line 480-498): resolve each declared component's
-                    // sub-parameter (type + code) from the registry so the
-                    // backend can match components within the same
-                    // composite instance. The value stays raw (`eq`, not
-                    // the parsed value) for the reason above.
-                    let components = registry
-                        .get_param(resource_type, name)
-                        .and_then(|def| def.component.clone())
-                        .map(|comps| {
-                            comps
-                                .iter()
-                                .filter_map(|c| {
-                                    registry.get_by_url(&c.definition).map(|sub| {
-                                        CompositeSearchComponent {
-                                            param_type: sub.param_type,
-                                            param_name: sub.code.clone(),
-                                        }
-                                    })
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    (vec![SearchValue::eq(value.clone())], components)
-                } else {
-                    (vec![parsed], Vec::new())
-                };
-
-                SearchParameter {
-                    name: name.clone(),
-                    param_type,
-                    modifier: None,
-                    values,
-                    chain: vec![],
-                    components,
-                }
-            })
-            .collect()
+        crate::search::build_conditional_parameters(&registry, resource_type, params)
     }
 
     fn merge_unique(target: &mut Vec<StoredResource>, additions: Vec<StoredResource>) {
@@ -3724,6 +3658,7 @@ mod date_filter_tests {
 mod query_support_tests {
     use super::*;
     use crate::backends::mongodb::MongoBackendConfig;
+    use crate::types::CompositeSearchComponent;
 
     /// `birthdate:missing=true` carries the value `true`, which is not a
     /// date — `:missing` must be accepted as presence-only (#881) rather
@@ -4298,6 +4233,7 @@ mod number_quantity_precision_tests {
 mod composite_component_filter_tests {
     use super::*;
     use crate::backends::mongodb::MongoBackendConfig;
+    use crate::types::CompositeSearchComponent;
 
     fn backend() -> MongoBackend {
         MongoBackend::new(MongoBackendConfig::default()).unwrap()
@@ -4991,11 +4927,13 @@ mod build_search_parameters_tests {
     #[test]
     fn unregistered_parameter_resolves_type_from_the_stripped_value() {
         let backend = MongoBackend::new(MongoBackendConfig::default()).unwrap();
-        let params = backend.build_search_parameters(
-            &tenant(),
-            "Patient",
-            &[("foo".to_string(), "gt2020-01-01".to_string())],
-        );
+        let params = backend
+            .build_search_parameters(
+                &tenant(),
+                "Patient",
+                &[("foo".to_string(), "gt2020-01-01".to_string())],
+            )
+            .expect("criteria build");
 
         assert_eq!(params.len(), 1);
         let param = &params[0];
@@ -5024,14 +4962,16 @@ mod build_search_parameters_tests {
         })
         .unwrap();
 
-        let params = backend.build_search_parameters(
-            &tenant(),
-            "Observation",
-            &[(
-                "code-value-quantity".to_string(),
-                "http://loinc.org|8302-2$gt150".to_string(),
-            )],
-        );
+        let params = backend
+            .build_search_parameters(
+                &tenant(),
+                "Observation",
+                &[(
+                    "code-value-quantity".to_string(),
+                    "http://loinc.org|8302-2$gt150".to_string(),
+                )],
+            )
+            .expect("criteria build");
 
         assert_eq!(params.len(), 1);
         let param = &params[0];
