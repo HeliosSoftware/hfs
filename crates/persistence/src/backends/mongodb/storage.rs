@@ -1308,8 +1308,14 @@ impl ResourceStorage for MongoBackend {
         let mut resources = Vec::with_capacity(ids.len());
 
         for id in ids {
-            if let Some(resource) = self.read(tenant, resource_type, id).await? {
-                resources.push(resource);
+            // A missing or soft-deleted (Gone) id is omitted, not fatal — one
+            // deleted target must not fail the whole batch (matches the default
+            // impl / #1119).
+            match self.read(tenant, resource_type, id).await {
+                Ok(Some(resource)) => resources.push(resource),
+                Ok(None) => {}
+                Err(StorageError::Resource(ResourceError::Gone { .. })) => {}
+                Err(e) => return Err(e),
             }
         }
 
