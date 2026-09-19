@@ -4,13 +4,25 @@
 //! `cargo test -p helios-persistence --features mongodb --test mongodb_tests`
 //!
 //! The integration tests provision MongoDB automatically: when Docker is
-//! available they start an ephemeral standalone Mongo testcontainer (so the
-//! suite runs in CI), and they otherwise use `HFS_TEST_MONGODB_URL` if set
-//! (e.g. `HFS_TEST_MONGODB_URL=mongodb://localhost:27017` to target a specific
+//! available they start an ephemeral **single-node replica set** Mongo
+//! testcontainer (so the suite runs in CI), and they otherwise use
+//! `HFS_TEST_MONGODB_URL` if set (e.g.
+//! `HFS_TEST_MONGODB_URL=mongodb://localhost:27017` to target a specific
 //! instance). When neither is available the integration tests skip.
 //!
-//! Multi-document transaction tests additionally require a replica set; against
-//! a standalone server they skip only the transaction-specific assertions.
+//! Multi-document transactions need the oplog, which only a replica set has —
+//! a plain standalone `mongod` cannot run them. The harness's own container is
+//! therefore always initiated as a one-member replica set (`rs0`), so
+//! transaction Bundle code paths actually execute in CI instead of vacuously
+//! skipping. Because that member advertises `localhost:27017` (its own
+//! in-container address, not the host-mapped port), the connection string sets
+//! `directConnection=true` to stop the driver from attempting replica-set
+//! discovery through an address it can't reach. Skips on
+//! `TransactionError::UnsupportedIsolationLevel` only remain possible when
+//! `HFS_TEST_MONGODB_URL` points at someone's own standalone server; against
+//! the harness's own container that error is a test *failure* (see
+//! [`transactions_required`]), because it can only mean the harness itself
+//! failed to bring the replica set up.
 
 #![cfg(feature = "mongodb")]
 
@@ -175,6 +187,13 @@ async fn mongodb_integration_transaction_bundle_topology_behavior() {
         .await
     {
         Ok(bundle_result) => assert!(bundle_result.entries.is_empty()),
+        Err(TransactionError::UnsupportedIsolationLevel { .. }) if transactions_required() => {
+            panic!(
+                "mongodb_integration_transaction_bundle_topology_behavior: the harness's own \
+                 Mongo container is a replica set and must support transactions; \
+                 UnsupportedIsolationLevel here means the harness itself is broken"
+            );
+        }
         Err(TransactionError::UnsupportedIsolationLevel { .. }) => {
             eprintln!(
                 "Skipping mongodb_integration_transaction_bundle_topology_behavior (MongoDB topology does not support transactions)"
@@ -182,6 +201,16 @@ async fn mongodb_integration_transaction_bundle_topology_behavior() {
         }
         Err(other) => panic!("Unexpected transaction result: {}", other),
     }
+}
+
+/// Whether the transaction-specific portion of a test must succeed rather
+/// than skip: true whenever the suite is using its own harness-started Mongo
+/// container, which is always initiated as a replica set (see
+/// [`shared_mongo`]) and therefore always supports multi-document
+/// transactions. Only an externally supplied `HFS_TEST_MONGODB_URL` (which
+/// may point at a standalone server) still gets the old skip behaviour.
+fn transactions_required() -> bool {
+    test_mongo_url().is_none()
 }
 
 async fn process_transaction_or_skip(
@@ -195,6 +224,13 @@ async fn process_transaction_or_skip(
         .await
     {
         Ok(result) => Some(result),
+        Err(TransactionError::UnsupportedIsolationLevel { .. }) if transactions_required() => {
+            panic!(
+                "{test_name}: the harness's own Mongo container is a replica set and must \
+                 support transactions; UnsupportedIsolationLevel here means the harness \
+                 itself is broken"
+            );
+        }
         Err(TransactionError::UnsupportedIsolationLevel { .. }) => {
             eprintln!(
                 "Skipping {} (MongoDB topology does not support transactions)",
@@ -214,18 +250,28 @@ fn test_mongo_url() -> Option<String> {
 ///
 /// Prefers an externally supplied server (`HFS_TEST_MONGODB_URL`, e.g. for local
 /// runs against a specific instance) and otherwise starts a single ephemeral
-/// **standalone** Mongo testcontainer shared across the whole test binary, so the
-/// suite runs in CI (where Docker is available) instead of silently skipping.
-/// Each test still uses a unique database name, so they don't collide on the
-/// shared server.
+/// **single-node replica set** Mongo testcontainer shared across the whole test
+/// binary, so the suite runs in CI (where Docker is available) instead of
+/// silently skipping. Each test still uses a unique database name, so they
+/// don't collide on the shared server.
 ///
-/// Multi-document transactions require a replica set, which a standalone server
-/// does not provide; the transaction tests detect this and skip that portion
-/// (see [`process_transaction_or_skip`]). Everything else — CRUD, search,
-/// history, pagination, tenancy, conditional ops — runs. If neither a URL nor
-/// Docker is available the tests skip.
+/// Multi-document transactions need the oplog, which only a replica set has.
+/// The harness-started container is always initiated as a one-member replica
+/// set (`rs0`) so the transaction tests really exercise those code paths (see
+/// [`super::transactions_required`] / [`super::process_transaction_or_skip`]);
+/// a skip on `TransactionError::UnsupportedIsolationLevel` is only possible
+/// against an external, standalone `HFS_TEST_MONGODB_URL`. The replica set's
+/// member address is fixed to `localhost:27017` (its own in-container
+/// address), so the returned connection string carries
+/// `directConnection=true` — otherwise the driver would try to discover the
+/// replica set topology through that unreachable address instead of using the
+/// mapped port directly. If neither a URL nor Docker is available the tests
+/// skip.
 mod shared_mongo {
+    use std::time::{Duration, Instant};
+
     use testcontainers::ImageExt;
+    use testcontainers::core::ExecCommand;
     use testcontainers::runners::AsyncRunner;
     use testcontainers_modules::mongo::Mongo;
     use tokio::sync::OnceCell;
@@ -240,6 +286,77 @@ mod shared_mongo {
 
     static SHARED: OnceCell<Option<SharedMongo>> = OnceCell::const_new();
 
+    /// Runs `rs.initiate` with an explicit member list so the single-node
+    /// replica set advertises `localhost:27017` — its own in-container
+    /// address — instead of letting it pick a random hostname the host could
+    /// never resolve through the mapped port.
+    ///
+    /// We don't use `testcontainers_modules::mongo::Mongo::repl_set()` for
+    /// this: its `Image::cmd()` (`--replSet rs`) is fully *replaced*, not
+    /// merged, by the `with_cmd([...])` below — see
+    /// `ImageExt::with_cmd` in testcontainers 0.27
+    /// (`core/image/image_ext.rs`: `ContainerRequest { overridden_cmd: cmd,
+    /// ..container_req }`) — so it wouldn't contribute anything once we
+    /// supply our own full command. Its `exec_after_start` also just runs a
+    /// bare `rs.initiate()`, which lets the node self-select the container's
+    /// hostname as the sole member — unreachable from the host. Initiating
+    /// explicitly here, then polling for a writable primary ourselves, gives
+    /// full control over both.
+    async fn initiate_replica_set(container: &testcontainers::ContainerAsync<Mongo>) {
+        let exec_result = container
+            .exec(ExecCommand::new([
+                "mongosh",
+                "--quiet",
+                "--eval",
+                "rs.initiate({_id:\"rs0\",members:[{_id:0,host:\"localhost:27017\"}]})",
+            ]))
+            .await;
+        match exec_result {
+            // `stdout_to_vec` blocks until the eval finishes; the actual
+            // success signal is the writable-primary poll below, since
+            // rs.initiate() returns before the node has finished electing
+            // itself primary.
+            Ok(mut exec_result) => {
+                let _ = exec_result.stdout_to_vec().await;
+            }
+            Err(err) => panic!(
+                "shared_mongo: failed to exec `rs.initiate` on the Mongo testcontainer: {err}"
+            ),
+        }
+    }
+
+    /// Polls `db.hello().isWritablePrimary` until the single-node replica set
+    /// has elected itself primary, so callers never race a connection attempt
+    /// against a node still in `STARTUP2`/`SECONDARY`. Panics after 60s: at
+    /// that point the harness's own container is broken, and letting every
+    /// dependent test silently report "skip: no Docker" would hide that.
+    async fn wait_for_writable_primary(container: &testcontainers::ContainerAsync<Mongo>) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let exec_result = container
+                .exec(ExecCommand::new([
+                    "mongosh",
+                    "--quiet",
+                    "--eval",
+                    "db.hello().isWritablePrimary",
+                ]))
+                .await;
+            if let Ok(mut exec_result) = exec_result
+                && let Ok(stdout) = exec_result.stdout_to_vec().await
+                && String::from_utf8_lossy(&stdout).trim() == "true"
+            {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "shared_mongo: replica set rs0 did not report a writable primary within \
+                     60s of `rs.initiate` — the harness's Mongo container is broken"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
     async fn shared() -> Option<&'static SharedMongo> {
         SHARED
             .get_or_init(|| async {
@@ -250,8 +367,9 @@ mod shared_mongo {
                         _container: None,
                     });
                 }
-                // Otherwise start an ephemeral standalone Mongo container; if
-                // Docker is unavailable, `start()` errors and the suite skips.
+                // Otherwise start an ephemeral single-node replica-set Mongo
+                // container; if Docker is unavailable, `start()` errors and
+                // the suite skips.
                 let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
                 // `SHARED` is a static and never dropped; the cleanup label
                 // lets the exit hook remove the container.
@@ -268,6 +386,16 @@ mod shared_mongo {
                         // suite's tiny datasets. `--bind_ip_all` matches the stock
                         // image default and keeps the mapped port reachable once we
                         // supply our own command.
+                        //
+                        // `--replSet rs0` turns this into a (single-node) replica
+                        // set: multi-document transactions need the oplog, which a
+                        // standalone mongod does not have — every transaction test
+                        // used to detect `UnsupportedIsolationLevel` and skip,
+                        // vacuously "passing" without ever exercising the
+                        // transaction Bundle code paths. `--oplogSize 128` (MB)
+                        // keeps that oplog small on CI disks; mongod's own default
+                        // sizing (a percentage of free disk) is unnecessary for
+                        // this suite's tiny datasets.
                         .with_cmd([
                             "mongod",
                             "--bind_ip_all",
@@ -277,6 +405,10 @@ mod shared_mongo {
                             // is only registered when test commands are enabled.
                             "--setParameter",
                             "enableTestCommands=1",
+                            "--replSet",
+                            "rs0",
+                            "--oplogSize",
+                            "128",
                         ])
                         // Every test creates its own uniquely-named database, and
                         // WiredTiger holds file handles open per collection/index
@@ -290,10 +422,20 @@ mod shared_mongo {
                 .start()
                 .await
                 .ok()?;
+
+                initiate_replica_set(&container).await;
+                wait_for_writable_primary(&container).await;
+
                 let host = container.get_host().await.ok()?;
                 let port = container.get_host_port_ipv4(27017).await.ok()?;
                 Some(SharedMongo {
-                    connection_string: format!("mongodb://{host}:{port}/"),
+                    // The replica set's sole member advertises
+                    // `localhost:27017` (its address inside the container),
+                    // which is unreachable from the host through the mapped
+                    // port — `directConnection=true` stops the driver from
+                    // trying to discover the topology through it and pins it
+                    // to this one endpoint instead.
+                    connection_string: format!("mongodb://{host}:{port}/?directConnection=true"),
                     _container: Some(container),
                 })
             })
@@ -672,10 +814,43 @@ async fn create_backend_with_search_offloaded(
     build_backend(config).await
 }
 
+/// Appends `param` (`key=value`) to `url`'s query string, using `?` if it has
+/// none yet or `&` if it already does.
+fn append_query_param(url: &str, param: &str) -> String {
+    if url.contains('?') {
+        format!("{url}&{param}")
+    } else {
+        format!("{url}?{param}")
+    }
+}
+
+#[test]
+fn test_append_query_param() {
+    assert_eq!(
+        append_query_param("mongodb://h:1/", "retryWrites=false"),
+        "mongodb://h:1/?retryWrites=false"
+    );
+    assert_eq!(
+        append_query_param("mongodb://h:1/?directConnection=true", "retryWrites=false"),
+        "mongodb://h:1/?directConnection=true&retryWrites=false"
+    );
+}
+
 /// A backend whose driver connections carry `app_name`, so a `failCommand`
 /// failpoint configured with `data.appName` hits only this backend.
+///
+/// Used exclusively by the bulk-submit `failCommand` retry tests below, which
+/// assert on *this module's own* bounded retry/attempt counting against a
+/// fail point's `times` budget. Against a replica set the driver's own
+/// retryable-writes support (on by default) transparently retries a dropped
+/// single-statement write once before the error ever reaches this module's
+/// code, silently spending part of the fail point's budget and changing (or
+/// erasing) the attempt counts these tests assert on — so `retryWrites=false`
+/// is forced here to restore the semantics they were written against: every
+/// dropped command must reach this module's own retry loop.
 async fn create_backend_with_app_name(test_name: &str, app_name: &str) -> Option<MongoBackend> {
     let connection_string = shared_mongo::connection_string().await?;
+    let connection_string = append_query_param(&connection_string, "retryWrites=false");
     let config = MongoBackendConfig {
         connection_string,
         database_name: build_test_database_name(test_name),
@@ -1504,7 +1679,7 @@ async fn mongodb_integration_transaction_bundle_mixed_operations_and_idempotent_
 
 #[tokio::test]
 async fn mongodb_integration_transaction_if_none_exist_match_resolves_urn_references() {
-    let Some(backend) = create_backend("if_none_exist_urn").await else {
+    let Some(backend) = create_backend_with_full_registry("if_none_exist_urn").await else {
         eprintln!(
             "Skipping mongodb_integration_transaction_if_none_exist_match_resolves_urn_references (requires Docker or HFS_TEST_MONGODB_URL)"
         );
@@ -1588,7 +1763,8 @@ async fn mongodb_integration_transaction_if_none_exist_match_resolves_urn_refere
 
 #[tokio::test]
 async fn mongodb_integration_transaction_bundle_conditional_headers() {
-    let Some(backend) = create_backend("bundle_conditional_headers").await else {
+    let Some(backend) = create_backend_with_full_registry("bundle_conditional_headers").await
+    else {
         eprintln!(
             "Skipping mongodb_integration_transaction_bundle_conditional_headers (requires Docker or HFS_TEST_MONGODB_URL)"
         );
@@ -1701,6 +1877,14 @@ async fn mongodb_integration_transaction_bundle_conditional_headers() {
         .process_transaction(&tenant, bad_if_match, FhirVersion::default())
         .await
     {
+        Err(TransactionError::UnsupportedIsolationLevel { .. }) if transactions_required() => {
+            panic!(
+                "mongodb_integration_transaction_bundle_conditional_headers/if-match-bad: the \
+                 harness's own Mongo container is a replica set and must support \
+                 transactions; UnsupportedIsolationLevel here means the harness itself is \
+                 broken"
+            );
+        }
         Err(TransactionError::UnsupportedIsolationLevel { .. }) => {
             eprintln!(
                 "Skipping mongodb_integration_transaction_bundle_conditional_headers/if-match-bad (MongoDB topology does not support transactions)"
@@ -1781,6 +1965,13 @@ async fn mongodb_integration_transaction_bundle_rolls_back_on_failure() {
         .process_transaction(&tenant, entries, FhirVersion::default())
         .await
     {
+        Err(TransactionError::UnsupportedIsolationLevel { .. }) if transactions_required() => {
+            panic!(
+                "mongodb_integration_transaction_bundle_rolls_back_on_failure: the harness's \
+                 own Mongo container is a replica set and must support transactions; \
+                 UnsupportedIsolationLevel here means the harness itself is broken"
+            );
+        }
         Err(TransactionError::UnsupportedIsolationLevel { .. }) => {
             eprintln!(
                 "Skipping mongodb_integration_transaction_bundle_rolls_back_on_failure (MongoDB topology does not support transactions)"
@@ -9218,6 +9409,13 @@ mod bulk_submit {
                     .await
                     .unwrap();
                 options.app_name = Some(app_name);
+                // Against a replica set the driver's own retryable-writes
+                // support would transparently retry the dropped `insert`
+                // once, on a fresh connection, before this test ever sees an
+                // error — defeating the one-shot failpoint this test exists
+                // to pin down. Force it off so the failpoint's single hit is
+                // what this client actually observes.
+                options.retry_writes = Some(false);
                 Client::with_options(options).unwrap()
             }
         };
@@ -12719,6 +12917,15 @@ async fn mongodb_integration_if_none_exist_multiple_matches_rolls_back() {
         .process_transaction(&tenant, entries, FhirVersion::default())
         .await
     {
+        Err(helios_persistence::error::TransactionError::UnsupportedIsolationLevel { .. })
+            if transactions_required() =>
+        {
+            panic!(
+                "mongodb_integration_if_none_exist_multiple_matches_rolls_back: the harness's \
+                 own Mongo container is a replica set and must support transactions; \
+                 UnsupportedIsolationLevel here means the harness itself is broken"
+            );
+        }
         Err(helios_persistence::error::TransactionError::UnsupportedIsolationLevel { .. }) => {
             eprintln!("Skipping multiple_matches_rolls_back (replica-set required)");
             return;

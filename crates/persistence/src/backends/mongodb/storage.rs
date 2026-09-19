@@ -799,11 +799,15 @@ impl ResourceStorage for MongoBackend {
         self.index_resource(&db, tenant_id, resource_type, &id, &resource, &mut session)
             .await?;
 
+        commit_best_effort_multi_write_session(&mut session, transaction_active, "create").await?;
+
         // An overlay-affecting SearchParameter write: refresh the stored-param
         // cache (which the per-tenant loader reads) and drop the cached
-        // registries. Seeded spec copies never affect the overlay (see
-        // `create_affects_overlay`), which keeps bulk seeding from triggering
-        // an O(n²) reload storm.
+        // registries. This must run after the commit above: `reload_stored_cache`
+        // reads the `resources` collection without the session, so while the
+        // transaction is still open the write above is invisible to it. Seeded
+        // spec copies never affect the overlay (see `create_affects_overlay`),
+        // which keeps bulk seeding from triggering an O(n²) reload storm.
         if resource_type == "SearchParameter"
             && self.tenant_registries().create_affects_overlay(&resource)
         {
@@ -811,8 +815,6 @@ impl ResourceStorage for MongoBackend {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
             }
         }
-
-        commit_best_effort_multi_write_session(&mut session, transaction_active, "create").await?;
 
         Ok(StoredResource::from_storage(
             resource_type,
@@ -1094,15 +1096,18 @@ impl ResourceStorage for MongoBackend {
         self.index_resource(&db, tenant_id, resource_type, id, &resource, &mut session)
             .await?;
 
+        commit_best_effort_multi_write_session(&mut session, transaction_active, "update").await?;
+
         // A SearchParameter update may change a tenant's overlay (status flips,
         // expression edits): refresh the stored-param cache and drop registries.
+        // This must run after the commit above: `reload_stored_cache` reads the
+        // `resources` collection without the session, so it cannot observe the
+        // update while the transaction is still open.
         if resource_type == "SearchParameter" {
             if let Err(e) = self.reload_stored_cache().await {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
             }
         }
-
-        commit_best_effort_multi_write_session(&mut session, transaction_active, "update").await?;
 
         Ok(StoredResource::from_storage(
             resource_type,
@@ -1255,15 +1260,18 @@ impl ResourceStorage for MongoBackend {
         self.delete_search_index(&db, tenant_id, resource_type, id, &mut session)
             .await?;
 
+        commit_best_effort_multi_write_session(&mut session, transaction_active, "delete").await?;
+
         // A SearchParameter delete may remove a tenant's overlay entry: refresh
-        // the stored-param cache and drop registries.
+        // the stored-param cache and drop registries. This must run after the
+        // commit above: `reload_stored_cache` reads the `resources` collection
+        // without the session, so it cannot observe the delete while the
+        // transaction is still open.
         if resource_type == "SearchParameter" {
             if let Err(e) = self.reload_stored_cache().await {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
             }
         }
-
-        commit_best_effort_multi_write_session(&mut session, transaction_active, "delete").await?;
 
         Ok(())
     }
@@ -2080,15 +2088,18 @@ impl MongoBackend {
         self.index_resource(&db, tenant_id, resource_type, id, &resource, &mut session)
             .await?;
 
+        commit_best_effort_multi_write_session(&mut session, transaction_active, "restore").await?;
+
         // A restored SearchParameter re-enters a tenant's overlay: refresh the
-        // stored-param cache and drop registries.
+        // stored-param cache and drop registries. This must run after the
+        // commit above: `reload_stored_cache` reads the `resources` collection
+        // without the session, so it cannot observe the restore while the
+        // transaction is still open.
         if resource_type == "SearchParameter" {
             if let Err(e) = self.reload_stored_cache().await {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
             }
         }
-
-        commit_best_effort_multi_write_session(&mut session, transaction_active, "restore").await?;
 
         Ok(StoredResource::from_storage(
             resource_type,
