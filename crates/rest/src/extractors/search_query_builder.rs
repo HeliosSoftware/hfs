@@ -497,6 +497,45 @@ fn parse_search_parameter(
         }
     }
 
+    // The same for number and quantity parameters (#1319): PostgreSQL and
+    // Elasticsearch used to skip a value whose number part does not parse, so
+    // `probability=abc` was an unconstrained search; SQLite matches nothing and
+    // MongoDB errors. For a quantity only the number part — everything before
+    // the first `|` — is checked; system and code are free text.
+    if registered
+        && matches!(
+            param_type,
+            SearchParamType::Number | SearchParamType::Quantity
+        )
+        && chain.is_empty()
+        && !matches!(modifier, Some(SearchModifier::Missing))
+    {
+        let number_part = |v: &str| -> String {
+            match param_type {
+                SearchParamType::Quantity => v.split('|').next().unwrap_or_default().to_string(),
+                _ => v.to_string(),
+            }
+        };
+        if let Some(bad) = values
+            .iter()
+            .find(|v| !v.value.is_empty() && !is_number_search_value(&number_part(&v.value)))
+        {
+            return Err(RestError::InvalidParameter {
+                param: name.to_string(),
+                message: format!(
+                    "'{}' is not a valid {param_type} value (expected [prefix]number{}, where \
+                     number is a decimal with an optional exponent)",
+                    bad.value,
+                    if param_type == SearchParamType::Quantity {
+                        "[|system|code]"
+                    } else {
+                        ""
+                    }
+                ),
+            });
+        }
+    }
+
     let mut param = SearchParameter {
         name: base_name.to_string(),
         param_type,
@@ -597,6 +636,37 @@ fn is_date_search_value(value: &str) -> bool {
         [h, m, s] => field(h, 23) && field(m, 59) && field(s, 60),
         _ => false,
     }
+}
+
+/// Whether `value` (comparator prefix already removed) is the number of a FHIR
+/// number or quantity search value: an optional sign, digits with an optional
+/// fraction, and an optional exponent.
+///
+/// Like [`is_date_search_value`], the widest reading: a leading `+`, leading
+/// zeros and a bare leading or trailing point (`.5`, `5.`) are tolerated. What
+/// it stops is what is not a number at all — `abc`, `1e` — and the words a
+/// float parser accepts for non-finite values (`inf`, `nan`), which as a
+/// comparison bound match every row. Mirrors the PostgreSQL builder's
+/// `parse_search_number`, which stays as defence in depth.
+fn is_number_search_value(value: &str) -> bool {
+    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    let unsigned = value.strip_prefix(['+', '-']).unwrap_or(value);
+    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, Some(exponent)),
+        None => (unsigned, None),
+    };
+    if let Some(exponent) = exponent {
+        let exponent = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+        if exponent.is_empty() || !digits(exponent) {
+            return false;
+        }
+    }
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if (whole.is_empty() && fraction.is_empty()) || !digits(whole) || !digits(fraction) {
+        return false;
+    }
+    // Rules out a literal that overflows to infinity (`1e999`).
+    value.parse::<f64>().is_ok_and(f64::is_finite)
 }
 
 /// Parses a parameter name into the base name and optional modifier.
@@ -919,6 +989,18 @@ mod tests {
                 SearchParamType::Date,
                 "Observation",
             ),
+            (
+                "Observation-value-quantity",
+                "value-quantity",
+                SearchParamType::Quantity,
+                "Observation",
+            ),
+            (
+                "RiskAssessment-probability",
+                "probability",
+                SearchParamType::Number,
+                "RiskAssessment",
+            ),
         ];
         for (id, code, ty, base) in entries {
             r.register(
@@ -1231,6 +1313,140 @@ mod tests {
         parse_search_parameter("Patient", "name", "2024-13-45", &registry).unwrap();
         // An empty value is left to the backend, as before.
         parse_search_parameter("Patient", "birthdate", "", &registry).unwrap();
+    }
+
+    #[test]
+    fn test_number_search_value_grammar() {
+        for value in [
+            "0", "5", "5.4", "-5.4", "100.00", "1e3", "1E3", "1e+3", "1.5E-2", "-1.5e-2",
+            // Tolerated beyond the FHIR decimal grammar.
+            "+5.4", "007", ".5", "5.", "-.5",
+        ] {
+            assert!(is_number_search_value(value), "should accept {value:?}");
+        }
+        for value in [
+            "abc",
+            "",
+            " ",
+            " 5",
+            "5 ",
+            "1e",
+            "1e+",
+            "e5",
+            ".",
+            "-",
+            "--5",
+            "0.2abc",
+            "1.2.3",
+            "1e5.5",
+            "1_000",
+            "0x10",
+            "inf",
+            "+inf",
+            "-Infinity",
+            "NaN",
+            "nan",
+            "1e999",
+        ] {
+            assert!(!is_number_search_value(value), "should reject {value:?}");
+        }
+    }
+
+    #[test]
+    fn test_invalid_number_value_is_rejected() {
+        // #1319: these reached the storage backend, where PostgreSQL and
+        // Elasticsearch dropped the constraint.
+        let registry = test_registry();
+
+        for value in [
+            "abc", "gtabc", "neabc", "1e", "ltinf", "nenan",
+            // One bad alternative spoils the OR-list.
+            "0.5,nope",
+        ] {
+            let error = parse_search_parameter("RiskAssessment", "probability", value, &registry)
+                .unwrap_err();
+            assert!(
+                matches!(&error, RestError::InvalidParameter { param, .. } if param == "probability"),
+                "unexpected error for {value:?}: {error:?}"
+            );
+        }
+
+        for value in [
+            "abc",
+            "abc|http://unitsofmeasure.org|mg",
+            "gt|http://unitsofmeasure.org|mg",
+            "|http://unitsofmeasure.org|mg",
+            "||mg",
+            "ltinf||mg",
+            "5.4||mg,abc||mg",
+        ] {
+            let error = parse_search_parameter("Observation", "value-quantity", value, &registry)
+                .unwrap_err();
+            assert!(
+                matches!(&error, RestError::InvalidParameter { param, .. } if param == "value-quantity"),
+                "unexpected error for {value:?}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_valid_number_and_quantity_values_still_parse() {
+        let registry = test_registry();
+
+        for (value, prefix, bare) in [
+            ("0.5", SearchPrefix::Eq, "0.5"),
+            ("ge0.5", SearchPrefix::Ge, "0.5"),
+            ("lt1e3", SearchPrefix::Lt, "1e3"),
+            ("ne-1.5E-2", SearchPrefix::Ne, "-1.5E-2"),
+        ] {
+            let param =
+                parse_search_parameter("RiskAssessment", "probability", value, &registry).unwrap();
+            assert_eq!(param.values[0].prefix, prefix);
+            assert_eq!(param.values[0].value, bare);
+        }
+
+        for (value, prefix, bare) in [
+            ("5.4", SearchPrefix::Eq, "5.4"),
+            ("5.4|mg", SearchPrefix::Eq, "5.4|mg"),
+            ("5.4||mg", SearchPrefix::Eq, "5.4||mg"),
+            (
+                "gt5.4|http://unitsofmeasure.org|mg",
+                SearchPrefix::Gt,
+                "5.4|http://unitsofmeasure.org|mg",
+            ),
+            // System and code are free text, escaped pipe included.
+            (
+                "le1e3|http://x|a\\|b",
+                SearchPrefix::Le,
+                "1e3|http://x|a\\|b",
+            ),
+            (
+                "ap-5.4||not a number",
+                SearchPrefix::Ap,
+                "-5.4||not a number",
+            ),
+        ] {
+            let param =
+                parse_search_parameter("Observation", "value-quantity", value, &registry).unwrap();
+            assert_eq!(param.values[0].prefix, prefix);
+            assert_eq!(param.values[0].value, bare);
+        }
+    }
+
+    #[test]
+    fn test_number_validation_leaves_other_parameters_alone() {
+        let registry = test_registry();
+
+        // `:missing` carries a boolean, not a number.
+        parse_search_parameter("RiskAssessment", "probability:missing", "true", &registry).unwrap();
+        parse_search_parameter("Observation", "value-quantity:missing", "false", &registry)
+            .unwrap();
+        // An unregistered parameter only has a guessed type.
+        parse_search_parameter("RiskAssessment", "custom-number", "gtabc", &registry).unwrap();
+        // Not a number parameter at all.
+        parse_search_parameter("Patient", "name", "abc", &registry).unwrap();
+        // An empty value is left to the backend, as for dates.
+        parse_search_parameter("RiskAssessment", "probability", "", &registry).unwrap();
     }
 
     #[test]

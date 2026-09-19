@@ -1293,6 +1293,78 @@ mod date_search {
             assert_eq!(body["issue"][0]["code"], "invalid", "query={query}");
         }
     }
+
+    /// #1319: a number or quantity value whose number part is not a number
+    /// never reaches a storage backend. PostgreSQL and Elasticsearch used to
+    /// skip it, turning `value-quantity=abc` into an unconstrained search.
+    #[tokio::test]
+    async fn test_invalid_number_or_quantity_value_is_a_400_not_a_search() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        // Positive control: the valid forms still search.
+        for query in [
+            "/Observation?value-quantity=gt70",
+            "/Observation?value-quantity=72%7C%7Cbpm",
+            "/Observation?value-quantity=le1e3",
+            "/RiskAssessment?probability=gt0.5",
+        ] {
+            let response = server
+                .get(query)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            response.assert_status_ok();
+        }
+        let response = server
+            .get("/Observation?value-quantity=gt70")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        let body: Value = response.json();
+        assert!(!get_bundle_entries(&body).is_empty());
+
+        let assert_invalid = |response: axum_test::TestResponse, context: String| {
+            response.assert_status(StatusCode::BAD_REQUEST);
+            let body: Value = response.json();
+            assert_eq!(body["resourceType"], "OperationOutcome", "{context}");
+            assert_eq!(body["issue"][0]["code"], "invalid", "{context}");
+        };
+
+        for query in [
+            "/RiskAssessment?probability=abc",
+            "/RiskAssessment?probability=gtabc",
+            "/RiskAssessment?probability=1e",
+            "/RiskAssessment?probability=ltinf",
+            "/Observation?value-quantity=abc",
+            "/Observation?value-quantity=neabc",
+            "/Observation?value-quantity=abc%7Chttp://unitsofmeasure.org%7Cmg",
+            "/Observation?value-quantity=gt%7Chttp://unitsofmeasure.org%7Cmg",
+            "/Observation?value-quantity=nenan%7C%7Cmg",
+        ] {
+            let response = server
+                .get(query)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            assert_invalid(response, format!("GET {query}"));
+        }
+
+        for (path, name, value) in [
+            ("/RiskAssessment/_search", "probability", "abc"),
+            ("/RiskAssessment/_search", "probability", "neabc"),
+            ("/Observation/_search", "value-quantity", "abc"),
+            (
+                "/Observation/_search",
+                "value-quantity",
+                "gt|http://unitsofmeasure.org|mg",
+            ),
+        ] {
+            let response = server
+                .post(path)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .form(&[(name, value)])
+                .await;
+            assert_invalid(response, format!("POST {path} {name}={value}"));
+        }
+    }
 }
 
 // =============================================================================
