@@ -1564,6 +1564,30 @@ fn migrate_v32_to_v33(conn: &Connection) -> StorageResult<()> {
         )
         .map_err(|e| migration_err(format!("v33 attempts column: {e}")))?;
     }
+
+    // `bulk_manifests.index_pending`: a manifest whose resources were ingested
+    // with indexing deferred owes a search-index rebuild (#1125).
+    let has_index_pending = conn
+        .prepare(
+            "SELECT 1 FROM pragma_table_info('bulk_manifests') WHERE name = 'index_pending'",
+        )
+        .and_then(|mut stmt| stmt.exists([]))
+        .unwrap_or(false);
+    if !has_index_pending {
+        conn.execute(
+            "ALTER TABLE bulk_manifests ADD COLUMN index_pending INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|e| migration_err(format!("v30 index_pending column: {e}")))?;
+    }
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_bulk_manifests_index_pending
+         ON bulk_manifests(tenant_id, submitter, submission_id, manifest_id)
+         WHERE index_pending = 1",
+        [],
+    )
+    .map_err(|e| migration_err(format!("v30 index_pending index: {e}")))?;
+
     Ok(())
 }
 
