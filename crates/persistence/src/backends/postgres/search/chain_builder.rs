@@ -18,7 +18,7 @@ use crate::error::{BackendError, StorageResult};
 use crate::search::SearchParameterRegistry;
 use crate::types::{ChainConfig, ReverseChainedParameter, SearchParamType, SearchValue};
 
-use super::query_builder::{SqlFragment, SqlParam};
+use super::query_builder::{SqlFragment, SqlParam, date_predicate};
 
 /// A single link in a forward chain.
 #[derive(Debug, Clone)]
@@ -375,10 +375,10 @@ impl ChainQueryBuilder {
     ) -> StorageResult<(String, Vec<SqlParam>)> {
         let alias = format!("si{}", chain.links.len());
 
-        if let Some((sql, bind)) =
+        if let Some(condition) =
             resources_backed_condition(&chain.terminal_param, &alias, value, param_num)
         {
-            return Ok((sql, vec![bind]));
+            return Ok(condition);
         }
 
         let (condition, params) = match chain.terminal_type {
@@ -433,8 +433,7 @@ impl ChainQueryBuilder {
             ),
             SearchParamType::Date => {
                 let date_col = format!("{}.value_date", alias);
-                let (sql, bind) = build_date_condition(&date_col, value, param_num);
-                (sql, vec![bind])
+                build_date_condition(&date_col, value, param_num)
             }
             SearchParamType::Number => {
                 let num_col = format!("{}.value_number", alias);
@@ -621,9 +620,8 @@ impl ChainQueryBuilder {
 
         let alias = format!("si{}", depth);
 
-        if let Some((sql, bind)) = resources_backed_condition(param_name, &alias, value, param_num)
-        {
-            return Ok((sql, vec![bind]));
+        if let Some(condition) = resources_backed_condition(param_name, &alias, value, param_num) {
+            return Ok(condition);
         }
 
         let (condition, params) = match param_type {
@@ -678,8 +676,7 @@ impl ChainQueryBuilder {
             ),
             SearchParamType::Date => {
                 let date_col = format!("{}.value_date", alias);
-                let (sql, bind) = build_date_condition(&date_col, value, param_num);
-                (sql, vec![bind])
+                build_date_condition(&date_col, value, param_num)
             }
             SearchParamType::Number => {
                 let num_col = format!("{}.value_number", alias);
@@ -743,11 +740,11 @@ fn resources_backed_condition(
     alias: &str,
     value: &SearchValue,
     param_num: usize,
-) -> Option<(String, SqlParam)> {
+) -> Option<(String, Vec<SqlParam>)> {
     match param_name {
         "_id" => Some((
             format!("{}.id = ${}", alias, param_num),
-            SqlParam::Text(value.value.clone()),
+            vec![SqlParam::Text(value.value.clone())],
         )),
         "_lastUpdated" => Some(build_date_condition(
             &format!("{}.last_updated", alias),
@@ -758,30 +755,34 @@ fn resources_backed_condition(
     }
 }
 
-fn build_date_condition(column: &str, value: &SearchValue, param_num: usize) -> (String, SqlParam) {
-    use crate::types::SearchPrefix;
-
-    let (op, val) = match value.prefix {
-        SearchPrefix::Eq => ("=", &value.value),
-        SearchPrefix::Ne => ("!=", &value.value),
-        SearchPrefix::Gt => (">", &value.value),
-        SearchPrefix::Lt => ("<", &value.value),
-        SearchPrefix::Ge => (">=", &value.value),
-        SearchPrefix::Le => ("<=", &value.value),
-        SearchPrefix::Sa => (">", &value.value),
-        SearchPrefix::Eb => ("<", &value.value),
-        SearchPrefix::Ap => {
-            return (
-                format!("DATE({}) = DATE(${})", column, param_num),
-                SqlParam::Text(value.value.clone()),
-            );
-        }
-    };
-
-    (
-        format!("{} {} ${}", column, op, param_num),
-        SqlParam::Text(val.clone()),
-    )
+/// The terminal date comparison, against `value_date` or `last_updated`.
+///
+/// Delegates to [`date_predicate`], the per-prefix table the unchained `date`
+/// and `_lastUpdated` searches use, so a chained date means what the unchained
+/// one does: `TIMESTAMPTZ` binds, precision ranges (`eq2020-01-01` is the whole
+/// day), zone offsets honored, and a non-date matching nothing.
+///
+/// This used to be its own operator table binding the raw search string as
+/// `SqlParam::Text`. Both columns are `TIMESTAMPTZ`, and tokio-postgres will
+/// not serialize a `String` into one, so every chained date search failed with
+/// `error serializing parameter` before reaching the server (#1290).
+///
+/// Binds zero (not a date), one, or two parameters, numbered from `param_num`
+/// with no gaps. The terminal condition is the only part of a chain that binds
+/// anything — every link above it uses `$1` and literals — so the caller needs
+/// no further accounting than returning these params in order.
+fn build_date_condition(
+    column: &str,
+    value: &SearchValue,
+    param_num: usize,
+) -> (String, Vec<SqlParam>) {
+    // `date_predicate` pre-increments: it numbers its first bind `next + 1`.
+    let mut next = param_num - 1;
+    let (sql, params) = date_predicate(column, value.prefix, &value.value, &mut next);
+    debug_assert_eq!(next, param_num - 1 + params.len());
+    // Parenthesized: the predicate may be `a AND b`, and it is spliced after
+    // an `AND` in the terminal subquery today but need not always be.
+    (format!("({sql})"), params)
 }
 
 fn build_number_condition(
@@ -968,10 +969,178 @@ mod tests {
             .unwrap();
 
         assert!(frag.sql.contains("FROM resources si1"), "{}", frag.sql);
+        // `gt` at day precision is "after the whole day": `>=` the day's end,
+        // bound as a timestamp (#1290), exactly as the unchained form does.
         assert!(
-            frag.sql.contains("si1.last_updated > $2"),
+            frag.sql.contains("(si1.last_updated >= $2)"),
             "the prefix must survive: {}",
             frag.sql
+        );
+        assert_eq!(frag.params.len(), 1);
+        assert!(matches!(
+            &frag.params[0],
+            SqlParam::Timestamp(ts) if ts.to_rfc3339() == "2024-01-02T00:00:00+00:00"
+        ));
+    }
+
+    fn obs_subject_patient_birthdate() -> Arc<RwLock<SearchParameterRegistry>> {
+        registry_with(vec![
+            SearchParameterDefinition::new(
+                "http://hl7.org/fhir/SearchParameter/Observation-subject",
+                "subject",
+                SearchParamType::Reference,
+                "Observation.subject",
+            )
+            .with_base(vec!["Observation"])
+            .with_targets(vec!["Patient"]),
+            SearchParameterDefinition::new(
+                "http://hl7.org/fhir/SearchParameter/individual-birthdate",
+                "birthdate",
+                SearchParamType::Date,
+                "Patient.birthDate",
+            )
+            .with_base(vec!["Patient"]),
+        ])
+    }
+
+    /// The `$N` placeholders a fragment uses, in order of first appearance.
+    fn placeholders(sql: &str) -> Vec<usize> {
+        let mut seen = Vec::new();
+        for (i, _) in sql.match_indices('$') {
+            let digits: String = sql[i + 1..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if let Ok(n) = digits.parse::<usize>() {
+                if !seen.contains(&n) {
+                    seen.push(n);
+                }
+            }
+        }
+        seen
+    }
+
+    /// A chained date terminal binds timestamps and carries precision-range
+    /// semantics; before #1290 it bound the raw string as text, which
+    /// tokio-postgres cannot serialize into `TIMESTAMPTZ`.
+    #[test]
+    fn a_chained_date_binds_timestamps_with_gap_free_placeholders() {
+        let builder = ChainQueryBuilder::new("t", "Observation", obs_subject_patient_birthdate())
+            .with_param_offset(1);
+        let parsed = builder.parse_chain("subject.birthdate").unwrap();
+        assert_eq!(parsed.terminal_type, SearchParamType::Date);
+
+        // (value, expected predicate, expected binds)
+        let cases: &[(&str, &str, &[&str])] = &[
+            (
+                "2020-01-01",
+                "(si1.value_date >= $2 AND si1.value_date < $3)",
+                &["2020-01-01T00:00:00+00:00", "2020-01-02T00:00:00+00:00"],
+            ),
+            (
+                "ne2020-01",
+                "((si1.value_date < $2 OR si1.value_date >= $3))",
+                &["2020-01-01T00:00:00+00:00", "2020-02-01T00:00:00+00:00"],
+            ),
+            (
+                "ge1980-01-01",
+                "(si1.value_date >= $2)",
+                &["1980-01-01T00:00:00+00:00"],
+            ),
+            (
+                "gt1980",
+                "(si1.value_date >= $2)",
+                &["1981-01-01T00:00:00+00:00"],
+            ),
+            (
+                "le1980-01-01",
+                "(si1.value_date < $2)",
+                &["1980-01-02T00:00:00+00:00"],
+            ),
+            (
+                "lt1980-01-01",
+                "(si1.value_date < $2)",
+                &["1980-01-01T00:00:00+00:00"],
+            ),
+            // A full instant is scalar, with the offset folded into the bind.
+            (
+                "gt2019-05-04T23:30:00-07:00",
+                "(si1.value_date > $2)",
+                &["2019-05-05T06:30:00+00:00"],
+            ),
+        ];
+        for (value, predicate, binds) in cases {
+            let frag = builder
+                .build_forward_chain_sql(&parsed, &SearchValue::parse(value))
+                .unwrap();
+            assert!(frag.sql.contains(predicate), "{value}: {}", frag.sql);
+            let got: Vec<String> = frag
+                .params
+                .iter()
+                .map(|p| match p {
+                    SqlParam::Timestamp(ts) => ts.to_rfc3339(),
+                    other => panic!("{value}: non-timestamp bind {other:?}"),
+                })
+                .collect();
+            assert_eq!(&got, binds, "{value}");
+            // `$1` is the tenant; the binds follow it with no gap.
+            let expected: Vec<usize> = (1..=1 + binds.len()).collect();
+            assert_eq!(placeholders(&frag.sql), expected, "{value}: {}", frag.sql);
+        }
+    }
+
+    /// A terminal value that is not a date matches nothing and binds nothing —
+    /// under `ne` too, which would otherwise widen the result (#1289).
+    #[test]
+    fn a_chained_non_date_matches_nothing_and_binds_nothing() {
+        let builder = ChainQueryBuilder::new("t", "Observation", obs_subject_patient_birthdate())
+            .with_param_offset(1);
+        let parsed = builder.parse_chain("subject.birthdate").unwrap();
+
+        for value in ["not-a-date", "nenot-a-date", "ge", ""] {
+            let frag = builder
+                .build_forward_chain_sql(&parsed, &SearchValue::parse(value))
+                .unwrap();
+            assert!(frag.sql.contains("AND (FALSE)"), "{value}: {}", frag.sql);
+            assert!(frag.params.is_empty(), "{value}: {:?}", frag.params);
+            assert_eq!(placeholders(&frag.sql), vec![1], "{value}: {}", frag.sql);
+        }
+    }
+
+    /// The reverse (`_has`) terminal takes the same path.
+    #[test]
+    fn a_reverse_chained_date_binds_timestamps() {
+        let registry = registry_with(vec![
+            SearchParameterDefinition::new(
+                "http://hl7.org/fhir/SearchParameter/clinical-date",
+                "date",
+                SearchParamType::Date,
+                "Observation.effective",
+            )
+            .with_base(vec!["Observation"]),
+        ]);
+        let builder = ChainQueryBuilder::new("t", "Patient", registry).with_param_offset(1);
+        let rc = ReverseChainedParameter::terminal(
+            "Observation",
+            "subject",
+            "date",
+            SearchValue::parse("2020-01-01"),
+        );
+        let frag = builder.build_reverse_chain_sql(&rc).unwrap();
+
+        assert!(
+            frag.sql
+                .contains("(si2.value_date >= $2 AND si2.value_date < $3)"),
+            "{}",
+            frag.sql
+        );
+        assert_eq!(placeholders(&frag.sql), vec![1, 2, 3], "{}", frag.sql);
+        assert!(
+            frag.params
+                .iter()
+                .all(|p| matches!(p, SqlParam::Timestamp(_))),
+            "{:?}",
+            frag.params
         );
     }
 
