@@ -11739,6 +11739,357 @@ mod postgres_integration {
         }
     }
 
+    /// Seeds the chained-numeric fixture (#1306) through the real write path.
+    ///
+    /// Number terminal, `MolecularSequence.referenceSeq.windowStart`, reached
+    /// by `Observation?has-member:MolecularSequence.window-start`:
+    /// `on-neg` → -100, `on-zero` → 0, `on-100` → 100, `on-105` → 105,
+    /// `on-200` → 200. The zero row is what an unparseable number used to
+    /// match, because it was read as `0`.
+    ///
+    /// Quantity terminal, `Observation.valueQuantity`, reached by
+    /// `DiagnosticReport?result:Observation.value-quantity` and by
+    /// `Patient?_has:Observation:subject:value-quantity`:
+    /// `dr-neg`/`pq-neg` → -5.4 mg, `dr-a`/`pq-a` → 5.4 mg,
+    /// `dr-b`/`pq-b` → 5.9 mg, `dr-c`/`pq-c` → 6.5 mg,
+    /// `dr-g`/`pq-g` → 0.0054 g (the same amount as 5.4 mg).
+    ///
+    /// Asserts that the *unchained* number and quantity searches find the
+    /// seeded rows, so a chained assertion can never pass vacuously against an
+    /// index that holds no numeric rows.
+    async fn seed_chain_numeric_fixture(backend: &PostgresBackend, tenant: &TenantContext) {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        for (suffix, window_start) in [
+            ("neg", -100),
+            ("zero", 0),
+            ("100", 100),
+            ("105", 105),
+            ("200", 200),
+        ] {
+            backend
+                .create(
+                    tenant,
+                    "MolecularSequence",
+                    json!({
+                        "resourceType": "MolecularSequence",
+                        "id": format!("ms-{suffix}"),
+                        "coordinateSystem": 0,
+                        "referenceSeq": {"windowStart": window_start, "windowEnd": 1000},
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            backend
+                .create(
+                    tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": format!("on-{suffix}"),
+                        "status": "final",
+                        "code": {"text": "x"},
+                        "hasMember": [{"reference": format!("MolecularSequence/ms-{suffix}")}],
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        for (suffix, amount, unit) in [
+            ("neg", -5.4, "mg"),
+            ("a", 5.4, "mg"),
+            ("b", 5.9, "mg"),
+            ("c", 6.5, "mg"),
+            ("g", 0.0054, "g"),
+        ] {
+            backend
+                .create(
+                    tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": format!("pq-{suffix}")}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            backend
+                .create(
+                    tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": format!("oq-{suffix}"),
+                        "status": "final",
+                        "code": {"text": "x"},
+                        "subject": {"reference": format!("Patient/pq-{suffix}")},
+                        "valueQuantity": {
+                            "value": amount,
+                            "unit": unit,
+                            "system": "http://unitsofmeasure.org",
+                            "code": unit,
+                        },
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            backend
+                .create(
+                    tenant,
+                    "DiagnosticReport",
+                    json!({
+                        "resourceType": "DiagnosticReport",
+                        "id": format!("dr-{suffix}"),
+                        "status": "final",
+                        "code": {"text": "x"},
+                        "result": [{"reference": format!("Observation/oq-{suffix}")}],
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let query = |rt: &str, name: &str, ty: SearchParamType, v: &str| {
+            SearchQuery::new(rt).with_parameter(SearchParameter {
+                name: name.to_string(),
+                param_type: ty,
+                modifier: None,
+                values: vec![SearchValue::parse(v)],
+                chain: vec![],
+                components: vec![],
+            })
+        };
+        let found = backend
+            .search(
+                tenant,
+                &query(
+                    "MolecularSequence",
+                    "window-start",
+                    SearchParamType::Number,
+                    "ap100",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            found.resources.items.len(),
+            2,
+            "fixture: window-start must be indexed or the chained tests are vacuous"
+        );
+        let found = backend
+            .search(
+                tenant,
+                &query(
+                    "Observation",
+                    "value-quantity",
+                    SearchParamType::Quantity,
+                    "ap5.4",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            found.resources.items.len(),
+            2,
+            "fixture: value-quantity must be indexed or the chained tests are vacuous"
+        );
+    }
+
+    /// Compares one chained-numeric case, recording rather than panicking so a
+    /// run reports every failing prefix at once.
+    fn check_chain_case(
+        failures: &mut Vec<String>,
+        label: &str,
+        value: &str,
+        result: Result<Vec<String>, impl std::fmt::Display>,
+        expected: &[&str],
+    ) {
+        match result {
+            Err(e) => failures.push(format!("{label}={value}: {e}")),
+            Ok(ids) => {
+                let ids = sorted_ids(ids);
+                if ids != expect_ids(expected) {
+                    failures.push(format!("{label}={value}: got {ids:?}, want {expected:?}"));
+                }
+            }
+        }
+    }
+
+    /// `Observation?has-member:MolecularSequence.window-start=<value>` through
+    /// the `ChainedSearchProvider` trait API (#1306). `ap` inlined its bounds
+    /// into the SQL text yet still returned a bind, so the statement was handed
+    /// one more parameter than it had placeholders.
+    #[tokio::test]
+    async fn postgres_integration_resolve_chain_number_terminal() {
+        use helios_persistence::core::ChainedSearchProvider;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("chain-number");
+        seed_chain_numeric_fixture(&backend, &tenant).await;
+
+        let cases: &[(&str, &[&str])] = &[
+            ("ap100", &["on-100", "on-105"]),
+            // A negative value: the window is [-110, -90], not [-90, -110].
+            ("ap-100", &["on-neg"]),
+            ("ap0", &["on-zero"]),
+            ("100", &["on-100"]),
+            ("100.0", &["on-100"]),
+            ("ne100", &["on-105", "on-200", "on-neg", "on-zero"]),
+            ("gt100", &["on-105", "on-200"]),
+            ("ge100", &["on-100", "on-105", "on-200"]),
+            ("lt100", &["on-neg", "on-zero"]),
+            ("le100", &["on-100", "on-neg", "on-zero"]),
+            ("lt0", &["on-neg"]),
+            // Not a number: must match nothing. It used to be read as 0.
+            ("abc", &[]),
+            ("apabc", &[]),
+            ("neabc", &[]),
+            ("gtabc", &[]),
+        ];
+        let mut failures = Vec::new();
+        for (value, expected) in cases {
+            let result = backend
+                .resolve_chain(
+                    &tenant,
+                    "Observation",
+                    "has-member:MolecularSequence.window-start",
+                    value,
+                )
+                .await;
+            check_chain_case(&mut failures, "window-start", value, result, expected);
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    /// `DiagnosticReport?result:Observation.value-quantity=<value>` through the
+    /// trait API (#1306), including the `number|system|code` forms.
+    #[tokio::test]
+    async fn postgres_integration_resolve_chain_quantity_terminal() {
+        use helios_persistence::core::ChainedSearchProvider;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("chain-quantity");
+        seed_chain_numeric_fixture(&backend, &tenant).await;
+
+        let cases: &[(&str, &[&str])] = &[
+            // No unit: the stored number alone is compared.
+            ("ap5.4", &["dr-a", "dr-b"]),
+            ("ap-5.4", &["dr-neg"]),
+            ("5.4", &["dr-a"]),
+            ("ne5.4", &["dr-b", "dr-c", "dr-g", "dr-neg"]),
+            ("gt5.4", &["dr-b", "dr-c"]),
+            ("ge5.4", &["dr-a", "dr-b", "dr-c"]),
+            ("lt0", &["dr-neg"]),
+            ("sa5.4", &["dr-b", "dr-c"]),
+            ("eb5.4", &["dr-g", "dr-neg"]),
+            ("le5.4", &["dr-a", "dr-g", "dr-neg"]),
+            // With a unit, as the unchained search reads it: the stored unit,
+            // or a UCUM equivalent (0.0054 g is 5.4 mg).
+            ("5.4|http://unitsofmeasure.org|mg", &["dr-a", "dr-g"]),
+            ("5.4||mg", &["dr-a", "dr-g"]),
+            (
+                "ap5.4|http://unitsofmeasure.org|mg",
+                &["dr-a", "dr-b", "dr-g"],
+            ),
+            ("ap-5.4||mg", &["dr-neg"]),
+            ("gt5.4||mg", &["dr-b", "dr-c"]),
+            ("5.4||kg", &[]),
+            // Not a number: must match nothing. It used to be read as 0.
+            ("abc", &[]),
+            ("apabc", &[]),
+            ("neabc", &[]),
+            ("abc||mg", &[]),
+        ];
+        let mut failures = Vec::new();
+        for (value, expected) in cases {
+            let result = backend
+                .resolve_chain(
+                    &tenant,
+                    "DiagnosticReport",
+                    "result:Observation.value-quantity",
+                    value,
+                )
+                .await;
+            check_chain_case(&mut failures, "value-quantity", value, result, expected);
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    /// Reverse chains onto numeric terminals (#1306):
+    /// `Patient?_has:Observation:subject:value-quantity=<value>` for quantity
+    /// and `Patient?_has:ChargeItem:subject:factor-override=<value>` for number.
+    #[tokio::test]
+    async fn postgres_integration_resolve_reverse_chain_numeric_terminal() {
+        use helios_persistence::core::ChainedSearchProvider;
+        use helios_persistence::types::{ReverseChainedParameter, SearchValue};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("reverse-chain-numeric");
+        seed_chain_numeric_fixture(&backend, &tenant).await;
+        for (patient, factor) in [("pq-a", 2.0), ("pq-neg", -2.0), ("pq-c", 0.0)] {
+            backend
+                .create(
+                    &tenant,
+                    "ChargeItem",
+                    json!({
+                        "resourceType": "ChargeItem",
+                        "id": format!("ci-{patient}"),
+                        "status": "billable",
+                        "code": {"text": "x"},
+                        "subject": {"reference": format!("Patient/{patient}")},
+                        "factorOverride": factor,
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let cases: &[(&str, &str, &str, &[&str])] = &[
+            ("Observation", "value-quantity", "ap5.4", &["pq-a", "pq-b"]),
+            ("Observation", "value-quantity", "ap-5.4", &["pq-neg"]),
+            (
+                "Observation",
+                "value-quantity",
+                "5.4||mg",
+                &["pq-a", "pq-g"],
+            ),
+            ("Observation", "value-quantity", "lt0", &["pq-neg"]),
+            ("Observation", "value-quantity", "apabc", &[]),
+            ("ChargeItem", "factor-override", "ap2", &["pq-a"]),
+            ("ChargeItem", "factor-override", "ap-2", &["pq-neg"]),
+            ("ChargeItem", "factor-override", "2", &["pq-a"]),
+            ("ChargeItem", "factor-override", "ne2", &["pq-c", "pq-neg"]),
+            ("ChargeItem", "factor-override", "lt0", &["pq-neg"]),
+            ("ChargeItem", "factor-override", "abc", &[]),
+            ("ChargeItem", "factor-override", "apabc", &[]),
+        ];
+        let mut failures = Vec::new();
+        for (source, param, value, expected) in cases {
+            let rc = ReverseChainedParameter::terminal(
+                *source,
+                "subject",
+                *param,
+                SearchValue::parse(value),
+            );
+            let result = backend.resolve_reverse_chain(&tenant, "Patient", &rc).await;
+            check_chain_case(
+                &mut failures,
+                &format!("_has {param}"),
+                value,
+                result,
+                expected,
+            );
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
     // ========================================================================
     // Bulk Export — Phase 2 multi-instance job state on Postgres.
     // ========================================================================

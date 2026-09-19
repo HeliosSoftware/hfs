@@ -172,6 +172,162 @@ fn numeric_predicate(
     }
 }
 
+/// Builds the comparison of one `number` search value (prefix already split
+/// off) against the numeric column `col`, advancing `next` by exactly the
+/// number of binds returned.
+///
+/// The unchained `number` builder and the chain builder's number terminal
+/// (`chain_builder.rs`, #1306) both call this, so they share
+/// [`numeric_predicate`]'s per-prefix table and its implicit-precision range.
+///
+/// Returns `None`, leaving `next` untouched, when `raw` is not a number. What
+/// that means is the caller's decision; the chain builder turns it into
+/// [`match_nothing`].
+pub(crate) fn number_predicate(
+    col: &str,
+    prefix: SearchPrefix,
+    raw: &str,
+    next: &mut usize,
+) -> Option<(String, Vec<SqlParam>)> {
+    let num: f64 = raw.parse().ok()?;
+    let (lo, hi) = crate::search::implicit_range(num, raw);
+    Some(numeric_predicate(col, prefix, num, lo, hi, next))
+}
+
+/// Builds the comparison of one `quantity` search value —
+/// `number`, `number|code` or `number|system|code`, prefix already split off —
+/// against the `value_quantity_*` columns, advancing `next` by exactly the
+/// number of binds returned.
+///
+/// `table` qualifies the columns: empty for the unchained builder, whose
+/// subquery has a single unaliased `search_index`, and `"si2."`-style for the
+/// chain builder's terminals (`chain_builder.rs`, #1306). Both call this, so a
+/// chained quantity means what the unchained one does, units included.
+///
+/// Returns `None`, leaving `next` untouched, when the number part does not
+/// parse. The returned predicate is parenthesized.
+pub(crate) fn quantity_predicate(
+    table: &str,
+    prefix: SearchPrefix,
+    raw_value: &str,
+    next: &mut usize,
+) -> Option<(String, Vec<SqlParam>)> {
+    /// Binds one float and returns its placeholder number.
+    fn bind(v: f64, params: &mut Vec<SqlParam>, next: &mut usize) -> usize {
+        *next += 1;
+        params.push(SqlParam::Float(v));
+        *next
+    }
+
+    // Parse quantity: number|system|code (or number|code, or number).
+    let parts: Vec<&str> = raw_value.splitn(3, '|').collect();
+    let num_str = *parts.first()?;
+    let num: f64 = num_str.parse().ok()?;
+    let (system, code) = match parts.len() {
+        3 => (
+            (!parts[1].is_empty()).then_some(parts[1]),
+            (!parts[2].is_empty()).then_some(parts[2]),
+        ),
+        2 => (None, (!parts[1].is_empty()).then_some(parts[1])),
+        _ => (None, None),
+    };
+
+    // Raw branch: value comparison (exact for comparators, implicit-precision
+    // range for eq/ne) + the stored unit/system.
+    let (lo, hi) = crate::search::implicit_range(num, num_str);
+    let (mut raw, mut params) = numeric_predicate(
+        &format!("{table}value_quantity_value"),
+        prefix,
+        num,
+        lo,
+        hi,
+        next,
+    );
+    if let Some(c) = code {
+        *next += 1;
+        params.push(SqlParam::text(c));
+        raw.push_str(&format!(" AND {table}value_quantity_unit = ${next}"));
+    }
+    if let Some(s) = system {
+        *next += 1;
+        params.push(SqlParam::text(s));
+        raw.push_str(&format!(" AND {table}value_quantity_system = ${next}"));
+    }
+
+    // Canonical branch on the canonical columns so unit equivalents
+    // match (g ⇄ mg). Bounds are canonicalized in the search unit before
+    // comparison. Skipped for non-convertible units; `ne` also uses this
+    // branch (negated range) so it matches the raw-OR-canonical `eq`
+    // semantics inverted, same as SQLite's `build_canonical_condition`.
+    let mut predicate = format!("({raw})");
+    if let Some(c) = code {
+        if let Some((_, cunit)) = helios_fhirpath::ucum::canonicalize_quantity(num, c) {
+            let canon = |x: f64| helios_fhirpath::ucum::canonicalize_quantity(x, c).map(|(v, _)| v);
+            // Both ends of a window, canonicalized and put in order (a
+            // conversion may be decreasing).
+            let canon_window = |a: f64, b: f64| match (canon(a), canon(b)) {
+                (Some(a), Some(b)) => Some(if a <= b { (a, b) } else { (b, a) }),
+                _ => None,
+            };
+            let col = format!("{table}value_quantity_canonical_value");
+            // Comparators match the exact canonicalized value:
+            // gt/sa → > canon(num), lt/eb → < canon(num),
+            // ge → ≥ canon(num), le → ≤ canon(num). Precision
+            // only bounds `eq`/`ne` (below).
+            let range: Option<String> = match prefix {
+                SearchPrefix::Gt | SearchPrefix::Sa => {
+                    canon(num).map(|b| format!("{col} > ${}", bind(b, &mut params, next)))
+                }
+                SearchPrefix::Lt | SearchPrefix::Eb => {
+                    canon(num).map(|b| format!("{col} < ${}", bind(b, &mut params, next)))
+                }
+                SearchPrefix::Ge => {
+                    canon(num).map(|b| format!("{col} >= ${}", bind(b, &mut params, next)))
+                }
+                SearchPrefix::Le => {
+                    canon(num).map(|b| format!("{col} <= ${}", bind(b, &mut params, next)))
+                }
+                SearchPrefix::Ap => {
+                    let margin = (num.abs() * 0.1).max(0.0001);
+                    canon_window(num - margin, num + margin).map(|(lo, hi)| {
+                        let lo_p = bind(lo, &mut params, next);
+                        let hi_p = bind(hi, &mut params, next);
+                        format!("{col} BETWEEN ${lo_p} AND ${hi_p}")
+                    })
+                }
+                // Ne: negated implicit-precision range, mirroring the raw
+                // branch's `numeric_predicate` shape for `Ne`.
+                SearchPrefix::Ne => {
+                    let half = quantity_implicit_precision(num_str) / 2.0;
+                    canon_window(num - half, num + half).map(|(lo, hi)| {
+                        let lo_p = bind(lo, &mut params, next);
+                        let hi_p = bind(hi, &mut params, next);
+                        format!("({col} < ${lo_p} OR {col} >= ${hi_p})")
+                    })
+                }
+                // Eq: implicit-precision range.
+                SearchPrefix::Eq => {
+                    let half = quantity_implicit_precision(num_str) / 2.0;
+                    canon_window(num - half, num + half).map(|(lo, hi)| {
+                        let lo_p = bind(lo, &mut params, next);
+                        let hi_p = bind(hi, &mut params, next);
+                        format!("{col} >= ${lo_p} AND {col} < ${hi_p}")
+                    })
+                }
+            };
+            if let Some(range) = range {
+                *next += 1;
+                params.push(SqlParam::text(&cunit));
+                predicate = format!(
+                    "(({raw}) OR ({range} AND {table}value_quantity_canonical_unit = ${next}))"
+                );
+            }
+        }
+    }
+
+    Some((predicate, params))
+}
+
 /// Returns the `[start, end)` timestamp range for a date search value at its
 /// inherent precision (year/month/day). Full-precision instants return a
 /// degenerate range (`start == end`).
@@ -1782,13 +1938,11 @@ impl PostgresQueryBuilder {
         let mut next = offset;
 
         for value in &param.values {
-            let num: f64 = match value.value.parse() {
-                Ok(n) => n,
-                Err(_) => continue,
+            let Some((sql, params)) =
+                number_predicate("value_number", value.prefix, &value.value, &mut next)
+            else {
+                continue;
             };
-            let (lo, hi) = crate::search::implicit_range(num, &value.value);
-            let (sql, params) =
-                numeric_predicate("value_number", value.prefix, num, lo, hi, &mut next);
             conditions.push(SqlFragment::with_params(
                 format!(
                     "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND {})",
@@ -1815,133 +1969,11 @@ impl PostgresQueryBuilder {
         let mut next = offset;
 
         for value in &param.values {
-            // Parse quantity: [prefix]number|system|code (or number|code, or number).
-            let parts: Vec<&str> = value.value.splitn(3, '|').collect();
-            let num: f64 = match parts.first().and_then(|s| s.parse::<f64>().ok()) {
-                Some(n) => n,
-                None => continue,
+            let Some((predicate, params)) =
+                quantity_predicate("", value.prefix, &value.value, &mut next)
+            else {
+                continue;
             };
-            let num_str = parts[0];
-            let (system, code) = match parts.len() {
-                3 => (
-                    (!parts[1].is_empty()).then_some(parts[1]),
-                    (!parts[2].is_empty()).then_some(parts[2]),
-                ),
-                2 => (None, (!parts[1].is_empty()).then_some(parts[1])),
-                _ => (None, None),
-            };
-
-            // Raw branch: value comparison (exact for comparators, implicit-precision
-            // range for eq/ne) + the stored unit/system.
-            let (lo, hi) = crate::search::implicit_range(num, num_str);
-            let (raw_num, mut params) =
-                numeric_predicate("value_quantity_value", value.prefix, num, lo, hi, &mut next);
-            let mut raw = raw_num;
-            if let Some(c) = code {
-                next += 1;
-                params.push(SqlParam::text(c));
-                raw.push_str(&format!(" AND value_quantity_unit = ${next}"));
-            }
-            if let Some(s) = system {
-                next += 1;
-                params.push(SqlParam::text(s));
-                raw.push_str(&format!(" AND value_quantity_system = ${next}"));
-            }
-
-            // Canonical branch on the canonical columns so unit equivalents
-            // match (g ⇄ mg). Bounds are canonicalized in the search unit before
-            // comparison. Skipped for non-convertible units; `ne` also uses this
-            // branch (negated range) so it matches the raw-OR-canonical `eq`
-            // semantics inverted, same as SQLite's `build_canonical_condition`.
-            let mut predicate = format!("({raw})");
-            if let Some(c) = code {
-                if let Some((_, cunit)) = helios_fhirpath::ucum::canonicalize_quantity(num, c) {
-                    let canon =
-                        |x: f64| helios_fhirpath::ucum::canonicalize_quantity(x, c).map(|(v, _)| v);
-                    let col = "value_quantity_canonical_value";
-                    // Comparators match the exact canonicalized value:
-                    // gt/sa → > canon(num), lt/eb → < canon(num),
-                    // ge → ≥ canon(num), le → ≤ canon(num). Precision
-                    // only bounds `eq`/`ne` (below).
-                    let range: Option<String> = match value.prefix {
-                        SearchPrefix::Gt | SearchPrefix::Sa => canon(num).map(|b| {
-                            next += 1;
-                            params.push(SqlParam::Float(b));
-                            format!("{col} > ${next}")
-                        }),
-                        SearchPrefix::Lt | SearchPrefix::Eb => canon(num).map(|b| {
-                            next += 1;
-                            params.push(SqlParam::Float(b));
-                            format!("{col} < ${next}")
-                        }),
-                        SearchPrefix::Ge => canon(num).map(|b| {
-                            next += 1;
-                            params.push(SqlParam::Float(b));
-                            format!("{col} >= ${next}")
-                        }),
-                        SearchPrefix::Le => canon(num).map(|b| {
-                            next += 1;
-                            params.push(SqlParam::Float(b));
-                            format!("{col} <= ${next}")
-                        }),
-                        SearchPrefix::Ap => {
-                            let margin = (num.abs() * 0.1).max(0.0001);
-                            match (canon(num - margin), canon(num + margin)) {
-                                (Some(a), Some(b)) => {
-                                    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-                                    next += 1;
-                                    params.push(SqlParam::Float(lo));
-                                    let lo_p = next;
-                                    next += 1;
-                                    params.push(SqlParam::Float(hi));
-                                    Some(format!("{col} BETWEEN ${lo_p} AND ${next}"))
-                                }
-                                _ => None,
-                            }
-                        }
-                        // Ne: negated implicit-precision range, mirroring the raw
-                        // branch's `numeric_predicate` shape for `Ne`.
-                        SearchPrefix::Ne => {
-                            let half = quantity_implicit_precision(num_str) / 2.0;
-                            match (canon(num - half), canon(num + half)) {
-                                (Some(a), Some(b)) => {
-                                    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-                                    next += 1;
-                                    params.push(SqlParam::Float(lo));
-                                    let lo_p = next;
-                                    next += 1;
-                                    params.push(SqlParam::Float(hi));
-                                    Some(format!("({col} < ${lo_p} OR {col} >= ${next})"))
-                                }
-                                _ => None,
-                            }
-                        }
-                        // Eq + default: implicit-precision range.
-                        _ => {
-                            let half = quantity_implicit_precision(num_str) / 2.0;
-                            match (canon(num - half), canon(num + half)) {
-                                (Some(a), Some(b)) => {
-                                    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-                                    next += 1;
-                                    params.push(SqlParam::Float(lo));
-                                    let lo_p = next;
-                                    next += 1;
-                                    params.push(SqlParam::Float(hi));
-                                    Some(format!("{col} >= ${lo_p} AND {col} < ${next}"))
-                                }
-                                _ => None,
-                            }
-                        }
-                    };
-                    if let Some(range) = range {
-                        next += 1;
-                        params.push(SqlParam::text(&cunit));
-                        predicate = format!(
-                            "(({raw}) OR ({range} AND value_quantity_canonical_unit = ${next}))"
-                        );
-                    }
-                }
-            }
 
             conditions.push(SqlFragment::with_params(
                 format!(
