@@ -924,6 +924,43 @@ mod tests {
         }
     }
 
+    /// #1316: the zone must not count towards the precision an indexed value
+    /// carries. A negative offset used to index as millisecond.
+    #[test]
+    fn test_convert_date_precision_ignores_zone() {
+        let precision_of = |value: Value| {
+            let results = ValueConverter::convert(&value, SearchParamType::Date, "date").unwrap();
+            results
+                .iter()
+                .map(|r| match r {
+                    IndexValue::Date { precision, .. } => *precision,
+                    other => panic!("expected a date, got {other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            precision_of(json!("2016-01-23T17:07:42-04:00")),
+            vec![DatePrecision::Second]
+        );
+        assert_eq!(
+            precision_of(json!("2016-01-23T17:07:42.123-04:00")),
+            vec![DatePrecision::Millisecond]
+        );
+        assert_eq!(
+            precision_of(json!({
+                "start": "2016-01-23T17:07:42-04:00",
+                "end": "2016-01-23T17:07:42+05:30"
+            })),
+            vec![DatePrecision::Second, DatePrecision::Second]
+        );
+        // Not a valid dateTime, but still indexed, at the precision it shows.
+        assert_eq!(
+            precision_of(json!("2016-01-23T17:07-04:00")),
+            vec![DatePrecision::Minute]
+        );
+    }
+
     #[test]
     fn test_convert_period() {
         let value = json!({
