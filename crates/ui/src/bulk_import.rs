@@ -887,7 +887,9 @@ async fn backend_services_token(client_id: &str, token_url: &str) -> Result<Stri
         .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            upstream_failure_detail(&e, 10, "the token endpoint did not answer in time")
+        })?;
     let status = response.status();
     let body: Value = response.json().await.map_err(|e| e.to_string())?;
     if !status.is_success() {
@@ -929,7 +931,7 @@ async fn post_kickoff(
     let response = request
         .send()
         .await
-        .map_err(|e| format!("POST {target} failed: {e}"))?;
+        .map_err(|e| format!("POST {target} failed: {}", kickoff_failure_detail(&e)))?;
     let status = response.status().as_u16();
     let content_type = response
         .headers()
@@ -1007,7 +1009,10 @@ async fn status_kickoff(submission: &Submission, id: &str, tenant: &str) -> Resu
         let token = backend_services_token(&submission.client_id, &submission.token_url).await?;
         request = request.bearer_auth(token);
     }
-    let response = request.send().await.map_err(|e| e.to_string())?;
+    let response = request
+        .send()
+        .await
+        .map_err(|e| kickoff_failure_detail(&e))?;
     let status = response.status().as_u16();
     response
         .headers()
@@ -1058,6 +1063,13 @@ fn poll_failure_detail(e: &reqwest::Error) -> String {
         STATUS_POLL_TIMEOUT_SECS,
         "the recipient's status endpoint can be slow while it is ingesting",
     )
+}
+
+/// Renders a kick-off transport failure with its cause: without the
+/// `source()` chain a DNS failure, a refused connection, and a TLS error all
+/// read as `error sending request for url (...)`.
+fn kickoff_failure_detail(e: &reqwest::Error) -> String {
+    upstream_failure_detail(e, 15, "the recipient did not answer the kick-off in time")
 }
 
 /// Whether the recipient asked us to hold off: a stored `next_poll_at` still
