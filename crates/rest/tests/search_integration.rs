@@ -1373,6 +1373,119 @@ mod date_search {
         assert_invalid_date_outcome(&response, query);
     }
 
+    /// Seeds one Procedure performed at `2013-04-05T13:20:00Z`, written with a
+    /// positive offset.
+    async fn seed_procedure_with_positive_offset(backend: &SqliteBackend) {
+        backend
+            .create(
+                &test_tenant(),
+                "Procedure",
+                json!({
+                    "resourceType": "Procedure",
+                    "id": "proc-plus",
+                    "status": "completed",
+                    "subject": {"reference": "Patient/patient-1"},
+                    "performedDateTime": "2013-04-05T18:50:00+05:30"
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed procedure");
+    }
+
+    fn assert_finds_the_procedure(response: &axum_test::TestResponse, context: &str) {
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+        assert_eq!(entries.len(), 1, "{context}: {body}");
+        assert_eq!(entries[0]["resource"]["id"], "proc-plus", "{context}");
+    }
+
+    /// #1296: a `+` offset sent without percent-encoding is form-decoded into
+    /// a space. It used to be an empty 200 on SQLite and PostgreSQL, a 400 on
+    /// MongoDB and a 500 on Elasticsearch; it is now read as the `+` it was.
+    #[tokio::test]
+    async fn test_literal_plus_offset_finds_the_resource() {
+        let (server, backend) = create_test_server().await;
+        seed_procedure_with_positive_offset(&backend).await;
+
+        for query in [
+            // Positive control: properly encoded.
+            "/Procedure?date=2013-04-05T18:50:00%2B05:30",
+            // The literal `+`, under no prefix and under one.
+            "/Procedure?date=2013-04-05T18:50:00+05:30",
+            "/Procedure?date=ge2013-04-05T18:50:00+05:30",
+            "/Procedure?date=eq2013-04-05T18:50+05:30",
+            // The same instant in another zone.
+            "/Procedure?date=2013-04-05T09:20:00-04:00",
+        ] {
+            let response = server
+                .get(query)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            assert_finds_the_procedure(&response, query);
+        }
+
+        // The repair restores an offset; it does not make a wrong one match.
+        let response = server
+            .get("/Procedure?date=2013-04-05T18:50:00+05:00")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        assert_eq!(get_bundle_entries(&response.json::<Value>()).len(), 0);
+    }
+
+    /// The same through a POST `_search` body, which is form-decoded too.
+    #[tokio::test]
+    async fn test_literal_plus_offset_finds_the_resource_on_post_search() {
+        let (server, backend) = create_test_server().await;
+        seed_procedure_with_positive_offset(&backend).await;
+
+        for body in [
+            "date=2013-04-05T18:50:00%2B05:30",
+            "date=2013-04-05T18:50:00+05:30",
+        ] {
+            let response = server
+                .post("/Procedure/_search")
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                // `text` sets `text/plain`; the form content type goes after.
+                .text(body)
+                .content_type("application/x-www-form-urlencoded")
+                .await;
+            assert_finds_the_procedure(&response, body);
+        }
+    }
+
+    /// The self link must describe the search that ran, and must round-trip:
+    /// the repaired value is re-encoded, not echoed with a bare space or `+`.
+    #[tokio::test]
+    async fn test_literal_plus_offset_self_link_round_trips() {
+        let (server, backend) = create_test_server().await;
+        seed_procedure_with_positive_offset(&backend).await;
+
+        let response = server
+            .get("/Procedure?date=2013-04-05T18:50:00+05:30")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let self_link = body["link"]
+            .as_array()
+            .and_then(|links| links.iter().find(|l| l["relation"] == "self"))
+            .and_then(|l| l["url"].as_str())
+            .expect("self link")
+            .to_string();
+
+        let path = self_link
+            .strip_prefix("http://localhost:8080")
+            .unwrap_or(&self_link);
+        let again = server
+            .get(path)
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        assert_finds_the_procedure(&again, &self_link);
+    }
+
     /// Minute precision is valid in FHIR search, unlike the dateTime datatype.
     #[tokio::test]
     async fn test_minute_precision_date_value_is_accepted() {
