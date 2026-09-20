@@ -71,6 +71,7 @@ pub mod extractor;
 pub mod list_resolver;
 pub mod loader;
 pub mod metadata_modifier;
+pub mod numeric_value;
 pub mod range;
 pub mod registry;
 pub mod reindex;
@@ -98,6 +99,10 @@ pub use extractor::{ContainedExtraction, ExtractedValue, SearchParameterExtracto
 pub use list_resolver::{query_has_list, resolve_list};
 pub use loader::SearchParameterLoader;
 pub use metadata_modifier::reject_unsupported_metadata_modifier;
+pub use numeric_value::{
+    FhirNumberValue, FhirQuantityValue, NumberValueError, NumberValueErrorReason,
+    validate_numeric_parameter, validate_numeric_values,
+};
 pub use range::{implicit_precision, implicit_range};
 pub use registry::{
     RegistryUpdate, SearchParameterDefinition, SearchParameterRegistry, SearchParameterSource,

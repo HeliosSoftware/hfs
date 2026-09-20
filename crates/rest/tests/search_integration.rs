@@ -1682,6 +1682,145 @@ mod date_search {
             assert_invalid(response, format!("POST {path} {name}={value}"));
         }
     }
+
+    fn assert_invalid_number_outcome(response: &axum_test::TestResponse, context: &str) {
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let body: Value = response.json();
+        assert_eq!(body["resourceType"], "OperationOutcome", "{context}");
+        assert_eq!(body["issue"][0]["code"], "invalid", "{context}");
+        let text = body["issue"][0]["diagnostics"]
+            .as_str()
+            .or_else(|| body["issue"][0]["details"]["text"].as_str())
+            .unwrap_or_default();
+        assert!(
+            text.contains("not a valid number"),
+            "{context}: the outcome should say what is wrong, got {body}"
+        );
+    }
+
+    /// #1340: the values `f64::from_str` takes for numbers — as a bound they
+    /// match every row — an empty value, and a composite's numeric component,
+    /// over GET and POST `_search`, whatever the client's `Prefer: handling`:
+    /// lenient handling is for parameters the server does not know, not for
+    /// values it cannot read.
+    #[tokio::test]
+    async fn test_invalid_number_is_a_400_from_the_shared_gate() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        for (path, name, value) in [
+            ("/RiskAssessment", "probability", "inf"),
+            ("/RiskAssessment", "probability", "lt-inf"),
+            ("/RiskAssessment", "probability", "neNaN"),
+            ("/RiskAssessment", "probability", "lt1e999"),
+            ("/RiskAssessment", "probability", "0x10"),
+            ("/RiskAssessment", "probability", ""),
+            ("/Observation", "value-quantity", "ltinf||mg"),
+            ("/Observation", "value-quantity", "||mg"),
+            ("/Observation", "value-quantity", "5.4\\|mg"),
+            ("/Observation", "code-value-quantity", "8480-6$abc"),
+            ("/Observation", "code-value-quantity", "8480-6$ltinf||mg"),
+        ] {
+            for handling in ["handling=lenient", "handling=strict"] {
+                let response = server
+                    .get(path)
+                    .add_query_param(name, value)
+                    .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                    .add_header(
+                        axum::http::header::HeaderName::from_static("prefer"),
+                        HeaderValue::from_static(handling),
+                    )
+                    .await;
+                assert_invalid_number_outcome(&response, &format!("GET {name}={value} {handling}"));
+
+                let response = server
+                    .post(&format!("{path}/_search"))
+                    .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                    .add_header(
+                        axum::http::header::HeaderName::from_static("prefer"),
+                        HeaderValue::from_static(handling),
+                    )
+                    .form(&[(name, value)])
+                    .await;
+                assert_invalid_number_outcome(
+                    &response,
+                    &format!("POST {name}={value} {handling}"),
+                );
+            }
+        }
+    }
+
+    /// A chained or `_has` terminal is typed only when the chain is resolved,
+    /// so it is the storage gate that rejects it.
+    #[tokio::test]
+    async fn test_invalid_chained_number_value_is_a_400() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        for (path, name, value) in [
+            ("/DiagnosticReport", "result.value-quantity", "abc"),
+            (
+                "/DiagnosticReport",
+                "result:Observation.value-quantity",
+                "ltinf",
+            ),
+            ("/Patient", "_has:Observation:subject:value-quantity", "abc"),
+            (
+                "/Patient",
+                "_has:Observation:subject:value-quantity",
+                "ltinf||mg",
+            ),
+            (
+                "/Patient",
+                "_has:RiskAssessment:subject:probability",
+                "nenan",
+            ),
+        ] {
+            let response = server
+                .get(path)
+                .add_query_param(name, value)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            assert_invalid_number_outcome(&response, &format!("GET {path}?{name}={value}"));
+        }
+
+        // Positive control: the valid forms of the same searches run.
+        for (path, name, value) in [
+            ("/DiagnosticReport", "result.value-quantity", "gt1"),
+            ("/Patient", "_has:Observation:subject:value-quantity", "gt1"),
+        ] {
+            let response = server
+                .get(path)
+                .add_query_param(name, value)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            response.assert_status_ok();
+        }
+    }
+
+    /// A `+` that form-decoding turned into a space is still the number the
+    /// client wrote.
+    #[tokio::test]
+    async fn test_literal_plus_in_a_number_is_accepted() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        for query in [
+            "/Observation?value-quantity=lt1e+3",
+            "/Observation?value-quantity=gt+70",
+            "/Observation?value-quantity=+72",
+        ] {
+            let response = server
+                .get(query)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            response.assert_status_ok();
+            assert!(
+                !get_bundle_entries(&response.json::<Value>()).is_empty(),
+                "{query} should find the seeded heart rate"
+            );
+        }
+    }
 }
 
 // =============================================================================

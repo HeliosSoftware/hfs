@@ -362,6 +362,20 @@ pub enum SearchError {
         reason: String,
     },
 
+    /// A number or quantity search value whose number is not a finite decimal.
+    ///
+    /// Raised by [`crate::search::validate_numeric_values`] before any backend
+    /// builds a query, so every backend answers an invalid number the same way.
+    #[error("invalid value for number or quantity parameter '{param}': {reason}")]
+    InvalidNumberValue {
+        /// Name of the search parameter carrying the value.
+        param: String,
+        /// The rejected value, as received.
+        value: String,
+        /// What is wrong with it, and the forms that are accepted.
+        reason: String,
+    },
+
     /// Composite search parameter error.
     #[error("invalid composite search parameter: {message}")]
     InvalidComposite {

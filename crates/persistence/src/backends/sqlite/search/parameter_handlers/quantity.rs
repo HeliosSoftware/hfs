@@ -1,5 +1,6 @@
 //! Quantity parameter SQL handler.
 
+use crate::search::FhirQuantityValue;
 use crate::types::{SearchPrefix, SearchValue};
 
 use super::super::query_builder::{SqlFragment, SqlParam};
@@ -28,47 +29,24 @@ impl QuantityHandler {
     ) -> SqlFragment {
         let param_num = param_offset + 1;
 
-        // Parse the quantity value: [prefix]number|system|code or [prefix]number|code or [prefix]number
-        let quantity_str = &value.value;
-        let parts: Vec<&str> = quantity_str.split('|').collect();
-
-        let (num_str, num_value, system, code) = match parts.len() {
-            1 => {
-                // Just a number
-                let num: f64 = match parts[0].parse() {
-                    Ok(v) => v,
-                    Err(_) => return SqlFragment::new("1 = 0"),
-                };
-                (parts[0], num, None, None)
+        // Parse the quantity value — [prefix]number|system|code, number|code or
+        // number — by the grammar every backend shares: only an unescaped `|`
+        // separates, and the number must be a finite decimal. The search gate
+        // (`validate_numeric_values`) rejects anything else before any SQL is
+        // built, so this is defence in depth: an impossible condition under
+        // every prefix, never a dropped or widened one. `f64::from_str` used
+        // to stand here, and took `inf` and `nan` (#1340).
+        let quantity = match FhirQuantityValue::parse(&value.value) {
+            Ok(quantity) => quantity,
+            Err(error) => {
+                tracing::warn!(
+                    "unvalidated quantity search value reached the SQLite handler: {error}"
+                );
+                return SqlFragment::new("1 = 0");
             }
-            2 => {
-                // number|code
-                let num: f64 = match parts[0].parse() {
-                    Ok(v) => v,
-                    Err(_) => return SqlFragment::new("1 = 0"),
-                };
-                (parts[0], num, None, Some(parts[1]))
-            }
-            3 => {
-                // number|system|code
-                let num: f64 = match parts[0].parse() {
-                    Ok(v) => v,
-                    Err(_) => return SqlFragment::new("1 = 0"),
-                };
-                let system = if parts[1].is_empty() {
-                    None
-                } else {
-                    Some(parts[1])
-                };
-                let code = if parts[2].is_empty() {
-                    None
-                } else {
-                    Some(parts[2])
-                };
-                (parts[0], num, system, code)
-            }
-            _ => return SqlFragment::new("1 = 0"),
         };
+        let (num_str, num_value) = (quantity.number.text(), quantity.number.value);
+        let (system, code) = (quantity.system.as_deref(), quantity.code.as_deref());
 
         // Raw match: numeric comparison plus the stored unit/system verbatim.
         let raw = {
@@ -366,5 +344,49 @@ mod tests {
         let frag = QuantityHandler::build_sql(&value, 0);
 
         assert!(frag.sql.contains("BETWEEN"));
+    }
+
+    /// Defence in depth behind `validate_numeric_values` (#1340): a number
+    /// part that is missing, malformed or not finite is an impossible
+    /// condition under every prefix, never a widened one.
+    #[test]
+    fn invalid_number_part_matches_nothing() {
+        for prefix in [SearchPrefix::Eq, SearchPrefix::Ne, SearchPrefix::Lt] {
+            for raw in [
+                "abc",
+                "",
+                "||mg",
+                "|http://unitsofmeasure.org|mg",
+                "abc|http://unitsofmeasure.org|mg",
+                "inf||mg",
+                "nan",
+                "1e999|mg",
+                "5.4\\|mg",
+            ] {
+                let frag = QuantityHandler::build_sql(&SearchValue::new(prefix, raw), 0);
+                assert_eq!(frag.sql, "1 = 0", "{prefix:?} {raw:?}");
+                assert!(frag.params.is_empty(), "{prefix:?} {raw:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_escaped_pipe_is_part_of_the_code() {
+        let value = SearchValue::new(SearchPrefix::Eq, "5.4|http://example.org|a\\|b");
+        let frag = QuantityHandler::build_sql(&value, 0);
+        assert!(
+            frag.params
+                .iter()
+                .any(|p| matches!(p, SqlParam::String(s) if s == "a|b")),
+            "{:?}",
+            frag.params
+        );
+        assert!(
+            frag.params
+                .iter()
+                .any(|p| matches!(p, SqlParam::String(s) if s == "http://example.org")),
+            "{:?}",
+            frag.params
+        );
     }
 }
