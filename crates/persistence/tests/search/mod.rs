@@ -72,6 +72,9 @@ pub mod modifier_tests;
 /// Elasticsearch test binaries via `#[path]` (#1337).
 pub mod number_exponent_suite;
 pub mod number_tests;
+/// Backend-agnostic scenarios, shared with the PostgreSQL, MongoDB and
+/// Elasticsearch test binaries via `#[path]` (#1340).
+pub mod numeric_validation_suite;
 pub mod pagination_tests;
 pub mod quantity_tests;
 pub mod reference_tests;

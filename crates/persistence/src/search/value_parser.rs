@@ -61,6 +61,8 @@ pub fn split_unescaped_commas(value: &str) -> Vec<String> {
 /// for any registered parameter (everything in the FHIR spec); the value-shape
 /// heuristic inside [`resolve_param_type`] is reached only for unregistered
 /// custom params, and sees the values with any prefix already stripped.
+///
+/// The prefix rule itself is [`SearchValue::parse_for_type`]'s.
 pub fn parse_typed_values(
     registry: &SearchParameterRegistry,
     resource_type: &str,
@@ -72,17 +74,10 @@ pub fn parse_typed_values(
 
     let param_type = resolve_param_type(registry, resource_type, name, &tentative_values);
 
-    let values = if matches!(
-        param_type,
-        SearchParamType::Date | SearchParamType::Number | SearchParamType::Quantity
-    ) {
-        tentative_values
-    } else {
-        raw_values
-            .iter()
-            .map(|v| SearchValue::eq(v.clone()))
-            .collect()
-    };
+    let values = raw_values
+        .iter()
+        .map(|v| SearchValue::parse_for_type(v, param_type))
+        .collect();
 
     (param_type, values)
 }

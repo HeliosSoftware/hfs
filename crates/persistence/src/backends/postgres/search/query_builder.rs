@@ -176,70 +176,31 @@ fn numeric_predicate(
 /// Parses the number part of a `number` or `quantity` search value (prefix
 /// already split off), or returns `None` when it is not a finite decimal.
 ///
-/// Accepted: an optional sign, then digits with an optional fraction, then an
-/// optional exponent — `5`, `-5.4`, `+5.4`, `007`, `1e3`, `1.5E-2`. That is
-/// the FHIR `decimal` grammar
-/// (`-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?`) read as widely as is
-/// still unambiguous: a leading `+`, leading zeros and a bare leading or
-/// trailing point (`.5`, `5.`) are tolerated, because a false rejection turns a
-/// working search into an empty one.
-///
-/// Rejected: everything else `f64::from_str` would take — `inf`, `infinity`,
-/// `nan` in any case — plus a literal that overflows to infinity (`1e999`),
-/// surrounding whitespace and the empty string. The non-finite values are not
-/// just invalid, they widen: `value_number < 'Infinity'` is true of every row,
-/// and Postgres orders `NaN` above every number, so `lt`/`le`/`ne` with `nan`
-/// would match everything.
+/// The grammar is the one every backend shares,
+/// [`FhirNumberValue`](crate::search::FhirNumberValue): an optional sign,
+/// digits with an optional fraction, an optional exponent, finite once parsed.
+/// It began here (#1319) and moved there (#1340); see that module for the
+/// leniencies and for why `inf`, `nan` and `1e999` are rejected — as a bound
+/// they are not just invalid, they widen: `value_number < 'Infinity'` is true
+/// of every row, and Postgres orders `NaN` above every number, so
+/// `lt`/`le`/`ne` with `nan` would match everything.
 pub(crate) fn parse_search_number(raw: &str) -> Option<f64> {
-    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
-    let unsigned = raw.strip_prefix(['+', '-']).unwrap_or(raw);
-    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
-        Some((mantissa, exponent)) => (mantissa, Some(exponent)),
-        None => (unsigned, None),
-    };
-    if let Some(exponent) = exponent {
-        let exponent = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
-        if exponent.is_empty() || !digits(exponent) {
-            return None;
-        }
-    }
-    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-    if (whole.is_empty() && fraction.is_empty()) || !digits(whole) || !digits(fraction) {
-        return None;
-    }
-    raw.parse::<f64>().ok().filter(|n| n.is_finite())
+    crate::search::FhirNumberValue::parse(raw)
+        .ok()
+        .map(|number| number.value)
 }
 
-/// Splits a `quantity` search value — `number`, `number|code` or
-/// `number|system|code`, prefix already split off — into its number part,
-/// system and code. An empty system or code is `None`.
-///
-/// Only an *unescaped* `|` separates; `\|` is a literal pipe inside a part and
-/// is unescaped here (the REST layer leaves `\|` intact for this purpose — see
-/// `split_unescaped_commas`). Anything after the second separator belongs to
-/// the code.
-fn split_quantity_value(raw: &str) -> (String, Option<String>, Option<String>) {
-    let mut parts: Vec<String> = vec![String::new()];
-    let mut chars = raw.chars().peekable();
-    while let Some(c) = chars.next() {
-        let last = parts.len() - 1;
-        match c {
-            '\\' if chars.peek() == Some(&'|') => {
-                chars.next();
-                parts[last].push('|');
-            }
-            '|' if parts.len() < 3 => parts.push(String::new()),
-            _ => parts[last].push(c),
-        }
-    }
-    let mut parts = parts.into_iter();
-    let number = parts.next().unwrap_or_default();
-    let non_empty = |s: String| (!s.is_empty()).then_some(s);
-    match (parts.next(), parts.next()) {
-        (Some(system), Some(code)) => (number, non_empty(system), non_empty(code)),
-        (Some(code), None) => (number, None, non_empty(code)),
-        _ => (number, None, None),
-    }
+/// `None` for a number or quantity value the shared grammar refused. The search
+/// gate (`validate_numeric_values`) rejects such a value before a query is
+/// built, so reaching this is worth a warning.
+fn unvalidated<T>(parsed: Result<T, crate::search::NumberValueError>) -> Option<T> {
+    parsed
+        .inspect_err(|error| {
+            tracing::warn!(
+                "unvalidated number search value reached the PostgreSQL builder: {error}"
+            )
+        })
+        .ok()
 }
 
 /// Builds the comparison of one `number` search value (prefix already split
@@ -260,9 +221,9 @@ pub(crate) fn number_predicate(
     raw: &str,
     next: &mut usize,
 ) -> Option<(String, Vec<SqlParam>)> {
-    let num = parse_search_number(raw)?;
-    let (lo, hi) = crate::search::implicit_range(num, raw);
-    Some(numeric_predicate(col, prefix, num, lo, hi, next))
+    let number = unvalidated(crate::search::FhirNumberValue::parse(raw))?;
+    let (lo, hi) = number.implicit_range();
+    Some(numeric_predicate(col, prefix, number.value, lo, hi, next))
 }
 
 /// Builds the comparison of one `quantity` search value —
@@ -292,14 +253,15 @@ pub(crate) fn quantity_predicate(
         *next
     }
 
-    // Parse quantity: number|system|code (or number|code, or number).
-    let (num_str, system, code) = split_quantity_value(raw_value);
-    let (num_str, system, code) = (num_str.as_str(), system.as_deref(), code.as_deref());
-    let num = parse_search_number(num_str)?;
+    // Parse quantity: number|system|code (or number|code, or number), by the
+    // grammar every backend shares — only an unescaped `|` separates.
+    let quantity = unvalidated(crate::search::FhirQuantityValue::parse(raw_value))?;
+    let (num_str, num) = (quantity.number.text(), quantity.number.value);
+    let (system, code) = (quantity.system.as_deref(), quantity.code.as_deref());
 
     // Raw branch: value comparison (exact for comparators, implicit-precision
     // range for eq/ne) + the stored unit/system.
-    let (lo, hi) = crate::search::implicit_range(num, num_str);
+    let (lo, hi) = quantity.number.implicit_range();
     let (mut raw, mut params) = numeric_predicate(
         &format!("{table}value_quantity_value"),
         prefix,
@@ -1993,13 +1955,17 @@ impl PostgresQueryBuilder {
                 ))
             }
             SearchParamType::Quantity => {
-                let parts: Vec<&str> = value.value.splitn(3, '|').collect();
-                // As for Number: `FALSE`, never `None` (#1319).
-                let Some(num) = parts.first().and_then(|s| parse_search_number(s)) else {
+                // As for Number: `FALSE`, never `None` (#1319). Split by the
+                // shared grammar, so an escaped `|` stays in the code and the
+                // `number|code` shorthand names a code here too.
+                let Some(quantity) =
+                    unvalidated(crate::search::FhirQuantityValue::parse(&value.value))
+                else {
                     return Some((match_nothing().sql, Vec::new()));
                 };
+                let num = quantity.number.value;
                 let op = Self::prefix_to_operator(&value.prefix);
-                if parts.len() >= 3 {
+                if let Some(code) = quantity.code.as_deref() {
                     Some((
                         format!(
                             "value_quantity_value {} ${} AND value_quantity_unit = ${}",
@@ -2007,7 +1973,7 @@ impl PostgresQueryBuilder {
                             offset + 1,
                             offset + 2
                         ),
-                        vec![SqlParam::Float(num), SqlParam::text(parts[2])],
+                        vec![SqlParam::Float(num), SqlParam::text(code)],
                     ))
                 } else {
                     Some((
@@ -3902,41 +3868,17 @@ mod tests {
         for input in NOT_NUMBERS {
             assert_eq!(parse_search_number(input), None, "input {input:?}");
         }
-        // Parses as a float but overflows to infinity; whitespace; doubled
-        // signs; a second point; digit separators.
+        // Surrounding whitespace is trimmed by the shared grammar: `gt+5`
+        // arrives form-decoded as `gt 5`.
+        assert_eq!(parse_search_number(" 5 "), Some(5.0));
+        // Parses as a float but overflows to infinity; inner whitespace;
+        // doubled signs; a second point; digit separators.
         for input in [
-            "1e999", "-1e999", " 5", "5 ", "--5", "+-5", "1.2.3", "1e5.5", "1_000", "infinity",
+            "1e999", "-1e999", "5 4", "- 5", "--5", "+-5", "1.2.3", "1e5.5", "1_000", "infinity",
             "nan", "+inf",
         ] {
             assert_eq!(parse_search_number(input), None, "input {input:?}");
         }
-    }
-
-    #[test]
-    fn split_quantity_value_honors_escaped_pipes() {
-        let split = |raw: &str| {
-            let (n, s, c) = split_quantity_value(raw);
-            (n, s.unwrap_or_default(), c.unwrap_or_default())
-        };
-        let own = |n: &str, s: &str, c: &str| (n.to_string(), s.to_string(), c.to_string());
-
-        assert_eq!(split("5.4"), own("5.4", "", ""));
-        assert_eq!(split("5.4|mg"), own("5.4", "", "mg"));
-        assert_eq!(split("5.4||mg"), own("5.4", "", "mg"));
-        assert_eq!(
-            split("5.4|http://unitsofmeasure.org|mg"),
-            own("5.4", "http://unitsofmeasure.org", "mg")
-        );
-        assert_eq!(split("5.4|http://x|"), own("5.4", "http://x", ""));
-        assert_eq!(split("|http://x|mg"), own("", "http://x", "mg"));
-        // `\|` is a literal pipe, in either position.
-        assert_eq!(split("5.4|http://x|a\\|b"), own("5.4", "http://x", "a|b"));
-        assert_eq!(split("5.4|a\\|b"), own("5.4", "", "a|b"));
-        assert_eq!(split("5.4|s\\|t|mg"), own("5.4", "s|t", "mg"));
-        // Anything after the second separator stays in the code; other
-        // backslashes are left alone.
-        assert_eq!(split("5.4|s|a|b"), own("5.4", "s", "a|b"));
-        assert_eq!(split("5.4||a\\b"), own("5.4", "", "a\\b"));
     }
 
     #[test]

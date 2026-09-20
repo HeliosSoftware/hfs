@@ -669,6 +669,11 @@ mod date_precision_suite;
 #[path = "search/number_exponent_suite.rs"]
 mod number_exponent_suite;
 
+/// The backend-agnostic number / quantity validation suite (#1319, #1340).
+/// Same `#[path]` arrangement.
+#[path = "search/numeric_validation_suite.rs"]
+mod numeric_validation_suite;
+
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
 
@@ -962,6 +967,19 @@ mod es_integration {
             &backend,
             "number-exponent-1337",
             true,
+        )
+        .await;
+    }
+
+    /// #1340: a number that did not parse made the handler return `None`,
+    /// which the query builder filters out, so `probability=abc` returned
+    /// every RiskAssessment; and `ltinf` matched every indexed row.
+    #[tokio::test]
+    async fn es_invalid_numbers_are_rejected_on_every_path() {
+        let backend = create_backend().await;
+        super::numeric_validation_suite::invalid_numbers_are_rejected_on_every_path(
+            &backend,
+            "numeric-validation-1340",
         )
         .await;
     }

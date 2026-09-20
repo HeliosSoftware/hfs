@@ -58,7 +58,9 @@ fn unavailable_error(message: String) -> crate::error::StorageError {
 /// an error, never a query the builder has to make something of.
 fn reject_unsupported_metadata_modifier(query: &SearchQuery) -> StorageResult<()> {
     crate::search::reject_unsupported_metadata_modifier(query)?;
-    crate::search::validate_date_values(query)
+    crate::search::validate_date_values(query)?;
+    // And a number or quantity value that is not a number (#1319, #1340).
+    crate::search::validate_numeric_values(query)
 }
 
 /// Maximum retry attempts for transient ES search failures (in addition to the

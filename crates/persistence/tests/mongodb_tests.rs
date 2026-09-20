@@ -563,6 +563,42 @@ async fn mongodb_exponent_values_use_significant_figures() {
     .await;
 }
 
+/// The backend-agnostic number / quantity validation suite (#1319, #1340).
+/// Same `#[path]` arrangement.
+#[path = "search/numeric_validation_suite.rs"]
+mod numeric_validation_suite;
+
+/// #1340: `probability=abc` was a `QueryParseError` here, and `ltinf` matched
+/// every indexed row. Needs the full registry so `probability` and
+/// `value-quantity` extract into the search index — the suite's positive
+/// controls fail loudly if they did not.
+#[tokio::test]
+async fn mongodb_invalid_numbers_are_rejected_on_every_path() {
+    let Some(backend) = create_backend_with_full_registry("numeric_validation").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    numeric_validation_suite::invalid_numbers_are_rejected_on_every_path(
+        &backend,
+        "numeric-validation-1340",
+    )
+    .await;
+}
+
+/// #1340: the same values as conditional criteria.
+#[tokio::test]
+async fn mongodb_invalid_numbers_are_rejected_in_conditional_criteria() {
+    let Some(backend) = create_backend_with_full_registry("numeric_validation_cond").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    numeric_validation_suite::invalid_numbers_are_rejected_in_conditional_criteria(
+        &backend,
+        "numeric-validation-cond-1340",
+    )
+    .await;
+}
+
 /// #1062: a comma-separated value list on one `SearchParameter` is OR per
 /// FHIR (https://build.fhir.org/search.html#combining) — for date same as
 /// every other type. Drives the real `SearchProvider::search` /
