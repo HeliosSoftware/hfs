@@ -50,6 +50,9 @@ pub fn make_sqlite_backend_for(fhir_version: FhirVersion) -> SqliteBackend {
 pub mod chained_tests;
 /// Backend-agnostic scenarios, shared with the PostgreSQL, MongoDB and
 /// Elasticsearch test binaries via `#[path]` (#1293, #1295, #1296, #1297).
+/// Backend-agnostic scenarios, shared with the PostgreSQL and MongoDB test
+/// binaries via `#[path]` (#1315).
+pub mod date_minute_index_suite;
 pub mod date_precision_suite;
 pub mod date_tests;
 /// Backend-agnostic scenarios, shared with the PostgreSQL test binary via

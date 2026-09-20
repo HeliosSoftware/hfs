@@ -518,6 +518,29 @@ async fn mongodb_sub_day_date_precision_and_validation() {
     date_precision_suite::sub_day_precision_and_validation(&backend, "date-precision-1297").await;
 }
 
+/// The backend-agnostic suite for stored dateTimes with minutes but no
+/// seconds (#1315). Same `#[path]` arrangement.
+#[path = "search/date_minute_index_suite.rs"]
+mod date_minute_index_suite;
+
+/// #1315: a stored `…T09:20` is not RFC 3339, so `normalize_date_for_mongo`
+/// returned `None`, the `search_index` document was skipped, and the resource
+/// could not be found by that date parameter at all. Needs the full registry
+/// so `Procedure.date` extracts — the suite's positive controls fail loudly if
+/// it did not.
+#[tokio::test]
+async fn mongodb_minute_precision_stored_dates_are_indexed() {
+    let Some(backend) = create_backend_with_full_registry("date_minute_index").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    date_minute_index_suite::minute_precision_stored_values_are_indexed(
+        &backend,
+        "date-minute-index-1315",
+    )
+    .await;
+}
+
 /// #1062: a comma-separated value list on one `SearchParameter` is OR per
 /// FHIR (https://build.fhir.org/search.html#combining) — for date same as
 /// every other type. Drives the real `SearchProvider::search` /
