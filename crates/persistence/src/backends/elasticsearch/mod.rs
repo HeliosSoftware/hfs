@@ -50,3 +50,4 @@ mod storage;
 pub use backend::{
     ElasticsearchAuth, ElasticsearchBackend, ElasticsearchConfig, WriteRefreshPolicy,
 };
+pub use schema::{SCHEMA_VERSION, SCHEMA_VERSION_META_KEY};
