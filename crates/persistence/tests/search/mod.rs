@@ -68,6 +68,9 @@ pub mod meta_params_suite;
 pub mod meta_params_suite_tests;
 pub mod meta_params_tests;
 pub mod modifier_tests;
+/// Backend-agnostic scenarios, shared with the PostgreSQL, MongoDB and
+/// Elasticsearch test binaries via `#[path]` (#1337).
+pub mod number_exponent_suite;
 pub mod number_tests;
 /// Backend-agnostic scenarios, shared with the PostgreSQL, MongoDB and
 /// Elasticsearch test binaries via `#[path]` (#1340).

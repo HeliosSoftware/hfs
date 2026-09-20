@@ -191,6 +191,20 @@ async fn test_number_prefix_boundary_matrix() {
     }
 }
 
+/// The shared table for exponent-form number and quantity values (#1337);
+/// PostgreSQL, MongoDB and Elasticsearch run the same one.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_exponent_values_use_significant_figures() {
+    let backend = create_sqlite_backend();
+    super::number_exponent_suite::exponent_values_use_significant_figures(
+        &backend,
+        "number-exponent",
+        true,
+    )
+    .await;
+}
+
 /// The shared number / quantity validation tables (#1319, #1340); PostgreSQL,
 /// MongoDB and Elasticsearch run the same ones.
 #[cfg(feature = "sqlite")]
