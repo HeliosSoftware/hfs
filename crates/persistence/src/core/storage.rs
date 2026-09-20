@@ -1146,6 +1146,11 @@ pub enum PatchFormat {
 }
 
 /// Extension trait for conditional operations based on search criteria.
+///
+/// Every `search_params` argument is the query portion of a search URL as it
+/// appears on the wire — form-urlencoded, exactly what `If-None-Exist` and a
+/// conditional URL carry. Callers pass it through undecoded; it is decoded
+/// once, by [`crate::search::parse_conditional_criteria`] (#1322).
 #[async_trait]
 pub trait ConditionalStorage: ResourceStorage {
     /// Creates a resource only if no matching resource exists.
