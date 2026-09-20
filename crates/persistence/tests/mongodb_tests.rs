@@ -570,6 +570,64 @@ async fn mongodb_contained_criteria_are_applied_or_rejected() {
     contained_suite::criteria_are_applied_or_rejected(&backend, "contained-criteria-1363").await;
 }
 
+/// The backend-agnostic suite for exponent-form number and quantity search
+/// values (#1337). Same `#[path]` arrangement.
+#[path = "search/number_exponent_suite.rs"]
+mod number_exponent_suite;
+
+/// #1337: `1e2` is one significant figure, `[50, 150)`. Needs the full
+/// registry so `ChargeItem.factor-override` and `Observation.value-quantity`
+/// extract. MongoDB has no canonical-unit quantity match, hence `false`.
+#[tokio::test]
+async fn mongodb_exponent_values_use_significant_figures() {
+    let Some(backend) = create_backend_with_full_registry("number_exponent").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    number_exponent_suite::exponent_values_use_significant_figures(
+        &backend,
+        "number-exponent-1337",
+        false,
+    )
+    .await;
+}
+
+/// The backend-agnostic number / quantity validation suite (#1319, #1340).
+/// Same `#[path]` arrangement.
+#[path = "search/numeric_validation_suite.rs"]
+mod numeric_validation_suite;
+
+/// #1340: `probability=abc` was a `QueryParseError` here, and `ltinf` matched
+/// every indexed row. Needs the full registry so `probability` and
+/// `value-quantity` extract into the search index — the suite's positive
+/// controls fail loudly if they did not.
+#[tokio::test]
+async fn mongodb_invalid_numbers_are_rejected_on_every_path() {
+    let Some(backend) = create_backend_with_full_registry("numeric_validation").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    numeric_validation_suite::invalid_numbers_are_rejected_on_every_path(
+        &backend,
+        "numeric-validation-1340",
+    )
+    .await;
+}
+
+/// #1340: the same values as conditional criteria.
+#[tokio::test]
+async fn mongodb_invalid_numbers_are_rejected_in_conditional_criteria() {
+    let Some(backend) = create_backend_with_full_registry("numeric_validation_cond").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    numeric_validation_suite::invalid_numbers_are_rejected_in_conditional_criteria(
+        &backend,
+        "numeric-validation-cond-1340",
+    )
+    .await;
+}
+
 /// #1062: a comma-separated value list on one `SearchParameter` is OR per
 /// FHIR (https://build.fhir.org/search.html#combining) — for date same as
 /// every other type. Drives the real `SearchProvider::search` /
@@ -809,6 +867,24 @@ fn create_tenant(tenant_id: &str) -> TenantContext {
     TenantContext::new(TenantId::new(tenant_id), TenantPermissions::full_access())
 }
 
+/// The repo's `data/` directory, holding the spec SearchParameter files.
+///
+/// Every backend helper below passes it as `data_dir`. Left unset, the backend
+/// falls back to `./data`, which does not exist under `cargo test` (the working
+/// directory is `crates/persistence/`), so the registry silently ends up with
+/// only the five embedded parameters and anything else — `identifier`, `name`,
+/// … — indexes nothing: searches and `ifNoneExist` criteria then match nothing
+/// and tests pass or fail vacuously (#1324). [`build_backend`] asserts the spec
+/// file really loaded. Loading it costs ~150 ms per backend in a debug build.
+fn repo_data_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("data")
+}
+
+/// The default backend for a test: shared mongo, unique database, full spec
+/// registry (see [`repo_data_dir`]).
 async fn create_backend(test_name: &str) -> Option<MongoBackend> {
     create_backend_with_search_offloaded(test_name, false).await
 }
@@ -867,7 +943,22 @@ async fn build_backend(mut config: MongoBackendConfig) -> Option<MongoBackend> {
         let backend = MongoBackend::new(config.clone())
             .expect("failed to create MongoBackend for mongodb integration tests");
         match backend.initialize().await {
-            Ok(()) => return Some(backend),
+            Ok(()) => {
+                // Positive control for the registry itself: a `data_dir` that
+                // does not resolve only logs a warning and leaves the five
+                // embedded parameters, which is exactly the vacuous-test trap
+                // of #1324 — fail loudly instead.
+                if let Some(data_dir) = &config.data_dir {
+                    let registry = backend.search_param_registry(&create_tenant("registry-probe"));
+                    assert!(
+                        registry.read().get_param("Patient", "identifier").is_some(),
+                        "spec SearchParameters did not load from {} — `Patient.identifier` \
+                         is not registered, so search-dependent assertions would be vacuous",
+                        data_dir.display()
+                    );
+                }
+                return Some(backend);
+            }
             Err(err) if attempt < MAX_ATTEMPTS && is_mongo_unavailable(&err) => {
                 eprintln!(
                     "MongoDB schema init attempt {attempt}/{MAX_ATTEMPTS} failed \
@@ -901,6 +992,7 @@ async fn create_backend_with_search_offloaded(
         connection_string,
         database_name: build_test_database_name(test_name),
         search_offloaded,
+        data_dir: Some(repo_data_dir()),
         ..Default::default()
     };
 
@@ -948,6 +1040,7 @@ async fn create_backend_with_app_name(test_name: &str, app_name: &str) -> Option
         connection_string,
         database_name: build_test_database_name(test_name),
         app_name: app_name.to_string(),
+        data_dir: Some(repo_data_dir()),
         ..Default::default()
     };
     build_backend(config).await
@@ -969,19 +1062,11 @@ async fn count_docs(backend: &MongoBackend, collection: &str, filter: Document) 
 
 /// Creates a backend whose registry is loaded from the repo's spec files, so
 /// non-embedded search parameters (e.g. `value-quantity`) are active.
+///
+/// Since #1324 every helper does this, so this is [`create_backend`] under a
+/// name that states the dependency at the call site.
 async fn create_backend_with_full_registry(test_name: &str) -> Option<MongoBackend> {
-    let connection_string = shared_mongo::connection_string().await?;
-    let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|p| p.join("data"))?;
-    let config = MongoBackendConfig {
-        connection_string,
-        database_name: build_test_database_name(test_name),
-        data_dir: Some(data_dir),
-        ..Default::default()
-    };
-    build_backend(config).await
+    create_backend(test_name).await
 }
 
 async fn search_index_entry_count(
@@ -1456,6 +1541,7 @@ async fn mongodb_integration_reuses_client_pool_under_concurrent_read_search() {
         connection_string: connection_string.clone(),
         database_name: build_test_database_name("client_pool_reuse"),
         max_connections: 8,
+        data_dir: Some(repo_data_dir()),
         ..Default::default()
     };
     let Some(backend) = build_backend(config).await else {
@@ -1511,7 +1597,10 @@ async fn mongodb_integration_reuses_client_pool_under_concurrent_read_search() {
                     chain: vec![],
                     components: vec![],
                 });
-                backend.search(&tenant, &query).await.unwrap();
+                // Positive control: with `identifier` unregistered this
+                // search matched nothing and never exercised the index.
+                let found = backend.search(&tenant, &query).await.unwrap();
+                assert_eq!(found.resources.items.len(), 1);
             }
         }));
     }
@@ -7591,6 +7680,18 @@ async fn mongodb_integration_standalone_search_writes_search_index() {
     assert!(
         count > 0,
         "search_index should contain entries in standalone mode"
+    );
+    // `count > 0` alone is satisfied by the embedded `_id`/`_lastUpdated`
+    // rows; a spec-registered parameter proves the resource was really indexed.
+    let identifier_rows = count_docs(
+        &backend,
+        "search_index",
+        doc! { "resource_id": created.id(), "param_name": "identifier" },
+    )
+    .await;
+    assert!(
+        identifier_rows > 0,
+        "the Patient's `identifier` must be indexed"
     );
 }
 

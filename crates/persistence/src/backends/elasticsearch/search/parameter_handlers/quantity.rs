@@ -2,14 +2,31 @@
 
 use serde_json::{Value, json};
 
+use crate::search::FhirQuantityValue;
 use crate::types::SearchPrefix;
 
 /// Builds an ES query clause for a quantity search parameter.
 ///
-/// Format: `[prefix]number|system|code` or `[prefix]number|code` or `[prefix]number`
+/// Format: `[prefix]number|system|code` or `[prefix]number|code` or
+/// `[prefix]number`, read by the grammar every backend shares
+/// ([`FhirQuantityValue`]): only an unescaped `|` separates.
+///
+/// Never returns `None` for a value it cannot read — see
+/// [`number::build_clause`](super::number::build_clause): the query builder's
+/// `filter_map` would drop the constraint and the search would return
+/// everything (#1319). It is [`match_none`](super::date::match_none) instead.
 pub fn build_clause(name: &str, value: &str, prefix: SearchPrefix) -> Option<Value> {
-    let (num_str, system, code) = parse_quantity_value(value);
-    let num: f64 = num_str.parse().ok()?;
+    let quantity = match FhirQuantityValue::parse(value) {
+        Ok(quantity) => quantity,
+        Err(error) => {
+            tracing::warn!(
+                "unvalidated quantity search value reached the Elasticsearch handler: {error}"
+            );
+            return Some(super::date::match_none());
+        }
+    };
+    let (num_str, num) = (quantity.number.text(), quantity.number.value);
+    let (system, code) = (quantity.system.as_deref(), quantity.code.as_deref());
 
     // Raw match against the stored value/unit/system.
     let mut raw_must = vec![
@@ -124,50 +141,9 @@ fn ordered(a: f64, b: f64) -> (f64, f64) {
     if a <= b { (a, b) } else { (b, a) }
 }
 
-/// Parses a quantity value string into (number, system, code).
-///
-/// Formats:
-/// - `5.4` -> ("5.4", None, None)
-/// - `5.4|mg` -> ("5.4", None, Some("mg"))
-/// - `5.4|http://unitsofmeasure.org|mg` -> ("5.4", Some("http://..."), Some("mg"))
-fn parse_quantity_value(value: &str) -> (&str, Option<&str>, Option<&str>) {
-    let parts: Vec<&str> = value.splitn(3, '|').collect();
-    match parts.len() {
-        1 => (parts[0], None, None),
-        2 => (parts[0], None, Some(parts[1])),
-        3 => {
-            let system = if parts[1].is_empty() {
-                None
-            } else {
-                Some(parts[1])
-            };
-            let code = if parts[2].is_empty() {
-                None
-            } else {
-                Some(parts[2])
-            };
-            (parts[0], system, code)
-        }
-        _ => (value, None, None),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_parse_quantity_value() {
-        let (n, s, c) = parse_quantity_value("5.4");
-        assert_eq!(n, "5.4");
-        assert!(s.is_none());
-        assert!(c.is_none());
-
-        let (n, s, c) = parse_quantity_value("5.4|http://unitsofmeasure.org|mg");
-        assert_eq!(n, "5.4");
-        assert_eq!(s, Some("http://unitsofmeasure.org"));
-        assert_eq!(c, Some("mg"));
-    }
 
     #[test]
     fn test_quantity_clause() {
@@ -291,5 +267,44 @@ mod tests {
         let lt = canonical_range["lt"].as_f64().expect("lt must be a number");
         assert!((gte - expected_lo).abs() < 1e-9);
         assert!((lt - expected_hi).abs() < 1e-9);
+    }
+
+    /// The `filter_map` trap (#1319), as for numbers: never `None`.
+    #[test]
+    fn an_invalid_number_part_is_match_none_never_none() {
+        for prefix in [SearchPrefix::Eq, SearchPrefix::Ne, SearchPrefix::Lt] {
+            for raw in [
+                "abc",
+                "",
+                "||mg",
+                "|http://unitsofmeasure.org|mg",
+                "abc|http://unitsofmeasure.org|mg",
+                "inf||mg",
+                "nan",
+                "1e999|mg",
+            ] {
+                assert_eq!(
+                    build_clause("value-quantity", raw, prefix),
+                    Some(json!({ "match_none": {} })),
+                    "{prefix:?} {raw:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_escaped_pipe_is_part_of_the_code() {
+        let clause = build_clause(
+            "value-quantity",
+            "5.4|http://example.org|a\\|b",
+            SearchPrefix::Eq,
+        )
+        .unwrap();
+        let s = serde_json::to_string(&clause).unwrap();
+        assert!(s.contains(r#""search_params.quantity.code":"a|b""#), "{s}");
+        assert!(
+            s.contains(r#""search_params.quantity.system":"http://example.org""#),
+            "{s}"
+        );
     }
 }

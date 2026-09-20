@@ -1682,6 +1682,145 @@ mod date_search {
             assert_invalid(response, format!("POST {path} {name}={value}"));
         }
     }
+
+    fn assert_invalid_number_outcome(response: &axum_test::TestResponse, context: &str) {
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let body: Value = response.json();
+        assert_eq!(body["resourceType"], "OperationOutcome", "{context}");
+        assert_eq!(body["issue"][0]["code"], "invalid", "{context}");
+        let text = body["issue"][0]["diagnostics"]
+            .as_str()
+            .or_else(|| body["issue"][0]["details"]["text"].as_str())
+            .unwrap_or_default();
+        assert!(
+            text.contains("not a valid number"),
+            "{context}: the outcome should say what is wrong, got {body}"
+        );
+    }
+
+    /// #1340: the values `f64::from_str` takes for numbers — as a bound they
+    /// match every row — an empty value, and a composite's numeric component,
+    /// over GET and POST `_search`, whatever the client's `Prefer: handling`:
+    /// lenient handling is for parameters the server does not know, not for
+    /// values it cannot read.
+    #[tokio::test]
+    async fn test_invalid_number_is_a_400_from_the_shared_gate() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        for (path, name, value) in [
+            ("/RiskAssessment", "probability", "inf"),
+            ("/RiskAssessment", "probability", "lt-inf"),
+            ("/RiskAssessment", "probability", "neNaN"),
+            ("/RiskAssessment", "probability", "lt1e999"),
+            ("/RiskAssessment", "probability", "0x10"),
+            ("/RiskAssessment", "probability", ""),
+            ("/Observation", "value-quantity", "ltinf||mg"),
+            ("/Observation", "value-quantity", "||mg"),
+            ("/Observation", "value-quantity", "5.4\\|mg"),
+            ("/Observation", "code-value-quantity", "8480-6$abc"),
+            ("/Observation", "code-value-quantity", "8480-6$ltinf||mg"),
+        ] {
+            for handling in ["handling=lenient", "handling=strict"] {
+                let response = server
+                    .get(path)
+                    .add_query_param(name, value)
+                    .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                    .add_header(
+                        axum::http::header::HeaderName::from_static("prefer"),
+                        HeaderValue::from_static(handling),
+                    )
+                    .await;
+                assert_invalid_number_outcome(&response, &format!("GET {name}={value} {handling}"));
+
+                let response = server
+                    .post(&format!("{path}/_search"))
+                    .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                    .add_header(
+                        axum::http::header::HeaderName::from_static("prefer"),
+                        HeaderValue::from_static(handling),
+                    )
+                    .form(&[(name, value)])
+                    .await;
+                assert_invalid_number_outcome(
+                    &response,
+                    &format!("POST {name}={value} {handling}"),
+                );
+            }
+        }
+    }
+
+    /// A chained or `_has` terminal is typed only when the chain is resolved,
+    /// so it is the storage gate that rejects it.
+    #[tokio::test]
+    async fn test_invalid_chained_number_value_is_a_400() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        for (path, name, value) in [
+            ("/DiagnosticReport", "result.value-quantity", "abc"),
+            (
+                "/DiagnosticReport",
+                "result:Observation.value-quantity",
+                "ltinf",
+            ),
+            ("/Patient", "_has:Observation:subject:value-quantity", "abc"),
+            (
+                "/Patient",
+                "_has:Observation:subject:value-quantity",
+                "ltinf||mg",
+            ),
+            (
+                "/Patient",
+                "_has:RiskAssessment:subject:probability",
+                "nenan",
+            ),
+        ] {
+            let response = server
+                .get(path)
+                .add_query_param(name, value)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            assert_invalid_number_outcome(&response, &format!("GET {path}?{name}={value}"));
+        }
+
+        // Positive control: the valid forms of the same searches run.
+        for (path, name, value) in [
+            ("/DiagnosticReport", "result.value-quantity", "gt1"),
+            ("/Patient", "_has:Observation:subject:value-quantity", "gt1"),
+        ] {
+            let response = server
+                .get(path)
+                .add_query_param(name, value)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            response.assert_status_ok();
+        }
+    }
+
+    /// A `+` that form-decoding turned into a space is still the number the
+    /// client wrote.
+    #[tokio::test]
+    async fn test_literal_plus_in_a_number_is_accepted() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        for query in [
+            "/Observation?value-quantity=lt1e+3",
+            "/Observation?value-quantity=gt+70",
+            "/Observation?value-quantity=+72",
+        ] {
+            let response = server
+                .get(query)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            response.assert_status_ok();
+            assert!(
+                !get_bundle_entries(&response.json::<Value>()).is_empty(),
+                "{query} should find the seeded heart rate"
+            );
+        }
+    }
 }
 
 // =============================================================================
@@ -3315,6 +3454,183 @@ mod chaining {
             .await,
             ["ps"]
         );
+    }
+
+    /// #1339: a terminology-backed modifier the parameter's type does not
+    /// define is a client error, whether or not a terminology server is
+    /// configured: the `400` a direct or chained `birthdate:exact` gets, not the
+    /// `501` reserved for a *valid* modifier this server cannot answer.
+    #[tokio::test]
+    async fn test_terminology_modifier_on_wrong_parameter_type_is_400_not_501() {
+        let (server, backend) = create_test_server().await;
+        seed_chain_name_data(&backend).await;
+
+        // Positive controls: the parameters and chains themselves resolve.
+        assert_eq!(ids(&server, "/Patient?name=Smith").await, ["pl", "ps"]);
+        assert_eq!(ids(&server, "/Patient?birthdate=1980-01-01").await, ["ps"]);
+        assert_eq!(ids(&server, "/Encounter?subject.name=Smith").await.len(), 2);
+
+        for url in [
+            // Direct.
+            "/Patient?name:in=http://example.org/vs",
+            "/Patient?name:not-in=http://example.org/vs",
+            "/Patient?name:below=Smith",
+            "/Patient?birthdate:below=1980-01-01",
+            "/Patient?birthdate:above=1980-01-01",
+            "/Patient?birthdate:in=http://example.org/vs",
+            // `:in` is token-only: not defined for a reference or a uri either.
+            "/Observation?subject:in=http://example.org/vs",
+            "/Patient?_profile:in=http://example.org/vs",
+            // Forward chains, untyped, typed and multi-hop.
+            "/Encounter?subject.name:in=http://example.org/vs",
+            "/Encounter?subject:Patient.name:in=http://example.org/vs",
+            "/Encounter?subject:Patient.birthdate:below=1980-01-01",
+            "/Observation?encounter.subject:Patient.name:above=Smith",
+            // `_has`, plain and nested.
+            "/Patient?_has:Observation:subject:date:in=http://example.org/vs",
+            "/Patient?_has:Observation:subject:date:below=2020-01-01",
+            "/Patient?_has:Encounter:subject:_has:Observation:encounter:date:in=http://example.org/vs",
+        ] {
+            let (status, text) = outcome(&server, url).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{url}: {text}");
+            assert!(text.contains("is not supported for"), "{url}: {text}");
+        }
+
+        // A valid terminology modifier is still the `501`.
+        for url in [
+            "/Patient?gender:in=http://example.org/vs",
+            "/Patient?gender:below=http://hl7.org/fhir/administrative-gender|male",
+            "/Encounter?subject.gender:in=http://example.org/vs",
+            "/Patient?_has:Observation:subject:code:below=http://loinc.org|1234-5",
+        ] {
+            let (status, text) = outcome(&server, url).await;
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{url}: {text}");
+        }
+    }
+
+    /// #1339: modifiers and `:[type]` qualifiers are case-sensitive. A
+    /// differently-cased one used to be honoured (`name:EXACT`); it is now the
+    /// `400` of any unknown modifier, never a search without it.
+    #[tokio::test]
+    async fn test_modifiers_are_case_sensitive() {
+        let (server, backend) = create_test_server().await;
+        seed_chain_name_data(&backend).await;
+
+        // Positive controls: the properly-cased forms.
+        assert_eq!(ids(&server, "/Patient?family:exact=Smith").await, ["ps"]);
+        assert_eq!(
+            ids(&server, "/Observation?subject:Patient=ps").await,
+            ["os"]
+        );
+        assert_eq!(
+            ids(&server, "/Encounter?subject:Patient.family:exact=Smith").await,
+            ["es"]
+        );
+
+        for (url, hint) in [
+            ("/Patient?family:EXACT=Smith", "':exact'?"),
+            ("/Patient?family:Exact=Smith", "':exact'?"),
+            ("/Patient?gender:Missing=true", "':missing'?"),
+            ("/Observation?code:NOT=1234-5", "':not'?"),
+            ("/Observation?subject:patient=ps", "':Patient'?"),
+            ("/Observation?subject:PATIENT=ps", "':Patient'?"),
+            ("/Encounter?subject:Patient.family:EXACT=Smith", "':exact'?"),
+            (
+                "/Patient?_has:Observation:subject:code:NOT=1234-5",
+                "':not'?",
+            ),
+        ] {
+            let (status, text) = outcome(&server, url).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{url}: {text}");
+            assert!(text.contains("case-sensitive"), "{url}: {text}");
+            assert!(text.contains(hint), "{url}: {text}");
+        }
+    }
+
+    /// #1339: a `:[type]` qualifier is judged against the FHIR version of the
+    /// search (R4 here), wherever it is written. On a chain hop and as a `_has`
+    /// source type it used not to be judged at all: an empty `200`, or a `400`
+    /// about something else.
+    #[tokio::test]
+    async fn test_type_qualifier_must_be_a_resource_type_of_the_request_version() {
+        let (server, backend) = create_test_server().await;
+        seed_chain_name_data(&backend).await;
+
+        // Positive controls.
+        assert_eq!(
+            ids(&server, "/Encounter?subject:Patient.family=Smith").await,
+            ["el", "es"]
+        );
+        assert_eq!(
+            ids(&server, "/Patient?_has:Observation:subject:code=1234-5").await,
+            ["ps"]
+        );
+
+        for (url, named) in [
+            // `ActorDefinition` is an R5 resource type.
+            ("/Observation?subject:ActorDefinition=x", "ActorDefinition"),
+            (
+                "/Encounter?subject:ActorDefinition.name=x",
+                "ActorDefinition",
+            ),
+            (
+                "/Patient?_has:ActorDefinition:subject:code=x",
+                "ActorDefinition",
+            ),
+            ("/Encounter?subject:Bogus.family=Smith", "Bogus"),
+            ("/Encounter?subject:patient.family=Smith", "':Patient'?"),
+            (
+                "/Observation?subject:Patient.general-practitioner:practitioner.name=Smith",
+                "':Practitioner'?",
+            ),
+            (
+                "/Patient?_has:observation:subject:code=1234-5",
+                "':Observation'?",
+            ),
+            (
+                "/Patient?_has:Encounter:subject:_has:Bogus:encounter:code=1234-5",
+                "Bogus",
+            ),
+        ] {
+            let (status, text) = outcome(&server, url).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{url}: {text}");
+            assert!(text.contains(named), "{url}: {text}");
+            assert!(text.contains("of FHIR R4"), "{url}: {text}");
+        }
+    }
+
+    /// #1339: the `400` / `501` for the terminal parameter of a nested `_has`
+    /// names the whole key as written, not just its innermost level.
+    #[tokio::test]
+    async fn test_nested_has_errors_name_the_full_key() {
+        let (server, backend) = create_test_server().await;
+        seed_chain_name_data(&backend).await;
+
+        let key = "_has:Encounter:subject:_has:Observation:encounter:code";
+        // Positive control: the nested `_has` resolves.
+        assert_eq!(
+            ids(&server, &format!("/Patient?{key}=1234-5")).await,
+            ["ps"]
+        );
+
+        for (suffix, value, expected) in [
+            // Needs a terminology server (#1317).
+            (":in", "http://example.org/vs", StatusCode::NOT_IMPLEMENTED),
+            (
+                ":below",
+                "http://loinc.org|1234-5",
+                StatusCode::NOT_IMPLEMENTED,
+            ),
+            // Not defined for a token; not a modifier; not a boolean (#1302).
+            (":exact", "1234-5", StatusCode::BAD_REQUEST),
+            (":bogus", "1234-5", StatusCode::BAD_REQUEST),
+            (":missing", "yes", StatusCode::BAD_REQUEST),
+        ] {
+            let url = format!("/Patient?{key}{suffix}={value}");
+            let (status, text) = outcome(&server, &url).await;
+            assert_eq!(status, expected, "{url}: {text}");
+            assert!(text.contains(key), "{url}: {text}");
+        }
     }
 
     #[tokio::test]

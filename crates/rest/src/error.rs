@@ -966,6 +966,10 @@ impl From<SearchError> for RestError {
                 param,
                 message: reason,
             },
+            SearchError::InvalidNumberValue { param, reason, .. } => RestError::InvalidParameter {
+                param,
+                message: reason,
+            },
             SearchError::UnsupportedParameterType { .. }
             | SearchError::UnsupportedModifier { .. }
             | SearchError::InvalidComposite { .. }

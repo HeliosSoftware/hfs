@@ -1,12 +1,23 @@
 //! Integration tests for HTS (Helios Terminology Server) delegation.
 //!
 //! These tests verify that:
-//! 1. Search parameters with `:in` modifiers are expanded via `POST /ValueSet/$expand`
-//!    on a configured terminology server and the expanded codes replace the original param.
-//! 2. Search parameters with `:not-in` modifiers are gracefully dropped (fail-open)
-//!    because the SQLite backend does not support negated value-set filtering.
-//! 3. When no terminology server is configured, `:in` / `:not-in` params pass through
-//!    to the persistence layer unchanged.
+//! 1. With a terminology server configured, a token `:in` parameter is expanded
+//!    via `POST /ValueSet/$expand` and replaced by a plain token parameter
+//!    carrying the expanded codes; token `:above` / `:below` are expanded the
+//!    same way (code subsumption). This covers the terminal parameter of a
+//!    chained or `_has` search too.
+//! 2. `:not-in` is a `501` with or without a terminology server: no backend
+//!    implements negated value-set filtering, and dropping the filter would
+//!    return a superset of what was asked for.
+//! 3. Without a terminology server, `:in` and token `:above` / `:below` are a
+//!    `501` naming `HFS_TERMINOLOGY_SERVER` — they are not passed through to
+//!    the persistence layer, which would match the ValueSet URL as a literal
+//!    code. (`:above` / `:below` on a uri or reference are structural and need
+//!    no terminology server.)
+//! 4. A terminology modifier the parameter's type does not define (`name:in`)
+//!    is a `400` either way, and never reaches the terminology server.
+//! 5. When the terminology server cannot be reached, the parameter is dropped
+//!    and the search continues without it (fail-open).
 //!
 //! # How the mock server works
 //!
@@ -344,4 +355,73 @@ async fn test_chained_in_and_below_modifiers_resolve_with_terminology_server() {
             "{key}: expected one $expand call"
         );
     }
+}
+
+/// #1339: a terminology-backed modifier on a parameter whose type does not
+/// define it (`name:in` — a string) is a `400` with a terminology server too.
+/// It used to be expanded like a token's and searched as `name=<codes>`, an
+/// empty `200`. The terminology server is not consulted for it.
+#[tokio::test]
+async fn test_terminology_modifier_on_wrong_parameter_type_is_rejected_before_expansion() {
+    let expansion = make_expansion("http://example.org/cs", &["Smith"]);
+    let (ts_url, requests) = start_mock_hts(expansion).await;
+
+    // The spec search parameters are needed: the embedded fallback set does not
+    // know `name` or `birthdate`, and an unregistered parameter is not gated.
+    let data_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data");
+    let backend = SqliteBackend::with_config(
+        ":memory:",
+        helios_persistence::backends::sqlite::SqliteBackendConfig {
+            data_dir: Some(data_dir),
+            ..Default::default()
+        },
+    )
+    .expect("SQLite in-memory failed");
+    backend.init_schema().expect("Schema init failed");
+    let config = ServerConfig {
+        terminology_server: Some(ts_url),
+        ..ServerConfig::for_testing()
+    };
+    let server = TestServer::new(create_app_with_config(backend, config)).unwrap();
+
+    let patient = json!({"resourceType": "Patient", "id": "p1", "gender": "male",
+                         "name": [{"family": "Smith"}]});
+    let response = server.put("/Patient/p1").json(&patient).await;
+    assert!(response.status_code().is_success());
+
+    // Positive control: the parameter itself finds the patient.
+    let response = server
+        .get("/Patient")
+        .add_query_param("name", "Smith")
+        .await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+    assert_eq!(response.json::<Value>()["entry"][0]["resource"]["id"], "p1");
+
+    for (key, value) in [
+        ("name:in", "http://example.org/vs"),
+        ("name:not-in", "http://example.org/vs"),
+        ("name:below", "http://example.org/cs|Smith"),
+        ("birthdate:above", "http://example.org/cs|1980"),
+    ] {
+        let response = server.get("/Patient").add_query_param(key, value).await;
+        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST, "{key}");
+        assert!(
+            response.json::<Value>()["issue"][0]
+                .to_string()
+                .contains("is not supported for"),
+            "{key}"
+        );
+    }
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "an invalid modifier must not reach the terminology server"
+    );
+
+    // A valid one still does.
+    let response = server
+        .get("/Patient")
+        .add_query_param("gender:in", "http://example.org/vs")
+        .await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+    assert_eq!(requests.lock().unwrap().len(), 1);
 }
