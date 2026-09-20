@@ -15,10 +15,12 @@ env:
   CARGO_BUILD_JOBS: 1
   CARGO_PROFILE_DEV_DEBUG: 0
   HFS_PORT: 8089
-  # Pinned release of inferno-framework/us-quality-core-test-kit. Provides
-  # both the Inferno stack and the fixture bundles loaded into HFS, so the
-  # suite and its data always move together.
-  TEST_KIT_REF: v0.2.0
+  # Pinned commit of our fork of inferno-framework/us-quality-core-test-kit.
+  # Provides both the Inferno stack and the fixture bundles loaded into HFS,
+  # so the suite and its data always move together. The fork carries no
+  # upstream tags, so pin by SHA: 41fc954 is upstream v0.2.0.
+  TEST_KIT_REPO: HeliosSoftware/us-quality-core-test-kit
+  TEST_KIT_REF: 41fc954beee8e9046e7935a043e470966de9b890
   # Remote Docker host (set via GitHub repository secrets or variables; leave unset for local Docker)
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
   DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
@@ -66,7 +68,7 @@ jobs:
       - name: Checkout us-quality-core-test-kit
         uses: actions/checkout@v5
         with:
-          repository: inferno-framework/us-quality-core-test-kit
+          repository: ${{ env.TEST_KIT_REPO }}
           ref: ${{ env.TEST_KIT_REF }}
           path: us-quality-core-test-kit
 
@@ -228,7 +230,7 @@ jobs:
       - name: Checkout us-quality-core-test-kit (fixtures)
         uses: actions/checkout@v5
         with:
-          repository: inferno-framework/us-quality-core-test-kit
+          repository: ${{ env.TEST_KIT_REPO }}
           ref: ${{ env.TEST_KIT_REF }}
           path: us-quality-core-test-kit
 
