@@ -119,9 +119,17 @@ pub fn create_index_mapping(config: &super::backend::ElasticsearchConfig) -> ser
                             "type": "nested",
                             "properties": {
                                 "name": { "type": "keyword" },
+                                // The writer only ever sends a complete UTC
+                                // instant (`es_index_date`). `ignore_malformed`
+                                // is the net under it: a value Elasticsearch
+                                // cannot parse costs the document that one
+                                // field instead of rejecting the whole
+                                // document (#1314). It reaches new indices
+                                // only; an existing index keeps its mapping.
                                 "value": {
                                     "type": "date",
-                                    "format": "strict_date_optional_time||epoch_millis||yyyy||yyyy-MM||yyyy-MM-dd"
+                                    "format": "strict_date_optional_time||epoch_millis||yyyy||yyyy-MM||yyyy-MM-dd",
+                                    "ignore_malformed": true
                                 },
                                 "precision": { "type": "keyword" }
                             }
@@ -194,7 +202,8 @@ pub fn create_index_mapping(config: &super::backend::ElasticsearchConfig) -> ser
                                 "quantity_system": { "type": "keyword" },
                                 "date": {
                                     "type": "date",
-                                    "format": "strict_date_optional_time||epoch_millis||yyyy||yyyy-MM||yyyy-MM-dd"
+                                    "format": "strict_date_optional_time||epoch_millis||yyyy||yyyy-MM||yyyy-MM-dd",
+                                    "ignore_malformed": true
                                 },
                                 "reference": { "type": "keyword" },
                                 "uri": { "type": "keyword" }
@@ -626,6 +635,14 @@ mod tests {
         assert_eq!(sp["quantity"]["type"], "nested");
         assert_eq!(sp["reference"]["type"], "nested");
         assert_eq!(sp["uri"]["type"], "nested");
+
+        // #1314: one malformed date must not reject a whole document.
+        let date = &sp["date"]["properties"]["value"];
+        assert_eq!(date["type"], "date");
+        assert_eq!(date["ignore_malformed"], true);
+        let composite_date = &sp["composite"]["properties"]["date"];
+        assert_eq!(composite_date["type"], "date");
+        assert_eq!(composite_date["ignore_malformed"], true);
 
         // Verify normalizer
         assert!(mapping["settings"]["analysis"]["normalizer"]["lowercase_normalizer"].is_object());
