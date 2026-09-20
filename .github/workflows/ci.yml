@@ -594,8 +594,22 @@ jobs:
       # single-version non-R4 build catches the opposite mistake — an import or
       # arm that is only used under R4. Kept to two invocations: each rebuilds
       # the generated `helios-fhir` model for its feature set.
+      #
+      # Same Windows/non-Windows split as the #1291 step above: a bare
+      # `shell: bash` is WSL's bash on the self-hosted Windows agent.
       - name: Check builds with FHIR version feature subsets (#1367)
+        if: runner.os != 'Windows'
         shell: bash
+        run: |
+          for spec in "helios-rest R4,R5,sqlite" "helios-hfs R5,sqlite"; do
+            set -- $spec
+            echo "::group::$1 --no-default-features --features $2"
+            cargo clippy -p "$1" --no-default-features --features "$2" -- -D warnings -A clippy::items_after_test_module -A clippy::large_enum_variant -A clippy::question_mark -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::field_reassign_with_default -A clippy::doc-overindented-list-items -A clippy::doc-lazy-continuation
+            echo "::endgroup::"
+          done
+      - name: Check builds with FHIR version feature subsets (#1367) (Windows)
+        if: runner.os == 'Windows'
+        shell: 'C:\Progra~1\Git\bin\bash.exe --noprofile --norc -eo pipefail {0}'
         run: |
           for spec in "helios-rest R4,R5,sqlite" "helios-hfs R5,sqlite"; do
             set -- $spec
