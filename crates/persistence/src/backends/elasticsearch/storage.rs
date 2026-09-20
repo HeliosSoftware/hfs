@@ -14,7 +14,7 @@ use futures::StreamExt;
 use async_trait::async_trait;
 use chrono::{SecondsFormat, Utc};
 use elasticsearch::params::Refresh;
-use elasticsearch::{BulkParts, DeleteByQueryParts, DeleteParts, GetParts, IndexParts};
+use elasticsearch::{BulkParts, DeleteByQueryParts, DeleteParts, IndexParts};
 use helios_fhir::FhirVersion;
 use serde_json::{Value, json};
 
@@ -29,6 +29,7 @@ use crate::types::StoredResource;
 
 use super::backend::ElasticsearchBackend;
 use super::schema;
+use super::search_impl::{ReadOp, send_read_with_retry};
 
 /// Upper bound on operations per `_bulk` request, on top of the configured byte
 /// budget ([`ElasticsearchConfig::bulk_max_bytes`](super::backend::ElasticsearchConfig::bulk_max_bytes)).
@@ -987,20 +988,18 @@ impl ResourceStorage for ElasticsearchBackend {
         let index = self.index_name(tenant_id, resource_type);
         let doc_id = Self::document_id(resource_type, id);
 
-        let existing = self
-            .client()
-            .get(GetParts::IndexId(&index, &doc_id))
-            .send()
-            .await;
-
         // Deciding "this resource is new, start at version 1" requires knowing that
-        // it does not already exist. Only a 404 establishes that. If the existence
-        // check failed at the transport layer we must not guess "new" — doing so
-        // would reset the version of a resource that does exist, silently clobbering
-        // its history.
+        // it does not already exist. Only Elasticsearch saying so establishes that
+        // (`"found": false`, or the index does not exist) — the same two answers
+        // `read` accepts, through the same retried request (#1364). If the
+        // existence check failed, or was answered by something else with a bare
+        // 404, we must not guess "new" — doing so would reset the version of a
+        // resource that does exist, silently clobbering its history.
+        let op = ReadOp::Get { doc_id: &doc_id };
+        let existing = send_read_with_retry(self, op, &index, Value::Null).await?;
+
         let (version_id, is_new) = match existing {
-            Ok(resp) if resp.status_code().is_success() => {
-                let body = resp.json::<Value>().await.unwrap_or_default();
+            Some(body) => {
                 let source = body.get("_source");
                 // Belt-and-braces tenant guard, mirroring `read` (see below).
                 //
@@ -1045,19 +1044,7 @@ impl ResourceStorage for ElasticsearchBackend {
                     ((current_version + 1).to_string(), false)
                 }
             }
-            Ok(resp) if resp.status_code().as_u16() == 404 => ("1".to_string(), true),
-            Ok(resp) => {
-                let status = resp.status_code().as_u16();
-                let body = resp.text().await.unwrap_or_default();
-                return Err(internal_error(format!(
-                    "Failed to check existence of {resource_type}/{id} (status {status}): {body}"
-                )));
-            }
-            Err(e) => {
-                return Err(unavailable_error(format!(
-                    "Elasticsearch unreachable while checking existence of {resource_type}/{id}: {e}"
-                )));
-            }
+            None => ("1".to_string(), true),
         };
 
         // Ensure resource has correct type and id
@@ -1150,48 +1137,27 @@ impl ResourceStorage for ElasticsearchBackend {
         let index = self.index_name(tenant_id, resource_type);
         let doc_id = Self::document_id(resource_type, id);
 
-        let response = self
-            .client()
-            .get(GetParts::IndexId(&index, &doc_id))
-            .send()
-            .await;
-
         // `Ok(None)` means "this resource does not exist" — a factual claim about
-        // the data. Only ES itself can license that claim, by answering 404. A
+        // the data. Only ES itself can license that claim, and it does so in
+        // exactly two ways: a 404 with `"found": false`, or a 404 naming an
+        // `index_not_found_exception`. A bare 404 (a proxy, a wrong base path), a
         // transport failure (cluster down, DNS, TLS, timeout) or a 5xx/401/403
-        // means we never learned anything, and must surface as an error. Reporting
+        // means we never learned anything, and must surface as an error — after
+        // the same retries a search gets, when it is transient (#1364). Reporting
         // it as "not found" would make a down cluster indistinguishable from an
         // empty one, which is exactly the misleading result this contract forbids.
-        let response = match response {
-            Ok(r) => r,
-            Err(e) => {
-                return Err(unavailable_error(format!(
-                    "Elasticsearch unreachable while reading {resource_type}/{id}: {e}"
-                )));
-            }
-        };
-
-        let status = response.status_code();
-        if status.as_u16() == 404 {
+        let op = ReadOp::Get { doc_id: &doc_id };
+        let Some(body) = send_read_with_retry(self, op, &index, Value::Null).await? else {
             return Ok(None);
-        }
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(internal_error(format!(
-                "Failed to read {resource_type}/{id} (status {}): {body}",
-                status.as_u16()
-            )));
-        }
-
-        let body: Value = response
-            .json()
-            .await
-            .map_err(|e| internal_error(format!("Failed to parse ES response: {}", e)))?;
-
-        let source = match body.get("_source") {
-            Some(s) => s,
-            None => return Ok(None),
         };
+
+        // A found document always carries its `_source` (the mapping never
+        // disables it), so a 200 without one did not come from the get API.
+        let source = body.get("_source").ok_or_else(|| {
+            internal_error(format!(
+                "Get response for {resource_type}/{id} carries no _source: {body}"
+            ))
+        })?;
 
         // Check if deleted
         if source
@@ -1359,33 +1325,17 @@ impl ResourceStorage for ElasticsearchBackend {
             }
         });
 
-        let response = self
-            .client()
-            .count(elasticsearch::CountParts::Index(&[&index_pattern]))
-            .body(query)
-            .send()
-            .await;
-
         // As in `read`: a count of 0 is a claim about the data. Make it only when
-        // the cluster says so, or when the index genuinely does not exist (404).
-        // An unreachable cluster must error, not silently report "zero resources".
-        match response {
-            Ok(resp) if resp.status_code().is_success() => {
-                let body: Value = resp.json().await.unwrap_or_default();
-                Ok(body.get("count").and_then(|c| c.as_u64()).unwrap_or(0))
-            }
-            // Index doesn't exist yet — legitimately zero.
-            Ok(resp) if resp.status_code().as_u16() == 404 => Ok(0),
-            Ok(resp) => {
-                let status = resp.status_code().as_u16();
-                let body = resp.text().await.unwrap_or_default();
-                Err(internal_error(format!(
-                    "Count failed (status {status}): {body}"
-                )))
-            }
-            Err(e) => Err(unavailable_error(format!(
-                "Elasticsearch unreachable during count: {e}"
-            ))),
+        // the cluster says so, or when it says the index does not exist (yet) —
+        // by the parsed `index_not_found_exception`, not by a bare 404. Anything
+        // else goes the way it does for `search_count`: retried when transient,
+        // then an error, never "zero resources" (#1364).
+        match send_read_with_retry(self, ReadOp::Count, &index_pattern, query).await? {
+            None => Ok(0),
+            Some(body) => body
+                .get("count")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| internal_error(format!("Count response carries no count: {body}"))),
         }
     }
 
@@ -2177,28 +2127,23 @@ impl ReindexSource for ElasticsearchBackend {
         let tenant_id = tenant.tenant_id().as_str();
         let pattern = tenant_index_pattern(self, tenant_id);
 
-        let response = self
-            .client()
-            .search(elasticsearch::SearchParts::Index(&[&pattern]))
-            .body(json!({
-                "size": 0,
-                "query": { "bool": { "filter": [
-                    { "term": { "tenant_id": tenant_id } },
-                    { "term": { "is_deleted": false } }
-                ]}},
-                "aggs": { "types": { "terms": { "field": "resource_type", "size": 1000 } } }
-            }))
-            .allow_no_indices(true)
-            .ignore_unavailable(true)
-            .send()
-            .await
-            .map_err(|e| internal_error(format!("Failed to list resource types: {e}")))?;
+        let body = json!({
+            "size": 0,
+            "query": { "bool": { "filter": [
+                { "term": { "tenant_id": tenant_id } },
+                { "term": { "is_deleted": false } }
+            ]}},
+            "aggs": { "types": { "terms": { "field": "resource_type", "size": 1000 } } }
+        });
 
-        if !response.status_code().is_success() {
+        // A tenant with no indices is an empty `200` (a wildcard that matches
+        // nothing is allowed by default). A failed listing is an error, never
+        // "no resource types": that would let a reindex finish successfully
+        // having done nothing (#1364).
+        let Some(body) = send_read_with_retry(self, ReadOp::Search, &pattern, body).await? else {
             return Ok(Vec::new());
-        }
+        };
 
-        let body: Value = response.json().await.unwrap_or_default();
         Ok(body
             .pointer("/aggregations/types/buckets")
             .and_then(|b| b.as_array())
@@ -2253,25 +2198,17 @@ impl ReindexSource for ElasticsearchBackend {
             body["search_after"] = after;
         }
 
-        let response = self
-            .client()
-            .search(elasticsearch::SearchParts::Index(&[&index]))
-            .body(body)
-            .allow_no_indices(true)
-            .ignore_unavailable(true)
-            .send()
-            .await
-            .map_err(|e| internal_error(format!("Failed to fetch resources: {e}")))?;
-
-        if !response.status_code().is_success() {
+        // Only a missing index is an empty page. A failed page is an error, never
+        // "the last page": that would end the walk early and silently truncate
+        // whatever is being rebuilt from it (#1364).
+        let Some(payload) = send_read_with_retry(self, ReadOp::Search, &index, body).await? else {
             return Ok(ResourcePage {
                 resources: Vec::new(),
                 next_cursor: None,
                 skipped: Vec::new(),
             });
-        }
+        };
 
-        let payload: Value = response.json().await.unwrap_or_default();
         let hits = payload
             .pointer("/hits/hits")
             .and_then(|h| h.as_array())

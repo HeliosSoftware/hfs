@@ -73,10 +73,20 @@ mod date_precision_suite;
 #[path = "search/date_minute_index_suite.rs"]
 mod date_minute_index_suite;
 
+/// The backend-agnostic suite for exponent-form number and quantity search
+/// values (#1337). Same `#[path]` arrangement.
+#[path = "search/number_exponent_suite.rs"]
+mod number_exponent_suite;
+
 /// The backend-agnostic conditional-criteria suite (#1312): criteria whose
 /// values begin with comparator letters. Same `#[path]` arrangement.
 #[path = "search/conditional_criteria_suite.rs"]
 mod conditional_criteria_suite;
+
+/// The backend-agnostic number / quantity validation suite (#1319, #1340).
+/// Same `#[path]` arrangement.
+#[path = "search/numeric_validation_suite.rs"]
+mod numeric_validation_suite;
 
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
@@ -12283,6 +12293,11 @@ mod postgres_integration {
 
     // ========================================================================
     // Unparseable number / quantity values never widen a search (#1319).
+    //
+    // #1319 made the query builder emit `FALSE` for them; since #1340 the
+    // shared gate (`validate_numeric_values`) rejects them before a query is
+    // built, so through `search` they are an `InvalidNumberValue`. The `FALSE`
+    // stays as defence in depth and is pinned by the builder's unit tests.
     // ========================================================================
 
     /// Three RiskAssessments (`ra-low` 0.2, `ra-high` 0.8, `ra-none` without a
@@ -12353,8 +12368,32 @@ mod postgres_integration {
         )
     }
 
-    /// Runs `cases` as `<resource_type>?<name>=<value>` and reports every
-    /// mismatch at once.
+    /// What [`ids_or_refused`] reports for a search the shared numeric gate
+    /// refused (#1340).
+    const REFUSED: &[&str] = &["<InvalidNumberValue>"];
+
+    /// The ids a search found, or [`REFUSED`].
+    fn ids_or_refused(
+        result: helios_persistence::error::StorageResult<helios_persistence::core::SearchResult>,
+    ) -> Result<Vec<String>, StorageError> {
+        if is_invalid_number(&result) {
+            return Ok(expect_ids(REFUSED));
+        }
+        result.map(|found| result_ids(&found))
+    }
+
+    /// Whether a search was refused by the shared numeric gate (#1340).
+    fn is_invalid_number<T>(result: &helios_persistence::error::StorageResult<T>) -> bool {
+        matches!(
+            result,
+            Err(StorageError::Search(
+                helios_persistence::error::SearchError::InvalidNumberValue { .. }
+            ))
+        )
+    }
+
+    /// Runs `cases` as `<resource_type>?<name>=<value>`, expects every value of
+    /// `invalid` to be refused, and reports every mismatch at once.
     async fn check_numeric_cases(
         backend: &PostgresBackend,
         tenant: &TenantContext,
@@ -12362,21 +12401,24 @@ mod postgres_integration {
         name: &str,
         param_type: helios_persistence::types::SearchParamType,
         cases: &[(&str, &[&str])],
+        invalid: &[&str],
     ) {
         use helios_persistence::core::SearchProvider;
         use helios_persistence::types::{SearchParameter, SearchQuery, SearchValue};
 
-        let mut failures = Vec::new();
-        for (value, expected) in cases {
-            let query = SearchQuery::new(resource_type).with_parameter(SearchParameter {
+        let query = |value: &str| {
+            SearchQuery::new(resource_type).with_parameter(SearchParameter {
                 name: name.to_string(),
                 param_type,
                 modifier: None,
                 values: vec![SearchValue::parse(value)],
                 chain: vec![],
                 components: vec![],
-            });
-            match backend.search(tenant, &query).await {
+            })
+        };
+        let mut failures = Vec::new();
+        for (value, expected) in cases {
+            match backend.search(tenant, &query(value)).await {
                 Ok(found) => {
                     let ids = result_ids(&found);
                     if ids != expect_ids(expected) {
@@ -12386,6 +12428,15 @@ mod postgres_integration {
                     }
                 }
                 Err(e) => failures.push(format!("{name}={value}: error {e}")),
+            }
+        }
+        for value in invalid {
+            let result = backend.search(tenant, &query(value)).await;
+            if !is_invalid_number(&result) {
+                failures.push(format!(
+                    "{name}={value}: expected InvalidNumberValue, got {:?}",
+                    result.map(|found| result_ids(&found))
+                ));
             }
         }
         assert!(failures.is_empty(), "\n{}", failures.join("\n"));
@@ -12410,28 +12461,30 @@ mod postgres_integration {
             ("gt-1", &["ra-high", "ra-low"]),
             ("+0.2", &["ra-low"]),
             ("gt.5", &["ra-high"]),
-            // Not a number: nothing, under every prefix.
-            ("abc", &[]),
-            ("eqabc", &[]),
-            ("neabc", &[]),
-            ("gtabc", &[]),
-            ("ltabc", &[]),
-            ("geabc", &[]),
-            ("leabc", &[]),
-            ("saabc", &[]),
-            ("ebabc", &[]),
-            ("apabc", &[]),
-            ("1e", &[]),
-            ("gt", &[]),
-            ("", &[]),
-            ("0.2abc", &[]),
+        ];
+        let invalid: &[&str] = &[
+            // Not a number: refused, under every prefix.
+            "abc",
+            "eqabc",
+            "neabc",
+            "gtabc",
+            "ltabc",
+            "geabc",
+            "leabc",
+            "saabc",
+            "ebabc",
+            "apabc",
+            "1e",
+            "gt",
+            "",
+            "0.2abc",
             // `f64::from_str` takes these; as bounds they match every row.
-            ("ltinf", &[]),
-            ("ltinfinity", &[]),
-            ("gt-inf", &[]),
-            ("ltnan", &[]),
-            ("neNaN", &[]),
-            ("lt1e999", &[]),
+            "ltinf",
+            "ltinfinity",
+            "gt-inf",
+            "ltnan",
+            "neNaN",
+            "lt1e999",
         ];
         check_numeric_cases(
             &backend,
@@ -12440,6 +12493,7 @@ mod postgres_integration {
             "probability",
             SearchParamType::Number,
             cases,
+            invalid,
         )
         .await;
     }
@@ -12470,19 +12524,21 @@ mod postgres_integration {
             ("5.4|http://unitsofmeasure.org|a\\|b", &["uq-pipe"]),
             ("5.4||a\\|b", &["uq-pipe"]),
             ("5.4|a\\|b", &["uq-pipe"]),
-            // Number part is not a number.
-            ("abc", &[]),
-            ("neabc", &[]),
-            ("apabc", &[]),
-            ("abc|http://unitsofmeasure.org|mg", &[]),
-            ("neabc|http://unitsofmeasure.org|mg", &[]),
-            ("gt|http://unitsofmeasure.org|mg", &[]),
-            ("|http://unitsofmeasure.org|mg", &[]),
-            ("||mg", &[]),
-            ("", &[]),
-            ("1e||mg", &[]),
-            ("ltinf||mg", &[]),
-            ("nenan||mg", &[]),
+        ];
+        // Number part is not a number.
+        let invalid: &[&str] = &[
+            "abc",
+            "neabc",
+            "apabc",
+            "abc|http://unitsofmeasure.org|mg",
+            "neabc|http://unitsofmeasure.org|mg",
+            "gt|http://unitsofmeasure.org|mg",
+            "|http://unitsofmeasure.org|mg",
+            "||mg",
+            "",
+            "1e||mg",
+            "ltinf||mg",
+            "nenan||mg",
         ];
         check_numeric_cases(
             &backend,
@@ -12491,6 +12547,7 @@ mod postgres_integration {
             "value-quantity",
             SearchParamType::Quantity,
             cases,
+            invalid,
         )
         .await;
     }
@@ -12538,21 +12595,20 @@ mod postgres_integration {
             (
                 "value-quantity=abc&code=8480-6",
                 vec![quantity("abc"), code.clone()],
-                &[],
+                REFUSED,
             ),
             (
                 "code=8480-6&value-quantity=gtabc&value-quantity=gt6",
                 vec![code.clone(), quantity("gtabc"), quantity("gt6")],
-                &[],
+                REFUSED,
             ),
         ];
         let mut failures = Vec::new();
         for (label, params, expected) in cases {
             let mut query = SearchQuery::new("Observation");
             query.parameters = params;
-            match backend.search(&tenant, &query).await {
-                Ok(found) => {
-                    let ids = result_ids(&found);
+            match ids_or_refused(backend.search(&tenant, &query).await) {
+                Ok(ids) => {
                     if ids != expect_ids(expected) {
                         failures.push(format!("{label}: got {ids:?}, expected {expected:?}"));
                     }
@@ -12579,12 +12635,12 @@ mod postgres_integration {
         let cases: &[(&str, &[&str])] = &[
             ("8480-6$5.4", &["uq-a", "uq-pipe"]),
             ("8480-6$gt6", &["uq-b"]),
-            ("8480-6$abc", &[]),
-            ("8480-6$neabc", &[]),
-            ("8480-6$gt", &[]),
-            ("8480-6$ltinf", &[]),
-            ("8480-6$nenan", &[]),
-            ("8480-6$abc|http://unitsofmeasure.org|mg", &[]),
+            ("8480-6$abc", REFUSED),
+            ("8480-6$neabc", REFUSED),
+            ("8480-6$gt", REFUSED),
+            ("8480-6$ltinf", REFUSED),
+            ("8480-6$nenan", REFUSED),
+            ("8480-6$abc|http://unitsofmeasure.org|mg", REFUSED),
         ];
         let mut failures = Vec::new();
         for (value, expected) in cases {
@@ -12605,9 +12661,8 @@ mod postgres_integration {
                     },
                 ],
             });
-            match backend.search(&tenant, &query).await {
-                Ok(found) => {
-                    let ids = result_ids(&found);
+            match ids_or_refused(backend.search(&tenant, &query).await) {
+                Ok(ids) => {
                     if ids != expect_ids(expected) {
                         failures.push(format!(
                             "code-value-quantity={value}: got {ids:?}, expected {expected:?}"
@@ -12690,14 +12745,14 @@ mod postgres_integration {
             // Positive and negative controls, then the unparseable values.
             (observation, "ge5", &["dr-container"]),
             (observation, "ge6", &[]),
-            (observation, "abc", &[]),
-            (observation, "neabc||mg", &[]),
-            (observation, "ltinf", &[]),
+            (observation, "abc", REFUSED),
+            (observation, "neabc||mg", REFUSED),
+            (observation, "ltinf", REFUSED),
             (risk, "lt0.5", &["dr-container"]),
             (risk, "gt0.5", &[]),
-            (risk, "abc", &[]),
-            (risk, "neabc", &[]),
-            (risk, "ltinf", &[]),
+            (risk, "abc", REFUSED),
+            (risk, "neabc", REFUSED),
+            (risk, "ltinf", REFUSED),
         ];
         let mut failures = Vec::new();
         for ((resource_type, other, other_type, other_value), numeric, expected) in cases {
@@ -12712,8 +12767,7 @@ mod postgres_integration {
                 param(other, *other_type, other_value),
                 param(name, ty, numeric),
             ];
-            let found = backend.search(&tenant, &query).await.unwrap();
-            let ids = result_ids(&found);
+            let ids = ids_or_refused(backend.search(&tenant, &query).await).unwrap();
             if ids != expect_ids(expected) {
                 failures.push(format!(
                     "{resource_type}?_contained=true&{other}={other_value}&{name}={numeric}: \
@@ -14553,6 +14607,218 @@ mod postgres_integration {
         use helios_persistence::core::SearchProvider;
         let backend = create_backend().await;
         assert!(backend.supports_contained_search());
+    }
+
+    /// A contained Observation for the repeated-parameter `_contained` test.
+    fn contained_observation(
+        id: &str,
+        code: &str,
+        date: &str,
+        categories: &[&str],
+    ) -> serde_json::Value {
+        let categories: Vec<serde_json::Value> = categories
+            .iter()
+            .map(|c| json!({"coding": [{"system": "http://example.org/cat", "code": c}]}))
+            .collect();
+        json!({
+            "resourceType": "Observation",
+            "id": id,
+            "status": "final",
+            "category": categories,
+            "code": {"coding": [{"system": "http://loinc.org", "code": code}]},
+            "effectiveDateTime": date,
+        })
+    }
+
+    /// Repeating a parameter under `_contained=true` is a conjunction: every
+    /// occurrence must hold, and on the same contained resource (#1336). A
+    /// comma list within one occurrence stays a disjunction.
+    ///
+    /// Containers (DiagnosticReport → contained Observations):
+    /// - `dr-ab`: `a` (code X, 2020-06, cat1+cat2) and `b` (Y, 2021-06, cat1)
+    /// - `dr-b`: only `b` (Y, 2021-06, cat1) — satisfies `ge2020` alone
+    /// - `dr-early`: only `e` (Y, 2019-06, cat2) — satisfies `le2020` alone
+    /// - `dr-bc`: `b2` (Y, 2020-07, cat1) and `c` (X, 2022-01, cat2) — no one
+    ///   contained resource has code X and a 2020 date, or both categories
+    /// - `dr-late`: `l` (X, 2020-11, cat1)
+    #[tokio::test]
+    async fn postgres_integration_contained_repeated_params_are_anded() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            ContainedMode, ContainedReturn, SearchParamType, SearchParameter, SearchQuery,
+            SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("contained-repeated-1336");
+        let containers = [
+            (
+                "dr-ab",
+                vec![
+                    contained_observation("a", "X", "2020-06-15", &["cat1", "cat2"]),
+                    contained_observation("b", "Y", "2021-06-15", &["cat1"]),
+                ],
+            ),
+            (
+                "dr-b",
+                vec![contained_observation("b", "Y", "2021-06-15", &["cat1"])],
+            ),
+            (
+                "dr-early",
+                vec![contained_observation("e", "Y", "2019-06-15", &["cat2"])],
+            ),
+            (
+                "dr-bc",
+                vec![
+                    contained_observation("b2", "Y", "2020-07-01", &["cat1"]),
+                    contained_observation("c", "X", "2022-01-01", &["cat2"]),
+                ],
+            ),
+            (
+                "dr-late",
+                vec![contained_observation("l", "X", "2020-11-20", &["cat1"])],
+            ),
+        ];
+        for (id, contained) in containers {
+            backend
+                .create(
+                    &tenant,
+                    "DiagnosticReport",
+                    json!({
+                        "resourceType": "DiagnosticReport",
+                        "id": id,
+                        "status": "final",
+                        "code": {"text": "panel"},
+                        "contained": contained,
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let param = |name: &str, ty: SearchParamType, values: &[&str]| SearchParameter {
+            name: name.to_string(),
+            param_type: ty,
+            modifier: None,
+            values: values.iter().map(|v| SearchValue::parse(v)).collect(),
+            chain: vec![],
+            components: vec![],
+        };
+        let date = |values: &[&str]| param("date", SearchParamType::Date, values);
+        let token = |name: &str, value: &str| param(name, SearchParamType::Token, &[value]);
+
+        let cases: Vec<(&str, Vec<SearchParameter>, &[&str])> = vec![
+            // Positive controls: single occurrences, proving the rows are indexed.
+            (
+                "date=ge2020-01-01",
+                vec![date(&["ge2020-01-01"])],
+                &["dr-ab", "dr-b", "dr-bc", "dr-late"],
+            ),
+            (
+                "date=le2020-12-31",
+                vec![date(&["le2020-12-31"])],
+                &["dr-ab", "dr-bc", "dr-early", "dr-late"],
+            ),
+            (
+                "code=X",
+                vec![token("code", "X")],
+                &["dr-ab", "dr-bc", "dr-late"],
+            ),
+            (
+                "category=cat2",
+                vec![token("category", "cat2")],
+                &["dr-ab", "dr-bc", "dr-early"],
+            ),
+            // The range from the issue: dr-b and dr-early satisfy one bound only.
+            (
+                "date=ge2020-01-01&date=le2020-12-31",
+                vec![date(&["ge2020-01-01"]), date(&["le2020-12-31"])],
+                &["dr-ab", "dr-bc", "dr-late"],
+            ),
+            // Different parameters must hold on the SAME contained resource:
+            // dr-bc has code X on `c` and a 2020 date on `b2`.
+            (
+                "code=X&date=le2020-12-31",
+                vec![token("code", "X"), date(&["le2020-12-31"])],
+                &["dr-ab", "dr-late"],
+            ),
+            (
+                "code=X&date=ge2020-01-01&date=le2020-12-31",
+                vec![
+                    token("code", "X"),
+                    date(&["ge2020-01-01"]),
+                    date(&["le2020-12-31"]),
+                ],
+                &["dr-ab", "dr-late"],
+            ),
+            // OR within an occurrence, AND across occurrences.
+            (
+                "date=le2020-12-31&date=lt2020-03-01,gt2020-10-01",
+                vec![
+                    date(&["le2020-12-31"]),
+                    date(&["lt2020-03-01", "gt2020-10-01"]),
+                ],
+                &["dr-early", "dr-late"],
+            ),
+            // Repeated token: both categories on one contained resource.
+            (
+                "category=cat1&category=cat2",
+                vec![token("category", "cat1"), token("category", "cat2")],
+                &["dr-ab"],
+            ),
+        ];
+
+        let mut failures = Vec::new();
+        for (label, parameters, expected) in &cases {
+            let mut query = SearchQuery::new("Observation");
+            query.contained = ContainedMode::On;
+            query.parameters = parameters.clone();
+            let found = backend.search(&tenant, &query).await.unwrap();
+            let ids = result_ids(&found);
+            if ids != expect_ids(expected) {
+                failures.push(format!(
+                    "Observation?_contained=true&{label}: got {ids:?}, expected {expected:?}"
+                ));
+            }
+        }
+
+        // `_containedType=contained` returns only the contained resources that
+        // satisfy every occurrence — `a`, not its sibling `b`.
+        let mut query = SearchQuery::new("Observation");
+        query.contained = ContainedMode::On;
+        query.contained_return = ContainedReturn::Contained;
+        query.parameters = vec![date(&["ge2020-01-01"]), date(&["le2020-12-31"])];
+        let found = backend.search(&tenant, &query).await.unwrap();
+        let ids = result_ids(&found);
+        if ids != expect_ids(&["a", "b2", "l"]) {
+            failures.push(format!(
+                "_containedType=contained&date=ge2020-01-01&date=le2020-12-31: \
+                 got {ids:?}, expected [a, b2, l]"
+            ));
+        }
+
+        // `_contained=both` merges top-level matches with the containers; the
+        // range applies to both halves.
+        for (id, when) in [("top-in", "2020-05-01"), ("top-out", "2021-05-01")] {
+            let top = contained_observation(id, "X", when, &["cat1"]);
+            backend
+                .create(&tenant, "Observation", top, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+        let mut query = SearchQuery::new("Observation");
+        query.contained = ContainedMode::Both;
+        query.parameters = vec![date(&["ge2020-01-01"]), date(&["le2020-12-31"])];
+        let found = backend.search(&tenant, &query).await.unwrap();
+        let ids = result_ids(&found);
+        if ids != expect_ids(&["dr-ab", "dr-bc", "dr-late", "top-in"]) {
+            failures.push(format!(
+                "_contained=both&date=ge2020-01-01&date=le2020-12-31: got {ids:?}"
+            ));
+        }
+
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
     }
 
     // ========================================================================
@@ -18431,6 +18697,30 @@ mod postgres_integration {
         .await;
     }
 
+    /// #1340: a number or quantity value that is not a number is an error on
+    /// every path (#1332 made it `FALSE`; before that the constraint was
+    /// dropped).
+    #[tokio::test]
+    async fn postgres_integration_invalid_numbers_are_rejected_on_every_path() {
+        let backend = create_backend().await;
+        super::numeric_validation_suite::invalid_numbers_are_rejected_on_every_path(
+            &backend,
+            &unique_base("numeric_validation"),
+        )
+        .await;
+    }
+
+    /// #1340: the same values as conditional criteria.
+    #[tokio::test]
+    async fn postgres_integration_invalid_numbers_are_rejected_in_conditional_criteria() {
+        let backend = create_backend().await;
+        super::numeric_validation_suite::invalid_numbers_are_rejected_in_conditional_criteria(
+            &backend,
+            &unique_base("numeric_validation_cond"),
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn postgres_integration_day_precision_date_boundaries() {
         let backend = create_backend().await;
@@ -18863,6 +19153,18 @@ mod postgres_integration {
         super::date_minute_index_suite::minute_precision_stored_values_are_indexed(
             &backend,
             &unique_base("date_minute_index"),
+        )
+        .await;
+    }
+
+    /// #1337: `1e2` is one significant figure, `[50, 150)`.
+    #[tokio::test]
+    async fn postgres_integration_exponent_values_use_significant_figures() {
+        let backend = create_backend().await;
+        super::number_exponent_suite::exponent_values_use_significant_figures(
+            &backend,
+            &unique_base("number_exponent"),
+            true,
         )
         .await;
     }

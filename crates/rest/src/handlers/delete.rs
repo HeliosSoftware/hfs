@@ -232,9 +232,25 @@ where
 ///
 /// # Response
 ///
-/// - `204 No Content` - Resource(s) deleted
-/// - `404 Not Found` - No resources matched
-/// - `412 Precondition Failed` - Multiple resources matched
+/// - `204 No Content` - the single match was deleted, **or nothing matched**
+/// - `400 Bad Request` - criteria that cannot be evaluated (unknown parameter,
+///   empty value, …); nothing is deleted
+/// - `405 Method Not Allowed` - `AuditEvent` resources are immutable
+/// - `412 Precondition Failed` - more than one resource matched
+///   (`conditionalDelete` is advertised as `single`)
+///
+/// # No match
+///
+/// FHIR R4, R4B and R5 word it identically
+/// ([conditional delete](https://hl7.org/fhir/R4/http.html#delete)): "No
+/// matches or One Match: The server performs an ordinary delete on the matching
+/// resource", and an ordinary delete says: "Upon successful deletion, or if the
+/// resource does not exist at all, the server should return either a 200 OK if
+/// the response contains a payload, or a 204 No Content with no response
+/// payload". No payload is sent, so no match is `204`, not `404` (#1361) — the
+/// same answer a batch `DELETE [type]?criteria` entry gives. It differs from
+/// conditional *patch*, where the same text says `404`: a delete that finds
+/// nothing has reached its goal, a patch has not.
 pub async fn conditional_delete_handler<S>(
     State(state): State<AppState<S>>,
     Path(resource_type): Path<String>,
@@ -304,7 +320,9 @@ where
             Ok(response)
         }
         ConditionalDeleteResult::NoMatch => {
-            // Per FHIR spec, no match on conditional delete is success
+            // "No matches or One Match: The server performs an ordinary
+            // delete", which answers 204 "if the resource does not exist at
+            // all" — see the handler doc.
             Ok(StatusCode::NO_CONTENT.into_response())
         }
         ConditionalDeleteResult::MultipleMatches(count) => Err(RestError::MultipleMatches {

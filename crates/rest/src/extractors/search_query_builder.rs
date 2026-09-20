@@ -216,6 +216,12 @@ fn build_query(
     // time instead (#1289), Elasticsearch for the year 2000 (#1293), and
     // SQLite rolled `2024-02-30` over into March (#1295).
     helios_persistence::search::validate_date_values(&query)?;
+    // The numeric sibling: a number or quantity value whose number is not one
+    // (`probability=abc`, `value-quantity=ltinf||mg`), composite components
+    // included. Elasticsearch used to drop such a constraint and PostgreSQL did
+    // until #1332 (#1319); SQLite, MongoDB and Elasticsearch took `inf` and
+    // `nan` for numbers, so `ltinf` matched every row (#1340).
+    helios_persistence::search::validate_numeric_values(&query)?;
 
     Ok(query)
 }
@@ -442,56 +448,6 @@ fn parse_search_parameter_in(
         )?;
     }
 
-    // Reject a value that is not a number for a registry-known number or
-    // quantity parameter, rather than handing it to a storage backend (#1319):
-    // PostgreSQL and Elasticsearch used to skip a value whose number part does
-    // not parse, so `probability=abc` was an unconstrained search; SQLite
-    // matches nothing and MongoDB errors. For a quantity only the number part —
-    // everything before the first `|` — is checked; system and code are free
-    // text. Scoped like the modifier check above: an unregistered param only
-    // has a guessed type. Skipped for `:missing` (its value is a boolean), for
-    // chains (the value belongs to the chain's last link, whose type is not
-    // resolved here), and for an empty value, which is left to the backend.
-    //
-    // Date values get the same treatment from the gate every backend shares,
-    // `helios_persistence::search::validate_date_values`, in
-    // `build_search_query`.
-    let registered = registry.get_param(resource_type, base_name).is_some()
-        || registry.get_param("Resource", base_name).is_some();
-    if registered
-        && matches!(
-            param_type,
-            SearchParamType::Number | SearchParamType::Quantity
-        )
-        && chain.is_empty()
-        && !matches!(modifier, Some(SearchModifier::Missing))
-    {
-        let number_part = |v: &str| -> String {
-            match param_type {
-                SearchParamType::Quantity => v.split('|').next().unwrap_or_default().to_string(),
-                _ => v.to_string(),
-            }
-        };
-        if let Some(bad) = values
-            .iter()
-            .find(|v| !v.value.is_empty() && !is_number_search_value(&number_part(&v.value)))
-        {
-            return Err(RestError::InvalidParameter {
-                param: name.to_string(),
-                message: format!(
-                    "'{}' is not a valid {param_type} value (expected [prefix]number{}, where \
-                     number is a decimal with an optional exponent)",
-                    bad.value,
-                    if param_type == SearchParamType::Quantity {
-                        "[|system|code]"
-                    } else {
-                        ""
-                    }
-                ),
-            });
-        }
-    }
-
     let mut param = SearchParameter {
         name: base_name.to_string(),
         param_type,
@@ -523,38 +479,6 @@ fn parse_search_parameter_in(
     }
 
     Ok(param)
-}
-
-/// Whether `value` (comparator prefix already removed) is the number of a FHIR
-/// number or quantity search value: an optional sign, digits with an optional
-/// fraction, and an optional exponent.
-///
-/// Deliberately the widest reading, because a false rejection turns a working
-/// search into a 400: a leading `+`, leading zeros and a bare leading or
-/// trailing point (`.5`, `5.`) are tolerated. What it stops is what is not a
-/// number at all — `abc`, `1e` — and the words a float parser accepts for
-/// non-finite values (`inf`, `nan`), which as a comparison bound match every
-/// row. Mirrors the PostgreSQL builder's `parse_search_number`, which stays as
-/// defence in depth.
-fn is_number_search_value(value: &str) -> bool {
-    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
-    let unsigned = value.strip_prefix(['+', '-']).unwrap_or(value);
-    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
-        Some((mantissa, exponent)) => (mantissa, Some(exponent)),
-        None => (unsigned, None),
-    };
-    if let Some(exponent) = exponent {
-        let exponent = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
-        if exponent.is_empty() || !digits(exponent) {
-            return false;
-        }
-    }
-    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-    if (whole.is_empty() && fraction.is_empty()) || !digits(whole) || !digits(fraction) {
-        return false;
-    }
-    // Rules out a literal that overflows to infinity (`1e999`).
-    value.parse::<f64>().is_ok_and(f64::is_finite)
 }
 
 /// Parses a direct (unchained) parameter name into the base name and optional
@@ -1861,19 +1785,24 @@ mod tests {
 
     #[test]
     fn test_number_search_value_grammar() {
+        // The grammar itself is `helios_persistence::search::FhirNumberValue`'s,
+        // and is tested exhaustively there; this pins that the REST layer
+        // applies that one and no laxer reading of its own.
+        let registry = test_registry();
+
         for value in [
             "0", "5", "5.4", "-5.4", "100.00", "1e3", "1E3", "1e+3", "1.5E-2", "-1.5e-2",
             // Tolerated beyond the FHIR decimal grammar.
             "+5.4", "007", ".5", "5.", "-.5",
+            // A `+` that form-decoding turned into a space.
+            "1e 3", "gt 5.4",
         ] {
-            assert!(is_number_search_value(value), "should accept {value:?}");
+            build_one("RiskAssessment", "probability", value, &registry)
+                .unwrap_or_else(|e| panic!("should accept {value:?}: {e:?}"));
         }
         for value in [
             "abc",
             "",
-            " ",
-            " 5",
-            "5 ",
             "1e",
             "1e+",
             "e5",
@@ -1892,7 +1821,10 @@ mod tests {
             "nan",
             "1e999",
         ] {
-            assert!(!is_number_search_value(value), "should reject {value:?}");
+            assert!(
+                build_one("RiskAssessment", "probability", value, &registry).is_err(),
+                "should reject {value:?}"
+            );
         }
     }
 
@@ -1907,8 +1839,7 @@ mod tests {
             // One bad alternative spoils the OR-list.
             "0.5,nope",
         ] {
-            let error = parse_search_parameter("RiskAssessment", "probability", value, &registry)
-                .unwrap_err();
+            let error = build_one("RiskAssessment", "probability", value, &registry).unwrap_err();
             assert!(
                 matches!(&error, RestError::InvalidParameter { param, .. } if param == "probability"),
                 "unexpected error for {value:?}: {error:?}"
@@ -1923,14 +1854,64 @@ mod tests {
             "||mg",
             "ltinf||mg",
             "5.4||mg,abc||mg",
+            // An escaped pipe does not end the number part.
+            "5.4\\|mg",
         ] {
-            let error = parse_search_parameter("Observation", "value-quantity", value, &registry)
-                .unwrap_err();
+            let error = build_one("Observation", "value-quantity", value, &registry).unwrap_err();
             assert!(
                 matches!(&error, RestError::InvalidParameter { param, .. } if param == "value-quantity"),
                 "unexpected error for {value:?}: {error:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_invalid_number_in_a_composite_component_is_rejected() {
+        let mut registry = test_registry();
+        let mut composite = SearchParameterDefinition::new(
+            "http://hl7.org/fhir/SearchParameter/Observation-code-value-quantity",
+            "code-value-quantity",
+            SearchParamType::Composite,
+            "Observation",
+        )
+        .with_base(vec!["Observation"]);
+        composite.component = Some(
+            [
+                "http://hl7.org/fhir/SearchParameter/Observation-code",
+                "http://hl7.org/fhir/SearchParameter/Observation-value-quantity",
+            ]
+            .into_iter()
+            .map(
+                |definition| helios_persistence::search::registry::CompositeComponentDef {
+                    definition: definition.to_string(),
+                    expression: String::new(),
+                },
+            )
+            .collect(),
+        );
+        registry.register(composite).unwrap();
+
+        for value in [
+            "8480-6$abc",
+            "8480-6$gtabc",
+            "8480-6$ltinf||mm[Hg]",
+            "8480-6$",
+        ] {
+            let error =
+                build_one("Observation", "code-value-quantity", value, &registry).unwrap_err();
+            assert!(
+                matches!(&error, RestError::InvalidParameter { param, .. } if param == "code-value-quantity"),
+                "unexpected error for {value:?}: {error:?}"
+            );
+        }
+        // The token half is not a number, whatever it looks like.
+        build_one(
+            "Observation",
+            "code-value-quantity",
+            "abc$gt5.4|http://unitsofmeasure.org|mm[Hg]",
+            &registry,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1943,10 +1924,9 @@ mod tests {
             ("lt1e3", SearchPrefix::Lt, "1e3"),
             ("ne-1.5E-2", SearchPrefix::Ne, "-1.5E-2"),
         ] {
-            let param =
-                parse_search_parameter("RiskAssessment", "probability", value, &registry).unwrap();
-            assert_eq!(param.values[0].prefix, prefix);
-            assert_eq!(param.values[0].value, bare);
+            let query = build_one("RiskAssessment", "probability", value, &registry).unwrap();
+            assert_eq!(query.parameters[0].values[0].prefix, prefix);
+            assert_eq!(query.parameters[0].values[0].value, bare);
         }
 
         for (value, prefix, bare) in [
@@ -1970,10 +1950,9 @@ mod tests {
                 "-5.4||not a number",
             ),
         ] {
-            let param =
-                parse_search_parameter("Observation", "value-quantity", value, &registry).unwrap();
-            assert_eq!(param.values[0].prefix, prefix);
-            assert_eq!(param.values[0].value, bare);
+            let query = build_one("Observation", "value-quantity", value, &registry).unwrap();
+            assert_eq!(query.parameters[0].values[0].prefix, prefix);
+            assert_eq!(query.parameters[0].values[0].value, bare);
         }
     }
 
@@ -1982,15 +1961,23 @@ mod tests {
         let registry = test_registry();
 
         // `:missing` carries a boolean, not a number.
-        parse_search_parameter("RiskAssessment", "probability:missing", "true", &registry).unwrap();
-        parse_search_parameter("Observation", "value-quantity:missing", "false", &registry)
-            .unwrap();
-        // An unregistered parameter only has a guessed type.
-        parse_search_parameter("RiskAssessment", "custom-number", "gtabc", &registry).unwrap();
+        build_one("RiskAssessment", "probability:missing", "true", &registry).unwrap();
+        build_one("Observation", "value-quantity:missing", "false", &registry).unwrap();
+        // A chain's value belongs to its last link, whose type is not known
+        // here; the storage gate validates the terminal query instead.
+        build_one(
+            "DiagnosticReport",
+            "result.value-quantity",
+            "abc",
+            &registry,
+        )
+        .unwrap();
+        // An unregistered parameter is never typed as a number by a value that
+        // is not one.
+        build_one("RiskAssessment", "custom-number", "gtabc", &registry).unwrap();
         // Not a number parameter at all.
-        parse_search_parameter("Patient", "name", "abc", &registry).unwrap();
-        // An empty value is left to the backend, as for dates.
-        parse_search_parameter("RiskAssessment", "probability", "", &registry).unwrap();
+        build_one("Patient", "name", "abc", &registry).unwrap();
+        build_one("Patient", "name", "inf", &registry).unwrap();
     }
 
     #[test]

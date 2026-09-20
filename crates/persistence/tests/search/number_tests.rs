@@ -190,3 +190,42 @@ async fn test_number_prefix_boundary_matrix() {
         );
     }
 }
+
+/// The shared table for exponent-form number and quantity values (#1337);
+/// PostgreSQL, MongoDB and Elasticsearch run the same one.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_exponent_values_use_significant_figures() {
+    let backend = create_sqlite_backend();
+    super::number_exponent_suite::exponent_values_use_significant_figures(
+        &backend,
+        "number-exponent",
+        true,
+    )
+    .await;
+}
+
+/// The shared number / quantity validation tables (#1319, #1340); PostgreSQL,
+/// MongoDB and Elasticsearch run the same ones.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_numeric_validation_suite() {
+    let backend = super::make_sqlite_backend();
+    super::numeric_validation_suite::invalid_numbers_are_rejected_on_every_path(
+        &backend,
+        "numeric-validation",
+    )
+    .await;
+}
+
+/// The same values as conditional criteria.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_numeric_validation_suite_conditional_criteria() {
+    let backend = super::make_sqlite_backend();
+    super::numeric_validation_suite::invalid_numbers_are_rejected_in_conditional_criteria(
+        &backend,
+        "numeric-validation-conditional",
+    )
+    .await;
+}

@@ -44,6 +44,9 @@ use crate::state::AppState;
 /// ## Type-level
 /// - `GET /{type}` - Search
 /// - `POST /{type}` - Create
+/// - `PUT /{type}?criteria` - Conditional update
+/// - `PATCH /{type}?criteria` - Conditional patch
+/// - `DELETE /{type}?criteria` - Conditional delete
 /// - `POST /{type}/_search` - Search (POST)
 /// - `GET /{type}/_history` - Type history
 ///
@@ -372,6 +375,11 @@ where
         .route(
             "/{resource_type}",
             delete(handlers::conditional_delete_handler::<S>),
+        )
+        // Conditional patch: PATCH [base]/[type]?[search-params]
+        .route(
+            "/{resource_type}",
+            patch(handlers::conditional_patch_handler::<S>),
         )
         .route(
             "/{resource_type}/_search",

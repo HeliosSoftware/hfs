@@ -4,14 +4,72 @@
 //! Uses nested objects for search parameters to ensure correct multi-value matching.
 
 use elasticsearch::indices::{
-    IndicesCreateParts, IndicesExistsParts, IndicesGetSettingsParts, IndicesPutSettingsParts,
-    IndicesPutTemplateParts,
+    IndicesCreateParts, IndicesExistsParts, IndicesGetMappingParts, IndicesGetSettingsParts,
+    IndicesPutMappingParts, IndicesPutSettingsParts, IndicesPutTemplateParts,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::error::{BackendError, StorageResult};
 
 use super::backend::ElasticsearchBackend;
+
+/// Version of the index mapping built by `create_index_mapping`.
+///
+/// Every index HFS creates carries this number in its mapping `_meta` under
+/// [`SCHEMA_VERSION_META_KEY`]. At startup, and the first time a process touches
+/// an index in `ensure_index`, `reconcile_index_mappings` /
+/// `reconcile_index` compare the stored number with this one and `PUT
+/// _mapping` the current mapping onto any index that is behind. An index with
+/// no marker predates the mechanism and counts as version `0`.
+///
+/// # When to bump
+///
+/// Bump this by one in the same commit as **any** edit to the `mappings` half
+/// of `create_index_mapping`. Without the bump, existing indices never see
+/// the change (#1335: `ignore_malformed` from #1314 reached new indices only).
+/// Edits to the `settings` half do not need a bump: settings are not part of
+/// `PUT _mapping`, and the dynamic ones have their own pass
+/// (`raise_nested_objects_limit`).
+///
+/// # What a bump can and cannot deliver
+///
+/// Elasticsearch only accepts *additive* mapping changes on a live index.
+/// Verified by hand against 7.17.29 and 8.15.0, which behave the same:
+///
+/// - **Applies in place:** a new field, a new sub-field (`fields`), `_meta`,
+///   and these parameters of an existing field: `ignore_malformed` (including
+///   on a date inside a `nested` object), `ignore_above`, `coerce`, `meta`.
+///   It affects documents indexed from then on; nothing is re-indexed.
+/// - **Rejected with a `400`** (`illegal_argument_exception` "Cannot update
+///   parameter [...]" / "cannot be changed from type", `mapper_exception`):
+///   a field's `type`, `format`, `analyzer`, `normalizer`, `null_value`,
+///   `index`, `doc_values`, `store`, an object's `enabled`, and `object` ⇄
+///   `nested`. Such a change needs a new index and a `$reindex`; a bump alone
+///   only produces the error below for every existing index, on every start.
+/// - A mapping that references a *new* analyzer or normalizer is rejected too
+///   (`mapper_parsing_exception`): analysis settings are static.
+///
+/// Two properties of `PUT _mapping` shape the implementation. `_meta` is
+/// **replaced**, not merged, so the marker is merged into whatever `_meta` an
+/// index already has. And an updatable parameter that is *omitted* is reset to
+/// its default, so an older build must never re-apply its mapping over a newer
+/// one: an index whose stored version is at or above this one is left alone.
+///
+/// # Failure policy
+///
+/// Reconciliation never blocks startup and never fails a write. A failure is
+/// logged at `error` with the index name and the server carries on with that
+/// index on its old mapping.
+///
+/// # History
+///
+/// - `1` — first versioned mapping; delivers `ignore_malformed` on
+///   `search_params.date.value` and `search_params.composite.date` (#1314) to
+///   indices created before it.
+pub const SCHEMA_VERSION: u64 = 1;
+
+/// The key, in an index mapping's `_meta`, that holds [`SCHEMA_VERSION`].
+pub const SCHEMA_VERSION_META_KEY: &str = "hfs_schema_version";
 
 /// Creates the index mapping for FHIR resources.
 ///
@@ -39,6 +97,9 @@ pub fn create_index_mapping(config: &super::backend::ElasticsearchConfig) -> ser
             }
         },
         "mappings": {
+            // Any edit below needs a `SCHEMA_VERSION` bump to reach existing
+            // indices — see its docs.
+            "_meta": { SCHEMA_VERSION_META_KEY: SCHEMA_VERSION },
             "properties": {
                 // Metadata fields
                 "resource_type": { "type": "keyword" },
@@ -124,8 +185,8 @@ pub fn create_index_mapping(config: &super::backend::ElasticsearchConfig) -> ser
                                 // is the net under it: a value Elasticsearch
                                 // cannot parse costs the document that one
                                 // field instead of rejecting the whole
-                                // document (#1314). It reaches new indices
-                                // only; an existing index keeps its mapping.
+                                // document (#1314). Existing indices get it
+                                // from the reconcile pass (#1335).
                                 "value": {
                                     "type": "date",
                                     "format": "strict_date_optional_time||epoch_millis||yyyy||yyyy-MM||yyyy-MM-dd",
@@ -271,7 +332,6 @@ pub async fn create_index_template(backend: &ElasticsearchBackend) -> StorageRes
     Ok(())
 }
 
-/// Ensures an index exists for the given tenant and resource type, creating it if necessary.
 /// The index setting capping how many nested objects one document may hold.
 const NESTED_OBJECTS_LIMIT_SETTING: &str = "index.mapping.nested_objects.limit";
 
@@ -401,6 +461,307 @@ fn index_unavailable(message: String) -> crate::error::StorageError {
     })
 }
 
+/// What reconciling one index's mapping came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReconcileOutcome {
+    /// Already at [`SCHEMA_VERSION`] or newer; nothing was sent.
+    Current,
+    /// The current mapping was applied and the version marker written.
+    Updated,
+    /// The index disappeared between being listed and being updated.
+    Gone,
+    /// The cluster could not answer (transport failure, `409`, `429`, `5xx`).
+    /// Worth trying again: the next startup, or the next `ensure_index`, does.
+    Transient(String),
+    /// Elasticsearch refused the mapping (`400`: a change that cannot be made
+    /// in place) or the request (`401`/`403`: no `manage` privilege). Trying
+    /// again cannot help.
+    Rejected(String),
+}
+
+/// Totals of one startup [`reconcile_index_mappings`] pass.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReconcileReport {
+    /// Indices already at [`SCHEMA_VERSION`] or newer.
+    pub current: usize,
+    /// Indices brought up to [`SCHEMA_VERSION`].
+    pub updated: usize,
+    /// Indices left on their old mapping; each was logged.
+    pub failed: usize,
+}
+
+/// `filter_path` that keeps a `GET _mapping` response to a few bytes per index:
+/// the `_meta` holding the version marker, plus one field every HFS index has.
+/// The second entry keeps an index with no `_meta` in the response (a filter
+/// that matches nothing drops the index altogether) and leaves out an index
+/// under the prefix that HFS did not create.
+const RECONCILE_FILTER_PATH: &[&str] = &[
+    "*.mappings._meta",
+    "*.mappings.properties.resource_type.type",
+];
+
+/// The [`SCHEMA_VERSION`] an index's mapping `_meta` records; `0` when it
+/// records none.
+fn stored_schema_version(meta: Option<&Value>) -> u64 {
+    meta.and_then(|m| m.get(SCHEMA_VERSION_META_KEY))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
+/// The HFS indices in a filtered `GET _mapping` response whose stored version
+/// is below [`SCHEMA_VERSION`], each with its existing `_meta`, sorted by name;
+/// and how many HFS indices are already current.
+fn stale_indices(body: &Value) -> (Vec<(String, Option<Value>)>, usize) {
+    let mut stale = Vec::new();
+    let mut current = 0;
+    for (name, entry) in body.as_object().into_iter().flatten() {
+        if entry
+            .pointer("/mappings/properties/resource_type")
+            .is_none()
+        {
+            continue;
+        }
+        let meta = entry.pointer("/mappings/_meta");
+        if stored_schema_version(meta) >= SCHEMA_VERSION {
+            current += 1;
+        } else {
+            stale.push((name.clone(), meta.cloned()));
+        }
+    }
+    stale.sort_by(|a, b| a.0.cmp(&b.0));
+    (stale, current)
+}
+
+/// The `PUT _mapping` body for an index: the current mapping, with the version
+/// marker merged into the `_meta` the index already has. `PUT _mapping`
+/// replaces `_meta` wholesale, so sending only the marker would erase any
+/// other key an operator put there.
+fn reconcile_mapping_body(
+    config: &super::backend::ElasticsearchConfig,
+    existing_meta: Option<&Value>,
+) -> Value {
+    let mut mappings = create_index_mapping(config)["mappings"].clone();
+    let mut meta = existing_meta
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    meta.insert(SCHEMA_VERSION_META_KEY.to_string(), json!(SCHEMA_VERSION));
+    mappings["_meta"] = Value::Object(meta);
+    mappings
+}
+
+/// Whether an existing `_meta` holds anything besides the version marker, in
+/// which case the index needs a `PUT _mapping` body of its own.
+fn has_foreign_meta(meta: Option<&Value>) -> bool {
+    meta.and_then(Value::as_object)
+        .is_some_and(|m| m.keys().any(|k| k != SCHEMA_VERSION_META_KEY))
+}
+
+/// Classifies a non-success `PUT _mapping` (or `GET _mapping`) answer.
+fn classify_mapping_failure(status: u16, body: &str) -> ReconcileOutcome {
+    let detail = format!("status {status}: {body}");
+    match status {
+        404 => ReconcileOutcome::Gone,
+        // `409`: a concurrent cluster-state update won; the same request
+        // succeeds once it has settled.
+        409 | 429 | 500..=599 => ReconcileOutcome::Transient(detail),
+        _ => ReconcileOutcome::Rejected(detail),
+    }
+}
+
+/// Sends one `PUT _mapping` to `indices`.
+///
+/// Idempotent, which is what makes several HFS instances starting together
+/// safe: they all read the same stale version and all send the same body, and
+/// Elasticsearch serialises the mapping updates on the master — the second one
+/// is a no-op.
+async fn put_mapping(
+    backend: &ElasticsearchBackend,
+    indices: &[&str],
+    body: Value,
+) -> ReconcileOutcome {
+    let response = match backend
+        .client()
+        .indices()
+        .put_mapping(IndicesPutMappingParts::Index(indices))
+        .body(body)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(e) => return ReconcileOutcome::Transient(e.to_string()),
+    };
+    let status = response.status_code();
+    if status.is_success() {
+        return ReconcileOutcome::Updated;
+    }
+    let text = response.text().await.unwrap_or_default();
+    classify_mapping_failure(status.as_u16(), &text)
+}
+
+/// Reads the filtered mapping of `target` (an index name or a glob).
+async fn read_schema_versions(
+    backend: &ElasticsearchBackend,
+    target: &str,
+) -> Result<Value, ReconcileOutcome> {
+    let response = backend
+        .client()
+        .indices()
+        .get_mapping(IndicesGetMappingParts::Index(&[target]))
+        .filter_path(RECONCILE_FILTER_PATH)
+        .allow_no_indices(true)
+        .ignore_unavailable(true)
+        .send()
+        .await
+        .map_err(|e| ReconcileOutcome::Transient(e.to_string()))?;
+    let status = response.status_code();
+    if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        return Err(classify_mapping_failure(status.as_u16(), &text));
+    }
+    response
+        .json::<Value>()
+        .await
+        .map_err(|e| ReconcileOutcome::Transient(format!("unreadable mapping response: {e}")))
+}
+
+/// Logs an index that stays on its old mapping, and records the ones that a
+/// retry cannot fix so `ensure_index` does not ask again on every write.
+fn note_reconcile_outcome(backend: &ElasticsearchBackend, index: &str, outcome: &ReconcileOutcome) {
+    match outcome {
+        ReconcileOutcome::Current | ReconcileOutcome::Updated => {
+            backend.mark_schema_checked(index);
+        }
+        ReconcileOutcome::Gone => {}
+        ReconcileOutcome::Transient(detail) => tracing::error!(
+            index,
+            schema_version = SCHEMA_VERSION,
+            detail,
+            "could not reconcile the Elasticsearch index mapping; the index keeps its old \
+             mapping until the next attempt (next write to it, or next startup)"
+        ),
+        ReconcileOutcome::Rejected(detail) => {
+            backend.mark_schema_checked(index);
+            tracing::error!(
+                index,
+                schema_version = SCHEMA_VERSION,
+                detail,
+                "Elasticsearch refused the current index mapping; the index keeps its old \
+                 mapping. A `400` means the change cannot be made in place (recreate the index \
+                 and `$reindex`); a `401`/`403` means the HFS user lacks the `manage` index \
+                 privilege"
+            );
+        }
+    }
+}
+
+/// Brings every existing HFS index under the configured prefix up to
+/// [`SCHEMA_VERSION`]. Run at startup; see [`SCHEMA_VERSION`] for the
+/// convention and the failure policy.
+///
+/// Indices are `{prefix}_{tenant}_{type}` — one per tenant per resource type —
+/// so they are discovered with the `{prefix}_*` glob, as the template and
+/// [`raise_nested_objects_limit`] do. One request when nothing is stale (the
+/// normal start); otherwise one more per `INDICES_PER_PUT` stale indices.
+///
+/// Infallible by design: every failure is logged and counted, never returned.
+pub async fn reconcile_index_mappings(backend: &ElasticsearchBackend) -> ReconcileReport {
+    /// Index names per `PUT _mapping`, keeping the request URL short.
+    const INDICES_PER_PUT: usize = 50;
+
+    let pattern = format!("{}_*", backend.config().index_prefix);
+    let mut report = ReconcileReport::default();
+
+    let body = match read_schema_versions(backend, &pattern).await {
+        Ok(body) => body,
+        Err(outcome) => {
+            // No index could be read, so none is named: log the glob.
+            note_reconcile_outcome(backend, &pattern, &outcome);
+            report.failed = usize::from(outcome != ReconcileOutcome::Gone);
+            return report;
+        }
+    };
+    let (stale, current) = stale_indices(&body);
+    report.current = current;
+
+    // Indices with nothing of their own in `_meta` share one body, so they go
+    // out in chunks; a failed chunk is redone index by index so the error
+    // names the index that caused it.
+    let (own_body, shared): (Vec<_>, Vec<_>) = stale
+        .into_iter()
+        .partition(|(_, meta)| has_foreign_meta(meta.as_ref()));
+    let mut singly: Vec<(String, Option<Value>)> = own_body;
+    for chunk in shared.chunks(INDICES_PER_PUT) {
+        let names: Vec<&str> = chunk.iter().map(|(name, _)| name.as_str()).collect();
+        let body = reconcile_mapping_body(backend.config(), None);
+        if names.len() > 1 && put_mapping(backend, &names, body).await == ReconcileOutcome::Updated
+        {
+            for name in names {
+                note_reconcile_outcome(backend, name, &ReconcileOutcome::Updated);
+            }
+            report.updated += chunk.len();
+        } else {
+            singly.extend(chunk.iter().cloned());
+        }
+    }
+    for (name, meta) in singly {
+        let body = reconcile_mapping_body(backend.config(), meta.as_ref());
+        let outcome = put_mapping(backend, &[&name], body).await;
+        note_reconcile_outcome(backend, &name, &outcome);
+        match outcome {
+            ReconcileOutcome::Updated => report.updated += 1,
+            ReconcileOutcome::Current | ReconcileOutcome::Gone => {}
+            ReconcileOutcome::Transient(_) | ReconcileOutcome::Rejected(_) => report.failed += 1,
+        }
+    }
+
+    if report.updated > 0 || report.failed > 0 {
+        tracing::info!(
+            schema_version = SCHEMA_VERSION,
+            updated = report.updated,
+            failed = report.failed,
+            current = report.current,
+            "reconciled Elasticsearch index mappings"
+        );
+    }
+    report
+}
+
+/// Brings one existing index up to [`SCHEMA_VERSION`], once per process.
+///
+/// The startup pass covers the indices that exist at startup. This covers the
+/// rest: an index an older HFS instance creates afterwards during a rolling
+/// upgrade, and one the startup pass could not reach. On the write path, so it
+/// never returns an error — see [`SCHEMA_VERSION`].
+async fn reconcile_index(backend: &ElasticsearchBackend, index: &str) {
+    if backend.is_schema_checked(index) {
+        return;
+    }
+    let outcome = match read_schema_versions(backend, index).await {
+        Err(outcome) => outcome,
+        Ok(body) => match stale_indices(&body) {
+            (stale, _) if !stale.is_empty() => {
+                let meta = stale[0].1.as_ref();
+                let body = reconcile_mapping_body(backend.config(), meta);
+                put_mapping(backend, &[index], body).await
+            }
+            (_, 1) => ReconcileOutcome::Current,
+            // Not an index HFS laid out (no `resource_type` field), or gone.
+            _ => ReconcileOutcome::Gone,
+        },
+    };
+    if outcome == ReconcileOutcome::Updated {
+        tracing::info!(
+            index,
+            schema_version = SCHEMA_VERSION,
+            "reconciled Elasticsearch index mapping"
+        );
+    }
+    note_reconcile_outcome(backend, index, &outcome);
+}
+
+/// Ensures an index exists for the given tenant and resource type, creating it
+/// if necessary, and that an existing one carries the current mapping.
 pub async fn ensure_index(
     backend: &ElasticsearchBackend,
     tenant_id: &str,
@@ -421,6 +782,7 @@ pub async fn ensure_index(
 
     let exists_status = exists_response.status_code();
     if exists_status.is_success() {
+        reconcile_index(backend, &index).await;
         return Ok(());
     }
     // A throttled or failing cluster says nothing about whether the index
@@ -466,6 +828,8 @@ pub async fn ensure_index(
         ));
     }
 
+    // Created from the current mapping, marker included.
+    backend.mark_schema_checked(&index);
     tracing::debug!("Created Elasticsearch index '{}'", index);
     Ok(())
 }
@@ -646,6 +1010,102 @@ mod tests {
 
         // Verify normalizer
         assert!(mapping["settings"]["analysis"]["normalizer"]["lowercase_normalizer"].is_object());
+    }
+
+    /// #1335: a new index is born at the current version, through both the
+    /// create body and the template (which reuse this mapping).
+    #[test]
+    fn test_index_mapping_carries_schema_version() {
+        let mapping = create_index_mapping(&ElasticsearchConfig::default());
+        assert_eq!(
+            mapping["mappings"]["_meta"][SCHEMA_VERSION_META_KEY],
+            SCHEMA_VERSION
+        );
+    }
+
+    /// #1335: which indices the reconcile pass updates. No marker is version
+    /// 0; a newer marker is never downgraded; an index under the prefix that
+    /// HFS did not lay out (no `resource_type` field) is not touched.
+    #[test]
+    fn test_stale_indices() {
+        let hfs = json!({ "resource_type": { "type": "keyword" } });
+        let body = json!({
+            "hfs_t_patient": { "mappings": { "properties": hfs } },
+            "hfs_t_observation": { "mappings": {
+                "_meta": { "owner": "ops" }, "properties": hfs
+            } },
+            "hfs_t_encounter": { "mappings": {
+                "_meta": { SCHEMA_VERSION_META_KEY: SCHEMA_VERSION }, "properties": hfs
+            } },
+            "hfs_t_condition": { "mappings": {
+                "_meta": { SCHEMA_VERSION_META_KEY: SCHEMA_VERSION + 1 }, "properties": hfs
+            } },
+            "hfs_not_ours": { "mappings": { "_meta": { "x": 1 } } }
+        });
+
+        let (stale, current) = stale_indices(&body);
+        assert_eq!(
+            stale,
+            vec![
+                (
+                    "hfs_t_observation".to_string(),
+                    Some(json!({ "owner": "ops" }))
+                ),
+                ("hfs_t_patient".to_string(), None),
+            ]
+        );
+        assert_eq!(current, 2);
+        assert_eq!(stale_indices(&json!({})), (Vec::new(), 0));
+        assert_eq!(stale_indices(&json!("not an object")), (Vec::new(), 0));
+    }
+
+    /// #1335: `PUT _mapping` replaces `_meta`, so the marker is merged into
+    /// what is there; and the body is the mapping half only.
+    #[test]
+    fn test_reconcile_mapping_body() {
+        let config = ElasticsearchConfig::default();
+
+        let plain = reconcile_mapping_body(&config, None);
+        assert_eq!(plain, create_index_mapping(&config)["mappings"]);
+        assert!(plain.get("settings").is_none());
+
+        let existing = json!({ "owner": "ops", SCHEMA_VERSION_META_KEY: 0 });
+        let merged = reconcile_mapping_body(&config, Some(&existing));
+        assert_eq!(
+            merged["_meta"],
+            json!({ "owner": "ops", SCHEMA_VERSION_META_KEY: SCHEMA_VERSION })
+        );
+        assert_eq!(merged["properties"], plain["properties"]);
+
+        assert!(has_foreign_meta(Some(&existing)));
+        assert!(!has_foreign_meta(Some(
+            &json!({ SCHEMA_VERSION_META_KEY: 0 })
+        )));
+        assert!(!has_foreign_meta(None));
+    }
+
+    /// #1335: which `PUT _mapping` failures are worth another attempt.
+    #[test]
+    fn test_classify_mapping_failure() {
+        assert_eq!(classify_mapping_failure(404, ""), ReconcileOutcome::Gone);
+        for status in [409, 429, 500, 503] {
+            assert!(
+                matches!(
+                    classify_mapping_failure(status, ""),
+                    ReconcileOutcome::Transient(_)
+                ),
+                "{status}"
+            );
+        }
+        for status in [400, 401, 403] {
+            assert!(
+                matches!(
+                    classify_mapping_failure(status, ""),
+                    ReconcileOutcome::Rejected(_)
+                ),
+                "{status}"
+            );
+        }
     }
 
     /// #1050: which existing indices the startup pass raises. An explicit

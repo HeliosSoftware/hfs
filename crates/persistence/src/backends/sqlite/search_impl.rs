@@ -50,7 +50,9 @@ fn internal_error(message: String) -> StorageError {
 /// an error, never a query the builder has to make something of.
 fn reject_unsupported_metadata_modifier(query: &SearchQuery) -> StorageResult<()> {
     crate::search::reject_unsupported_metadata_modifier(query)?;
-    crate::search::validate_date_values(query)
+    crate::search::validate_date_values(query)?;
+    // And a number or quantity value that is not a number (#1319, #1340).
+    crate::search::validate_numeric_values(query)
 }
 
 fn reject_contained_missing(query: &SearchQuery) -> StorageResult<()> {
