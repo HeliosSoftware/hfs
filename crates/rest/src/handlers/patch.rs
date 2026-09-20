@@ -179,18 +179,15 @@ pub async fn conditional_patch_handler<S>(
     Path(resource_type): Path<String>,
     headers: HeaderMap,
     tenant: TenantExtractor,
-    query: axum::extract::Query<std::collections::HashMap<String, String>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     prefer: PreferHeader,
     body: Bytes,
 ) -> RestResult<Response>
 where
     S: ResourceStorage + ConditionalStorage + Send + Sync,
 {
-    let search_params: String = query
-        .iter()
-        .map(|(k, v)| format!("{}={}", k, v))
-        .collect::<Vec<_>>()
-        .join("&");
+    // Every occurrence of a repeated parameter, in order (#1321).
+    let search_params = super::batch::normalize_criteria(raw_query.as_deref().unwrap_or_default());
 
     debug!(
         resource_type = %resource_type,

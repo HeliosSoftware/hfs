@@ -581,3 +581,218 @@ async fn batch_conditional_put_and_delete_hit_the_named_resource() {
         );
     }
 }
+
+// =============================================================================
+// Repeated parameters (#1321)
+// =============================================================================
+
+/// A patient the repeated-parameter scenarios tell apart by birth date and
+/// tags. Its family name is its id, so `families` shows who was rewritten.
+async fn put_dated_patient(server: &TestServer, id: &str, birth_date: &str, tags: &[&str]) {
+    server
+        .put(&format!("/Patient/{id}"))
+        .add_header(X_TENANT_ID, tenant())
+        .json(&dated_patient(Some(id), id, birth_date, tags))
+        .await
+        .assert_status(StatusCode::CREATED);
+}
+
+fn dated_patient(id: Option<&str>, family: &str, birth_date: &str, tags: &[&str]) -> Value {
+    let tags: Vec<Value> = tags
+        .iter()
+        .map(|code| json!({"system": "http://example.org/tags", "code": code}))
+        .collect();
+    let mut body = json!({
+        "resourceType": "Patient",
+        "meta": {"tag": tags},
+        "name": [{"family": family}],
+        "birthDate": birth_date
+    });
+    if let Some(id) = id {
+        body["id"] = json!(id);
+    }
+    body
+}
+
+async fn search_ids(server: &TestServer, query: &str) -> Vec<String> {
+    let bundle: Value = server
+        .get(&format!("/Patient?{query}"))
+        .add_header(X_TENANT_ID, tenant())
+        .await
+        .json();
+    let mut ids: Vec<String> = bundle["entry"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| e["resource"]["id"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    ids.sort();
+    ids
+}
+
+/// The two repeated-parameter criteria. A repeated parameter is an AND; the
+/// resource endpoints used to read the query into a `HashMap`, which kept the
+/// last occurrence only.
+const RANGE: &str = "birthdate=ge1980-01-01&birthdate=le1980-12-31";
+const BOTH_TAGS: &str = "_tag=red&_tag=blue";
+
+/// One decoy per constraint: each satisfies exactly one occurrence of `RANGE`
+/// and exactly one of `BOTH_TAGS`.
+async fn seed_repeated_parameter_decoys(server: &TestServer) {
+    // Satisfies `le1980-12-31` and `_tag=blue` — the last occurrences.
+    put_dated_patient(server, "early-blue", "1970-06-01", &["blue"]).await;
+    // Satisfies `ge1980-01-01` and `_tag=red` — the first occurrences.
+    put_dated_patient(server, "late-red", "1990-06-01", &["red"]).await;
+}
+
+async fn seed_repeated_parameter_target(server: &TestServer) {
+    put_dated_patient(server, "target", "1980-06-01", &["red", "blue"]).await;
+}
+
+const DECOYS: [(&str, &str); 2] = [("early-blue", "early-blue"), ("late-red", "late-red")];
+
+#[tokio::test]
+async fn conditional_put_honours_every_occurrence_of_a_repeated_parameter() {
+    for criteria in [RANGE, BOTH_TAGS] {
+        let server = test_server().await;
+        seed_repeated_parameter_decoys(&server).await;
+        seed_repeated_parameter_target(&server).await;
+        // Positive control: direct search ANDs the occurrences.
+        assert_eq!(search_ids(&server, criteria).await, vec!["target"]);
+
+        let response = server
+            .put(&format!("/Patient?{criteria}"))
+            .add_header(X_TENANT_ID, tenant())
+            .json(&dated_patient(
+                None,
+                "Updated",
+                "1980-06-01",
+                &["red", "blue"],
+            ))
+            .await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "PUT /Patient?{criteria} names exactly one patient"
+        );
+        assert_eq!(
+            families(&server).await,
+            pairs(&[DECOYS[0], DECOYS[1], ("target", "Updated")]),
+            "{criteria}"
+        );
+    }
+}
+
+/// With no patient satisfying both constraints, nothing may be overwritten or
+/// deleted — least of all the decoy that satisfies one of them.
+#[tokio::test]
+async fn a_resource_matching_one_occurrence_of_a_repeated_parameter_is_not_touched() {
+    for criteria in [RANGE, BOTH_TAGS] {
+        let server = test_server().await;
+        put_dated_patient(&server, "early-blue", "1970-06-01", &["blue"]).await;
+        assert!(search_ids(&server, criteria).await.is_empty());
+        // Positive control: the decoy is indexed under the last occurrence.
+        let last = criteria.rsplit('&').next().expect("last pair");
+        assert_eq!(search_ids(&server, last).await, vec!["early-blue"]);
+
+        let response = server
+            .put(&format!("/Patient?{criteria}"))
+            .add_header(X_TENANT_ID, tenant())
+            .json(&dated_patient(None, "Incoming", "1980-06-01", &[]))
+            .await;
+        assert_eq!(response.status_code(), StatusCode::CREATED, "{criteria}");
+        let after = families(&server).await;
+        assert!(
+            after.contains(&("early-blue".to_string(), "early-blue".to_string())),
+            "PUT /Patient?{criteria} overwrote the decoy: {after:?}"
+        );
+
+        let server = test_server().await;
+        put_dated_patient(&server, "early-blue", "1970-06-01", &["blue"]).await;
+        server
+            .delete(&format!("/Patient?{criteria}"))
+            .add_header(X_TENANT_ID, tenant())
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        assert_eq!(
+            families(&server).await,
+            pairs(&[DECOYS[0]]),
+            "DELETE /Patient?{criteria} deleted a patient matching only one occurrence"
+        );
+    }
+}
+
+#[tokio::test]
+async fn conditional_delete_honours_every_occurrence_of_a_repeated_parameter() {
+    for criteria in [RANGE, BOTH_TAGS] {
+        let server = test_server().await;
+        seed_repeated_parameter_decoys(&server).await;
+        seed_repeated_parameter_target(&server).await;
+
+        server
+            .delete(&format!("/Patient?{criteria}"))
+            .add_header(X_TENANT_ID, tenant())
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        assert_eq!(
+            families(&server).await,
+            pairs(&DECOYS),
+            "DELETE /Patient?{criteria}"
+        );
+    }
+}
+
+/// `If-None-Exist` and the Bundle paths carry the criteria as one string, so
+/// they never collapsed; pinned so they stay that way. (Conditional `PATCH`
+/// has a handler with the same `HashMap`, fixed alongside, but no route: the
+/// server answers `PATCH /Patient?…` with 405.)
+#[tokio::test]
+async fn header_and_bundle_criteria_honour_repeated_parameters() {
+    for criteria in [RANGE, BOTH_TAGS] {
+        // Only one-constraint decoys exist: the create must happen.
+        let server = test_server().await;
+        seed_repeated_parameter_decoys(&server).await;
+        conditional_create(&server, criteria)
+            .await
+            .assert_status(StatusCode::CREATED);
+
+        for bundle_type in ["batch", "transaction"] {
+            let server = test_server().await;
+            seed_repeated_parameter_decoys(&server).await;
+            let reply = post_bundle(
+                &server,
+                bundle_type,
+                json!([{
+                    "resource": patient("Incoming", "incoming-1"),
+                    "request": {"method": "POST", "url": "Patient", "ifNoneExist": criteria}
+                }]),
+            )
+            .await;
+            let status = reply["entry"][0]["response"]["status"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(
+                status.starts_with("201"),
+                "{bundle_type} {criteria}: {status}"
+            );
+        }
+
+        let server = test_server().await;
+        seed_repeated_parameter_decoys(&server).await;
+        seed_repeated_parameter_target(&server).await;
+        post_bundle(
+            &server,
+            "batch",
+            json!([{"request": {"method": "DELETE", "url": format!("Patient?{criteria}")}}]),
+        )
+        .await;
+        assert_eq!(
+            families(&server).await,
+            pairs(&DECOYS),
+            "batch DELETE Patient?{criteria}"
+        );
+    }
+}

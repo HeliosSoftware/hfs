@@ -1534,13 +1534,12 @@ impl AuditTarget {
     }
 }
 
-/// Percent-decodes a bundle entry's conditional criteria into the `k=v&k=v`
-/// form `ConditionalStorage` takes, keeping repeated keys and their order.
+/// Percent-decodes conditional criteria — a bundle entry's, or a resource
+/// endpoint's query — into the `k=v&k=v` form `ConditionalStorage` takes,
+/// keeping repeated keys and their order.
 ///
-/// A decoded value that itself contains `&` or `=` cannot survive the re-join;
-/// the resource endpoints share that limit, since they re-join axum's decoded
-/// pairs the same way (`conditional_update_handler`).
-fn normalize_criteria(raw: &str) -> String {
+/// A decoded value that itself contains `&` or `=` cannot survive the re-join.
+pub(super) fn normalize_criteria(raw: &str) -> String {
     crate::extractors::query_pairs::parse_query_pairs(Some(raw))
         .into_iter()
         .map(|(key, value)| format!("{key}={value}"))
