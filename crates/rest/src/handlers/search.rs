@@ -974,22 +974,42 @@ mod urlencoding {
     }
 }
 
-/// Pre-processes search params that contain `:in` or `:not-in` modifiers by
-/// expanding the referenced ValueSet via the terminology server.
+/// Rewrites the terminology-backed modifiers — `:in`, and `:above` / `:below`
+/// on a token — into plain token parameters, using the terminology server at
+/// `ts_url`. Keys are matched by suffix, so the terminal parameter of a chained
+/// or `_has` search (`subject:Patient.gender:in`) is rewritten like a direct one.
 ///
-/// **`:in` modifier** — The ValueSet at the given URL is expanded.  The
-/// parameter is replaced with a plain token parameter whose value is the
-/// expanded codes joined by commas (FHIR OR semantics).
+/// Only called when a terminology server is configured. Without one the caller
+/// (`execute_search_bundle`) rejects these modifiers with a `501` instead —
+/// direct parameters in its own guard, chain terminals in the chain resolver —
+/// rather than let them reach a backend, which would match the ValueSet URL or
+/// the bare code literally. A modifier the parameter's type does not define
+/// (`name:in`) has already been rejected with a `400` by then — on a direct
+/// parameter. On a chain terminal it has not: its type is only known to the
+/// chain resolver, which runs after this rewrite and so sees a plain parameter.
+///
+/// **`:in`** — The ValueSet at the given URL is expanded, and the parameter is
+/// replaced with a plain token parameter whose value is the expanded codes
+/// joined by commas (FHIR OR semantics).
 /// Example: `code:in=http://example.org/vs` → `code=http://cs|A,http://cs|B`
 ///
-/// **`:not-in` modifier** — Returns `Err(RestError::NotImplemented)` so the
-/// caller can surface an explicit 501 to the client.  Silently dropping a
-/// negation filter would return incorrect results (all resources instead of
-/// the expected subset), which is worse than an honest error.
+/// **`:below` / `:above`** — For a `system|code` value, the code is expanded to
+/// itself plus its descendants (`is-a`) / ancestors (`generalizes`), and the
+/// parameter is replaced the same way. A value without a `|` is the uri /
+/// reference form, which is structural: it is passed through with its modifier
+/// for the backend to resolve natively.
 ///
-/// All other parameters pass through unchanged. On individual expansion
-/// failures the problematic parameter is skipped with a warning so a single
-/// bad ValueSet URL does not abort the entire search.
+/// **`:not-in`** — Returns `Err(RestError::NotImplemented)`, a `501`. Silently
+/// dropping a negation filter would return all resources instead of the
+/// expected subset, which is worse than an honest error. (The caller rejects
+/// `:not-in` itself before getting here; this arm keeps the function safe to
+/// call on its own.)
+///
+/// All other parameters pass through unchanged. An empty expansion is replaced
+/// by a sentinel value that matches nothing. If an expansion *fails*, the
+/// parameter is dropped with a warning and the search continues without that
+/// filter (fail-open), so an unreachable terminology server or a single bad
+/// ValueSet URL does not abort the entire search.
 async fn expand_terminology_params(
     pairs: Vec<(String, String)>,
     ts_url: &str,

@@ -1,12 +1,23 @@
 //! Integration tests for HTS (Helios Terminology Server) delegation.
 //!
 //! These tests verify that:
-//! 1. Search parameters with `:in` modifiers are expanded via `POST /ValueSet/$expand`
-//!    on a configured terminology server and the expanded codes replace the original param.
-//! 2. Search parameters with `:not-in` modifiers are gracefully dropped (fail-open)
-//!    because the SQLite backend does not support negated value-set filtering.
-//! 3. When no terminology server is configured, `:in` / `:not-in` params pass through
-//!    to the persistence layer unchanged.
+//! 1. With a terminology server configured, a token `:in` parameter is expanded
+//!    via `POST /ValueSet/$expand` and replaced by a plain token parameter
+//!    carrying the expanded codes; token `:above` / `:below` are expanded the
+//!    same way (code subsumption). This covers the terminal parameter of a
+//!    chained or `_has` search too.
+//! 2. `:not-in` is a `501` with or without a terminology server: no backend
+//!    implements negated value-set filtering, and dropping the filter would
+//!    return a superset of what was asked for.
+//! 3. Without a terminology server, `:in` and token `:above` / `:below` are a
+//!    `501` naming `HFS_TERMINOLOGY_SERVER` — they are not passed through to
+//!    the persistence layer, which would match the ValueSet URL as a literal
+//!    code. (`:above` / `:below` on a uri or reference are structural and need
+//!    no terminology server.)
+//! 4. A terminology modifier the parameter's type does not define (`name:in`)
+//!    is a `400` either way, and never reaches the terminology server.
+//! 5. When the terminology server cannot be reached, the parameter is dropped
+//!    and the search continues without it (fail-open).
 //!
 //! # How the mock server works
 //!
