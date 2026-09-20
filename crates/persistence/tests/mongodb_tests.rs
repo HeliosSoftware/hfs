@@ -621,6 +621,34 @@ async fn mongodb_system_qualified_tokens_match_code_elements() {
     .await;
 }
 
+/// #1379: a row indexed before the marker existed has no system at all and
+/// keeps its old behaviour until the resource is reindexed.
+#[tokio::test]
+async fn mongodb_unmarked_code_rows_keep_their_old_behaviour() {
+    let Some(backend) = create_backend_with_full_registry("token_code_system_old").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    let tenant =
+        token_code_system_suite::seed_for_unmarked_rows(&backend, "token-code-system-old-1379")
+            .await;
+    let raw_client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect raw MongoDB client");
+    let search_index: Collection<Document> = raw_client
+        .database(&backend.config().database_name)
+        .collection("search_index");
+    let stripped = search_index
+        .update_many(
+            doc! { "tenant_id": tenant.tenant_id().as_str(), "param_name": "gender" },
+            doc! { "$unset": { "value_token_system": "" } },
+        )
+        .await
+        .expect("failed to strip the marker");
+    assert_eq!(stripped.modified_count, 1);
+    token_code_system_suite::unmarked_rows_keep_their_old_behaviour(&backend, &tenant).await;
+}
+
 /// #1062: a comma-separated value list on one `SearchParameter` is OR per
 /// FHIR (https://build.fhir.org/search.html#combining) — for date same as
 /// every other type. Drives the real `SearchProvider::search` /

@@ -310,3 +310,68 @@ pub async fn system_qualified_tokens_match_code_elements<S>(
     }
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
+
+/// Seeds one Patient for [`unmarked_rows_keep_their_old_behaviour`] and waits
+/// for it to be searchable. The caller then strips the marker from its
+/// `gender` row through the backend's own store, which is what a row indexed
+/// before #1379 looks like: no system at all.
+pub async fn seed_for_unmarked_rows<S>(backend: &S, tenant_base: &str) -> TenantContext
+where
+    S: ResourceStorage + SearchProvider,
+{
+    let tenant = TenantContext::new(TenantId::new(tenant_base), TenantPermissions::full_access());
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({"id": "pt-old", "gender": "female"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create pt-old failed: {e}"));
+
+    // Indexed as today: the qualified form matches. Polled for Elasticsearch.
+    let qualified = query("Patient", "gender", None, &format!("{GENDER}|female"));
+    let mut got = BTreeSet::new();
+    for _ in 0..60 {
+        got = matched(backend, &tenant, &qualified).await;
+        if got == ids(&["pt-old"]) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    assert_eq!(got, ids(&["pt-old"]), "marked row matches system|code");
+    tenant
+}
+
+/// A row without the marker cannot be told from a system-less Coding, so it
+/// behaves exactly as it did before #1379 — it never over-matches — until the
+/// resource is reindexed.
+pub async fn unmarked_rows_keep_their_old_behaviour<S>(backend: &S, tenant: &TenantContext)
+where
+    S: ResourceStorage + SearchProvider,
+{
+    let not = Some(SearchModifier::Not);
+    let qualified = format!("{GENDER}|female");
+    let mut failures = Vec::new();
+    for (modifier, value, expected) in [
+        // Positive control: the row is still there.
+        (None, "female", &["pt-old"][..]),
+        (None, "|female", &["pt-old"][..]),
+        (None, qualified.as_str(), &[][..]),
+        (not, qualified.as_str(), &["pt-old"][..]),
+    ] {
+        let got = matched(
+            backend,
+            tenant,
+            &query("Patient", "gender", modifier.clone(), value),
+        )
+        .await;
+        if got != ids(expected) {
+            failures.push(format!(
+                "gender {modifier:?} = {value}: got {got:?}, expected {expected:?}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}

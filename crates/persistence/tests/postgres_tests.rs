@@ -19186,6 +19186,30 @@ mod postgres_integration {
         .await;
     }
 
+    /// #1379: a row indexed before the marker existed has no system at all and
+    /// keeps its old behaviour until the resource is reindexed.
+    #[tokio::test]
+    async fn postgres_integration_unmarked_code_rows_keep_their_old_behaviour() {
+        let backend = create_backend().await;
+        let tenant = super::token_code_system_suite::seed_for_unmarked_rows(
+            &backend,
+            &unique_base("token_code_system_old"),
+        )
+        .await;
+        let client = backend.get_client().await.unwrap();
+        let stripped = client
+            .execute(
+                "UPDATE search_index SET value_token_system = NULL \
+                 WHERE tenant_id = $1 AND param_name = 'gender'",
+                &[&tenant.tenant_id().as_str()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(stripped, 1);
+        super::token_code_system_suite::unmarked_rows_keep_their_old_behaviour(&backend, &tenant)
+            .await;
+    }
+
     #[tokio::test]
     async fn postgres_integration_distinct_tenant_ids_never_share_data() {
         let backend = create_backend().await;
