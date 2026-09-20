@@ -664,6 +664,11 @@ mod date_boundary_suite;
 #[path = "search/date_precision_suite.rs"]
 mod date_precision_suite;
 
+/// The backend-agnostic `_contained` suite (#1336, #1362, #1363). Same
+/// `#[path]` arrangement.
+#[path = "search/contained_suite.rs"]
+mod contained_suite;
+
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
 
@@ -947,6 +952,15 @@ mod es_integration {
             "date-precision-1293",
         )
         .await;
+    }
+
+    /// #1362: every contained resource is a document of its own here, so a
+    /// repeated parameter is two clauses on one document.
+    #[tokio::test]
+    async fn es_contained_repeated_parameters_are_anded() {
+        let backend = create_backend().await;
+        super::contained_suite::repeated_parameters_are_anded(&backend, "contained-repeated-1362")
+            .await;
     }
 
     // ========================================================================

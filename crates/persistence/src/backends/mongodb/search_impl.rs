@@ -931,6 +931,11 @@ impl MongoBackend {
     /// multiple internal matches. Then `$sort` for a stable page order, then
     /// `$skip`/`$limit`, with a `$facet` count alongside when `_total` is
     /// requested.
+    ///
+    /// The set of matched *names* proves every criterion held only while each
+    /// name occurs once. When a name repeats (`date=ge2020&date=le2020`) the
+    /// per-entity stage is instead one `$unionWith` arm per occurrence, and an
+    /// entity must come back from all of them (#1362).
     #[allow(clippy::too_many_arguments)]
     async fn matching_contained(
         &self,
@@ -947,7 +952,10 @@ impl MongoBackend {
         let contained_rows =
             db.collection::<Document>(MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION);
 
-        let mut branches: Vec<Bson> = Vec::new();
+        let scope = doc! { "tenant_id": tenant_id, "contained_type": contained_type };
+        // One entry per parameter *occurrence*; values inside an occurrence
+        // are ORed by `build_search_index_filter`.
+        let mut branches: Vec<Document> = Vec::new();
         let mut distinct_names: Vec<String> = Vec::new();
         for param in &query.parameters {
             if param.name.starts_with('_')
@@ -963,7 +971,7 @@ impl MongoBackend {
             let mut branch = self.build_search_index_filter("", "", param)?;
             branch.remove("tenant_id");
             branch.remove("resource_type");
-            branches.push(Bson::Document(branch));
+            branches.push(branch);
             if !distinct_names.contains(&param.name) {
                 distinct_names.push(param.name.clone());
             }
@@ -975,26 +983,68 @@ impl MongoBackend {
             });
         }
 
-        let mut pipeline = vec![
-            doc! { "$match": {
-                "tenant_id": tenant_id,
-                "contained_type": contained_type,
-                "$or": branches,
-            }},
-            // Always per entity: the AND below must hold within one
-            // contained resource, not across every entity a container holds.
-            doc! { "$group": {
-                "_id": {
-                    "rtype": "$resource_type",
-                    "rid": "$resource_id",
-                    "lid": "$contained_local_id",
-                },
-                "names": { "$addToSet": "$param_name" },
-            }},
-        ];
-        if distinct_names.len() > 1 {
-            pipeline.push(doc! { "$match": { "names": { "$all": distinct_names } } });
-        }
+        let entity = doc! {
+            "rtype": "$resource_type",
+            "rid": "$resource_id",
+            "lid": "$contained_local_id",
+        };
+        let mut pipeline = if distinct_names.len() == branches.len() {
+            // Every name occurs once, so the set of names an entity matched
+            // proves every branch did.
+            let mut first = scope;
+            first.insert(
+                "$or",
+                branches.into_iter().map(Bson::Document).collect::<Vec<_>>(),
+            );
+            let mut stages = vec![
+                doc! { "$match": first },
+                // Always per entity: the AND below must hold within one
+                // contained resource, not across every entity a container holds.
+                doc! { "$group": {
+                    "_id": entity,
+                    "names": { "$addToSet": "$param_name" },
+                }},
+            ];
+            if distinct_names.len() > 1 {
+                stages.push(doc! { "$match": { "names": { "$all": distinct_names } } });
+            }
+            stages
+        } else {
+            // A name repeats (`date=ge2020&date=le2020`): one row can satisfy
+            // only some of its occurrences, and the names an entity matched no
+            // longer tell them apart (#1362). A branch is a query document, not
+            // an aggregation expression, so it cannot tag rows in place;
+            // instead each occurrence selects its entities in a pipeline of its
+            // own, tagged with the occurrence's index, and an entity must come
+            // back from every one of them.
+            let occurrence = |index: usize, branch: Document| {
+                let mut filter = scope.clone();
+                filter.extend(branch);
+                vec![
+                    doc! { "$match": filter },
+                    doc! { "$group": { "_id": entity.clone() } },
+                    doc! { "$addFields": { "occurrence": index as i32 } },
+                ]
+            };
+            let required: Vec<i32> = (0..branches.len() as i32).collect();
+            let mut occurrences = branches.into_iter().enumerate();
+            let mut stages = occurrences
+                .next()
+                .map(|(index, branch)| occurrence(index, branch))
+                .unwrap_or_default();
+            for (index, branch) in occurrences {
+                stages.push(doc! { "$unionWith": {
+                    "coll": MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION,
+                    "pipeline": occurrence(index, branch),
+                }});
+            }
+            stages.push(doc! { "$group": {
+                "_id": "$_id",
+                "occurrences": { "$addToSet": "$occurrence" },
+            }});
+            stages.push(doc! { "$match": { "occurrences": { "$all": required } } });
+            stages
+        };
         let sort = match contained_return {
             ContainedReturn::Container => {
                 // Collapse the surviving per-entity slots to one per

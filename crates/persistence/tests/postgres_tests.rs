@@ -78,6 +78,11 @@ mod date_minute_index_suite;
 #[path = "search/conditional_criteria_suite.rs"]
 mod conditional_criteria_suite;
 
+/// The backend-agnostic `_contained` suite (#1336, #1362, #1363). Same
+/// `#[path]` arrangement.
+#[path = "search/contained_suite.rs"]
+mod contained_suite;
+
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
 
@@ -14555,218 +14560,6 @@ mod postgres_integration {
         assert!(backend.supports_contained_search());
     }
 
-    /// A contained Observation for the repeated-parameter `_contained` test.
-    fn contained_observation(
-        id: &str,
-        code: &str,
-        date: &str,
-        categories: &[&str],
-    ) -> serde_json::Value {
-        let categories: Vec<serde_json::Value> = categories
-            .iter()
-            .map(|c| json!({"coding": [{"system": "http://example.org/cat", "code": c}]}))
-            .collect();
-        json!({
-            "resourceType": "Observation",
-            "id": id,
-            "status": "final",
-            "category": categories,
-            "code": {"coding": [{"system": "http://loinc.org", "code": code}]},
-            "effectiveDateTime": date,
-        })
-    }
-
-    /// Repeating a parameter under `_contained=true` is a conjunction: every
-    /// occurrence must hold, and on the same contained resource (#1336). A
-    /// comma list within one occurrence stays a disjunction.
-    ///
-    /// Containers (DiagnosticReport → contained Observations):
-    /// - `dr-ab`: `a` (code X, 2020-06, cat1+cat2) and `b` (Y, 2021-06, cat1)
-    /// - `dr-b`: only `b` (Y, 2021-06, cat1) — satisfies `ge2020` alone
-    /// - `dr-early`: only `e` (Y, 2019-06, cat2) — satisfies `le2020` alone
-    /// - `dr-bc`: `b2` (Y, 2020-07, cat1) and `c` (X, 2022-01, cat2) — no one
-    ///   contained resource has code X and a 2020 date, or both categories
-    /// - `dr-late`: `l` (X, 2020-11, cat1)
-    #[tokio::test]
-    async fn postgres_integration_contained_repeated_params_are_anded() {
-        use helios_persistence::core::SearchProvider;
-        use helios_persistence::types::{
-            ContainedMode, ContainedReturn, SearchParamType, SearchParameter, SearchQuery,
-            SearchValue,
-        };
-
-        let backend = create_backend().await;
-        let tenant = create_tenant("contained-repeated-1336");
-        let containers = [
-            (
-                "dr-ab",
-                vec![
-                    contained_observation("a", "X", "2020-06-15", &["cat1", "cat2"]),
-                    contained_observation("b", "Y", "2021-06-15", &["cat1"]),
-                ],
-            ),
-            (
-                "dr-b",
-                vec![contained_observation("b", "Y", "2021-06-15", &["cat1"])],
-            ),
-            (
-                "dr-early",
-                vec![contained_observation("e", "Y", "2019-06-15", &["cat2"])],
-            ),
-            (
-                "dr-bc",
-                vec![
-                    contained_observation("b2", "Y", "2020-07-01", &["cat1"]),
-                    contained_observation("c", "X", "2022-01-01", &["cat2"]),
-                ],
-            ),
-            (
-                "dr-late",
-                vec![contained_observation("l", "X", "2020-11-20", &["cat1"])],
-            ),
-        ];
-        for (id, contained) in containers {
-            backend
-                .create(
-                    &tenant,
-                    "DiagnosticReport",
-                    json!({
-                        "resourceType": "DiagnosticReport",
-                        "id": id,
-                        "status": "final",
-                        "code": {"text": "panel"},
-                        "contained": contained,
-                    }),
-                    FhirVersion::default(),
-                )
-                .await
-                .unwrap();
-        }
-
-        let param = |name: &str, ty: SearchParamType, values: &[&str]| SearchParameter {
-            name: name.to_string(),
-            param_type: ty,
-            modifier: None,
-            values: values.iter().map(|v| SearchValue::parse(v)).collect(),
-            chain: vec![],
-            components: vec![],
-        };
-        let date = |values: &[&str]| param("date", SearchParamType::Date, values);
-        let token = |name: &str, value: &str| param(name, SearchParamType::Token, &[value]);
-
-        let cases: Vec<(&str, Vec<SearchParameter>, &[&str])> = vec![
-            // Positive controls: single occurrences, proving the rows are indexed.
-            (
-                "date=ge2020-01-01",
-                vec![date(&["ge2020-01-01"])],
-                &["dr-ab", "dr-b", "dr-bc", "dr-late"],
-            ),
-            (
-                "date=le2020-12-31",
-                vec![date(&["le2020-12-31"])],
-                &["dr-ab", "dr-bc", "dr-early", "dr-late"],
-            ),
-            (
-                "code=X",
-                vec![token("code", "X")],
-                &["dr-ab", "dr-bc", "dr-late"],
-            ),
-            (
-                "category=cat2",
-                vec![token("category", "cat2")],
-                &["dr-ab", "dr-bc", "dr-early"],
-            ),
-            // The range from the issue: dr-b and dr-early satisfy one bound only.
-            (
-                "date=ge2020-01-01&date=le2020-12-31",
-                vec![date(&["ge2020-01-01"]), date(&["le2020-12-31"])],
-                &["dr-ab", "dr-bc", "dr-late"],
-            ),
-            // Different parameters must hold on the SAME contained resource:
-            // dr-bc has code X on `c` and a 2020 date on `b2`.
-            (
-                "code=X&date=le2020-12-31",
-                vec![token("code", "X"), date(&["le2020-12-31"])],
-                &["dr-ab", "dr-late"],
-            ),
-            (
-                "code=X&date=ge2020-01-01&date=le2020-12-31",
-                vec![
-                    token("code", "X"),
-                    date(&["ge2020-01-01"]),
-                    date(&["le2020-12-31"]),
-                ],
-                &["dr-ab", "dr-late"],
-            ),
-            // OR within an occurrence, AND across occurrences.
-            (
-                "date=le2020-12-31&date=lt2020-03-01,gt2020-10-01",
-                vec![
-                    date(&["le2020-12-31"]),
-                    date(&["lt2020-03-01", "gt2020-10-01"]),
-                ],
-                &["dr-early", "dr-late"],
-            ),
-            // Repeated token: both categories on one contained resource.
-            (
-                "category=cat1&category=cat2",
-                vec![token("category", "cat1"), token("category", "cat2")],
-                &["dr-ab"],
-            ),
-        ];
-
-        let mut failures = Vec::new();
-        for (label, parameters, expected) in &cases {
-            let mut query = SearchQuery::new("Observation");
-            query.contained = ContainedMode::On;
-            query.parameters = parameters.clone();
-            let found = backend.search(&tenant, &query).await.unwrap();
-            let ids = result_ids(&found);
-            if ids != expect_ids(expected) {
-                failures.push(format!(
-                    "Observation?_contained=true&{label}: got {ids:?}, expected {expected:?}"
-                ));
-            }
-        }
-
-        // `_containedType=contained` returns only the contained resources that
-        // satisfy every occurrence — `a`, not its sibling `b`.
-        let mut query = SearchQuery::new("Observation");
-        query.contained = ContainedMode::On;
-        query.contained_return = ContainedReturn::Contained;
-        query.parameters = vec![date(&["ge2020-01-01"]), date(&["le2020-12-31"])];
-        let found = backend.search(&tenant, &query).await.unwrap();
-        let ids = result_ids(&found);
-        if ids != expect_ids(&["a", "b2", "l"]) {
-            failures.push(format!(
-                "_containedType=contained&date=ge2020-01-01&date=le2020-12-31: \
-                 got {ids:?}, expected [a, b2, l]"
-            ));
-        }
-
-        // `_contained=both` merges top-level matches with the containers; the
-        // range applies to both halves.
-        for (id, when) in [("top-in", "2020-05-01"), ("top-out", "2021-05-01")] {
-            let top = contained_observation(id, "X", when, &["cat1"]);
-            backend
-                .create(&tenant, "Observation", top, FhirVersion::default())
-                .await
-                .unwrap();
-        }
-        let mut query = SearchQuery::new("Observation");
-        query.contained = ContainedMode::Both;
-        query.parameters = vec![date(&["ge2020-01-01"]), date(&["le2020-12-31"])];
-        let found = backend.search(&tenant, &query).await.unwrap();
-        let ids = result_ids(&found);
-        if ids != expect_ids(&["dr-ab", "dr-bc", "dr-late", "top-in"]) {
-            failures.push(format!(
-                "_contained=both&date=ge2020-01-01&date=le2020-12-31: got {ids:?}"
-            ));
-        }
-
-        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
-    }
-
     // ========================================================================
     // Backend error handling — a reachable but misconfigured store
     // ========================================================================
@@ -19075,6 +18868,18 @@ mod postgres_integration {
         super::date_minute_index_suite::minute_precision_stored_values_are_indexed(
             &backend,
             &unique_base("date_minute_index"),
+        )
+        .await;
+    }
+
+    /// #1336: a repeated parameter under `_contained` is a conjunction on one
+    /// contained resource.
+    #[tokio::test]
+    async fn postgres_integration_contained_repeated_parameters_are_anded() {
+        let backend = create_backend().await;
+        super::contained_suite::repeated_parameters_are_anded(
+            &backend,
+            &unique_base("contained_repeated"),
         )
         .await;
     }

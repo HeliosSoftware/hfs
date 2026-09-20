@@ -37,6 +37,19 @@ async fn sqlite_conditional_criteria_with_prefix_like_values() {
     .await;
 }
 
+/// The backend-agnostic `_contained` suite (#1336, #1362, #1363). Same
+/// `#[path]` arrangement.
+#[path = "search/contained_suite.rs"]
+mod contained_suite;
+
+/// #1362: a repeated parameter under `_contained` is a conjunction on one
+/// contained resource.
+#[tokio::test]
+async fn sqlite_contained_repeated_parameters_are_anded() {
+    let backend = create_backend();
+    contained_suite::repeated_parameters_are_anded(&backend, "contained-repeated-1362").await;
+}
+
 fn create_backend() -> SqliteBackend {
     // Configure with data directory to load spec SearchParameters
     // CARGO_MANIFEST_DIR for tests is crates/persistence

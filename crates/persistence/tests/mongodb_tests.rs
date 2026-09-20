@@ -541,6 +541,24 @@ async fn mongodb_minute_precision_stored_dates_are_indexed() {
     .await;
 }
 
+/// The backend-agnostic `_contained` suite (#1336, #1362, #1363). Same
+/// `#[path]` arrangement.
+#[path = "search/contained_suite.rs"]
+mod contained_suite;
+
+/// #1362: `matching_contained` proved "every criterion matched" by the set of
+/// parameter *names*, so a repeated parameter was a disjunction. Needs the
+/// full registry so the contained Observations index at all — the suite's
+/// positive controls fail loudly if they did not.
+#[tokio::test]
+async fn mongodb_contained_repeated_parameters_are_anded() {
+    let Some(backend) = create_backend_with_full_registry("contained_repeated").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    contained_suite::repeated_parameters_are_anded(&backend, "contained-repeated-1362").await;
+}
+
 /// #1062: a comma-separated value list on one `SearchParameter` is OR per
 /// FHIR (https://build.fhir.org/search.html#combining) — for date same as
 /// every other type. Drives the real `SearchProvider::search` /

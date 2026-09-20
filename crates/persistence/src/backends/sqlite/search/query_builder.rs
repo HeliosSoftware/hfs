@@ -281,12 +281,17 @@ impl QueryBuilder {
     /// COUNT(DISTINCT param_name) >= <n>`, so a container only matches when a
     /// single contained resource satisfies all parameters.
     ///
+    /// Each occurrence of a parameter is its own AND-ed branch (values within
+    /// an occurrence are ORed). Counting distinct names only proves every
+    /// branch matched while the names are distinct, so once a name repeats
+    /// (`date=ge2020&date=le2020`) the `HAVING` instead requires each branch
+    /// with `MAX(CASE WHEN <branch> THEN 1 ELSE 0 END) = 1`, on the same
+    /// contained entity (#1362). The aggregates repeat the `WHERE` branches
+    /// verbatim, reusing their numbered placeholders rather than binding again.
+    ///
     /// Param layout: `?1` = tenant, `?2` = contained type, then value params.
     /// Returns `None` when no standard parameter contributes a condition
     /// (special `_`-params and composites are not applied to contained matching).
-    ///
-    /// Limitation: repeated occurrences of the same parameter name are treated
-    /// as OR rather than AND for the distinct-name count.
     pub fn build_contained(&self, query: &SearchQuery) -> Option<SqlFragment> {
         let mut branches: Vec<String> = Vec::new();
         let mut params: Vec<SqlParam> = Vec::new();
@@ -332,13 +337,24 @@ impl QueryBuilder {
             return None;
         }
 
+        let having = if distinct_names.len() == branches.len() {
+            format!("COUNT(DISTINCT param_name) >= {}", distinct_names.len())
+        } else {
+            // A repeated name: one row can satisfy only some of its occurrences,
+            // so require every branch. The placeholders are reused, not rebound.
+            branches
+                .iter()
+                .map(|branch| format!("MAX(CASE WHEN {branch} THEN 1 ELSE 0 END) = 1"))
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        };
         let sql = format!(
             "SELECT resource_type, resource_id, contained_local_id FROM search_index \
              WHERE tenant_id = ?1 AND is_contained = 1 AND contained_type = ?2 AND ({}) \
              GROUP BY resource_type, resource_id, contained_local_id \
-             HAVING COUNT(DISTINCT param_name) >= {}",
+             HAVING {}",
             branches.join(" OR "),
-            distinct_names.len()
+            having
         );
         Some(SqlFragment::with_params(sql, params))
     }
@@ -1483,6 +1499,120 @@ mod tests {
             fragment.sql.contains(" OR "),
             "bare-id path still ORs: {}",
             fragment.sql
+        );
+    }
+
+    fn contained_param(
+        name: &str,
+        ty: SearchParamType,
+        modifier: Option<SearchModifier>,
+        values: &[&str],
+    ) -> SearchParameter {
+        SearchParameter {
+            name: name.to_string(),
+            param_type: ty,
+            modifier,
+            values: values.iter().map(|v| SearchValue::parse(v)).collect(),
+            chain: vec![],
+            components: vec![],
+        }
+    }
+
+    fn contained_query(parameters: Vec<SearchParameter>) -> SearchQuery {
+        let mut query = SearchQuery::new("Observation");
+        query.contained = crate::types::ContainedMode::On;
+        query.parameters = parameters;
+        query
+    }
+
+    /// The `?N` numbers in `sql`, in order of appearance.
+    fn numbered_placeholders(sql: &str) -> Vec<usize> {
+        sql.split('?')
+            .skip(1)
+            .filter_map(|rest| {
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                digits.parse().ok()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn contained_distinct_names_count_names() {
+        // Distinct names: the name count proves every branch matched, and the
+        // SQL is what it was before occurrences were told apart (#1362).
+        let query = contained_query(vec![
+            contained_param("code", SearchParamType::Token, None, &["X"]),
+            contained_param("date", SearchParamType::Date, None, &["ge2020-01-01"]),
+        ]);
+        let frag = QueryBuilder::new("t", "Observation")
+            .build_contained(&query)
+            .unwrap();
+
+        assert!(
+            frag.sql.starts_with(
+                "SELECT resource_type, resource_id, contained_local_id FROM search_index \
+                 WHERE tenant_id = ?1 AND is_contained = 1 AND contained_type = ?2 AND \
+                 ((param_name = 'code' AND ("
+            ),
+            "{}",
+            frag.sql
+        );
+        assert!(
+            frag.sql.ends_with(
+                " GROUP BY resource_type, resource_id, contained_local_id \
+                 HAVING COUNT(DISTINCT param_name) >= 2"
+            ),
+            "{}",
+            frag.sql
+        );
+        assert!(!frag.sql.contains("MAX("), "{}", frag.sql);
+    }
+
+    #[test]
+    fn contained_repeated_name_requires_every_occurrence() {
+        // `code=X&date=ge2020-01-01&date=le2020-12-31,2019`: a name count of 2
+        // is met by a contained resource matching only one date bound (#1362).
+        let query = contained_query(vec![
+            contained_param("code", SearchParamType::Token, None, &["X"]),
+            contained_param("date", SearchParamType::Date, None, &["ge2020-01-01"]),
+            contained_param(
+                "date",
+                SearchParamType::Date,
+                None,
+                &["le2020-12-31", "2019"],
+            ),
+        ]);
+        let frag = QueryBuilder::new("t", "Observation")
+            .build_contained(&query)
+            .unwrap();
+
+        let (filter, having) = frag.sql.split_once(" HAVING ").expect("a HAVING clause");
+        assert!(!having.contains("COUNT("), "{having}");
+        let required: Vec<&str> = having.split(" AND MAX(CASE WHEN ").collect();
+        assert_eq!(required.len(), 3, "one aggregate per occurrence: {having}");
+        assert!(required[0].starts_with("MAX(CASE WHEN (param_name = 'code'"));
+        assert!(required[1].starts_with("(param_name = 'date'"), "{having}");
+        assert!(required[2].starts_with("(param_name = 'date'"), "{having}");
+        assert!(
+            required
+                .iter()
+                .all(|r| r.ends_with("THEN 1 ELSE 0 END) = 1")),
+            "{having}"
+        );
+
+        // HAVING re-reads the WHERE placeholders: gap-free from ?3, none new.
+        // (A year-precision date names its one placeholder twice.)
+        let in_filter = numbered_placeholders(filter);
+        let mut distinct = in_filter.clone();
+        distinct.dedup();
+        let mut expected: Vec<usize> = vec![1, 2];
+        expected.extend(3..3 + frag.params.len());
+        assert_eq!(distinct, expected, "{}", frag.sql);
+        assert_eq!(
+            numbered_placeholders(having),
+            in_filter[2..],
+            "{}",
+            frag.sql
         );
     }
 }
