@@ -257,6 +257,10 @@ pub struct ElasticsearchBackend {
     /// Per-tenant search parameter registries (a shared base plus per-tenant
     /// overlays). Shared with the primary backend for consistency.
     registries: Arc<TenantSearchRegistries>,
+    /// Indices whose mapping this process has already reconciled with
+    /// `schema::SCHEMA_VERSION` (or found it cannot), so `ensure_index` checks
+    /// each index once per process rather than on every write (#1335).
+    schema_checked: parking_lot::Mutex<std::collections::HashSet<String>>,
 }
 
 impl Debug for ElasticsearchBackend {
@@ -347,6 +351,7 @@ impl ElasticsearchBackend {
             client,
             config,
             registries,
+            schema_checked: Default::default(),
         })
     }
 
@@ -366,6 +371,7 @@ impl ElasticsearchBackend {
             client,
             config,
             registries,
+            schema_checked: Default::default(),
         })
     }
 
@@ -417,6 +423,17 @@ impl ElasticsearchBackend {
     /// Returns the Elasticsearch client.
     pub(crate) fn client(&self) -> &Elasticsearch {
         &self.client
+    }
+
+    /// Whether this process has already reconciled `index`'s mapping.
+    pub(super) fn is_schema_checked(&self, index: &str) -> bool {
+        self.schema_checked.lock().contains(index)
+    }
+
+    /// Records that `index`'s mapping needs no further reconciling by this
+    /// process.
+    pub(super) fn mark_schema_checked(&self, index: &str) {
+        self.schema_checked.lock().insert(index.to_string());
     }
 
     /// Returns the backend configuration.
@@ -655,6 +672,11 @@ impl Backend for ElasticsearchBackend {
                  resources with more nested values than an index's current limit stay unsearchable"
             ),
         }
+
+        // Likewise the template's *mapping* only reaches new indices. Bring
+        // existing ones up to `SCHEMA_VERSION` (#1335). Never fatal: each
+        // failure is logged with its index, which then keeps its old mapping.
+        super::schema::reconcile_index_mappings(self).await;
         Ok(())
     }
 
