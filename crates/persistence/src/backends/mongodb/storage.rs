@@ -4856,6 +4856,55 @@ fn resolve_bundle_references(value: &mut Value, reference_map: &HashMap<String, 
 }
 
 #[cfg(test)]
+mod index_date_tests {
+    use super::*;
+
+    /// A search value and the stored value it should match must never be zoned
+    /// differently. Search values are read by the shared `FhirDateValue`;
+    /// stored ones by [`normalize_date_for_mongo`], which stays lenient by
+    /// design. For every form a resource can carry, the instant indexed must
+    /// be the start of the range searched (both are then cut to the
+    /// millisecond a BSON date holds).
+    ///
+    /// Not in the table, because a resource cannot validly carry them: `hh:mm`
+    /// without seconds (valid in search only; not indexed) and a `:60` leap
+    /// second (the search side reads it as the next second).
+    #[test]
+    fn search_and_index_agree_on_every_valid_value() {
+        for value in [
+            "2013",
+            "2013-04",
+            "2013-12",
+            "2013-04-05",
+            "2024-02-29",
+            "2013-04-05T09:20:00",
+            "2013-04-05T09:20:00Z",
+            "2013-04-05T09:20:00-04:00",
+            "2013-04-05T18:50:00+05:30",
+            "2013-04-05T09:20:00-00:00",
+            "2013-04-05T23:20:00+14:00",
+            "2013-04-05T09:20:00.5Z",
+            "2013-04-05T23:30:00.123-04:00",
+            "2021-11-10T16:48:57.246958-08:00",
+        ] {
+            let searched = crate::search::FhirDateValue::parse(value)
+                .unwrap_or_else(|e| panic!("{value} is a valid search value: {e}"));
+            assert_eq!(
+                normalize_date_for_mongo(value),
+                Some(searched.start),
+                "{value}"
+            );
+            let (start, _) = searched.range_at(crate::search::StorageResolution::Millis);
+            assert_eq!(
+                normalize_date_for_mongo(value).map(chrono_to_bson),
+                Some(chrono_to_bson(start)),
+                "{value} at BSON resolution"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod history_query_tests {
     //! Docker-free unit tests for the pure query builders behind #1053's
     //! fix: the server-side cursor predicate, sort, and fetch-limit that

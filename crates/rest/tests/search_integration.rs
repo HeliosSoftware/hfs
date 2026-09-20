@@ -1379,31 +1379,236 @@ mod date_search {
         assert!(entries.len() >= 2);
     }
 
-    /// #1289: a value that is not a date never reaches a storage backend. On
-    /// PostgreSQL it used to be replaced by the current time, so the `lt` form
-    /// here returned nearly every Patient with a plain 200.
+    /// The date values no backend may accept, with the comparator prefixes the
+    /// issues reported them under.
+    const INVALID_DATE_VALUES: &[&str] = &[
+        "not-a-date",
+        "ltnot-a-date",
+        "gtnot-a-date",
+        "gtabcd",
+        "lt2024-1x",
+        "gt2024-13-45",
+        "ne2024-13-45",
+        // SQLite's `datetime()` used to roll this over to March 1st (#1295).
+        "lt2024-02-30",
+        "ltT25:00:00Z",
+        // An hour needs minutes; minutes without seconds are fine.
+        "2013-04-05T10",
+    ];
+
+    fn assert_invalid_date_outcome(response: &axum_test::TestResponse, context: &str) {
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let body: Value = response.json();
+        assert_eq!(body["resourceType"], "OperationOutcome", "{context}");
+        assert_eq!(body["issue"][0]["code"], "invalid", "{context}");
+        let text = body["issue"][0]["diagnostics"]
+            .as_str()
+            .or_else(|| body["issue"][0]["details"]["text"].as_str())
+            .unwrap_or_default();
+        assert!(
+            text.contains("not a valid FHIR date"),
+            "{context}: the outcome should say what is wrong, got {body}"
+        );
+    }
+
+    /// #1289, #1293, #1295: a value that is not a date never reaches a storage
+    /// backend. PostgreSQL used to replace it with the current time and
+    /// Elasticsearch with the year 2000, so the client got a plausible 200.
     #[tokio::test]
     async fn test_invalid_date_value_is_a_400_not_a_search() {
         let (server, backend) = create_test_server().await;
         seed_search_test_data(&backend).await;
 
+        for value in INVALID_DATE_VALUES {
+            for param in ["birthdate", "_lastUpdated"] {
+                let query = format!("/Patient?{param}={value}");
+                let response = server
+                    .get(&query)
+                    .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                    .await;
+                assert_invalid_date_outcome(&response, &query);
+            }
+        }
+    }
+
+    /// The same values through POST `_search`, which has its own form decoding.
+    #[tokio::test]
+    async fn test_invalid_date_value_is_a_400_on_post_search() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        for value in INVALID_DATE_VALUES {
+            for param in ["birthdate", "_lastUpdated"] {
+                let response = server
+                    .post("/Patient/_search")
+                    .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                    .form(&[(param, value)])
+                    .await;
+                assert_invalid_date_outcome(&response, &format!("POST {param}={value}"));
+            }
+        }
+    }
+
+    /// An invalid value is a 400 whatever the client's `Prefer: handling`:
+    /// lenient handling is for parameters the server does not know, not for
+    /// values it cannot read.
+    #[tokio::test]
+    async fn test_invalid_date_value_is_a_400_under_lenient_handling() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        for handling in ["handling=lenient", "handling=strict"] {
+            let response = server
+                .get("/Patient?birthdate=lt2024-02-30")
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .add_header(
+                    axum::http::header::HeaderName::from_static("prefer"),
+                    HeaderValue::from_static(handling),
+                )
+                .await;
+            assert_invalid_date_outcome(&response, handling);
+        }
+    }
+
+    /// A chained terminal is typed only when the chain is resolved, so it is
+    /// the storage gate that rejects it. (Valid prefixed terminals are #1292.)
+    #[tokio::test]
+    async fn test_invalid_chained_date_value_is_a_400() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let query = "/Observation?subject:Patient.birthdate=not-a-date";
+        let response = server
+            .get(query)
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        assert_invalid_date_outcome(&response, query);
+    }
+
+    /// Seeds one Procedure performed at `2013-04-05T13:20:00Z`, written with a
+    /// positive offset.
+    async fn seed_procedure_with_positive_offset(backend: &SqliteBackend) {
+        backend
+            .create(
+                &test_tenant(),
+                "Procedure",
+                json!({
+                    "resourceType": "Procedure",
+                    "id": "proc-plus",
+                    "status": "completed",
+                    "subject": {"reference": "Patient/patient-1"},
+                    "performedDateTime": "2013-04-05T18:50:00+05:30"
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed procedure");
+    }
+
+    fn assert_finds_the_procedure(response: &axum_test::TestResponse, context: &str) {
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+        assert_eq!(entries.len(), 1, "{context}: {body}");
+        assert_eq!(entries[0]["resource"]["id"], "proc-plus", "{context}");
+    }
+
+    /// #1296: a `+` offset sent without percent-encoding is form-decoded into
+    /// a space. It used to be an empty 200 on SQLite and PostgreSQL, a 400 on
+    /// MongoDB and a 500 on Elasticsearch; it is now read as the `+` it was.
+    #[tokio::test]
+    async fn test_literal_plus_offset_finds_the_resource() {
+        let (server, backend) = create_test_server().await;
+        seed_procedure_with_positive_offset(&backend).await;
+
         for query in [
-            "/Patient?birthdate=not-a-date",
-            "/Patient?birthdate=ltnot-a-date",
-            "/Patient?birthdate=gt2024-13-45",
-            "/Patient?birthdate=ne2024-13-45",
-            "/Patient?_lastUpdated=ltnot-a-date",
+            // Positive control: properly encoded.
+            "/Procedure?date=2013-04-05T18:50:00%2B05:30",
+            // The literal `+`, under no prefix and under one.
+            "/Procedure?date=2013-04-05T18:50:00+05:30",
+            "/Procedure?date=ge2013-04-05T18:50:00+05:30",
+            "/Procedure?date=eq2013-04-05T18:50+05:30",
+            // The same instant in another zone.
+            "/Procedure?date=2013-04-05T09:20:00-04:00",
         ] {
             let response = server
                 .get(query)
                 .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
                 .await;
-
-            response.assert_status(StatusCode::BAD_REQUEST);
-            let body: Value = response.json();
-            assert_eq!(body["resourceType"], "OperationOutcome", "query={query}");
-            assert_eq!(body["issue"][0]["code"], "invalid", "query={query}");
+            assert_finds_the_procedure(&response, query);
         }
+
+        // The repair restores an offset; it does not make a wrong one match.
+        let response = server
+            .get("/Procedure?date=2013-04-05T18:50:00+05:00")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        assert_eq!(get_bundle_entries(&response.json::<Value>()).len(), 0);
+    }
+
+    /// The same through a POST `_search` body, which is form-decoded too.
+    #[tokio::test]
+    async fn test_literal_plus_offset_finds_the_resource_on_post_search() {
+        let (server, backend) = create_test_server().await;
+        seed_procedure_with_positive_offset(&backend).await;
+
+        for body in [
+            "date=2013-04-05T18:50:00%2B05:30",
+            "date=2013-04-05T18:50:00+05:30",
+        ] {
+            let response = server
+                .post("/Procedure/_search")
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                // `text` sets `text/plain`; the form content type goes after.
+                .text(body)
+                .content_type("application/x-www-form-urlencoded")
+                .await;
+            assert_finds_the_procedure(&response, body);
+        }
+    }
+
+    /// The self link must describe the search that ran, and must round-trip:
+    /// the repaired value is re-encoded, not echoed with a bare space or `+`.
+    #[tokio::test]
+    async fn test_literal_plus_offset_self_link_round_trips() {
+        let (server, backend) = create_test_server().await;
+        seed_procedure_with_positive_offset(&backend).await;
+
+        let response = server
+            .get("/Procedure?date=2013-04-05T18:50:00+05:30")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let self_link = body["link"]
+            .as_array()
+            .and_then(|links| links.iter().find(|l| l["relation"] == "self"))
+            .and_then(|l| l["url"].as_str())
+            .expect("self link")
+            .to_string();
+
+        let path = self_link
+            .strip_prefix("http://localhost:8080")
+            .unwrap_or(&self_link);
+        let again = server
+            .get(path)
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        assert_finds_the_procedure(&again, &self_link);
+    }
+
+    /// Minute precision is valid in FHIR search, unlike the dateTime datatype.
+    #[tokio::test]
+    async fn test_minute_precision_date_value_is_accepted() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let response = server
+            .get("/Patient?birthdate=lt2013-04-05T09:20")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
     }
 
     /// #1319: a number or quantity value whose number part is not a number

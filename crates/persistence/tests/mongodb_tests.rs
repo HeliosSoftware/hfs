@@ -499,6 +499,25 @@ async fn mongodb_day_precision_date_boundaries() {
     date_boundary_suite::day_precision_boundaries(&backend, "date-boundary-519").await;
 }
 
+/// The backend-agnostic sub-day precision and date-validation suite (#1293,
+/// #1295, #1296, #1297). Same `#[path]` arrangement.
+#[path = "search/date_precision_suite.rs"]
+mod date_precision_suite;
+
+/// #1297: `eq` on a value with a time was `$eq` on its first instant, so a
+/// second-precision search missed a stored `…:00.123`; and minute precision,
+/// valid in FHIR search, was a 400. Needs the full registry so
+/// `Procedure.date` extracts into the search index — the suite's positive
+/// control fails loudly if it did not.
+#[tokio::test]
+async fn mongodb_sub_day_date_precision_and_validation() {
+    let Some(backend) = create_backend_with_full_registry("date_precision").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    date_precision_suite::sub_day_precision_and_validation(&backend, "date-precision-1297").await;
+}
+
 /// #1062: a comma-separated value list on one `SearchParameter` is OR per
 /// FHIR (https://build.fhir.org/search.html#combining) — for date same as
 /// every other type. Drives the real `SearchProvider::search` /

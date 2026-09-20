@@ -364,10 +364,13 @@ impl<'a> EsQueryBuilder<'a> {
             .iter()
             .map(
                 |value| match date::field_range("last_updated", &value.value, value.prefix) {
-                    date::DateRange::Within(range) => range,
-                    date::DateRange::Outside(range) => {
+                    Some(date::DateRange::Within(range)) => range,
+                    Some(date::DateRange::Outside(range)) => {
                         json!({ "bool": { "must_not": [range] } })
                     }
+                    // Not a date: a clause that matches nothing. Dropping the
+                    // value instead would return every resource (#1293).
+                    None => date::match_none(),
                 },
             )
             .collect();
@@ -722,6 +725,49 @@ mod tests {
         assert_eq!(clause["bool"]["minimum_should_match"], 1);
         assert_eq!(should[0]["range"]["last_updated"]["gte"], "2026-09-01");
         assert_eq!(should[1]["range"]["last_updated"]["gte"], "2026-09-03");
+    }
+
+    /// #1293: a value that is not a date used to be read as the year 2000, so
+    /// `_lastUpdated=gtnot-a-date` returned every resource. The search gate
+    /// rejects it before a query is built; if one is built anyway, the clause
+    /// matches nothing and is never dropped from the query.
+    #[test]
+    fn a_date_value_that_is_not_a_date_matches_nothing() {
+        let clause = last_updated_query(vec![SearchValue::new(SearchPrefix::Gt, "not-a-date")]);
+        assert_eq!(clause, json!({ "match_none": {} }));
+
+        // In an OR list the bad value contributes nothing; the good one stays.
+        let clause = last_updated_query(vec![
+            SearchValue::new(SearchPrefix::Ne, "2024-13-45"),
+            SearchValue::eq("2026-09-03"),
+        ]);
+        let should = clause["bool"]["should"].as_array().expect("bool.should");
+        assert_eq!(should[0], json!({ "match_none": {} }));
+        assert_eq!(should[1]["range"]["last_updated"]["gte"], "2026-09-03");
+
+        // An indexed date parameter: `filter_map` must not get a `None` to drop.
+        let query = SearchQuery::new("Procedure").with_parameter(SearchParameter {
+            name: "date".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: vec![SearchValue::new(SearchPrefix::Gt, "abcd")],
+            chain: vec![],
+            components: vec![],
+        });
+        let builder = EsQueryBuilder::new("acme", "Procedure", "hfs_acme_procedure".to_string());
+        assert_eq!(
+            builder.build(&query).body["query"]["bool"]["must"][0],
+            json!({ "match_none": {} })
+        );
+    }
+
+    #[test]
+    fn last_updated_second_precision_is_the_whole_second() {
+        let clause = last_updated_query(vec![SearchValue::eq("2026-09-06T04:44:27-04:00")]);
+        assert_eq!(
+            clause["range"]["last_updated"],
+            json!({ "gte": "2026-09-06T08:44:27.000Z", "lt": "2026-09-06T08:44:28.000Z" })
+        );
     }
 
     fn not_param(values: Vec<SearchValue>) -> SearchQuery {

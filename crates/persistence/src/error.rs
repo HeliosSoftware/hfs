@@ -348,6 +348,20 @@ pub enum SearchError {
         message: String,
     },
 
+    /// A date search value that is not a FHIR date, dateTime or instant.
+    ///
+    /// Raised by [`crate::search::validate_date_values`] before any backend
+    /// builds a query, so every backend answers an invalid date the same way.
+    #[error("invalid value for date parameter '{param}': {reason}")]
+    InvalidDateValue {
+        /// Name of the search parameter carrying the value.
+        param: String,
+        /// The rejected value, as received.
+        value: String,
+        /// What is wrong with it, and the forms that are accepted.
+        reason: String,
+    },
+
     /// Composite search parameter error.
     #[error("invalid composite search parameter: {message}")]
     InvalidComposite {

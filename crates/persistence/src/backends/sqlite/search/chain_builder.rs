@@ -737,7 +737,9 @@ impl ChainQueryBuilder {
 
 /// Builds a date comparison condition.
 fn build_date_condition(column: &str, value: &SearchValue, param_num: usize) -> (String, SqlParam) {
-    let (sql, bound) = super::parameter_handlers::date::date_condition(
+    // Matches nothing, still binding `?param_num`, for a value that is not a
+    // date — which the search gate rejects before a chain is ever built.
+    let (sql, bound) = super::parameter_handlers::date::date_condition_or_nothing(
         column,
         value.prefix,
         &value.value,

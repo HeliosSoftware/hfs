@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 
 use crate::backends::postgres::schema::IndexLayout;
 use crate::search::fold_text;
+use crate::search::{DatePredicate, FhirDateValue, StorageResolution};
 use crate::types::{
     CompartmentMembership, SearchModifier, SearchParamType, SearchParameter, SearchPrefix,
     SearchQuery, SearchValue, strip_reference_version,
@@ -393,34 +394,33 @@ pub(crate) fn quantity_predicate(
 }
 
 /// Returns the `[start, end)` timestamp range for a date search value at its
-/// inherent precision (year/month/day). Full-precision instants return a
-/// degenerate range (`start == end`).
+/// own precision — a year, a month, a day, a minute, a second, or a fraction
+/// of one — as [`FhirDateValue`] defines it for every backend, clamped to the
+/// microseconds a `TIMESTAMPTZ` holds. `end` is always after `start`.
 ///
-/// Returns `None` when the value is not a date at all (see
-/// [`PostgresQueryBuilder::parse_date_value`]). Every caller must turn that into
-/// [`match_nothing`] rather than skipping the value: a dropped constraint
-/// over-matches.
+/// A value with a time used to get a degenerate range (`start == end`) and a
+/// scalar comparison, so `eq…T23:30:00-04:00` missed a stored `…:00.123` that
+/// SQLite and Elasticsearch found (#1297), and a client echoing a millisecond
+/// `meta.lastUpdated` could not find the microsecond value stored for it.
+///
+/// Returns `None` when the value is not a date (`not-a-date`, `2024-13-45`).
+/// Every caller must turn that into [`match_nothing`] rather than skipping the
+/// value: a dropped constraint over-matches. This path once fell back to
+/// `Utc::now()` instead, which turned a parse failure into a plausible-looking
+/// bound — `lt`/`le` matched essentially every indexed row, and the client got
+/// an ordinary `200` (#1289). It is also what hid #1288: a mishandled negative
+/// offset became "compare against now" instead of a visible failure.
+///
+/// The value is read by the grammar every backend shares. It used to be
+/// normalized with the index writer's `normalize_date_for_pg` and judged by
+/// chrono (`parse_date_value`, now gone), which kept a search value and a
+/// stored value zoned alike (#1288) but accepted what chrono accepts rather
+/// than what FHIR does. That invariant is now held by test: see
+/// `search_and_index_agree_on_every_valid_value` in `writer.rs`.
 pub(crate) fn date_precision_range(value: &str) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
-    use chrono::Datelike;
-    let start = PostgresQueryBuilder::parse_date_value(value)?;
-    let end = if value.contains('T') {
-        start
-    } else if value.len() == 4 {
-        start.with_year(start.year() + 1).unwrap_or(start)
-    } else if value.len() == 7 {
-        let (y, m) = (start.year(), start.month());
-        let (ny, nm) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
-        start
-            .with_month(1)
-            .and_then(|d| d.with_year(ny))
-            .and_then(|d| d.with_month(nm))
-            .unwrap_or(start)
-    } else if value.len() == 10 {
-        start + chrono::Duration::days(1)
-    } else {
-        start
-    };
-    Some((start, end))
+    FhirDateValue::parse(value)
+        .ok()
+        .map(|date| date.range_at(StorageResolution::Micros))
 }
 
 /// The condition emitted for a search value that cannot be interpreted: it
@@ -437,88 +437,67 @@ pub(crate) fn match_nothing() -> SqlFragment {
 /// Builds the comparison of one date search value against a `TIMESTAMPTZ`
 /// column, advancing `next` by exactly the number of binds returned.
 ///
-/// This is the single per-prefix table for date search on Postgres. The
-/// unchained `date` and `_lastUpdated` builders and the chain builder's
-/// terminals (`chain_builder.rs`, #1290) all call it, so they cannot drift:
+/// This is the single place a date search value becomes SQL on Postgres. The
+/// unchained `date` and `_lastUpdated` builders, the composite date component
+/// and the chain builder's terminals (`chain_builder.rs`, #1290) all call it,
+/// so they cannot drift:
 ///
+/// - the value is read by [`FhirDateValue`], the grammar and precision range
+///   every backend shares, and compared through the [`DatePredicate`] it
+///   yields — only `>=` and `<` against the bounds of `[start, end)`, at every
+///   precision. There is no scalar fallback for a value with a time: a second
+///   is a range too (#1297);
 /// - binds are always [`SqlParam::Timestamp`] — a text bind against
 ///   `TIMESTAMPTZ` fails serialization in tokio-postgres (#871, #1290), and a
 ///   `$N::timestamptz` cast does not help, it only restates the inferred type;
-/// - a value below instant precision is compared as the `[start, end)` range
-///   from [`date_precision_range`], so `eq2020-01-01` means the whole day;
-/// - a full instant (degenerate range) is a scalar comparison, with any zone
-///   offset already folded into the bound instant;
-/// - `ap` has no approximation window here: it falls through to
-///   [`PostgresQueryBuilder::prefix_to_operator`], which maps it to `=`, so it
-///   is a scalar equality with the start of the value's range at every
-///   precision. That is the pre-existing unchained behavior, kept as is rather
-///   than inventing a margin in one path.
+/// - `ap` has no approximation window here: the shared layer leaves it to the
+///   backend, and this one keeps what it always did — a scalar `=` (via
+///   [`PostgresQueryBuilder::prefix_to_operator`]) on the start of the range.
 ///
 /// `col` is interpolated verbatim and must be a trusted column expression
 /// (`value_date`, `si2.value_date`, `si2.last_updated`), never user input.
 ///
 /// A value that is not a date yields [`match_nothing`]'s `FALSE` with no binds
-/// and leaves `next` untouched, under every prefix, `ne` included (#1289).
+/// and leaves `next` untouched, under every prefix, `ne` included (#1289). The
+/// search gate (`validate_date_values`) rejects such a value before a query is
+/// built, so that branch means a caller skipped the gate.
 pub(crate) fn date_predicate(
     col: &str,
     prefix: SearchPrefix,
     value: &str,
     next: &mut usize,
 ) -> (String, Vec<SqlParam>) {
-    let Some((start, end)) = date_precision_range(value) else {
-        return (match_nothing().sql, Vec::new());
+    let parsed = match FhirDateValue::parse(value) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            tracing::warn!("unvalidated date search value reached the PostgreSQL builder: {error}");
+            return (match_nothing().sql, Vec::new());
+        }
     };
-    // Comparators match against the precision-range boundaries; a
-    // full-precision instant (degenerate range) falls back to scalar.
-    let degenerate = start == end;
-    match prefix {
-        SearchPrefix::Eq if !degenerate => {
-            *next += 1;
-            let a = *next;
-            *next += 1;
-            (
-                format!("{col} >= ${a} AND {col} < ${next}"),
-                vec![SqlParam::Timestamp(start), SqlParam::Timestamp(end)],
-            )
+
+    let mut params = Vec::new();
+    let mut bind = |instant: DateTime<Utc>| {
+        *next += 1;
+        params.push(SqlParam::Timestamp(instant));
+        format!("${next}")
+    };
+    let sql = match parsed.predicate(prefix, StorageResolution::Micros) {
+        Some(DatePredicate::Within { ge, lt }) => {
+            format!("{col} >= {} AND {col} < {}", bind(ge), bind(lt))
         }
-        SearchPrefix::Ne if !degenerate => {
-            *next += 1;
-            let a = *next;
-            *next += 1;
-            (
-                format!("({col} < ${a} OR {col} >= ${next})"),
-                vec![SqlParam::Timestamp(start), SqlParam::Timestamp(end)],
-            )
+        Some(DatePredicate::Outside { lt, ge }) => {
+            format!("({col} < {} OR {col} >= {})", bind(lt), bind(ge))
         }
-        SearchPrefix::Gt | SearchPrefix::Sa if !degenerate => {
-            *next += 1;
-            (format!("{col} >= ${next}"), vec![SqlParam::Timestamp(end)])
+        Some(DatePredicate::AtOrAfter(bound)) => format!("{col} >= {}", bind(bound)),
+        Some(DatePredicate::Before(bound)) => format!("{col} < {}", bind(bound)),
+        // `ap`: scalar comparison with the start of the range, as before.
+        None => {
+            let op = PostgresQueryBuilder::prefix_to_operator(&prefix);
+            let (start, _) = parsed.range_at(StorageResolution::Micros);
+            format!("{col} {op} {}", bind(start))
         }
-        SearchPrefix::Lt | SearchPrefix::Eb if !degenerate => {
-            *next += 1;
-            (format!("{col} < ${next}"), vec![SqlParam::Timestamp(start)])
-        }
-        SearchPrefix::Ge if !degenerate => {
-            *next += 1;
-            (
-                format!("{col} >= ${next}"),
-                vec![SqlParam::Timestamp(start)],
-            )
-        }
-        SearchPrefix::Le if !degenerate => {
-            *next += 1;
-            (format!("{col} < ${next}"), vec![SqlParam::Timestamp(end)])
-        }
-        // Degenerate (full-precision) or `ap`: scalar comparison.
-        other => {
-            let op = PostgresQueryBuilder::prefix_to_operator(&other);
-            *next += 1;
-            (
-                format!("{col} {op} ${next}"),
-                vec![SqlParam::Timestamp(start)],
-            )
-        }
-    }
+    };
+    (sql, params)
 }
 
 /// How a sort key's value is typed for cursor (keyset) binding and comparison.
@@ -1973,18 +1952,23 @@ impl PostgresQueryBuilder {
                 }
             }
             SearchParamType::Date => {
-                let op = Self::prefix_to_operator(&value.prefix);
+                // The same precision range a standalone date parameter gets;
+                // this used to be a scalar comparison with the start of the
+                // value, so `eq2024-01-15` meant midnight rather than the day.
                 // Not a date: a bare `FALSE` predicate with no params, rather
                 // than `None`. Composite callers treat `None` as match-nothing,
                 // but `build_contained` skips it, which would drop the
                 // constraint and over-match (#1289).
-                let Some(ts) = Self::parse_date_value(&value.value) else {
-                    return Some((match_nothing().sql, Vec::new()));
-                };
-                Some((
-                    format!("value_date {} ${}", op, offset + 1),
-                    vec![SqlParam::Timestamp(ts)],
-                ))
+                let mut next = offset;
+                let (sql, params) =
+                    date_predicate("value_date", value.prefix, &value.value, &mut next);
+                // Parenthesized, because callers join predicates with AND/OR;
+                // the bind-free `FALSE` stays bare.
+                if params.is_empty() {
+                    Some((sql, params))
+                } else {
+                    Some((format!("({sql})"), params))
+                }
             }
             _ => None,
         }
@@ -2444,36 +2428,6 @@ impl PostgresQueryBuilder {
             SearchPrefix::Eb => "<", // ends before
             SearchPrefix::Ap => "=", // approximately (simplified)
         }
-    }
-
-    /// Parses a FHIR date search value into a `DateTime<Utc>`.
-    ///
-    /// Handles partial dates (year, year-month, date) and full date-times.
-    ///
-    /// Returns `None` when the value is not a date (`not-a-date`, `2024-13-45`).
-    /// This previously fell back to `Utc::now()`, which turned a parse failure
-    /// into a plausible-looking bound: `lt`/`le` then matched essentially every
-    /// indexed row, `gt`/`ge`/`eq` matched nothing, and the client got an
-    /// ordinary `200` either way (#1289). It is also what hid #1288 — a
-    /// mishandled negative offset became "compare against now" instead of a
-    /// visible failure. The index writer dropped the identical fallback for the
-    /// same reason; see `parse_index_date` in `writer.rs` (#494).
-    pub(crate) fn parse_date_value(value: &str) -> Option<DateTime<Utc>> {
-        // Normalized by the same function the index writer uses, so a search
-        // value and the stored value it should match can never be zoned
-        // differently. This used to carry its own zone test, which recognized
-        // only `+`, `Z` and `-00:00`: every other negative offset
-        // (`2013-04-05T09:20:00-04:00`) was taken for zone-less, had `+00:00`
-        // appended, failed to parse, and fell through to the `Utc::now()`
-        // fallback this function then had — so the search silently compared
-        // against the current time and matched nothing. The writer's copy of
-        // that bug was fixed; this one was not.
-        let normalized = super::writer::normalize_date_for_pg(value);
-
-        DateTime::parse_from_rfc3339(&normalized)
-            .map(|dt| dt.with_timezone(&Utc))
-            .or_else(|_| normalized.parse::<DateTime<Utc>>())
-            .ok()
     }
 }
 
@@ -3228,18 +3182,147 @@ mod tests {
         ));
         let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
 
-        assert!(frag.sql.contains("value_date = $3"), "{}", frag.sql);
-        assert_eq!(frag.params.len(), 1);
-        match &frag.params[0] {
-            SqlParam::Timestamp(ts) => {
-                assert_eq!(ts.to_rfc3339(), "2013-04-05T13:20:00+00:00");
+        // The whole second it names, not a scalar `=` on its first instant:
+        // a stored `…T09:20:00.123-04:00` is inside it (#1297).
+        assert!(
+            frag.sql.contains("value_date >= $3 AND value_date < $4"),
+            "{}",
+            frag.sql
+        );
+        assert_eq!(
+            timestamps(&frag.params),
+            ["2013-04-05T13:20:00+00:00", "2013-04-05T13:20:01+00:00"]
+        );
+    }
+
+    /// The bound timestamps of a fragment, in order; panics on any other bind.
+    fn timestamps(params: &[SqlParam]) -> Vec<String> {
+        params
+            .iter()
+            .map(|param| match param {
+                SqlParam::Timestamp(ts) => ts.to_rfc3339(),
+                other => panic!("must bind a timestamp: {other:?}"),
+            })
+            .collect()
+    }
+
+    /// #1297: every prefix compares against the bounds of the range the value
+    /// names, at every precision — on `value_date` and on `last_updated`.
+    #[test]
+    fn date_predicate_maps_every_prefix_onto_the_range_bounds() {
+        let (start, end) = ("2013-04-06T03:30:00+00:00", "2013-04-06T03:30:01+00:00");
+        for col in ["value_date", "last_updated"] {
+            for (prefix, sql, binds) in [
+                (SearchPrefix::Eq, "{c} >= $3 AND {c} < $4", vec![start, end]),
+                (
+                    SearchPrefix::Ne,
+                    "({c} < $3 OR {c} >= $4)",
+                    vec![start, end],
+                ),
+                (SearchPrefix::Gt, "{c} >= $3", vec![end]),
+                (SearchPrefix::Sa, "{c} >= $3", vec![end]),
+                (SearchPrefix::Lt, "{c} < $3", vec![start]),
+                (SearchPrefix::Eb, "{c} < $3", vec![start]),
+                (SearchPrefix::Ge, "{c} >= $3", vec![start]),
+                (SearchPrefix::Le, "{c} < $3", vec![end]),
+                // `ap` keeps its scalar equality with the start of the range.
+                (SearchPrefix::Ap, "{c} = $3", vec![start]),
+            ] {
+                let mut next = 2;
+                let (got, params) =
+                    date_predicate(col, prefix, "2013-04-05T23:30:00-04:00", &mut next);
+                assert_eq!(got, sql.replace("{c}", col), "{prefix}");
+                assert_eq!(timestamps(&params), binds, "{prefix}");
+                assert_eq!(next, 2 + params.len(), "{prefix}: next counts the binds");
             }
-            other => panic!("must bind a timestamp: {other:?}"),
         }
     }
 
     #[test]
-    fn parse_date_value_honors_every_zone_form() {
+    fn date_predicate_ranges_follow_the_precision_supplied() {
+        for (value, start, end) in [
+            // Minute precision is valid in FHIR search.
+            (
+                "2013-04-05T09:20",
+                "2013-04-05T09:20:00+00:00",
+                "2013-04-05T09:21:00+00:00",
+            ),
+            // A millisecond value finds the microsecond timestamp stored for
+            // it: `_lastUpdated=eq<meta.lastUpdated>` used to be a scalar `=`.
+            (
+                "2026-09-06T08:44:27.804Z",
+                "2026-09-06T08:44:27.804+00:00",
+                "2026-09-06T08:44:27.805+00:00",
+            ),
+            (
+                "2021-11-10T16:48:57.246958-08:00",
+                "2021-11-11T00:48:57.246958+00:00",
+                "2021-11-11T00:48:57.246959+00:00",
+            ),
+            // #1296: a `+` that form decoding turned into a space.
+            (
+                "2013-04-05T18:50:00 05:30",
+                "2013-04-05T13:20:00+00:00",
+                "2013-04-05T13:20:01+00:00",
+            ),
+            (
+                "2013-12",
+                "2013-12-01T00:00:00+00:00",
+                "2014-01-01T00:00:00+00:00",
+            ),
+        ] {
+            let mut next = 0;
+            let (_, params) = date_predicate("value_date", SearchPrefix::Eq, value, &mut next);
+            assert_eq!(timestamps(&params), [start, end], "{value}");
+        }
+    }
+
+    /// A value that is not a date binds nothing and leaves the numbering of
+    /// the binds around it alone, under every prefix.
+    #[test]
+    fn date_predicate_fails_closed_without_binds() {
+        for value in ["not-a-date", "2024-02-30", "2013-04-05T10", ""] {
+            for prefix in [
+                SearchPrefix::Eq,
+                SearchPrefix::Ne,
+                SearchPrefix::Lt,
+                SearchPrefix::Ap,
+            ] {
+                let mut next = 7;
+                let (sql, params) = date_predicate("value_date", prefix, value, &mut next);
+                assert_eq!(sql, "FALSE", "{prefix}{value}");
+                assert!(params.is_empty());
+                assert_eq!(next, 7);
+            }
+        }
+    }
+
+    /// A composite's date component gets the same precision range a standalone
+    /// date parameter does. It used to be a scalar comparison with the start
+    /// of the value, so `2024-01-15` meant midnight rather than the day.
+    #[test]
+    fn composite_date_component_is_a_precision_range() {
+        let (sql, params) = PostgresQueryBuilder::build_composite_component(
+            &SearchValue::new(SearchPrefix::Eq, "2024-01-15"),
+            SearchParamType::Date,
+            4,
+            1,
+        )
+        .expect("a date component");
+        assert_eq!(sql, "(value_date >= $5 AND value_date < $6)");
+        assert_eq!(
+            timestamps(&params),
+            ["2024-01-15T00:00:00+00:00", "2024-01-16T00:00:00+00:00"]
+        );
+    }
+
+    /// The first instant of the range a search value names.
+    fn start_of(value: &str) -> Option<DateTime<Utc>> {
+        date_precision_range(value).map(|(start, _)| start)
+    }
+
+    #[test]
+    fn date_range_start_honors_every_zone_form() {
         let cases = [
             ("2013-04-05T09:20:00-04:00", "2013-04-05T13:20:00+00:00"),
             ("2013-04-05T09:20:00+05:30", "2013-04-05T03:50:00+00:00"),
@@ -3258,7 +3341,7 @@ mod tests {
         ];
         for (input, expected) in cases {
             assert_eq!(
-                PostgresQueryBuilder::parse_date_value(input).map(|ts| ts.to_rfc3339()),
+                start_of(input).map(|ts| ts.to_rfc3339()),
                 Some(expected.to_string()),
                 "input {input}"
             );
@@ -3306,14 +3389,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_date_value_rejects_what_is_not_a_date() {
+    fn date_range_rejects_what_is_not_a_date() {
         // #1289: these used to come back as `Utc::now()`.
         for input in NOT_DATES {
-            assert_eq!(
-                PostgresQueryBuilder::parse_date_value(input),
-                None,
-                "input {input}"
-            );
             assert_eq!(date_precision_range(input), None, "input {input}");
         }
     }

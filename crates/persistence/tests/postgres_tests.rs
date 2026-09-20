@@ -63,6 +63,11 @@ mod meta_params_suite;
 #[path = "search/date_boundary_suite.rs"]
 mod date_boundary_suite;
 
+/// The backend-agnostic sub-day precision and date-validation suite (#1293,
+/// #1295, #1296, #1297). Same `#[path]` arrangement.
+#[path = "search/date_precision_suite.rs"]
+mod date_precision_suite;
+
 /// The backend-agnostic conditional-criteria suite (#1312): criteria whose
 /// values begin with comparator letters. Same `#[path]` arrangement.
 #[path = "search/conditional_criteria_suite.rs"]
@@ -770,8 +775,9 @@ mod query_builder_tests {
             );
         }
 
-        // A full-precision instant is a degenerate range and falls back to
-        // scalar comparison.
+        // A value with a time is a range too — the whole second (#1297). `gt`
+        // is strictly after it, so it starts at the *end* of that second; this
+        // used to be a scalar `>` on its first instant.
         let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
             name: "_lastUpdated".to_string(),
             param_type: SearchParamType::Date,
@@ -783,10 +789,16 @@ mod query_builder_tests {
         let fragment = PostgresQueryBuilder::build_search_query(&query, 0)
             .expect("full-precision instant must build");
         assert!(
-            fragment.sql.contains("last_updated > $1"),
-            "full-precision gt must stay scalar, got SQL: {}",
+            fragment.sql.contains("last_updated >= $1"),
+            "second-precision gt starts at the end of the second, got SQL: {}",
             fragment.sql
         );
+        match &fragment.params[..] {
+            [SqlParam::Timestamp(bound)] => {
+                assert_eq!(bound.to_rfc3339(), "2024-01-01T10:00:01+00:00");
+            }
+            other => panic!("expected one timestamp bind, got {other:?}"),
+        }
     }
 }
 
@@ -18420,6 +18432,21 @@ mod postgres_integration {
         super::date_boundary_suite::day_precision_boundaries(
             &backend,
             &unique_base("date_boundary"),
+        )
+        .await;
+    }
+
+    /// #1297: a value with a time was a scalar comparison, so a
+    /// second-precision `eq` missed a stored `…:00.123` and a millisecond
+    /// `_lastUpdated` missed the microsecond timestamp stored for it. Also
+    /// holds PostgreSQL to the shared grammar: a value that is not a date is
+    /// an error (#1289 made it `FALSE`; before that it was "now").
+    #[tokio::test]
+    async fn postgres_integration_sub_day_date_precision_and_validation() {
+        let backend = create_backend().await;
+        super::date_precision_suite::sub_day_precision_and_validation(
+            &backend,
+            &unique_base("date_precision"),
         )
         .await;
     }

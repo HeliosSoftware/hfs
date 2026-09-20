@@ -6,6 +6,7 @@
 //! - [`loader`] - Loads parameters from embedded, stored, and config sources
 //! - [`extractor`] - FHIRPath-based value extraction from resources
 //! - [`converters`] - Conversion between FHIRPath results and index values
+//! - [`date_value`] - The shared grammar, precision range and prefix mapping for date search values
 //! - [`writer`] - Trait for writing extracted values to search indexes
 //! - [`reindex`] - $reindex operation for rebuilding search indexes
 //! - [`errors`] - Search-specific error types
@@ -64,6 +65,7 @@
 pub mod chain_resolver;
 pub mod conditional;
 pub mod converters;
+pub mod date_value;
 pub mod errors;
 pub mod extractor;
 pub mod list_resolver;
@@ -87,6 +89,10 @@ pub use conditional::{
     build_conditional_parameters, build_conditional_query, parse_conditional_criteria,
 };
 pub use converters::{IndexValue, ValueConverter};
+pub use date_value::{
+    DatePredicate, DateValueError, DateValueErrorReason, DateValuePrecision, FhirDateValue,
+    StorageResolution, validate_date_parameter, validate_date_values,
+};
 pub use errors::{ExtractionError, LoaderError, RegistryError, ReindexError};
 pub use extractor::{ContainedExtraction, ExtractedValue, SearchParameterExtractor};
 pub use list_resolver::{query_has_list, resolve_list};

@@ -1356,6 +1356,41 @@ pub(super) fn normalize_date_for_pg(value: &str) -> String {
 mod tests {
     use super::*;
 
+    /// A search value and the stored value it should match must never be zoned
+    /// differently (#1288). The query side used to guarantee that by calling
+    /// [`normalize_date_for_pg`] itself; it now reads search values with the
+    /// shared `FhirDateValue`, so the guarantee is held here instead: for every
+    /// form a resource can carry, the instant indexed is the start of the
+    /// range searched.
+    ///
+    /// Not in the table, because a resource cannot validly carry them and the
+    /// writer stays lenient by design: `hh:mm` without seconds (valid in
+    /// search only; the writer does not index it) and a `:60` leap second
+    /// (the search side reads it as the next second).
+    #[test]
+    fn search_and_index_agree_on_every_valid_value() {
+        for value in [
+            "2013",
+            "2013-04",
+            "2013-12",
+            "2013-04-05",
+            "2024-02-29",
+            "2013-04-05T09:20:00",
+            "2013-04-05T09:20:00Z",
+            "2013-04-05T09:20:00-04:00",
+            "2013-04-05T18:50:00+05:30",
+            "2013-04-05T09:20:00-00:00",
+            "2013-04-05T23:20:00+14:00",
+            "2013-04-05T09:20:00.5Z",
+            "2013-04-05T23:30:00.123-04:00",
+            "2021-11-10T16:48:57.246958-08:00",
+        ] {
+            let searched = crate::search::FhirDateValue::parse(value)
+                .unwrap_or_else(|e| panic!("{value} is a valid search value: {e}"));
+            assert_eq!(parse_index_date(value), Some(searched.start), "{value}");
+        }
+    }
+
     /// The two statements are built from one [`insert_plan`], and
     /// [`PostgresSearchIndexWriter::insert_rows`] and
     /// [`PostgresSearchIndexWriter::insert_rows_multi`] push their three scalars

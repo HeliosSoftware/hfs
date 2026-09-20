@@ -44,8 +44,13 @@ fn internal_error(message: String) -> StorageError {
 /// and `search_with_connection` (also reached directly by the in-transaction
 /// `ifNoneExist` resolution path, `find_matching_resources_in_tx` in
 /// `storage.rs`, which never goes through `search`).
+///
+/// Every one of those paths must also refuse a date value that is not a date
+/// (#1293, #1295), so the shared date gate runs here too: an invalid value is
+/// an error, never a query the builder has to make something of.
 fn reject_unsupported_metadata_modifier(query: &SearchQuery) -> StorageResult<()> {
-    crate::search::reject_unsupported_metadata_modifier(query)
+    crate::search::reject_unsupported_metadata_modifier(query)?;
+    crate::search::validate_date_values(query)
 }
 
 fn reject_contained_missing(query: &SearchQuery) -> StorageResult<()> {

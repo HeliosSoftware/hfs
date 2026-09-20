@@ -1080,11 +1080,12 @@ mod tests {
                 "(si1.value_date < $2)",
                 &["1980-01-01T00:00:00+00:00"],
             ),
-            // A full instant is scalar, with the offset folded into the bind.
+            // A value to the second is a range too (#1297): `gt` is past the
+            // end of that second, with the offset folded into the bind.
             (
                 "gt2019-05-04T23:30:00-07:00",
-                "(si1.value_date > $2)",
-                &["2019-05-05T06:30:00+00:00"],
+                "(si1.value_date >= $2)",
+                &["2019-05-05T06:30:01+00:00"],
             ),
         ];
         for (value, predicate, binds) in cases {
