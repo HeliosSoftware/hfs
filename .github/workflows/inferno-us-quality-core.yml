@@ -2,6 +2,15 @@ name: Inferno US Quality Core Test Suite
 
 on:
   workflow_dispatch: # Manual trigger
+    inputs:
+      test_kit_ref:
+        description: "Test kit branch, tag or SHA in the fork to run instead of the pinned TEST_KIT_REF (e.g. to try a kit fix)"
+        required: false
+        default: ""
+      backends:
+        description: 'JSON array of backends to run, e.g. ["sqlite"]. Blank runs all of them'
+        required: false
+        default: ""
   schedule:
     # Weekly US Quality Core conformance tracking run — Saturday 08:00 UTC.
     # Kept off Sunday 08:00 (inferno-us-core, ~2.5h) and clear of the daily
@@ -20,7 +29,7 @@ env:
   # so the suite and its data always move together. The fork carries no
   # upstream tags, so pin by SHA: 41fc954 is upstream v0.2.0.
   TEST_KIT_REPO: HeliosSoftware/us-quality-core-test-kit
-  TEST_KIT_REF: 41fc954beee8e9046e7935a043e470966de9b890
+  TEST_KIT_REF: ${{ inputs.test_kit_ref || '41fc954beee8e9046e7935a043e470966de9b890' }}
   # Remote Docker host (set via GitHub repository secrets or variables; leave unset for local Docker)
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
   DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
@@ -211,16 +220,7 @@ jobs:
         suite_id: [us_quality_core_v100_ballot]
         # Same backend set as inferno-us-core.yml; the service-container and
         # HFS start steps below are ported from it.
-        backend:
-          [
-            sqlite,
-            sqlite-elasticsearch,
-            postgres,
-            postgres-elasticsearch,
-            mongodb,
-            mongodb-elasticsearch,
-            s3-elasticsearch,
-          ]
+        backend: ${{ fromJSON(inputs.backends || '["sqlite","sqlite-elasticsearch","postgres","postgres-elasticsearch","mongodb","mongodb-elasticsearch","s3-elasticsearch"]') }}
         include:
           - { suite_id: us_quality_core_v100_ballot, version_label: "v1.0.0-ballot" }
     steps:
