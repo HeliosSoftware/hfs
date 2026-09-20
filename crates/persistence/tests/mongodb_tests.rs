@@ -559,6 +559,17 @@ async fn mongodb_contained_repeated_parameters_are_anded() {
     contained_suite::repeated_parameters_are_anded(&backend, "contained-repeated-1362").await;
 }
 
+/// #1363: `_`-parameters, composites and modifiers are applied under
+/// `_contained`, or refused by name — never dropped.
+#[tokio::test]
+async fn mongodb_contained_criteria_are_applied_or_rejected() {
+    let Some(backend) = create_backend_with_full_registry("contained_criteria").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    contained_suite::criteria_are_applied_or_rejected(&backend, "contained-criteria-1363").await;
+}
+
 /// #1062: a comma-separated value list on one `SearchParameter` is OR per
 /// FHIR (https://build.fhir.org/search.html#combining) — for date same as
 /// every other type. Drives the real `SearchProvider::search` /

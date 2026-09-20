@@ -723,9 +723,45 @@ impl ElasticsearchBackend {
         let resource_type = &query.resource_type;
         let index = self.index_name(tenant_id, resource_type);
 
+        // `_id` names a contained resource by its local id. The standard
+        // clause is a term on `resource_id`, which for a contained document is
+        // the synthetic `<container id>#<local id>` and so never matched
+        // (#1363). Take those parameters out and filter on the right field
+        // per document kind instead.
+        let (id_params, parameters): (Vec<_>, Vec<_>) =
+            query.parameters.iter().cloned().partition(|p| {
+                p.name == "_id"
+                    && matches!(p.modifier, None | Some(crate::types::SearchModifier::Not))
+            });
+        let mut standard_query = query.clone();
+        standard_query.parameters = parameters;
+
         // Fetch a generous window of candidate hits (offset/count applied below).
         let mut es_query =
-            EsQueryBuilder::new(tenant_id, resource_type, index.clone()).build(query);
+            EsQueryBuilder::new(tenant_id, resource_type, index.clone()).build(&standard_query);
+        for param in &id_params {
+            let ids: Vec<&str> = param.values.iter().map(|v| v.value.as_str()).collect();
+            let matches_id = json!({ "bool": { "should": [
+                { "bool": { "filter": [
+                    { "term": { "is_contained": true } },
+                    { "terms": { "contained_local_id": ids } },
+                ]}},
+                { "bool": {
+                    "must_not": [{ "term": { "is_contained": true } }],
+                    "filter": [{ "terms": { "resource_id": ids } }],
+                }},
+            ], "minimum_should_match": 1 }});
+            let occur = if param.modifier.is_some() {
+                "must_not"
+            } else {
+                "filter"
+            };
+            let clauses = &mut es_query.body["query"]["bool"][occur];
+            match clauses.as_array_mut() {
+                Some(existing) => existing.push(matches_id),
+                None => *clauses = json!([matches_id]),
+            }
+        }
         let count = query.count.unwrap_or(100) as usize;
         let offset = query.offset.unwrap_or(0) as usize;
         if let Some(obj) = es_query.body.as_object_mut() {

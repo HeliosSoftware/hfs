@@ -18884,6 +18884,18 @@ mod postgres_integration {
         .await;
     }
 
+    /// #1363: `_`-parameters, composites and modifiers are applied under
+    /// `_contained`, or refused by name — never dropped.
+    #[tokio::test]
+    async fn postgres_integration_contained_criteria_are_applied_or_rejected() {
+        let backend = create_backend().await;
+        super::contained_suite::criteria_are_applied_or_rejected(
+            &backend,
+            &unique_base("contained_criteria"),
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn postgres_integration_distinct_tenant_ids_never_share_data() {
         let backend = create_backend().await;

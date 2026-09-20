@@ -1,4 +1,4 @@
-//! Backend-agnostic `_contained` search suite (issues #1336, #1362).
+//! Backend-agnostic `_contained` search suite (issues #1336, #1362, #1363).
 //!
 //! `_contained=true|both` matches the resources *inside* a container, and each
 //! backend answers it from its own index shape: SQLite and PostgreSQL group
@@ -406,6 +406,232 @@ where
             Expect::Ids(&["dr-ab", "dr-bc", "dr-late", "top-in"]),
         )
         .both(),
+    ];
+
+    assert_cases(backend, &tenant, &controls, &cases).await;
+}
+
+/// No criterion is silently dropped under `_contained` (#1363): `_`-prefixed
+/// parameters, composites and modifiers narrow the contained match, or the
+/// search is refused with an error naming the parameter.
+///
+/// Containers (DiagnosticReport → one contained Observation each, code X
+/// unless noted):
+/// - `m-tagged`: `t1` — `meta.tag` foo, `meta.profile` …/p1, `meta.security`
+///   R, `valueQuantity` 7 mg
+/// - `m-plain`: `p1` — no `meta`, `valueQuantity` 3 mg
+/// - `m-str`: `s1` — `valueString` "hello"
+/// - `m-other`: `o1` — code Y with text "Glucose level", `valueString`
+///   "Hello World"
+pub async fn criteria_are_applied_or_rejected<S>(backend: &S, tenant_base: &str)
+where
+    S: ResourceStorage + SearchProvider,
+{
+    let tenant = TenantContext::new(TenantId::new(tenant_base), TenantPermissions::full_access());
+
+    let mut tagged = observation("t1", "X", "2020-06-15", &["cat1"]);
+    tagged["meta"] = json!({
+        "tag": [{"system": "http://example.org/tags", "code": "foo"}],
+        "profile": ["http://example.org/StructureDefinition/p1"],
+        "security": [{
+            "system": "http://terminology.hl7.org/CodeSystem/v3-Confidentiality",
+            "code": "R",
+        }],
+    });
+    let quantity = |value: f64| {
+        json!({
+            "value": value,
+            "unit": "mg",
+            "system": "http://unitsofmeasure.org",
+            "code": "mg",
+        })
+    };
+    tagged["valueQuantity"] = quantity(7.0);
+    let mut plain = observation("p1", "X", "2020-06-15", &["cat1"]);
+    plain["valueQuantity"] = quantity(3.0);
+    let mut string = observation("s1", "X", "2020-06-15", &["cat1"]);
+    string["valueString"] = json!("hello");
+    let mut other = observation("o1", "Y", "2020-06-15", &["cat1"]);
+    other["code"]["text"] = json!("Glucose level");
+    other["valueString"] = json!("Hello World");
+
+    seed_containers(
+        backend,
+        &tenant,
+        vec![
+            ("m-tagged", vec![tagged]),
+            ("m-plain", vec![plain]),
+            ("m-str", vec![string]),
+            ("m-other", vec![other]),
+        ],
+    )
+    .await;
+
+    let value_string = |value: &str| literal("value-string", SearchParamType::String, value);
+    let controls = [
+        Case::new(
+            "code=X",
+            vec![token("code", "X")],
+            Expect::Ids(&["m-plain", "m-str", "m-tagged"]),
+        ),
+        Case::new(
+            "code=Y",
+            vec![token("code", "Y")],
+            Expect::Ids(&["m-other"]),
+        ),
+        // Default string matching: case-insensitive starts-with.
+        Case::new(
+            "value-string=hello",
+            vec![value_string("hello")],
+            Expect::Ids(&["m-other", "m-str"]),
+        ),
+        Case::new(
+            "value-quantity=gt1",
+            vec![param(
+                "value-quantity",
+                SearchParamType::Quantity,
+                vec![SearchValue::parse("gt1")],
+            )],
+            Expect::Ids(&["m-plain", "m-tagged"]),
+        ),
+    ];
+
+    let code_x = || token("code", "X");
+    let cases = [
+        // 1. `_`-prefixed parameters that describe the contained resource.
+        Case::new(
+            "code=X&_tag=foo",
+            vec![code_x(), token("_tag", "foo")],
+            Expect::IdsOrRejected(&["m-tagged"], "_tag"),
+        ),
+        Case::new(
+            "code=X&_tag=absent",
+            vec![code_x(), token("_tag", "absent")],
+            Expect::IdsOrRejected(&[], "_tag"),
+        ),
+        Case::new(
+            "_tag=foo (alone)",
+            vec![token("_tag", "foo")],
+            Expect::IdsOrRejected(&["m-tagged"], "_tag"),
+        ),
+        Case::new(
+            "code=X&_profile=http://example.org/StructureDefinition/p1",
+            vec![
+                code_x(),
+                literal(
+                    "_profile",
+                    SearchParamType::Uri,
+                    "http://example.org/StructureDefinition/p1",
+                ),
+            ],
+            Expect::IdsOrRejected(&["m-tagged"], "_profile"),
+        ),
+        Case::new(
+            "code=X&_security=R",
+            vec![code_x(), token("_security", "R")],
+            Expect::IdsOrRejected(&["m-tagged"], "_security"),
+        ),
+        // `_id` is the contained resource's local id.
+        Case::new(
+            "code=X&_id=t1",
+            vec![code_x(), token("_id", "t1")],
+            Expect::IdsOrRejected(&["m-tagged"], "_id"),
+        ),
+        Case::new(
+            "_id=t1 (alone)",
+            vec![token("_id", "t1")],
+            Expect::IdsOrRejected(&["m-tagged"], "_id"),
+        ),
+        // A contained resource has no `meta.lastUpdated` of its own; a backend
+        // that answers takes the container's.
+        Case::new(
+            "code=X&_lastUpdated=lt1990-01-01",
+            vec![
+                code_x(),
+                param(
+                    "_lastUpdated",
+                    SearchParamType::Date,
+                    vec![SearchValue::parse("lt1990-01-01")],
+                ),
+            ],
+            Expect::IdsOrRejected(&[], "_lastUpdated"),
+        ),
+        Case::new(
+            "code=X&_lastUpdated=gt1990-01-01",
+            vec![
+                code_x(),
+                param(
+                    "_lastUpdated",
+                    SearchParamType::Date,
+                    vec![SearchValue::parse("gt1990-01-01")],
+                ),
+            ],
+            Expect::IdsOrRejected(&["m-plain", "m-str", "m-tagged"], "_lastUpdated"),
+        ),
+        // 2. Composites.
+        Case::new(
+            "code-value-quantity=X$gt5",
+            vec![code_value_quantity("X$gt5")],
+            Expect::IdsOrRejected(&["m-tagged"], "code-value-quantity"),
+        ),
+        Case::new(
+            "code=X&code-value-quantity=X$gt5",
+            vec![code_x(), code_value_quantity("X$gt5")],
+            Expect::IdsOrRejected(&["m-tagged"], "code-value-quantity"),
+        ),
+        // 3. Modifiers.
+        Case::new(
+            "code:not=X",
+            vec![with_modifier(code_x(), SearchModifier::Not)],
+            Expect::IdsOrRejected(&["m-other"], "code"),
+        ),
+        Case::new(
+            "code:text=glucose",
+            vec![with_modifier(
+                token("code", "glucose"),
+                SearchModifier::Text,
+            )],
+            Expect::IdsOrRejected(&["m-other"], "code"),
+        ),
+        Case::new(
+            "value-string:exact=hello",
+            vec![with_modifier(value_string("hello"), SearchModifier::Exact)],
+            Expect::IdsOrRejected(&["m-str"], "value-string"),
+        ),
+        Case::new(
+            "value-string:exact=Hello",
+            vec![with_modifier(value_string("Hello"), SearchModifier::Exact)],
+            Expect::IdsOrRejected(&[], "value-string"),
+        ),
+        Case::new(
+            "value-string:contains=world",
+            vec![with_modifier(
+                value_string("world"),
+                SearchModifier::Contains,
+            )],
+            Expect::IdsOrRejected(&["m-other"], "value-string"),
+        ),
+        Case::new(
+            "value-string:missing=true",
+            vec![with_modifier(value_string("true"), SearchModifier::Missing)],
+            Expect::IdsOrRejected(&["m-plain", "m-tagged"], "value-string"),
+        ),
+        Case::new(
+            "value-string:missing=false",
+            vec![with_modifier(
+                value_string("false"),
+                SearchModifier::Missing,
+            )],
+            Expect::IdsOrRejected(&["m-other", "m-str"], "value-string"),
+        ),
+        Case::new(
+            "code=X&value-string:missing=true",
+            vec![
+                code_x(),
+                with_modifier(value_string("true"), SearchModifier::Missing),
+            ],
+            Expect::IdsOrRejected(&["m-plain", "m-tagged"], "value-string"),
+        ),
     ];
 
     assert_cases(backend, &tenant, &controls, &cases).await;

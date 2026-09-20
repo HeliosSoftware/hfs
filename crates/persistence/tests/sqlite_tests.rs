@@ -50,6 +50,14 @@ async fn sqlite_contained_repeated_parameters_are_anded() {
     contained_suite::repeated_parameters_are_anded(&backend, "contained-repeated-1362").await;
 }
 
+/// #1363: `_`-parameters, composites and modifiers are applied under
+/// `_contained`, or refused by name — never dropped.
+#[tokio::test]
+async fn sqlite_contained_criteria_are_applied_or_rejected() {
+    let backend = create_backend();
+    contained_suite::criteria_are_applied_or_rejected(&backend, "contained-criteria-1363").await;
+}
+
 fn create_backend() -> SqliteBackend {
     // Configure with data directory to load spec SearchParameters
     // CARGO_MANIFEST_DIR for tests is crates/persistence

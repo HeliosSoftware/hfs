@@ -963,6 +963,18 @@ mod es_integration {
             .await;
     }
 
+    /// #1363: `_`-parameters, composites and modifiers are applied under
+    /// `_contained`, or refused by name — never dropped.
+    #[tokio::test]
+    async fn es_contained_criteria_are_applied_or_rejected() {
+        let backend = create_backend().await;
+        super::contained_suite::criteria_are_applied_or_rejected(
+            &backend,
+            "contained-criteria-1363",
+        )
+        .await;
+    }
+
     // ========================================================================
     // Index-side date handling (#1314)
     // ========================================================================
