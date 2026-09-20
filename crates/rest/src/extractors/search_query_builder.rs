@@ -804,6 +804,18 @@ fn parse_has_parameter_in(
     value: &str,
     types: TypeScope,
 ) -> Result<Option<ReverseChainedParameter>, RestError> {
+    parse_has_level(name, name, value, types)
+}
+
+/// One level of a `_has` key. `name` is this level (`_has:C:d:code` for the
+/// inner level of `_has:A:b:_has:C:d:code`); `key` is the whole key as the
+/// client wrote it, which is what every error names.
+fn parse_has_level(
+    key: &str,
+    name: &str,
+    value: &str,
+    types: TypeScope,
+) -> Result<Option<ReverseChainedParameter>, RestError> {
     // Handle both _has:... format and _has key with value containing the chain
     let chain_str = if name == "_has" {
         // Value format: Observation:patient:code
@@ -820,7 +832,7 @@ fn parse_has_parameter_in(
 
     if parts.len() < 3 {
         return Err(RestError::InvalidParameter {
-            param: name.to_string(),
+            param: key.to_string(),
             message:
                 "Invalid _has format. Expected _has:[type]:[reference-param]:[search-param]=value"
                     .to_string(),
@@ -836,7 +848,7 @@ fn parse_has_parameter_in(
     // of the key against (#1339).
     if !types.contains(&source_type) {
         return Err(RestError::InvalidParameter {
-            param: name.to_string(),
+            param: key.to_string(),
             message: format!(
                 "unknown resource type '{source_type}' in _has; it is not a resource type{}{}",
                 version_clause(types),
@@ -852,7 +864,7 @@ fn parse_has_parameter_in(
             SearchValue::eq(parts[3])
         } else {
             return Err(RestError::InvalidParameter {
-                param: name.to_string(),
+                param: key.to_string(),
                 message: "Missing value for _has parameter".to_string(),
             });
         }
@@ -866,7 +878,7 @@ fn parse_has_parameter_in(
     // expression, which we parse recursively.
     if search_param == "_has" {
         let inner = &chain_str[parts[0].len() + parts[1].len() + 2..];
-        let nested = parse_has_parameter_in(inner, value, types)?;
+        let nested = parse_has_level(key, inner, value, types)?;
         if let Some(nested_chain) = nested {
             return Ok(Some(ReverseChainedParameter::nested(
                 source_type,
@@ -884,8 +896,8 @@ fn parse_has_parameter_in(
     // `_has=Type:ref:param:value` form the fourth part is the value.)
     let search_param = match parts.get(3) {
         Some(suffix) if name != "_has" => {
-            let modifier = parse_terminal_modifier(name, &search_param, suffix, types)?;
-            check_missing_literal(name, Some(&modifier), value)?;
+            let modifier = parse_terminal_modifier(key, &search_param, suffix, types)?;
+            check_missing_literal(key, Some(&modifier), value)?;
             format!("{search_param}:{suffix}")
         }
         _ => search_param,
@@ -1615,6 +1627,29 @@ mod tests {
         assert!(parse_has_parameter("_has:Observation:subject:code:bogus", "1").is_err());
         assert!(parse_has_parameter("_has:Observation:subject:code:missing", "yes").is_err());
         assert!(parse_has_parameter("_has:Observation:subject:code:missing", "true").is_ok());
+    }
+
+    /// #1339: an error in an inner level of a nested `_has` names the whole
+    /// key, as written — not just the level it was found in.
+    #[test]
+    fn test_nested_has_errors_name_the_full_key() {
+        for (key, value) in [
+            (
+                "_has:Encounter:subject:_has:Observation:encounter:code:bogus",
+                "x",
+            ),
+            (
+                "_has:Encounter:subject:_has:Observation:encounter:code:missing",
+                "yes",
+            ),
+            ("_has:Encounter:subject:_has:Observation:encounter", "x"),
+            ("_has:Encounter:subject:_has:Bogus:encounter:code", "x"),
+        ] {
+            match parse_has_parameter(key, value) {
+                Err(RestError::InvalidParameter { param, .. }) => assert_eq!(param, key),
+                other => panic!("{key}: expected InvalidParameter, got {other:?}"),
+            }
+        }
     }
 
     #[test]

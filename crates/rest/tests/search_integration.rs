@@ -3460,6 +3460,40 @@ mod chaining {
         }
     }
 
+    /// #1339: the `400` / `501` for the terminal parameter of a nested `_has`
+    /// names the whole key as written, not just its innermost level.
+    #[tokio::test]
+    async fn test_nested_has_errors_name_the_full_key() {
+        let (server, backend) = create_test_server().await;
+        seed_chain_name_data(&backend).await;
+
+        let key = "_has:Encounter:subject:_has:Observation:encounter:code";
+        // Positive control: the nested `_has` resolves.
+        assert_eq!(
+            ids(&server, &format!("/Patient?{key}=1234-5")).await,
+            ["ps"]
+        );
+
+        for (suffix, value, expected) in [
+            // Needs a terminology server (#1317).
+            (":in", "http://example.org/vs", StatusCode::NOT_IMPLEMENTED),
+            (
+                ":below",
+                "http://loinc.org|1234-5",
+                StatusCode::NOT_IMPLEMENTED,
+            ),
+            // Not defined for a token; not a modifier; not a boolean (#1302).
+            (":exact", "1234-5", StatusCode::BAD_REQUEST),
+            (":bogus", "1234-5", StatusCode::BAD_REQUEST),
+            (":missing", "yes", StatusCode::BAD_REQUEST),
+        ] {
+            let url = format!("/Patient?{key}{suffix}={value}");
+            let (status, text) = outcome(&server, &url).await;
+            assert_eq!(status, expected, "{url}: {text}");
+            assert!(text.contains(key), "{url}: {text}");
+        }
+    }
+
     #[tokio::test]
     async fn test_multiple_chain_levels() {
         let (server, backend) = create_test_server().await;
