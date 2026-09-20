@@ -1243,3 +1243,92 @@ async fn resource_level_parameters_are_valid_criteria() {
         );
     }
 }
+
+// =============================================================================
+// Modifiers
+// =============================================================================
+
+/// Modifiers in criteria follow direct search's rules: an unknown modifier, a
+/// `:Type` that is no resource type, and a modifier the parameter's type does
+/// not define are a 400; a modifier that needs terminology expansion — which
+/// conditional criteria never get — is a 501, not a literal match.
+#[tokio::test]
+async fn modifiers_in_criteria_follow_direct_search() {
+    for (criteria, expected) in [
+        ("family:nonsense=Neal", StatusCode::BAD_REQUEST),
+        ("identifier:exact=ne123", StatusCode::BAD_REQUEST),
+        ("general-practitioner:Bogus=1", StatusCode::BAD_REQUEST),
+        ("_text:missing=true", StatusCode::BAD_REQUEST),
+        (
+            "identifier:in=http://example.org/ValueSet/mrns",
+            StatusCode::NOT_IMPLEMENTED,
+        ),
+        (
+            "identifier:not-in=http://example.org/ValueSet/mrns",
+            StatusCode::NOT_IMPLEMENTED,
+        ),
+        ("gender:below=male", StatusCode::NOT_IMPLEMENTED),
+        ("gender:above=male", StatusCode::NOT_IMPLEMENTED),
+    ] {
+        let server = test_server().await;
+        seed_target_and_decoy(&server).await;
+
+        // Direct search (no terminology server configured) answers the same.
+        server
+            .get(&format!("/Patient?{criteria}"))
+            .add_header(X_TENANT_ID, tenant())
+            .add_header(PREFER, HeaderValue::from_static("handling=strict"))
+            .await
+            .assert_status(expected);
+
+        let response = conditional_create(&server, criteria).await;
+        assert_eq!(
+            response.status_code(),
+            expected,
+            "If-None-Exist: {criteria}"
+        );
+        let response = server
+            .put(&format!("/Patient?{criteria}"))
+            .add_header(X_TENANT_ID, tenant())
+            .json(&patient("Updated", "ne123"))
+            .await;
+        assert_eq!(response.status_code(), expected, "PUT {criteria}");
+        let response = server
+            .delete(&format!("/Patient?{criteria}"))
+            .add_header(X_TENANT_ID, tenant())
+            .await;
+        assert_eq!(response.status_code(), expected, "DELETE {criteria}");
+
+        assert_eq!(families(&server).await, pairs(&SEEDED), "{criteria}");
+    }
+}
+
+/// Modifiers the backends resolve natively still work.
+#[tokio::test]
+async fn natively_resolved_modifiers_still_select_the_target() {
+    for criteria in [
+        "family:exact=Neal",
+        "family:contains=eal",
+        "identifier:not=123&identifier:not=zz9",
+    ] {
+        let server = test_server().await;
+        seed_target_and_decoy(&server).await;
+        // Positive control.
+        assert_eq!(
+            search_ids(&server, criteria).await,
+            vec!["target"],
+            "{criteria}"
+        );
+
+        server
+            .delete(&format!("/Patient?{criteria}"))
+            .add_header(X_TENANT_ID, tenant())
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        assert_eq!(
+            families(&server).await,
+            pairs(&[("bystander", "Wilson"), ("decoy", "Allen")]),
+            "DELETE /Patient?{criteria}"
+        );
+    }
+}

@@ -41,7 +41,9 @@ use crate::types::{
 };
 
 use super::registry::{SearchParameterRegistry, fallback_param_type};
-use super::value_parser::{parse_typed_values, split_unescaped_commas};
+use super::value_parser::{
+    param_requires_terminology, parse_typed_values, split_unescaped_commas, validate_modifier,
+};
 
 /// Upper bound on the matches a conditional interaction asks the search for.
 /// One match and "more than one" are all it ever distinguishes; the bound only
@@ -118,6 +120,14 @@ pub fn parse_conditional_criteria(criteria: &str) -> Vec<(String, String)> {
 /// which would match nothing and quietly turn the interaction into an
 /// unconditional one.
 ///
+/// # Modifiers
+///
+/// A `:modifier` is held to direct search's rules — a known modifier or a real
+/// resource type, and [`validate_modifier`] for the parameter's type — and a
+/// modifier only a terminology server can answer
+/// ([`param_requires_terminology`]) is refused as not supported, since nothing
+/// expands conditional criteria.
+///
 /// # Unknown parameters
 ///
 /// A criterion whose parameter the tenant's registry does not define for
@@ -160,10 +170,10 @@ pub fn build_conditional_parameters(
 
         let (name, modifier) = match raw_name.split_once(':') {
             Some((name, modifier_str)) => {
-                let modifier = SearchModifier::parse(modifier_str).ok_or_else(|| {
+                let modifier = parse_modifier(modifier_str).ok_or_else(|| {
                     query_error(format!(
                         "unknown search modifier ':{modifier_str}' on conditional criterion \
-                         '{raw_name}'"
+                         '{raw_name}'; it is neither a search modifier nor a resource type"
                     ))
                 })?;
                 (name, Some(modifier))
@@ -203,13 +213,19 @@ pub fn build_conditional_parameters(
         };
 
         if let Some(m) = &modifier {
-            if definition.is_some()
-                && param_type != SearchParamType::Special
-                && !m.is_valid_for(param_type)
-            {
-                return Err(StorageError::Search(SearchError::UnsupportedModifier {
-                    modifier: m.to_string(),
-                    param_type: param_type.to_string(),
+            // The rules direct search and the chain resolver apply.
+            validate_modifier(registry, resource_type, name, param_type, m).map_err(query_error)?;
+            // Direct search hands `:in` and token `:above` / `:below` to a
+            // terminology server before it builds the query. Nothing expands
+            // conditional criteria, and a backend given the bare modifier
+            // matches the value-set URL or the code literally — so the
+            // precondition would silently mean something else.
+            if param_requires_terminology(registry, resource_type, name, m) {
+                return Err(StorageError::Search(SearchError::IncludeNotSupported {
+                    operation: format!(
+                        "search modifier ':{m}' on conditional criterion '{raw_name}' needs \
+                         terminology expansion, which conditional criteria do not get; it is"
+                    ),
                 }));
             }
         }
@@ -297,6 +313,46 @@ fn values_for_type(param_type: SearchParamType, raw_values: &[String]) -> Vec<Se
             }
         })
         .collect()
+}
+
+/// Parses a `:suffix` as a search modifier, or as the `:[type]` qualifier of a
+/// reference parameter.
+///
+/// [`SearchModifier::parse`] reads any capitalised suffix as a type qualifier,
+/// so the name is checked against the resource types of the enabled FHIR
+/// versions: `subject:Bogus` is no more a modifier than `subject:bogus`. This
+/// is the rule of helios-rest's `parse_modifier`, which persistence cannot
+/// call; the two should become one.
+fn parse_modifier(suffix: &str) -> Option<SearchModifier> {
+    match SearchModifier::parse(suffix)? {
+        SearchModifier::Type(t) if !is_resource_type(&t) => None,
+        modifier => Some(modifier),
+    }
+}
+
+/// Whether `name` is, case-sensitively, a resource type of any FHIR version
+/// enabled in this build.
+fn is_resource_type(name: &str) -> bool {
+    use helios_fhir::FhirResourceTypeProvider;
+
+    let mut known = false;
+    #[cfg(feature = "R4")]
+    {
+        known |= helios_fhir::r4::Resource::get_resource_type_names().contains(&name);
+    }
+    #[cfg(feature = "R4B")]
+    {
+        known |= helios_fhir::r4b::Resource::get_resource_type_names().contains(&name);
+    }
+    #[cfg(feature = "R5")]
+    {
+        known |= helios_fhir::r5::Resource::get_resource_type_names().contains(&name);
+    }
+    #[cfg(feature = "R6")]
+    {
+        known |= helios_fhir::r6::Resource::get_resource_type_names().contains(&name);
+    }
+    known
 }
 
 fn unknown_parameter(resource_type: &str, name: &str) -> StorageError {
@@ -398,17 +454,57 @@ mod tests {
         assert_eq!(param.modifier, Some(SearchModifier::Exact));
         assert_eq!(param.values[0].value, "Neal");
 
+        let param = one("general-practitioner:Practitioner=p1");
+        assert_eq!(
+            param.modifier,
+            Some(SearchModifier::Type("Practitioner".to_string()))
+        );
+
         let registry = registry();
         for criteria in [
             "identifier:exact=ne123",
             "family:bogus=Neal",
             "family:missing=maybe",
+            // A capitalised suffix is a type qualifier only if it is a type.
+            "general-practitioner:Bogus=p1",
+            "general-practitioner:practitioner=p1",
+            // No presence row to test `:missing` against.
+            "_text:missing=true",
         ] {
             assert!(
-                build_conditional_query(&registry, "Patient", criteria).is_err(),
+                matches!(
+                    build_conditional_query(&registry, "Patient", criteria),
+                    Err(StorageError::Search(SearchError::QueryParseError { .. }))
+                ),
                 "{criteria} must be refused"
             );
         }
+    }
+
+    #[test]
+    fn terminology_backed_modifiers_are_not_searched_literally() {
+        let registry = registry();
+        for criteria in [
+            "identifier:in=http://example.org/ValueSet/mrns",
+            "identifier:not-in=http://example.org/ValueSet/mrns",
+            "identifier:below=123",
+            "identifier:above=123",
+        ] {
+            assert!(
+                matches!(
+                    build_conditional_query(&registry, "Patient", criteria),
+                    Err(StorageError::Search(
+                        SearchError::IncludeNotSupported { .. }
+                    ))
+                ),
+                "{criteria} must be refused as not supported"
+            );
+        }
+        // On a reference, `:below` is structural and resolved natively.
+        assert_eq!(
+            one("general-practitioner:below=Practitioner/p1").modifier,
+            Some(SearchModifier::Below)
+        );
     }
 
     #[test]
