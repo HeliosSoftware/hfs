@@ -559,8 +559,25 @@ jobs:
       # per backend on its own, with warnings denied so a helper left unused by
       # a subset fails here too. `--no-default-features` is required: the
       # default set enables `sqlite`.
+      #
+      # The loop is bash, and a bare `shell: bash` resolves to WSL's
+      # `C:\Windows\System32\bash.exe` on the self-hosted Windows agent, which
+      # aborts with "Windows Subsystem for Linux has no installed distributions".
+      # Same split as the MinIO steps above: Git Bash via the space-free 8.3
+      # path on Windows, plain `shell: bash` elsewhere. The two steps run the
+      # identical script; exactly one fires per run via the `runner.os` guard.
       - name: Check hfs builds with single-backend feature sets (#1291)
+        if: runner.os != 'Windows'
         shell: bash
+        run: |
+          for features in R4,sqlite,postgres R4,postgres R4,mongodb R4,s3 R4,s3,elasticsearch; do
+            echo "::group::helios-hfs --no-default-features --features $features"
+            cargo clippy -p helios-hfs --no-default-features --features "$features" -- -D warnings -A clippy::items_after_test_module -A clippy::large_enum_variant -A clippy::question_mark -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::field_reassign_with_default -A clippy::doc-overindented-list-items -A clippy::doc-lazy-continuation
+            echo "::endgroup::"
+          done
+      - name: Check hfs builds with single-backend feature sets (#1291) (Windows)
+        if: runner.os == 'Windows'
+        shell: 'C:\Progra~1\Git\bin\bash.exe --noprofile --norc -eo pipefail {0}'
         run: |
           for features in R4,sqlite,postgres R4,postgres R4,mongodb R4,s3 R4,s3,elasticsearch; do
             echo "::group::helios-hfs --no-default-features --features $features"
