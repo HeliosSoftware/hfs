@@ -110,23 +110,28 @@ pub fn get_resource_type_names() -> &'static [&'static str] {
 /// assert!(!is_valid_resource_type("patient")); // Case-sensitive
 /// ```
 pub fn is_valid_resource_type(type_name: &str) -> bool {
+    // One `|=` per enabled version rather than a chain of early returns: in a
+    // single-version build that chain is `if x { return true; } false`, which
+    // newer clippy rejects (`needless_bool`). The lookups are cheap, so not
+    // short-circuiting costs nothing.
+    let mut known = false;
     #[cfg(feature = "R4")]
-    if r4_resource_types().contains(&type_name) {
-        return true;
+    {
+        known |= r4_resource_types().contains(&type_name);
     }
     #[cfg(feature = "R4B")]
-    if r4b_resource_types().contains(&type_name) {
-        return true;
+    {
+        known |= r4b_resource_types().contains(&type_name);
     }
     #[cfg(feature = "R5")]
-    if r5_resource_types().contains(&type_name) {
-        return true;
+    {
+        known |= r5_resource_types().contains(&type_name);
     }
     #[cfg(feature = "R6")]
-    if r6_resource_types().contains(&type_name) {
-        return true;
+    {
+        known |= r6_resource_types().contains(&type_name);
     }
-    false
+    known
 }
 
 /// Checks whether a path segment names a resource type in any FHIR version
@@ -138,23 +143,25 @@ pub fn is_valid_resource_type(type_name: &str) -> bool {
 /// tenant prefix. Write handlers still require the exact, case-sensitive name
 /// for the request's effective FHIR version through [`admit_resource_type`].
 pub fn is_reserved_resource_path(type_name: &str) -> bool {
+    // Same shape as `is_valid_resource_type`, for the same reason.
+    let mut reserved = false;
     #[cfg(feature = "R4")]
-    if helios_fhir::r4::Resource::is_resource_type(type_name) {
-        return true;
+    {
+        reserved |= helios_fhir::r4::Resource::is_resource_type(type_name);
     }
     #[cfg(feature = "R4B")]
-    if helios_fhir::r4b::Resource::is_resource_type(type_name) {
-        return true;
+    {
+        reserved |= helios_fhir::r4b::Resource::is_resource_type(type_name);
     }
     #[cfg(feature = "R5")]
-    if helios_fhir::r5::Resource::is_resource_type(type_name) {
-        return true;
+    {
+        reserved |= helios_fhir::r5::Resource::is_resource_type(type_name);
     }
     #[cfg(feature = "R6")]
-    if helios_fhir::r6::Resource::is_resource_type(type_name) {
-        return true;
+    {
+        reserved |= helios_fhir::r6::Resource::is_resource_type(type_name);
     }
-    false
+    reserved
 }
 
 /// Returns the FHIR version string for the enabled version.
