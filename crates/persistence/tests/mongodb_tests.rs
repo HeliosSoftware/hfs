@@ -541,6 +541,28 @@ async fn mongodb_minute_precision_stored_dates_are_indexed() {
     .await;
 }
 
+/// The backend-agnostic suite for exponent-form number and quantity search
+/// values (#1337). Same `#[path]` arrangement.
+#[path = "search/number_exponent_suite.rs"]
+mod number_exponent_suite;
+
+/// #1337: `1e2` is one significant figure, `[50, 150)`. Needs the full
+/// registry so `ChargeItem.factor-override` and `Observation.value-quantity`
+/// extract. MongoDB has no canonical-unit quantity match, hence `false`.
+#[tokio::test]
+async fn mongodb_exponent_values_use_significant_figures() {
+    let Some(backend) = create_backend_with_full_registry("number_exponent").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    number_exponent_suite::exponent_values_use_significant_figures(
+        &backend,
+        "number-exponent-1337",
+        false,
+    )
+    .await;
+}
+
 /// #1062: a comma-separated value list on one `SearchParameter` is OR per
 /// FHIR (https://build.fhir.org/search.html#combining) — for date same as
 /// every other type. Drives the real `SearchProvider::search` /
