@@ -21,8 +21,18 @@
 //! again: comparator prefixes only for date / number / quantity parameters,
 //! OR-lists split on unescaped commas, and `name:modifier` honoured.
 //!
-//! The criteria string is taken as already percent-decoded — the REST layer
-//! decodes it once, and no backend decodes it again.
+//! # Encoding
+//!
+//! The criteria string is the query portion of a search URL, **as it appears
+//! on the wire**: `application/x-www-form-urlencoded`, like any search query.
+//! That is what `If-None-Exist` and `Bundle.entry.request.ifNoneExist` are
+//! defined to carry, and what the REST layer hands over untouched for a
+//! conditional URL. It is decoded exactly once, in
+//! [`parse_conditional_criteria`], with the parser direct search uses — after
+//! the split into pairs, so a decoded `&`, `=` or `+` inside a value stays
+//! inside it (#1322). A caller that already holds decoded pairs uses
+//! [`build_conditional_query_from_pairs`]; it must never join them into a
+//! string for this module to split again.
 
 use crate::error::{SearchError, StorageError, StorageResult};
 use crate::types::{
@@ -31,7 +41,9 @@ use crate::types::{
 };
 
 use super::registry::{SearchParameterRegistry, fallback_param_type};
-use super::value_parser::{parse_typed_values, split_unescaped_commas};
+use super::value_parser::{
+    param_requires_terminology, parse_typed_values, split_unescaped_commas, validate_modifier,
+};
 
 /// Upper bound on the matches a conditional interaction asks the search for.
 /// One match and "more than one" are all it ever distinguishes; the bound only
@@ -61,15 +73,36 @@ const RESULT_PARAMS: &[&str] = &[
     "_score",
 ];
 
-/// Splits conditional criteria into `(name, value)` pairs.
+/// Resource-level parameters that are criteria even when the tenant's registry
+/// has no definition for them (a backend built without the spec files registers
+/// only a handful): the ones [`fallback_param_type`] can place in the index
+/// column the extractor writes them under. Every other name has to be
+/// registered for the resource type, or for `Resource`.
+const ALWAYS_INDEXED_PARAMS: &[&str] = &[
+    "_id",
+    "_lastUpdated",
+    "_tag",
+    "_profile",
+    "_security",
+    "_source",
+];
+
+/// Splits form-urlencoded conditional criteria into decoded `(name, value)`
+/// pairs.
 ///
-/// Pairs without an `=`, with an empty name, or with an empty value are
-/// dropped. Repeated names are kept, in order: FHIR ANDs them.
+/// The decoding is `form_urlencoded`'s, the parser the REST layer reads a
+/// search query with: `%XX` escapes are resolved and `+` is a space, in names
+/// and values alike, *after* the split on `&` and `=` — so
+/// `identifier=http%3A%2F%2Fexample.org%7C123` names `http://example.org|123`,
+/// and an encoded `&` or `=` is part of its value. `%2C` decodes to a comma,
+/// which then separates OR alternatives exactly as a literal one does; a comma
+/// that belongs to the value is escaped the FHIR way, `\,`.
+///
+/// Pairs with an empty name or an empty value are dropped. Repeated names are
+/// kept, in order: FHIR ANDs them.
 pub fn parse_conditional_criteria(criteria: &str) -> Vec<(String, String)> {
-    criteria
-        .split('&')
-        .filter_map(|pair| {
-            let (name, value) = pair.split_once('=')?;
+    form_urlencoded::parse(criteria.as_bytes())
+        .filter_map(|(name, value)| {
             let (name, value) = (name.trim(), value.trim());
             if name.is_empty() || value.is_empty() {
                 return None;
@@ -81,10 +114,33 @@ pub fn parse_conditional_criteria(criteria: &str) -> Vec<(String, String)> {
 
 /// Builds the typed search parameters a list of criteria pairs describes.
 ///
-/// Result-shaping parameters (`_format`, `_count`, …) are skipped. Criteria
-/// this layer cannot evaluate — chained parameters, `_has`, `_list` — are
-/// refused rather than searched for under their literal name, which would
-/// match nothing and quietly turn the interaction into an unconditional one.
+/// Result-shaping parameters ([`RESULT_PARAMS`]: `_format`, `_count`, …) are
+/// skipped. Criteria this layer cannot evaluate — chained parameters, `_has`,
+/// `_list` — are refused rather than searched for under their literal name,
+/// which would match nothing and quietly turn the interaction into an
+/// unconditional one.
+///
+/// # Modifiers
+///
+/// A `:modifier` is held to direct search's rules — a known modifier or a real
+/// resource type, and [`validate_modifier`] for the parameter's type — and a
+/// modifier only a terminology server can answer
+/// ([`param_requires_terminology`]) is refused as not supported, since nothing
+/// expands conditional criteria.
+///
+/// # Unknown parameters
+///
+/// A criterion whose parameter the tenant's registry does not define for
+/// `resource_type` (or for `Resource`) is an error, which REST answers with a
+/// `400` naming it (#1323). A search may ignore a parameter it does not know —
+/// that is what `Prefer: handling=lenient` asks for — but these criteria are the
+/// precondition of a *write*, and neither way of carrying on is safe: searching
+/// for the unknown name matches nothing, so `If-None-Exist: identifer=123`
+/// creates the duplicate it exists to prevent and a conditional update creates
+/// instead of updating; ignoring it widens the match, so the update or delete
+/// lands on a resource the client did not name. FHIR defines `Prefer: handling`
+/// for searches and is silent on conditional interactions, so the header is
+/// deliberately not consulted.
 pub fn build_conditional_parameters(
     registry: &SearchParameterRegistry,
     resource_type: &str,
@@ -114,10 +170,10 @@ pub fn build_conditional_parameters(
 
         let (name, modifier) = match raw_name.split_once(':') {
             Some((name, modifier_str)) => {
-                let modifier = SearchModifier::parse(modifier_str).ok_or_else(|| {
+                let modifier = parse_modifier(modifier_str).ok_or_else(|| {
                     query_error(format!(
                         "unknown search modifier ':{modifier_str}' on conditional criterion \
-                         '{raw_name}'"
+                         '{raw_name}'; it is neither a search modifier nor a resource type"
                     ))
                 })?;
                 (name, Some(modifier))
@@ -138,29 +194,38 @@ pub fn build_conditional_parameters(
         let definition = registry
             .get_param(resource_type, name)
             .or_else(|| registry.get_param("Resource", name));
+        if definition.is_none() && !ALWAYS_INDEXED_PARAMS.contains(&name) {
+            return Err(unknown_parameter(resource_type, name));
+        }
         let raw_values = split_unescaped_commas(raw_value);
 
-        let (param_type, values) = match (&definition, fallback_param_type(name)) {
-            // A registry miss on a name the fallback table knows keeps the
-            // table's answer: it records which index column the extractor
-            // writes those rows under (see `fallback_param_type`).
-            (None, fallback) if fallback != SearchParamType::String => {
+        let (param_type, values) = match &definition {
+            // A registry miss on a parameter every resource is indexed under
+            // takes the fallback table's type: it records which index column
+            // the extractor writes those rows under (see
+            // `fallback_param_type`).
+            None => {
+                let fallback = fallback_param_type(name);
                 (fallback, values_for_type(fallback, &raw_values))
             }
-            // Registered parameters — everything in the spec — resolve
-            // deterministically; anything else gets the same value-shape
-            // heuristic direct search applies.
-            _ => parse_typed_values(registry, resource_type, name, &raw_values),
+            // Registered parameters resolve deterministically.
+            Some(_) => parse_typed_values(registry, resource_type, name, &raw_values),
         };
 
         if let Some(m) = &modifier {
-            if definition.is_some()
-                && param_type != SearchParamType::Special
-                && !m.is_valid_for(param_type)
-            {
-                return Err(StorageError::Search(SearchError::UnsupportedModifier {
-                    modifier: m.to_string(),
-                    param_type: param_type.to_string(),
+            // The rules direct search and the chain resolver apply.
+            validate_modifier(registry, resource_type, name, param_type, m).map_err(query_error)?;
+            // Direct search hands `:in` and token `:above` / `:below` to a
+            // terminology server before it builds the query. Nothing expands
+            // conditional criteria, and a backend given the bare modifier
+            // matches the value-set URL or the code literally — so the
+            // precondition would silently mean something else.
+            if param_requires_terminology(registry, resource_type, name, m) {
+                return Err(StorageError::Search(SearchError::IncludeNotSupported {
+                    operation: format!(
+                        "search modifier ':{m}' on conditional criterion '{raw_name}' needs \
+                         terminology expansion, which conditional criteria do not get; it is"
+                    ),
                 }));
             }
         }
@@ -200,13 +265,25 @@ pub fn build_conditional_parameters(
 /// Builds the search a conditional interaction's criteria describe, or `None`
 /// when they select nothing — matching everything would be the literal
 /// reading, but no conditional interaction means that.
+///
+/// `criteria` is form-urlencoded (see the [module notes](self#encoding)).
 pub fn build_conditional_query(
     registry: &SearchParameterRegistry,
     resource_type: &str,
     criteria: &str,
 ) -> StorageResult<Option<SearchQuery>> {
     let pairs = parse_conditional_criteria(criteria);
-    let parameters = build_conditional_parameters(registry, resource_type, &pairs)?;
+    build_conditional_query_from_pairs(registry, resource_type, &pairs)
+}
+
+/// [`build_conditional_query`] for criteria that are already decoded
+/// `(name, value)` pairs.
+pub fn build_conditional_query_from_pairs(
+    registry: &SearchParameterRegistry,
+    resource_type: &str,
+    pairs: &[(String, String)],
+) -> StorageResult<Option<SearchQuery>> {
+    let parameters = build_conditional_parameters(registry, resource_type, pairs)?;
     if parameters.is_empty() {
         return Ok(None);
     }
@@ -236,6 +313,54 @@ fn values_for_type(param_type: SearchParamType, raw_values: &[String]) -> Vec<Se
             }
         })
         .collect()
+}
+
+/// Parses a `:suffix` as a search modifier, or as the `:[type]` qualifier of a
+/// reference parameter.
+///
+/// [`SearchModifier::parse`] reads any capitalised suffix as a type qualifier,
+/// so the name is checked against the resource types of the enabled FHIR
+/// versions: `subject:Bogus` is no more a modifier than `subject:bogus`. This
+/// is the rule of helios-rest's `parse_modifier`, which persistence cannot
+/// call; the two should become one.
+fn parse_modifier(suffix: &str) -> Option<SearchModifier> {
+    match SearchModifier::parse(suffix)? {
+        SearchModifier::Type(t) if !is_resource_type(&t) => None,
+        modifier => Some(modifier),
+    }
+}
+
+/// Whether `name` is, case-sensitively, a resource type of any FHIR version
+/// enabled in this build.
+fn is_resource_type(name: &str) -> bool {
+    use helios_fhir::FhirResourceTypeProvider;
+
+    let mut known = false;
+    #[cfg(feature = "R4")]
+    {
+        known |= helios_fhir::r4::Resource::get_resource_type_names().contains(&name);
+    }
+    #[cfg(feature = "R4B")]
+    {
+        known |= helios_fhir::r4b::Resource::get_resource_type_names().contains(&name);
+    }
+    #[cfg(feature = "R5")]
+    {
+        known |= helios_fhir::r5::Resource::get_resource_type_names().contains(&name);
+    }
+    #[cfg(feature = "R6")]
+    {
+        known |= helios_fhir::r6::Resource::get_resource_type_names().contains(&name);
+    }
+    known
+}
+
+fn unknown_parameter(resource_type: &str, name: &str) -> StorageError {
+    query_error(format!(
+        "conditional criteria name the search parameter '{name}', which is not known for \
+         {resource_type}. Criteria guard a write, so an unknown parameter is an error rather \
+         than ignored (Prefer: handling does not apply); nothing was written"
+    ))
 }
 
 fn query_error(message: String) -> StorageError {
@@ -295,9 +420,6 @@ mod tests {
             ("general-practitioner=le-1", "le-1"),
             // Unregistered, but the fallback table types it as a uri.
             ("_source=sandbox.example/feed", "sandbox.example/feed"),
-            // Unregistered and unknown to the fallback table: value-shape
-            // heuristic, which reads this as a string.
-            ("nickname=Lee", "Lee"),
         ] {
             let param = one(criteria);
             assert_eq!(param.values.len(), 1, "{criteria}");
@@ -332,17 +454,57 @@ mod tests {
         assert_eq!(param.modifier, Some(SearchModifier::Exact));
         assert_eq!(param.values[0].value, "Neal");
 
+        let param = one("general-practitioner:Practitioner=p1");
+        assert_eq!(
+            param.modifier,
+            Some(SearchModifier::Type("Practitioner".to_string()))
+        );
+
         let registry = registry();
         for criteria in [
             "identifier:exact=ne123",
             "family:bogus=Neal",
             "family:missing=maybe",
+            // A capitalised suffix is a type qualifier only if it is a type.
+            "general-practitioner:Bogus=p1",
+            "general-practitioner:practitioner=p1",
+            // No presence row to test `:missing` against.
+            "_text:missing=true",
         ] {
             assert!(
-                build_conditional_query(&registry, "Patient", criteria).is_err(),
+                matches!(
+                    build_conditional_query(&registry, "Patient", criteria),
+                    Err(StorageError::Search(SearchError::QueryParseError { .. }))
+                ),
                 "{criteria} must be refused"
             );
         }
+    }
+
+    #[test]
+    fn terminology_backed_modifiers_are_not_searched_literally() {
+        let registry = registry();
+        for criteria in [
+            "identifier:in=http://example.org/ValueSet/mrns",
+            "identifier:not-in=http://example.org/ValueSet/mrns",
+            "identifier:below=123",
+            "identifier:above=123",
+        ] {
+            assert!(
+                matches!(
+                    build_conditional_query(&registry, "Patient", criteria),
+                    Err(StorageError::Search(
+                        SearchError::IncludeNotSupported { .. }
+                    ))
+                ),
+                "{criteria} must be refused as not supported"
+            );
+        }
+        // On a reference, `:below` is structural and resolved natively.
+        assert_eq!(
+            one("general-practitioner:below=Practitioner/p1").modifier,
+            Some(SearchModifier::Below)
+        );
     }
 
     #[test]
@@ -357,6 +519,34 @@ mod tests {
         .expect("some");
         assert_eq!(query.parameters.len(), 1);
         assert_eq!(query.parameters[0].name, "identifier");
+
+        // The whole list, pinned: a name dropped from it becomes an unknown
+        // parameter (a 400); a name added to it stops being a criterion.
+        let expected = [
+            "_format",
+            "_pretty",
+            "_count",
+            "_offset",
+            "_cursor",
+            "_sort",
+            "_total",
+            "_summary",
+            "_elements",
+            "_include",
+            "_revinclude",
+            "_contained",
+            "_containedType",
+            "_score",
+        ];
+        assert_eq!(RESULT_PARAMS, expected);
+        for name in expected {
+            assert!(
+                build_conditional_query(&registry, "Patient", &format!("{name}=x"))
+                    .expect(name)
+                    .is_none(),
+                "{name}"
+            );
+        }
 
         assert!(
             build_conditional_query(&registry, "Patient", "_format=json")
@@ -383,6 +573,108 @@ mod tests {
                 "{criteria} must be refused"
             );
         }
+    }
+
+    #[test]
+    fn unknown_parameters_are_refused_by_name() {
+        let registry = registry();
+        for (criteria, name) in [
+            ("identifer=123", "identifer"),
+            ("identifer:exact=123", "identifer"),
+            ("identifier=123&nickname=Lee", "nickname"),
+            // Case matters, as it does in a search.
+            ("Identifier=123", "Identifier"),
+            // The fallback table's bare-name heuristics (`patient`, `subject`,
+            // …) do not make a parameter known for this type.
+            ("subject=Patient/1", "subject"),
+            // Not a result parameter, and nothing this layer evaluates.
+            ("_type=Patient", "_type"),
+            ("_query=mine", "_query"),
+        ] {
+            let error = build_conditional_query(&registry, "Patient", criteria)
+                .expect_err(criteria)
+                .to_string();
+            assert!(error.contains(&format!("'{name}'")), "{criteria}: {error}");
+        }
+    }
+
+    #[test]
+    fn resource_level_parameters_need_no_registration() {
+        // `registry()` defines none of them.
+        for (criteria, param_type) in [
+            ("_id=p1", SearchParamType::Token),
+            ("_tag=gold", SearchParamType::Token),
+            ("_security=R", SearchParamType::Token),
+            ("_profile=http://example.org/p", SearchParamType::Uri),
+            ("_source=http://example.org/feed", SearchParamType::Uri),
+            ("_lastUpdated=gt2020-01-01", SearchParamType::Date),
+        ] {
+            assert_eq!(one(criteria).param_type, param_type, "{criteria}");
+        }
+    }
+
+    #[test]
+    fn criteria_are_form_urlencoded() {
+        fn pairs(criteria: &str) -> Vec<(String, String)> {
+            parse_conditional_criteria(criteria)
+        }
+        fn pair(name: &str, value: &str) -> (String, String) {
+            (name.to_string(), value.to_string())
+        }
+
+        assert_eq!(
+            pairs("identifier=http%3A%2F%2Fexample.org%7C123"),
+            vec![pair("identifier", "http://example.org|123")]
+        );
+        // Unencoded criteria read as before.
+        assert_eq!(
+            pairs("identifier=http://example.org|123&family=Neal"),
+            vec![
+                pair("identifier", "http://example.org|123"),
+                pair("family", "Neal")
+            ]
+        );
+        // Decoding follows the split, so an encoded `&` or `=` is data; a
+        // literal `=` after the first is data too.
+        assert_eq!(
+            pairs("identifier=http://x?a%3D1%26b=2|v&family%3Aexact=Neal"),
+            vec![
+                pair("identifier", "http://x?a=1&b=2|v"),
+                pair("family:exact", "Neal")
+            ]
+        );
+        // `+` is a space, `%2B` a plus — as in a search URL.
+        assert_eq!(
+            pairs("family=Mary+Ann&given=a%2Bb"),
+            vec![pair("family", "Mary Ann"), pair("given", "a+b")]
+        );
+        // Nothing usable.
+        for criteria in ["", "&", "family", "family=", "=Neal", "family=+"] {
+            assert!(pairs(criteria).is_empty(), "{criteria:?}");
+        }
+    }
+
+    #[test]
+    fn an_encoded_comma_separates_alternatives_like_a_literal_one() {
+        for criteria in ["family=Neal%2CLevine", "family=Neal,Levine"] {
+            let values: Vec<String> = one(criteria).values.into_iter().map(|v| v.value).collect();
+            assert_eq!(values, vec!["Neal", "Levine"], "{criteria}");
+        }
+        for criteria in ["family=Neal%5C%2CLevine", "family=Neal\\,Levine"] {
+            let param = one(criteria);
+            assert_eq!(param.values.len(), 1, "{criteria}");
+            assert_eq!(param.values[0].value, "Neal,Levine", "{criteria}");
+        }
+    }
+
+    #[test]
+    fn decoded_pairs_are_never_split_again() {
+        let pairs = vec![("identifier".to_string(), "a&family=Wilson".to_string())];
+        let query = build_conditional_query_from_pairs(&registry(), "Patient", &pairs)
+            .expect("valid")
+            .expect("some");
+        assert_eq!(query.parameters.len(), 1);
+        assert_eq!(query.parameters[0].values[0].value, "a&family=Wilson");
     }
 
     #[test]

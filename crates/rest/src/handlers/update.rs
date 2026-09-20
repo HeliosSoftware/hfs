@@ -330,7 +330,7 @@ pub async fn conditional_update_handler<S>(
     Path(resource_type): Path<String>,
     tenant: TenantExtractor,
     version: FhirVersionExtractor,
-    query: axum::extract::Query<std::collections::HashMap<String, String>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     prefer: PreferHeader,
     req_headers: HeaderMap,
     FhirResource(resource): FhirResource,
@@ -353,12 +353,13 @@ where
     // Negotiate response format from Accept header
     let negotiated = negotiate_format(&req_headers, None);
 
-    // Build search params string
-    let search_params: String = query
-        .iter()
-        .map(|(k, v)| format!("{}={}", k, v))
-        .collect::<Vec<_>>()
-        .join("&");
+    // The raw query, handed over as written. A `HashMap` of it keeps only the
+    // last occurrence of a repeated parameter, which FHIR ANDs
+    // (`date=ge…&date=le…`), so the write matched more than it named (#1321);
+    // and re-joining decoded pairs turns a decoded `&` or `=` inside a value
+    // into a pair boundary (#1322). The shared criteria builder splits, then
+    // decodes, once.
+    let search_params = raw_query.unwrap_or_default();
 
     debug!(
         resource_type = %resource_type,

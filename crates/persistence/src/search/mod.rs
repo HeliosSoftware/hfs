@@ -87,7 +87,8 @@ pub use chain_resolver::{
     ChainResolveOptions, query_has_chains, resolve_chains, resolve_chains_with,
 };
 pub use conditional::{
-    build_conditional_parameters, build_conditional_query, parse_conditional_criteria,
+    build_conditional_parameters, build_conditional_query, build_conditional_query_from_pairs,
+    parse_conditional_criteria,
 };
 pub use converters::{IndexValue, ValueConverter};
 pub use date_value::{

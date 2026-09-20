@@ -239,7 +239,7 @@ pub async fn conditional_delete_handler<S>(
     State(state): State<AppState<S>>,
     Path(resource_type): Path<String>,
     tenant: TenantExtractor,
-    query: axum::extract::Query<std::collections::HashMap<String, String>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> RestResult<Response>
 where
     S: ResourceStorage + ConditionalStorage + Send + Sync,
@@ -251,12 +251,12 @@ where
         });
     }
 
-    // Build search params string
-    let search_params: String = query
-        .iter()
-        .map(|(k, v)| format!("{}={}", k, v))
-        .collect::<Vec<_>>()
-        .join("&");
+    // The raw query, handed over as written: a `HashMap` of it keeps only the
+    // last occurrence of a repeated parameter — which, on a delete, widens
+    // what is deleted (#1321) — and re-joining decoded pairs corrupts a value
+    // containing `&` or `=` (#1322). The shared criteria builder splits, then
+    // decodes, once.
+    let search_params = raw_query.unwrap_or_default();
 
     debug!(
         resource_type = %resource_type,

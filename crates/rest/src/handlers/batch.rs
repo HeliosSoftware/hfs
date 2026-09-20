@@ -1010,19 +1010,19 @@ where
         }
     }
 
-    // A query on a type-level URL is FHIR conditional criteria (#511). It is
-    // percent-decoded here, once, so the backend receives exactly what the
-    // resource endpoints hand it: axum's `Query` decodes for them, and no
-    // backend decodes for itself. Repeated keys survive, which the endpoints'
-    // `HashMap` round-trip loses (FHIR AND semantics). GET is exempt — a query
-    // there is a search, executed below.
+    // A query on a type-level URL is FHIR conditional criteria (#511). It goes
+    // to the backend exactly as written, as the resource endpoints pass their
+    // raw query: the shared criteria builder decodes it, once, after splitting
+    // it into pairs. Decoding here and re-joining the pairs let a decoded `&`
+    // or `=` inside a value become a pair boundary (#1322). GET is exempt — a
+    // query there is a search, executed below.
     let criteria = if matches!(method, BundleMethod::Get) {
         None
     } else {
-        conditional_criteria(url, &id).map(normalize_criteria)
+        conditional_criteria(url, &id)
     };
 
-    if let Some(criteria) = criteria.as_deref() {
+    if let Some(criteria) = criteria {
         // FHIR defines no `POST [type]?[criteria]`; a conditional create is
         // expressed through `request.ifNoneExist`. Refuse rather than guess.
         if matches!(method, BundleMethod::Post) {
@@ -1038,7 +1038,7 @@ where
                 ),
             });
         }
-        if criteria.is_empty() {
+        if helios_persistence::search::parse_conditional_criteria(criteria).is_empty() {
             // `Patient?&` decodes to nothing. Empty criteria would match every
             // resource of the type on a literal reading; no conditional
             // interaction means that.
@@ -1158,8 +1158,9 @@ where
 
             // Conditional create. The criteria are passed verbatim, as the
             // resource endpoint passes its `If-None-Exist` header and as the
-            // transaction executors pass the same field: it is a query string
-            // by definition, not a URL component to decode.
+            // transaction executors pass the same field: it is a form-urlencoded
+            // query string by definition, which the shared criteria builder
+            // decodes (#1322).
             if let Some(criteria) = if_none_exist {
                 return match state
                     .storage()
@@ -1248,7 +1249,7 @@ where
 
             // Conditional update, mirroring `conditional_update_handler`:
             // upsert, so no match creates (201) and one match updates (200).
-            if let Some(criteria) = criteria.as_deref() {
+            if let Some(criteria) = criteria {
                 if let Err(e) = state
                     .validation()
                     .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
@@ -1397,7 +1398,7 @@ where
             // Conditional delete, mirroring `conditional_delete_handler`: no
             // match is a success (R4 §3.1.0.7.1), several matches are 412
             // because `/metadata` elects `conditionalDelete: "single"`.
-            if let Some(criteria) = criteria.as_deref() {
+            if let Some(criteria) = criteria {
                 return match state
                     .storage()
                     .conditional_delete(tenant.context(), &resource_type, criteria)
@@ -1532,20 +1533,6 @@ impl AuditTarget {
             ),
         }
     }
-}
-
-/// Percent-decodes a bundle entry's conditional criteria into the `k=v&k=v`
-/// form `ConditionalStorage` takes, keeping repeated keys and their order.
-///
-/// A decoded value that itself contains `&` or `=` cannot survive the re-join;
-/// the resource endpoints share that limit, since they re-join axum's decoded
-/// pairs the same way (`conditional_update_handler`).
-fn normalize_criteria(raw: &str) -> String {
-    crate::extractors::query_pairs::parse_query_pairs(Some(raw))
-        .into_iter()
-        .map(|(key, value)| format!("{key}={value}"))
-        .collect::<Vec<_>>()
-        .join("&")
 }
 
 fn admit_bundle_mutation(
@@ -4389,11 +4376,12 @@ mod tests {
         assert!(state.storage().conditional_calls().is_empty());
     }
 
-    /// A conditional PUT hands the backend percent-decoded criteria with
-    /// repeated keys intact, and maps each `ConditionalUpdateResult` the way
+    /// A conditional PUT hands the backend the criteria exactly as written —
+    /// still encoded, repeated keys intact; the shared criteria builder decodes
+    /// them (#1322) — and maps each `ConditionalUpdateResult` the way
     /// `conditional_update_handler` maps it (#511).
     #[tokio::test]
-    async fn conditional_put_decodes_criteria_and_maps_update_results() {
+    async fn conditional_put_passes_criteria_through_and_maps_update_results() {
         let bundle = serde_json::json!({
             "resourceType": "Bundle",
             "type": "batch",
@@ -4413,7 +4401,7 @@ mod tests {
             vec![(
                 "update",
                 "Patient".to_string(),
-                "identifier=http://example.org|123&identifier=x".to_string()
+                "identifier=http%3A%2F%2Fexample.org%7C123&identifier=x".to_string()
             )]
         );
         let entry = &response["entry"][0];
