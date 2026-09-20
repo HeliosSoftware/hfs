@@ -83,7 +83,8 @@ pub mod writer;
 
 // Re-export main types
 pub use chain_resolver::{
-    ChainResolveOptions, query_has_chains, resolve_chains, resolve_chains_with,
+    ChainResolveOptions, TerminologyExpander, TerminologyExpansion, query_has_chains,
+    resolve_chains, resolve_chains_with,
 };
 pub use conditional::{
     build_conditional_parameters, build_conditional_query, parse_conditional_criteria,

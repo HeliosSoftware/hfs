@@ -3369,6 +3369,65 @@ mod chaining {
         }
     }
 
+    /// #1365: `:not-in` on the terminal parameter of a chained / `_has` search
+    /// follows the direct form's order — the `400` for a type that does not
+    /// define it comes before the `501` for one that does. It used to be a
+    /// blanket `501` on any key ending in `:not-in`.
+    #[tokio::test]
+    async fn test_chained_not_in_is_400_on_a_non_token_terminal_and_501_on_a_token() {
+        let (server, backend) = create_test_server().await;
+        seed_chain_name_data(&backend).await;
+
+        // Positive controls: the chains themselves resolve.
+        assert_eq!(ids(&server, "/Encounter?subject.name=Smith").await.len(), 2);
+        assert_eq!(ids(&server, "/Encounter?subject.gender=male").await, ["es"]);
+        assert_eq!(
+            ids(&server, "/Patient?_has:Observation:subject:code=1234-5").await,
+            ["ps"]
+        );
+
+        // The direct forms, for reference.
+        let (direct_status, _) = outcome(&server, "/Patient?name:not-in=http://vs").await;
+        assert_eq!(direct_status, StatusCode::BAD_REQUEST);
+        let (direct_status, direct_text) =
+            outcome(&server, "/Patient?gender:not-in=http://vs").await;
+        assert_eq!(direct_status, StatusCode::NOT_IMPLEMENTED);
+        assert!(
+            direct_text.contains("search modifier ':not-in' is not supported"),
+            "{direct_text}"
+        );
+
+        for url in [
+            "/Encounter?subject.name:not-in=http://example.org/vs",
+            "/Encounter?subject:Patient.name:not-in=http://example.org/vs",
+            "/Encounter?subject:Patient.birthdate:not-in=http://example.org/vs",
+            "/Observation?encounter.subject:Patient.name:not-in=http://example.org/vs",
+            "/Patient?_has:Observation:subject:date:not-in=http://example.org/vs",
+            "/Patient?_has:Encounter:subject:_has:Observation:encounter:date:not-in=http://example.org/vs",
+        ] {
+            let (status, text) = outcome(&server, url).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{url}: {text}");
+            assert!(text.contains("is not supported for"), "{url}: {text}");
+        }
+
+        for url in [
+            "/Encounter?subject.gender:not-in=http://example.org/vs",
+            "/Encounter?subject:Patient.gender:not-in=http://example.org/vs",
+            "/Observation?encounter.subject:Patient.gender:not-in=http://example.org/vs",
+            "/Patient?_has:Observation:subject:code:not-in=http://example.org/vs",
+            "/Patient?_has:Encounter:subject:_has:Observation:encounter:code:not-in=http://example.org/vs",
+        ] {
+            let (status, text) = outcome(&server, url).await;
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{url}: {text}");
+            // The direct form's wording, not "requires a terminology server":
+            // one would not help.
+            assert!(
+                text.contains("search modifier ':not-in' is not supported"),
+                "{url}: {text}"
+            );
+        }
+    }
+
     /// #1339: modifiers and `:[type]` qualifiers are case-sensitive. A
     /// differently-cased one used to be honoured (`name:EXACT`); it is now the
     /// `400` of any unknown modifier, never a search without it.
