@@ -3827,6 +3827,9 @@ impl MongoBackend {
         }
 
         if self.is_search_offloaded() {
+            // This path reads the pairs itself; an empty `identifier=` would
+            // add no condition and match the whole type (#1360).
+            crate::search::conditional::reject_empty_criterion_values(&parsed_params)?;
             return self
                 .if_none_exist_offloaded_scan(db, session, tenant, resource_type, &parsed_params)
                 .await;

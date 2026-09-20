@@ -87,7 +87,7 @@ pub use history::{
     history_system_handler, history_type_handler,
 };
 pub use nl_search::nl_search_handler;
-pub use patch::patch_handler;
+pub use patch::{conditional_patch_handler, patch_handler};
 pub use purge::{purge_instance_handler, purge_type_handler};
 pub use read::{head_read_handler, read_handler};
 pub use reindex::{
