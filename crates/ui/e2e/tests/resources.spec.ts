@@ -2,6 +2,12 @@ import { test, expect } from "../pages/fixtures";
 import { createResource, updateResource, waitSearchable } from "../pages/api";
 import type { ResourcesPage } from "../pages/resources";
 
+// The rail's counts come from the dashboard snapshot, which needs a count
+// read path. The S3-primary legs of the backend matrix have none, so the
+// harness sets this flag for them (as dashboard.spec.ts reads it) and the
+// count assertions stand down; the rail itself stays covered.
+const noCounts = process.env.HFS_E2E_NO_CHART_DATA === "1";
+
 // The Resources workspace beyond the edit flows: the type rail (filter + live
 // counts), the modal's open/close/tab surface, the delete flow, and the promise
 // that every FHIR resource type is reachable — "test all the resources".
@@ -344,6 +350,7 @@ test("counts render next to each type from the dashboard snapshot", async ({
   resources,
   request,
 }) => {
+  test.skip(noCounts, "no count read path on this backend");
   // Seed one so the count is unambiguous and non-empty. The dashboard
   // snapshot is cached briefly (#541), so poll a fresh page load rather than
   // waiting on a client-side hydration fetch.
@@ -449,7 +456,7 @@ test("picking rail types repaints the recently-used group in MRU order, capped a
     "ActivityDefinition",
   ]);
 
-  for (const type of types) {
+  for (const type of noCounts ? [] : types) {
     const listCount = await resources.count(type).textContent();
     const recentCount = await resources.recentItem(type).locator(".count").textContent();
     expect(recentCount).toBe(listCount);
