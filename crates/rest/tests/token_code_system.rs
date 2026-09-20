@@ -30,10 +30,13 @@ const GENDER: &str = "http://hl7.org/fhir/administrative-gender";
 const OBS_STATUS: &str = "http://hl7.org/fhir/observation-status";
 const LOINC: &str = "http://loinc.org";
 
+/// The `$expand` requests a mock terminology server received.
+type Requests = Arc<Mutex<Vec<Value>>>;
+
 /// Starts a mock terminology server whose `POST /ValueSet/$expand` answers
 /// every request with `system|code` for each of `codes`, and records the
 /// requests it received.
-async fn start_mock_hts(system: &str, codes: &[&str]) -> (String, Arc<Mutex<Vec<Value>>>) {
+async fn start_mock_hts(system: &str, codes: &[&str]) -> (String, Requests) {
     let contains: Vec<Value> = codes
         .iter()
         .map(|code| json!({"system": system, "code": code, "display": code}))
@@ -42,10 +45,10 @@ async fn start_mock_hts(system: &str, codes: &[&str]) -> (String, Arc<Mutex<Vec<
         "resourceType": "ValueSet",
         "expansion": {"total": contains.len(), "contains": contains}
     }));
-    let requests: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(vec![]));
+    let requests: Requests = Arc::new(Mutex::new(vec![]));
 
     async fn expand(
-        State((requests, expansion)): State<(Arc<Mutex<Vec<Value>>>, Arc<Value>)>,
+        State((requests, expansion)): State<(Requests, Arc<Value>)>,
         Json(body): Json<Value>,
     ) -> (StatusCode, Json<Value>) {
         requests.lock().unwrap().push(body);
