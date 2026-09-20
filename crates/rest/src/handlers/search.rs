@@ -29,7 +29,9 @@ use helios_fhir::FhirVersion;
 
 use crate::error::{RestError, RestResult};
 use crate::extractors::query_pairs::{last_value, parse_query_pairs};
-use crate::extractors::{SearchParams, TenantExtractor, build_search_query, unknown_search_params};
+use crate::extractors::{
+    SearchParams, TenantExtractor, build_search_query_for_version, unknown_search_params,
+};
 use crate::middleware::content_type::{FhirFormat, negotiate_format};
 use crate::middleware::prefer::PreferHeader;
 use crate::responses::format_resource_response;
@@ -386,7 +388,10 @@ where
     let mut query = {
         let reg = state.storage().search_param_registry(tenant.context());
         let registry = reg.read();
-        let built = build_search_query(resource_type, &search_params, &registry)?;
+        // Against the version the search resolves in (see above), so a
+        // `:[type]` qualifier cannot name a type only another version has.
+        let built =
+            build_search_query_for_version(resource_type, &search_params, &registry, fhir_version)?;
         // Under strict handling, reject a `_sort` on a field the server cannot
         // actually sort by (it would otherwise silently fall back to `id`). Only
         // `_id`, `_lastUpdated`, and registered indexed typed params sort
@@ -769,7 +774,12 @@ where
     let mut query = {
         let reg = state.storage().search_param_registry(tenant.context());
         let registry = reg.read();
-        build_search_query("Resource", &search_params, &registry)?
+        build_search_query_for_version(
+            "Resource",
+            &search_params,
+            &registry,
+            state.config().default_fhir_version,
+        )?
     };
 
     // Clamp page size to the configured default/maximum.
