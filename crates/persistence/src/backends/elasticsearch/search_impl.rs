@@ -247,23 +247,26 @@ enum SearchAttempt {
     Permanent(crate::error::StorageError),
 }
 
-/// The two read APIs that share one attempt/retry/classify path, so a count
-/// can never again be handled more loosely than the search it belongs to
-/// (#1335).
+/// The read APIs that share one attempt/retry/classify path, so a count can
+/// never again be handled more loosely than the search it belongs to (#1335),
+/// nor a storage-side read more loosely than a search-side one (#1364).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReadOp {
+pub(super) enum ReadOp<'a> {
     /// `POST {index}/_search`.
     Search,
     /// `POST {index}/_count`.
     Count,
+    /// `GET {index}/_doc/{doc_id}`; the request body is not sent.
+    Get { doc_id: &'a str },
 }
 
-impl ReadOp {
+impl ReadOp<'_> {
     /// Lower-case name, as it appears in log lines.
     fn name(self) -> &'static str {
         match self {
             ReadOp::Search => "search",
             ReadOp::Count => "count",
+            ReadOp::Get { .. } => "get",
         }
     }
 
@@ -272,14 +275,27 @@ impl ReadOp {
         match self {
             ReadOp::Search => "Search",
             ReadOp::Count => "Count",
+            ReadOp::Get { .. } => "Get",
         }
     }
 }
 
-/// Sends a single ES search (or count) request and classifies the response.
+/// Whether a `404` is Elasticsearch saying "this index exists and has no
+/// document with that id": the get API answers exactly that with
+/// `"found": false`. As with [`is_index_not_found`], the bare status proves
+/// nothing — a proxy or a wrong base path answers `404` too, and "this resource
+/// does not exist" is a claim only the cluster can make (#1364).
+fn is_document_not_found(status: u16, body: &str) -> bool {
+    status == 404
+        && serde_json::from_str::<Value>(body)
+            .is_ok_and(|parsed| parsed.get("found").and_then(Value::as_bool) == Some(false))
+}
+
+/// Sends a single ES search (or count, or get) request and classifies the
+/// response.
 async fn send_search_once(
     backend: &ElasticsearchBackend,
-    op: ReadOp,
+    op: ReadOp<'_>,
     index: &str,
     body: Value,
 ) -> SearchAttempt {
@@ -297,6 +313,13 @@ async fn send_search_once(
                 .client()
                 .count(elasticsearch::CountParts::Index(&[index]))
                 .body(body)
+                .send()
+                .await
+        }
+        ReadOp::Get { doc_id } => {
+            backend
+                .client()
+                .get(elasticsearch::GetParts::IndexId(index, doc_id))
                 .send()
                 .await
         }
@@ -334,6 +357,11 @@ async fn send_search_once(
     let resp_body = response.text().await.unwrap_or_default();
 
     if is_index_not_found(status, &resp_body) {
+        return SearchAttempt::EmptyIndex;
+    }
+    // For a get, a document missing from an existing index is the same answer
+    // as a missing index: nothing is stored there.
+    if matches!(op, ReadOp::Get { .. }) && is_document_not_found(status, &resp_body) {
         return SearchAttempt::EmptyIndex;
     }
 
@@ -397,11 +425,14 @@ async fn send_search_with_retry(
     send_read_with_retry(backend, ReadOp::Search, index, body).await
 }
 
-/// [`send_search_with_retry`] for either read API; `search_count` is the
-/// `ReadOp::Count` caller.
-async fn send_read_with_retry(
+/// [`send_search_with_retry`] for any read API; `search_count` is the
+/// `ReadOp::Count` caller here, and the storage-side reads in `storage.rs`
+/// (`count`, `read`, the `create_or_update` existence check, the
+/// `ReindexSource` reads) go through it too (#1364). For `ReadOp::Get`,
+/// `Ok(None)` also covers a document that is not in an existing index.
+pub(super) async fn send_read_with_retry(
     backend: &ElasticsearchBackend,
-    op: ReadOp,
+    op: ReadOp<'_>,
     index: &str,
     body: Value,
 ) -> StorageResult<Option<Value>> {
