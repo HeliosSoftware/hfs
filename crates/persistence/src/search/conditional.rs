@@ -41,6 +41,7 @@ use crate::types::{
 };
 
 use super::registry::{SearchParameterRegistry, fallback_param_type};
+use super::type_qualifier::ResourceTypeScope;
 use super::value_parser::{
     param_requires_terminology, parse_typed_values, split_unescaped_commas, validate_modifier,
 };
@@ -122,8 +123,9 @@ pub fn parse_conditional_criteria(criteria: &str) -> Vec<(String, String)> {
 ///
 /// # Modifiers
 ///
-/// A `:modifier` is held to direct search's rules — a known modifier or a real
-/// resource type, and [`validate_modifier`] for the parameter's type — and a
+/// A `:modifier` is held to direct search's rules — a known modifier or a
+/// resource type in `types` ([`ResourceTypeScope`], the rule and the error text
+/// direct search uses), and [`validate_modifier`] for the parameter's type — and a
 /// modifier only a terminology server can answer
 /// ([`param_requires_terminology`]) is refused as not supported, since nothing
 /// expands conditional criteria.
@@ -145,6 +147,7 @@ pub fn build_conditional_parameters(
     registry: &SearchParameterRegistry,
     resource_type: &str,
     pairs: &[(String, String)],
+    types: ResourceTypeScope,
 ) -> StorageResult<Vec<SearchParameter>> {
     let mut parameters = Vec::with_capacity(pairs.len());
 
@@ -170,11 +173,8 @@ pub fn build_conditional_parameters(
 
         let (name, modifier) = match raw_name.split_once(':') {
             Some((name, modifier_str)) => {
-                let modifier = parse_modifier(modifier_str).ok_or_else(|| {
-                    query_error(format!(
-                        "unknown search modifier ':{modifier_str}' on conditional criterion \
-                         '{raw_name}'; it is neither a search modifier nor a resource type"
-                    ))
+                let modifier = types.parse_modifier(modifier_str).ok_or_else(|| {
+                    query_error(types.unknown_modifier_message(modifier_str, name))
                 })?;
                 (name, Some(modifier))
             }
@@ -267,13 +267,17 @@ pub fn build_conditional_parameters(
 /// reading, but no conditional interaction means that.
 ///
 /// `criteria` is form-urlencoded (see the [module notes](self#encoding)).
+/// `types` is the FHIR version the criteria are searched in — the one the
+/// backend's index and registry were built for — so a `:[type]` qualifier
+/// cannot name a type only another enabled version has (#1366).
 pub fn build_conditional_query(
     registry: &SearchParameterRegistry,
     resource_type: &str,
     criteria: &str,
+    types: ResourceTypeScope,
 ) -> StorageResult<Option<SearchQuery>> {
     let pairs = parse_conditional_criteria(criteria);
-    build_conditional_query_from_pairs(registry, resource_type, &pairs)
+    build_conditional_query_from_pairs(registry, resource_type, &pairs, types)
 }
 
 /// [`build_conditional_query`] for criteria that are already decoded
@@ -282,8 +286,9 @@ pub fn build_conditional_query_from_pairs(
     registry: &SearchParameterRegistry,
     resource_type: &str,
     pairs: &[(String, String)],
+    types: ResourceTypeScope,
 ) -> StorageResult<Option<SearchQuery>> {
-    let parameters = build_conditional_parameters(registry, resource_type, pairs)?;
+    let parameters = build_conditional_parameters(registry, resource_type, pairs, types)?;
     if parameters.is_empty() {
         return Ok(None);
     }
@@ -315,46 +320,6 @@ fn values_for_type(param_type: SearchParamType, raw_values: &[String]) -> Vec<Se
         .collect()
 }
 
-/// Parses a `:suffix` as a search modifier, or as the `:[type]` qualifier of a
-/// reference parameter.
-///
-/// [`SearchModifier::parse`] reads any capitalised suffix as a type qualifier,
-/// so the name is checked against the resource types of the enabled FHIR
-/// versions: `subject:Bogus` is no more a modifier than `subject:bogus`. This
-/// is the rule of helios-rest's `parse_modifier`, which persistence cannot
-/// call; the two should become one.
-fn parse_modifier(suffix: &str) -> Option<SearchModifier> {
-    match SearchModifier::parse(suffix)? {
-        SearchModifier::Type(t) if !is_resource_type(&t) => None,
-        modifier => Some(modifier),
-    }
-}
-
-/// Whether `name` is, case-sensitively, a resource type of any FHIR version
-/// enabled in this build.
-fn is_resource_type(name: &str) -> bool {
-    use helios_fhir::FhirResourceTypeProvider;
-
-    let mut known = false;
-    #[cfg(feature = "R4")]
-    {
-        known |= helios_fhir::r4::Resource::get_resource_type_names().contains(&name);
-    }
-    #[cfg(feature = "R4B")]
-    {
-        known |= helios_fhir::r4b::Resource::get_resource_type_names().contains(&name);
-    }
-    #[cfg(feature = "R5")]
-    {
-        known |= helios_fhir::r5::Resource::get_resource_type_names().contains(&name);
-    }
-    #[cfg(feature = "R6")]
-    {
-        known |= helios_fhir::r6::Resource::get_resource_type_names().contains(&name);
-    }
-    known
-}
-
 fn unknown_parameter(resource_type: &str, name: &str) -> StorageError {
     query_error(format!(
         "conditional criteria name the search parameter '{name}', which is not known for \
@@ -372,6 +337,28 @@ mod tests {
     use super::*;
     use crate::search::registry::SearchParameterDefinition;
     use crate::types::SearchPrefix;
+
+    /// The builders under test, judged against the build's default FHIR
+    /// version as a backend judges them against its configured one.
+    fn scope() -> ResourceTypeScope {
+        ResourceTypeScope::version(helios_fhir::FhirVersion::default_enabled())
+    }
+
+    fn build_conditional_query(
+        registry: &SearchParameterRegistry,
+        resource_type: &str,
+        criteria: &str,
+    ) -> StorageResult<Option<SearchQuery>> {
+        super::build_conditional_query(registry, resource_type, criteria, scope())
+    }
+
+    fn build_conditional_query_from_pairs(
+        registry: &SearchParameterRegistry,
+        resource_type: &str,
+        pairs: &[(String, String)],
+    ) -> StorageResult<Option<SearchQuery>> {
+        super::build_conditional_query_from_pairs(registry, resource_type, pairs, scope())
+    }
 
     fn registry() -> SearchParameterRegistry {
         let mut registry = SearchParameterRegistry::new();
@@ -687,5 +674,74 @@ mod tests {
         .expect("valid")
         .expect("some");
         assert_eq!(query.parameters.len(), 2);
+    }
+
+    /// The rule and the text are direct search's (`ResourceTypeScope`), so a
+    /// conditional criterion is refused in the words a search would be (#1366).
+    #[test]
+    fn type_qualifiers_share_direct_searchs_rule_and_message() {
+        let version = helios_fhir::FhirVersion::default_enabled();
+        for (criteria, expected) in [
+            (
+                "general-practitioner:Bogus=p1",
+                format!(
+                    "unknown search modifier ':Bogus' on parameter 'general-practitioner'; it is \
+                     neither a search modifier nor a resource type of FHIR {version}"
+                ),
+            ),
+            (
+                "general-practitioner:practitioner=p1",
+                "(modifiers and resource type names are case-sensitive: ':Practitioner'?)"
+                    .to_string(),
+            ),
+            (
+                "family:EXACT=Neal",
+                "(modifiers and resource type names are case-sensitive: ':exact'?)".to_string(),
+            ),
+        ] {
+            match build_conditional_query(&registry(), "Patient", criteria) {
+                Err(StorageError::Search(SearchError::QueryParseError { message })) => {
+                    assert!(message.contains(&expected), "{criteria}: {message}")
+                }
+                other => panic!("{criteria} must be refused, got {other:?}"),
+            }
+        }
+    }
+
+    /// Only a multi-version build can tell the versions apart.
+    #[cfg(all(feature = "R4", feature = "R5"))]
+    #[test]
+    fn a_type_qualifier_of_another_enabled_version_is_refused() {
+        use helios_fhir::FhirVersion;
+        // ActorDefinition is new in R5; DocumentManifest did not survive R4B.
+        for (criteria, ok, other) in [
+            (
+                "general-practitioner:ActorDefinition=a1",
+                FhirVersion::R5,
+                FhirVersion::R4,
+            ),
+            (
+                "general-practitioner:DocumentManifest=d1",
+                FhirVersion::R4,
+                FhirVersion::R5,
+            ),
+        ] {
+            let build = |v| {
+                super::build_conditional_query(
+                    &registry(),
+                    "Patient",
+                    criteria,
+                    ResourceTypeScope::version(v),
+                )
+            };
+            assert!(build(ok).is_ok(), "{criteria} is valid in {ok}");
+            match build(other) {
+                Err(StorageError::Search(SearchError::QueryParseError { message })) => assert!(
+                    message.contains(&format!("nor a resource type of FHIR {other}")),
+                    "{message}"
+                ),
+                result => panic!("{criteria} must be refused in {other}, got {result:?}"),
+            }
+        }
     }
 }

@@ -3233,7 +3233,12 @@ impl MongoBackend {
     ) -> StorageResult<Option<SearchQuery>> {
         let registry_arc = self.tenant_registry(tenant.tenant_id().as_str());
         let registry = registry_arc.read();
-        crate::search::build_conditional_query(&registry, resource_type, criteria)
+        crate::search::build_conditional_query(
+            &registry,
+            resource_type,
+            criteria,
+            crate::search::ResourceTypeScope::version(self.config().fhir_version),
+        )
     }
 
     /// Types already-split criteria pairs, for the in-transaction
@@ -3247,7 +3252,12 @@ impl MongoBackend {
     ) -> StorageResult<Vec<SearchParameter>> {
         let registry_arc = self.tenant_registry(tenant.tenant_id().as_str());
         let registry = registry_arc.read();
-        crate::search::build_conditional_parameters(&registry, resource_type, params)
+        crate::search::build_conditional_parameters(
+            &registry,
+            resource_type,
+            params,
+            crate::search::ResourceTypeScope::version(self.config().fhir_version),
+        )
     }
 
     fn merge_unique(target: &mut Vec<StoredResource>, additions: Vec<StoredResource>) {

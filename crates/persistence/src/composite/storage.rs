@@ -206,7 +206,14 @@ impl CompositeStorage {
         let query = {
             let registry_arc = self.search_param_registry(tenant);
             let registry = registry_arc.read();
-            crate::search::build_conditional_query(&registry, resource_type, search_params)?
+            // A composite has no FHIR version of its own to judge a `:[type]`
+            // qualifier against, so any enabled version's type passes here.
+            crate::search::build_conditional_query(
+                &registry,
+                resource_type,
+                search_params,
+                crate::search::ResourceTypeScope::any_enabled(),
+            )?
         };
         let Some(query) = query else {
             return Ok(Vec::new());

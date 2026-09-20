@@ -18,7 +18,8 @@ use tracing::debug;
 use crate::error::{RestError, RestResult};
 use crate::extractors::query_pairs::parse_query_pairs;
 use crate::extractors::{
-    FhirVersionExtractor, SearchParams, TenantExtractor, build_search_query, unknown_search_params,
+    FhirVersionExtractor, SearchParams, TenantExtractor, build_search_query_for_version,
+    unknown_search_params,
 };
 use crate::handlers::search::append_ignored_params_outcome;
 use crate::middleware::prefer::PreferHeader;
@@ -127,7 +128,7 @@ where
     let mut query = {
         let reg = state.storage().search_param_registry(tenant.context());
         let registry = reg.read();
-        build_search_query(&target_type, &search_params, &registry)?
+        build_search_query_for_version(&target_type, &search_params, &registry, fhir_version)?
     };
 
     // Restrict to compartment members. A resource joins a compartment if it
@@ -280,6 +281,13 @@ where
     // Enumerate compartment member types and pre-build a SearchQuery for each,
     // restricted to the compartment. Building happens under the registry read
     // lock (no await); the lock is released before any search executes.
+    //
+    // A query that fails to build for one member type skips that type. One that
+    // fails for *every* member type is not a filter some types cannot satisfy
+    // but a malformed search — an unknown modifier, a `:[type]` qualifier that
+    // is not a resource type of this FHIR version — and is answered with the
+    // `400` a typed compartment search gives, not an empty bundle (#1366).
+    let mut first_build_error: Option<RestError> = None;
     let queries: Vec<helios_persistence::types::SearchQuery> = {
         let reg = state.storage().search_param_registry(tenant.context());
         let registry = reg.read();
@@ -294,7 +302,12 @@ where
 
                 // A parameter that is invalid for this member type means the type
                 // cannot satisfy it — skip the type rather than failing the request.
-                let mut query = match build_search_query(target_type, &search_params, &registry) {
+                let mut query = match build_search_query_for_version(
+                    target_type,
+                    &search_params,
+                    &registry,
+                    fhir_version,
+                ) {
                     Ok(q) => q,
                     Err(e) => {
                         debug!(
@@ -302,6 +315,7 @@ where
                             error = %e,
                             "Skipping compartment member type: query not applicable"
                         );
+                        first_build_error.get_or_insert(e);
                         return None;
                     }
                 };
@@ -319,6 +333,12 @@ where
             })
             .collect()
     };
+
+    if queries.is_empty() {
+        if let Some(e) = first_build_error {
+            return Err(e);
+        }
+    }
 
     // Run each member-type search, accumulating matches up to the page-size cap.
     let mut collected: Vec<helios_persistence::types::StoredResource> = Vec::new();

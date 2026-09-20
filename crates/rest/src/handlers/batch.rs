@@ -581,15 +581,21 @@ where
         // with the entry named in front. Re-wrapping it as `BadRequest` from
         // `client_response().2` was the same code-discard #504 removed from
         // the per-entry paths.
-        crate::extractors::build_search_query_from_pairs(&search_type, &pairs, &registry).map_err(
-            |e| match e {
-                RestError::InvalidParameter { param, message } => RestError::InvalidParameter {
-                    param,
-                    message: format!("entry {} search '{}': {}", index, entry.url, message),
-                },
-                other => other,
+        // Against the version `execute_search_bundle` will run the entry in,
+        // so what passes here is what executes (#1366).
+        crate::extractors::build_search_query_from_pairs(
+            &search_type,
+            &pairs,
+            &registry,
+            state.config().default_fhir_version,
+        )
+        .map_err(|e| match e {
+            RestError::InvalidParameter { param, message } => RestError::InvalidParameter {
+                param,
+                message: format!("entry {} search '{}': {}", index, entry.url, message),
             },
-        )?;
+            other => other,
+        })?;
     }
 
     // Conditional references (`Type?query`) resolve against the server's
@@ -2255,12 +2261,15 @@ where
         let registry = state.storage().search_param_registry(tenant.context());
         let mut query = {
             let registry = registry.read();
-            crate::extractors::build_search_query_from_pairs(resource_type, &pairs, &registry)
-                .map_err(|e| RestError::BadRequest {
-                    message: format!(
-                        "Conditional reference '{reference}' is not a valid search: {e}"
-                    ),
-                })?
+            crate::extractors::build_search_query_from_pairs(
+                resource_type,
+                &pairs,
+                &registry,
+                state.config().default_fhir_version,
+            )
+            .map_err(|e| RestError::BadRequest {
+                message: format!("Conditional reference '{reference}' is not a valid search: {e}"),
+            })?
         };
         // Two is enough to prove the match is not unique.
         query.count = Some(2);

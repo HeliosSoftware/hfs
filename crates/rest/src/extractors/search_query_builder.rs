@@ -6,7 +6,8 @@ use std::collections::HashMap;
 
 use helios_fhir::FhirVersion;
 use helios_persistence::search::{
-    SearchParameterRegistry, parse_typed_values, split_unescaped_commas, validate_modifier,
+    ResourceTypeScope as TypeScope, SearchParameterRegistry, parse_typed_values,
+    split_unescaped_commas, validate_modifier,
 };
 use helios_persistence::types::{
     CompositeSearchComponent, ContainedMode, ContainedReturn, IncludeDirective, IncludeType,
@@ -28,21 +29,13 @@ use crate::error::RestError;
 /// - _include/_revinclude directives
 /// - System parameters (_count, _sort, _total, etc.)
 ///
-/// A `:[type]` qualifier is accepted when it names a resource type of *any*
-/// enabled FHIR version. A caller that knows the version the search runs
-/// against should use [`build_search_query_for_version`].
-pub fn build_search_query(
-    resource_type: &str,
-    params: &SearchParams,
-    registry: &SearchParameterRegistry,
-) -> Result<SearchQuery, RestError> {
-    build_query(resource_type, params, registry, TypeScope(None))
-}
-
-/// [`build_search_query`] for a search against `fhir_version`: a `:[type]`
-/// qualifier (`subject:Patient`, a chain hop's, a `_has` source type) must name
-/// a resource type of that version, not merely of some version this build
-/// supports (#1339).
+/// The search runs against `fhir_version`: a `:[type]` qualifier
+/// (`subject:Patient`, a chain hop's, a `_has` source type) must name a
+/// resource type of that version, not merely of some version this build
+/// supports (#1339). There is deliberately no version-less entry point — every
+/// REST path that builds a query knows the version it searches in (#1366). The
+/// rule itself is [`helios_persistence::search::ResourceTypeScope`], which
+/// conditional criteria share.
 pub fn build_search_query_for_version(
     resource_type: &str,
     params: &SearchParams,
@@ -53,30 +46,20 @@ pub fn build_search_query_for_version(
         resource_type,
         params,
         registry,
-        TypeScope(Some(fhir_version)),
+        TypeScope::version(fhir_version),
     )
 }
 
-/// The resource types a `:[type]` qualifier may name: those of the FHIR version
-/// the search runs against, or — for a caller that does not say — those of
-/// every enabled version.
-#[derive(Debug, Clone, Copy)]
-struct TypeScope(Option<FhirVersion>);
-
-impl TypeScope {
-    fn contains(self, type_name: &str) -> bool {
-        match self.0 {
-            Some(v) => crate::fhir_types::is_valid_resource_type_for_version(type_name, v),
-            None => crate::fhir_types::is_valid_resource_type(type_name),
-        }
-    }
-
-    fn names(self) -> &'static [&'static str] {
-        match self.0 {
-            Some(v) => crate::fhir_types::get_resource_type_names_for_version(v),
-            None => crate::fhir_types::get_resource_type_names(),
-        }
-    }
+/// [`build_search_query_for_version`] judging a `:[type]` qualifier against
+/// every enabled FHIR version. What every caller did before #1339; kept for the
+/// unit tests, which pin the difference.
+#[cfg(test)]
+fn build_search_query(
+    resource_type: &str,
+    params: &SearchParams,
+    registry: &SearchParameterRegistry,
+) -> Result<SearchQuery, RestError> {
+    build_query(resource_type, params, registry, TypeScope::any_enabled())
 }
 
 fn build_query(
@@ -237,18 +220,6 @@ fn build_query(
     Ok(query)
 }
 
-/// Builds a SearchQuery from a raw HashMap.
-///
-/// Convenience function when you don't have a SearchParams instance.
-pub fn build_search_query_from_map(
-    resource_type: &str,
-    params: &HashMap<String, String>,
-    registry: &SearchParameterRegistry,
-) -> Result<SearchQuery, RestError> {
-    let search_params = SearchParams::from_map(params.clone());
-    build_search_query(resource_type, &search_params, registry)
-}
-
 /// The `_`-prefixed global/result parameters this server actually honours.
 ///
 /// Every other underscore name is unknown, exactly like a misspelled ordinary
@@ -379,17 +350,17 @@ pub fn unsortable_sort_warnings(
     warnings
 }
 
-/// Builds a SearchQuery from ordered key/value pairs.
-///
-/// Unlike [`build_search_query_from_map`], this preserves repeated parameters
-/// (FHIR AND semantics) and multiple `_include`/`_revinclude`/`_has` directives.
+/// [`build_search_query_for_version`] from ordered key/value pairs, which
+/// preserve repeated parameters (FHIR AND semantics) and multiple
+/// `_include`/`_revinclude`/`_has` directives.
 pub fn build_search_query_from_pairs(
     resource_type: &str,
     pairs: &[(String, String)],
     registry: &SearchParameterRegistry,
+    fhir_version: FhirVersion,
 ) -> Result<SearchQuery, RestError> {
     let search_params = SearchParams::from_pairs(pairs.to_vec());
-    build_search_query(resource_type, &search_params, registry)
+    build_search_query_for_version(resource_type, &search_params, registry, fhir_version)
 }
 
 /// Parses a single search parameter with potential modifiers, a `:[type]`
@@ -401,7 +372,13 @@ fn parse_search_parameter(
     value: &str,
     registry: &SearchParameterRegistry,
 ) -> Result<SearchParameter, RestError> {
-    parse_search_parameter_in(resource_type, name, value, registry, TypeScope(None))
+    parse_search_parameter_in(
+        resource_type,
+        name,
+        value,
+        registry,
+        TypeScope::any_enabled(),
+    )
 }
 
 /// Parses a single search parameter with potential modifiers.
@@ -594,7 +571,7 @@ fn is_number_search_value(value: &str) -> bool {
 /// - "name:bogus" -> error
 #[cfg(test)]
 fn parse_parameter_name(name: &str) -> Result<(&str, Option<SearchModifier>), RestError> {
-    parse_parameter_name_in(name, TypeScope(None))
+    parse_parameter_name_in(name, TypeScope::any_enabled())
 }
 
 /// [`parse_parameter_name`], a `:[type]` qualifier being one of `types`.
@@ -605,60 +582,16 @@ fn parse_parameter_name_in(
     let (param_name, suffix) = split_qualifier(name);
     let modifier = suffix
         .map(|s| {
-            parse_modifier(s, types).ok_or_else(|| RestError::InvalidParameter {
-                param: name.to_string(),
-                message: format!(
-                    "unknown search modifier ':{s}' on parameter '{param_name}'; it is neither a \
-                     search modifier nor a resource type{}{}",
-                    version_clause(types),
-                    case_hint(s, types)
-                ),
-            })
+            // The rule and its wording are shared with conditional criteria.
+            types
+                .parse_modifier(s)
+                .ok_or_else(|| RestError::InvalidParameter {
+                    param: name.to_string(),
+                    message: types.unknown_modifier_message(s, param_name),
+                })
         })
         .transpose()?;
     Ok((param_name, modifier))
-}
-
-/// Parses a `:suffix` as a search modifier, or as the `:[type]` qualifier of a
-/// reference parameter.
-///
-/// `SearchModifier::parse` reads any capitalised suffix as a type qualifier, so
-/// the name is checked against the resource types in scope here — those of the
-/// request's FHIR version, when the caller knows it — `subject:Bogus` is no
-/// more a modifier than `subject:bogus`. Whether
-/// the modifier suits the parameter's *type* (a `:[type]` qualifier is only
-/// defined for references) is `validate_modifier`'s job.
-fn parse_modifier(suffix: &str, types: TypeScope) -> Option<SearchModifier> {
-    match SearchModifier::parse(suffix)? {
-        SearchModifier::Type(t) if !types.contains(&t) => None,
-        modifier => Some(modifier),
-    }
-}
-
-/// Names the FHIR version a `:[type]` qualifier was judged against, when it
-/// was judged against one: ` of FHIR R4`.
-fn version_clause(types: TypeScope) -> String {
-    types.0.map(|v| format!(" of FHIR {v}")).unwrap_or_default()
-}
-
-/// Modifiers and resource type names are case-sensitive (`name:EXACT` and
-/// `subject:patient` are neither). When an unknown `:suffix` is one of them in
-/// a different case, this is the clause that says so, for the `400`.
-fn case_hint(suffix: &str, types: TypeScope) -> String {
-    let lower = suffix.to_lowercase();
-    let intended = if lower != suffix && SearchModifier::parse(&lower).is_some() {
-        Some(lower)
-    } else {
-        types
-            .names()
-            .iter()
-            .find(|t| **t != suffix && t.eq_ignore_ascii_case(suffix))
-            .map(|t| t.to_string())
-    };
-    match intended {
-        Some(i) => format!(" (modifiers and resource type names are case-sensitive: ':{i}'?)"),
-        None => String::new(),
-    }
 }
 
 /// A parsed chain: the base parameter, one hop per reference parameter, and the
@@ -689,7 +622,7 @@ type ParsedChain<'a> = (
 ///   ("subject", [{subject, Patient, organization}, {organization, Organization, name}], Exact)
 #[cfg(test)]
 fn parse_chain(name: &str) -> Result<ParsedChain<'_>, RestError> {
-    parse_chain_in(name, TypeScope(None))
+    parse_chain_in(name, TypeScope::any_enabled())
 }
 
 /// [`parse_chain`], a hop's `:Type` qualifier being one of `types`.
@@ -723,8 +656,8 @@ fn parse_chain_in(name: &str, types: TypeScope) -> Result<ParsedChain<'_>, RestE
                 message: format!(
                     "unknown resource type ':{t}' on reference parameter '{reference_param}' of \
                      the chain; it is not a resource type{}{}",
-                    version_clause(types),
-                    case_hint(t, types)
+                    types.version_clause(),
+                    types.case_hint(t)
                 ),
             });
         }
@@ -750,15 +683,17 @@ fn parse_terminal_modifier(
     suffix: &str,
     types: TypeScope,
 ) -> Result<SearchModifier, RestError> {
-    parse_modifier(suffix, types).ok_or_else(|| RestError::InvalidParameter {
-        param: name.to_string(),
-        message: format!(
-            "unknown search modifier ':{suffix}' on '{terminal_param}', the last parameter of \
+    types
+        .parse_modifier(suffix)
+        .ok_or_else(|| RestError::InvalidParameter {
+            param: name.to_string(),
+            message: format!(
+                "unknown search modifier ':{suffix}' on '{terminal_param}', the last parameter of \
              the chain; only a search modifier may follow it (a ':Type' qualifier belongs on a \
              reference parameter){}",
-            case_hint(suffix, types)
-        ),
-    })
+                types.case_hint(suffix)
+            ),
+        })
 }
 
 /// FHIR defines `:missing` as a single, case-sensitive boolean literal.
@@ -795,7 +730,7 @@ fn parse_has_parameter(
     name: &str,
     value: &str,
 ) -> Result<Option<ReverseChainedParameter>, RestError> {
-    parse_has_parameter_in(name, value, TypeScope(None))
+    parse_has_parameter_in(name, value, TypeScope::any_enabled())
 }
 
 /// [`parse_has_parameter`], a source type being one of `types`.
@@ -851,8 +786,8 @@ fn parse_has_level(
             param: key.to_string(),
             message: format!(
                 "unknown resource type '{source_type}' in _has; it is not a resource type{}{}",
-                version_clause(types),
-                case_hint(&source_type, types)
+                types.version_clause(),
+                types.case_hint(&source_type)
             ),
         });
     }
@@ -1279,7 +1214,15 @@ mod tests {
                 build_for("Observation", key, Some(invalid_in)).is_err(),
                 "{key}"
             );
-            // The version-less entry point keeps accepting any enabled version.
+            // The pair-based entry point (batch, `_typeFilter`) is the same
+            // builder, and is as strict (#1366).
+            let pairs = [(key.to_string(), "x".to_string())];
+            let from_pairs =
+                |v| build_search_query_from_pairs("Observation", &pairs, &test_registry(), v);
+            assert!(from_pairs(valid_in).is_ok(), "{key}");
+            assert!(from_pairs(invalid_in).is_err(), "{key}");
+            // What every caller outside the search handler did before #1366:
+            // any enabled version's type passed. Test-only now.
             assert!(build_for("Observation", key, None).is_ok(), "{key}");
         }
     }
@@ -1788,6 +1731,7 @@ mod tests {
             resource_type,
             &[(name.to_string(), value.to_string())],
             registry,
+            FhirVersion::default_enabled(),
         )
     }
 
