@@ -961,3 +961,285 @@ async fn url_criteria_with_an_ampersand_or_equals_in_a_value_hit_the_named_resou
         );
     }
 }
+
+// =============================================================================
+// Unknown parameters (#1323)
+// =============================================================================
+
+const PREFER: HeaderName = HeaderName::from_static("prefer");
+
+/// Criteria with a parameter the server does not know for `Patient`: a typo,
+/// a parameter of another resource type, and the same beside a good criterion.
+const UNKNOWN_PARAMETER_CRITERIA: [(&str, &str); 4] = [
+    ("identifer=ne123", "identifer"),
+    ("identifer:exact=ne123", "identifer"),
+    ("identifier=ne123&specimen=ne123", "specimen"),
+    ("identifier=ne123&Identifier=ne123", "Identifier"),
+];
+
+/// A 400 whose OperationOutcome names the offending parameter.
+fn assert_rejected_naming(response: &axum_test::TestResponse, param: &str, context: &str) {
+    assert_eq!(
+        response.status_code(),
+        StatusCode::BAD_REQUEST,
+        "{context}: {}",
+        response.text()
+    );
+    let outcome: Value = response.json();
+    assert_eq!(outcome["resourceType"], "OperationOutcome", "{context}");
+    assert!(
+        outcome.to_string().contains(&format!("'{param}'")),
+        "{context}: the outcome must name '{param}': {outcome}"
+    );
+}
+
+const SEEDED: [(&str, &str); 3] = [
+    ("bystander", "Wilson"),
+    ("decoy", "Allen"),
+    ("target", "Neal"),
+];
+
+/// A misspelt criterion used to be searched for under its literal name, match
+/// nothing, and so create a duplicate (`If-None-Exist`), create instead of
+/// update (`PUT`), or answer a delete with a 204 that deleted nothing. Ignoring
+/// it instead would widen the match of a write. It is refused — whatever
+/// `Prefer: handling` says, which governs searches, not write preconditions.
+#[tokio::test]
+async fn an_unknown_criterion_is_rejected_and_nothing_is_written() {
+    for (criteria, param) in UNKNOWN_PARAMETER_CRITERIA {
+        for prefer in [None, Some("handling=lenient"), Some("handling=strict")] {
+            let server = test_server().await;
+            seed_target_and_decoy(&server).await;
+            let context = format!("{criteria} (Prefer: {prefer:?})");
+            let with_prefer = |request: axum_test::TestRequest| match prefer {
+                Some(value) => request.add_header(PREFER, HeaderValue::from_static(value)),
+                None => request,
+            };
+
+            let response = with_prefer(
+                server
+                    .post("/Patient")
+                    .add_header(X_TENANT_ID, tenant())
+                    .add_header(
+                        IF_NONE_EXIST,
+                        HeaderValue::from_str(criteria).expect("header value"),
+                    )
+                    .json(&patient("Incoming", "ne123")),
+            )
+            .await;
+            assert_rejected_naming(&response, param, &format!("If-None-Exist: {context}"));
+
+            let response = with_prefer(
+                server
+                    .put(&format!("/Patient?{criteria}"))
+                    .add_header(X_TENANT_ID, tenant())
+                    .json(&patient("Updated", "ne123")),
+            )
+            .await;
+            assert_rejected_naming(&response, param, &format!("PUT {context}"));
+
+            let response = with_prefer(
+                server
+                    .delete(&format!("/Patient?{criteria}"))
+                    .add_header(X_TENANT_ID, tenant()),
+            )
+            .await;
+            assert_rejected_naming(&response, param, &format!("DELETE {context}"));
+
+            assert_eq!(families(&server).await, pairs(&SEEDED), "{context}");
+        }
+    }
+}
+
+/// In a batch the entry fails and its neighbours proceed; a transaction fails
+/// as a whole. Either way nothing is written for the bad entry.
+#[tokio::test]
+async fn an_unknown_criterion_fails_the_bundle_entry() {
+    for (criteria, param) in UNKNOWN_PARAMETER_CRITERIA {
+        let conditional_entries = [
+            json!({
+                "resource": patient("Incoming", "ne123"),
+                "request": {"method": "POST", "url": "Patient", "ifNoneExist": criteria}
+            }),
+            json!({
+                "resource": patient("Updated", "ne123"),
+                "request": {"method": "PUT", "url": format!("Patient?{criteria}")}
+            }),
+            json!({"request": {"method": "DELETE", "url": format!("Patient?{criteria}")}}),
+        ];
+        let neighbour = json!({
+            "resource": patient("Neighbour", "nb-1"),
+            "request": {"method": "POST", "url": "Patient"}
+        });
+
+        for entry in &conditional_entries {
+            let server = test_server().await;
+            seed_target_and_decoy(&server).await;
+            let reply = post_bundle(&server, "batch", json!([entry, neighbour])).await;
+            let response = &reply["entry"][0]["response"];
+            assert!(
+                response["status"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with("400"),
+                "batch {entry}: {response}"
+            );
+            assert!(
+                response["outcome"]
+                    .to_string()
+                    .contains(&format!("'{param}'")),
+                "batch {entry}: the outcome must name '{param}': {response}"
+            );
+            assert!(
+                reply["entry"][1]["response"]["status"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with("201"),
+                "the neighbouring entry must proceed: {reply}"
+            );
+            let mut expected = pairs(&SEEDED);
+            let after: Vec<(String, String)> = families(&server)
+                .await
+                .into_iter()
+                .filter(|(_, family)| family != "Neighbour")
+                .collect();
+            expected.sort();
+            assert_eq!(after, expected, "batch {entry}");
+        }
+
+        // Transaction: only `ifNoneExist` reaches the criteria builder (a
+        // query-bearing `request.url` is refused outright).
+        let server = test_server().await;
+        seed_target_and_decoy(&server).await;
+        let response = server
+            .post("/")
+            .add_header(X_TENANT_ID, tenant())
+            .json(&json!({
+                "resourceType": "Bundle",
+                "type": "transaction",
+                "entry": [neighbour, conditional_entries[0]]
+            }))
+            .await;
+        assert_rejected_naming(&response, param, &format!("transaction {criteria}"));
+        assert_eq!(
+            families(&server).await,
+            pairs(&SEEDED),
+            "transaction {criteria}: the whole Bundle must roll back"
+        );
+    }
+}
+
+/// Result parameters are not criteria: beside a real criterion they change
+/// nothing, and on their own they select nothing (never "everything").
+#[tokio::test]
+async fn result_parameters_are_ignored_not_rejected() {
+    const RESULT_PARAMETERS: [&str; 14] = [
+        "_format=json",
+        "_pretty=true",
+        "_summary=true",
+        "_elements=name",
+        "_count=1",
+        "_offset=5",
+        "_cursor=abc",
+        "_sort=family",
+        "_total=accurate",
+        "_include=Patient:organization",
+        "_revinclude=Observation:patient",
+        "_contained=false",
+        "_containedType=container",
+        "_score=true",
+    ];
+
+    for result_parameter in RESULT_PARAMETERS {
+        let server = test_server().await;
+        seed_target_and_decoy(&server).await;
+        let criteria = format!("{result_parameter}&identifier=ne123");
+
+        conditional_create(&server, &criteria)
+            .await
+            .assert_status(StatusCode::OK);
+        server
+            .put(&format!("/Patient?{criteria}"))
+            .add_header(X_TENANT_ID, tenant())
+            .json(&patient("Updated", "ne123"))
+            .await
+            .assert_status(StatusCode::OK);
+        assert_eq!(
+            families(&server).await,
+            pairs(&[
+                ("bystander", "Wilson"),
+                ("decoy", "Allen"),
+                ("target", "Updated")
+            ]),
+            "{criteria}"
+        );
+
+        // Alone, it selects nothing — the delete must not sweep the type.
+        server
+            .delete(&format!("/Patient?{result_parameter}"))
+            .add_header(X_TENANT_ID, tenant())
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        assert_eq!(families(&server).await.len(), 3, "{result_parameter}");
+
+        server
+            .delete(&format!("/Patient?{criteria}"))
+            .add_header(X_TENANT_ID, tenant())
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        assert_eq!(
+            families(&server).await,
+            pairs(&[("bystander", "Wilson"), ("decoy", "Allen")]),
+            "{criteria}"
+        );
+    }
+}
+
+/// The resource-level parameters are criteria like any other.
+#[tokio::test]
+async fn resource_level_parameters_are_valid_criteria() {
+    for criteria in [
+        "_id=target",
+        "_tag=http://example.org/tags|gold",
+        "_security=http://example.org/sec|R",
+        "_profile=http://example.org/StructureDefinition/gold",
+        "_source=http://example.org/feed",
+        "_lastUpdated=gt2000-01-01&_tag=gold",
+    ] {
+        let server = test_server().await;
+        put_patient(&server, "decoy", "Allen", "123").await;
+        server
+            .put("/Patient/target")
+            .add_header(X_TENANT_ID, tenant())
+            .json(&json!({
+                "resourceType": "Patient",
+                "id": "target",
+                "meta": {
+                    "source": "http://example.org/feed",
+                    "profile": ["http://example.org/StructureDefinition/gold"],
+                    "tag": [{"system": "http://example.org/tags", "code": "gold"}],
+                    "security": [{"system": "http://example.org/sec", "code": "R"}]
+                },
+                "name": [{"family": "Neal"}]
+            }))
+            .await
+            .assert_status(StatusCode::CREATED);
+        // Positive control.
+        assert_eq!(
+            search_ids(&server, criteria).await,
+            vec!["target"],
+            "{criteria}"
+        );
+
+        server
+            .delete(&format!("/Patient?{criteria}"))
+            .add_header(X_TENANT_ID, tenant())
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        assert_eq!(
+            families(&server).await,
+            pairs(&[("decoy", "Allen")]),
+            "DELETE /Patient?{criteria}"
+        );
+    }
+}

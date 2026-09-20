@@ -5005,20 +5005,27 @@ mod build_search_parameters_tests {
         TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access())
     }
 
-    /// A parameter the registry has never heard of falls back to
-    /// `infer_param_type_from_value`, which assumes the comparator prefix
-    /// has already been stripped. With the default (embedded-only)
-    /// registry, `foo` is unregistered, so `gt2020-01-01` must still be
-    /// read as `Date` with prefix `Gt` and value `2020-01-01` — the
-    /// pre-#1206 behaviour that a raw-string probe silently broke.
+    /// A parameter the registry has never heard of is refused: conditional
+    /// criteria guard a write, so an unknown name is neither searched for
+    /// literally nor ignored (#1323). With the default (embedded-only)
+    /// registry, `foo` is unregistered; `_lastUpdated` is a date, read with
+    /// prefix `Gt` and value `2020-01-01`.
     #[test]
-    fn unregistered_parameter_resolves_type_from_the_stripped_value() {
+    fn unregistered_parameter_is_refused_and_a_date_keeps_its_prefix() {
         let backend = MongoBackend::new(MongoBackendConfig::default()).unwrap();
-        let params = backend
+        backend
             .build_search_parameters(
                 &tenant(),
                 "Patient",
                 &[("foo".to_string(), "gt2020-01-01".to_string())],
+            )
+            .expect_err("an unregistered criterion must be refused");
+
+        let params = backend
+            .build_search_parameters(
+                &tenant(),
+                "Patient",
+                &[("_lastUpdated".to_string(), "gt2020-01-01".to_string())],
             )
             .expect("criteria build");
 

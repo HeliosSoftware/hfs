@@ -71,6 +71,20 @@ const RESULT_PARAMS: &[&str] = &[
     "_score",
 ];
 
+/// Resource-level parameters that are criteria even when the tenant's registry
+/// has no definition for them (a backend built without the spec files registers
+/// only a handful): the ones [`fallback_param_type`] can place in the index
+/// column the extractor writes them under. Every other name has to be
+/// registered for the resource type, or for `Resource`.
+const ALWAYS_INDEXED_PARAMS: &[&str] = &[
+    "_id",
+    "_lastUpdated",
+    "_tag",
+    "_profile",
+    "_security",
+    "_source",
+];
+
 /// Splits form-urlencoded conditional criteria into decoded `(name, value)`
 /// pairs.
 ///
@@ -98,10 +112,25 @@ pub fn parse_conditional_criteria(criteria: &str) -> Vec<(String, String)> {
 
 /// Builds the typed search parameters a list of criteria pairs describes.
 ///
-/// Result-shaping parameters (`_format`, `_count`, …) are skipped. Criteria
-/// this layer cannot evaluate — chained parameters, `_has`, `_list` — are
-/// refused rather than searched for under their literal name, which would
-/// match nothing and quietly turn the interaction into an unconditional one.
+/// Result-shaping parameters ([`RESULT_PARAMS`]: `_format`, `_count`, …) are
+/// skipped. Criteria this layer cannot evaluate — chained parameters, `_has`,
+/// `_list` — are refused rather than searched for under their literal name,
+/// which would match nothing and quietly turn the interaction into an
+/// unconditional one.
+///
+/// # Unknown parameters
+///
+/// A criterion whose parameter the tenant's registry does not define for
+/// `resource_type` (or for `Resource`) is an error, which REST answers with a
+/// `400` naming it (#1323). A search may ignore a parameter it does not know —
+/// that is what `Prefer: handling=lenient` asks for — but these criteria are the
+/// precondition of a *write*, and neither way of carrying on is safe: searching
+/// for the unknown name matches nothing, so `If-None-Exist: identifer=123`
+/// creates the duplicate it exists to prevent and a conditional update creates
+/// instead of updating; ignoring it widens the match, so the update or delete
+/// lands on a resource the client did not name. FHIR defines `Prefer: handling`
+/// for searches and is silent on conditional interactions, so the header is
+/// deliberately not consulted.
 pub fn build_conditional_parameters(
     registry: &SearchParameterRegistry,
     resource_type: &str,
@@ -155,19 +184,22 @@ pub fn build_conditional_parameters(
         let definition = registry
             .get_param(resource_type, name)
             .or_else(|| registry.get_param("Resource", name));
+        if definition.is_none() && !ALWAYS_INDEXED_PARAMS.contains(&name) {
+            return Err(unknown_parameter(resource_type, name));
+        }
         let raw_values = split_unescaped_commas(raw_value);
 
-        let (param_type, values) = match (&definition, fallback_param_type(name)) {
-            // A registry miss on a name the fallback table knows keeps the
-            // table's answer: it records which index column the extractor
-            // writes those rows under (see `fallback_param_type`).
-            (None, fallback) if fallback != SearchParamType::String => {
+        let (param_type, values) = match &definition {
+            // A registry miss on a parameter every resource is indexed under
+            // takes the fallback table's type: it records which index column
+            // the extractor writes those rows under (see
+            // `fallback_param_type`).
+            None => {
+                let fallback = fallback_param_type(name);
                 (fallback, values_for_type(fallback, &raw_values))
             }
-            // Registered parameters — everything in the spec — resolve
-            // deterministically; anything else gets the same value-shape
-            // heuristic direct search applies.
-            _ => parse_typed_values(registry, resource_type, name, &raw_values),
+            // Registered parameters resolve deterministically.
+            Some(_) => parse_typed_values(registry, resource_type, name, &raw_values),
         };
 
         if let Some(m) = &modifier {
@@ -267,6 +299,14 @@ fn values_for_type(param_type: SearchParamType, raw_values: &[String]) -> Vec<Se
         .collect()
 }
 
+fn unknown_parameter(resource_type: &str, name: &str) -> StorageError {
+    query_error(format!(
+        "conditional criteria name the search parameter '{name}', which is not known for \
+         {resource_type}. Criteria guard a write, so an unknown parameter is an error rather \
+         than ignored (Prefer: handling does not apply); nothing was written"
+    ))
+}
+
 fn query_error(message: String) -> StorageError {
     StorageError::Search(SearchError::QueryParseError { message })
 }
@@ -324,9 +364,6 @@ mod tests {
             ("general-practitioner=le-1", "le-1"),
             // Unregistered, but the fallback table types it as a uri.
             ("_source=sandbox.example/feed", "sandbox.example/feed"),
-            // Unregistered and unknown to the fallback table: value-shape
-            // heuristic, which reads this as a string.
-            ("nickname=Lee", "Lee"),
         ] {
             let param = one(criteria);
             assert_eq!(param.values.len(), 1, "{criteria}");
@@ -387,6 +424,34 @@ mod tests {
         assert_eq!(query.parameters.len(), 1);
         assert_eq!(query.parameters[0].name, "identifier");
 
+        // The whole list, pinned: a name dropped from it becomes an unknown
+        // parameter (a 400); a name added to it stops being a criterion.
+        let expected = [
+            "_format",
+            "_pretty",
+            "_count",
+            "_offset",
+            "_cursor",
+            "_sort",
+            "_total",
+            "_summary",
+            "_elements",
+            "_include",
+            "_revinclude",
+            "_contained",
+            "_containedType",
+            "_score",
+        ];
+        assert_eq!(RESULT_PARAMS, expected);
+        for name in expected {
+            assert!(
+                build_conditional_query(&registry, "Patient", &format!("{name}=x"))
+                    .expect(name)
+                    .is_none(),
+                "{name}"
+            );
+        }
+
         assert!(
             build_conditional_query(&registry, "Patient", "_format=json")
                 .expect("valid")
@@ -411,6 +476,44 @@ mod tests {
                 build_conditional_query(&registry, "Patient", criteria).is_err(),
                 "{criteria} must be refused"
             );
+        }
+    }
+
+    #[test]
+    fn unknown_parameters_are_refused_by_name() {
+        let registry = registry();
+        for (criteria, name) in [
+            ("identifer=123", "identifer"),
+            ("identifer:exact=123", "identifer"),
+            ("identifier=123&nickname=Lee", "nickname"),
+            // Case matters, as it does in a search.
+            ("Identifier=123", "Identifier"),
+            // The fallback table's bare-name heuristics (`patient`, `subject`,
+            // …) do not make a parameter known for this type.
+            ("subject=Patient/1", "subject"),
+            // Not a result parameter, and nothing this layer evaluates.
+            ("_type=Patient", "_type"),
+            ("_query=mine", "_query"),
+        ] {
+            let error = build_conditional_query(&registry, "Patient", criteria)
+                .expect_err(criteria)
+                .to_string();
+            assert!(error.contains(&format!("'{name}'")), "{criteria}: {error}");
+        }
+    }
+
+    #[test]
+    fn resource_level_parameters_need_no_registration() {
+        // `registry()` defines none of them.
+        for (criteria, param_type) in [
+            ("_id=p1", SearchParamType::Token),
+            ("_tag=gold", SearchParamType::Token),
+            ("_security=R", SearchParamType::Token),
+            ("_profile=http://example.org/p", SearchParamType::Uri),
+            ("_source=http://example.org/feed", SearchParamType::Uri),
+            ("_lastUpdated=gt2020-01-01", SearchParamType::Date),
+        ] {
+            assert_eq!(one(criteria).param_type, param_type, "{criteria}");
         }
     }
 
