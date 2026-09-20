@@ -3369,6 +3369,45 @@ mod chaining {
         }
     }
 
+    /// #1339: modifiers and `:[type]` qualifiers are case-sensitive. A
+    /// differently-cased one used to be honoured (`name:EXACT`); it is now the
+    /// `400` of any unknown modifier, never a search without it.
+    #[tokio::test]
+    async fn test_modifiers_are_case_sensitive() {
+        let (server, backend) = create_test_server().await;
+        seed_chain_name_data(&backend).await;
+
+        // Positive controls: the properly-cased forms.
+        assert_eq!(ids(&server, "/Patient?family:exact=Smith").await, ["ps"]);
+        assert_eq!(
+            ids(&server, "/Observation?subject:Patient=ps").await,
+            ["os"]
+        );
+        assert_eq!(
+            ids(&server, "/Encounter?subject:Patient.family:exact=Smith").await,
+            ["es"]
+        );
+
+        for (url, hint) in [
+            ("/Patient?family:EXACT=Smith", "':exact'?"),
+            ("/Patient?family:Exact=Smith", "':exact'?"),
+            ("/Patient?gender:Missing=true", "':missing'?"),
+            ("/Observation?code:NOT=1234-5", "':not'?"),
+            ("/Observation?subject:patient=ps", "':Patient'?"),
+            ("/Observation?subject:PATIENT=ps", "':Patient'?"),
+            ("/Encounter?subject:Patient.family:EXACT=Smith", "':exact'?"),
+            (
+                "/Patient?_has:Observation:subject:code:NOT=1234-5",
+                "':not'?",
+            ),
+        ] {
+            let (status, text) = outcome(&server, url).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{url}: {text}");
+            assert!(text.contains("case-sensitive"), "{url}: {text}");
+            assert!(text.contains(hint), "{url}: {text}");
+        }
+    }
+
     #[tokio::test]
     async fn test_multiple_chain_levels() {
         let (server, backend) = create_test_server().await;

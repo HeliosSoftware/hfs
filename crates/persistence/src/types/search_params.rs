@@ -86,8 +86,12 @@ impl fmt::Display for SearchModifier {
 
 impl SearchModifier {
     /// Parses a modifier string, returning None for unknown modifiers.
+    ///
+    /// Case-sensitive, as FHIR modifiers are: `exact` is a modifier, `EXACT`
+    /// is not (#1339). A capitalised suffix is read as a `:[type]` qualifier;
+    /// whether it names a resource type is for the caller to check.
     pub fn parse(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
+        match s {
             "exact" => Some(SearchModifier::Exact),
             "contains" => Some(SearchModifier::Contains),
             "text" => Some(SearchModifier::Text),
@@ -100,8 +104,9 @@ impl SearchModifier {
             "identifier" => Some(SearchModifier::Identifier),
             // The FHIR spec (build.fhir.org) spells this `of-type`, and that is
             // the form advertised in our CapabilityStatement; accept the legacy
-            // camelCase `ofType` too so older clients keep working.
-            "of-type" | "oftype" => Some(SearchModifier::OfType),
+            // camelCase `ofType` too so older clients keep working (it is
+            // also what `Display` writes).
+            "of-type" | "ofType" => Some(SearchModifier::OfType),
             "iterate" => Some(SearchModifier::Iterate),
             "text-advanced" => Some(SearchModifier::TextAdvanced),
             "code-text" => Some(SearchModifier::CodeText),
@@ -941,6 +946,43 @@ mod tests {
             Some(SearchModifier::OfType)
         );
         assert_eq!(SearchModifier::parse("unknown"), None);
+    }
+
+    /// #1339: FHIR modifiers are case-sensitive; a differently-cased spelling
+    /// is not the modifier.
+    #[test]
+    fn test_search_modifier_parse_is_case_sensitive() {
+        // A capitalised suffix reads as a `:[type]` qualifier, which is the
+        // caller's to check against the resource types; the rest are unknown.
+        for s in ["EXACT", "Exact", "Missing", "NOT-IN", "Of-Type", "OfType"] {
+            assert_eq!(
+                SearchModifier::parse(s),
+                Some(SearchModifier::Type(s.to_string())),
+                "{s}"
+            );
+        }
+        for s in ["eXact", "oftype", "not-In", "patient"] {
+            assert_eq!(SearchModifier::parse(s), None, "{s}");
+        }
+        // Every modifier parses back from the spelling it displays as.
+        for m in [
+            SearchModifier::Exact,
+            SearchModifier::Contains,
+            SearchModifier::Text,
+            SearchModifier::Not,
+            SearchModifier::Missing,
+            SearchModifier::Above,
+            SearchModifier::Below,
+            SearchModifier::In,
+            SearchModifier::NotIn,
+            SearchModifier::Identifier,
+            SearchModifier::OfType,
+            SearchModifier::Iterate,
+            SearchModifier::TextAdvanced,
+            SearchModifier::CodeText,
+        ] {
+            assert_eq!(SearchModifier::parse(&m.to_string()), Some(m));
+        }
     }
 
     #[test]

@@ -533,7 +533,8 @@ fn parse_parameter_name(name: &str) -> Result<(&str, Option<SearchModifier>), Re
                 param: name.to_string(),
                 message: format!(
                     "unknown search modifier ':{s}' on parameter '{param_name}'; it is neither a \
-                     search modifier nor a resource type"
+                     search modifier nor a resource type{}",
+                    case_hint(s)
                 ),
             })
         })
@@ -553,6 +554,25 @@ fn parse_modifier(suffix: &str) -> Option<SearchModifier> {
     match SearchModifier::parse(suffix)? {
         SearchModifier::Type(t) if !crate::fhir_types::is_valid_resource_type(&t) => None,
         modifier => Some(modifier),
+    }
+}
+
+/// Modifiers and resource type names are case-sensitive (`name:EXACT` and
+/// `subject:patient` are neither). When an unknown `:suffix` is one of them in
+/// a different case, this is the clause that says so, for the `400`.
+fn case_hint(suffix: &str) -> String {
+    let lower = suffix.to_lowercase();
+    let intended = if lower != suffix && SearchModifier::parse(&lower).is_some() {
+        Some(lower)
+    } else {
+        crate::fhir_types::get_resource_type_names()
+            .iter()
+            .find(|t| **t != suffix && t.eq_ignore_ascii_case(suffix))
+            .map(|t| t.to_string())
+    };
+    match intended {
+        Some(i) => format!(" (modifiers and resource type names are case-sensitive: ':{i}'?)"),
+        None => String::new(),
     }
 }
 
@@ -629,7 +649,8 @@ fn parse_terminal_modifier(
         message: format!(
             "unknown search modifier ':{suffix}' on '{terminal_param}', the last parameter of \
              the chain; only a search modifier may follow it (a ':Type' qualifier belongs on a \
-             reference parameter)"
+             reference parameter){}",
+            case_hint(suffix)
         ),
     })
 }
@@ -988,6 +1009,47 @@ mod tests {
                 }
                 other => panic!("{name}: expected InvalidParameter, got {other:?}"),
             }
+        }
+    }
+
+    /// #1339: modifiers are case-sensitive. A differently-cased one is unknown,
+    /// and the `400` says what was probably meant.
+    #[test]
+    fn test_modifiers_and_type_qualifiers_are_case_sensitive() {
+        let reg = test_registry();
+        for (resource_type, name, hint) in [
+            ("Patient", "name:EXACT", "':exact'?"),
+            ("Patient", "name:Exact", "':exact'?"),
+            ("Patient", "name:eXact", "':exact'?"),
+            ("Patient", "name:Missing", "':missing'?"),
+            ("Observation", "code:NOT", "':not'?"),
+            ("Observation", "code:Of-Type", "':of-type'?"),
+            ("Observation", "subject:patient", "':Patient'?"),
+            ("Observation", "subject:PATIENT", "':Patient'?"),
+            // The terminal of a chain and of a `_has`.
+            ("Observation", "subject:Patient.name:EXACT", "':exact'?"),
+        ] {
+            match parse_search_parameter(resource_type, name, "true", &reg) {
+                Err(RestError::InvalidParameter { param, message }) => {
+                    assert_eq!(param, name);
+                    assert!(message.contains("case-sensitive"), "{name}: {message}");
+                    assert!(message.contains(hint), "{name}: {message}");
+                }
+                other => panic!("{name}: expected InvalidParameter, got {other:?}"),
+            }
+        }
+        match parse_has_parameter("_has:Observation:subject:code:NOT", "x") {
+            Err(RestError::InvalidParameter { message, .. }) => {
+                assert!(message.contains("':not'?"), "{message}")
+            }
+            other => panic!("expected InvalidParameter, got {other:?}"),
+        }
+        // No hint for something that is not a modifier in any case.
+        match parse_search_parameter("Patient", "name:bogus", "x", &reg) {
+            Err(RestError::InvalidParameter { message, .. }) => {
+                assert!(!message.contains("case-sensitive"), "{message}")
+            }
+            other => panic!("expected InvalidParameter, got {other:?}"),
         }
     }
 
