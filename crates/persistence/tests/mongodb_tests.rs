@@ -5965,6 +5965,12 @@ async fn mongodb_integration_uri_below_and_above_are_segment_aware() {
     assert_eq!(ids(&result), vec!["vs-a", "vs-root"]);
     assert_eq!(result.total, Some(2));
 
+    // `_total=none` skips the count: no total on the result.
+    below.total = Some(TotalMode::None);
+    let result = backend.search(&tenant, &below).await.unwrap();
+    assert_eq!(ids(&result), vec!["vs-a", "vs-root"]);
+    assert_eq!(result.total, None);
+
     // `:above=http://example.org/fhir/ValueSet/a` — the value and its
     // path-segment parents down to the authority; `vs-root` is one of those
     // parents, `vs-x` is not.

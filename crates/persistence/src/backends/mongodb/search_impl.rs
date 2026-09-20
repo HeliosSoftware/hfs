@@ -567,7 +567,7 @@ impl SearchProvider for MongoBackend {
             _ => None,
         };
 
-        let total = if query.total.is_some() {
+        let total = if query.wants_total() {
             Some(self.search_count(tenant, query).await?)
         } else {
             None

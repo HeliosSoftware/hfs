@@ -498,11 +498,16 @@ impl SearchProvider for ElasticsearchBackend {
             .cloned()
             .unwrap_or_default();
 
-        let total = body
-            .get("hits")
-            .and_then(|h| h.get("total"))
-            .and_then(|t| t.get("value"))
-            .and_then(|v| v.as_u64());
+        // Only when `_total` asked for one: `_total=none` (or no `_total`)
+        // omits `Bundle.total`, matching the other backends.
+        let total = if query.wants_total() {
+            body.get("hits")
+                .and_then(|h| h.get("total"))
+                .and_then(|t| t.get("value"))
+                .and_then(|v| v.as_u64())
+        } else {
+            None
+        };
 
         let count = query.count.unwrap_or(20) as usize;
 

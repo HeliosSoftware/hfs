@@ -363,10 +363,18 @@ jobs:
               ;;
           esac
 
+          # A file database, as the per-PR suite uses (boot.mjs), not
+          # `:memory:`: a pooled in-memory database needs `cache=shared`, whose
+          # table-level locks fail at once with "database table is locked" --
+          # SQLITE_LOCKED never reaches the busy handler, so busy_timeout does
+          # not cover it and concurrent writes 500.
+          SQLITE_DB="$RUNNER_TEMP/hfs-ui-matrix-${{ matrix.backend }}.db"
+          rm -f "$SQLITE_DB" "$SQLITE_DB-wal" "$SQLITE_DB-shm"
+
           if [ "${{ matrix.backend }}" = "sqlite-elasticsearch" ]; then
             HFS_STORAGE_BACKEND=sqlite-elasticsearch \
             HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
-            ./target/debug/hfs --database-url :memory: --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+            ./target/debug/hfs --database-url "$SQLITE_DB" --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "postgres-elasticsearch" ]; then
             HFS_STORAGE_BACKEND=postgres-elasticsearch \
             HFS_PG_HOST="$DOCKER_HOST_IP" \
@@ -407,7 +415,7 @@ jobs:
             ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           else
             HFS_STORAGE_BACKEND=sqlite \
-            ./target/debug/hfs --database-url :memory: --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+            ./target/debug/hfs --database-url "$SQLITE_DB" --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           fi
 
           echo $! > /tmp/hfs-ui-matrix-${{ matrix.backend }}.pid

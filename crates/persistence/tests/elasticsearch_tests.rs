@@ -4116,6 +4116,13 @@ mod es_integration {
         assert_eq!(ids, vec!["a", "c"], "_id:not=b must exclude only b");
         assert_eq!(result.total, Some(2));
 
+        // `_total=none` omits the total even though ES tracked the hits.
+        let mut no_total = query.clone();
+        no_total.total = Some(TotalMode::None);
+        let result = backend.search(&tenant, &no_total).await.unwrap();
+        assert_eq!(result.total, None);
+        assert_eq!(result.resources.page_info.total, None);
+
         let mut query_two = SearchQuery::new("Patient")
             .with_parameter(SearchParameter {
                 name: "_id".to_string(),

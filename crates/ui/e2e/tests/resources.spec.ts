@@ -1155,12 +1155,10 @@ test("a Patient summary shows every summary element it has, not a hand-picked fo
   await expect(resources.results.rows).toHaveCount(1);
 
   const headers = await resources.page.locator("#query-results-head th").allTextContents();
-  const order = ["identifier", "active", "name", "telecom", "gender", "birthDate", "address"];
-  const positions = order.map((col) => headers.indexOf(col));
-  for (const position of positions) expect(position).toBeGreaterThanOrEqual(0);
-  for (let i = 1; i < positions.length; i++) {
-    expect(positions[i]).toBeGreaterThan(positions[i - 1]);
-  }
+  // Presence only: columns follow the key order the server sent, and that is
+  // the backend's to choose — Postgres JSONB does not keep insertion order.
+  const expected = ["identifier", "active", "name", "telecom", "gender", "birthDate", "address"];
+  for (const col of expected) expect(headers).toContain(col);
 });
 
 test("columns are the union across the returned resources", async ({ resources, request }) => {
