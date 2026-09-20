@@ -7,6 +7,8 @@
 //! example the lint rejects is an example the server cannot run — and must
 //! produce the rows expected for `test-bundle.json`.
 
+#![cfg(feature = "R4")]
+
 use helios_sof::lint::lint_view_definition;
 use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 use serde_json::{Value, json};
