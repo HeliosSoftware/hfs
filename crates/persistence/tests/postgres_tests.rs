@@ -19210,6 +19210,17 @@ mod postgres_integration {
             .await;
     }
 
+    /// #1379: the same predicate as a chain terminal.
+    #[tokio::test]
+    async fn postgres_integration_system_qualified_tokens_in_chains() {
+        let backend = create_backend().await;
+        super::token_code_system_suite::system_qualified_tokens_in_chains(
+            &backend,
+            &unique_base("token_code_system_chain"),
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn postgres_integration_distinct_tenant_ids_never_share_data() {
         let backend = create_backend().await;

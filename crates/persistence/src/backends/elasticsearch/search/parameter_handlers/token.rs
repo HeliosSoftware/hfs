@@ -220,6 +220,34 @@ mod tests {
         assert!(s.contains("8867-4"));
     }
 
+    /// #1379: `system|code` accepts the named system or the marker of a `code`
+    /// element; `|code` counts the marker as "no system"; `system|` does not
+    /// mention it.
+    #[test]
+    fn test_implicit_system_marker() {
+        let param = make_param("gender", None);
+        let must = |value: &str| {
+            build_clause(&param, value).unwrap()["nested"]["query"]["bool"]["must"].clone()
+        };
+
+        assert_eq!(
+            must("http://hl7.org/fhir/administrative-gender|female")[1],
+            json!({ "terms": { "search_params.token.system": [
+                "http://hl7.org/fhir/administrative-gender",
+                IMPLICIT_TOKEN_SYSTEM
+            ] } })
+        );
+        assert_eq!(
+            must("|female")[2]["bool"]["should"][1],
+            json!({ "term": { "search_params.token.system": IMPLICIT_TOKEN_SYSTEM } })
+        );
+        assert!(
+            !must("http://hl7.org/fhir/administrative-gender|")
+                .to_string()
+                .contains(IMPLICIT_TOKEN_SYSTEM)
+        );
+    }
+
     #[test]
     fn test_not_modifier_builds_positive_clause() {
         // The query builder applies the negation once, around all values (#473);

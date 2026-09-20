@@ -375,3 +375,114 @@ where
     }
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
+
+/// The same predicate reached as the terminal of a forward chain and of
+/// `_has`. (No composite case: R4 defines no usable composite with a `code`
+/// component — `DocumentReference?relationship` has its component expressions
+/// swapped in the spec. The composite builders are pinned by unit tests.)
+///
+/// Chains go through `resolve_chains`, as the REST layer sends them; the SQL
+/// chain builders' copies of the predicate are pinned by their unit tests.
+pub async fn system_qualified_tokens_in_chains<S>(backend: &S, tenant_base: &str)
+where
+    S: ResourceStorage + SearchProvider,
+{
+    use helios_persistence::search::resolve_chains;
+    use helios_persistence::types::{ChainedParameter, ReverseChainedParameter};
+
+    let tenant = TenantContext::new(TenantId::new(tenant_base), TenantPermissions::full_access());
+
+    let observation = |id: &str, status: &str, patient: &str| {
+        json!({
+            "id": id,
+            "status": status,
+            "code": {"coding": [{"system": LOINC, "code": "1234-5"}]},
+            "subject": {"reference": format!("Patient/{patient}")},
+        })
+    };
+    let resources = [
+        ("Patient", json!({"id": "pt-f", "gender": "female"})),
+        ("Patient", json!({"id": "pt-m", "gender": "male"})),
+        ("Observation", observation("ob-f", "final", "pt-f")),
+        ("Observation", observation("ob-m", "preliminary", "pt-m")),
+    ];
+    for (resource_type, resource) in resources {
+        let id = resource["id"].as_str().unwrap_or_default().to_string();
+        backend
+            .create(&tenant, resource_type, resource, FhirVersion::default())
+            .await
+            .unwrap_or_else(|e| panic!("create {id} failed: {e}"));
+    }
+
+    let forward = |value: &str| {
+        SearchQuery::new("Observation")
+            .with_parameter(SearchParameter {
+                name: "subject".to_string(),
+                param_type: SearchParamType::Reference,
+                values: vec![SearchValue::eq(value)],
+                chain: vec![ChainedParameter {
+                    reference_param: "subject".to_string(),
+                    target_type: Some("Patient".to_string()),
+                    target_param: "gender".to_string(),
+                }],
+                ..Default::default()
+            })
+            .with_count(100)
+    };
+    let reverse = |value: &str| {
+        let mut query = SearchQuery::new("Patient").with_count(100);
+        query.reverse_chains.push(ReverseChainedParameter::terminal(
+            "Observation",
+            "subject",
+            "status",
+            SearchValue::eq(value),
+        ));
+        query
+    };
+    // (label, query, expected). The unqualified rows are the positive
+    // controls, and the first of them is polled for Elasticsearch.
+    let cases: Vec<(String, SearchQuery, &[&str])> = vec![
+        (
+            "subject:Patient.gender=female".into(),
+            forward("female"),
+            &["ob-f"],
+        ),
+        (
+            "subject:Patient.gender=<system>|female".into(),
+            forward(&format!("{GENDER}|female")),
+            &["ob-f"],
+        ),
+        (
+            "_has:Observation:subject:status=final".into(),
+            reverse("final"),
+            &["pt-f"],
+        ),
+        (
+            "_has:Observation:subject:status=<system>|final".into(),
+            reverse(&format!("{OBS_STATUS}|final")),
+            &["pt-f"],
+        ),
+    ];
+
+    let mut failures = Vec::new();
+    for (index, (label, query, expected)) in cases.iter().enumerate() {
+        let resolved = resolve_chains(backend, &tenant, query)
+            .await
+            .unwrap_or_else(|e| panic!("resolve {label} failed: {e}"));
+        let mut got = matched(backend, &tenant, &resolved).await;
+        if index == 0 {
+            for _ in 0..60 {
+                if got == ids(expected) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                got = matched(backend, &tenant, &resolved).await;
+            }
+            assert_eq!(got, ids(expected), "positive control {label}");
+        }
+        if got != ids(expected) {
+            failures.push(format!("{label}: got {got:?}, expected {expected:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}

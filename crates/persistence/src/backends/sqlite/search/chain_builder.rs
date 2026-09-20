@@ -965,6 +965,34 @@ mod tests {
         assert!(fragment.sql.contains("Patient/%"));
     }
 
+    /// #1379: the chain terminal is a separate copy of the token match, and
+    /// has to accept the implicit-system marker of a `code` element the same
+    /// way `TokenHandler` does — for `system|code` and for `|code`.
+    #[test]
+    fn a_chained_system_qualified_token_accepts_the_implicit_system() {
+        let registry = create_test_registry();
+        let builder = ChainQueryBuilder::new("tenant1", "Patient", registry);
+        for (value, expected) in [
+            (
+                "http://loinc.org|1234-5",
+                format!("value_token_system IN ('http://loinc.org', '{IMPLICIT_TOKEN_SYSTEM}')"),
+            ),
+            (
+                "|1234-5",
+                format!("value_token_system IN ('', '{IMPLICIT_TOKEN_SYSTEM}')"),
+            ),
+        ] {
+            let rc = ReverseChainedParameter::terminal(
+                "Observation",
+                "subject",
+                "code",
+                SearchValue::eq(value),
+            );
+            let fragment = builder.build_reverse_chain_sql(&rc).unwrap();
+            assert!(fragment.sql.contains(&expected), "{}", fragment.sql);
+        }
+    }
+
     #[test]
     fn test_reverse_chain_depth() {
         let inner = ReverseChainedParameter::terminal(

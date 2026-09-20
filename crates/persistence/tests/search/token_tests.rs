@@ -433,3 +433,15 @@ async fn test_system_qualified_tokens_match_code_elements() {
     )
     .await;
 }
+
+/// #1379: the same predicate as a chain terminal.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_system_qualified_tokens_in_chains() {
+    let backend = super::make_sqlite_backend();
+    super::token_code_system_suite::system_qualified_tokens_in_chains(
+        &backend,
+        "token-code-system-chain",
+    )
+    .await;
+}

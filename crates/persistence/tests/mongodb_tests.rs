@@ -649,6 +649,20 @@ async fn mongodb_unmarked_code_rows_keep_their_old_behaviour() {
     token_code_system_suite::unmarked_rows_keep_their_old_behaviour(&backend, &tenant).await;
 }
 
+/// #1379: the same predicate as a chain terminal.
+#[tokio::test]
+async fn mongodb_system_qualified_tokens_in_chains() {
+    let Some(backend) = create_backend_with_full_registry("token_code_system_chain").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    token_code_system_suite::system_qualified_tokens_in_chains(
+        &backend,
+        "token-code-system-chain-1379",
+    )
+    .await;
+}
+
 /// #1062: a comma-separated value list on one `SearchParameter` is OR per
 /// FHIR (https://build.fhir.org/search.html#combining) — for date same as
 /// every other type. Drives the real `SearchProvider::search` /

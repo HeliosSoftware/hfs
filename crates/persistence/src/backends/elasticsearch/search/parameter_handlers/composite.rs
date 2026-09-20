@@ -196,6 +196,15 @@ mod tests {
         assert!(s.contains("token_code"));
         assert!(s.contains("quantity_value"));
         assert!(s.contains("gte"));
+        // The named system, or the marker of a `code` component (#1379).
+        assert!(s.contains(crate::search::IMPLICIT_TOKEN_SYSTEM));
+        // `system|` names the codes OF a system: no marker.
+        let clause = build_clause(&param, "http://loinc.org|$ge100").unwrap();
+        assert!(
+            !clause
+                .to_string()
+                .contains(crate::search::IMPLICIT_TOKEN_SYSTEM)
+        );
     }
 
     fn code_date_param() -> SearchParameter {
