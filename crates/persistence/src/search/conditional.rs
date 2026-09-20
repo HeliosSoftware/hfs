@@ -98,18 +98,52 @@ const ALWAYS_INDEXED_PARAMS: &[&str] = &[
 /// which then separates OR alternatives exactly as a literal one does; a comma
 /// that belongs to the value is escaped the FHIR way, `\,`.
 ///
-/// Pairs with an empty name or an empty value are dropped. Repeated names are
-/// kept, in order: FHIR ANDs them.
+/// Pairs with an empty name are dropped. A pair with an empty value — `name=`,
+/// or a bare `name` with no `=` at all, which is the same thing to a form
+/// parser — is **kept**, so that [`build_conditional_parameters`] can refuse
+/// it: dropping it here silently widened the precondition of a write (#1360).
+/// Repeated names are kept, in order: FHIR ANDs them.
 pub fn parse_conditional_criteria(criteria: &str) -> Vec<(String, String)> {
     form_urlencoded::parse(criteria.as_bytes())
         .filter_map(|(name, value)| {
             let (name, value) = (name.trim(), value.trim());
-            if name.is_empty() || value.is_empty() {
+            if name.is_empty() {
                 return None;
             }
             Some((name.to_string(), value.to_string()))
         })
         .collect()
+}
+
+/// Refuses a criterion that carries no value: `identifier=`, a bare
+/// `identifier`, or an OR-list with an empty alternative (`identifier=,`,
+/// `family=Jones,`).
+///
+/// This is what an unset template variable renders as (`identifier={{mrn}}`).
+/// Dropping the pair leaves the *other* criteria to decide the match — `PUT
+/// Patient?identifier=&family=Jones` overwrote whichever Jones there was — and,
+/// when it was the only criterion, leaves none, so a conditional create went
+/// ahead unguarded. An empty alternative is no better: a string search for the
+/// prefix `""` matches every value. Direct search evaluates the empty value
+/// (an empty token finds nothing); a read can afford that. As for an unknown
+/// parameter (#1323), `Prefer: handling` is not consulted.
+///
+/// Result parameters ([`RESULT_PARAMS`]) are no criteria and are exempt.
+/// [`build_conditional_parameters`] applies this to every pair; a resolver that
+/// reads the parsed pairs without going through it has to call this itself.
+pub fn reject_empty_criterion_values(pairs: &[(String, String)]) -> StorageResult<()> {
+    for (raw_name, raw_value) in pairs {
+        if RESULT_PARAMS.contains(&raw_name.as_str()) {
+            continue;
+        }
+        if split_unescaped_commas(raw_value)
+            .iter()
+            .any(|alternative| alternative.is_empty())
+        {
+            return Err(empty_value(raw_name));
+        }
+    }
+    Ok(())
 }
 
 /// Builds the typed search parameters a list of criteria pairs describes.
@@ -146,6 +180,10 @@ pub fn build_conditional_parameters(
     resource_type: &str,
     pairs: &[(String, String)],
 ) -> StorageResult<Vec<SearchParameter>> {
+    // First, so that `_has=`, `a.b=` and `x:missing=` are all reported as what
+    // they are: a criterion without a value (#1360).
+    reject_empty_criterion_values(pairs)?;
+
     let mut parameters = Vec::with_capacity(pairs.len());
 
     for (raw_name, raw_value) in pairs {
@@ -360,6 +398,14 @@ fn unknown_parameter(resource_type: &str, name: &str) -> StorageError {
         "conditional criteria name the search parameter '{name}', which is not known for \
          {resource_type}. Criteria guard a write, so an unknown parameter is an error rather \
          than ignored (Prefer: handling does not apply); nothing was written"
+    ))
+}
+
+fn empty_value(raw_name: &str) -> StorageError {
+    query_error(format!(
+        "conditional criterion '{raw_name}' has no value, or an empty alternative in its \
+         comma-separated list. Criteria guard a write, so it is an error rather than dropped, \
+         which would widen the match (Prefer: handling does not apply); nothing was written"
     ))
 }
 
@@ -648,9 +694,60 @@ mod tests {
             pairs("family=Mary+Ann&given=a%2Bb"),
             vec![pair("family", "Mary Ann"), pair("given", "a+b")]
         );
-        // Nothing usable.
-        for criteria in ["", "&", "family", "family=", "=Neal", "family=+"] {
+        // Nothing at all.
+        for criteria in ["", "&", "=Neal", "=", "&&"] {
             assert!(pairs(criteria).is_empty(), "{criteria:?}");
+        }
+        // A name without a value is kept, for the builder to refuse (#1360).
+        for criteria in ["family", "family=", "family=+", "family=%20"] {
+            assert_eq!(pairs(criteria), vec![pair("family", "")], "{criteria:?}");
+        }
+    }
+
+    #[test]
+    fn a_criterion_without_a_value_is_refused_not_dropped() {
+        for (criteria, named) in [
+            ("identifier=", "'identifier'"),
+            ("identifier", "'identifier'"),
+            ("identifier=&family=Neal", "'identifier'"),
+            ("family=Neal&identifier", "'identifier'"),
+            ("identifier=+", "'identifier'"),
+            ("identifier=,", "'identifier'"),
+            ("family=Neal,", "'family'"),
+            ("family=,Neal", "'family'"),
+            ("identifier:missing=", "'identifier:missing'"),
+            ("_id=", "'_id'"),
+            // Reported as empty, not as a chain / `_has` / unknown parameter.
+            ("general-practitioner.name=", "'general-practitioner.name'"),
+            (
+                "_has:Observation:patient:code=",
+                "'_has:Observation:patient:code'",
+            ),
+            ("nonsense=", "'nonsense'"),
+        ] {
+            let message = build_conditional_query(&registry(), "Patient", criteria)
+                .expect_err(criteria)
+                .to_string();
+            assert!(message.contains(named), "{criteria}: {message}");
+            assert!(message.contains("no value"), "{criteria}: {message}");
+        }
+
+        // An escaped comma is data, not an empty alternative.
+        assert_eq!(one("family=Neal\\,").values[0].value, "Neal,");
+        // `:missing` carries a value.
+        assert_eq!(
+            one("identifier:missing=true").modifier,
+            Some(SearchModifier::Missing)
+        );
+        // Result parameters are no criteria, with or without a value.
+        assert_eq!(one("_format=&family=Neal&_pretty").name, "family");
+        for criteria in ["_format=", "_format", "_count=&_summary"] {
+            assert!(
+                build_conditional_query(&registry(), "Patient", criteria)
+                    .expect("valid")
+                    .is_none(),
+                "{criteria}"
+            );
         }
     }
 
