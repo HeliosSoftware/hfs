@@ -796,3 +796,168 @@ async fn header_and_bundle_criteria_honour_repeated_parameters() {
         );
     }
 }
+
+// =============================================================================
+// Percent-decoding (#1322)
+// =============================================================================
+
+/// `Bundle.entry.response.status` of a one-entry Bundle carrying a conditional
+/// create.
+async fn bundle_if_none_exist_status(
+    server: &TestServer,
+    bundle_type: &str,
+    criteria: &str,
+) -> String {
+    let reply = post_bundle(
+        server,
+        bundle_type,
+        json!([{
+            "resource": patient("Incoming", "incoming-1"),
+            "request": {"method": "POST", "url": "Patient", "ifNoneExist": criteria}
+        }]),
+    )
+    .await;
+    reply["entry"][0]["response"]["status"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Whether the criteria, as a direct search, find exactly the one seeded
+/// patient. Every scenario below holds conditional criteria to this.
+async fn direct_search_finds_existing(server: &TestServer, criteria: &str) -> bool {
+    match search_ids(server, criteria).await.as_slice() {
+        [] => false,
+        [only] => {
+            assert_eq!(only, "existing", "{criteria}");
+            true
+        }
+        several => panic!("{criteria} found {several:?}"),
+    }
+}
+
+/// `If-None-Exist` and `ifNoneExist` are the query portion of a search URL, so
+/// they are form-urlencoded like one. A client that encodes `system|value` —
+/// as any URL library does — must find the resource, not duplicate it.
+///
+/// Each case is the criteria and whether they name the seeded patient
+/// (family `Mary Ann`, identifier `http://example.org/mrn|a+b&c=d,e`).
+#[tokio::test]
+async fn header_and_bundle_criteria_are_percent_decoded() {
+    let cases = [
+        // The issue's headline: an encoded `system|value`.
+        (
+            "identifier=http%3A%2F%2Fexample.org%2Fmrn%7Ca%2Bb%26c%3Dd%5C%2Ce",
+            true,
+        ),
+        // A value containing `&`, `=` and `+`, encoded; the comma is escaped
+        // the FHIR way (`\,`), itself encoded or not.
+        ("identifier=a%2Bb%26c%3Dd%5C%2Ce", true),
+        ("identifier=a%2Bb%26c%3Dd%5C,e", true),
+        // `%2C` is a comma once decoded, and an unescaped comma separates OR
+        // alternatives — exactly as in a direct search URL.
+        ("identifier=a%2Bb%26c%3Dd%2Ce", false),
+        ("identifier=absent%2Ca%2Bb%26c%3Dd%5C%2Ce", true),
+        // `+` is a space; `%2B` is a plus.
+        ("family=Mary+Ann", true),
+        ("family=Mary%20Ann", true),
+        ("family:exact=Mary%2BAnn", false),
+        ("identifier=a+b%26c%3Dd%5C%2Ce", false),
+        // An encoded name and modifier.
+        ("family%3Aexact=Mary%20Ann", true),
+    ];
+
+    for (criteria, names_existing) in cases {
+        let server = test_server().await;
+        put_patient(&server, "existing", "Mary Ann", "a+b&c=d,e").await;
+        // Conditional criteria must mean what the same string means as a
+        // direct search — which is also the positive control on the seed.
+        assert_eq!(
+            direct_search_finds_existing(&server, criteria).await,
+            names_existing,
+            "direct search disagrees with the test's expectation for {criteria}"
+        );
+
+        let expected = if names_existing {
+            StatusCode::OK
+        } else {
+            StatusCode::CREATED
+        };
+        let response = conditional_create(&server, criteria).await;
+        assert_eq!(
+            response.status_code(),
+            expected,
+            "If-None-Exist: {criteria}"
+        );
+
+        for bundle_type in ["batch", "transaction"] {
+            let server = test_server().await;
+            put_patient(&server, "existing", "Mary Ann", "a+b&c=d,e").await;
+            let status = bundle_if_none_exist_status(&server, bundle_type, criteria).await;
+            assert!(
+                status.starts_with(if names_existing { "200" } else { "201" }),
+                "{bundle_type} ifNoneExist {criteria}: {status}"
+            );
+        }
+    }
+}
+
+/// Conditional `PUT` / `DELETE` criteria arrive in the URL, which the server
+/// used to decode and then re-join into one `a=b&c=d` string for the backend
+/// to split again — so a decoded `&` or `=` inside a value became a pair
+/// boundary. `identifier=a%26family%3DWilson` turned into "identifier `a` AND
+/// family `Wilson`", which names the decoy.
+#[tokio::test]
+async fn url_criteria_with_an_ampersand_or_equals_in_a_value_hit_the_named_resource() {
+    let criteria = "identifier=a%26family%3DWilson";
+
+    let seed = |server: TestServer| async move {
+        put_patient(&server, "target", "Neal", "a&family=Wilson").await;
+        put_patient(&server, "decoy", "Wilson", "a").await;
+        assert_eq!(search_ids(&server, criteria).await, vec!["target"]);
+        server
+    };
+
+    let server = seed(test_server().await).await;
+    server
+        .put(&format!("/Patient?{criteria}"))
+        .add_header(X_TENANT_ID, tenant())
+        .json(&patient("Updated", "a&family=Wilson"))
+        .await
+        .assert_status(StatusCode::OK);
+    assert_eq!(
+        families(&server).await,
+        pairs(&[("decoy", "Wilson"), ("target", "Updated")]),
+        "PUT /Patient?{criteria}"
+    );
+
+    let server = seed(test_server().await).await;
+    server
+        .delete(&format!("/Patient?{criteria}"))
+        .add_header(X_TENANT_ID, tenant())
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    assert_eq!(
+        families(&server).await,
+        pairs(&[("decoy", "Wilson")]),
+        "DELETE /Patient?{criteria}"
+    );
+
+    for (method, expected) in [
+        ("PUT", pairs(&[("decoy", "Wilson"), ("target", "Updated")])),
+        ("DELETE", pairs(&[("decoy", "Wilson")])),
+    ] {
+        let server = seed(test_server().await).await;
+        let mut entry =
+            json!({"request": {"method": method, "url": format!("Patient?{criteria}")}});
+        if method == "PUT" {
+            entry["resource"] = patient("Updated", "a&family=Wilson");
+        }
+        post_bundle(&server, "batch", json!([entry])).await;
+        assert_eq!(
+            families(&server).await,
+            expected,
+            "batch {method} Patient?{criteria}"
+        );
+    }
+}

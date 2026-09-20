@@ -251,10 +251,12 @@ where
         });
     }
 
-    // Every occurrence of a repeated parameter, in order: FHIR ANDs them, and
-    // a `HashMap` of the query keeps only the last — which, on a delete,
-    // widens what is deleted (#1321).
-    let search_params = super::batch::normalize_criteria(raw_query.as_deref().unwrap_or_default());
+    // The raw query, handed over as written: a `HashMap` of it keeps only the
+    // last occurrence of a repeated parameter — which, on a delete, widens
+    // what is deleted (#1321) — and re-joining decoded pairs corrupts a value
+    // containing `&` or `=` (#1322). The shared criteria builder splits, then
+    // decodes, once.
+    let search_params = raw_query.unwrap_or_default();
 
     debug!(
         resource_type = %resource_type,

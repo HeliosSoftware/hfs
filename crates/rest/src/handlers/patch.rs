@@ -186,8 +186,9 @@ pub async fn conditional_patch_handler<S>(
 where
     S: ResourceStorage + ConditionalStorage + Send + Sync,
 {
-    // Every occurrence of a repeated parameter, in order (#1321).
-    let search_params = super::batch::normalize_criteria(raw_query.as_deref().unwrap_or_default());
+    // The raw query, as written: every occurrence of a repeated parameter
+    // (#1321), decoded once by the shared criteria builder (#1322).
+    let search_params = raw_query.unwrap_or_default();
 
     debug!(
         resource_type = %resource_type,

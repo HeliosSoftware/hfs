@@ -70,6 +70,9 @@ rayon = "1.8"
 # Bulk-submit result receipts spool to a per-run temp directory (#982) instead
 # of accumulating in memory. Uses the platform temp dir, so `TMPDIR` isolates it.
 tempfile = "3"
+# Decodes conditional-interaction criteria (`If-None-Exist`, `ifNoneExist`,
+# conditional URLs) with the parser helios-rest uses for a search query (#1322).
+form_urlencoded = "1"
 
 # SQLite backend
 rusqlite = { version = "0.33", features = ["bundled", "serde_json", "functions"], optional = true }

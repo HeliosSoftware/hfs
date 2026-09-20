@@ -353,10 +353,13 @@ where
     // Negotiate response format from Accept header
     let negotiated = negotiate_format(&req_headers, None);
 
-    // Every occurrence of a repeated parameter, in order: FHIR ANDs them
-    // (`date=ge…&date=le…`), and a `HashMap` of the query keeps only the last,
-    // which widens what the write matches (#1321).
-    let search_params = super::batch::normalize_criteria(raw_query.as_deref().unwrap_or_default());
+    // The raw query, handed over as written. A `HashMap` of it keeps only the
+    // last occurrence of a repeated parameter, which FHIR ANDs
+    // (`date=ge…&date=le…`), so the write matched more than it named (#1321);
+    // and re-joining decoded pairs turns a decoded `&` or `=` inside a value
+    // into a pair boundary (#1322). The shared criteria builder splits, then
+    // decodes, once.
+    let search_params = raw_query.unwrap_or_default();
 
     debug!(
         resource_type = %resource_type,

@@ -21,8 +21,18 @@
 //! again: comparator prefixes only for date / number / quantity parameters,
 //! OR-lists split on unescaped commas, and `name:modifier` honoured.
 //!
-//! The criteria string is taken as already percent-decoded — the REST layer
-//! decodes it once, and no backend decodes it again.
+//! # Encoding
+//!
+//! The criteria string is the query portion of a search URL, **as it appears
+//! on the wire**: `application/x-www-form-urlencoded`, like any search query.
+//! That is what `If-None-Exist` and `Bundle.entry.request.ifNoneExist` are
+//! defined to carry, and what the REST layer hands over untouched for a
+//! conditional URL. It is decoded exactly once, in
+//! [`parse_conditional_criteria`], with the parser direct search uses — after
+//! the split into pairs, so a decoded `&`, `=` or `+` inside a value stays
+//! inside it (#1322). A caller that already holds decoded pairs uses
+//! [`build_conditional_query_from_pairs`]; it must never join them into a
+//! string for this module to split again.
 
 use crate::error::{SearchError, StorageError, StorageResult};
 use crate::types::{
@@ -61,15 +71,22 @@ const RESULT_PARAMS: &[&str] = &[
     "_score",
 ];
 
-/// Splits conditional criteria into `(name, value)` pairs.
+/// Splits form-urlencoded conditional criteria into decoded `(name, value)`
+/// pairs.
 ///
-/// Pairs without an `=`, with an empty name, or with an empty value are
-/// dropped. Repeated names are kept, in order: FHIR ANDs them.
+/// The decoding is `form_urlencoded`'s, the parser the REST layer reads a
+/// search query with: `%XX` escapes are resolved and `+` is a space, in names
+/// and values alike, *after* the split on `&` and `=` — so
+/// `identifier=http%3A%2F%2Fexample.org%7C123` names `http://example.org|123`,
+/// and an encoded `&` or `=` is part of its value. `%2C` decodes to a comma,
+/// which then separates OR alternatives exactly as a literal one does; a comma
+/// that belongs to the value is escaped the FHIR way, `\,`.
+///
+/// Pairs with an empty name or an empty value are dropped. Repeated names are
+/// kept, in order: FHIR ANDs them.
 pub fn parse_conditional_criteria(criteria: &str) -> Vec<(String, String)> {
-    criteria
-        .split('&')
-        .filter_map(|pair| {
-            let (name, value) = pair.split_once('=')?;
+    form_urlencoded::parse(criteria.as_bytes())
+        .filter_map(|(name, value)| {
             let (name, value) = (name.trim(), value.trim());
             if name.is_empty() || value.is_empty() {
                 return None;
@@ -200,13 +217,25 @@ pub fn build_conditional_parameters(
 /// Builds the search a conditional interaction's criteria describe, or `None`
 /// when they select nothing — matching everything would be the literal
 /// reading, but no conditional interaction means that.
+///
+/// `criteria` is form-urlencoded (see the [module notes](self#encoding)).
 pub fn build_conditional_query(
     registry: &SearchParameterRegistry,
     resource_type: &str,
     criteria: &str,
 ) -> StorageResult<Option<SearchQuery>> {
     let pairs = parse_conditional_criteria(criteria);
-    let parameters = build_conditional_parameters(registry, resource_type, &pairs)?;
+    build_conditional_query_from_pairs(registry, resource_type, &pairs)
+}
+
+/// [`build_conditional_query`] for criteria that are already decoded
+/// `(name, value)` pairs.
+pub fn build_conditional_query_from_pairs(
+    registry: &SearchParameterRegistry,
+    resource_type: &str,
+    pairs: &[(String, String)],
+) -> StorageResult<Option<SearchQuery>> {
+    let parameters = build_conditional_parameters(registry, resource_type, pairs)?;
     if parameters.is_empty() {
         return Ok(None);
     }
@@ -383,6 +412,70 @@ mod tests {
                 "{criteria} must be refused"
             );
         }
+    }
+
+    #[test]
+    fn criteria_are_form_urlencoded() {
+        fn pairs(criteria: &str) -> Vec<(String, String)> {
+            parse_conditional_criteria(criteria)
+        }
+        fn pair(name: &str, value: &str) -> (String, String) {
+            (name.to_string(), value.to_string())
+        }
+
+        assert_eq!(
+            pairs("identifier=http%3A%2F%2Fexample.org%7C123"),
+            vec![pair("identifier", "http://example.org|123")]
+        );
+        // Unencoded criteria read as before.
+        assert_eq!(
+            pairs("identifier=http://example.org|123&family=Neal"),
+            vec![
+                pair("identifier", "http://example.org|123"),
+                pair("family", "Neal")
+            ]
+        );
+        // Decoding follows the split, so an encoded `&` or `=` is data; a
+        // literal `=` after the first is data too.
+        assert_eq!(
+            pairs("identifier=http://x?a%3D1%26b=2|v&family%3Aexact=Neal"),
+            vec![
+                pair("identifier", "http://x?a=1&b=2|v"),
+                pair("family:exact", "Neal")
+            ]
+        );
+        // `+` is a space, `%2B` a plus — as in a search URL.
+        assert_eq!(
+            pairs("family=Mary+Ann&given=a%2Bb"),
+            vec![pair("family", "Mary Ann"), pair("given", "a+b")]
+        );
+        // Nothing usable.
+        for criteria in ["", "&", "family", "family=", "=Neal", "family=+"] {
+            assert!(pairs(criteria).is_empty(), "{criteria:?}");
+        }
+    }
+
+    #[test]
+    fn an_encoded_comma_separates_alternatives_like_a_literal_one() {
+        for criteria in ["family=Neal%2CLevine", "family=Neal,Levine"] {
+            let values: Vec<String> = one(criteria).values.into_iter().map(|v| v.value).collect();
+            assert_eq!(values, vec!["Neal", "Levine"], "{criteria}");
+        }
+        for criteria in ["family=Neal%5C%2CLevine", "family=Neal\\,Levine"] {
+            let param = one(criteria);
+            assert_eq!(param.values.len(), 1, "{criteria}");
+            assert_eq!(param.values[0].value, "Neal,Levine", "{criteria}");
+        }
+    }
+
+    #[test]
+    fn decoded_pairs_are_never_split_again() {
+        let pairs = vec![("identifier".to_string(), "a&family=Wilson".to_string())];
+        let query = build_conditional_query_from_pairs(&registry(), "Patient", &pairs)
+            .expect("valid")
+            .expect("some");
+        assert_eq!(query.parameters.len(), 1);
+        assert_eq!(query.parameters[0].values[0].value, "a&family=Wilson");
     }
 
     #[test]
