@@ -18456,6 +18456,404 @@ mod postgres_integration {
         .await;
     }
 
+    /// #1300: the values of ONE parameter (`date=a,b`) are alternatives. The
+    /// date, `_lastUpdated`, number and quantity builders ANDed them, so a list
+    /// naming two different days asked for a resource on both and found none.
+    /// Repeating the parameter (`date=ge…&date=le…`) is the conjunction, and it
+    /// is folded one level up (`build_search_query_for`), so it must stay one.
+    #[tokio::test]
+    async fn postgres_integration_comma_list_is_or_and_repeated_param_is_and() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant(&unique_base("or_list"));
+
+        let mut procedure_ids = Vec::new();
+        for performed in ["2013-04-05", "2020-06-01"] {
+            let stored = backend
+                .create(
+                    &tenant,
+                    "Procedure",
+                    json!({
+                        "resourceType": "Procedure",
+                        "status": "completed",
+                        "subject": {"reference": "Patient/or-list"},
+                        "performedDateTime": performed
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            procedure_ids.push(stored.id().to_string());
+        }
+        let (old, new) = (procedure_ids[0].clone(), procedure_ids[1].clone());
+        pin_last_updated(&backend, &old, instant("2013-04-05T10:00:00Z")).await;
+        pin_last_updated(&backend, &new, instant("2020-06-01T10:00:00Z")).await;
+
+        let mut observation_ids = Vec::new();
+        for value in [5.0, 50.0] {
+            let stored = backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "status": "final",
+                        "code": {"text": "or-list"},
+                        "valueQuantity": {
+                            "value": value,
+                            "unit": "mg",
+                            "system": "http://unitsofmeasure.org",
+                            "code": "mg"
+                        }
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            observation_ids.push(stored.id().to_string());
+        }
+        let mut risk_ids = Vec::new();
+        for probability in [0.2, 0.8] {
+            let stored = backend
+                .create(
+                    &tenant,
+                    "RiskAssessment",
+                    json!({
+                        "resourceType": "RiskAssessment",
+                        "status": "final",
+                        "subject": {"reference": "Patient/or-list"},
+                        "prediction": [{"probabilityDecimal": probability}]
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            risk_ids.push(stored.id().to_string());
+        }
+
+        let param =
+            |name: &str, param_type: SearchParamType, values: Vec<SearchValue>| SearchParameter {
+                name: name.to_string(),
+                param_type,
+                modifier: None,
+                values,
+                chain: vec![],
+                components: vec![],
+            };
+        let search = |resource_type: &'static str, params: Vec<SearchParameter>| {
+            let backend = &backend;
+            let tenant = &tenant;
+            async move {
+                let mut query = SearchQuery::new(resource_type);
+                for p in params {
+                    query = query.with_parameter(p);
+                }
+                let mut ids: Vec<String> = backend
+                    .search(tenant, &query)
+                    .await
+                    .unwrap()
+                    .resources
+                    .items
+                    .iter()
+                    .map(|r| r.id().to_string())
+                    .collect();
+                ids.sort();
+                ids
+            }
+        };
+        let sorted = |ids: &[String]| {
+            let mut ids = ids.to_vec();
+            ids.sort();
+            ids
+        };
+        let date = SearchParamType::Date;
+
+        // Positive controls: each value alone finds exactly its own resource, so
+        // the parameters below are indexed and an empty list result is the fold.
+        for (name, value, expected) in [
+            ("date", "2013-04-05", &old),
+            ("date", "2020-06-01", &new),
+            ("_lastUpdated", "2013-04-05", &old),
+            ("_lastUpdated", "2020-06-01", &new),
+        ] {
+            assert_eq!(
+                search(
+                    "Procedure",
+                    vec![param(name, date, vec![SearchValue::eq(value)])]
+                )
+                .await,
+                vec![expected.clone()],
+                "control: {name}={value}"
+            );
+        }
+
+        // `date=2013-04-05,2020-06-01` — either day.
+        assert_eq!(
+            search(
+                "Procedure",
+                vec![param(
+                    "date",
+                    date,
+                    vec![SearchValue::eq("2013-04-05"), SearchValue::eq("2020-06-01")]
+                )]
+            )
+            .await,
+            sorted(&procedure_ids),
+            "date=2013-04-05,2020-06-01"
+        );
+        // `_lastUpdated=2013-04-05,2020-06-01`
+        assert_eq!(
+            search(
+                "Procedure",
+                vec![param(
+                    "_lastUpdated",
+                    date,
+                    vec![SearchValue::eq("2013-04-05"), SearchValue::eq("2020-06-01")]
+                )]
+            )
+            .await,
+            sorted(&procedure_ids),
+            "_lastUpdated=2013-04-05,2020-06-01"
+        );
+        // A prefixed list: `date=lt2014-01-01,gt2020-01-01` — no single day can
+        // satisfy both, so under AND this is empty by construction.
+        for name in ["date", "_lastUpdated"] {
+            assert_eq!(
+                search(
+                    "Procedure",
+                    vec![param(
+                        name,
+                        date,
+                        vec![
+                            SearchValue::new(SearchPrefix::Lt, "2014-01-01"),
+                            SearchValue::new(SearchPrefix::Gt, "2020-01-01"),
+                        ]
+                    )]
+                )
+                .await,
+                sorted(&procedure_ids),
+                "{name}=lt2014-01-01,gt2020-01-01"
+            );
+        }
+        // An alternative nothing matches adds nothing.
+        assert_eq!(
+            search(
+                "Procedure",
+                vec![param(
+                    "date",
+                    date,
+                    vec![SearchValue::eq("2013-04-05"), SearchValue::eq("1999-01-01")]
+                )]
+            )
+            .await,
+            vec![old.clone()],
+            "date=2013-04-05,1999-01-01"
+        );
+
+        // Repeated parameters stay a conjunction: `date=ge2013-01-01&date=le2013-12-31`
+        // is the year 2013, not "everything".
+        for name in ["date", "_lastUpdated"] {
+            assert_eq!(
+                search(
+                    "Procedure",
+                    vec![
+                        param(
+                            name,
+                            date,
+                            vec![SearchValue::new(SearchPrefix::Ge, "2013-01-01")]
+                        ),
+                        param(
+                            name,
+                            date,
+                            vec![SearchValue::new(SearchPrefix::Le, "2013-12-31")]
+                        ),
+                    ]
+                )
+                .await,
+                vec![old.clone()],
+                "{name}=ge2013-01-01&{name}=le2013-12-31"
+            );
+        }
+        // …and an OR list inside a conjunction keeps its parentheses:
+        // `date=2013-04-05,2020-06-01&date=gt2019-01-01`.
+        assert_eq!(
+            search(
+                "Procedure",
+                vec![
+                    param(
+                        "date",
+                        date,
+                        vec![SearchValue::eq("2013-04-05"), SearchValue::eq("2020-06-01")]
+                    ),
+                    param(
+                        "date",
+                        date,
+                        vec![SearchValue::new(SearchPrefix::Gt, "2019-01-01")]
+                    ),
+                ]
+            )
+            .await,
+            vec![new.clone()],
+            "date=2013-04-05,2020-06-01&date=gt2019-01-01"
+        );
+
+        // The sibling builders had the same fold. Quantity: `value-quantity=5|…|mg,50|…|mg`.
+        let quantity = SearchParamType::Quantity;
+        let mg = |n: &str| SearchValue::eq(format!("{n}|http://unitsofmeasure.org|mg"));
+        assert_eq!(
+            search(
+                "Observation",
+                vec![param("value-quantity", quantity, vec![mg("5")])]
+            )
+            .await,
+            vec![observation_ids[0].clone()],
+            "control: value-quantity=5|…|mg"
+        );
+        assert_eq!(
+            search(
+                "Observation",
+                vec![param("value-quantity", quantity, vec![mg("5"), mg("50")])]
+            )
+            .await,
+            sorted(&observation_ids),
+            "value-quantity=5|…|mg,50|…|mg"
+        );
+        assert_eq!(
+            search(
+                "Observation",
+                vec![
+                    param(
+                        "value-quantity",
+                        quantity,
+                        vec![SearchValue::new(
+                            SearchPrefix::Gt,
+                            "1|http://unitsofmeasure.org|mg"
+                        )]
+                    ),
+                    param(
+                        "value-quantity",
+                        quantity,
+                        vec![SearchValue::new(
+                            SearchPrefix::Lt,
+                            "10|http://unitsofmeasure.org|mg"
+                        )]
+                    ),
+                ]
+            )
+            .await,
+            vec![observation_ids[0].clone()],
+            "value-quantity=gt1|…|mg&value-quantity=lt10|…|mg"
+        );
+
+        // Number: `probability=0.2,0.8`.
+        let number = SearchParamType::Number;
+        assert_eq!(
+            search(
+                "RiskAssessment",
+                vec![param("probability", number, vec![SearchValue::eq("0.2")])]
+            )
+            .await,
+            vec![risk_ids[0].clone()],
+            "control: probability=0.2"
+        );
+        assert_eq!(
+            search(
+                "RiskAssessment",
+                vec![param(
+                    "probability",
+                    number,
+                    vec![SearchValue::eq("0.2"), SearchValue::eq("0.8")]
+                )]
+            )
+            .await,
+            sorted(&risk_ids),
+            "probability=0.2,0.8"
+        );
+    }
+
+    /// What makes the OR fold (#1300) safe: under OR a value that is not a date
+    /// is `FALSE OR x`, so it no longer empties the parameter the way it did
+    /// under AND. It never gets that far — the shared gate rejects the whole
+    /// request, in either order and under `ne`, for `search` and `search_count`
+    /// alike, so a list with a bad value is an error and never a widened (or
+    /// silently narrowed) result.
+    #[tokio::test]
+    async fn postgres_integration_invalid_date_in_or_list_is_rejected() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::error::SearchError;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant(&unique_base("or_list_gate"));
+        backend
+            .create(
+                &tenant,
+                "Procedure",
+                json!({
+                    "resourceType": "Procedure",
+                    "status": "completed",
+                    "subject": {"reference": "Patient/or-list"},
+                    "performedDateTime": "2013-04-05"
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let query = |name: &str, values: Vec<SearchValue>| {
+            SearchQuery::new("Procedure").with_parameter(SearchParameter {
+                name: name.to_string(),
+                param_type: SearchParamType::Date,
+                modifier: None,
+                values,
+                chain: vec![],
+                components: vec![],
+            })
+        };
+
+        // Positive control: the valid value alone finds the resource.
+        let found = backend
+            .search(&tenant, &query("date", vec![SearchValue::eq("2013-04-05")]))
+            .await
+            .unwrap();
+        assert_eq!(found.resources.items.len(), 1);
+
+        for name in ["date", "_lastUpdated"] {
+            for values in [
+                vec![SearchValue::eq("2013-04-05"), SearchValue::eq("not-a-date")],
+                vec![
+                    SearchValue::new(SearchPrefix::Lt, "not-a-date"),
+                    SearchValue::eq("2013-04-05"),
+                ],
+                vec![
+                    SearchValue::new(SearchPrefix::Ne, "2013-13-45"),
+                    SearchValue::eq("2013-04-05"),
+                ],
+            ] {
+                let q = query(name, values);
+                let context = format!("{name}: {:?}", q.parameters[0].values);
+                match backend.search(&tenant, &q).await {
+                    Err(StorageError::Search(SearchError::InvalidDateValue { .. })) => {}
+                    Err(other) => panic!("{context}: expected InvalidDateValue, got {other}"),
+                    Ok(result) => panic!(
+                        "{context}: must be rejected, returned {} resource(s)",
+                        result.resources.items.len()
+                    ),
+                }
+                assert!(
+                    backend.search_count(&tenant, &q).await.is_err(),
+                    "{context}: search_count must be rejected too"
+                );
+            }
+        }
+    }
+
     /// #1315: a stored `…T09:20` is not RFC 3339, so `parse_index_date`
     /// returned `None`, the `search_index` row was skipped, and the resource
     /// could not be found by that date parameter at all.
