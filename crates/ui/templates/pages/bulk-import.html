@@ -56,6 +56,10 @@
 <div class="card notice">{{ i18n.t("bulk-import-unavailable") }}</div>
 {% else %}
 
+{# #1245: a row can read Completed while the rebuild that makes its resources
+   searchable is still running, or ended with resources left unindexed. #}
+{% include "partials/bulk_import_rebuild.html" %}
+
 {% match error %}{% when Some(message) %}
 <div class="card notice">{{ message }}</div>
 {% when None %}{% endmatch %}

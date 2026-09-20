@@ -67,6 +67,15 @@ fn reject_contained_missing(query: &SearchQuery) -> StorageResult<()> {
     Ok(())
 }
 
+/// A `_cursor` that decoded but carries a sort value of the wrong type for its
+/// sort key. Cursors are unkeyed base64 JSON, so any client can craft one; this
+/// is a bad request (400), not a server fault (#1120).
+fn invalid_cursor(cursor: &PageCursor) -> StorageError {
+    StorageError::Search(SearchError::InvalidCursor {
+        cursor: cursor.encode(),
+    })
+}
+
 /// Binds the cursor's boundary sort value as `?3`, typed per the sort key kind.
 /// Timestamps are stored as RFC3339 text, so they bind (and compare) as text.
 fn bind_cursor_value(
@@ -81,20 +90,14 @@ fn bind_cursor_value(
                 Some(CursorValue::Decimal(f)) => *f,
                 Some(CursorValue::Number(i)) => *i as f64,
                 Some(CursorValue::String(s)) => s.parse().unwrap_or(0.0),
-                _ => {
-                    return Err(internal_error(
-                        "Invalid cursor: expected number".to_string(),
-                    ));
-                }
+                _ => return Err(invalid_cursor(cursor)),
             };
             params.push(Box::new(n));
         }
         SortValueKind::Timestamp | SortValueKind::Text => match value {
             Some(CursorValue::String(s)) => params.push(Box::new(s.clone())),
             Some(CursorValue::Null) | None => params.push(Box::new(Option::<String>::None)),
-            _ => {
-                return Err(internal_error("Invalid cursor: expected text".to_string()));
-            }
+            _ => return Err(invalid_cursor(cursor)),
         },
     }
     Ok(())
@@ -774,16 +777,11 @@ impl ChainedSearchProvider for SqliteBackend {
 
         // Build the SQL fragment. The chained value still carries its
         // comparator prefix (`patient.birthdate=le1956-07-14`); strip it only
-        // when the terminal parameter's type admits one, so a string value
-        // like `family=Levine` is never misread as le + "vine" (#258).
-        let candidate = crate::types::SearchValue::parse(value);
-        let search_value = if candidate.prefix != crate::types::SearchPrefix::Eq
-            && candidate.prefix.is_valid_for(parsed.terminal_type)
-        {
-            candidate
-        } else {
-            SearchValue::eq(value)
-        };
+        // when the terminal parameter's type admits one — date, number and
+        // quantity, explicit `eq` included — so a string or token value is
+        // never misread: not `family=Levine` as le + "vine" (#258), nor
+        // `family=nelson` as ne + "lson" (#1307).
+        let search_value = SearchValue::parse_for_type(value, parsed.terminal_type);
         let fragment = match builder.build_forward_chain_sql(&parsed, &search_value) {
             Ok(f) => f,
             Err(e) => {
@@ -1287,6 +1285,30 @@ mod tests {
     use crate::tenant::{TenantId, TenantPermissions};
     use crate::types::SearchParameter;
     use serde_json::json;
+
+    #[test]
+    fn a_type_mismatched_cursor_sort_value_is_a_client_error() {
+        // Crafted: a boolean where the Timestamp sort key expects an RFC3339
+        // string. Must surface as a 400 InvalidCursor, not a 500 (#1120).
+        let cursor = PageCursor::new(vec![CursorValue::Boolean(true)], "p1");
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        let err = bind_cursor_value(&mut params, SortValueKind::Timestamp, &cursor)
+            .expect_err("a boolean is not a timestamp");
+        match err {
+            StorageError::Search(SearchError::InvalidCursor { cursor: c }) => {
+                assert_eq!(c, cursor.encode())
+            }
+            other => panic!("expected InvalidCursor, got {other:?}"),
+        }
+
+        // A well-typed cursor still binds.
+        let ok = PageCursor::new(
+            vec![CursorValue::String("2024-01-01T00:00:00Z".to_string())],
+            "p1",
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        assert!(bind_cursor_value(&mut params, SortValueKind::Timestamp, &ok).is_ok());
+    }
 
     fn create_test_backend() -> SqliteBackend {
         // Point at the workspace's data directory so the search-parameter
@@ -2300,6 +2322,200 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ids, vec!["o1".to_string()], "Levine matches, unclipped");
+    }
+
+    /// Seeds the #1307 fixture through the real write path. Every terminal
+    /// value that begins with a comparator pair (`ne…`, `eq…`) has a decoy
+    /// whose value is what is left once the pair is wrongly stripped, so a
+    /// misparse shows up as the decoy being returned.
+    async fn seed_chain_prefix_fixture(backend: &SqliteBackend, tenant: &TenantContext) {
+        let resources = [
+            (
+                "Patient",
+                json!({"id": "nelson-1", "birthDate": "1950-04-12", "name": [{"family": "Nelson"}]}),
+            ),
+            (
+                "Patient",
+                json!({"id": "wilson-1", "birthDate": "1960-01-01", "name": [{"family": "Wilson"}]}),
+            ),
+            (
+                "Patient",
+                json!({"id": "equus-1", "birthDate": "1970-01-01", "name": [{"family": "Equus"}]}),
+            ),
+            ("Device", json!({"id": "dev-news", "url": "news:example/1"})),
+            ("Device", json!({"id": "dev-ws", "url": "ws:example/1"})),
+            (
+                "MolecularSequence",
+                json!({"id": "ms-10", "coordinateSystem": 0, "referenceSeq": {"windowStart": 10}}),
+            ),
+            (
+                "MolecularSequence",
+                json!({"id": "ms-0", "coordinateSystem": 0, "referenceSeq": {"windowStart": 0}}),
+            ),
+            (
+                "Observation",
+                json!({
+                    "id": "o-nelson", "status": "final",
+                    "code": {"coding": [{"system": "http://example.org/c", "code": "ne123"}]},
+                    "subject": {"reference": "Patient/nelson-1"},
+                    "device": {"reference": "Device/dev-news"},
+                    "derivedFrom": [{"reference": "MolecularSequence/ms-10"}],
+                    "valueQuantity": {"value": 5.4, "unit": "mg"},
+                }),
+            ),
+            (
+                "Observation",
+                json!({
+                    "id": "o-wilson", "status": "final",
+                    "code": {"coding": [{"system": "http://example.org/c", "code": "123"}]},
+                    "subject": {"reference": "Patient/wilson-1"},
+                    "device": {"reference": "Device/dev-ws"},
+                    "derivedFrom": [{"reference": "MolecularSequence/ms-0"}],
+                    "valueQuantity": {"value": 0, "unit": "mg"},
+                }),
+            ),
+            (
+                "Observation",
+                json!({
+                    "id": "o-equus", "status": "final",
+                    "code": {"coding": [{"system": "http://example.org/c", "code": "eq77"}]},
+                    "subject": {"reference": "Patient/equus-1"},
+                    "valueQuantity": {"value": 7.0, "unit": "mg"},
+                }),
+            ),
+            (
+                "Observation",
+                json!({
+                    "id": "o-77", "status": "final",
+                    "code": {"coding": [{"system": "http://example.org/c", "code": "77"}]},
+                    "valueQuantity": {"value": 9.0, "unit": "mg"},
+                }),
+            ),
+        ];
+        for (resource_type, body) in resources {
+            backend
+                .create(tenant, resource_type, body, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+        for obs in ["o-nelson", "o-wilson", "o-equus", "o-77"] {
+            backend
+                .create(
+                    tenant,
+                    "DiagnosticReport",
+                    json!({
+                        "id": obs.replacen("o-", "dr-", 1), "status": "final",
+                        "code": {"text": "panel"},
+                        "result": [{"reference": format!("Observation/{obs}")}],
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    /// #1307: through the `ChainedSearchProvider` trait API a comparator
+    /// prefix is recognised only on date / number / quantity terminals —
+    /// including an explicit `eq` — and never on string / token / reference /
+    /// uri terminals, whatever the value starts with.
+    #[tokio::test]
+    async fn test_resolve_chain_prefix_only_on_ordered_terminals() {
+        const WINDOW_START: &str = "derived-from:MolecularSequence.window-start";
+        const VALUE_QUANTITY: &str = "result.value-quantity";
+
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        seed_chain_prefix_fixture(&backend, &tenant).await;
+
+        let cases: &[(&str, &str, &str, &[&str])] = &[
+            // Positive controls: unprefixed values prove each terminal is
+            // indexed, so the cases below cannot pass or fail vacuously.
+            ("Observation", "subject.family", "Wilson", &["o-wilson"]),
+            ("DiagnosticReport", "result.code", "123", &["dr-wilson"]),
+            (
+                "DiagnosticReport",
+                "result.subject",
+                "wilson-1",
+                &["dr-wilson"],
+            ),
+            (
+                "Observation",
+                "device:Device.url",
+                "ws:example/1",
+                &["o-wilson"],
+            ),
+            ("DiagnosticReport", VALUE_QUANTITY, "5.4", &["dr-nelson"]),
+            ("Observation", WINDOW_START, "10", &["o-nelson"]),
+            (
+                "Observation",
+                "subject.birthdate",
+                "1950-04-12",
+                &["o-nelson"],
+            ),
+            // String terminal: `ne` + "lson" would also match Wilson.
+            ("Observation", "subject.family", "nelson", &["o-nelson"]),
+            ("Observation", "subject.family", "Nelson", &["o-nelson"]),
+            ("Observation", "subject.family", "Equus", &["o-equus"]),
+            // Token terminal: `ne` + "123" / `eq` + "77" are the decoys' codes.
+            ("DiagnosticReport", "result.code", "ne123", &["dr-nelson"]),
+            ("DiagnosticReport", "result.code", "eq77", &["dr-equus"]),
+            // Reference terminal: `ne` + "lson-1" would also match wilson-1.
+            (
+                "DiagnosticReport",
+                "result.subject",
+                "nelson-1",
+                &["dr-nelson"],
+            ),
+            // Uri terminal: `ne` + "ws:example/1" is the decoy's url.
+            (
+                "Observation",
+                "device:Device.url",
+                "news:example/1",
+                &["o-nelson"],
+            ),
+            // Quantity terminal: explicit `eq` is a prefix, as are the rest.
+            ("DiagnosticReport", VALUE_QUANTITY, "eq5.4", &["dr-nelson"]),
+            (
+                "DiagnosticReport",
+                VALUE_QUANTITY,
+                "ne5.4",
+                &["dr-77", "dr-equus", "dr-wilson"],
+            ),
+            (
+                "DiagnosticReport",
+                VALUE_QUANTITY,
+                "gt6",
+                &["dr-77", "dr-equus"],
+            ),
+            // Number terminal, likewise.
+            ("Observation", WINDOW_START, "eq10", &["o-nelson"]),
+            ("Observation", WINDOW_START, "ne10", &["o-wilson"]),
+            ("Observation", WINDOW_START, "gt5", &["o-nelson"]),
+            // Date terminal with an explicit `eq`.
+            (
+                "Observation",
+                "subject.birthdate",
+                "eq1950-04-12",
+                &["o-nelson"],
+            ),
+        ];
+
+        let mut failures = Vec::new();
+        for (base, chain, value, expected) in cases {
+            let mut ids = backend
+                .resolve_chain(&tenant, base, chain, value)
+                .await
+                .unwrap_or_else(|e| panic!("{base}?{chain}={value}: {e}"));
+            ids.sort();
+            let expected: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
+            if ids != expected {
+                failures.push(format!(
+                    "{base}?{chain}={value}: got {ids:?}, want {expected:?}"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
     }
 
     #[tokio::test]

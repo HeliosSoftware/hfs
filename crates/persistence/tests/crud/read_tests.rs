@@ -333,6 +333,50 @@ async fn test_read_batch_partial() {
     assert_eq!(results.len(), 2, "Should return only existing resources");
 }
 
+/// A soft-deleted (Gone) id in a batch is skipped, not fatal: its live
+/// siblings of the same type must still be returned (#1119).
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_read_batch_skips_soft_deleted() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+
+    let created1 = backend
+        .create(
+            &tenant,
+            "Patient",
+            create_patient_json("Live"),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let created2 = backend
+        .create(
+            &tenant,
+            "Patient",
+            create_patient_json("Doomed"),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    // Soft-delete the second so a bare read of it returns Gone.
+    backend
+        .delete(&tenant, "Patient", created2.id())
+        .await
+        .unwrap();
+
+    let ids = vec![created1.id(), created2.id()];
+    let results = backend.read_batch(&tenant, "Patient", &ids).await.unwrap();
+
+    assert_eq!(
+        results.len(),
+        1,
+        "the deleted id is skipped, the live sibling still returned"
+    );
+    assert_eq!(results[0].id(), created1.id());
+}
+
 /// Test read_batch with empty list.
 #[cfg(feature = "sqlite")]
 #[tokio::test]

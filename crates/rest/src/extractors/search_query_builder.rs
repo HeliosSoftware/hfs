@@ -4,7 +4,9 @@
 
 use std::collections::HashMap;
 
-use helios_persistence::search::{SearchParameterRegistry, resolve_param_type};
+use helios_persistence::search::{
+    SearchParameterRegistry, parse_typed_values, split_unescaped_commas, validate_modifier,
+};
 use helios_persistence::types::{
     CompositeSearchComponent, ContainedMode, ContainedReturn, IncludeDirective, IncludeType,
     ReverseChainedParameter, SearchModifier, SearchParamType, SearchParameter, SearchQuery,
@@ -13,43 +15,6 @@ use helios_persistence::types::{
 
 use super::SearchParams;
 use crate::error::RestError;
-
-/// Splits a FHIR search value into its comma-separated OR-alternatives,
-/// respecting backslash escaping.
-///
-/// Per the FHIR spec, the characters `, | $ \` are escaped with a leading
-/// backslash inside a value. Only the comma is the OR-list separator at this
-/// layer, so we split on *unescaped* commas and unescape `\,` and `\\` here.
-/// Other escapes (`\|`, `\$`) are left intact for the backend's token/composite
-/// parsing to interpret.
-fn split_unescaped_commas(value: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut chars = value.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => match chars.peek() {
-                Some(',') => {
-                    cur.push(',');
-                    chars.next();
-                }
-                Some('\\') => {
-                    cur.push('\\');
-                    chars.next();
-                }
-                // Preserve other escapes (e.g. `\|`, `\$`) for downstream parsing.
-                _ => cur.push('\\'),
-            },
-            ',' => {
-                out.push(cur.trim().to_string());
-                cur = String::new();
-            }
-            _ => cur.push(c),
-        }
-    }
-    out.push(cur.trim().to_string());
-    out
-}
 
 /// Builds a SearchQuery from REST parameters.
 ///
@@ -380,49 +345,22 @@ fn parse_search_parameter(
     value: &str,
     registry: &SearchParameterRegistry,
 ) -> Result<SearchParameter, RestError> {
-    // A dotted name is a chained parameter, and a colon inside it
-    // (`subject:Patient.name`) is the chain's type qualifier — modifier
-    // parsing must not eat it (it used to keep `subject` and drop the whole
-    // `.name` tail, turning the chain into a plain reference search).
-    let (param_name, modifier) = if name.contains('.') {
-        (name, None)
+    // A dotted name is a chained parameter (e.g. "patient.name" or
+    // "subject:Patient.name:exact"). A colon inside it is a hop's type
+    // qualifier, except on the last part, where it is the modifier of the
+    // chain's terminal parameter — `parse_parameter_name` cuts at the first
+    // colon and would misread either.
+    let (base_name, chain, modifier) = if name.contains('.') {
+        parse_chain(name)?
     } else {
-        parse_parameter_name(name)
+        let (base_name, modifier) = parse_parameter_name(name)?;
+        (base_name, vec![], modifier)
     };
-
-    // Check for chained parameters (e.g., "patient.name" or "subject:Patient.name")
-    let (base_name, chain) = parse_chain(param_name);
 
     // FHIR defines :missing as a single, case-sensitive boolean literal.
     // Validate it before splitting comma-separated OR values so malformed
     // inputs cannot silently become `missing=false` in a storage backend.
-    if matches!(modifier, Some(SearchModifier::Missing)) && !matches!(value, "true" | "false") {
-        return Err(RestError::InvalidParameter {
-            param: name.to_string(),
-            message: "the :missing modifier requires exactly 'true' or 'false'".to_string(),
-        });
-    }
-
-    // Full-text and other computed `_` parameters have no ordinary presence
-    // row in the search index. Treating them as index-backed would make
-    // `:missing=true` match every resource.
-    let registered = registry.get_param(resource_type, base_name).is_some()
-        || registry.get_param("Resource", base_name).is_some();
-    let has_presence_index = matches!(base_name, "_id" | "_lastUpdated")
-        || registered
-            && matches!(
-                base_name,
-                "_tag" | "_profile" | "_security" | "_source" | "_language"
-            );
-    if matches!(modifier, Some(SearchModifier::Missing))
-        && base_name.starts_with('_')
-        && !has_presence_index
-    {
-        return Err(RestError::InvalidParameter {
-            param: name.to_string(),
-            message: format!(":missing is not supported for parameter '{base_name}'"),
-        });
-    }
+    check_missing_literal(name, modifier.as_ref(), value)?;
 
     // Parse the value(s) - multiple values separated by comma are ORed.
     // Prefix extraction (gt/lt/ge/le/sa/eb/ap/eq/ne) is only meaningful for
@@ -433,49 +371,82 @@ fn parse_search_parameter(
     // value escaping. A literal comma in a value is written `\,` and must not
     // start a new OR-alternative.
     let raw_values: Vec<String> = split_unescaped_commas(value);
-    let tentative_values: Vec<SearchValue> =
-        raw_values.iter().map(|v| SearchValue::parse(v)).collect();
 
-    // Resolve the canonical type from the search parameter registry. This is
-    // deterministic for any registered parameter (which is everything in the
-    // FHIR spec); the value-shape heuristic is reached only for unregistered
-    // custom params. See `helios_persistence::search::resolve_param_type`.
-    let param_type = resolve_param_type(registry, resource_type, base_name, &tentative_values);
+    // Resolve the canonical type from the search parameter registry and parse
+    // the values for it. This is deterministic for any registered parameter
+    // (which is everything in the FHIR spec); the value-shape heuristic is
+    // reached only for unregistered custom params. The routine is shared with
+    // the chain resolver, which parses the terminal parameter of a chained or
+    // `_has` search the same way — for a chained parameter `base_name` is the
+    // reference hop, so its values stay raw here and are typed there. See
+    // `helios_persistence::search::parse_typed_values`.
+    let (param_type, values) = parse_typed_values(registry, resource_type, base_name, &raw_values);
 
     // FHIR-spec modifier validation: reject a modifier that is not defined for
-    // this parameter's type (e.g. `:exact` on a token, `:contains` on a date)
-    // with a 400, rather than silently ignoring it. Scoped to registry-known,
-    // non-special params:
-    //   * unregistered custom params get a value-shape heuristic type, so
-    //     gating them could falsely reject a legitimate custom modifier;
-    //   * the `special` full-text params (`_text`, `_content`, …) carry
-    //     server-specific modifier semantics outside the typed modifier table.
-    // `is_valid_for` reflects what this server honors; combinations that are
-    // spec-valid but not yet implemented are enabled as their phase lands.
-    if let Some(m) = &modifier {
-        let registered = registry.get_param(resource_type, base_name).is_some()
-            || registry.get_param("Resource", base_name).is_some();
-        if registered && param_type != SearchParamType::Special && !m.is_valid_for(param_type) {
+    // this parameter's type (e.g. `:exact` on a token, `:contains` on a date),
+    // or `:missing` on a parameter with no presence index, with a 400 rather
+    // than silently ignoring it — see `validate_modifier`. A chained
+    // parameter's modifier belongs to its terminal parameter, whose type is
+    // not known until the chain resolver has walked the hops; the resolver
+    // runs the same check there.
+    if let (Some(m), true) = (&modifier, chain.is_empty()) {
+        validate_modifier(registry, resource_type, base_name, param_type, m).map_err(
+            |message| RestError::InvalidParameter {
+                param: name.to_string(),
+                message,
+            },
+        )?;
+    }
+
+    // Reject a value that is not a number for a registry-known number or
+    // quantity parameter, rather than handing it to a storage backend (#1319):
+    // PostgreSQL and Elasticsearch used to skip a value whose number part does
+    // not parse, so `probability=abc` was an unconstrained search; SQLite
+    // matches nothing and MongoDB errors. For a quantity only the number part —
+    // everything before the first `|` — is checked; system and code are free
+    // text. Scoped like the modifier check above: an unregistered param only
+    // has a guessed type. Skipped for `:missing` (its value is a boolean), for
+    // chains (the value belongs to the chain's last link, whose type is not
+    // resolved here), and for an empty value, which is left to the backend.
+    //
+    // Date values get the same treatment from the gate every backend shares,
+    // `helios_persistence::search::validate_date_values`, in
+    // `build_search_query`.
+    let registered = registry.get_param(resource_type, base_name).is_some()
+        || registry.get_param("Resource", base_name).is_some();
+    if registered
+        && matches!(
+            param_type,
+            SearchParamType::Number | SearchParamType::Quantity
+        )
+        && chain.is_empty()
+        && !matches!(modifier, Some(SearchModifier::Missing))
+    {
+        let number_part = |v: &str| -> String {
+            match param_type {
+                SearchParamType::Quantity => v.split('|').next().unwrap_or_default().to_string(),
+                _ => v.to_string(),
+            }
+        };
+        if let Some(bad) = values
+            .iter()
+            .find(|v| !v.value.is_empty() && !is_number_search_value(&number_part(&v.value)))
+        {
             return Err(RestError::InvalidParameter {
                 param: name.to_string(),
                 message: format!(
-                    "search modifier ':{m}' is not supported for {param_type} parameter '{base_name}'"
+                    "'{}' is not a valid {param_type} value (expected [prefix]number{}, where \
+                     number is a decimal with an optional exponent)",
+                    bad.value,
+                    if param_type == SearchParamType::Quantity {
+                        "[|system|code]"
+                    } else {
+                        ""
+                    }
                 ),
             });
         }
     }
-
-    let values: Vec<SearchValue> = if matches!(
-        param_type,
-        SearchParamType::Date | SearchParamType::Number | SearchParamType::Quantity
-    ) {
-        tentative_values
-    } else {
-        raw_values
-            .iter()
-            .map(|v| SearchValue::eq(v.clone()))
-            .collect()
-    };
 
     let mut param = SearchParameter {
         name: base_name.to_string(),
@@ -510,114 +481,180 @@ fn parse_search_parameter(
     Ok(param)
 }
 
-/// Parses a parameter name into the base name and optional modifier.
+/// Whether `value` (comparator prefix already removed) is the number of a FHIR
+/// number or quantity search value: an optional sign, digits with an optional
+/// fraction, and an optional exponent.
+///
+/// Deliberately the widest reading, because a false rejection turns a working
+/// search into a 400: a leading `+`, leading zeros and a bare leading or
+/// trailing point (`.5`, `5.`) are tolerated. What it stops is what is not a
+/// number at all — `abc`, `1e` — and the words a float parser accepts for
+/// non-finite values (`inf`, `nan`), which as a comparison bound match every
+/// row. Mirrors the PostgreSQL builder's `parse_search_number`, which stays as
+/// defence in depth.
+fn is_number_search_value(value: &str) -> bool {
+    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    let unsigned = value.strip_prefix(['+', '-']).unwrap_or(value);
+    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, Some(exponent)),
+        None => (unsigned, None),
+    };
+    if let Some(exponent) = exponent {
+        let exponent = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+        if exponent.is_empty() || !digits(exponent) {
+            return false;
+        }
+    }
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if (whole.is_empty() && fraction.is_empty()) || !digits(whole) || !digits(fraction) {
+        return false;
+    }
+    // Rules out a literal that overflows to infinity (`1e999`).
+    value.parse::<f64>().is_ok_and(f64::is_finite)
+}
+
+/// Parses a direct (unchained) parameter name into the base name and optional
+/// modifier.
+///
+/// A `:suffix` that is neither a search modifier nor a resource-type qualifier
+/// is an error: dropping it would run a different search than the one asked
+/// for (`name:exat=Smith` would widen an exact match into a prefix match).
 ///
 /// Examples:
 /// - "name" -> ("name", None)
 /// - "name:exact" -> ("name", Some(Exact))
 /// - "subject:Patient" -> ("subject", Some(Type("Patient")))
-fn parse_parameter_name(name: &str) -> (&str, Option<SearchModifier>) {
-    if let Some(colon_pos) = name.find(':') {
-        let param_name = &name[..colon_pos];
-        let modifier_str = &name[colon_pos + 1..];
+/// - "name:bogus" -> error
+fn parse_parameter_name(name: &str) -> Result<(&str, Option<SearchModifier>), RestError> {
+    let (param_name, suffix) = split_qualifier(name);
+    let modifier = suffix
+        .map(|s| {
+            parse_modifier(s).ok_or_else(|| RestError::InvalidParameter {
+                param: name.to_string(),
+                message: format!(
+                    "unknown search modifier ':{s}' on parameter '{param_name}'; it is neither a \
+                     search modifier nor a resource type"
+                ),
+            })
+        })
+        .transpose()?;
+    Ok((param_name, modifier))
+}
 
-        // Check if there's a chain after the modifier
-        // e.g., "subject:Patient.name" -> modifier is "Patient", then chain follows
-        let modifier_str = if let Some(dot_pos) = modifier_str.find('.') {
-            &modifier_str[..dot_pos]
-        } else {
-            modifier_str
-        };
-
-        let modifier = SearchModifier::parse(modifier_str);
-        (param_name, modifier)
-    } else {
-        (name, None)
+/// Parses a `:suffix` as a search modifier, or as the `:[type]` qualifier of a
+/// reference parameter.
+///
+/// `SearchModifier::parse` reads any capitalised suffix as a type qualifier, so
+/// the name is checked against the resource types of the enabled FHIR versions
+/// here — `subject:Bogus` is no more a modifier than `subject:bogus`. Whether
+/// the modifier suits the parameter's *type* (a `:[type]` qualifier is only
+/// defined for references) is `validate_modifier`'s job.
+fn parse_modifier(suffix: &str) -> Option<SearchModifier> {
+    match SearchModifier::parse(suffix)? {
+        SearchModifier::Type(t) if !crate::fhir_types::is_valid_resource_type(&t) => None,
+        modifier => Some(modifier),
     }
 }
 
+/// A parsed chain: the base parameter, one hop per reference parameter, and the
+/// modifier written on the terminal parameter.
+type ParsedChain<'a> = (
+    &'a str,
+    Vec<helios_persistence::types::ChainedParameter>,
+    Option<SearchModifier>,
+);
+
 /// Parses chain elements from a parameter name.
 ///
+/// A chain `a:T0.b:T1.c` is one hop per reference parameter: hop 0 follows `a`
+/// (to a `T0`) and targets `b`; hop 1 follows `b` (to a `T1`) and targets `c`.
+/// A `:Type` qualifier constrains the reference parameter it is written on, so
+/// it belongs to the hop whose `reference_param` that is.
+///
+/// The last part, `c`, is the terminal search parameter, not a reference: a
+/// `:suffix` on it is a search *modifier* (`name:exact`), returned separately —
+/// it becomes the chained `SearchParameter`'s modifier, which the chain
+/// resolver applies to the terminal search. A suffix that is not a modifier is
+/// an error rather than something to drop silently.
+///
 /// Examples:
-/// - "name" -> ("name", [])
-/// - "patient.name" -> ("patient", [ChainedParameter{...}])
-/// - "subject:Patient.organization.name" -> ("subject", [ChainedParameter{target_type: Patient, ...}])
-fn parse_chain(name: &str) -> (&str, Vec<helios_persistence::types::ChainedParameter>) {
-    // Handle type-qualified chains like "subject:Patient.organization.name"
-    let (base_with_type, rest) = if let Some(dot_pos) = name.find('.') {
-        (&name[..dot_pos], Some(&name[dot_pos + 1..]))
-    } else {
-        (name, None)
-    };
-
-    // Extract type modifier from base if present
-    let (base_name, target_type) = if let Some(colon_pos) = base_with_type.find(':') {
-        let base = &base_with_type[..colon_pos];
-        let type_str = &base_with_type[colon_pos + 1..];
-        (base, Some(type_str.to_string()))
-    } else {
-        (base_with_type, None)
-    };
-
-    // No chain if no dot
-    let rest = match rest {
-        Some(r) => r,
-        None => return (base_name, vec![]),
-    };
+/// - "name" -> ("name", [], None)
+/// - "patient.name" -> ("patient", [{patient, None, name}], None)
+/// - "subject:Patient.organization:Organization.name:exact" ->
+///   ("subject", [{subject, Patient, organization}, {organization, Organization, name}], Exact)
+fn parse_chain(name: &str) -> Result<ParsedChain<'_>, RestError> {
+    let mut parts = name.split('.');
+    // `split` always yields at least one item.
+    let (base_name, mut qualifier) = split_qualifier(parts.next().unwrap_or(name));
+    let mut reference_param = base_name;
 
     let mut chain = Vec::new();
-    let parts: Vec<&str> = rest.split('.').collect();
-
-    // For simple chains like "patient.name", we need one ChainedParameter
-    // For complex chains like "subject.organization.name", we need multiple
-    if parts.len() == 1 {
-        // Simple chain: patient.name
+    let mut modifier = None;
+    let mut parts = parts.peekable();
+    while let Some(part) = parts.next() {
+        // Every part but the last is itself a reference parameter, whose
+        // qualifier belongs to the *next* hop.
+        let (target_param, suffix) = split_qualifier(part);
+        let next_qualifier = if parts.peek().is_some() {
+            suffix
+        } else {
+            modifier = suffix
+                .map(|s| parse_terminal_modifier(name, target_param, s))
+                .transpose()?;
+            None
+        };
         chain.push(helios_persistence::types::ChainedParameter {
-            reference_param: base_name.to_string(),
-            target_type,
-            target_param: parts[0].to_string(),
+            reference_param: reference_param.to_string(),
+            target_type: qualifier.map(str::to_string),
+            target_param: target_param.to_string(),
         });
-    } else {
-        // Complex chain: build step by step
-        // For subject.organization.name:
-        // 1. reference_param=subject, target_param=organization
-        // 2. reference_param=organization, target_param=name
-        for i in 0..parts.len() {
-            let ref_param = if i == 0 {
-                base_name.to_string()
-            } else {
-                // Get base part of previous (strip any type modifier)
-                let prev = parts[i - 1];
-                if let Some(colon_pos) = prev.find(':') {
-                    prev[..colon_pos].to_string()
-                } else {
-                    prev.to_string()
-                }
-            };
-
-            // Check if current part has type qualifier
-            let (current_param, part_type) = if let Some(colon_pos) = parts[i].find(':') {
-                (
-                    parts[i][..colon_pos].to_string(),
-                    Some(parts[i][colon_pos + 1..].to_string()),
-                )
-            } else {
-                (parts[i].to_string(), None)
-            };
-
-            chain.push(helios_persistence::types::ChainedParameter {
-                reference_param: ref_param,
-                target_type: if i == 0 {
-                    target_type.clone()
-                } else {
-                    part_type
-                },
-                target_param: current_param,
-            });
-        }
+        reference_param = target_param;
+        qualifier = next_qualifier;
     }
 
-    (base_name, chain)
+    Ok((base_name, chain, modifier))
+}
+
+/// Parses the `:suffix` written on the terminal parameter of a chain or `_has`.
+///
+/// Whether the modifier suits the terminal parameter's *type* is checked by the
+/// chain resolver, which is where that type becomes known.
+fn parse_terminal_modifier(
+    name: &str,
+    terminal_param: &str,
+    suffix: &str,
+) -> Result<SearchModifier, RestError> {
+    parse_modifier(suffix).ok_or_else(|| RestError::InvalidParameter {
+        param: name.to_string(),
+        message: format!(
+            "unknown search modifier ':{suffix}' on '{terminal_param}', the last parameter of \
+             the chain; only a search modifier may follow it (a ':Type' qualifier belongs on a \
+             reference parameter)"
+        ),
+    })
+}
+
+/// FHIR defines `:missing` as a single, case-sensitive boolean literal.
+fn check_missing_literal(
+    name: &str,
+    modifier: Option<&SearchModifier>,
+    value: &str,
+) -> Result<(), RestError> {
+    if matches!(modifier, Some(SearchModifier::Missing)) && !matches!(value, "true" | "false") {
+        return Err(RestError::InvalidParameter {
+            param: name.to_string(),
+            message: "the :missing modifier requires exactly 'true' or 'false'".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Splits `param:Qualifier` into the parameter and its optional qualifier.
+fn split_qualifier(part: &str) -> (&str, Option<&str>) {
+    match part.split_once(':') {
+        Some((param, qualifier)) => (param, Some(qualifier)),
+        None => (part, None),
+    }
 }
 
 /// Parses _has parameter (reverse chaining).
@@ -687,6 +724,21 @@ fn parse_has_parameter(
             )));
         }
     }
+
+    // `_has:Observation:subject:code:not=…` — what follows the terminal
+    // parameter is its search modifier. `ReverseChainedParameter` carries it
+    // inside `search_param`, as written (see `terminal_param`); the chain
+    // resolver applies it to the terminal search and checks it against the
+    // parameter's type. Here it only has to *be* a modifier. (In the
+    // `_has=Type:ref:param:value` form the fourth part is the value.)
+    let search_param = match parts.get(3) {
+        Some(suffix) if name != "_has" => {
+            let modifier = parse_terminal_modifier(name, &search_param, suffix)?;
+            check_missing_literal(name, Some(&modifier), value)?;
+            format!("{search_param}:{suffix}")
+        }
+        _ => search_param,
+    };
 
     Ok(Some(ReverseChainedParameter::terminal(
         source_type,
@@ -830,6 +882,18 @@ mod tests {
                 SearchParamType::Date,
                 "Observation",
             ),
+            (
+                "Observation-value-quantity",
+                "value-quantity",
+                SearchParamType::Quantity,
+                "Observation",
+            ),
+            (
+                "RiskAssessment-probability",
+                "probability",
+                SearchParamType::Number,
+                "RiskAssessment",
+            ),
         ];
         for (id, code, ty, base) in entries {
             r.register(
@@ -848,7 +912,7 @@ mod tests {
 
     #[test]
     fn test_parse_parameter_name_simple() {
-        let (name, modifier) = parse_parameter_name("name");
+        let (name, modifier) = parse_parameter_name("name").unwrap();
         assert_eq!(name, "name");
         assert!(modifier.is_none());
     }
@@ -883,21 +947,141 @@ mod tests {
 
     #[test]
     fn test_parse_parameter_name_with_modifier() {
-        let (name, modifier) = parse_parameter_name("name:exact");
+        let (name, modifier) = parse_parameter_name("name:exact").unwrap();
         assert_eq!(name, "name");
         assert_eq!(modifier, Some(SearchModifier::Exact));
     }
 
     #[test]
     fn test_parse_parameter_name_with_type_modifier() {
-        let (name, modifier) = parse_parameter_name("subject:Patient");
+        let (name, modifier) = parse_parameter_name("subject:Patient").unwrap();
         assert_eq!(name, "subject");
         assert_eq!(modifier, Some(SearchModifier::Type("Patient".to_string())));
     }
 
+    /// #1318: a suffix that is neither a modifier nor a resource type is a 400
+    /// naming the parameter and the suffix — not a search without the modifier.
+    #[test]
+    fn test_unknown_modifier_on_direct_parameter_is_rejected() {
+        let reg = test_registry();
+        for (resource_type, name, suffix) in [
+            ("Patient", "name:bogus", ":bogus"),
+            // A typo must not widen an exact match into a prefix match.
+            ("Patient", "name:exat", ":exat"),
+            ("Patient", "name:", ":"),
+            ("Patient", "name:exact:extra", ":exact:extra"),
+            // Capitalised, but not a resource type.
+            ("Observation", "subject:Bogus", ":Bogus"),
+            ("Observation", "subject:bogus", ":bogus"),
+            // Global parameters are direct parameters too.
+            ("Patient", "_id:bogus", ":bogus"),
+            // An unregistered parameter reaching the builder gets no pass: the
+            // suffix is not a modifier whatever the parameter turns out to be.
+            ("Patient", "custom:bogus", ":bogus"),
+        ] {
+            match parse_search_parameter(resource_type, name, "x", &reg) {
+                Err(RestError::InvalidParameter { param, message }) => {
+                    assert_eq!(param, name);
+                    assert!(message.contains(&format!("'{suffix}'")), "{message}");
+                    let base = name.split(':').next().unwrap();
+                    assert!(message.contains(&format!("'{base}'")), "{message}");
+                }
+                other => panic!("{name}: expected InvalidParameter, got {other:?}"),
+            }
+        }
+    }
+
+    /// #1318: the `:[type]` qualifier stays valid on a reference parameter, is
+    /// a wrong-type modifier anywhere else, and needs a real resource type.
+    #[test]
+    fn test_type_qualifier_needs_a_reference_parameter_and_a_resource_type() {
+        let reg = test_registry();
+        let p = parse_search_parameter("Observation", "subject:Patient", "123", &reg).unwrap();
+        assert_eq!(p.name, "subject");
+        assert_eq!(
+            p.modifier,
+            Some(SearchModifier::Type("Patient".to_string()))
+        );
+
+        assert!(matches!(
+            parse_search_parameter("Patient", "birthdate:Patient", "1980", &reg),
+            Err(RestError::InvalidParameter { .. })
+        ));
+        // Case-sensitive, like every resource type name.
+        assert!(parse_search_parameter("Observation", "subject:PATIENT", "123", &reg).is_err());
+        // The same rule holds on the terminal of a chain.
+        assert!(parse_chain("subject.general-practitioner:Bogus").is_err());
+        assert!(parse_chain("subject.general-practitioner:Practitioner").is_ok());
+    }
+
+    /// #1318: every modifier in `SearchModifier` is still accepted on a
+    /// parameter type it is defined for.
+    #[test]
+    fn test_every_known_modifier_is_still_accepted() {
+        let reg = test_registry();
+        for (resource_type, name, value, expected) in [
+            ("Patient", "name:exact", "x", SearchModifier::Exact),
+            ("Patient", "name:contains", "x", SearchModifier::Contains),
+            ("Patient", "name:text", "x", SearchModifier::Text),
+            ("Patient", "name:missing", "true", SearchModifier::Missing),
+            ("Observation", "code:not", "x", SearchModifier::Not),
+            ("Observation", "code:text", "x", SearchModifier::Text),
+            ("Observation", "code:above", "x", SearchModifier::Above),
+            ("Observation", "code:below", "x", SearchModifier::Below),
+            ("Observation", "code:in", "x", SearchModifier::In),
+            ("Observation", "code:not-in", "x", SearchModifier::NotIn),
+            (
+                "Observation",
+                "code:of-type",
+                "a|b|c",
+                SearchModifier::OfType,
+            ),
+            (
+                "Observation",
+                "code:ofType",
+                "a|b|c",
+                SearchModifier::OfType,
+            ),
+            (
+                "Observation",
+                "code:code-text",
+                "x",
+                SearchModifier::CodeText,
+            ),
+            (
+                "Observation",
+                "code:text-advanced",
+                "x",
+                SearchModifier::TextAdvanced,
+            ),
+            (
+                "Observation",
+                "subject:identifier",
+                "s|v",
+                SearchModifier::Identifier,
+            ),
+            (
+                "Observation",
+                "subject:Patient",
+                "1",
+                SearchModifier::Type("Patient".to_string()),
+            ),
+            (
+                "Observation",
+                "date:missing",
+                "false",
+                SearchModifier::Missing,
+            ),
+        ] {
+            let p = parse_search_parameter(resource_type, name, value, &reg)
+                .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            assert_eq!(p.modifier, Some(expected), "{name}");
+        }
+    }
+
     #[test]
     fn test_parse_chain_simple() {
-        let (name, chain) = parse_chain("patient.name");
+        let (name, chain, _) = parse_chain("patient.name").unwrap();
         assert_eq!(name, "patient");
         assert_eq!(chain.len(), 1);
         assert_eq!(chain[0].reference_param, "patient");
@@ -906,7 +1090,7 @@ mod tests {
 
     #[test]
     fn test_parse_chain_with_type() {
-        let (name, chain) = parse_chain("subject:Patient.name");
+        let (name, chain, _) = parse_chain("subject:Patient.name").unwrap();
         assert_eq!(name, "subject");
         assert_eq!(chain.len(), 1);
         assert_eq!(chain[0].reference_param, "subject");
@@ -916,13 +1100,240 @@ mod tests {
 
     #[test]
     fn test_parse_chain_multi_level() {
-        let (name, chain) = parse_chain("subject.organization.name");
+        let (name, chain, _) = parse_chain("subject.organization.name").unwrap();
         assert_eq!(name, "subject");
         assert_eq!(chain.len(), 2);
         assert_eq!(chain[0].reference_param, "subject");
         assert_eq!(chain[0].target_param, "organization");
         assert_eq!(chain[1].reference_param, "organization");
         assert_eq!(chain[1].target_param, "name");
+    }
+
+    /// One hop of an expected chain: (reference_param, target_type, target_param).
+    type Hop = (&'static str, Option<&'static str>, &'static str);
+
+    type OwnedHop = (String, Option<String>, String);
+
+    fn hops(chain: &[helios_persistence::types::ChainedParameter]) -> Vec<OwnedHop> {
+        chain
+            .iter()
+            .map(|c| {
+                (
+                    c.reference_param.clone(),
+                    c.target_type.clone(),
+                    c.target_param.clone(),
+                )
+            })
+            .collect()
+    }
+    fn owned(expected: &[Hop]) -> Vec<OwnedHop> {
+        expected
+            .iter()
+            .map(|(r, t, p)| (r.to_string(), t.map(str::to_string), p.to_string()))
+            .collect()
+    }
+
+    /// #1303: a `:Type` qualifier constrains the reference parameter it is
+    /// written on, at every position of the chain.
+    #[test]
+    fn test_parse_chain_type_qualifier_positions() {
+        let cases: &[(&str, &[Hop])] = &[
+            ("patient.name", &[("patient", None, "name")]),
+            (
+                "subject:Patient.name",
+                &[("subject", Some("Patient"), "name")],
+            ),
+            (
+                "subject.organization.name",
+                &[
+                    ("subject", None, "organization"),
+                    ("organization", None, "name"),
+                ],
+            ),
+            (
+                "subject:Patient.organization.name",
+                &[
+                    ("subject", Some("Patient"), "organization"),
+                    ("organization", None, "name"),
+                ],
+            ),
+            (
+                "subject.organization:Organization.name",
+                &[
+                    ("subject", None, "organization"),
+                    ("organization", Some("Organization"), "name"),
+                ],
+            ),
+            (
+                "subject:Patient.organization:Organization.name",
+                &[
+                    ("subject", Some("Patient"), "organization"),
+                    ("organization", Some("Organization"), "name"),
+                ],
+            ),
+            (
+                "encounter:Encounter.subject:Patient.general-practitioner:Practitioner.name",
+                &[
+                    ("encounter", Some("Encounter"), "subject"),
+                    ("subject", Some("Patient"), "general-practitioner"),
+                    ("general-practitioner", Some("Practitioner"), "name"),
+                ],
+            ),
+            (
+                "encounter.subject.general-practitioner:Organization.name",
+                &[
+                    ("encounter", None, "subject"),
+                    ("subject", None, "general-practitioner"),
+                    ("general-practitioner", Some("Organization"), "name"),
+                ],
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (name, expected) in cases {
+            let (base, chain, modifier) = parse_chain(name).unwrap();
+            if base != expected[0].0 || hops(&chain) != owned(expected) || modifier.is_some() {
+                failures.push(format!(
+                    "{name}\n   got      {:?} {modifier:?}\n   expected {:?} None",
+                    hops(&chain),
+                    owned(expected)
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    /// #1302: the `:suffix` of the last part is the terminal parameter's search
+    /// modifier — never a type qualifier, and never part of the param name.
+    #[test]
+    fn test_parse_chain_terminal_modifier() {
+        let cases: &[(&str, &[Hop], SearchModifier)] = &[
+            (
+                "subject:Patient.name:exact",
+                &[("subject", Some("Patient"), "name")],
+                SearchModifier::Exact,
+            ),
+            (
+                "subject.name:contains",
+                &[("subject", None, "name")],
+                SearchModifier::Contains,
+            ),
+            (
+                "subject:Patient.birthdate:missing",
+                &[("subject", Some("Patient"), "birthdate")],
+                SearchModifier::Missing,
+            ),
+            (
+                "subject:Patient.organization:Organization.name:exact",
+                &[
+                    ("subject", Some("Patient"), "organization"),
+                    ("organization", Some("Organization"), "name"),
+                ],
+                SearchModifier::Exact,
+            ),
+            (
+                "encounter.subject.general-practitioner:Organization.name:contains",
+                &[
+                    ("encounter", None, "subject"),
+                    ("subject", None, "general-practitioner"),
+                    ("general-practitioner", Some("Organization"), "name"),
+                ],
+                SearchModifier::Contains,
+            ),
+            // On a reference terminal, `:Type` *is* a modifier, as it is on a
+            // direct `subject:Patient=…`.
+            (
+                "encounter.subject:Patient",
+                &[("encounter", None, "subject")],
+                SearchModifier::Type("Patient".to_string()),
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (name, expected, expected_modifier) in cases {
+            let (base, chain, modifier) = parse_chain(name).unwrap();
+            if base != expected[0].0
+                || hops(&chain) != owned(expected)
+                || modifier.as_ref() != Some(expected_modifier)
+            {
+                failures.push(format!(
+                    "{name}\n   got      {:?} {modifier:?}\n   expected {:?} {expected_modifier:?}",
+                    hops(&chain),
+                    owned(expected)
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+
+        // The modifier ends up on the chained parameter itself, which is where
+        // the chain resolver reads it from.
+        let param = parse_search_parameter(
+            "Observation",
+            "subject:Patient.name:exact",
+            "Smith",
+            &test_registry(),
+        )
+        .unwrap();
+        assert_eq!(param.name, "subject");
+        assert_eq!(param.modifier, Some(SearchModifier::Exact));
+        assert_eq!(param.chain[0].target_param, "name");
+    }
+
+    /// #1302: a last-part suffix that is no modifier is a 400, not dropped.
+    #[test]
+    fn test_parse_chain_rejects_unknown_terminal_suffix() {
+        let reg = test_registry();
+        for name in [
+            "subject:Patient.name:bogus",
+            "subject.organization.name:exact:extra",
+        ] {
+            assert!(parse_chain(name).is_err(), "{name}");
+            assert!(
+                matches!(
+                    parse_search_parameter("Observation", name, "x", &reg),
+                    Err(RestError::InvalidParameter { .. })
+                ),
+                "{name}"
+            );
+        }
+        // :missing keeps its literal check on a chained terminal.
+        assert!(
+            parse_search_parameter("Observation", "subject.birthdate:missing", "yes", &reg)
+                .is_err()
+        );
+        assert!(
+            parse_search_parameter("Observation", "subject.birthdate:missing", "true", &reg)
+                .is_ok()
+        );
+    }
+
+    /// #1302: `_has:Type:ref:param:modifier` keeps the modifier, in
+    /// `search_param`, for the chain resolver to apply.
+    #[test]
+    fn test_parse_has_parameter_terminal_modifier() {
+        let chain = parse_has_parameter("_has:Observation:subject:code:not", "1234-5")
+            .unwrap()
+            .unwrap();
+        assert_eq!(chain.search_param, "code:not");
+        assert_eq!(chain.terminal_param(), ("code", Some("not")));
+
+        let plain = parse_has_parameter("_has:Observation:subject:code", "1234-5")
+            .unwrap()
+            .unwrap();
+        assert_eq!(plain.terminal_param(), ("code", None));
+
+        let nested = parse_has_parameter(
+            "_has:Encounter:subject:_has:Observation:encounter:code:not",
+            "1234-5",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            nested.nested.as_ref().unwrap().terminal_param(),
+            ("code", Some("not"))
+        );
+
+        assert!(parse_has_parameter("_has:Observation:subject:code:bogus", "1").is_err());
+        assert!(parse_has_parameter("_has:Observation:subject:code:missing", "yes").is_err());
+        assert!(parse_has_parameter("_has:Observation:subject:code:missing", "true").is_ok());
     }
 
     #[test]
@@ -1186,6 +1597,140 @@ mod tests {
         build_one("Patient", "custom-date", "not-a-date", &registry).unwrap();
         // Not a date parameter at all.
         build_one("Patient", "name", "2024-13-45", &registry).unwrap();
+    }
+
+    #[test]
+    fn test_number_search_value_grammar() {
+        for value in [
+            "0", "5", "5.4", "-5.4", "100.00", "1e3", "1E3", "1e+3", "1.5E-2", "-1.5e-2",
+            // Tolerated beyond the FHIR decimal grammar.
+            "+5.4", "007", ".5", "5.", "-.5",
+        ] {
+            assert!(is_number_search_value(value), "should accept {value:?}");
+        }
+        for value in [
+            "abc",
+            "",
+            " ",
+            " 5",
+            "5 ",
+            "1e",
+            "1e+",
+            "e5",
+            ".",
+            "-",
+            "--5",
+            "0.2abc",
+            "1.2.3",
+            "1e5.5",
+            "1_000",
+            "0x10",
+            "inf",
+            "+inf",
+            "-Infinity",
+            "NaN",
+            "nan",
+            "1e999",
+        ] {
+            assert!(!is_number_search_value(value), "should reject {value:?}");
+        }
+    }
+
+    #[test]
+    fn test_invalid_number_value_is_rejected() {
+        // #1319: these reached the storage backend, where PostgreSQL and
+        // Elasticsearch dropped the constraint.
+        let registry = test_registry();
+
+        for value in [
+            "abc", "gtabc", "neabc", "1e", "ltinf", "nenan",
+            // One bad alternative spoils the OR-list.
+            "0.5,nope",
+        ] {
+            let error = parse_search_parameter("RiskAssessment", "probability", value, &registry)
+                .unwrap_err();
+            assert!(
+                matches!(&error, RestError::InvalidParameter { param, .. } if param == "probability"),
+                "unexpected error for {value:?}: {error:?}"
+            );
+        }
+
+        for value in [
+            "abc",
+            "abc|http://unitsofmeasure.org|mg",
+            "gt|http://unitsofmeasure.org|mg",
+            "|http://unitsofmeasure.org|mg",
+            "||mg",
+            "ltinf||mg",
+            "5.4||mg,abc||mg",
+        ] {
+            let error = parse_search_parameter("Observation", "value-quantity", value, &registry)
+                .unwrap_err();
+            assert!(
+                matches!(&error, RestError::InvalidParameter { param, .. } if param == "value-quantity"),
+                "unexpected error for {value:?}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_valid_number_and_quantity_values_still_parse() {
+        let registry = test_registry();
+
+        for (value, prefix, bare) in [
+            ("0.5", SearchPrefix::Eq, "0.5"),
+            ("ge0.5", SearchPrefix::Ge, "0.5"),
+            ("lt1e3", SearchPrefix::Lt, "1e3"),
+            ("ne-1.5E-2", SearchPrefix::Ne, "-1.5E-2"),
+        ] {
+            let param =
+                parse_search_parameter("RiskAssessment", "probability", value, &registry).unwrap();
+            assert_eq!(param.values[0].prefix, prefix);
+            assert_eq!(param.values[0].value, bare);
+        }
+
+        for (value, prefix, bare) in [
+            ("5.4", SearchPrefix::Eq, "5.4"),
+            ("5.4|mg", SearchPrefix::Eq, "5.4|mg"),
+            ("5.4||mg", SearchPrefix::Eq, "5.4||mg"),
+            (
+                "gt5.4|http://unitsofmeasure.org|mg",
+                SearchPrefix::Gt,
+                "5.4|http://unitsofmeasure.org|mg",
+            ),
+            // System and code are free text, escaped pipe included.
+            (
+                "le1e3|http://x|a\\|b",
+                SearchPrefix::Le,
+                "1e3|http://x|a\\|b",
+            ),
+            (
+                "ap-5.4||not a number",
+                SearchPrefix::Ap,
+                "-5.4||not a number",
+            ),
+        ] {
+            let param =
+                parse_search_parameter("Observation", "value-quantity", value, &registry).unwrap();
+            assert_eq!(param.values[0].prefix, prefix);
+            assert_eq!(param.values[0].value, bare);
+        }
+    }
+
+    #[test]
+    fn test_number_validation_leaves_other_parameters_alone() {
+        let registry = test_registry();
+
+        // `:missing` carries a boolean, not a number.
+        parse_search_parameter("RiskAssessment", "probability:missing", "true", &registry).unwrap();
+        parse_search_parameter("Observation", "value-quantity:missing", "false", &registry)
+            .unwrap();
+        // An unregistered parameter only has a guessed type.
+        parse_search_parameter("RiskAssessment", "custom-number", "gtabc", &registry).unwrap();
+        // Not a number parameter at all.
+        parse_search_parameter("Patient", "name", "abc", &registry).unwrap();
+        // An empty value is left to the backend, as for dates.
+        parse_search_parameter("RiskAssessment", "probability", "", &registry).unwrap();
     }
 
     #[test]

@@ -55,6 +55,18 @@ fn not_implemented() -> RestError {
     }
 }
 
+/// The export flow is enabled by configuration but the active storage backend
+/// provides no export job store / output store (e.g. `s3`, `mongodb`). This is a
+/// backend capability gap, not the `HFS_BULK_EXPORT_ENABLED` flag, so it must not
+/// blame that flag the operator never touched (#1226). Uses the same wording as
+/// the `UnsupportedCapability` arm of `map_storage_err`, so kick-off and the
+/// worker's mid-run capability check speak with one voice.
+fn export_unsupported_by_backend() -> RestError {
+    RestError::NotImplemented {
+        feature: "bulk export not supported by this backend".to_string(),
+    }
+}
+
 fn bad_request(msg: impl Into<String>) -> RestError {
     RestError::BadRequest {
         message: msg.into(),
@@ -128,7 +140,9 @@ where
     if !cfg.enabled {
         return Err(not_implemented());
     }
-    let jobs = state.bulk_export_jobs().ok_or_else(not_implemented)?;
+    let jobs = state
+        .bulk_export_jobs()
+        .ok_or_else(export_unsupported_by_backend)?;
 
     if !has_respond_async(headers) {
         return Err(bad_request(
@@ -556,8 +570,12 @@ where
     if !cfg.enabled {
         return Err(not_implemented());
     }
-    let jobs = state.bulk_export_jobs().ok_or_else(not_implemented)?;
-    let output = state.bulk_export_output().ok_or_else(not_implemented)?;
+    let jobs = state
+        .bulk_export_jobs()
+        .ok_or_else(export_unsupported_by_backend)?;
+    let output = state
+        .bulk_export_output()
+        .ok_or_else(export_unsupported_by_backend)?;
     let principal = request.extensions().get::<Principal>().cloned();
     let job_id = ExportJobId::from_string(job_id);
 
@@ -717,8 +735,12 @@ where
     if !cfg.enabled {
         return Err(not_implemented());
     }
-    let jobs = state.bulk_export_jobs().ok_or_else(not_implemented)?;
-    let output = state.bulk_export_output().ok_or_else(not_implemented)?;
+    let jobs = state
+        .bulk_export_jobs()
+        .ok_or_else(export_unsupported_by_backend)?;
+    let output = state
+        .bulk_export_output()
+        .ok_or_else(export_unsupported_by_backend)?;
     let principal = request.extensions().get::<Principal>().cloned();
     let job_id = ExportJobId::from_string(job_id);
 
@@ -787,9 +809,15 @@ where
     if !cfg.enabled {
         return Err(not_implemented());
     }
-    let jobs = state.bulk_export_jobs().ok_or_else(not_implemented)?;
-    let output = state.bulk_export_output().ok_or_else(not_implemented)?;
-    let file_auth = state.bulk_export_file_auth().ok_or_else(not_implemented)?;
+    let jobs = state
+        .bulk_export_jobs()
+        .ok_or_else(export_unsupported_by_backend)?;
+    let output = state
+        .bulk_export_output()
+        .ok_or_else(export_unsupported_by_backend)?;
+    let file_auth = state
+        .bulk_export_file_auth()
+        .ok_or_else(export_unsupported_by_backend)?;
     let principal = request.extensions().get::<Principal>().cloned();
     let job_id = ExportJobId::from_string(job_id);
 
@@ -1057,5 +1085,32 @@ mod tests {
             "the export-specific wording must survive: {unsupported:?}"
         );
         assert_eq!(unsupported.client_response().0, StatusCode::NOT_IMPLEMENTED);
+    }
+
+    /// The two 501s the export routes raise must be told apart: a backend with no
+    /// job/output store (s3, mongodb) must not blame `HFS_BULK_EXPORT_ENABLED`,
+    /// which the operator never set (#1226). Both stay 501; only the text differs,
+    /// and the backend case reuses the `map_storage_err` wording.
+    #[test]
+    fn disabled_by_env_and_unsupported_backend_are_distinct_messages() {
+        let (env_status, _, env_text) = not_implemented().client_response();
+        assert_eq!(env_status, StatusCode::NOT_IMPLEMENTED);
+        assert!(
+            env_text.contains("HFS_BULK_EXPORT_ENABLED=false"),
+            "the env-disabled 501 must still name the flag: {env_text}"
+        );
+
+        let (backend_status, backend_code, backend_text) =
+            export_unsupported_by_backend().client_response();
+        assert_eq!(backend_status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(backend_code, "not-supported");
+        assert!(
+            backend_text.contains("not supported by this backend"),
+            "the backend-gap 501 must say it is a backend limitation: {backend_text}"
+        );
+        assert!(
+            !backend_text.contains("HFS_BULK_EXPORT_ENABLED"),
+            "the backend-gap 501 must not blame the env flag: {backend_text}"
+        );
     }
 }

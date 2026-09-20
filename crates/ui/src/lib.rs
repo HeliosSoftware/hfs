@@ -1744,6 +1744,10 @@ pub fn mount_with_conformance_source_and_runtime(
             get(bulk_import::empty_manifest),
         )
         .route("/ui/bulk-import/keys", get(bulk_import::keys))
+        .route(
+            "/ui/bulk-import/rebuild",
+            get(bulk_import::rebuild_fragment),
+        )
         .route("/ui/bulk-import/{id}", get(bulk_import::detail))
         .route(
             "/ui/bulk-import/{id}/status",
