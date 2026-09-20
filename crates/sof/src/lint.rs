@@ -311,11 +311,10 @@ impl Node {
                     required: true,
                     kind: Kind::String,
                 },
-                // Not on the generated struct: the versioned canonical of the
-                // defining StructureDefinition, which FHIR R6 tooling puts on
-                // every instance of an additional resource — ViewDefinition
-                // became one in SQL on FHIR 3.0.0, and the specification's
-                // own examples carry it.
+                // The versioned canonical of the defining StructureDefinition,
+                // which FHIR R6 tooling puts on every instance of an additional
+                // resource — ViewDefinition became one in SQL on FHIR 3.0.0,
+                // and the specification's own examples carry it.
                 Field {
                     key: "resourceDefinition",
                     required: false,

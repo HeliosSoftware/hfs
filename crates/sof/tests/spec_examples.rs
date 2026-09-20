@@ -33,7 +33,16 @@ fn run_example(name: &str) -> Value {
     );
 
     let view: helios_fhir::r4::ViewDefinition =
-        serde_json::from_value(view_json).expect("Failed to create ViewDefinition");
+        serde_json::from_value(view_json.clone()).expect("Failed to create ViewDefinition");
+    // The typed model must not lose anything the example says — in particular
+    // `resourceDefinition`, which is not part of the ViewDefinition snapshot.
+    let resource: helios_fhir::r4::Resource =
+        serde_json::from_value(view_json.clone()).expect("Failed to create Resource");
+    assert_eq!(
+        serde_json::to_value(&resource).expect("Failed to serialize Resource"),
+        view_json,
+        "{name} does not survive a typed round trip"
+    );
     let bundle: helios_fhir::r4::Bundle =
         serde_json::from_value(read_json("test-bundle.json")).expect("Failed to create bundle");
 

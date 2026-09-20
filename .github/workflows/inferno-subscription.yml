@@ -396,12 +396,14 @@ jobs:
             HFS_MONGODB_DATABASE="helios_inferno_subscriptions_${{ github.run_id }}_${{ github.run_attempt }}_${{ matrix.backend }}" \
             ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "mongodb-elasticsearch" ]; then
+            # MongoDB caps database names at 63 characters; the full backend
+            # name pushes this one to 64, so the composite leg abbreviates it.
             HFS_SUBSCRIPTIONS_ENABLED=true \
             HFS_BASE_URL="$HFS_BASE_URL" \
             HFS_DEFAULT_FHIR_VERSION=R4 \
             HFS_STORAGE_BACKEND=mongodb-elasticsearch \
             HFS_DATABASE_URL="mongodb://$DOCKER_HOST_IP:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
-            HFS_MONGODB_DATABASE="helios_inferno_subscriptions_${{ github.run_id }}_${{ github.run_attempt }}_${{ matrix.backend }}" \
+            HFS_MONGODB_DATABASE="helios_inferno_subscriptions_${{ github.run_id }}_${{ github.run_attempt }}_mongodb_es" \
             HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
             ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "s3-elasticsearch" ]; then
