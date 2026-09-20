@@ -551,6 +551,23 @@ jobs:
         run: |
           cargo clippy --all-targets --all-features -- -D warnings -A clippy::items_after_test_module -A clippy::large_enum_variant -A clippy::question_mark -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::field_reassign_with_default -A clippy::doc-overindented-list-items -A clippy::doc-lazy-continuation
 
+      # The clippy run above uses `--all-features`, and every workflow that
+      # builds `hfs` on a PR enables most backends at once, so an item gated on
+      # one backend but used by another compiles everywhere CI looks and breaks
+      # only the narrower builds people actually deploy (#1291: a `mongodb`-gated
+      # helper called from the Postgres and S3 startup paths). Check `hfs` once
+      # per backend on its own, with warnings denied so a helper left unused by
+      # a subset fails here too. `--no-default-features` is required: the
+      # default set enables `sqlite`.
+      - name: Check hfs builds with single-backend feature sets (#1291)
+        shell: bash
+        run: |
+          for features in R4,sqlite,postgres R4,postgres R4,mongodb R4,s3 R4,s3,elasticsearch; do
+            echo "::group::helios-hfs --no-default-features --features $features"
+            cargo clippy -p helios-hfs --no-default-features --features "$features" -- -D warnings -A clippy::items_after_test_module -A clippy::large_enum_variant -A clippy::question_mark -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::field_reassign_with_default -A clippy::doc-overindented-list-items -A clippy::doc-lazy-continuation
+            echo "::endgroup::"
+          done
+
       # Git for Windows defaults to `core.symlinks=false` and checks a symlink
       # out as a text file holding the link target, which broke the Windows
       # release build (#1257). No Windows job builds the UI crates before
@@ -2078,6 +2095,10 @@ jobs:
           # subsumes and the :in/:not-in search modifiers all fail outright.
           # HTS serves operations at the root of its base URL: no /r4 or /r5 segment.
           TERMINOLOGY_SERVER_URL: https://hts.heliossoftware.com
+          # LLM provider key for hfs natural-language search. Only the hfs leg receives
+          # it. It is never written into the unit file (world-readable, and echoed by
+          # `systemctl show`); see the EnvironmentFile step below.
+          HFS_NL_SEARCH_API_KEY: ${{ matrix.server == 'hfs' && secrets.HFS_NL_SEARCH_API_KEY || '' }}
         run: |
           # Define SSH command with proper options (runner's own key is trusted by targets)
           SSH_CMD="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $DEPLOY_PORT $DEPLOY_USER@$DEPLOY_HOST"
@@ -2151,7 +2172,18 @@ jobs:
           elif [ "$SERVER_NAME" = "hfs" ]; then
             SERVICE_DESCRIPTION="Helios FHIR Server"
             SERVICE_EXEC_START="/opt/$SERVER_NAME/$SERVER_NAME --host 0.0.0.0"
-            SERVICE_ENV="Environment=\"HFS_SERVER_HOST=0.0.0.0\"\nEnvironment=\"HFS_BASE_URL=${HFS_PUBLIC_URL}\"\nEnvironment=\"HFS_TERMINOLOGY_SERVER=${TERMINOLOGY_SERVER_URL}\""
+            # HFS_SUBSCRIPTIONS_ENABLED is off by default; the release binary is built
+            # with --all-features, so the `subscriptions` feature is already compiled in.
+            SERVICE_ENV="Environment=\"HFS_SERVER_HOST=0.0.0.0\"\nEnvironment=\"HFS_BASE_URL=${HFS_PUBLIC_URL}\"\nEnvironment=\"HFS_TERMINOLOGY_SERVER=${TERMINOLOGY_SERVER_URL}\"\nEnvironment=\"HFS_SUBSCRIPTIONS_ENABLED=true\"\nEnvironment=\"HFS_NL_SEARCH_MODEL=claude-opus-4-8\"\nEnvironmentFile=-/etc/hfs/hfs.env"
+
+            # Secrets live in a root-only EnvironmentFile, fed over stdin so the key
+            # never appears in a command line, the unit file, or the repo. With the
+            # secret unset the file is left alone, so a hand-managed key on the server
+            # survives deploys; the leading "-" above makes a missing file non-fatal.
+            if [ -n "$HFS_NL_SEARCH_API_KEY" ]; then
+              printf 'HFS_NL_SEARCH_API_KEY=%s\n' "$HFS_NL_SEARCH_API_KEY" | \
+                $SSH_CMD "sudo sh -c 'umask 077; mkdir -p /etc/hfs; cat > /etc/hfs/hfs.env'"
+            fi
           elif [ "$SERVER_NAME" = "hts" ]; then
             SERVICE_DESCRIPTION="Helios Terminology Server"
             # hts uses a subcommand CLI: host/port/db flags live under `run`

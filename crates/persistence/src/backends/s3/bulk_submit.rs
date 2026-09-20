@@ -328,19 +328,12 @@ impl BulkSubmitProvider for S3Backend {
             }
         }
 
-        let mut manifest_state = self
-            .load_manifest_state_optional(&location, submission_id, manifest_id)
-            .await?
-            .ok_or_else(|| {
-                StorageError::BulkSubmit(BulkSubmitError::ManifestNotFound {
-                    submission_id: submission_id.submission_id.clone(),
-                    manifest_id: manifest_id.to_string(),
-                })
-            })?;
-
-        manifest_state.manifest.status = ManifestStatus::Processing;
-        self.save_manifest_state(&location, submission_id, &manifest_state)
-            .await?;
+        // Both manifest writes in this function go through compare-and-swap
+        // and touch only what a batch owns — never the lease fields (#1229).
+        self.mutate_manifest_state(&location, submission_id, manifest_id, |state| {
+            state.manifest.status = ManifestStatus::Processing;
+        })
+        .await?;
 
         let mut results = Vec::new();
         let mut error_count = 0u32;
@@ -425,24 +418,40 @@ impl BulkSubmitProvider for S3Backend {
         // semantics (#969). `processed_entries` means resources written to the
         // store, so skips are excluded and surface through their receipts
         // (#954); `last_processed_line` is a line cursor and counts them.
-        manifest_state.manifest.total_entries += results.len() as u64;
-        manifest_state.manifest.processed_entries += success_count;
-        manifest_state.manifest.failed_entries += failed_count;
-        manifest_state.last_processed_line += results.len() as u64;
-        // A leased manifest's terminal status belongs to the worker, which calls
-        // this once per manifest output file and only then decides. Settling it
-        // here would take the manifest out of `processing` mid-run, so a worker
-        // that died on the next file would never be reclaimed.
-        if manifest_state.worker_id.is_none() {
-            manifest_state.manifest.status = if failed_count > 0 {
-                ManifestStatus::Failed
-            } else {
-                ManifestStatus::Completed
-            };
-        }
-
-        self.save_manifest_state(&location, submission_id, &manifest_state)
-            .await?;
+        //
+        // Applied as deltas onto the state as it is stored *now*, not onto a
+        // copy read before the batch. The lease keeper renews `lease_expiry`
+        // on this same object while batches run, and writing the pre-batch
+        // copy back undid it: the batch in flight when a renewal landed wrote
+        // the pre-renewal expiry back a moment later, the next batch read
+        // that, and so the stored expiry never moved past the one the claim
+        // had set. During a long file — batches back to back, no gap for a
+        // renewal to survive in — the other worker therefore reclaimed the
+        // manifest exactly one lease duration after every claim, from a holder
+        // that was alive and heartbeating (#1229: 96 reclaims in 90 minutes,
+        // each one abandoning the download in progress). The same write also
+        // put a fenced-out holder's `worker_id` and `fencing_token` back over
+        // the new holder's.
+        let walked_entries = results.len() as u64;
+        self.mutate_manifest_state(&location, submission_id, manifest_id, |state| {
+            state.manifest.total_entries += walked_entries;
+            state.manifest.processed_entries += success_count;
+            state.manifest.failed_entries += failed_count;
+            state.last_processed_line += walked_entries;
+            // A leased manifest's terminal status belongs to the worker, which
+            // calls this once per manifest output file and only then decides.
+            // Settling it here would take the manifest out of `processing`
+            // mid-run, so a worker that died on the next file would never be
+            // reclaimed.
+            if state.worker_id.is_none() {
+                state.manifest.status = if failed_count > 0 {
+                    ManifestStatus::Failed
+                } else {
+                    ManifestStatus::Completed
+                };
+            }
+        })
+        .await?;
 
         submission.summary.total_entries += results.len() as u64;
         submission.summary.success_count += success_count;
@@ -1127,6 +1136,52 @@ impl S3Backend {
             .get_json_object::<SubmissionManifestState>(&location.bucket, &key)
             .await?
             .map(|(state, _)| state))
+    }
+
+    /// Applies `mutate` to a manifest state under compare-and-swap, re-reading
+    /// and re-applying it when another writer got in between.
+    ///
+    /// A manifest state carries its lease (`worker_id`, `lease_expiry`,
+    /// `fencing_token`) alongside its counters, and the lease keeper and the
+    /// claim path compare-and-swap that same object. A writer that is not
+    /// holding the lease handle — `process_entries` — must therefore never
+    /// write back a copy it read earlier: it goes through here, and `mutate`
+    /// states its change relative to whatever is stored (#1229).
+    async fn mutate_manifest_state<F>(
+        &self,
+        location: &TenantLocation,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        mutate: F,
+    ) -> StorageResult<()>
+    where
+        F: Fn(&mut SubmissionManifestState),
+    {
+        for _ in 0..super::submit_worker::CAS_ATTEMPTS {
+            let Some((mut state, etag)) = self
+                .load_manifest_for_cas(location, submission_id, manifest_id)
+                .await?
+            else {
+                return Err(StorageError::BulkSubmit(
+                    BulkSubmitError::ManifestNotFound {
+                        submission_id: submission_id.submission_id.clone(),
+                        manifest_id: manifest_id.to_string(),
+                    },
+                ));
+            };
+            mutate(&mut state);
+            if self
+                .save_manifest_if_unchanged(location, submission_id, &state, etag.as_deref())
+                .await?
+            {
+                return Ok(());
+            }
+        }
+        Err(super::submit_worker::internal_error(format!(
+            "manifest {manifest_id} of submission {submission_id} could not be updated after \
+             {} compare-and-swap attempts",
+            super::submit_worker::CAS_ATTEMPTS
+        )))
     }
 
     /// Serialises and writes a manifest state to S3.

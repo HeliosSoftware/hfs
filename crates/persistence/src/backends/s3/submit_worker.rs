@@ -84,9 +84,9 @@ const REGISTRY_NAMESPACE: &str = "submissions";
 const CLAIM_CANDIDATES: usize = 16;
 
 /// Attempts at a compare-and-swap that lost its race. Counts total attempts.
-const CAS_ATTEMPTS: usize = 5;
+pub(super) const CAS_ATTEMPTS: usize = 5;
 
-fn internal_error(message: impl Into<String>) -> StorageError {
+pub(super) fn internal_error(message: impl Into<String>) -> StorageError {
     StorageError::Backend(BackendError::Internal {
         backend_name: "s3".to_string(),
         message: message.into(),
@@ -322,7 +322,7 @@ impl S3Backend {
     /// One `GetObject` returns body and ETag from the same snapshot; a
     /// `HeadObject` + `GetObject` pair could straddle a concurrent write and
     /// pair one generation's state with another's ETag.
-    async fn load_manifest_for_cas(
+    pub(super) async fn load_manifest_for_cas(
         &self,
         location: &TenantLocation,
         id: &SubmissionId,
@@ -340,7 +340,7 @@ impl S3Backend {
 
     /// Writes a manifest state back only if it has not changed since it was
     /// read. `Ok(false)` means the compare-and-swap lost.
-    async fn save_manifest_if_unchanged(
+    pub(super) async fn save_manifest_if_unchanged(
         &self,
         location: &TenantLocation,
         id: &SubmissionId,
@@ -591,6 +591,8 @@ impl SubmitClaimStrategy for S3Backend {
             }
 
             let new_token = state.fencing_token + 1;
+            let previous_holder = state.worker_id.take();
+            let previous_expiry = state.lease_expiry;
             state.manifest.status = ManifestStatus::Processing;
             state.worker_id = Some(worker_id.as_str().to_string());
             state.lease_expiry = Some(lease_expiry);
@@ -605,6 +607,22 @@ impl SubmitClaimStrategy for S3Backend {
             {
                 continue;
             }
+
+            // A reclaim — a previous holder whose stored expiry had passed —
+            // is the event worth seeing in a log: it re-walks the manifest
+            // from its first file (#1127), and a holder that was alive and
+            // renewing means the stored expiry was wrong (#1229).
+            tracing::debug!(
+                submission = %id,
+                manifest = %manifest_id,
+                worker = %worker_id,
+                fencing_token = new_token,
+                previous_holder = ?previous_holder,
+                previous_expiry = ?previous_expiry,
+                held_until = %lease_expiry,
+                now = %now,
+                "bulk-submit lease acquired"
+            );
 
             return Ok(Some(ManifestLease {
                 tenant,

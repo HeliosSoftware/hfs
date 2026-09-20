@@ -343,11 +343,18 @@ const HANDLER_AUTHORIZED_OPS: [&str; 3] = ["$purge", "$reindex", "$reindex-statu
 /// equivalents) return data and must be authorized as `FhirOperation::Read`,
 /// never as the method-based fallthrough (`POST` → `Create`) would produce.
 ///
-/// This MUST stay a narrow, explicit allowlist — do not add `$export` or any
-/// other operation without confirming it is read-only and does not need its
-/// own scope (e.g. a destructive or write-shaped `$`-operation belongs in
-/// `HANDLER_AUTHORIZED_OPS` instead, with its own handler-level check).
-const READ_SHAPED_OPERATIONS: &[&str] = &["$everything"];
+/// This MUST stay a narrow, explicit allowlist — add an operation only after
+/// confirming it is read-only and needs no scope of its own. A destructive or
+/// write-shaped `$`-operation (e.g. `$bulk-submit`, a genuine write) belongs in
+/// `HANDLER_AUTHORIZED_OPS` instead, with its own handler-level check.
+///
+/// `$export` (Bulk Data) is read-shaped: type-level `/{type}/$export` and
+/// Group-instance `/Group/{id}/$export` return the exported data and are
+/// authorized as a Read of the first-segment type, exactly as their `GET`
+/// forms already are, so kicking one off with `POST` needs the same read scope,
+/// not a write one (#1123). System-level `/$export` is `$`-first and so is
+/// already method-agnostic (handled by the system-path guard below).
+const READ_SHAPED_OPERATIONS: &[&str] = &["$everything", "$export"];
 
 /// Extract the FHIR resource type and operation from a request path and method.
 ///
@@ -607,6 +614,33 @@ mod tests {
             let (rt, op) = extract_operation("/Patient/123/$everything", method).unwrap();
             assert_eq!(rt, "Patient", "method={method}");
             assert_eq!(op, FhirOperation::Read, "method={method}");
+        }
+    }
+
+    #[test]
+    fn test_extract_operation_export_is_read_for_get_and_post() {
+        // $export is read-shaped: GET and POST must both authorize as a Read of
+        // the first-segment type, at type and Group-instance level (#1123).
+        for method in ["GET", "POST"] {
+            let (rt, op) = extract_operation("/Patient/$export", method).unwrap();
+            assert_eq!(rt, "Patient", "type-level method={method}");
+            assert_eq!(op, FhirOperation::Read, "type-level method={method}");
+
+            let (rt, op) = extract_operation("/Group/g1/$export", method).unwrap();
+            assert_eq!(rt, "Group", "group-instance method={method}");
+            assert_eq!(op, FhirOperation::Read, "group-instance method={method}");
+        }
+    }
+
+    #[test]
+    fn test_extract_operation_system_export_is_deferred_for_both_methods() {
+        // System-level `/$export` is `$`-first, so it returns None (no per-type
+        // check) for GET and POST alike — already method-agnostic.
+        for method in ["GET", "POST"] {
+            assert!(
+                extract_operation("/$export", method).is_none(),
+                "method={method}"
+            );
         }
     }
 

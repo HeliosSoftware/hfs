@@ -18,6 +18,25 @@ use helios_persistence::core::{
 use helios_persistence::error::{ResourceError, StorageError};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 
+/// The backend-agnostic conditional-criteria suite (#1312). `#[path]` resolves
+/// relative to this file, the same arrangement the other backends' binaries
+/// use for their shared suites.
+#[path = "search/conditional_criteria_suite.rs"]
+mod conditional_criteria_suite;
+
+/// #1312: criteria whose values begin with comparator letters (`family=Neal`,
+/// `identifier=ne123`) name the right resource, and never an unrelated one.
+#[tokio::test]
+async fn sqlite_conditional_criteria_with_prefix_like_values() {
+    let backend = create_backend();
+    conditional_criteria_suite::prefix_like_criteria_name_the_right_resource(
+        &backend,
+        "cond-criteria-1312",
+        true,
+    )
+    .await;
+}
+
 fn create_backend() -> SqliteBackend {
     // Configure with data directory to load spec SearchParameters
     // CARGO_MANIFEST_DIR for tests is crates/persistence
