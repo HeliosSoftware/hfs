@@ -3317,6 +3317,58 @@ mod chaining {
         );
     }
 
+    /// #1339: a terminology-backed modifier the parameter's type does not
+    /// define is a client error, whether or not a terminology server is
+    /// configured: the `400` a direct or chained `birthdate:exact` gets, not the
+    /// `501` reserved for a *valid* modifier this server cannot answer.
+    #[tokio::test]
+    async fn test_terminology_modifier_on_wrong_parameter_type_is_400_not_501() {
+        let (server, backend) = create_test_server().await;
+        seed_chain_name_data(&backend).await;
+
+        // Positive controls: the parameters and chains themselves resolve.
+        assert_eq!(ids(&server, "/Patient?name=Smith").await, ["pl", "ps"]);
+        assert_eq!(ids(&server, "/Patient?birthdate=1980-01-01").await, ["ps"]);
+        assert_eq!(ids(&server, "/Encounter?subject.name=Smith").await.len(), 2);
+
+        for url in [
+            // Direct.
+            "/Patient?name:in=http://example.org/vs",
+            "/Patient?name:not-in=http://example.org/vs",
+            "/Patient?name:below=Smith",
+            "/Patient?birthdate:below=1980-01-01",
+            "/Patient?birthdate:above=1980-01-01",
+            "/Patient?birthdate:in=http://example.org/vs",
+            // `:in` is token-only: not defined for a reference or a uri either.
+            "/Observation?subject:in=http://example.org/vs",
+            "/Patient?_profile:in=http://example.org/vs",
+            // Forward chains, untyped, typed and multi-hop.
+            "/Encounter?subject.name:in=http://example.org/vs",
+            "/Encounter?subject:Patient.name:in=http://example.org/vs",
+            "/Encounter?subject:Patient.birthdate:below=1980-01-01",
+            "/Observation?encounter.subject:Patient.name:above=Smith",
+            // `_has`, plain and nested.
+            "/Patient?_has:Observation:subject:date:in=http://example.org/vs",
+            "/Patient?_has:Observation:subject:date:below=2020-01-01",
+            "/Patient?_has:Encounter:subject:_has:Observation:encounter:date:in=http://example.org/vs",
+        ] {
+            let (status, text) = outcome(&server, url).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{url}: {text}");
+            assert!(text.contains("is not supported for"), "{url}: {text}");
+        }
+
+        // A valid terminology modifier is still the `501`.
+        for url in [
+            "/Patient?gender:in=http://example.org/vs",
+            "/Patient?gender:below=http://hl7.org/fhir/administrative-gender|male",
+            "/Encounter?subject.gender:in=http://example.org/vs",
+            "/Patient?_has:Observation:subject:code:below=http://loinc.org|1234-5",
+        ] {
+            let (status, text) = outcome(&server, url).await;
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{url}: {text}");
+        }
+    }
+
     #[tokio::test]
     async fn test_multiple_chain_levels() {
         let (server, backend) = create_test_server().await;

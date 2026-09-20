@@ -526,15 +526,16 @@ fn parse_terminal_values(
 }
 
 /// Rejects a modifier the terminal parameter cannot take, with the same checks
-/// — and the same wording — a direct search on it gets:
+/// — in the same order, and with the same wording — a direct search on it gets:
 ///
-/// * one that needs a terminology server the caller does not have
-///   ([`param_requires_terminology`]), which the REST layer maps to a `501`.
-///   Checked first, as the REST handler's guard on a direct parameter is;
 /// * one the parameter's type does not define ([`validate_modifier`]), which
-///   the REST layer maps to a `400`.
+///   the REST layer maps to a `400`. Checked first, as the REST handler does
+///   for a direct parameter: `name:in` is a client error whether or not there
+///   is a terminology server to ask (#1339);
+/// * one that is valid but needs a terminology server the caller does not have
+///   ([`param_requires_terminology`]), which the REST layer maps to a `501`.
 ///
-/// `display` names the parameter as the client wrote it, for the first error.
+/// `display` names the parameter as the client wrote it, for the second error.
 fn check_terminal_modifier(
     registry: &SearchParameterRegistry,
     resource_type: &str,
@@ -547,6 +548,7 @@ fn check_terminal_modifier(
     let Some(m) = modifier else {
         return Ok(());
     };
+    validate_modifier(registry, resource_type, param_name, param_type, m).map_err(query_error)?;
     if !options.terminology_available
         && param_requires_terminology(registry, resource_type, param_name, m)
     {
@@ -555,7 +557,7 @@ fn check_terminal_modifier(
             param: display(),
         }));
     }
-    validate_modifier(registry, resource_type, param_name, param_type, m).map_err(query_error)
+    Ok(())
 }
 
 /// A forward chain as the client wrote it, less the terminal modifier:
@@ -1383,6 +1385,38 @@ mod tests {
             &["Practitioner/x"],
         );
         assert!(resolve_chains(&b, &t, &q).await.is_ok());
+
+        // #1339: a terminology modifier the terminal's type does not define is
+        // a parse error (`400`), not a missing terminology server (`501`) —
+        // with or without one.
+        for options in [false, true].map(|terminology_available| ChainResolveOptions {
+            terminology_available,
+        }) {
+            for q in [
+                // Procedure?subject:Patient.birthdate:in=… / .family:below=…
+                forward_modified(
+                    "Procedure",
+                    &[("subject", "Patient", "birthdate")],
+                    SearchModifier::In,
+                    &["http://example.org/vs"],
+                ),
+                forward_modified(
+                    "Procedure",
+                    &[("subject", "Patient", "family")],
+                    SearchModifier::Below,
+                    &["Smith"],
+                ),
+                has("Patient", "Procedure", "subject", "date:in", "http://vs"),
+                has("Patient", "Procedure", "subject", "date:above", "2020"),
+            ] {
+                match resolve_chains_with(&b, &t, &q, options).await {
+                    Err(StorageError::Search(SearchError::QueryParseError { message })) => {
+                        assert!(message.contains("is not supported for"), "{message}")
+                    }
+                    other => panic!("expected a query parse error, got {other:?}"),
+                }
+            }
+        }
     }
 
     /// Values a caller already parsed (non-`eq` prefix) pass through as given.

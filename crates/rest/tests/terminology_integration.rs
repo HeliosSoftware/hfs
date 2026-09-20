@@ -345,3 +345,72 @@ async fn test_chained_in_and_below_modifiers_resolve_with_terminology_server() {
         );
     }
 }
+
+/// #1339: a terminology-backed modifier on a parameter whose type does not
+/// define it (`name:in` — a string) is a `400` with a terminology server too.
+/// It used to be expanded like a token's and searched as `name=<codes>`, an
+/// empty `200`. The terminology server is not consulted for it.
+#[tokio::test]
+async fn test_terminology_modifier_on_wrong_parameter_type_is_rejected_before_expansion() {
+    let expansion = make_expansion("http://example.org/cs", &["Smith"]);
+    let (ts_url, requests) = start_mock_hts(expansion).await;
+
+    // The spec search parameters are needed: the embedded fallback set does not
+    // know `name` or `birthdate`, and an unregistered parameter is not gated.
+    let data_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data");
+    let backend = SqliteBackend::with_config(
+        ":memory:",
+        helios_persistence::backends::sqlite::SqliteBackendConfig {
+            data_dir: Some(data_dir),
+            ..Default::default()
+        },
+    )
+    .expect("SQLite in-memory failed");
+    backend.init_schema().expect("Schema init failed");
+    let config = ServerConfig {
+        terminology_server: Some(ts_url),
+        ..ServerConfig::for_testing()
+    };
+    let server = TestServer::new(create_app_with_config(backend, config)).unwrap();
+
+    let patient = json!({"resourceType": "Patient", "id": "p1", "gender": "male",
+                         "name": [{"family": "Smith"}]});
+    let response = server.put("/Patient/p1").json(&patient).await;
+    assert!(response.status_code().is_success());
+
+    // Positive control: the parameter itself finds the patient.
+    let response = server
+        .get("/Patient")
+        .add_query_param("name", "Smith")
+        .await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+    assert_eq!(response.json::<Value>()["entry"][0]["resource"]["id"], "p1");
+
+    for (key, value) in [
+        ("name:in", "http://example.org/vs"),
+        ("name:not-in", "http://example.org/vs"),
+        ("name:below", "http://example.org/cs|Smith"),
+        ("birthdate:above", "http://example.org/cs|1980"),
+    ] {
+        let response = server.get("/Patient").add_query_param(key, value).await;
+        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST, "{key}");
+        assert!(
+            response.json::<Value>()["issue"][0]
+                .to_string()
+                .contains("is not supported for"),
+            "{key}"
+        );
+    }
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "an invalid modifier must not reach the terminology server"
+    );
+
+    // A valid one still does.
+    let response = server
+        .get("/Patient")
+        .add_query_param("gender:in", "http://example.org/vs")
+        .await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+    assert_eq!(requests.lock().unwrap().len(), 1);
+}

@@ -19,7 +19,7 @@ use helios_persistence::core::{
     resolve_includes_iterative,
 };
 use helios_persistence::error::SearchError;
-use helios_persistence::search::param_requires_terminology;
+use helios_persistence::search::{param_requires_terminology, validate_modifier};
 use helios_persistence::types::{
     IncludeDirective, SearchBundle, SearchModifier, SearchParamType, StoredResource, TotalMode,
 };
@@ -226,6 +226,55 @@ where
         });
     }
 
+    // A terminology-backed modifier (`:in` / `:not-in` / `:above` / `:below`)
+    // the parameter's type does not define is a client error — `name:in`,
+    // `birthdate:below` — and must be the `400` any other mismatched modifier
+    // gets, not one of the `501`s below, which are for a *valid* modifier this
+    // server cannot answer (#1339). It has to be settled here, ahead of the
+    // query builder's own `validate_modifier` call: with a terminology server
+    // `expand_terminology_params` would otherwise rewrite the key into a plain
+    // parameter, and without one the guard would answer first.
+    //
+    // Direct parameters only, like the guard below: the terminal parameter of a
+    // chained or `_has` search is typed — and checked, in this same order — by
+    // the chain resolver (`check_terminal_modifier`).
+    {
+        let reg = state.storage().search_param_registry(tenant.context());
+        let registry = reg.read();
+        for (key, _) in &pairs {
+            if key.contains('.') || key.starts_with("_has:") {
+                continue;
+            }
+            let Some((base, modifier)) = key.split_once(':') else {
+                continue;
+            };
+            let Some(
+                parsed @ (SearchModifier::In
+                | SearchModifier::NotIn
+                | SearchModifier::Above
+                | SearchModifier::Below),
+            ) = SearchModifier::parse(modifier)
+            else {
+                continue;
+            };
+            // An unregistered parameter has no declared type to check against
+            // (`validate_modifier` only gates registered ones).
+            let Some(param_type) = registry
+                .get_param(resource_type, base)
+                .or_else(|| registry.get_param("Resource", base))
+                .map(|p| p.param_type)
+            else {
+                continue;
+            };
+            validate_modifier(&registry, resource_type, base, param_type, &parsed).map_err(
+                |message| RestError::InvalidParameter {
+                    param: key.clone(),
+                    message,
+                },
+            )?;
+        }
+    }
+
     // `:not-in` requires negated value-set filtering, which no backend
     // implements. Reject it explicitly (501) regardless of whether a terminology
     // server is configured, rather than silently ignoring it (which would return
@@ -258,6 +307,12 @@ where
             let reg = state.storage().search_param_registry(tenant.context());
             let registry = reg.read();
             for (key, _) in &pairs {
+                // A chain's terminal modifier is the resolver's to judge: only
+                // it knows the terminal's type, and so whether the modifier is
+                // valid there at all (`subject.name:in` is a `400`).
+                if key.contains('.') {
+                    continue;
+                }
                 let Some((base, modifier)) = key.split_once(':') else {
                     continue;
                 };
