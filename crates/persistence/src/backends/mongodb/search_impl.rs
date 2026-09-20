@@ -2598,8 +2598,12 @@ impl MongoBackend {
             } else if code.is_empty() {
                 Ok(doc! { "value_token_system": system })
             } else {
+                // The named system, or a `code` element, whose system is
+                // implicit and not verifiable here (#1379).
                 Ok(doc! {
-                    "value_token_system": system,
+                    "value_token_system": {
+                        "$in": crate::search::implicit_system_candidates(system).to_vec()
+                    },
                     "value_token_code": code,
                 })
             }

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use crate::error::{BackendError, StorageResult};
-use crate::search::SearchParameterRegistry;
+use crate::search::{IMPLICIT_TOKEN_SYSTEM, SearchParameterRegistry};
 use crate::types::{ChainConfig, ReverseChainedParameter, SearchParamType, SearchValue};
 
 use super::query_builder::{SqlFragment, SqlParam};
@@ -456,18 +456,19 @@ impl ChainQueryBuilder {
                     if system.is_empty() {
                         (
                             format!(
-                                "({}.value_token_system IS NULL OR {}.value_token_system = '') \
+                                "({}.value_token_system IS NULL OR {}.value_token_system IN ('', '{}')) \
                                  AND {}.value_token_code = ?{}",
-                                alias, alias, alias, param_num
+                                alias, alias, IMPLICIT_TOKEN_SYSTEM, alias, param_num
                             ),
                             SqlParam::String(code.to_string()),
                         )
                     } else {
                         (
                             format!(
-                                "{}.value_token_system = '{}' AND {}.value_token_code = ?{}",
+                                "{}.value_token_system IN ('{}', '{}') AND {}.value_token_code = ?{}",
                                 alias,
                                 system.replace('\'', "''"),
+                                IMPLICIT_TOKEN_SYSTEM,
                                 alias,
                                 param_num
                             ),
@@ -682,18 +683,19 @@ impl ChainQueryBuilder {
                     if system.is_empty() {
                         (
                             format!(
-                                "({}.value_token_system IS NULL OR {}.value_token_system = '') \
+                                "({}.value_token_system IS NULL OR {}.value_token_system IN ('', '{}')) \
                                  AND {}.value_token_code = ?{}",
-                                alias, alias, alias, param_num
+                                alias, alias, IMPLICIT_TOKEN_SYSTEM, alias, param_num
                             ),
                             SqlParam::String(code.to_string()),
                         )
                     } else {
                         (
                             format!(
-                                "{}.value_token_system = '{}' AND {}.value_token_code = ?{}",
+                                "{}.value_token_system IN ('{}', '{}') AND {}.value_token_code = ?{}",
                                 alias,
                                 system.replace('\'', "''"),
+                                IMPLICIT_TOKEN_SYSTEM,
                                 alias,
                                 param_num
                             ),

@@ -2,6 +2,7 @@
 
 use serde_json::{Value, json};
 
+use crate::search::{IMPLICIT_TOKEN_SYSTEM, implicit_system_candidates};
 use crate::types::{SearchModifier, SearchParameter};
 
 /// Builds an ES query clause for a token search parameter.
@@ -42,21 +43,29 @@ fn build_token_condition(
 
     if let Some((system, code)) = value.split_once('|') {
         if system.is_empty() && !code.is_empty() {
-            // |code - code with no system
+            // |code - code with no system. A `code` element has no system
+            // property either; its entry carries the marker (#1379).
             must_conditions.push(json!({ "term": { "search_params.token.code": code } }));
             must_conditions.push(json!({
                 "bool": {
-                    "must_not": [
-                        { "exists": { "field": "search_params.token.system" } }
-                    ]
+                    "should": [
+                        { "bool": { "must_not": [
+                            { "exists": { "field": "search_params.token.system" } }
+                        ] } },
+                        { "term": { "search_params.token.system": IMPLICIT_TOKEN_SYSTEM } }
+                    ],
+                    "minimum_should_match": 1
                 }
             }));
         } else if !system.is_empty() && code.is_empty() {
             // system| - any code in system
             must_conditions.push(json!({ "term": { "search_params.token.system": system } }));
         } else {
-            // system|code - both must match
-            must_conditions.push(json!({ "term": { "search_params.token.system": system } }));
+            // system|code - both must match; or a `code` element, whose
+            // system is implicit and not verifiable here (#1379).
+            must_conditions.push(json!({
+                "terms": { "search_params.token.system": implicit_system_candidates(system) }
+            }));
             must_conditions.push(json!({ "term": { "search_params.token.code": code } }));
         }
     } else {

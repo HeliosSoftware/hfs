@@ -1,5 +1,6 @@
 //! Token parameter SQL handler.
 
+use crate::search::IMPLICIT_TOKEN_SYSTEM;
 use crate::types::{SearchModifier, SearchValue};
 
 use super::super::query_builder::{SqlFragment, SqlParam};
@@ -12,8 +13,9 @@ impl TokenHandler {
     ///
     /// Token values can be:
     /// - `code` - matches any system
-    /// - `system|code` - matches specific system and code
-    /// - `|code` - matches code with no system (empty or null)
+    /// - `system|code` - matches specific system and code, or the code of a
+    ///   `code` element, whose system is implicit ([`IMPLICIT_TOKEN_SYSTEM`])
+    /// - `|code` - matches code with no system (empty, null or implicit)
     /// - `system|` - matches any code in system
     ///
     /// With `:of-type` modifier (for identifiers):
@@ -84,11 +86,12 @@ impl TokenHandler {
             let code = &token_value[pipe_pos + 1..];
 
             if system.is_empty() {
-                // |code - match code with no system
+                // |code - match code with no system. A `code` element has no
+                // system property either; its row carries the marker.
                 SqlFragment::with_params(
                     format!(
-                        "(value_token_system IS NULL OR value_token_system = '') AND value_token_code = ?{}",
-                        param_num
+                        "(value_token_system IS NULL OR value_token_system IN ('', '{}')) AND value_token_code = ?{}",
+                        IMPLICIT_TOKEN_SYSTEM, param_num
                     ),
                     vec![SqlParam::string(code)],
                 )
@@ -99,11 +102,15 @@ impl TokenHandler {
                     vec![SqlParam::string(system)],
                 )
             } else {
-                // system|code - exact match
+                // system|code - exact match, or a `code` element, whose
+                // system is implicit and not verifiable here (#1379). The
+                // marker is a constant, inlined so the parameter count — and
+                // with it every caller's offset arithmetic — is unchanged.
                 SqlFragment::with_params(
                     format!(
-                        "value_token_system = ?{} AND value_token_code = ?{}",
+                        "value_token_system IN (?{}, '{}') AND value_token_code = ?{}",
                         param_num,
+                        IMPLICIT_TOKEN_SYSTEM,
                         param_num + 1
                     ),
                     vec![SqlParam::string(system), SqlParam::string(code)],
@@ -251,7 +258,11 @@ mod tests {
         let value = SearchValue::new(SearchPrefix::Eq, "http://loinc.org|12345-6");
         let frag = TokenHandler::build_sql(&value, None, 0);
 
-        assert!(frag.sql.contains("value_token_system = ?1"));
+        // The system itself, or the marker of a `code` element (#1379) —
+        // inlined, so still two parameters.
+        assert!(frag.sql.contains(&format!(
+            "value_token_system IN (?1, '{IMPLICIT_TOKEN_SYSTEM}')"
+        )));
         assert!(frag.sql.contains("value_token_code = ?2"));
         assert_eq!(frag.params.len(), 2);
     }
@@ -262,6 +273,8 @@ mod tests {
         let frag = TokenHandler::build_sql(&value, None, 0);
 
         assert!(frag.sql.contains("IS NULL OR"));
+        // A `code` element has no system property either (#1379).
+        assert!(frag.sql.contains(IMPLICIT_TOKEN_SYSTEM));
         assert!(frag.sql.contains("value_token_code = ?1"));
     }
 
@@ -272,6 +285,9 @@ mod tests {
 
         assert!(frag.sql.contains("value_token_system = ?1"));
         assert!(!frag.sql.contains("value_token_code"));
+        // `system|` names the codes OF a system; a row whose system is
+        // implicit cannot be shown to belong to it.
+        assert!(!frag.sql.contains(IMPLICIT_TOKEN_SYSTEM));
     }
 
     #[test]

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use crate::error::{BackendError, StorageResult};
-use crate::search::SearchParameterRegistry;
+use crate::search::{IMPLICIT_TOKEN_SYSTEM, SearchParameterRegistry};
 use crate::types::{ChainConfig, ReverseChainedParameter, SearchParamType, SearchValue};
 
 use super::query_builder::{
@@ -396,9 +396,10 @@ impl ChainQueryBuilder {
                     if system.is_empty() {
                         (
                             format!(
-                                "({alias}.value_token_system IS NULL OR {alias}.value_token_system = '') \
+                                "({alias}.value_token_system IS NULL OR {alias}.value_token_system IN ('', '{implicit}')) \
                                  AND {alias}.value_token_code = ${pn}",
                                 alias = alias,
+                                implicit = IMPLICIT_TOKEN_SYSTEM,
                                 pn = param_num,
                             ),
                             vec![SqlParam::Text(code.to_string())],
@@ -411,8 +412,9 @@ impl ChainQueryBuilder {
                         // distinct statement text per system either way.
                         (
                             format!(
-                                "{alias}.value_token_system = ${pn} AND {alias}.value_token_code = ${pn2}",
+                                "{alias}.value_token_system IN (${pn}, '{implicit}') AND {alias}.value_token_code = ${pn2}",
                                 alias = alias,
+                                implicit = IMPLICIT_TOKEN_SYSTEM,
                                 pn = param_num,
                                 pn2 = param_num + 1,
                             ),
@@ -631,9 +633,10 @@ impl ChainQueryBuilder {
                     if system.is_empty() {
                         (
                             format!(
-                                "({alias}.value_token_system IS NULL OR {alias}.value_token_system = '') \
+                                "({alias}.value_token_system IS NULL OR {alias}.value_token_system IN ('', '{implicit}')) \
                                  AND {alias}.value_token_code = ${pn}",
                                 alias = alias,
+                                implicit = IMPLICIT_TOKEN_SYSTEM,
                                 pn = param_num,
                             ),
                             vec![SqlParam::Text(code.to_string())],
@@ -646,8 +649,9 @@ impl ChainQueryBuilder {
                         // distinct statement text per system either way.
                         (
                             format!(
-                                "{alias}.value_token_system = ${pn} AND {alias}.value_token_code = ${pn2}",
+                                "{alias}.value_token_system IN (${pn}, '{implicit}') AND {alias}.value_token_code = ${pn2}",
                                 alias = alias,
+                                implicit = IMPLICIT_TOKEN_SYSTEM,
                                 pn = param_num,
                                 pn2 = param_num + 1,
                             ),
@@ -1318,7 +1322,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            frag.sql.contains("value_token_system = $2")
+            frag.sql.contains("value_token_system IN ($2, ")
                 && frag.sql.contains("value_token_code = $3"),
             "both halves bound: {}",
             frag.sql
@@ -1349,7 +1353,7 @@ mod tests {
         let frag = builder.build_reverse_chain_sql(&rc).unwrap();
 
         assert!(
-            frag.sql.contains("value_token_system = $2")
+            frag.sql.contains("value_token_system IN ($2, ")
                 && frag.sql.contains("value_token_code = $3"),
             "both halves bound: {}",
             frag.sql

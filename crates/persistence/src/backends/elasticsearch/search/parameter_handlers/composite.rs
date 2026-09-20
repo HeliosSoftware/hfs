@@ -60,7 +60,15 @@ fn component_conditions(param_type: SearchParamType, part: &str) -> Option<Vec<V
         SearchParamType::Token => {
             let conds = if let Some((system, code)) = part.split_once('|') {
                 let mut v = Vec::new();
-                if !system.is_empty() {
+                if !system.is_empty() && !code.is_empty() {
+                    // Or a `code` component, whose system is implicit (#1379).
+                    v.push(json!({
+                        "terms": {
+                            field("token_system"):
+                                crate::search::implicit_system_candidates(system)
+                        }
+                    }));
+                } else if !system.is_empty() {
                     v.push(json!({ "term": { field("token_system"): system } }));
                 }
                 if !code.is_empty() {

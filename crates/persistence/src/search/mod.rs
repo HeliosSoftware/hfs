@@ -90,7 +90,9 @@ pub use conditional::{
     build_conditional_parameters, build_conditional_query, build_conditional_query_from_pairs,
     parse_conditional_criteria,
 };
-pub use converters::{IndexValue, ValueConverter};
+pub use converters::{
+    IMPLICIT_TOKEN_SYSTEM, IndexValue, ValueConverter, implicit_system_candidates,
+};
 pub use date_value::{
     DatePredicate, DateValueError, DateValueErrorReason, DateValuePrecision, FhirDateValue,
     StorageResolution, validate_date_parameter, validate_date_values,
