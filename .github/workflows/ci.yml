@@ -9,6 +9,12 @@ on:
     branches: [main]
 
 env:
+  # Pin the toolchain by environment, which rustup ranks above a directory
+  # override. A self-hosted runner kept a leftover `rustup override` to nightly
+  # for this checkout: the "Install Rust toolchain" step still reported stable,
+  # but every cargo command ran nightly, and nightly clippy failed lints that
+  # stable does not have — on that one runner only.
+  RUSTUP_TOOLCHAIN: stable
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: 2
   CARGO_PROFILE_DEV_DEBUG: 0
