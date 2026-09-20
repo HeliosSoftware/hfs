@@ -559,8 +559,25 @@ jobs:
       # per backend on its own, with warnings denied so a helper left unused by
       # a subset fails here too. `--no-default-features` is required: the
       # default set enables `sqlite`.
+      #
+      # The loop is bash, and a bare `shell: bash` resolves to WSL's
+      # `C:\Windows\System32\bash.exe` on the self-hosted Windows agent, which
+      # aborts with "Windows Subsystem for Linux has no installed distributions".
+      # Same split as the MinIO steps above: Git Bash via the space-free 8.3
+      # path on Windows, plain `shell: bash` elsewhere. The two steps run the
+      # identical script; exactly one fires per run via the `runner.os` guard.
       - name: Check hfs builds with single-backend feature sets (#1291)
+        if: runner.os != 'Windows'
         shell: bash
+        run: |
+          for features in R4,sqlite,postgres R4,postgres R4,mongodb R4,s3 R4,s3,elasticsearch; do
+            echo "::group::helios-hfs --no-default-features --features $features"
+            cargo clippy -p helios-hfs --no-default-features --features "$features" -- -D warnings -A clippy::items_after_test_module -A clippy::large_enum_variant -A clippy::question_mark -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::field_reassign_with_default -A clippy::doc-overindented-list-items -A clippy::doc-lazy-continuation
+            echo "::endgroup::"
+          done
+      - name: Check hfs builds with single-backend feature sets (#1291) (Windows)
+        if: runner.os == 'Windows'
+        shell: 'C:\Progra~1\Git\bin\bash.exe --noprofile --norc -eo pipefail {0}'
         run: |
           for features in R4,sqlite,postgres R4,postgres R4,mongodb R4,s3 R4,s3,elasticsearch; do
             echo "::group::helios-hfs --no-default-features --features $features"
@@ -2233,3 +2250,61 @@ jobs:
             $SSH_CMD "sudo journalctl -u $SERVER_NAME --lines=20"
             exit 1
           fi
+
+      # Seed the freshly reset hfs with the manual-test corpus. The deploy step
+      # above wipes hfs.db, so every release starts empty. HFS is the Data
+      # Consumer: it fetches the manifest and its NDJSON files from S3 itself,
+      # so this only kicks the submission off. The corpus is ~19M resources and
+      # ingests for hours, so the job does not wait for it to finish; follow it
+      # with POST /$bulk-submit-status or on the UI's Import page.
+      - name: Seed hfs via $bulk-submit
+        if: matrix.server == 'hfs'
+        env:
+          HFS_PUBLIC_URL: ${{ secrets.HFS_PUBLIC_URL }}
+          MANIFEST_URL: https://hfs-manual-test.s3.us-east-1.amazonaws.com/manifest.json
+          SUBMISSION_ID: deploy-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          if [ -z "$HFS_PUBLIC_URL" ]; then
+            echo "HFS_PUBLIC_URL secret is not set - cannot seed"
+            exit 1
+          fi
+          HFS_URL="${HFS_PUBLIC_URL%/}"
+
+          # systemd reports "active" before the listener is bound, and the
+          # proxy in front of the public URL answers 502 until it is.
+          up=0
+          for _ in $(seq 1 60); do
+            if curl -sf -o /dev/null "$HFS_URL/health"; then
+              up=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$up" != "1" ]; then
+            echo "hfs did not answer $HFS_URL/health within 120s - cannot seed"
+            exit 1
+          fi
+
+          # fhirBaseUrl is required whenever manifestUrl is present. "completed"
+          # closes the submission with this single manifest.
+          PAYLOAD=$(cat <<JSON
+          { "resourceType": "Parameters", "parameter": [
+            { "name": "submitter", "valueIdentifier": { "system": "https://github.com/${{ github.repository }}", "value": "ci-deploy" } },
+            { "name": "submissionId", "valueString": "$SUBMISSION_ID" },
+            { "name": "manifestUrl", "valueUrl": "$MANIFEST_URL" },
+            { "name": "fhirBaseUrl", "valueUrl": "${MANIFEST_URL%/manifest.json}" },
+            { "name": "submissionStatus", "valueCoding": { "system": "http://hl7.org/fhir/event-status", "code": "completed" } } ] }
+          JSON
+          )
+
+          RESPONSE=$(printf '%s' "$PAYLOAD" | curl -sS -w '\n%{http_code}' -X POST \
+            -H 'Content-Type: application/fhir+json' -H 'Accept: application/fhir+json' \
+            --data-binary @- "$HFS_URL/\$bulk-submit")
+          STATUS=$(printf '%s' "$RESPONSE" | tail -n1)
+          echo "$RESPONSE" | sed '$d'
+
+          if [ "$STATUS" != "200" ]; then
+            echo "\$bulk-submit kick-off failed with HTTP $STATUS"
+            exit 1
+          fi
+          echo "Bulk submit accepted - submissionId $SUBMISSION_ID, ingestion continues on the server"

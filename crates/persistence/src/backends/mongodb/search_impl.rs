@@ -102,6 +102,27 @@ fn build_date_filter_doc(value: &SearchValue, param: &str, field: &str) -> Stora
     })
 }
 
+/// The error for a number or quantity search value whose number is not one.
+///
+/// As for dates, such a value is an error here, never a filter — not even one
+/// that matches nothing. The search gate (`validate_numeric_values`) reports
+/// it first on every ordinary path; this is what the in-transaction
+/// conditional paths, which build filters without passing the gate, fall back
+/// on. Before the shared grammar this was a `QueryParseError`, and only for
+/// what `f64::from_str` refused: `ltinf` was `{"$lt": Infinity}`, which every
+/// indexed row satisfies (#1340).
+fn invalid_number_value(
+    param: &str,
+    value: &str,
+    error: &crate::search::NumberValueError,
+) -> StorageError {
+    StorageError::Search(SearchError::InvalidNumberValue {
+        param: param.to_string(),
+        value: value.to_string(),
+        reason: error.to_string(),
+    })
+}
+
 const CANDIDATE_BATCH_SIZE: usize = 512;
 const PROBE_ROW_LIMIT: u64 = 100_000;
 // 300k × ~45 bytes/UUID ≈ 13.5 MB — safely under the 16 MB BSON document cap.
@@ -353,19 +374,81 @@ pub(super) fn missing_presence_filter(
 /// today, so this is a clear 400 rather than a silent under- or
 /// over-match.
 fn reject_contained_composite(query: &SearchQuery) -> StorageResult<()> {
-    if query.contained != crate::types::ContainedMode::Off
-        && query
-            .parameters
-            .iter()
-            .any(|p| p.param_type == SearchParamType::Composite)
-    {
-        return Err(StorageError::Search(SearchError::InvalidComposite {
-            message: "composite search parameters are not supported together with _contained on \
-                 MongoDB"
-                .to_string(),
-        }));
+    if query.contained == crate::types::ContainedMode::Off {
+        return Ok(());
     }
-    Ok(())
+    match query
+        .parameters
+        .iter()
+        .find(|p| p.param_type == SearchParamType::Composite)
+    {
+        Some(param) => Err(reject_contained_parameter(
+            param,
+            "composite parameters are",
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Why `matching_contained` cannot apply `param`, if it cannot (#1363).
+///
+/// `search_index_contained` holds what the extractor found in the contained
+/// resource itself, one document per value. That answers every ordinary
+/// parameter, the `meta`-derived `_`-parameters and — through
+/// `contained_local_id` — `_id`. It does not answer:
+///
+/// - `_lastUpdated`: a contained resource has no `meta.lastUpdated` of its
+///   own, and the container's is not on these documents;
+/// - `_text`, `_content` and the other `_`-parameters resolved against
+///   `resources`, which only knows the container;
+/// - composites (see [`reject_contained_composite`]) and chains;
+/// - `:not` and `:missing`, which the standard path resolves as a complement
+///   over *resources* (`matching_resource_ids_complement_only`), never as a
+///   `search_index` filter. There is no such complement over contained
+///   entities yet.
+///
+/// Every other modifier goes to `build_search_index_filter`, which honours or
+/// refuses it exactly as it does for a top-level search.
+fn contained_unsupported_reason(param: &SearchParameter) -> Option<String> {
+    if !param.chain.is_empty() {
+        return Some("chained parameters are".to_string());
+    }
+    if param.name == "_id" {
+        return param
+            .modifier
+            .as_ref()
+            .map(|m| format!("the ':{m}' modifier on _id is"));
+    }
+    if param.name.starts_with('_')
+        && !matches!(
+            param.name.as_str(),
+            "_tag" | "_profile" | "_security" | "_source" | "_language"
+        )
+    {
+        return Some("this parameter is".to_string());
+    }
+    match (&param.modifier, param.param_type) {
+        (_, SearchParamType::Composite) => Some("composite parameters are".to_string()),
+        (_, SearchParamType::Special) => Some("special parameters are".to_string()),
+        (Some(m @ (SearchModifier::Not | SearchModifier::Missing)), _) => {
+            Some(format!("the ':{m}' modifier is"))
+        }
+        _ => None,
+    }
+}
+
+/// The error for a criterion `_contained` matching cannot apply, naming it:
+/// dropping it instead would answer a wider question than the one asked.
+fn reject_contained_parameter(param: &SearchParameter, reason: &str) -> StorageError {
+    let message = format!(
+        "search parameter '{}' cannot be combined with _contained=true or both: {reason} not \
+         supported for contained resources on MongoDB",
+        param.name
+    );
+    StorageError::Search(match param.param_type {
+        SearchParamType::Composite => SearchError::InvalidComposite { message },
+        _ => SearchError::QueryParseError { message },
+    })
 }
 
 /// The resource-document field a cursor pages over.
@@ -931,6 +1014,13 @@ impl MongoBackend {
     /// multiple internal matches. Then `$sort` for a stable page order, then
     /// `$skip`/`$limit`, with a `$facet` count alongside when `_total` is
     /// requested.
+    ///
+    /// The set of matched *names* proves every criterion held only while each
+    /// name occurs once. When a name repeats (`date=ge2020&date=le2020`) the
+    /// per-entity stage is instead one `$unionWith` arm per occurrence, and an
+    /// entity must come back from all of them (#1362). A criterion this path
+    /// cannot apply is refused, never skipped (#1363) — see
+    /// [`contained_unsupported_reason`].
     #[allow(clippy::too_many_arguments)]
     async fn matching_contained(
         &self,
@@ -947,15 +1037,22 @@ impl MongoBackend {
         let contained_rows =
             db.collection::<Document>(MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION);
 
-        let mut branches: Vec<Bson> = Vec::new();
+        let mut entity_scope = doc! { "tenant_id": tenant_id, "contained_type": contained_type };
+        // One entry per parameter *occurrence*; values inside an occurrence
+        // are ORed by `build_search_index_filter`.
+        let mut branches: Vec<Document> = Vec::new();
         let mut distinct_names: Vec<String> = Vec::new();
+        // `_id` is the contained resource's local id, a field of every row.
+        let mut id_clauses: Vec<Bson> = Vec::new();
         for param in &query.parameters {
-            if param.name.starts_with('_')
-                || matches!(
-                    param.param_type,
-                    SearchParamType::Composite | SearchParamType::Special
-                )
-            {
+            if let Some(reason) = contained_unsupported_reason(param) {
+                return Err(reject_contained_parameter(param, &reason));
+            }
+            if param.name == "_id" {
+                let ids: Vec<&str> = param.values.iter().map(|v| v.value.as_str()).collect();
+                id_clauses.push(Bson::Document(
+                    doc! { "contained_local_id": { "$in": ids } },
+                ));
                 continue;
             }
             // Reuse the standard per-param value filter, dropping the tenant /
@@ -963,38 +1060,85 @@ impl MongoBackend {
             let mut branch = self.build_search_index_filter("", "", param)?;
             branch.remove("tenant_id");
             branch.remove("resource_type");
-            branches.push(Bson::Document(branch));
+            branches.push(branch);
             if !distinct_names.contains(&param.name) {
                 distinct_names.push(param.name.clone());
             }
         }
-        if branches.is_empty() {
+        if branches.is_empty() && id_clauses.is_empty() {
             return Ok(ContainedPage {
                 keys: Vec::new(),
                 total: want_total.then_some(0),
             });
         }
-
-        let mut pipeline = vec![
-            doc! { "$match": {
-                "tenant_id": tenant_id,
-                "contained_type": contained_type,
-                "$or": branches,
-            }},
-            // Always per entity: the AND below must hold within one
-            // contained resource, not across every entity a container holds.
-            doc! { "$group": {
-                "_id": {
-                    "rtype": "$resource_type",
-                    "rid": "$resource_id",
-                    "lid": "$contained_local_id",
-                },
-                "names": { "$addToSet": "$param_name" },
-            }},
-        ];
-        if distinct_names.len() > 1 {
-            pipeline.push(doc! { "$match": { "names": { "$all": distinct_names } } });
+        if !id_clauses.is_empty() {
+            entity_scope.insert("$and", id_clauses);
         }
+
+        let entity = doc! {
+            "rtype": "$resource_type",
+            "rid": "$resource_id",
+            "lid": "$contained_local_id",
+        };
+        let mut pipeline = if distinct_names.len() == branches.len() {
+            // Every name occurs once, so the set of names an entity matched
+            // proves every branch did.
+            let mut first = entity_scope;
+            if !branches.is_empty() {
+                first.insert(
+                    "$or",
+                    branches.into_iter().map(Bson::Document).collect::<Vec<_>>(),
+                );
+            }
+            let mut stages = vec![
+                doc! { "$match": first },
+                // Always per entity: the AND below must hold within one
+                // contained resource, not across every entity a container holds.
+                doc! { "$group": {
+                    "_id": entity,
+                    "names": { "$addToSet": "$param_name" },
+                }},
+            ];
+            if distinct_names.len() > 1 {
+                stages.push(doc! { "$match": { "names": { "$all": distinct_names } } });
+            }
+            stages
+        } else {
+            // A name repeats (`date=ge2020&date=le2020`): one row can satisfy
+            // only some of its occurrences, and the names an entity matched no
+            // longer tell them apart (#1362). A branch is a query document, not
+            // an aggregation expression, so it cannot tag rows in place;
+            // instead each occurrence selects its entities in a pipeline of its
+            // own, tagged with the occurrence's index, and an entity must come
+            // back from every one of them.
+            let occurrence = |index: usize, branch: Document| {
+                let mut filter = entity_scope.clone();
+                filter.extend(branch);
+                vec![
+                    doc! { "$match": filter },
+                    doc! { "$group": { "_id": entity.clone() } },
+                    doc! { "$addFields": { "occurrence": index as i32 } },
+                ]
+            };
+            let required: Vec<i32> = (0..branches.len() as i32).collect();
+            let mut occurrences = branches.into_iter().enumerate();
+            let mut stages = occurrences
+                .next()
+                .map(|(index, branch)| occurrence(index, branch))
+                .unwrap_or_default();
+            for (index, branch) in occurrences {
+                stages.push(doc! { "$unionWith": {
+                    "coll": MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION,
+                    "pipeline": occurrence(index, branch),
+                }});
+            }
+            stages.push(doc! { "$group": {
+                "_id": "$_id",
+                "occurrences": { "$addToSet": "$occurrence" },
+            }});
+            stages.push(doc! { "$match": { "occurrences": { "$all": required } } });
+            stages
+        };
         let sort = match contained_return {
             ContainedReturn::Container => {
                 // Collapse the surviving per-entity slots to one per
@@ -1231,7 +1375,9 @@ impl MongoBackend {
 
         // The shared date gate: the same values are invalid here as on every
         // other backend, reported the same way (#1295).
-        crate::search::validate_date_values(query)
+        crate::search::validate_date_values(query)?;
+        // And its numeric sibling (#1340).
+        crate::search::validate_numeric_values(query)
     }
 
     /// Search with `_sort` on an indexed parameter (#881): pages over the id
@@ -2461,12 +2607,12 @@ impl MongoBackend {
             SearchParamType::String => self.build_string_filter(param, value),
             SearchParamType::Token => self.build_token_filter(param, value),
             SearchParamType::Date => self.build_date_filter(value, &param.name, "value_date"),
-            SearchParamType::Number => self.build_number_filter(value),
+            SearchParamType::Number => self.build_number_filter(&param.name, value),
             SearchParamType::Reference => {
                 self.build_reference_filter(param, value, reference_targets)
             }
             SearchParamType::Uri => self.build_uri_filter(param, value),
-            SearchParamType::Quantity => self.build_quantity_filter(value),
+            SearchParamType::Quantity => self.build_quantity_filter(&param.name, value),
             SearchParamType::Composite => {
                 // Composite parameters are planned by `composite_component_filters`
                 // (each component gets its own scoped filter document) and never
@@ -2770,59 +2916,31 @@ impl MongoBackend {
 
     /// Builds a MongoDB filter for a quantity parameter.
     ///
-    /// Value form: `[prefix]number[|system|code]` (or the `number|code` shorthand).
-    /// The comparison runs on `value_quantity_value`; an optional system/code
-    /// further constrain `value_quantity_system` / `value_quantity_unit` (the
-    /// extractor stores the quantity code under the unit field). Per the FHIR
-    /// number search spec (see `crate::search::range`), `eq`/`ne` match the
-    /// implicit-precision range derived from the number's textual form (`60`
-    /// ⇒ `[59.5, 60.5)`), while `gt`/`lt`/`ge`/`le`/`sa`/`eb` compare against
-    /// the exact value.
-    fn build_quantity_filter(&self, value: &SearchValue) -> StorageResult<Document> {
-        let parts: Vec<&str> = value.value.splitn(3, '|').collect();
-        let parsed = parts[0].parse::<f64>().map_err(|e| {
-            StorageError::Search(SearchError::QueryParseError {
-                message: format!("Invalid quantity value '{}': {}", value.value, e),
-            })
-        })?;
+    /// Value form: `[prefix]number[|system|code]` (or the `number|code` shorthand),
+    /// read by the grammar every backend shares
+    /// ([`FhirQuantityValue`](crate::search::FhirQuantityValue)): only an
+    /// unescaped `|` separates. The comparison runs on `value_quantity_value`;
+    /// an optional system/code further constrain `value_quantity_system` /
+    /// `value_quantity_unit` (the extractor stores the quantity code under the
+    /// unit field). Per the FHIR number search spec (see
+    /// `crate::search::range`), `eq`/`ne` match the implicit-precision range
+    /// derived from the number's textual form (`60` ⇒ `[59.5, 60.5)`), while
+    /// `gt`/`lt`/`ge`/`le`/`sa`/`eb` compare against the exact value.
+    ///
+    /// A number part that is not a number is an error here, never a filter —
+    /// see [`invalid_number_value`].
+    fn build_quantity_filter(&self, param: &str, value: &SearchValue) -> StorageResult<Document> {
+        let quantity = crate::search::FhirQuantityValue::parse(&value.value)
+            .map_err(|error| invalid_number_value(param, &value.value, &error))?;
 
-        let value_condition = match value.prefix {
-            SearchPrefix::Ap => {
-                let delta = (parsed.abs() * 0.1).max(0.1);
-                doc! { "$gte": parsed - delta, "$lte": parsed + delta }
-            }
-            SearchPrefix::Eq => {
-                let (lo, hi) = crate::search::implicit_range(parsed, parts[0]);
-                doc! { "$gte": lo, "$lt": hi }
-            }
-            SearchPrefix::Ne => {
-                let (lo, hi) = crate::search::implicit_range(parsed, parts[0]);
-                doc! { "$not": { "$gte": lo, "$lt": hi } }
-            }
-            _ => {
-                let op = Self::prefix_to_mongo_operator(value.prefix)?;
-                doc! { op: parsed }
-            }
+        let mut filter = doc! {
+            "value_quantity_value": Self::numeric_condition(value.prefix, &quantity.number)?
         };
-
-        let mut filter = doc! { "value_quantity_value": value_condition };
-        match parts.as_slice() {
-            // number|system|code
-            [_, system, code] => {
-                if !system.is_empty() {
-                    filter.insert("value_quantity_system", *system);
-                }
-                if !code.is_empty() {
-                    filter.insert("value_quantity_unit", *code);
-                }
-            }
-            // number|code shorthand
-            [_, code] => {
-                if !code.is_empty() {
-                    filter.insert("value_quantity_unit", *code);
-                }
-            }
-            _ => {}
+        if let Some(system) = quantity.system {
+            filter.insert("value_quantity_system", system);
+        }
+        if let Some(code) = quantity.code {
+            filter.insert("value_quantity_unit", code);
         }
 
         Ok(filter)
@@ -2834,44 +2952,40 @@ impl MongoBackend {
     /// derived from the number's textual form (`60` ⇒ `[59.5, 60.5)`, `60.0`
     /// ⇒ `[59.95, 60.05)`), while `gt`/`lt`/`ge`/`le`/`sa`/`eb` compare
     /// against the exact value.
-    fn build_number_filter(&self, value: &SearchValue) -> StorageResult<Document> {
-        let parsed = value.value.parse::<f64>().map_err(|e| {
-            StorageError::Search(SearchError::QueryParseError {
-                message: format!("Invalid number value '{}': {}", value.value, e),
-            })
-        })?;
+    ///
+    /// A value that is not a number is an error here, never a filter — see
+    /// [`invalid_number_value`].
+    fn build_number_filter(&self, param: &str, value: &SearchValue) -> StorageResult<Document> {
+        let number = crate::search::FhirNumberValue::parse(&value.value)
+            .map_err(|error| invalid_number_value(param, &value.value, &error))?;
+        Ok(doc! { "value_number": Self::numeric_condition(value.prefix, &number)? })
+    }
 
-        match value.prefix {
+    /// The comparison `prefix` makes against a numeric field, shared by the
+    /// number and quantity filters.
+    fn numeric_condition(
+        prefix: SearchPrefix,
+        number: &crate::search::FhirNumberValue,
+    ) -> StorageResult<Document> {
+        let parsed = number.value;
+        Ok(match prefix {
             SearchPrefix::Ap => {
                 let delta = (parsed.abs() * 0.1).max(0.1);
-                Ok(doc! {
-                    "value_number": {
-                        "$gte": parsed - delta,
-                        "$lte": parsed + delta,
-                    }
-                })
+                doc! { "$gte": parsed - delta, "$lte": parsed + delta }
             }
             SearchPrefix::Eq => {
-                let (lo, hi) = crate::search::implicit_range(parsed, &value.value);
-                Ok(doc! {
-                    "value_number": { "$gte": lo, "$lt": hi }
-                })
+                let (lo, hi) = number.implicit_range();
+                doc! { "$gte": lo, "$lt": hi }
             }
             SearchPrefix::Ne => {
-                let (lo, hi) = crate::search::implicit_range(parsed, &value.value);
-                Ok(doc! {
-                    "value_number": { "$not": { "$gte": lo, "$lt": hi } }
-                })
+                let (lo, hi) = number.implicit_range();
+                doc! { "$not": { "$gte": lo, "$lt": hi } }
             }
             _ => {
-                let op = Self::prefix_to_mongo_operator(value.prefix)?;
-                Ok(doc! {
-                    "value_number": {
-                        op: parsed,
-                    }
-                })
+                let op = Self::prefix_to_mongo_operator(prefix)?;
+                doc! { op: parsed }
             }
-        }
+        })
     }
 
     /// Maps a comparator prefix to its MongoDB query operator. The number and
@@ -3738,6 +3852,82 @@ mod date_filter_tests {
                 "{raw}: {error:?}"
             );
         }
+    }
+
+    /// The numeric sibling (#1340). `f64::from_str` used to be the judge, and
+    /// took `inf` and `nan`: `ltinf` was `{"$lt": Infinity}`, which every
+    /// indexed row satisfies, and `nenan` matched them all too.
+    #[test]
+    fn invalid_numbers_error() {
+        let backend =
+            MongoBackend::new(crate::backends::mongodb::MongoBackendConfig::default()).unwrap();
+        for raw in [
+            "abc",
+            "gtabc",
+            "",
+            "gt",
+            "1e",
+            "inf",
+            "lt-inf",
+            "ltInfinity",
+            "nenan",
+            "NaN",
+            "lt1e999",
+            "0x10",
+        ] {
+            let value = SearchValue::parse(raw);
+            for error in [
+                backend
+                    .build_number_filter("probability", &value)
+                    .expect_err(raw),
+                backend
+                    .build_quantity_filter("probability", &value)
+                    .expect_err(raw),
+            ] {
+                assert!(
+                    matches!(
+                        &error,
+                        StorageError::Search(SearchError::InvalidNumberValue { param, .. })
+                            if param == "probability"
+                    ),
+                    "{raw}: {error:?}"
+                );
+            }
+        }
+        for raw in ["||mg", "abc|http://unitsofmeasure.org|mg", "ltinf||mg"] {
+            let error = backend
+                .build_quantity_filter("value-quantity", &SearchValue::parse(raw))
+                .expect_err(raw);
+            assert!(
+                matches!(
+                    &error,
+                    StorageError::Search(SearchError::InvalidNumberValue { .. })
+                ),
+                "{raw}: {error:?}"
+            );
+        }
+    }
+
+    /// A quantity's system and code are split on unescaped pipes only.
+    #[test]
+    fn quantity_filter_unescapes_pipes() {
+        let backend =
+            MongoBackend::new(crate::backends::mongodb::MongoBackendConfig::default()).unwrap();
+        let filter = backend
+            .build_quantity_filter(
+                "value-quantity",
+                &SearchValue::parse("gt5.4|http://example.org|a\\|b"),
+            )
+            .unwrap();
+        assert_eq!(
+            filter.get_str("value_quantity_system"),
+            Ok("http://example.org")
+        );
+        assert_eq!(filter.get_str("value_quantity_unit"), Ok("a|b"));
+        assert_eq!(
+            filter.get_document("value_quantity_value").unwrap(),
+            &doc! { "$gt": 5.4 }
+        );
     }
 }
 
@@ -5005,20 +5195,27 @@ mod build_search_parameters_tests {
         TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access())
     }
 
-    /// A parameter the registry has never heard of falls back to
-    /// `infer_param_type_from_value`, which assumes the comparator prefix
-    /// has already been stripped. With the default (embedded-only)
-    /// registry, `foo` is unregistered, so `gt2020-01-01` must still be
-    /// read as `Date` with prefix `Gt` and value `2020-01-01` — the
-    /// pre-#1206 behaviour that a raw-string probe silently broke.
+    /// A parameter the registry has never heard of is refused: conditional
+    /// criteria guard a write, so an unknown name is neither searched for
+    /// literally nor ignored (#1323). With the default (embedded-only)
+    /// registry, `foo` is unregistered; `_lastUpdated` is a date, read with
+    /// prefix `Gt` and value `2020-01-01`.
     #[test]
-    fn unregistered_parameter_resolves_type_from_the_stripped_value() {
+    fn unregistered_parameter_is_refused_and_a_date_keeps_its_prefix() {
         let backend = MongoBackend::new(MongoBackendConfig::default()).unwrap();
-        let params = backend
+        backend
             .build_search_parameters(
                 &tenant(),
                 "Patient",
                 &[("foo".to_string(), "gt2020-01-01".to_string())],
+            )
+            .expect_err("an unregistered criterion must be refused");
+
+        let params = backend
+            .build_search_parameters(
+                &tenant(),
+                "Patient",
+                &[("_lastUpdated".to_string(), "gt2020-01-01".to_string())],
             )
             .expect("criteria build");
 

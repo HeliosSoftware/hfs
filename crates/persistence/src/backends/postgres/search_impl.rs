@@ -69,22 +69,16 @@ fn statement_is_reusable(query: &SearchQuery) -> bool {
 /// an error, never a query the builder has to make something of.
 fn reject_unsupported_metadata_modifier(query: &SearchQuery) -> StorageResult<()> {
     crate::search::reject_unsupported_metadata_modifier(query)?;
-    crate::search::validate_date_values(query)
+    crate::search::validate_date_values(query)?;
+    // And a number or quantity value that is not a number (#1319, #1340).
+    crate::search::validate_numeric_values(query)
 }
 
+/// Refuses what `_contained` matching cannot apply. `:missing` was once the
+/// only such criterion, hence the name; the full rule lives with the builder
+/// it describes (#1363).
 fn reject_contained_missing(query: &SearchQuery) -> StorageResult<()> {
-    if query.contained != crate::types::ContainedMode::Off
-        && query
-            .parameters
-            .iter()
-            .any(|param| matches!(param.modifier, Some(crate::types::SearchModifier::Missing)))
-    {
-        return Err(StorageError::Search(SearchError::QueryParseError {
-            message: "PostgreSQL does not support :missing with _contained=true or both"
-                .to_string(),
-        }));
-    }
-    Ok(())
+    PostgresQueryBuilder::reject_unsupported_contained(query).map_err(StorageError::Search)
 }
 
 /// Decides whether a page can be resolved from `search_index` alone, returning

@@ -9,8 +9,9 @@ builds it: all FHIR versions, all databases, all features (`--all-features`).
 
 From T2 onward every step is performed **by hand in the web UI** (`/ui`). The tester
 does not call the FHIR API with `curl` or any other client; the only command-line
-work is downloading and unpacking the test data, serving it over HTTP, and running
-the tiny webhook receiver that the subscription test needs.
+work is downloading and unpacking the test data, serving it over HTTP (optional for
+the T3 corpus, which is also hosted unpacked in S3 — see 7.1), and running the tiny
+webhook receiver that the subscription test needs.
 
 Legend for result cells: `☐` not run · `✅` pass · `❌` fail (link the issue) ·
 `N/A` not supported on this backend (expected, see [Expected support](#expected-support-by-backend)).
@@ -70,8 +71,8 @@ part of T4.
 | Python 3 with dev headers, `maturin` not required | `--workspace` includes `pysof` (PyO3 cdylib); the build needs a Python interpreter on `PATH` |
 | Docker | Postgres, Elasticsearch, MongoDB, MinIO |
 | `curl`, `jq` | T1 smoke check only; `jq` optionally trims the import manifest in T3 |
-| `tar`, `python3` | unpack the corpora; `python3 -m http.server` serves the corpus to the Import page and runs the webhook receiver in T8 |
-| ~45 GB free disk | corpus (3.6 GB tar.gz, 35 GB extracted) plus SQLite/Postgres data |
+| `tar`, `python3` | unpack the corpora; `python3 -m http.server` serves the corpus to the Import page (unless T3 uses the hosted manifest, 7.1) and runs the webhook receiver in T8 |
+| ~45 GB free disk | corpus (3.6 GB tar.gz, 35 GB extracted) plus SQLite/Postgres data; the corpus share is not needed when T3 uses the hosted manifest (7.1) |
 | A modern browser with JavaScript on | every step from T2 on runs in `/ui`; the Batch / Transaction page needs JavaScript |
 
 Shell conventions used below:
@@ -90,6 +91,7 @@ Test data used from T2 on:
 | Archive | Contents | Used in |
 |---|---|---|
 | <https://hfs-manual-test.s3.us-east-1.amazonaws.com/fhir2.tar.gz> (3.6 GB) | Synthea R4 corpus as NDJSON: 24 files, 18,955,865 resources for 11,704 Massachusetts patients, plus a Bulk Data `manifest.json` | T3 |
+| <https://hfs-manual-test.s3.us-east-1.amazonaws.com/manifest.json> | The same corpus, already unpacked in the S3 bucket: a Bulk Data manifest whose 24 `output` URLs point at the NDJSON files in the bucket. Use it directly as the T3 **Manifest URL** instead of downloading, unpacking, and serving `fhir2.tar.gz` (see 7.1) | T3 (alternative) |
 | <https://hfs-manual-test.s3.us-east-1.amazonaws.com/fhir-batch-import.tar.gz> (187 KB) | Three Synthea Bundles: `hospitalInformation…json` (batch, 9 entries), `practitionerInformation…json` (batch, 8 entries), `Nicky270_Ann985_Larkin917_…json` (transaction, 662 entries) | T2 |
 
 One patient from the corpus is used as the anchor for T4–T8. Its id is stable
@@ -369,9 +371,25 @@ The corpus is a Bulk Data export of 11,704 Synthea patients (18,955,865 resource
 24 NDJSON files) plus a `manifest.json` that references those files at
 `http://localhost:8000/…`. HFS ingests it with the Bulk Data `$bulk-submit`
 operation, driven from the **Import** page, which makes HFS fetch the manifest and
-every file from a small HTTP server you run on port 8000.
+every file from a small HTTP server you run on port 8000 — or, alternatively,
+straight from the S3 bucket, where the archive has already been unpacked.
 
 ### 7.1 Download, unpack, and serve the corpus
+
+**Alternative: use the hosted manifest and skip this section.** `fhir2.tar.gz` has
+been exploded in the S3 bucket: the 24 NDJSON files sit next to a manifest at
+<https://hfs-manual-test.s3.us-east-1.amazonaws.com/manifest.json> whose `output`
+URLs point at the bucket (`https://hfs-manual-test.s3.us-east-1.amazonaws.com/<Type>.ndjson`)
+instead of `http://localhost:8000/…`. The bucket is publicly readable, so no
+authentication is needed. To use it, do not download, unpack, or serve anything:
+go to 7.2 and enter that URL as the **Manifest URL**. The data is identical, so
+every count in 7.4 and T4 is unchanged. Two differences to allow for: the HFS
+process needs outbound internet access and pulls ~35 GB over it (so the elapsed
+time recorded in 7.3 includes the download and is not comparable with a
+locally-served run — note which source was used in the matrix cell), and there is
+no `$WORK/corpus-http.log` to watch in 7.3.
+
+Otherwise, host the corpus locally:
 
 ```bash
 mkdir -p "$WORK/corpus" && cd "$WORK/corpus"
@@ -396,6 +414,19 @@ jq '.output |= map(select(.type | IN("Patient","Encounter","Condition","Observat
    manifest.json > manifest-core.json          # 11,197,644 resources; Observation (7.5 GB) is the bulk of it
 ```
 
+No trimmed manifest is hosted in the bucket. To combine the reduced import with the
+hosted files, run the same `jq` filter over the hosted manifest and serve only the
+resulting small file locally — its `output` URLs still point at S3:
+
+```bash
+mkdir -p "$WORK/corpus" && cd "$WORK/corpus"
+curl -sf https://hfs-manual-test.s3.us-east-1.amazonaws.com/manifest.json \
+  | jq '.output |= map(select(.type | IN("Patient","Encounter","Condition","Observation","Procedure",
+                                         "Organization","Practitioner","PractitionerRole","Location")))' \
+  > manifest-core.json
+python3 -m http.server 8000 --bind 127.0.0.1 > "$WORK/corpus-http.log" 2>&1 &
+```
+
 Whichever manifest is used, the counts in T4 for `Patient`, `Encounter`,
 `Condition`, and `Observation` are unchanged.
 
@@ -409,7 +440,9 @@ Whichever manifest is used, the counts in T4 for `Patient`, `Encounter`,
 3. Fill in:
    - **Submission name**: `synthea-<backend>` (e.g. `synthea-sqlite`).
    - **Manifest URL**: `http://localhost:8000/manifest.json`
-     (or `http://localhost:8000/manifest-core.json` for the reduced import).
+     (or `http://localhost:8000/manifest-core.json` for the reduced import, or
+     `https://hfs-manual-test.s3.us-east-1.amazonaws.com/manifest.json` for the
+     hosted corpus — see 7.1).
    - **Authentication**: leave **None** selected.
    - Leave **Advanced options** collapsed (defaults: submitter
      `urn:helios:hfs:bulk-submit`, format `application/fhir+ndjson`).
@@ -434,7 +467,9 @@ On the detail page verify:
   every 5 s. Its text is the recipient's progress report (or *"Waiting for the
   recipient's first status report…"* right after kick-off).
 - In the HTTP server log (`$WORK/corpus-http.log`) the NDJSON files are being
-  requested one after another.
+  requested one after another. (Not applicable with the hosted manifest: the files
+  come from S3, so the log line quotes the S3 manifest URL and there is no local
+  request log.)
 
 Wait for the status card to change to **Result** → *"Processing finished at …"*,
 **Output files** = 24 (or 9 for the reduced manifest) and **Error files** = 0, the
@@ -1094,8 +1129,9 @@ For each backend row, attach to the release issue:
   are set, as they are in section 5. Without them T3 counts and T4 may lag.
 - **Import page = HFS submitting to itself**: the Data Recipient is `HFS_BASE_URL`,
   and the manifest and files are fetched by the HFS process, so `localhost:8000` must
-  be reachable from it. Re-submitting the same manifest URL for the same submission
-  is refused with `409 … already submitted`.
+  be reachable from it — or, with the hosted manifest (7.1),
+  `hfs-manual-test.s3.us-east-1.amazonaws.com` over outbound HTTPS. Re-submitting
+  the same manifest URL for the same submission is refused with `409 … already submitted`.
 - **Batch / Transaction page needs JavaScript** and is file-upload only (no paste);
   the body limit is `HFS_MAX_BODY_SIZE` (10 MiB by default).
 - **T2 order matters**: the patient transaction fails until the two reference-data

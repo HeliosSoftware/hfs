@@ -385,18 +385,24 @@ impl SearchValue {
     /// letters, which is wrong for every type but number, date and quantity:
     /// `family=nelson` is not `ne` + `lson`, and `code=eq77` is not `eq` +
     /// `77`. This keeps such a value whole, and for the ordered types strips
-    /// every prefix [`SearchPrefix::is_valid_for`] admits — an explicit `eq`
-    /// included, so `eq5.4` is the number `5.4` (#1307).
+    /// any of the nine prefixes — an explicit `eq` included, so `eq5.4` is the
+    /// number `5.4` (#1307).
     ///
-    /// A prefix the type does not admit (`sa`/`eb` on a number) is left in the
-    /// value, as before.
+    /// This is the one implementation of that rule (#1340):
+    /// [`parse_typed_values`](crate::search::parse_typed_values), which types
+    /// the values of REST, chain-resolver and conditional-criteria parameters,
+    /// calls it, as the SQLite and PostgreSQL `resolve_chain` do directly. The
+    /// two used to differ on `sa` / `eb` before a number — stripped there, left
+    /// in the value here, where the backend then read `sa10` as not a number —
+    /// so a chained `sa10` meant something else than a direct one. Every
+    /// backend compares a number under `sa` / `eb` as under `gt` / `lt`, so
+    /// they are stripped.
     pub fn parse_for_type(s: &str, param_type: SearchParamType) -> Self {
-        let (prefix, rest) = SearchPrefix::extract(s);
-        // `extract` reports `Eq` both for an explicit `eq` and for no prefix
-        // at all; `rest` is the whole value in the latter case, so taking it
-        // is right either way.
-        if prefix.is_valid_for(param_type) {
-            Self::new(prefix, rest)
+        if matches!(
+            param_type,
+            SearchParamType::Date | SearchParamType::Number | SearchParamType::Quantity
+        ) {
+            Self::parse(s)
         } else {
             Self::eq(s)
         }
@@ -1161,9 +1167,16 @@ mod tests {
             parsed("eb5.4", T::Quantity),
             (SearchPrefix::Eb, "5.4".to_string())
         );
-        // A prefix the type does not admit stays in the value.
-        assert_eq!(parsed("sa10", T::Number), whole("sa10"));
-        assert_eq!(parsed("eb10", T::Number), whole("eb10"));
+        // As a direct search always has, `sa` / `eb` before a number too:
+        // every backend compares them as `gt` / `lt`.
+        assert_eq!(
+            parsed("sa10", T::Number),
+            (SearchPrefix::Sa, "10".to_string())
+        );
+        assert_eq!(
+            parsed("eb10", T::Number),
+            (SearchPrefix::Eb, "10".to_string())
+        );
     }
 
     #[test]

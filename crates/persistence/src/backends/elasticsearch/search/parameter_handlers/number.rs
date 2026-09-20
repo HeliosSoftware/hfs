@@ -2,12 +2,31 @@
 
 use serde_json::{Value, json};
 
+use crate::search::FhirNumberValue;
 use crate::types::SearchPrefix;
 
 /// Builds an ES query clause for a number search parameter.
+///
+/// Never returns `None` for a value it cannot read. The query builder collects
+/// these clauses with `filter_map`, so `None` does not mean "matches nothing",
+/// it means "no constraint": `probability=abc` used to return every
+/// RiskAssessment (#1319). The search gate (`validate_numeric_values`) rejects
+/// such a value before a query is built; as defence in depth it is
+/// [`match_none`](super::date::match_none) here, under every prefix.
+/// `f64::from_str` used to stand here too, and took `inf` and `nan`, so
+/// `ltinf` matched every indexed row (#1340).
 pub fn build_clause(name: &str, value: &str, prefix: SearchPrefix) -> Option<Value> {
-    let num: f64 = value.parse().ok()?;
-    let implicit_precision = implicit_range(value);
+    let number = match FhirNumberValue::parse(value) {
+        Ok(number) => number,
+        Err(error) => {
+            tracing::warn!(
+                "unvalidated number search value reached the Elasticsearch handler: {error}"
+            );
+            return Some(super::date::match_none());
+        }
+    };
+    let num = number.value;
+    let implicit_precision = implicit_range(number.text());
 
     let range_condition = match prefix {
         SearchPrefix::Eq => {
@@ -104,12 +123,7 @@ pub fn build_clause(name: &str, value: &str, prefix: SearchPrefix) -> Option<Val
 /// "100.0" has implicit precision of 0.05
 /// "100.00" has implicit precision of 0.005
 pub(crate) fn implicit_range(value: &str) -> f64 {
-    if let Some(dot_pos) = value.find('.') {
-        let decimal_places = value.len() - dot_pos - 1;
-        0.5 * 10.0_f64.powi(-(decimal_places as i32))
-    } else {
-        0.5
-    }
+    crate::search::implicit_precision(value) / 2.0
 }
 
 #[cfg(test)]
@@ -162,5 +176,32 @@ mod tests {
         let plain = build_clause("length", "60", SearchPrefix::Gt).unwrap();
         let trailing_zero = build_clause("length", "60.0", SearchPrefix::Gt).unwrap();
         assert_eq!(plain, trailing_zero);
+    }
+
+    /// The `filter_map` trap (#1319): `None` from here does not mean "matches
+    /// nothing", it means "no constraint". A value that is not a number — by
+    /// the shared grammar, so `inf` and `nan` included (#1340) — must be a
+    /// clause, and one that matches nothing, under every prefix.
+    #[test]
+    fn a_value_that_is_not_a_number_is_match_none_never_none() {
+        for prefix in [
+            SearchPrefix::Eq,
+            SearchPrefix::Ne,
+            SearchPrefix::Gt,
+            SearchPrefix::Lt,
+            SearchPrefix::Ge,
+            SearchPrefix::Le,
+            SearchPrefix::Ap,
+        ] {
+            for raw in [
+                "abc", "", "1e", "inf", "-inf", "Infinity", "nan", "NaN", "1e999", "0x10",
+            ] {
+                assert_eq!(
+                    build_clause("probability", raw, prefix),
+                    Some(json!({ "match_none": {} })),
+                    "{prefix:?} {raw:?}"
+                );
+            }
+        }
     }
 }

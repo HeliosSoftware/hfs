@@ -7,11 +7,12 @@
 use chrono::{DateTime, Utc};
 
 use crate::backends::postgres::schema::IndexLayout;
+use crate::error::SearchError;
 use crate::search::fold_text;
 use crate::search::{DatePredicate, FhirDateValue, StorageResolution};
 use crate::types::{
-    CompartmentMembership, SearchModifier, SearchParamType, SearchParameter, SearchPrefix,
-    SearchQuery, SearchValue, strip_reference_version,
+    CompartmentMembership, ContainedMode, SearchModifier, SearchParamType, SearchParameter,
+    SearchPrefix, SearchQuery, SearchValue, strip_reference_version,
 };
 
 /// Returns the implicit precision of a decimal search value from its string form
@@ -176,70 +177,31 @@ fn numeric_predicate(
 /// Parses the number part of a `number` or `quantity` search value (prefix
 /// already split off), or returns `None` when it is not a finite decimal.
 ///
-/// Accepted: an optional sign, then digits with an optional fraction, then an
-/// optional exponent — `5`, `-5.4`, `+5.4`, `007`, `1e3`, `1.5E-2`. That is
-/// the FHIR `decimal` grammar
-/// (`-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?`) read as widely as is
-/// still unambiguous: a leading `+`, leading zeros and a bare leading or
-/// trailing point (`.5`, `5.`) are tolerated, because a false rejection turns a
-/// working search into an empty one.
-///
-/// Rejected: everything else `f64::from_str` would take — `inf`, `infinity`,
-/// `nan` in any case — plus a literal that overflows to infinity (`1e999`),
-/// surrounding whitespace and the empty string. The non-finite values are not
-/// just invalid, they widen: `value_number < 'Infinity'` is true of every row,
-/// and Postgres orders `NaN` above every number, so `lt`/`le`/`ne` with `nan`
-/// would match everything.
+/// The grammar is the one every backend shares,
+/// [`FhirNumberValue`](crate::search::FhirNumberValue): an optional sign,
+/// digits with an optional fraction, an optional exponent, finite once parsed.
+/// It began here (#1319) and moved there (#1340); see that module for the
+/// leniencies and for why `inf`, `nan` and `1e999` are rejected — as a bound
+/// they are not just invalid, they widen: `value_number < 'Infinity'` is true
+/// of every row, and Postgres orders `NaN` above every number, so
+/// `lt`/`le`/`ne` with `nan` would match everything.
 pub(crate) fn parse_search_number(raw: &str) -> Option<f64> {
-    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
-    let unsigned = raw.strip_prefix(['+', '-']).unwrap_or(raw);
-    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
-        Some((mantissa, exponent)) => (mantissa, Some(exponent)),
-        None => (unsigned, None),
-    };
-    if let Some(exponent) = exponent {
-        let exponent = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
-        if exponent.is_empty() || !digits(exponent) {
-            return None;
-        }
-    }
-    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-    if (whole.is_empty() && fraction.is_empty()) || !digits(whole) || !digits(fraction) {
-        return None;
-    }
-    raw.parse::<f64>().ok().filter(|n| n.is_finite())
+    crate::search::FhirNumberValue::parse(raw)
+        .ok()
+        .map(|number| number.value)
 }
 
-/// Splits a `quantity` search value — `number`, `number|code` or
-/// `number|system|code`, prefix already split off — into its number part,
-/// system and code. An empty system or code is `None`.
-///
-/// Only an *unescaped* `|` separates; `\|` is a literal pipe inside a part and
-/// is unescaped here (the REST layer leaves `\|` intact for this purpose — see
-/// `split_unescaped_commas`). Anything after the second separator belongs to
-/// the code.
-fn split_quantity_value(raw: &str) -> (String, Option<String>, Option<String>) {
-    let mut parts: Vec<String> = vec![String::new()];
-    let mut chars = raw.chars().peekable();
-    while let Some(c) = chars.next() {
-        let last = parts.len() - 1;
-        match c {
-            '\\' if chars.peek() == Some(&'|') => {
-                chars.next();
-                parts[last].push('|');
-            }
-            '|' if parts.len() < 3 => parts.push(String::new()),
-            _ => parts[last].push(c),
-        }
-    }
-    let mut parts = parts.into_iter();
-    let number = parts.next().unwrap_or_default();
-    let non_empty = |s: String| (!s.is_empty()).then_some(s);
-    match (parts.next(), parts.next()) {
-        (Some(system), Some(code)) => (number, non_empty(system), non_empty(code)),
-        (Some(code), None) => (number, None, non_empty(code)),
-        _ => (number, None, None),
-    }
+/// `None` for a number or quantity value the shared grammar refused. The search
+/// gate (`validate_numeric_values`) rejects such a value before a query is
+/// built, so reaching this is worth a warning.
+fn unvalidated<T>(parsed: Result<T, crate::search::NumberValueError>) -> Option<T> {
+    parsed
+        .inspect_err(|error| {
+            tracing::warn!(
+                "unvalidated number search value reached the PostgreSQL builder: {error}"
+            )
+        })
+        .ok()
 }
 
 /// Builds the comparison of one `number` search value (prefix already split
@@ -260,9 +222,9 @@ pub(crate) fn number_predicate(
     raw: &str,
     next: &mut usize,
 ) -> Option<(String, Vec<SqlParam>)> {
-    let num = parse_search_number(raw)?;
-    let (lo, hi) = crate::search::implicit_range(num, raw);
-    Some(numeric_predicate(col, prefix, num, lo, hi, next))
+    let number = unvalidated(crate::search::FhirNumberValue::parse(raw))?;
+    let (lo, hi) = number.implicit_range();
+    Some(numeric_predicate(col, prefix, number.value, lo, hi, next))
 }
 
 /// Builds the comparison of one `quantity` search value —
@@ -292,14 +254,15 @@ pub(crate) fn quantity_predicate(
         *next
     }
 
-    // Parse quantity: number|system|code (or number|code, or number).
-    let (num_str, system, code) = split_quantity_value(raw_value);
-    let (num_str, system, code) = (num_str.as_str(), system.as_deref(), code.as_deref());
-    let num = parse_search_number(num_str)?;
+    // Parse quantity: number|system|code (or number|code, or number), by the
+    // grammar every backend shares — only an unescaped `|` separates.
+    let quantity = unvalidated(crate::search::FhirQuantityValue::parse(raw_value))?;
+    let (num_str, num) = (quantity.number.text(), quantity.number.value);
+    let (system, code) = (quantity.system.as_deref(), quantity.code.as_deref());
 
     // Raw branch: value comparison (exact for comparators, implicit-precision
     // range for eq/ne) + the stored unit/system.
-    let (lo, hi) = crate::search::implicit_range(num, num_str);
+    let (lo, hi) = quantity.number.implicit_range();
     let (mut raw, mut params) = numeric_predicate(
         &format!("{table}value_quantity_value"),
         prefix,
@@ -726,16 +689,34 @@ impl PostgresQueryBuilder {
     ///
     /// Returns SQL selecting `(resource_type, resource_id, contained_local_id)`
     /// from `search_index` for contained resources (`is_contained = TRUE`) of the
-    /// searched type (`contained_type = $2`) matching every standard parameter,
+    /// searched type (`contained_type = $2`) matching every parameter,
     /// keyed on the contained entity `(resource_id, contained_local_id)` via
     /// `GROUP BY ... HAVING COUNT(DISTINCT param_name) >= n`. Value predicates are
     /// the bare column conditions shared with composite-component matching.
     ///
+    /// Each occurrence of a parameter is its own AND-ed branch (values within an
+    /// occurrence are ORed). Counting distinct names only proves every branch
+    /// matched while the names are distinct, so once a name repeats
+    /// (`date=ge2020&date=le2020`) the `HAVING` instead requires each branch
+    /// with `bool_or(<branch>)`, on the same contained entity. `:not` is the
+    /// same aggregate required not to hold — "no row of this entity matches" —
+    /// which needs every row of the entity, so the row filter in `WHERE` is
+    /// left out when one is present (#1363).
+    ///
+    /// `_id` is the contained resource's local id, a column of every row (the
+    /// writer drops the `_id` rows themselves), and narrows the rows directly.
+    /// `_tag`, `_profile`, `_security`, `_source` and `_language` are indexed
+    /// from the contained resource's own `meta` like any other parameter. What
+    /// the contained rows cannot answer is refused by
+    /// [`Self::reject_unsupported_contained`], which every caller runs first;
+    /// this function skips those parameters.
+    ///
     /// Param layout: `$1` = tenant, `$2` = contained type, then value params.
-    /// Returns `None` when no standard parameter contributes a condition
-    /// (special `_`-params and composites are not applied to contained matching).
+    /// Returns `None` when no parameter contributes a condition.
     pub fn build_contained(query: &SearchQuery) -> Option<SqlFragment> {
-        let mut branches: Vec<String> = Vec::new();
+        // (branch, negated)
+        let mut branches: Vec<(String, bool)> = Vec::new();
+        let mut entity_filters: Vec<String> = Vec::new();
         let mut params: Vec<SqlParam> = Vec::new();
         let mut distinct_names: std::collections::HashSet<String> =
             std::collections::HashSet::new();
@@ -743,12 +724,24 @@ impl PostgresQueryBuilder {
         let mut offset = 2;
 
         for param in &query.parameters {
-            if param.name.starts_with('_')
-                || matches!(
-                    param.param_type,
-                    SearchParamType::Composite | SearchParamType::Special
-                )
-            {
+            if Self::contained_unsupported_reason(param).is_some() || param.values.is_empty() {
+                continue;
+            }
+
+            if param.name == "_id" {
+                let placeholders: Vec<String> = param
+                    .values
+                    .iter()
+                    .map(|value| {
+                        params.push(SqlParam::text(&value.value));
+                        offset += 1;
+                        format!("${offset}")
+                    })
+                    .collect();
+                entity_filters.push(format!(
+                    "contained_local_id IN ({})",
+                    placeholders.join(", ")
+                ));
                 continue;
             }
 
@@ -784,26 +777,127 @@ impl PostgresQueryBuilder {
             if or_parts.is_empty() {
                 continue;
             }
-            branches.push(format!(
-                "(param_name = '{}' AND ({}))",
-                param.name,
-                or_parts.join(" OR ")
+            branches.push((
+                format!(
+                    "(param_name = '{}' AND ({}))",
+                    param.name,
+                    or_parts.join(" OR ")
+                ),
+                matches!(param.modifier, Some(SearchModifier::Not)),
             ));
             distinct_names.insert(param.name.clone());
         }
 
-        if branches.is_empty() {
+        if branches.is_empty() && entity_filters.is_empty() {
             return None;
         }
-        let sql = format!(
+
+        let any_negated = branches.iter().any(|(_, negated)| *negated);
+        let mut sql = String::from(
             "SELECT resource_type, resource_id, contained_local_id FROM search_index \
-             WHERE tenant_id = $1 AND is_contained = TRUE AND contained_type = $2 AND ({}) \
-             GROUP BY resource_type, resource_id, contained_local_id \
-             HAVING COUNT(DISTINCT param_name) >= {}",
-            branches.join(" OR "),
-            distinct_names.len()
+             WHERE tenant_id = $1 AND is_contained = TRUE AND contained_type = $2",
         );
+        for filter in &entity_filters {
+            sql.push_str(&format!(" AND {filter}"));
+        }
+        if !branches.is_empty() && !any_negated {
+            let positive: Vec<&str> = branches.iter().map(|(b, _)| b.as_str()).collect();
+            sql.push_str(&format!(" AND ({})", positive.join(" OR ")));
+        }
+        sql.push_str(" GROUP BY resource_type, resource_id, contained_local_id");
+        if !branches.is_empty() {
+            let having = if !any_negated && distinct_names.len() == branches.len() {
+                format!("COUNT(DISTINCT param_name) >= {}", distinct_names.len())
+            } else {
+                // A repeated name or a negation: one row can satisfy only some
+                // of the branches, so state each. The placeholders are reused,
+                // not rebound.
+                branches
+                    .iter()
+                    .map(|(branch, negated)| {
+                        if *negated {
+                            format!("bool_or{branch} IS NOT TRUE")
+                        } else {
+                            format!("bool_or{branch}")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" AND ")
+            };
+            sql.push_str(&format!(" HAVING {having}"));
+        }
         Some(SqlFragment::with_params(sql, params))
+    }
+
+    /// Why `_contained` matching cannot apply `param`, if it cannot.
+    ///
+    /// The contained rows of `search_index` hold what the extractor found in
+    /// the contained resource itself, one row per value. That answers every
+    /// ordinary parameter, the `meta`-derived `_`-parameters and — through
+    /// `contained_local_id` — `_id`. It does not answer:
+    ///
+    /// - `_lastUpdated`: a contained resource has no `meta.lastUpdated` of its
+    ///   own, and the container's is not on these rows;
+    /// - `_text`, `_content` and the other `_`-parameters that are resolved
+    ///   against `resources` or `resource_fts`, which only know the container;
+    /// - composites, which the writer leaves unfolded on contained rows and
+    ///   `build_contained` does not pair up, and chains, which it does not
+    ///   follow;
+    /// - any modifier but `:not`. The value predicates here are the bare column
+    ///   conditions of `build_composite_component`, which takes no modifier;
+    ///   the modifier-aware builders all wrap their predicate in a top-level
+    ///   `id IN (…)`. Until those are split, `:exact`, `:contains`, `:text`,
+    ///   `:of-type`, … are refused rather than read as a plain match.
+    ///   `:missing` has been refused here since it was introduced.
+    fn contained_unsupported_reason(param: &SearchParameter) -> Option<String> {
+        if !param.chain.is_empty() {
+            return Some("chained parameters are".to_string());
+        }
+        if param.name == "_id" {
+            return param
+                .modifier
+                .as_ref()
+                .map(|m| format!("the ':{m}' modifier on _id is"));
+        }
+        if param.name.starts_with('_')
+            && !matches!(
+                param.name.as_str(),
+                "_tag" | "_profile" | "_security" | "_source" | "_language"
+            )
+        {
+            return Some("this parameter is".to_string());
+        }
+        match (&param.modifier, param.param_type) {
+            (_, SearchParamType::Composite) => Some("composite parameters are".to_string()),
+            (_, SearchParamType::Special) => Some("special parameters are".to_string()),
+            (None | Some(SearchModifier::Not), _) => None,
+            (Some(m), _) => Some(format!("the ':{m}' modifier is")),
+        }
+    }
+
+    /// Refuses a `_contained=true|both` search carrying a criterion
+    /// [`Self::build_contained`] cannot apply, naming it (#1363). Such
+    /// criteria used to be skipped — or, for a modifier, read as a plain
+    /// match — so the search answered a different question than the one
+    /// asked. A no-op for `_contained=false`.
+    pub fn reject_unsupported_contained(query: &SearchQuery) -> Result<(), SearchError> {
+        if query.contained == ContainedMode::Off {
+            return Ok(());
+        }
+        for param in &query.parameters {
+            if let Some(reason) = Self::contained_unsupported_reason(param) {
+                let message = format!(
+                    "search parameter '{}' cannot be combined with _contained=true or both: \
+                     {reason} not supported for contained resources on PostgreSQL",
+                    param.name
+                );
+                return Err(match param.param_type {
+                    SearchParamType::Composite => SearchError::InvalidComposite { message },
+                    _ => SearchError::QueryParseError { message },
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Builds an `ORDER BY` clause from the query's `_sort` directives.
@@ -1976,13 +2070,17 @@ impl PostgresQueryBuilder {
                 ))
             }
             SearchParamType::Quantity => {
-                let parts: Vec<&str> = value.value.splitn(3, '|').collect();
-                // As for Number: `FALSE`, never `None` (#1319).
-                let Some(num) = parts.first().and_then(|s| parse_search_number(s)) else {
+                // As for Number: `FALSE`, never `None` (#1319). Split by the
+                // shared grammar, so an escaped `|` stays in the code and the
+                // `number|code` shorthand names a code here too.
+                let Some(quantity) =
+                    unvalidated(crate::search::FhirQuantityValue::parse(&value.value))
+                else {
                     return Some((match_nothing().sql, Vec::new()));
                 };
+                let num = quantity.number.value;
                 let op = Self::prefix_to_operator(&value.prefix);
-                if parts.len() >= 3 {
+                if let Some(code) = quantity.code.as_deref() {
                     Some((
                         format!(
                             "value_quantity_value {} ${} AND value_quantity_unit = ${}",
@@ -1990,7 +2088,7 @@ impl PostgresQueryBuilder {
                             offset + 1,
                             offset + 2
                         ),
-                        vec![SqlParam::Float(num), SqlParam::text(parts[2])],
+                        vec![SqlParam::Float(num), SqlParam::text(code)],
                     ))
                 } else {
                     Some((
@@ -3785,6 +3883,152 @@ mod tests {
         assert!(frag.params.is_empty(), "{:?}", frag.params);
     }
 
+    #[test]
+    fn contained_distinct_names_count_names() {
+        // Distinct names: the name count proves every branch matched, and the
+        // SQL is what it was before occurrences were told apart (#1336).
+        let query = SearchQuery::new("Observation")
+            .with_parameter(token_param("code", None, "X"))
+            .with_parameter(date_param("date", SearchPrefix::Ge, "2020-01-01"));
+        let frag = PostgresQueryBuilder::build_contained(&query).unwrap();
+
+        assert!(
+            frag.sql.ends_with("HAVING COUNT(DISTINCT param_name) >= 2"),
+            "{}",
+            frag.sql
+        );
+        assert!(!frag.sql.contains("bool_or"), "{}", frag.sql);
+    }
+
+    #[test]
+    fn contained_repeated_name_requires_every_occurrence() {
+        // `code=X&date=ge2020-01-01&date=le2020-12-31,2019`: a name count of 2
+        // is met by a contained resource matching only one date bound (#1336).
+        let mut upper = date_param("date", SearchPrefix::Le, "2020-12-31");
+        upper
+            .values
+            .push(SearchValue::new(SearchPrefix::Eq, "2019"));
+        let query = SearchQuery::new("Observation")
+            .with_parameter(token_param("code", None, "X"))
+            .with_parameter(date_param("date", SearchPrefix::Ge, "2020-01-01"))
+            .with_parameter(upper);
+        let frag = PostgresQueryBuilder::build_contained(&query).unwrap();
+
+        let (filter, having) = frag.sql.split_once(" HAVING ").expect("a HAVING clause");
+        assert!(!having.contains("COUNT("), "{having}");
+        let required: Vec<&str> = having.split(" AND bool_or(").collect();
+        assert_eq!(required.len(), 3, "one bool_or per occurrence: {having}");
+        assert!(required[0].starts_with("bool_or(param_name = 'code'"));
+        assert!(required[1].starts_with("param_name = 'date'"), "{having}");
+        assert!(required[2].starts_with("param_name = 'date'"), "{having}");
+        // The comma list stays a disjunction inside its own occurrence.
+        assert!(!required[1].contains(" OR "), "{having}");
+        assert!(required[2].contains(" OR "), "{having}");
+
+        // HAVING re-reads the WHERE placeholders: gap-free from $3, none new.
+        let in_filter = placeholders(filter);
+        let mut expected: Vec<usize> = vec![1, 2];
+        expected.extend(3..3 + frag.params.len());
+        assert_eq!(in_filter, expected, "{}", frag.sql);
+        assert_eq!(placeholders(having), in_filter[2..], "{}", frag.sql);
+    }
+
+    fn contained_query(parameters: Vec<SearchParameter>) -> SearchQuery {
+        let mut query = SearchQuery::new("Observation");
+        query.contained = ContainedMode::On;
+        query.parameters = parameters;
+        query
+    }
+
+    #[test]
+    fn contained_negation_is_decided_over_every_row_of_the_entity() {
+        // `:not` means "no row of this contained resource matches", which a
+        // WHERE row filter would make unanswerable (#1363).
+        let query = contained_query(vec![
+            token_param("code", None, "X"),
+            token_param("category", Some(SearchModifier::Not), "cat1"),
+        ]);
+        assert!(PostgresQueryBuilder::reject_unsupported_contained(&query).is_ok());
+        let frag = PostgresQueryBuilder::build_contained(&query).unwrap();
+
+        let (filter, having) = frag.sql.split_once(" HAVING ").expect("a HAVING clause");
+        assert!(!filter.contains("param_name"), "{filter}");
+        assert_eq!(
+            having,
+            "bool_or(param_name = 'code' AND (value_token_code = $3)) AND \
+             bool_or(param_name = 'category' AND (value_token_code = $4)) IS NOT TRUE"
+        );
+        assert_eq!(frag.params.len(), 2);
+    }
+
+    #[test]
+    fn contained_id_is_the_local_id_and_needs_no_other_criterion() {
+        let mut id = token_param("_id", None, "a");
+        id.values.push(SearchValue::new(SearchPrefix::Eq, "b"));
+        let frag =
+            PostgresQueryBuilder::build_contained(&contained_query(vec![id.clone()])).unwrap();
+        assert!(
+            frag.sql.ends_with(
+                "contained_type = $2 AND contained_local_id IN ($3, $4) \
+                 GROUP BY resource_type, resource_id, contained_local_id"
+            ),
+            "{}",
+            frag.sql
+        );
+
+        // Beside a value parameter the numbering carries on after the ids.
+        let frag = PostgresQueryBuilder::build_contained(&contained_query(vec![
+            id,
+            token_param("_tag", None, "foo"),
+        ]))
+        .unwrap();
+        assert_eq!(placeholders(&frag.sql), vec![1, 2, 3, 4, 5]);
+        assert_eq!(frag.params.len(), 3);
+        assert!(
+            frag.sql
+                .contains("(param_name = '_tag' AND (value_token_code = $5))")
+                && frag.sql.ends_with("HAVING COUNT(DISTINCT param_name) >= 1"),
+            "{}",
+            frag.sql
+        );
+    }
+
+    #[test]
+    fn contained_refuses_what_it_cannot_apply_by_name() {
+        let mut chained = reference_param("subject", None, "x");
+        chained.chain = vec![crate::types::ChainedParameter {
+            reference_param: "subject".to_string(),
+            target_type: Some("Patient".to_string()),
+            target_param: "name".to_string(),
+        }];
+        let mut exact = token_param("value-string", Some(SearchModifier::Exact), "hello");
+        exact.param_type = SearchParamType::String;
+        let refused = [
+            date_param("_lastUpdated", SearchPrefix::Gt, "2020"),
+            special_param("_text", vec![SearchValue::new(SearchPrefix::Eq, "x")]),
+            token_param("_id", Some(SearchModifier::Not), "a"),
+            composite_param("code-value-quantity", "X$5"),
+            // The bare column predicates take no modifier: before #1363 these
+            // were read as a plain match.
+            token_param("code", Some(SearchModifier::Text), "glucose"),
+            token_param("code", Some(SearchModifier::Missing), "true"),
+            exact,
+            chained,
+        ];
+        for param in refused {
+            let name = param.name.clone();
+            let mut query = contained_query(vec![token_param("status", None, "final"), param]);
+            let error = PostgresQueryBuilder::reject_unsupported_contained(&query)
+                .expect_err(&name)
+                .to_string();
+            assert!(error.contains(&format!("'{name}'")), "{error}");
+
+            // The same query without `_contained` is none of this gate's business.
+            query.contained = ContainedMode::Off;
+            assert!(PostgresQueryBuilder::reject_unsupported_contained(&query).is_ok());
+        }
+    }
+
     /// Values that reach the number and quantity builders but are not numbers:
     /// free text, a dangling exponent, a bare prefix remainder, a number with a
     /// tail — and the words `f64::from_str` takes for non-finite values.
@@ -3835,41 +4079,17 @@ mod tests {
         for input in NOT_NUMBERS {
             assert_eq!(parse_search_number(input), None, "input {input:?}");
         }
-        // Parses as a float but overflows to infinity; whitespace; doubled
-        // signs; a second point; digit separators.
+        // Surrounding whitespace is trimmed by the shared grammar: `gt+5`
+        // arrives form-decoded as `gt 5`.
+        assert_eq!(parse_search_number(" 5 "), Some(5.0));
+        // Parses as a float but overflows to infinity; inner whitespace;
+        // doubled signs; a second point; digit separators.
         for input in [
-            "1e999", "-1e999", " 5", "5 ", "--5", "+-5", "1.2.3", "1e5.5", "1_000", "infinity",
+            "1e999", "-1e999", "5 4", "- 5", "--5", "+-5", "1.2.3", "1e5.5", "1_000", "infinity",
             "nan", "+inf",
         ] {
             assert_eq!(parse_search_number(input), None, "input {input:?}");
         }
-    }
-
-    #[test]
-    fn split_quantity_value_honors_escaped_pipes() {
-        let split = |raw: &str| {
-            let (n, s, c) = split_quantity_value(raw);
-            (n, s.unwrap_or_default(), c.unwrap_or_default())
-        };
-        let own = |n: &str, s: &str, c: &str| (n.to_string(), s.to_string(), c.to_string());
-
-        assert_eq!(split("5.4"), own("5.4", "", ""));
-        assert_eq!(split("5.4|mg"), own("5.4", "", "mg"));
-        assert_eq!(split("5.4||mg"), own("5.4", "", "mg"));
-        assert_eq!(
-            split("5.4|http://unitsofmeasure.org|mg"),
-            own("5.4", "http://unitsofmeasure.org", "mg")
-        );
-        assert_eq!(split("5.4|http://x|"), own("5.4", "http://x", ""));
-        assert_eq!(split("|http://x|mg"), own("", "http://x", "mg"));
-        // `\|` is a literal pipe, in either position.
-        assert_eq!(split("5.4|http://x|a\\|b"), own("5.4", "http://x", "a|b"));
-        assert_eq!(split("5.4|a\\|b"), own("5.4", "", "a|b"));
-        assert_eq!(split("5.4|s\\|t|mg"), own("5.4", "s|t", "mg"));
-        // Anything after the second separator stays in the code; other
-        // backslashes are left alone.
-        assert_eq!(split("5.4|s|a|b"), own("5.4", "s", "a|b"));
-        assert_eq!(split("5.4||a\\b"), own("5.4", "", "a\\b"));
     }
 
     #[test]

@@ -58,7 +58,9 @@ fn unavailable_error(message: String) -> crate::error::StorageError {
 /// an error, never a query the builder has to make something of.
 fn reject_unsupported_metadata_modifier(query: &SearchQuery) -> StorageResult<()> {
     crate::search::reject_unsupported_metadata_modifier(query)?;
-    crate::search::validate_date_values(query)
+    crate::search::validate_date_values(query)?;
+    // And a number or quantity value that is not a number (#1319, #1340).
+    crate::search::validate_numeric_values(query)
 }
 
 /// Maximum retry attempts for transient ES search failures (in addition to the
@@ -178,6 +180,34 @@ fn classify_es_failure(status: u16, body: &str) -> EsFailureClass {
     }
 }
 
+/// Whether a non-success response says the index does not exist.
+///
+/// Read from the parsed error — a `404` whose error (or one of its root
+/// causes) is an `index_not_found_exception` — not from a substring of the
+/// body or from the bare status: a `404` from anything else on the way to the
+/// cluster (a proxy, a wrong base path) is not a statement that the data set
+/// is empty, and a query value that happens to contain the exception's name is
+/// echoed back inside other errors. Substring matching on these bodies is what
+/// #1294 was.
+fn is_index_not_found(status: u16, body: &str) -> bool {
+    const INDEX_NOT_FOUND: &str = "index_not_found_exception";
+    if status != 404 {
+        return false;
+    }
+    let Ok(parsed) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    let Some(error) = parsed.get("error") else {
+        return false;
+    };
+    let is_not_found = |e: &Value| e.get("type").and_then(Value::as_str) == Some(INDEX_NOT_FOUND);
+    is_not_found(error)
+        || error
+            .get("root_cause")
+            .and_then(Value::as_array)
+            .is_some_and(|causes| causes.iter().any(is_not_found))
+}
+
 /// The error for a query Elasticsearch rejected as malformed.
 ///
 /// REST renders `QueryParseError` as a `400` with the message verbatim, so the
@@ -219,18 +249,83 @@ enum SearchAttempt {
     Permanent(crate::error::StorageError),
 }
 
-/// Sends a single ES search request and classifies the response.
+/// The read APIs that share one attempt/retry/classify path, so a count can
+/// never again be handled more loosely than the search it belongs to (#1335),
+/// nor a storage-side read more loosely than a search-side one (#1364).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReadOp<'a> {
+    /// `POST {index}/_search`.
+    Search,
+    /// `POST {index}/_count`.
+    Count,
+    /// `GET {index}/_doc/{doc_id}`; the request body is not sent.
+    Get { doc_id: &'a str },
+}
+
+impl ReadOp<'_> {
+    /// Lower-case name, as it appears in log lines.
+    fn name(self) -> &'static str {
+        match self {
+            ReadOp::Search => "search",
+            ReadOp::Count => "count",
+            ReadOp::Get { .. } => "get",
+        }
+    }
+
+    /// Capitalised name, as it starts an error message.
+    fn title(self) -> &'static str {
+        match self {
+            ReadOp::Search => "Search",
+            ReadOp::Count => "Count",
+            ReadOp::Get { .. } => "Get",
+        }
+    }
+}
+
+/// Whether a `404` is Elasticsearch saying "this index exists and has no
+/// document with that id": the get API answers exactly that with
+/// `"found": false`. As with [`is_index_not_found`], the bare status proves
+/// nothing — a proxy or a wrong base path answers `404` too, and "this resource
+/// does not exist" is a claim only the cluster can make (#1364).
+fn is_document_not_found(status: u16, body: &str) -> bool {
+    status == 404
+        && serde_json::from_str::<Value>(body)
+            .is_ok_and(|parsed| parsed.get("found").and_then(Value::as_bool) == Some(false))
+}
+
+/// Sends a single ES search (or count, or get) request and classifies the
+/// response.
 async fn send_search_once(
     backend: &ElasticsearchBackend,
+    op: ReadOp<'_>,
     index: &str,
     body: Value,
 ) -> SearchAttempt {
-    let response = backend
-        .client()
-        .search(SearchParts::Index(&[index]))
-        .body(body)
-        .send()
-        .await;
+    let response = match op {
+        ReadOp::Search => {
+            backend
+                .client()
+                .search(SearchParts::Index(&[index]))
+                .body(body)
+                .send()
+                .await
+        }
+        ReadOp::Count => {
+            backend
+                .client()
+                .count(elasticsearch::CountParts::Index(&[index]))
+                .body(body)
+                .send()
+                .await
+        }
+        ReadOp::Get { doc_id } => {
+            backend
+                .client()
+                .get(elasticsearch::GetParts::IndexId(index, doc_id))
+                .send()
+                .await
+        }
+    };
 
     let response = match response {
         Ok(r) => r,
@@ -240,7 +335,11 @@ async fn send_search_once(
             // (see `SearchAttempt::Unreachable`), but never report it as an
             // empty index — that would silently turn "Elasticsearch is down"
             // into "this patient has no matching records".
-            tracing::warn!("ES search request failed at the transport layer: {}", e);
+            tracing::warn!(
+                "ES {} request failed at the transport layer: {}",
+                op.name(),
+                e
+            );
             return SearchAttempt::Unreachable(e.to_string());
         }
     };
@@ -249,7 +348,8 @@ async fn send_search_once(
         return match response.json::<Value>().await {
             Ok(v) => SearchAttempt::Body(v),
             Err(e) => SearchAttempt::Permanent(internal_error(format!(
-                "Failed to parse search response: {}",
+                "Failed to parse {} response: {}",
+                op.name(),
                 e
             ))),
         };
@@ -258,7 +358,12 @@ async fn send_search_once(
     let status = response.status_code().as_u16();
     let resp_body = response.text().await.unwrap_or_default();
 
-    if resp_body.contains("index_not_found_exception") {
+    if is_index_not_found(status, &resp_body) {
+        return SearchAttempt::EmptyIndex;
+    }
+    // For a get, a document missing from an existing index is the same answer
+    // as a missing index: nothing is stored there.
+    if matches!(op, ReadOp::Get { .. }) && is_document_not_found(status, &resp_body) {
         return SearchAttempt::EmptyIndex;
     }
 
@@ -268,10 +373,11 @@ async fn send_search_once(
             body: resp_body,
         },
         EsFailureClass::BadQuery => {
-            SearchAttempt::Permanent(bad_query_error("search", status, &resp_body))
+            SearchAttempt::Permanent(bad_query_error(op.name(), status, &resp_body))
         }
         EsFailureClass::Permanent => SearchAttempt::Permanent(internal_error(format!(
-            "Search failed (status {status}): {resp_body}"
+            "{} failed (status {status}): {resp_body}",
+            op.title()
         ))),
     }
 }
@@ -318,10 +424,24 @@ async fn send_search_with_retry(
     index: &str,
     body: Value,
 ) -> StorageResult<Option<Value>> {
+    send_read_with_retry(backend, ReadOp::Search, index, body).await
+}
+
+/// [`send_search_with_retry`] for any read API; `search_count` is the
+/// `ReadOp::Count` caller here, and the storage-side reads in `storage.rs`
+/// (`count`, `read`, the `create_or_update` existence check, the
+/// `ReindexSource` reads) go through it too (#1364). For `ReadOp::Get`,
+/// `Ok(None)` also covers a document that is not in an existing index.
+pub(super) async fn send_read_with_retry(
+    backend: &ElasticsearchBackend,
+    op: ReadOp<'_>,
+    index: &str,
+    body: Value,
+) -> StorageResult<Option<Value>> {
     let mut last_failure: Option<RetryableFailure> = None;
 
     for attempt in 0..=MAX_SEARCH_RETRIES {
-        let failure = match send_search_once(backend, index, body.clone()).await {
+        let failure = match send_search_once(backend, op, index, body.clone()).await {
             SearchAttempt::Body(v) => return Ok(Some(v)),
             SearchAttempt::EmptyIndex => return Ok(None),
             SearchAttempt::Permanent(e) => return Err(e),
@@ -338,7 +458,8 @@ async fn send_search_with_retry(
                 max = MAX_SEARCH_RETRIES + 1,
                 delay_ms,
                 index,
-                "Retryable ES search failure, retrying"
+                "Retryable ES {} failure, retrying",
+                op.name()
             );
             sleep(Duration::from_millis(delay_ms)).await;
         }
@@ -352,7 +473,8 @@ async fn send_search_with_retry(
                 "Elasticsearch unreachable after {attempts} attempts: {message}"
             )),
             RetryableFailure::Transient { status, body } => internal_error(format!(
-                "Search failed after {attempts} attempts (status {status}): {body}"
+                "{} failed after {attempts} attempts (status {status}): {body}",
+                op.title()
             )),
         },
     )
@@ -649,39 +771,18 @@ impl SearchProvider for ElasticsearchBackend {
 
         let count_body = build_count_query(tenant_id, resource_type, query);
 
-        let response = self
-            .client()
-            .count(elasticsearch::CountParts::Index(&[&index]))
-            .body(count_body)
-            .send()
-            .await;
-
         // A count of 0 is a factual claim about the data. Only make it when the
         // cluster actually told us so (success), or when the index genuinely
-        // does not exist yet (404). A transport failure or a 5xx means we never
-        // got an answer, and must surface as an error rather than as "zero".
-        match response {
-            Ok(resp) if resp.status_code().is_success() => {
-                let body: Value = resp.json().await.unwrap_or_default();
-                Ok(body.get("count").and_then(|c| c.as_u64()).unwrap_or(0))
-            }
-            Ok(resp) if resp.status_code().as_u16() == 404 => Ok(0),
-            Ok(resp) => {
-                let status = resp.status_code().as_u16();
-                let body = resp.text().await.unwrap_or_default();
-                // Same policy as `search`: a malformed query is the client's
-                // error (#1294). `count` has no retry loop, so a retryable
-                // failure still surfaces at once, as an internal error.
-                Err(match classify_es_failure(status, &body) {
-                    EsFailureClass::BadQuery => bad_query_error("count", status, &body),
-                    EsFailureClass::Retryable | EsFailureClass::Permanent => {
-                        internal_error(format!("Count failed (status {status}): {body}"))
-                    }
-                })
-            }
-            Err(e) => Err(unavailable_error(format!(
-                "Elasticsearch unreachable during count: {e}"
-            ))),
+        // does not exist yet (`index_not_found_exception`). Everything else goes
+        // the way it does for `search` — retried when transient, then an error,
+        // never "zero" (#1335): a failed count fails the whole search response
+        // when `_total` was asked for.
+        match send_read_with_retry(self, ReadOp::Count, &index, count_body).await? {
+            None => Ok(0),
+            Some(body) => body
+                .get("count")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| internal_error(format!("Count response carries no count: {body}"))),
         }
     }
 
@@ -723,9 +824,45 @@ impl ElasticsearchBackend {
         let resource_type = &query.resource_type;
         let index = self.index_name(tenant_id, resource_type);
 
+        // `_id` names a contained resource by its local id. The standard
+        // clause is a term on `resource_id`, which for a contained document is
+        // the synthetic `<container id>#<local id>` and so never matched
+        // (#1363). Take those parameters out and filter on the right field
+        // per document kind instead.
+        let (id_params, parameters): (Vec<_>, Vec<_>) =
+            query.parameters.iter().cloned().partition(|p| {
+                p.name == "_id"
+                    && matches!(p.modifier, None | Some(crate::types::SearchModifier::Not))
+            });
+        let mut standard_query = query.clone();
+        standard_query.parameters = parameters;
+
         // Fetch a generous window of candidate hits (offset/count applied below).
         let mut es_query =
-            EsQueryBuilder::new(tenant_id, resource_type, index.clone()).build(query);
+            EsQueryBuilder::new(tenant_id, resource_type, index.clone()).build(&standard_query);
+        for param in &id_params {
+            let ids: Vec<&str> = param.values.iter().map(|v| v.value.as_str()).collect();
+            let matches_id = json!({ "bool": { "should": [
+                { "bool": { "filter": [
+                    { "term": { "is_contained": true } },
+                    { "terms": { "contained_local_id": ids } },
+                ]}},
+                { "bool": {
+                    "must_not": [{ "term": { "is_contained": true } }],
+                    "filter": [{ "terms": { "resource_id": ids } }],
+                }},
+            ], "minimum_should_match": 1 }});
+            let occur = if param.modifier.is_some() {
+                "must_not"
+            } else {
+                "filter"
+            };
+            let clauses = &mut es_query.body["query"]["bool"][occur];
+            match clauses.as_array_mut() {
+                Some(existing) => existing.push(matches_id),
+                None => *clauses = json!([matches_id]),
+            }
+        }
         let count = query.count.unwrap_or(100) as usize;
         let offset = query.offset.unwrap_or(0) as usize;
         if let Some(obj) = es_query.body.as_object_mut() {
@@ -1238,6 +1375,34 @@ mod tests {
         }})
         .to_string();
         assert_eq!(classify_es_failure(400, &body), EsFailureClass::Permanent);
+    }
+
+    /// #1335: a missing index is recognised from the parsed error, under a
+    /// `404` only. The bodies are real 7.17.29 / 8.15.0 responses, trimmed.
+    #[test]
+    fn index_not_found_is_read_from_the_parsed_error() {
+        let missing = r#"{"error":{"root_cause":[{"type":"index_not_found_exception","reason":"no such index [hfs_t_patient]","index":"hfs_t_patient"}],"type":"index_not_found_exception","reason":"no such index [hfs_t_patient]","index":"hfs_t_patient"},"status":404}"#;
+        assert!(is_index_not_found(404, missing));
+
+        // Not a 404: whatever the body says, the index was not reported missing.
+        assert!(!is_index_not_found(400, missing));
+        assert!(!is_index_not_found(503, missing));
+
+        // A 404 that is not Elasticsearch's (a proxy, a wrong base path).
+        assert!(!is_index_not_found(404, ""));
+        assert!(!is_index_not_found(404, "<html>404 Not Found</html>"));
+        assert!(!is_index_not_found(404, r#"{"error":"Not Found"}"#));
+
+        // The exception's name inside a reason (a search value echoed back)
+        // is not the exception.
+        let echoed = r#"{"error":{"root_cause":[{"type":"resource_not_found_exception","reason":"index_not_found_exception"}],"type":"resource_not_found_exception","reason":"index_not_found_exception"},"status":404}"#;
+        assert!(!is_index_not_found(404, echoed));
+        let bad_query = r#"{"error":{"root_cause":[{"type":"parse_exception","reason":"failed to parse date field [index_not_found_exception]"}],"type":"search_phase_execution_exception","reason":"all shards failed"},"status":400}"#;
+        assert!(!is_index_not_found(400, bad_query));
+        assert_eq!(
+            classify_es_failure(400, bad_query),
+            EsFailureClass::BadQuery
+        );
     }
 
     /// The client-facing error carries none of the Elasticsearch body.

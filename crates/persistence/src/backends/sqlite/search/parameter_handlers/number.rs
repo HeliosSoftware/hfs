@@ -1,5 +1,6 @@
 //! Number parameter SQL handler.
 
+use crate::search::FhirNumberValue;
 use crate::types::SearchValue;
 
 use super::super::query_builder::SqlFragment;
@@ -31,19 +32,26 @@ impl NumberHandler {
     ) -> SqlFragment {
         let param_num = param_offset + 1;
 
-        // Parse the number value
-        let num_value: f64 = match value.value.parse() {
-            Ok(v) => v,
-            Err(_) => {
-                // Invalid number - return impossible condition
+        // The grammar every backend shares. The search gate
+        // (`validate_numeric_values`) rejects a value that is not a number
+        // before any SQL is built, so this is defence in depth: an impossible
+        // condition under every prefix, never a dropped or widened one.
+        // `f64::from_str` used to stand here, and took `inf` and `nan`:
+        // `value_number < Infinity` is true of every row (#1340).
+        let number = match FhirNumberValue::parse(&value.value) {
+            Ok(number) => number,
+            Err(error) => {
+                tracing::warn!(
+                    "unvalidated number search value reached the SQLite handler: {error}"
+                );
                 return SqlFragment::new("1 = 0");
             }
         };
 
         QuantityHandler::build_numeric_condition(
             column,
-            num_value,
-            &value.value,
+            number.value,
+            number.text(),
             value.prefix,
             param_num,
         )
@@ -150,5 +158,41 @@ mod tests {
         let frag = NumberHandler::build_sql(&value, 0);
 
         assert!(frag.sql.contains("1 = 0"));
+    }
+
+    /// Defence in depth behind `validate_numeric_values`: what `f64::from_str`
+    /// takes for a number is an impossible condition too, under every prefix —
+    /// `value_number < Infinity` is true of every row (#1340).
+    #[test]
+    fn non_finite_and_malformed_numbers_match_nothing() {
+        for prefix in [
+            SearchPrefix::Eq,
+            SearchPrefix::Ne,
+            SearchPrefix::Gt,
+            SearchPrefix::Lt,
+            SearchPrefix::Ge,
+            SearchPrefix::Le,
+            SearchPrefix::Ap,
+        ] {
+            for raw in [
+                "abc", "", "1e", "inf", "-inf", "Infinity", "nan", "NaN", "1e999", "0x10",
+            ] {
+                let frag = NumberHandler::build_sql(&SearchValue::new(prefix, raw), 0);
+                assert_eq!(frag.sql, "1 = 0", "{prefix:?} {raw:?}");
+                assert!(frag.params.is_empty(), "{prefix:?} {raw:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_form_decoded_plus_is_read_as_written() {
+        // `gt+5` and `1e+3` arrive as `gt 5` and `1e 3`.
+        let frag = NumberHandler::build_sql(&SearchValue::new(SearchPrefix::Gt, " 5"), 0);
+        assert_eq!(frag.sql, "value_number > ?1");
+        let frag = NumberHandler::build_sql(&SearchValue::new(SearchPrefix::Lt, "1e 3"), 0);
+        match &frag.params[0] {
+            SqlParam::Float(f) => assert!((*f - 1000.0).abs() < 1e-9),
+            _ => panic!("expected float param"),
+        }
     }
 }
