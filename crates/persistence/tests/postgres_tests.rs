@@ -73,6 +73,11 @@ mod date_precision_suite;
 #[path = "search/date_minute_index_suite.rs"]
 mod date_minute_index_suite;
 
+/// The backend-agnostic suite for exponent-form number and quantity search
+/// values (#1337). Same `#[path]` arrangement.
+#[path = "search/number_exponent_suite.rs"]
+mod number_exponent_suite;
+
 /// The backend-agnostic conditional-criteria suite (#1312): criteria whose
 /// values begin with comparator letters. Same `#[path]` arrangement.
 #[path = "search/conditional_criteria_suite.rs"]
@@ -19075,6 +19080,18 @@ mod postgres_integration {
         super::date_minute_index_suite::minute_precision_stored_values_are_indexed(
             &backend,
             &unique_base("date_minute_index"),
+        )
+        .await;
+    }
+
+    /// #1337: `1e2` is one significant figure, `[50, 150)`.
+    #[tokio::test]
+    async fn postgres_integration_exponent_values_use_significant_figures() {
+        let backend = create_backend().await;
+        super::number_exponent_suite::exponent_values_use_significant_figures(
+            &backend,
+            &unique_base("number_exponent"),
+            true,
         )
         .await;
     }

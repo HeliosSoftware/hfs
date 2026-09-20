@@ -664,6 +664,11 @@ mod date_boundary_suite;
 #[path = "search/date_precision_suite.rs"]
 mod date_precision_suite;
 
+/// The backend-agnostic suite for exponent-form number and quantity search
+/// values (#1337). Same `#[path]` arrangement.
+#[path = "search/number_exponent_suite.rs"]
+mod number_exponent_suite;
+
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
 
@@ -945,6 +950,18 @@ mod es_integration {
         super::date_precision_suite::sub_day_precision_and_validation(
             &backend,
             "date-precision-1293",
+        )
+        .await;
+    }
+
+    /// #1337: `1e2` is one significant figure, `[50, 150)`.
+    #[tokio::test]
+    async fn es_exponent_values_use_significant_figures() {
+        let backend = create_backend().await;
+        super::number_exponent_suite::exponent_values_use_significant_figures(
+            &backend,
+            "number-exponent-1337",
+            true,
         )
         .await;
     }

@@ -104,12 +104,7 @@ pub fn build_clause(name: &str, value: &str, prefix: SearchPrefix) -> Option<Val
 /// "100.0" has implicit precision of 0.05
 /// "100.00" has implicit precision of 0.005
 pub(crate) fn implicit_range(value: &str) -> f64 {
-    if let Some(dot_pos) = value.find('.') {
-        let decimal_places = value.len() - dot_pos - 1;
-        0.5 * 10.0_f64.powi(-(decimal_places as i32))
-    } else {
-        0.5
-    }
+    crate::search::implicit_precision(value) / 2.0
 }
 
 #[cfg(test)]
