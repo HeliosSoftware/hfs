@@ -2233,3 +2233,61 @@ jobs:
             $SSH_CMD "sudo journalctl -u $SERVER_NAME --lines=20"
             exit 1
           fi
+
+      # Seed the freshly reset hfs with the manual-test corpus. The deploy step
+      # above wipes hfs.db, so every release starts empty. HFS is the Data
+      # Consumer: it fetches the manifest and its NDJSON files from S3 itself,
+      # so this only kicks the submission off. The corpus is ~19M resources and
+      # ingests for hours, so the job does not wait for it to finish; follow it
+      # with POST /$bulk-submit-status or on the UI's Import page.
+      - name: Seed hfs via $bulk-submit
+        if: matrix.server == 'hfs'
+        env:
+          HFS_PUBLIC_URL: ${{ secrets.HFS_PUBLIC_URL }}
+          MANIFEST_URL: https://hfs-manual-test.s3.us-east-1.amazonaws.com/manifest.json
+          SUBMISSION_ID: deploy-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          if [ -z "$HFS_PUBLIC_URL" ]; then
+            echo "HFS_PUBLIC_URL secret is not set - cannot seed"
+            exit 1
+          fi
+          HFS_URL="${HFS_PUBLIC_URL%/}"
+
+          # systemd reports "active" before the listener is bound, and the
+          # proxy in front of the public URL answers 502 until it is.
+          up=0
+          for _ in $(seq 1 60); do
+            if curl -sf -o /dev/null "$HFS_URL/health"; then
+              up=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$up" != "1" ]; then
+            echo "hfs did not answer $HFS_URL/health within 120s - cannot seed"
+            exit 1
+          fi
+
+          # fhirBaseUrl is required whenever manifestUrl is present. "completed"
+          # closes the submission with this single manifest.
+          PAYLOAD=$(cat <<JSON
+          { "resourceType": "Parameters", "parameter": [
+            { "name": "submitter", "valueIdentifier": { "system": "https://github.com/${{ github.repository }}", "value": "ci-deploy" } },
+            { "name": "submissionId", "valueString": "$SUBMISSION_ID" },
+            { "name": "manifestUrl", "valueUrl": "$MANIFEST_URL" },
+            { "name": "fhirBaseUrl", "valueUrl": "${MANIFEST_URL%/manifest.json}" },
+            { "name": "submissionStatus", "valueCoding": { "system": "http://hl7.org/fhir/event-status", "code": "completed" } } ] }
+          JSON
+          )
+
+          RESPONSE=$(printf '%s' "$PAYLOAD" | curl -sS -w '\n%{http_code}' -X POST \
+            -H 'Content-Type: application/fhir+json' -H 'Accept: application/fhir+json' \
+            --data-binary @- "$HFS_URL/\$bulk-submit")
+          STATUS=$(printf '%s' "$RESPONSE" | tail -n1)
+          echo "$RESPONSE" | sed '$d'
+
+          if [ "$STATUS" != "200" ]; then
+            echo "\$bulk-submit kick-off failed with HTTP $STATUS"
+            exit 1
+          fi
+          echo "Bulk submit accepted - submissionId $SUBMISSION_ID, ingestion continues on the server"
