@@ -164,6 +164,7 @@ where
         .map(|rt| {
             build_resource_capability(
                 rt,
+                version,
                 &registry,
                 supports_contained,
                 &modifier_map,
@@ -330,6 +331,7 @@ fn build_rest_operations<S: ResourceStorage + Send + Sync + 'static>(
 /// Builds the capability entry for a resource type.
 fn build_resource_capability(
     resource_type: &str,
+    version: FhirVersion,
     registry: &SearchParameterRegistry,
     supports_contained: bool,
     modifier_map: &std::collections::HashMap<SearchParamType, Vec<&'static str>>,
@@ -372,6 +374,13 @@ fn build_resource_capability(
         entry["conditionalCreate"] = serde_json::Value::Bool(true);
         entry["conditionalUpdate"] = serde_json::Value::Bool(true);
         entry["conditionalDelete"] = serde_json::Value::String("single".to_string());
+        // `PATCH [type]?criteria` is served for every version, but only R5 and
+        // later have an element to say so: `rest.resource.conditionalPatch`
+        // does not exist in R4 / R4B, where emitting it would make the
+        // statement invalid.
+        if matches!(version.as_mime_param(), "5.0" | "6.0") {
+            entry["conditionalPatch"] = serde_json::Value::Bool(true);
+        }
     }
 
     // Advertise real `_include` targets: one "Type:code" per reference param on
