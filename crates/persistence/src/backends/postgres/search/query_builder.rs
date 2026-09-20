@@ -731,6 +731,12 @@ impl PostgresQueryBuilder {
     /// `GROUP BY ... HAVING COUNT(DISTINCT param_name) >= n`. Value predicates are
     /// the bare column conditions shared with composite-component matching.
     ///
+    /// Each occurrence of a parameter is its own AND-ed branch (values within an
+    /// occurrence are ORed). Counting distinct names only proves every branch
+    /// matched while the names are distinct, so once a name repeats
+    /// (`date=ge2020&date=le2020`) the `HAVING` instead requires each branch
+    /// with `bool_or(<branch>)`, on the same contained entity.
+    ///
     /// Param layout: `$1` = tenant, `$2` = contained type, then value params.
     /// Returns `None` when no standard parameter contributes a condition
     /// (special `_`-params and composites are not applied to contained matching).
@@ -795,13 +801,24 @@ impl PostgresQueryBuilder {
         if branches.is_empty() {
             return None;
         }
+        let having = if distinct_names.len() == branches.len() {
+            format!("COUNT(DISTINCT param_name) >= {}", distinct_names.len())
+        } else {
+            // A repeated name: one row can satisfy only some of its occurrences,
+            // so require every branch. The placeholders are reused, not rebound.
+            branches
+                .iter()
+                .map(|branch| format!("bool_or{branch}"))
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        };
         let sql = format!(
             "SELECT resource_type, resource_id, contained_local_id FROM search_index \
              WHERE tenant_id = $1 AND is_contained = TRUE AND contained_type = $2 AND ({}) \
              GROUP BY resource_type, resource_id, contained_local_id \
-             HAVING COUNT(DISTINCT param_name) >= {}",
+             HAVING {}",
             branches.join(" OR "),
-            distinct_names.len()
+            having
         );
         Some(SqlFragment::with_params(sql, params))
     }
@@ -3783,6 +3800,56 @@ mod tests {
             frag.sql
         );
         assert!(frag.params.is_empty(), "{:?}", frag.params);
+    }
+
+    #[test]
+    fn contained_distinct_names_count_names() {
+        // Distinct names: the name count proves every branch matched, and the
+        // SQL is what it was before occurrences were told apart (#1336).
+        let query = SearchQuery::new("Observation")
+            .with_parameter(token_param("code", None, "X"))
+            .with_parameter(date_param("date", SearchPrefix::Ge, "2020-01-01"));
+        let frag = PostgresQueryBuilder::build_contained(&query).unwrap();
+
+        assert!(
+            frag.sql.ends_with("HAVING COUNT(DISTINCT param_name) >= 2"),
+            "{}",
+            frag.sql
+        );
+        assert!(!frag.sql.contains("bool_or"), "{}", frag.sql);
+    }
+
+    #[test]
+    fn contained_repeated_name_requires_every_occurrence() {
+        // `code=X&date=ge2020-01-01&date=le2020-12-31,2019`: a name count of 2
+        // is met by a contained resource matching only one date bound (#1336).
+        let mut upper = date_param("date", SearchPrefix::Le, "2020-12-31");
+        upper
+            .values
+            .push(SearchValue::new(SearchPrefix::Eq, "2019"));
+        let query = SearchQuery::new("Observation")
+            .with_parameter(token_param("code", None, "X"))
+            .with_parameter(date_param("date", SearchPrefix::Ge, "2020-01-01"))
+            .with_parameter(upper);
+        let frag = PostgresQueryBuilder::build_contained(&query).unwrap();
+
+        let (filter, having) = frag.sql.split_once(" HAVING ").expect("a HAVING clause");
+        assert!(!having.contains("COUNT("), "{having}");
+        let required: Vec<&str> = having.split(" AND bool_or(").collect();
+        assert_eq!(required.len(), 3, "one bool_or per occurrence: {having}");
+        assert!(required[0].starts_with("bool_or(param_name = 'code'"));
+        assert!(required[1].starts_with("param_name = 'date'"), "{having}");
+        assert!(required[2].starts_with("param_name = 'date'"), "{having}");
+        // The comma list stays a disjunction inside its own occurrence.
+        assert!(!required[1].contains(" OR "), "{having}");
+        assert!(required[2].contains(" OR "), "{having}");
+
+        // HAVING re-reads the WHERE placeholders: gap-free from $3, none new.
+        let in_filter = placeholders(filter);
+        let mut expected: Vec<usize> = vec![1, 2];
+        expected.extend(3..3 + frag.params.len());
+        assert_eq!(in_filter, expected, "{}", frag.sql);
+        assert_eq!(placeholders(having), in_filter[2..], "{}", frag.sql);
     }
 
     /// Values that reach the number and quantity builders but are not numbers:
