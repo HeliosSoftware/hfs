@@ -209,7 +209,16 @@ jobs:
         suite_id: [us_quality_core_v100_ballot]
         # Same backend set as inferno-us-core.yml; the service-container and
         # HFS start steps below are ported from it.
-        backend: [sqlite, sqlite-elasticsearch, postgres, mongodb, s3-elasticsearch]
+        backend:
+          [
+            sqlite,
+            sqlite-elasticsearch,
+            postgres,
+            postgres-elasticsearch,
+            mongodb,
+            mongodb-elasticsearch,
+            s3-elasticsearch,
+          ]
         include:
           - { suite_id: us_quality_core_v100_ballot, version_label: "v1.0.0-ballot" }
     steps:
@@ -271,7 +280,7 @@ jobs:
           echo "OMITTED_TESTS=[${OMITTED}]" >> $GITHUB_ENV
 
       - name: Start MongoDB replica set
-        if: matrix.backend == 'mongodb'
+        if: matrix.backend == 'mongodb' || matrix.backend == 'mongodb-elasticsearch'
         run: |
           MONGO_CONTAINER="mongo-qc-${{ matrix.suite_id }}-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}"
           docker rm -fv "$MONGO_CONTAINER" 2>/dev/null || true
@@ -315,7 +324,7 @@ jobs:
           exit 1
 
       - name: Start Elasticsearch
-        if: matrix.backend == 'sqlite-elasticsearch' || matrix.backend == 's3-elasticsearch'
+        if: endsWith(matrix.backend, '-elasticsearch')
         run: |
           ES_CONTAINER="es-qc-${{ matrix.suite_id }}-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}"
           docker rm -fv $ES_CONTAINER 2>/dev/null || true
@@ -345,9 +354,9 @@ jobs:
           exit 1
 
       - name: Start PostgreSQL
-        if: matrix.backend == 'postgres'
+        if: matrix.backend == 'postgres' || matrix.backend == 'postgres-elasticsearch'
         run: |
-          PG_CONTAINER="pg-qc-${{ matrix.suite_id }}-${{ github.run_id }}-${{ github.run_attempt }}"
+          PG_CONTAINER="pg-qc-${{ matrix.suite_id }}-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}"
           docker rm -fv $PG_CONTAINER 2>/dev/null || true
           docker run -d --name $PG_CONTAINER -p 0:5432 \
             -e POSTGRES_USER=helios \
@@ -435,12 +444,36 @@ jobs:
             HFS_PG_USER=helios \
             HFS_PG_PASSWORD=helios \
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          elif [ "${{ matrix.backend }}" = "postgres-elasticsearch" ]; then
+            HFS_BASE_URL="$HFS_BASE_URL" \
+            HFS_STORAGE_BACKEND=postgres-elasticsearch \
+            HFS_PG_HOST=$DOCKER_HOST_IP \
+            HFS_PG_PORT=$PG_PORT \
+            HFS_PG_DBNAME=helios \
+            HFS_PG_USER=helios \
+            HFS_PG_PASSWORD=helios \
+            HFS_ELASTICSEARCH_NODES=http://$DOCKER_HOST_IP:$ES_PORT \
+            HFS_COMPOSITE_SYNC_MODE=synchronous \
+            HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for \
+            HFS_ELASTICSEARCH_REFRESH_INTERVAL=200ms \
+            ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "mongodb" ]; then
             MONGO_HOST="${DOCKER_HOST_IP:-127.0.0.1}"
             HFS_BASE_URL="$HFS_BASE_URL" \
             HFS_STORAGE_BACKEND=mongodb \
             HFS_DATABASE_URL="mongodb://$MONGO_HOST:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
             HFS_MONGODB_DATABASE="helios_inferno_${{ matrix.suite_id }}_${{ github.run_id }}_${{ github.run_attempt }}" \
+            ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          elif [ "${{ matrix.backend }}" = "mongodb-elasticsearch" ]; then
+            MONGO_HOST="${DOCKER_HOST_IP:-127.0.0.1}"
+            HFS_BASE_URL="$HFS_BASE_URL" \
+            HFS_STORAGE_BACKEND=mongodb-elasticsearch \
+            HFS_DATABASE_URL="mongodb://$MONGO_HOST:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
+            HFS_MONGODB_DATABASE="helios_inferno_${{ matrix.suite_id }}_${{ github.run_id }}_${{ github.run_attempt }}" \
+            HFS_ELASTICSEARCH_NODES=http://$DOCKER_HOST_IP:$ES_PORT \
+            HFS_COMPOSITE_SYNC_MODE=synchronous \
+            HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for \
+            HFS_ELASTICSEARCH_REFRESH_INTERVAL=200ms \
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "s3-elasticsearch" ]; then
             HFS_BASE_URL="$HFS_BASE_URL" \
@@ -511,7 +544,7 @@ jobs:
         # returns as soon as HFS finishes writing, but the first search may run
         # before ES has refreshed, producing missing-data failures. Force a
         # refresh on all hfs_* indices so the first test batch sees fresh data.
-        if: matrix.backend == 'sqlite-elasticsearch' || matrix.backend == 's3-elasticsearch'
+        if: endsWith(matrix.backend, '-elasticsearch')
         run: |
           curl -sf -X POST "http://$DOCKER_HOST_IP:$ES_PORT/hfs_*/_refresh" > /dev/null \
             || echo "::warning::Elasticsearch refresh request did not return success — proceeding anyway"
@@ -697,7 +730,7 @@ jobs:
       # Deliberately a warning, not a gate. A stale omission is not a broken
       # build, and failing on it would make a *fixed* test turn CI red — exactly
       # the backwards incentive that grew this list. It also cannot gate safely
-      # for another reason: the list is shared across all five backend legs, and
+      # for another reason: the list is shared across all seven backend legs, and
       # an id that passes on one backend may still be suppressing a real failure
       # on another. Pruning needs agreement across the matrix, which a per-job
       # gate cannot see. The job summary can.
@@ -840,7 +873,7 @@ jobs:
       # without needing shell access to the Docker host. Runs before Cleanup
       # removes the container.
       - name: Diagnose MongoDB failure
-        if: failure() && matrix.backend == 'mongodb'
+        if: failure() && (matrix.backend == 'mongodb' || matrix.backend == 'mongodb-elasticsearch')
         run: |
           echo "::group::MongoDB container state (OOMKilled / exit code)"
           docker inspect "${MONGO_CONTAINER:-none}" \
