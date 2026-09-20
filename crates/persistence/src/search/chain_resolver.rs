@@ -382,16 +382,40 @@ pub(crate) async fn resolve_reverse_chain<S>(
 where
     S: SearchProvider + ?Sized,
 {
+    resolve_reverse_chain_level(storage, tenant, base_type, reverse_chain, options, "").await
+}
+
+/// One level of [`resolve_reverse_chain`]. `outer` is the part of the key
+/// written before this level — `_has:Encounter:subject:` for the inner level of
+/// `_has:Encounter:subject:_has:Observation:encounter:code` — so an error on
+/// the terminal parameter can name the whole key, not just its last level.
+async fn resolve_reverse_chain_level<S>(
+    storage: &S,
+    tenant: &TenantContext,
+    base_type: &str,
+    reverse_chain: &ReverseChainedParameter,
+    options: ChainResolveOptions,
+    outer: &str,
+) -> StorageResult<Vec<String>>
+where
+    S: SearchProvider + ?Sized,
+{
+    // This level as written, less what follows the reference parameter.
+    let level = format!(
+        "{outer}_has:{}:{}:",
+        reverse_chain.source_type, reverse_chain.reference_param
+    );
     // Build a query selecting the matching `source_type` resources.
     let source_query = if let Some(inner) = &reverse_chain.nested {
         // Nested: the inner chain decides which source resources qualify. Its
         // base type is *this* level's source type.
-        let inner_ids = Box::pin(resolve_reverse_chain(
+        let inner_ids = Box::pin(resolve_reverse_chain_level(
             storage,
             tenant,
             &reverse_chain.source_type,
             inner,
             options,
+            &level,
         ))
         .await?;
         if inner_ids.is_empty() {
@@ -417,7 +441,7 @@ where
         let modifier = match modifier {
             Some(m) => Some(SearchModifier::parse(m).ok_or_else(|| {
                 query_error(format!(
-                    "unknown search modifier ':{m}' on _has parameter '{search_param}'"
+                    "unknown search modifier ':{m}' on _has parameter '{level}{search_param}'"
                 ))
             })?),
             None => None,
@@ -439,12 +463,7 @@ where
                 search_param,
                 search_param_type,
                 modifier.as_ref(),
-                || {
-                    format!(
-                        "_has:{}:{}:{search_param}",
-                        reverse_chain.source_type, reverse_chain.reference_param
-                    )
-                },
+                || format!("{level}{search_param}"),
                 options,
             )?;
             (search_param_type, values)
@@ -526,27 +545,33 @@ fn parse_terminal_values(
 }
 
 /// Rejects a modifier the terminal parameter cannot take, with the same checks
-/// — and the same wording — a direct search on it gets:
+/// — in the same order, and with the same wording — a direct search on it gets:
 ///
-/// * one that needs a terminology server the caller does not have
-///   ([`param_requires_terminology`]), which the REST layer maps to a `501`.
-///   Checked first, as the REST handler's guard on a direct parameter is;
 /// * one the parameter's type does not define ([`validate_modifier`]), which
-///   the REST layer maps to a `400`.
+///   the REST layer maps to a `400`. Checked first, as the REST handler does
+///   for a direct parameter: `name:in` is a client error whether or not there
+///   is a terminology server to ask (#1339);
+/// * one that is valid but needs a terminology server the caller does not have
+///   ([`param_requires_terminology`]), which the REST layer maps to a `501`.
 ///
-/// `display` names the parameter as the client wrote it, for the first error.
+/// `display` names the parameter as the client wrote it, less the modifier —
+/// the whole chain or `_has` key, every level of a nested one. Both errors
+/// carry it: the terminal parameter's own name alone does not tell the client
+/// which part of the request was wrong.
 fn check_terminal_modifier(
     registry: &SearchParameterRegistry,
     resource_type: &str,
     param_name: &str,
     param_type: SearchParamType,
     modifier: Option<&SearchModifier>,
-    display: impl FnOnce() -> String,
+    display: impl Fn() -> String,
     options: ChainResolveOptions,
 ) -> StorageResult<()> {
     let Some(m) = modifier else {
         return Ok(());
     };
+    validate_modifier(registry, resource_type, param_name, param_type, m)
+        .map_err(|message| query_error(format!("{message} (in '{}:{m}')", display())))?;
     if !options.terminology_available
         && param_requires_terminology(registry, resource_type, param_name, m)
     {
@@ -555,7 +580,7 @@ fn check_terminal_modifier(
             param: display(),
         }));
     }
-    validate_modifier(registry, resource_type, param_name, param_type, m).map_err(query_error)
+    Ok(())
 }
 
 /// A forward chain as the client wrote it, less the terminal modifier:
@@ -1286,7 +1311,8 @@ mod tests {
         );
         assert_eq!(
             message(q).await,
-            "search modifier ':exact' is not supported for date parameter 'birthdate'"
+            "search modifier ':exact' is not supported for date parameter 'birthdate' \
+             (in 'subject:Patient.birthdate:exact')"
         );
 
         // Patient?_has:Procedure:subject:status:exact=completed
@@ -1299,7 +1325,8 @@ mod tests {
         );
         assert_eq!(
             message(q).await,
-            "search modifier ':exact' is not supported for token parameter 'status'"
+            "search modifier ':exact' is not supported for token parameter 'status' \
+             (in '_has:Procedure:subject:status:exact')"
         );
 
         // Not a modifier at all.
@@ -1383,6 +1410,87 @@ mod tests {
             &["Practitioner/x"],
         );
         assert!(resolve_chains(&b, &t, &q).await.is_ok());
+
+        // #1339: a terminology modifier the terminal's type does not define is
+        // a parse error (`400`), not a missing terminology server (`501`) —
+        // with or without one.
+        for options in [false, true].map(|terminology_available| ChainResolveOptions {
+            terminology_available,
+        }) {
+            for q in [
+                // Procedure?subject:Patient.birthdate:in=… / .family:below=…
+                forward_modified(
+                    "Procedure",
+                    &[("subject", "Patient", "birthdate")],
+                    SearchModifier::In,
+                    &["http://example.org/vs"],
+                ),
+                forward_modified(
+                    "Procedure",
+                    &[("subject", "Patient", "family")],
+                    SearchModifier::Below,
+                    &["Smith"],
+                ),
+                has("Patient", "Procedure", "subject", "date:in", "http://vs"),
+                has("Patient", "Procedure", "subject", "date:above", "2020"),
+            ] {
+                match resolve_chains_with(&b, &t, &q, options).await {
+                    Err(StorageError::Search(SearchError::QueryParseError { message })) => {
+                        assert!(message.contains("is not supported for"), "{message}")
+                    }
+                    other => panic!("expected a query parse error, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// #1339: an error on the terminal parameter of a nested `_has` names the
+    /// whole key, not just its innermost level.
+    #[tokio::test]
+    async fn nested_has_terminal_errors_name_the_full_key() {
+        let b = backend();
+        let t = tenant();
+        seed_dated(&b, &t).await;
+
+        // Patient?_has:Encounter:subject:_has:Procedure:encounter:<param>=…
+        let nested = |param: &str| {
+            let mut query = SearchQuery::new("Patient");
+            query.reverse_chains.push(ReverseChainedParameter::nested(
+                "Encounter",
+                "subject",
+                ReverseChainedParameter::terminal(
+                    "Procedure",
+                    "encounter",
+                    param,
+                    SearchValue::eq("http://example.org/vs"),
+                ),
+            ));
+            query
+        };
+
+        match resolve_chains(&b, &t, &nested("status:in")).await {
+            Err(StorageError::Search(SearchError::TerminologyRequired { modifier, param })) => {
+                assert_eq!(modifier, "in");
+                assert_eq!(
+                    param,
+                    "_has:Encounter:subject:_has:Procedure:encounter:status"
+                );
+            }
+            other => panic!("expected a terminology-required error, got {other:?}"),
+        }
+        for param in ["status:exact", "date:in"] {
+            match resolve_chains(&b, &t, &nested(param)).await {
+                Err(StorageError::Search(SearchError::QueryParseError { message })) => {
+                    assert!(
+                        message.contains(&format!(
+                            "'_has:Encounter:subject:_has:Procedure:encounter:{param}'"
+                        )),
+                        "{message}"
+                    );
+                }
+                other => panic!("expected a query parse error, got {other:?}"),
+            }
+        }
     }
 
     /// Values a caller already parsed (non-`eq` prefix) pass through as given.

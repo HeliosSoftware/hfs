@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 
+use helios_fhir::FhirVersion;
 use helios_persistence::search::{
     SearchParameterRegistry, parse_typed_values, split_unescaped_commas, validate_modifier,
 };
@@ -26,10 +27,63 @@ use crate::error::RestError;
 /// - Reverse chaining (_has parameters)
 /// - _include/_revinclude directives
 /// - System parameters (_count, _sort, _total, etc.)
+///
+/// A `:[type]` qualifier is accepted when it names a resource type of *any*
+/// enabled FHIR version. A caller that knows the version the search runs
+/// against should use [`build_search_query_for_version`].
 pub fn build_search_query(
     resource_type: &str,
     params: &SearchParams,
     registry: &SearchParameterRegistry,
+) -> Result<SearchQuery, RestError> {
+    build_query(resource_type, params, registry, TypeScope(None))
+}
+
+/// [`build_search_query`] for a search against `fhir_version`: a `:[type]`
+/// qualifier (`subject:Patient`, a chain hop's, a `_has` source type) must name
+/// a resource type of that version, not merely of some version this build
+/// supports (#1339).
+pub fn build_search_query_for_version(
+    resource_type: &str,
+    params: &SearchParams,
+    registry: &SearchParameterRegistry,
+    fhir_version: FhirVersion,
+) -> Result<SearchQuery, RestError> {
+    build_query(
+        resource_type,
+        params,
+        registry,
+        TypeScope(Some(fhir_version)),
+    )
+}
+
+/// The resource types a `:[type]` qualifier may name: those of the FHIR version
+/// the search runs against, or — for a caller that does not say — those of
+/// every enabled version.
+#[derive(Debug, Clone, Copy)]
+struct TypeScope(Option<FhirVersion>);
+
+impl TypeScope {
+    fn contains(self, type_name: &str) -> bool {
+        match self.0 {
+            Some(v) => crate::fhir_types::is_valid_resource_type_for_version(type_name, v),
+            None => crate::fhir_types::is_valid_resource_type(type_name),
+        }
+    }
+
+    fn names(self) -> &'static [&'static str] {
+        match self.0 {
+            Some(v) => crate::fhir_types::get_resource_type_names_for_version(v),
+            None => crate::fhir_types::get_resource_type_names(),
+        }
+    }
+}
+
+fn build_query(
+    resource_type: &str,
+    params: &SearchParams,
+    registry: &SearchParameterRegistry,
+    types: TypeScope,
 ) -> Result<SearchQuery, RestError> {
     let mut query = SearchQuery::new(resource_type);
 
@@ -149,7 +203,7 @@ pub fn build_search_query(
     for (name, value) in params.search_params() {
         // Handle _has (reverse chaining)
         if name == "_has" || name.starts_with("_has:") {
-            if let Some(reverse_chain) = parse_has_parameter(name, value)? {
+            if let Some(reverse_chain) = parse_has_parameter_in(name, value, types)? {
                 query.reverse_chains.push(reverse_chain);
             }
             continue;
@@ -167,7 +221,7 @@ pub fn build_search_query(
         }
 
         // Parse the parameter
-        let param = parse_search_parameter(resource_type, name, value, registry)?;
+        let param = parse_search_parameter_in(resource_type, name, value, registry, types)?;
         query.parameters.push(param);
     }
 
@@ -344,12 +398,25 @@ pub fn build_search_query_from_pairs(
     build_search_query(resource_type, &search_params, registry)
 }
 
-/// Parses a single search parameter with potential modifiers.
+/// Parses a single search parameter with potential modifiers, a `:[type]`
+/// qualifier naming a resource type of any enabled FHIR version.
+#[cfg(test)]
 fn parse_search_parameter(
     resource_type: &str,
     name: &str,
     value: &str,
     registry: &SearchParameterRegistry,
+) -> Result<SearchParameter, RestError> {
+    parse_search_parameter_in(resource_type, name, value, registry, TypeScope(None))
+}
+
+/// Parses a single search parameter with potential modifiers.
+fn parse_search_parameter_in(
+    resource_type: &str,
+    name: &str,
+    value: &str,
+    registry: &SearchParameterRegistry,
+    types: TypeScope,
 ) -> Result<SearchParameter, RestError> {
     // A dotted name is a chained parameter (e.g. "patient.name" or
     // "subject:Patient.name:exact"). A colon inside it is a hop's type
@@ -357,9 +424,9 @@ fn parse_search_parameter(
     // chain's terminal parameter — `parse_parameter_name` cuts at the first
     // colon and would misread either.
     let (base_name, chain, modifier) = if name.contains('.') {
-        parse_chain(name)?
+        parse_chain_in(name, types)?
     } else {
-        let (base_name, modifier) = parse_parameter_name(name)?;
+        let (base_name, modifier) = parse_parameter_name_in(name, types)?;
         (base_name, vec![], modifier)
     };
 
@@ -449,15 +516,26 @@ fn parse_search_parameter(
 /// - "name:exact" -> ("name", Some(Exact))
 /// - "subject:Patient" -> ("subject", Some(Type("Patient")))
 /// - "name:bogus" -> error
+#[cfg(test)]
 fn parse_parameter_name(name: &str) -> Result<(&str, Option<SearchModifier>), RestError> {
+    parse_parameter_name_in(name, TypeScope(None))
+}
+
+/// [`parse_parameter_name`], a `:[type]` qualifier being one of `types`.
+fn parse_parameter_name_in(
+    name: &str,
+    types: TypeScope,
+) -> Result<(&str, Option<SearchModifier>), RestError> {
     let (param_name, suffix) = split_qualifier(name);
     let modifier = suffix
         .map(|s| {
-            parse_modifier(s).ok_or_else(|| RestError::InvalidParameter {
+            parse_modifier(s, types).ok_or_else(|| RestError::InvalidParameter {
                 param: name.to_string(),
                 message: format!(
                     "unknown search modifier ':{s}' on parameter '{param_name}'; it is neither a \
-                     search modifier nor a resource type"
+                     search modifier nor a resource type{}{}",
+                    version_clause(types),
+                    case_hint(s, types)
                 ),
             })
         })
@@ -469,14 +547,41 @@ fn parse_parameter_name(name: &str) -> Result<(&str, Option<SearchModifier>), Re
 /// reference parameter.
 ///
 /// `SearchModifier::parse` reads any capitalised suffix as a type qualifier, so
-/// the name is checked against the resource types of the enabled FHIR versions
-/// here — `subject:Bogus` is no more a modifier than `subject:bogus`. Whether
+/// the name is checked against the resource types in scope here — those of the
+/// request's FHIR version, when the caller knows it — `subject:Bogus` is no
+/// more a modifier than `subject:bogus`. Whether
 /// the modifier suits the parameter's *type* (a `:[type]` qualifier is only
 /// defined for references) is `validate_modifier`'s job.
-fn parse_modifier(suffix: &str) -> Option<SearchModifier> {
+fn parse_modifier(suffix: &str, types: TypeScope) -> Option<SearchModifier> {
     match SearchModifier::parse(suffix)? {
-        SearchModifier::Type(t) if !crate::fhir_types::is_valid_resource_type(&t) => None,
+        SearchModifier::Type(t) if !types.contains(&t) => None,
         modifier => Some(modifier),
+    }
+}
+
+/// Names the FHIR version a `:[type]` qualifier was judged against, when it
+/// was judged against one: ` of FHIR R4`.
+fn version_clause(types: TypeScope) -> String {
+    types.0.map(|v| format!(" of FHIR {v}")).unwrap_or_default()
+}
+
+/// Modifiers and resource type names are case-sensitive (`name:EXACT` and
+/// `subject:patient` are neither). When an unknown `:suffix` is one of them in
+/// a different case, this is the clause that says so, for the `400`.
+fn case_hint(suffix: &str, types: TypeScope) -> String {
+    let lower = suffix.to_lowercase();
+    let intended = if lower != suffix && SearchModifier::parse(&lower).is_some() {
+        Some(lower)
+    } else {
+        types
+            .names()
+            .iter()
+            .find(|t| **t != suffix && t.eq_ignore_ascii_case(suffix))
+            .map(|t| t.to_string())
+    };
+    match intended {
+        Some(i) => format!(" (modifiers and resource type names are case-sensitive: ':{i}'?)"),
+        None => String::new(),
     }
 }
 
@@ -506,7 +611,13 @@ type ParsedChain<'a> = (
 /// - "patient.name" -> ("patient", [{patient, None, name}], None)
 /// - "subject:Patient.organization:Organization.name:exact" ->
 ///   ("subject", [{subject, Patient, organization}, {organization, Organization, name}], Exact)
+#[cfg(test)]
 fn parse_chain(name: &str) -> Result<ParsedChain<'_>, RestError> {
+    parse_chain_in(name, TypeScope(None))
+}
+
+/// [`parse_chain`], a hop's `:Type` qualifier being one of `types`.
+fn parse_chain_in(name: &str, types: TypeScope) -> Result<ParsedChain<'_>, RestError> {
     let mut parts = name.split('.');
     // `split` always yields at least one item.
     let (base_name, mut qualifier) = split_qualifier(parts.next().unwrap_or(name));
@@ -523,10 +634,24 @@ fn parse_chain(name: &str) -> Result<ParsedChain<'_>, RestError> {
             suffix
         } else {
             modifier = suffix
-                .map(|s| parse_terminal_modifier(name, target_param, s))
+                .map(|s| parse_terminal_modifier(name, target_param, s, types))
                 .transpose()?;
             None
         };
+        // A hop's qualifier is the type of resource the reference is followed
+        // to. One that is not a resource type (of this FHIR version) can match
+        // nothing; say so rather than answer an empty `200` (#1339).
+        if let Some(t) = qualifier.filter(|t| !types.contains(t)) {
+            return Err(RestError::InvalidParameter {
+                param: name.to_string(),
+                message: format!(
+                    "unknown resource type ':{t}' on reference parameter '{reference_param}' of \
+                     the chain; it is not a resource type{}{}",
+                    version_clause(types),
+                    case_hint(t, types)
+                ),
+            });
+        }
         chain.push(helios_persistence::types::ChainedParameter {
             reference_param: reference_param.to_string(),
             target_type: qualifier.map(str::to_string),
@@ -547,13 +672,15 @@ fn parse_terminal_modifier(
     name: &str,
     terminal_param: &str,
     suffix: &str,
+    types: TypeScope,
 ) -> Result<SearchModifier, RestError> {
-    parse_modifier(suffix).ok_or_else(|| RestError::InvalidParameter {
+    parse_modifier(suffix, types).ok_or_else(|| RestError::InvalidParameter {
         param: name.to_string(),
         message: format!(
             "unknown search modifier ':{suffix}' on '{terminal_param}', the last parameter of \
              the chain; only a search modifier may follow it (a ':Type' qualifier belongs on a \
-             reference parameter)"
+             reference parameter){}",
+            case_hint(suffix, types)
         ),
     })
 }
@@ -587,9 +714,31 @@ fn split_qualifier(part: &str) -> (&str, Option<&str>) {
 /// Examples:
 /// - _has:Observation:patient:code=1234-5
 /// - Nested: _has:Observation:patient:_has:Provenance:target:agent=practitioner-id
+#[cfg(test)]
 fn parse_has_parameter(
     name: &str,
     value: &str,
+) -> Result<Option<ReverseChainedParameter>, RestError> {
+    parse_has_parameter_in(name, value, TypeScope(None))
+}
+
+/// [`parse_has_parameter`], a source type being one of `types`.
+fn parse_has_parameter_in(
+    name: &str,
+    value: &str,
+    types: TypeScope,
+) -> Result<Option<ReverseChainedParameter>, RestError> {
+    parse_has_level(name, name, value, types)
+}
+
+/// One level of a `_has` key. `name` is this level (`_has:C:d:code` for the
+/// inner level of `_has:A:b:_has:C:d:code`); `key` is the whole key as the
+/// client wrote it, which is what every error names.
+fn parse_has_level(
+    key: &str,
+    name: &str,
+    value: &str,
+    types: TypeScope,
 ) -> Result<Option<ReverseChainedParameter>, RestError> {
     // Handle both _has:... format and _has key with value containing the chain
     let chain_str = if name == "_has" {
@@ -607,7 +756,7 @@ fn parse_has_parameter(
 
     if parts.len() < 3 {
         return Err(RestError::InvalidParameter {
-            param: name.to_string(),
+            param: key.to_string(),
             message:
                 "Invalid _has format. Expected _has:[type]:[reference-param]:[search-param]=value"
                     .to_string(),
@@ -618,6 +767,20 @@ fn parse_has_parameter(
     let reference_param = parts[1].to_string();
     let search_param = parts[2].to_string();
 
+    // The source type is a `:[type]` like any other: one that is not a resource
+    // type (of this FHIR version) has no search parameters to resolve the rest
+    // of the key against (#1339).
+    if !types.contains(&source_type) {
+        return Err(RestError::InvalidParameter {
+            param: key.to_string(),
+            message: format!(
+                "unknown resource type '{source_type}' in _has; it is not a resource type{}{}",
+                version_clause(types),
+                case_hint(&source_type, types)
+            ),
+        });
+    }
+
     // Get the search value
     let search_value = if name == "_has" {
         // For _has=Observation:patient:code:value format
@@ -625,7 +788,7 @@ fn parse_has_parameter(
             SearchValue::eq(parts[3])
         } else {
             return Err(RestError::InvalidParameter {
-                param: name.to_string(),
+                param: key.to_string(),
                 message: "Missing value for _has parameter".to_string(),
             });
         }
@@ -639,7 +802,7 @@ fn parse_has_parameter(
     // expression, which we parse recursively.
     if search_param == "_has" {
         let inner = &chain_str[parts[0].len() + parts[1].len() + 2..];
-        let nested = parse_has_parameter(inner, value)?;
+        let nested = parse_has_level(key, inner, value, types)?;
         if let Some(nested_chain) = nested {
             return Ok(Some(ReverseChainedParameter::nested(
                 source_type,
@@ -657,8 +820,8 @@ fn parse_has_parameter(
     // `_has=Type:ref:param:value` form the fourth part is the value.)
     let search_param = match parts.get(3) {
         Some(suffix) if name != "_has" => {
-            let modifier = parse_terminal_modifier(name, &search_param, suffix)?;
-            check_missing_literal(name, Some(&modifier), value)?;
+            let modifier = parse_terminal_modifier(key, &search_param, suffix, types)?;
+            check_missing_literal(key, Some(&modifier), value)?;
             format!("{search_param}:{suffix}")
         }
         _ => search_param,
@@ -912,6 +1075,136 @@ mod tests {
                 }
                 other => panic!("{name}: expected InvalidParameter, got {other:?}"),
             }
+        }
+    }
+
+    /// #1339: modifiers are case-sensitive. A differently-cased one is unknown,
+    /// and the `400` says what was probably meant.
+    #[test]
+    fn test_modifiers_and_type_qualifiers_are_case_sensitive() {
+        let reg = test_registry();
+        for (resource_type, name, hint) in [
+            ("Patient", "name:EXACT", "':exact'?"),
+            ("Patient", "name:Exact", "':exact'?"),
+            ("Patient", "name:eXact", "':exact'?"),
+            ("Patient", "name:Missing", "':missing'?"),
+            ("Observation", "code:NOT", "':not'?"),
+            ("Observation", "code:Of-Type", "':of-type'?"),
+            ("Observation", "subject:patient", "':Patient'?"),
+            ("Observation", "subject:PATIENT", "':Patient'?"),
+            // The terminal of a chain and of a `_has`.
+            ("Observation", "subject:Patient.name:EXACT", "':exact'?"),
+        ] {
+            match parse_search_parameter(resource_type, name, "true", &reg) {
+                Err(RestError::InvalidParameter { param, message }) => {
+                    assert_eq!(param, name);
+                    assert!(message.contains("case-sensitive"), "{name}: {message}");
+                    assert!(message.contains(hint), "{name}: {message}");
+                }
+                other => panic!("{name}: expected InvalidParameter, got {other:?}"),
+            }
+        }
+        match parse_has_parameter("_has:Observation:subject:code:NOT", "x") {
+            Err(RestError::InvalidParameter { message, .. }) => {
+                assert!(message.contains("':not'?"), "{message}")
+            }
+            other => panic!("expected InvalidParameter, got {other:?}"),
+        }
+        // No hint for something that is not a modifier in any case.
+        match parse_search_parameter("Patient", "name:bogus", "x", &reg) {
+            Err(RestError::InvalidParameter { message, .. }) => {
+                assert!(!message.contains("case-sensitive"), "{message}")
+            }
+            other => panic!("expected InvalidParameter, got {other:?}"),
+        }
+    }
+
+    fn build_for(
+        resource_type: &str,
+        key: &str,
+        version: Option<FhirVersion>,
+    ) -> Result<SearchQuery, RestError> {
+        let reg = test_registry();
+        let params = SearchParams::from_pairs(vec![(key.to_string(), "x".to_string())]);
+        match version {
+            Some(v) => build_search_query_for_version(resource_type, &params, &reg, v),
+            None => build_search_query(resource_type, &params, &reg),
+        }
+    }
+
+    /// #1339: a `:[type]` qualifier — direct, on a chain hop, as a `_has` source
+    /// type — is judged against the FHIR version of the search.
+    #[cfg(feature = "R4")]
+    #[test]
+    fn test_type_qualifier_is_checked_against_the_request_version() {
+        let r4 = Some(FhirVersion::R4);
+        for key in [
+            "subject:Patient",
+            "subject:Patient.name",
+            "_has:Observation:subject:code",
+        ] {
+            let resource_type = if key.starts_with("_has") {
+                "Patient"
+            } else {
+                "Observation"
+            };
+            assert!(build_for(resource_type, key, r4).is_ok(), "{key}");
+        }
+        // `ActorDefinition` is R5+: never an R4 type, whatever else is enabled.
+        for key in [
+            "subject:ActorDefinition",
+            "subject:ActorDefinition.name",
+            "subject:Patient.general-practitioner:ActorDefinition.name",
+            "_has:ActorDefinition:subject:code",
+            "_has:Observation:subject:_has:ActorDefinition:subject:code",
+        ] {
+            match build_for("Observation", key, r4) {
+                Err(RestError::InvalidParameter { message, .. }) => {
+                    assert!(message.contains("ActorDefinition"), "{key}: {message}");
+                    assert!(message.contains("of FHIR R4"), "{key}: {message}");
+                }
+                other => panic!("{key}: expected InvalidParameter, got {other:?}"),
+            }
+        }
+        // A hop qualifier that is no resource type at all used to be an empty
+        // `200`.
+        for key in ["subject:Bogus.name", "subject:patient.name"] {
+            assert!(build_for("Observation", key, r4).is_err(), "{key}");
+            assert!(build_for("Observation", key, None).is_err(), "{key}");
+        }
+    }
+
+    /// #1339, with two versions enabled — the build the bug needs: a type of
+    /// the *other* version was accepted. (The default test build is R4-only;
+    /// run with `--features R4,R5`.)
+    #[cfg(all(feature = "R4", feature = "R5"))]
+    #[test]
+    fn test_type_qualifier_of_another_enabled_version_is_rejected() {
+        // `ActorDefinition` is R5-only, `DocumentManifest` R4-only.
+        for (key, valid_in, invalid_in) in [
+            ("subject:ActorDefinition", FhirVersion::R5, FhirVersion::R4),
+            ("subject:DocumentManifest", FhirVersion::R4, FhirVersion::R5),
+            (
+                "subject:ActorDefinition.name",
+                FhirVersion::R5,
+                FhirVersion::R4,
+            ),
+            (
+                "_has:DocumentManifest:subject:status",
+                FhirVersion::R4,
+                FhirVersion::R5,
+            ),
+        ] {
+            assert!(
+                build_for("Observation", key, Some(valid_in)).is_ok(),
+                "{key}"
+            );
+            assert!(
+                build_for("Observation", key, Some(invalid_in)).is_err(),
+                "{key}"
+            );
+            // The version-less entry point keeps accepting any enabled version.
+            assert!(build_for("Observation", key, None).is_ok(), "{key}");
         }
     }
 
@@ -1258,6 +1551,29 @@ mod tests {
         assert!(parse_has_parameter("_has:Observation:subject:code:bogus", "1").is_err());
         assert!(parse_has_parameter("_has:Observation:subject:code:missing", "yes").is_err());
         assert!(parse_has_parameter("_has:Observation:subject:code:missing", "true").is_ok());
+    }
+
+    /// #1339: an error in an inner level of a nested `_has` names the whole
+    /// key, as written — not just the level it was found in.
+    #[test]
+    fn test_nested_has_errors_name_the_full_key() {
+        for (key, value) in [
+            (
+                "_has:Encounter:subject:_has:Observation:encounter:code:bogus",
+                "x",
+            ),
+            (
+                "_has:Encounter:subject:_has:Observation:encounter:code:missing",
+                "yes",
+            ),
+            ("_has:Encounter:subject:_has:Observation:encounter", "x"),
+            ("_has:Encounter:subject:_has:Bogus:encounter:code", "x"),
+        ] {
+            match parse_has_parameter(key, value) {
+                Err(RestError::InvalidParameter { param, .. }) => assert_eq!(param, key),
+                other => panic!("{key}: expected InvalidParameter, got {other:?}"),
+            }
+        }
     }
 
     #[test]

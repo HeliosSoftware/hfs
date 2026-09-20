@@ -19,7 +19,7 @@ use helios_persistence::core::{
     resolve_includes_iterative,
 };
 use helios_persistence::error::SearchError;
-use helios_persistence::search::param_requires_terminology;
+use helios_persistence::search::{param_requires_terminology, validate_modifier};
 use helios_persistence::types::{
     IncludeDirective, SearchBundle, SearchModifier, SearchParamType, StoredResource, TotalMode,
 };
@@ -29,7 +29,9 @@ use helios_fhir::FhirVersion;
 
 use crate::error::{RestError, RestResult};
 use crate::extractors::query_pairs::{last_value, parse_query_pairs};
-use crate::extractors::{SearchParams, TenantExtractor, build_search_query, unknown_search_params};
+use crate::extractors::{
+    SearchParams, TenantExtractor, build_search_query_for_version, unknown_search_params,
+};
 use crate::middleware::content_type::{FhirFormat, negotiate_format};
 use crate::middleware::prefer::PreferHeader;
 use crate::responses::format_resource_response;
@@ -226,6 +228,55 @@ where
         });
     }
 
+    // A terminology-backed modifier (`:in` / `:not-in` / `:above` / `:below`)
+    // the parameter's type does not define is a client error — `name:in`,
+    // `birthdate:below` — and must be the `400` any other mismatched modifier
+    // gets, not one of the `501`s below, which are for a *valid* modifier this
+    // server cannot answer (#1339). It has to be settled here, ahead of the
+    // query builder's own `validate_modifier` call: with a terminology server
+    // `expand_terminology_params` would otherwise rewrite the key into a plain
+    // parameter, and without one the guard would answer first.
+    //
+    // Direct parameters only, like the guard below: the terminal parameter of a
+    // chained or `_has` search is typed — and checked, in this same order — by
+    // the chain resolver (`check_terminal_modifier`).
+    {
+        let reg = state.storage().search_param_registry(tenant.context());
+        let registry = reg.read();
+        for (key, _) in &pairs {
+            if key.contains('.') || key.starts_with("_has:") {
+                continue;
+            }
+            let Some((base, modifier)) = key.split_once(':') else {
+                continue;
+            };
+            let Some(
+                parsed @ (SearchModifier::In
+                | SearchModifier::NotIn
+                | SearchModifier::Above
+                | SearchModifier::Below),
+            ) = SearchModifier::parse(modifier)
+            else {
+                continue;
+            };
+            // An unregistered parameter has no declared type to check against
+            // (`validate_modifier` only gates registered ones).
+            let Some(param_type) = registry
+                .get_param(resource_type, base)
+                .or_else(|| registry.get_param("Resource", base))
+                .map(|p| p.param_type)
+            else {
+                continue;
+            };
+            validate_modifier(&registry, resource_type, base, param_type, &parsed).map_err(
+                |message| RestError::InvalidParameter {
+                    param: key.clone(),
+                    message,
+                },
+            )?;
+        }
+    }
+
     // `:not-in` requires negated value-set filtering, which no backend
     // implements. Reject it explicitly (501) regardless of whether a terminology
     // server is configured, rather than silently ignoring it (which would return
@@ -258,6 +309,12 @@ where
             let reg = state.storage().search_param_registry(tenant.context());
             let registry = reg.read();
             for (key, _) in &pairs {
+                // A chain's terminal modifier is the resolver's to judge: only
+                // it knows the terminal's type, and so whether the modifier is
+                // valid there at all (`subject.name:in` is a `400`).
+                if key.contains('.') {
+                    continue;
+                }
                 let Some((base, modifier)) = key.split_once(':') else {
                     continue;
                 };
@@ -331,7 +388,10 @@ where
     let mut query = {
         let reg = state.storage().search_param_registry(tenant.context());
         let registry = reg.read();
-        let built = build_search_query(resource_type, &search_params, &registry)?;
+        // Against the version the search resolves in (see above), so a
+        // `:[type]` qualifier cannot name a type only another version has.
+        let built =
+            build_search_query_for_version(resource_type, &search_params, &registry, fhir_version)?;
         // Under strict handling, reject a `_sort` on a field the server cannot
         // actually sort by (it would otherwise silently fall back to `id`). Only
         // `_id`, `_lastUpdated`, and registered indexed typed params sort
@@ -714,7 +774,12 @@ where
     let mut query = {
         let reg = state.storage().search_param_registry(tenant.context());
         let registry = reg.read();
-        build_search_query("Resource", &search_params, &registry)?
+        build_search_query_for_version(
+            "Resource",
+            &search_params,
+            &registry,
+            state.config().default_fhir_version,
+        )?
     };
 
     // Clamp page size to the configured default/maximum.
@@ -909,22 +974,42 @@ mod urlencoding {
     }
 }
 
-/// Pre-processes search params that contain `:in` or `:not-in` modifiers by
-/// expanding the referenced ValueSet via the terminology server.
+/// Rewrites the terminology-backed modifiers — `:in`, and `:above` / `:below`
+/// on a token — into plain token parameters, using the terminology server at
+/// `ts_url`. Keys are matched by suffix, so the terminal parameter of a chained
+/// or `_has` search (`subject:Patient.gender:in`) is rewritten like a direct one.
 ///
-/// **`:in` modifier** — The ValueSet at the given URL is expanded.  The
-/// parameter is replaced with a plain token parameter whose value is the
-/// expanded codes joined by commas (FHIR OR semantics).
+/// Only called when a terminology server is configured. Without one the caller
+/// (`execute_search_bundle`) rejects these modifiers with a `501` instead —
+/// direct parameters in its own guard, chain terminals in the chain resolver —
+/// rather than let them reach a backend, which would match the ValueSet URL or
+/// the bare code literally. A modifier the parameter's type does not define
+/// (`name:in`) has already been rejected with a `400` by then — on a direct
+/// parameter. On a chain terminal it has not: its type is only known to the
+/// chain resolver, which runs after this rewrite and so sees a plain parameter.
+///
+/// **`:in`** — The ValueSet at the given URL is expanded, and the parameter is
+/// replaced with a plain token parameter whose value is the expanded codes
+/// joined by commas (FHIR OR semantics).
 /// Example: `code:in=http://example.org/vs` → `code=http://cs|A,http://cs|B`
 ///
-/// **`:not-in` modifier** — Returns `Err(RestError::NotImplemented)` so the
-/// caller can surface an explicit 501 to the client.  Silently dropping a
-/// negation filter would return incorrect results (all resources instead of
-/// the expected subset), which is worse than an honest error.
+/// **`:below` / `:above`** — For a `system|code` value, the code is expanded to
+/// itself plus its descendants (`is-a`) / ancestors (`generalizes`), and the
+/// parameter is replaced the same way. A value without a `|` is the uri /
+/// reference form, which is structural: it is passed through with its modifier
+/// for the backend to resolve natively.
 ///
-/// All other parameters pass through unchanged. On individual expansion
-/// failures the problematic parameter is skipped with a warning so a single
-/// bad ValueSet URL does not abort the entire search.
+/// **`:not-in`** — Returns `Err(RestError::NotImplemented)`, a `501`. Silently
+/// dropping a negation filter would return all resources instead of the
+/// expected subset, which is worse than an honest error. (The caller rejects
+/// `:not-in` itself before getting here; this arm keeps the function safe to
+/// call on its own.)
+///
+/// All other parameters pass through unchanged. An empty expansion is replaced
+/// by a sentinel value that matches nothing. If an expansion *fails*, the
+/// parameter is dropped with a warning and the search continues without that
+/// filter (fail-open), so an unreachable terminology server or a single bad
+/// ValueSet URL does not abort the entire search.
 async fn expand_terminology_params(
     pairs: Vec<(String, String)>,
     ts_url: &str,
