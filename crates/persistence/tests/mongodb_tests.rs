@@ -599,6 +599,28 @@ async fn mongodb_invalid_numbers_are_rejected_in_conditional_criteria() {
     .await;
 }
 
+/// The backend-agnostic `system|code` on `code` elements suite (#1379). Same
+/// `#[path]` arrangement.
+#[path = "search/token_code_system_suite.rs"]
+mod token_code_system_suite;
+
+/// #1379: `gender=<system>|female` never matched a `code` element. Needs the
+/// full registry so `gender`, `status` and `code` extract into the search
+/// index — the suite's positive controls fail loudly if they did not.
+#[tokio::test]
+async fn mongodb_system_qualified_tokens_match_code_elements() {
+    let Some(backend) = create_backend_with_full_registry("token_code_system").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    token_code_system_suite::system_qualified_tokens_match_code_elements(
+        &backend,
+        "token-code-system-1379",
+        false,
+    )
+    .await;
+}
+
 /// #1062: a comma-separated value list on one `SearchParameter` is OR per
 /// FHIR (https://build.fhir.org/search.html#combining) — for date same as
 /// every other type. Drives the real `SearchProvider::search` /

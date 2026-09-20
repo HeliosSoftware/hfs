@@ -88,6 +88,11 @@ mod conditional_criteria_suite;
 #[path = "search/numeric_validation_suite.rs"]
 mod numeric_validation_suite;
 
+/// The backend-agnostic `system|code` on `code` elements suite (#1379). Same
+/// `#[path]` arrangement.
+#[path = "search/token_code_system_suite.rs"]
+mod token_code_system_suite;
+
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
 
@@ -19165,6 +19170,18 @@ mod postgres_integration {
             &backend,
             &unique_base("number_exponent"),
             true,
+        )
+        .await;
+    }
+
+    /// #1379: `gender=<system>|female` never matched a `code` element.
+    #[tokio::test]
+    async fn postgres_integration_system_qualified_tokens_match_code_elements() {
+        let backend = create_backend().await;
+        super::token_code_system_suite::system_qualified_tokens_match_code_elements(
+            &backend,
+            &unique_base("token_code_system"),
+            false,
         )
         .await;
     }
