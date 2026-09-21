@@ -90,7 +90,8 @@ fn stored_dashboard(store: &InMemorySettingsStore) -> Option<Value> {
 }
 
 /// An explicit full-page selection is persisted under the tenant-scoped
-/// `dashboard` key — types, window slug, and the "view all" flag.
+/// `dashboard` key — the curated types and window slug. The transient "view
+/// all" flag is deliberately not persisted, even when the request carries it.
 #[tokio::test]
 async fn an_explicit_full_page_selection_is_persisted() {
     let store = Arc::new(InMemorySettingsStore::new());
@@ -103,7 +104,7 @@ async fn an_explicit_full_page_selection_is_persisted() {
 
     assert_eq!(
         stored_dashboard(&store),
-        Some(json!({"types": ["Patient", "Observation"], "window": "24h", "all": true})),
+        Some(json!({"types": ["Patient", "Observation"], "window": "24h"})),
     );
 }
 
@@ -154,7 +155,7 @@ async fn a_bare_visit_restores_the_stored_window() {
     store
         .patch_settings(
             "l2:",
-            json!({"byTenant": {"default": {"dashboard": {"types": ["Patient"], "window": "1h", "all": false}}}}),
+            json!({"byTenant": {"default": {"dashboard": {"types": ["Patient"], "window": "1h"}}}}),
             None,
         )
         .await

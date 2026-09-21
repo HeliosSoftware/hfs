@@ -2115,10 +2115,9 @@ async fn index(
                 .and_then(DashboardWindow::from_slug)
         })
         .unwrap_or_default();
-    let all_types = match query_value(query.as_deref(), "all") {
-        Some(v) => v == "1",
-        None => stored.as_ref().is_some_and(|s| s.all),
-    };
+    // "View all resources" is not restored from storage (see DashboardSelection):
+    // it is a transient exploration mode, off unless this request asks for it.
+    let all_types = query_value(query.as_deref(), "all").as_deref() == Some("1");
     // The full type list is only fetched when offered â€” the common,
     // flag-off case pays nothing extra for it.
     let spec_types = if all_types {
@@ -2166,7 +2165,6 @@ async fn index(
         let selection = rail_state::DashboardSelection {
             types: types.clone(),
             window: Some(window.as_str().to_string()),
-            all: all_types,
         };
         rail_state::persist_dashboard(&state.settings, &settings.user_key, &rt.id, &selection)
             .await;

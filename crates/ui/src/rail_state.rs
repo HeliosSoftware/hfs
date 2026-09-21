@@ -444,10 +444,16 @@ const DASHBOARD_MAX_TYPES: usize = 6;
 
 /// The Home "FHIR resources over time" chart selection persisted per user and
 /// per tenant under the settings document's `dashboard` key (#1358): the charted
-/// resource types, the time window slug (`1h`/`24h`/`30d`), and the "View all
-/// resources" toggle. All fields are optional on read — an absent or malformed
-/// value reads as the empty default, which the dashboard treats as "no stored
-/// selection" and falls through to the provider default.
+/// resource types and the time window slug (`1h`/`24h`/`30d`). Both fields are
+/// optional on read — an absent or malformed value reads as the empty default,
+/// which the dashboard treats as "no stored selection" and falls through to the
+/// provider default.
+///
+/// The "View all resources" toggle is deliberately **not** persisted: it is a
+/// transient exploration mode (it offers every spec type, not the tenant's
+/// stored set), and silently restoring it on every visit to Home would surprise
+/// the user and change the established default-off behavior. Only the two things
+/// a user actually curates — which types, over what window — are remembered.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct DashboardSelection {
     /// Charted resource type names, already sanitized (ASCII-alphanumeric,
@@ -456,8 +462,6 @@ pub(crate) struct DashboardSelection {
     /// The time-window slug, if one was stored. `None` means "use the default".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) window: Option<String>,
-    /// The "View all resources" toggle.
-    pub(crate) all: bool,
 }
 
 impl DashboardSelection {
@@ -489,8 +493,7 @@ impl DashboardSelection {
             .get("window")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let all = obj.get("all").and_then(Value::as_bool).unwrap_or(false);
-        Self { types, window, all }
+        Self { types, window }
     }
 }
 
@@ -662,10 +665,9 @@ mod tests {
             "byTenant": {
                 "acme": {"dashboard": {
                     "types": ["Patient", "bad name", "Observation", "Patient", "Enc$", "A", "B", "C", "D", "E"],
-                    "window": "24h",
-                    "all": true
+                    "window": "24h"
                 }},
-                "beta": {"dashboard": {"types": ["Condition"], "window": "1h", "all": false}}
+                "beta": {"dashboard": {"types": ["Condition"], "window": "1h"}}
             }
         });
         let settings = RequestSettings {
@@ -680,7 +682,6 @@ mod tests {
             vec!["Patient", "Observation", "A", "B", "C", "D"]
         );
         assert_eq!(acme.window.as_deref(), Some("24h"));
-        assert!(acme.all);
 
         // Another tenant's selection is not visible here.
         let gamma = settings.dashboard("gamma");
@@ -715,7 +716,7 @@ mod tests {
                 "l2:",
                 json!({"theme": "dark", "byTenant": {
                     "acme": {"rails": {"resources": {"last": "Patient", "recent": []}}},
-                    "beta": {"dashboard": {"types": ["X"], "all": false}}
+                    "beta": {"dashboard": {"types": ["X"]}}
                 }}),
                 None,
             )
@@ -726,14 +727,13 @@ mod tests {
         let selection = DashboardSelection {
             types: vec!["Patient".to_string(), "Observation".to_string()],
             window: Some("30d".to_string()),
-            all: true,
         };
         persist_dashboard(&settings, "l2:", "acme", &selection).await;
 
         let document = store.get_settings("l2:").await.unwrap().unwrap().document;
         assert_eq!(
             document["byTenant"]["acme"]["dashboard"],
-            json!({"types": ["Patient", "Observation"], "window": "30d", "all": true})
+            json!({"types": ["Patient", "Observation"], "window": "30d"})
         );
         assert_eq!(
             document["byTenant"]["acme"]["rails"]["resources"]["last"], "Patient",
