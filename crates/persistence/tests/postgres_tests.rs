@@ -7406,37 +7406,178 @@ mod postgres_integration {
         assert!(ids.contains(&"obs-2"));
     }
 
-    /// A bare logical id must match a stored `Patient/<id>` reference.
-    ///
-    /// `Observation?patient=<id>` is the primary form in the spec and the shape
-    /// Inferno uses throughout, but Postgres compared the raw search value
-    /// against the stored `Patient/<id>` and so matched nothing — every clinical
-    /// search returned an empty Bundle (#490). The sibling test above covers the
-    /// `Type/id` form, which always worked; only that form was ever asserted,
-    /// which is how the gap survived.
-    #[tokio::test]
-    async fn postgres_integration_search_reference_bare_id() {
-        use helios_persistence::core::SearchProvider;
+    fn observation_reference_query(
+        parameter: &str,
+        values: &[&str],
+    ) -> helios_persistence::types::SearchQuery {
         use helios_persistence::types::{
-            SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
         };
 
+        SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: parameter.to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: values.iter().map(|value| SearchValue::eq(*value)).collect(),
+            chain: vec![],
+            components: vec![],
+        })
+    }
+
+    async fn reference_search_ids(
+        backend: &PostgresBackend,
+        tenant: &TenantContext,
+        query: &helios_persistence::types::SearchQuery,
+    ) -> Vec<String> {
+        use helios_persistence::core::SearchProvider;
+
+        let mut ids: Vec<String> = backend
+            .search(tenant, query)
+            .await
+            .unwrap()
+            .resources
+            .items
+            .iter()
+            .map(|resource| resource.id().to_string())
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    async fn create_subject_observation(
+        backend: &PostgresBackend,
+        tenant: &TenantContext,
+        id: &str,
+        reference: &str,
+    ) -> helios_persistence::types::StoredResource {
+        backend
+            .create(
+                tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": id,
+                    "subject": {"reference": reference},
+                    "code": {"coding": [{"code": "8867-4"}]},
+                    "status": "final"
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Bare ids match the last path segment without losing exact-reference
+    /// semantics for `Type/id` searches.
+    #[tokio::test]
+    async fn postgres_integration_search_reference_bare_id_forms_and_tenant_isolation() {
         let backend = create_backend().await;
-        let tenant = create_tenant("test-tenant");
+        let tenant = create_tenant("bare-reference-forms");
+        let other_tenant = create_tenant("bare-reference-forms-other");
 
         for (id, subject) in [
-            ("obs-1", "Patient/patient-1"),
-            ("obs-2", "Patient/patient-1"),
-            ("obs-3", "Patient/patient-2"),
+            ("ref-prefixed", "Patient/shared-id"),
+            ("ref-bare", "shared-id"),
+            (
+                "ref-absolute",
+                "https://records.example.test/fhir/Patient/shared-id",
+            ),
+            ("ref-versioned", "Patient/shared-id/_history/7"),
+            ("ref-other-type", "Device/shared-id"),
+            ("ref-patient-only", "Patient/patient-only"),
+            ("ref-percent", "Patient/literal%id"),
+            ("ref-underscore", "Patient/literal_id"),
         ] {
+            create_subject_observation(&backend, &tenant, id, subject).await;
+        }
+        create_subject_observation(
+            &backend,
+            &other_tenant,
+            "ref-other-tenant",
+            "Patient/shared-id",
+        )
+        .await;
+
+        assert_eq!(
+            reference_search_ids(
+                &backend,
+                &tenant,
+                &observation_reference_query("subject", &["shared-id"]),
+            )
+            .await,
+            vec![
+                "ref-absolute",
+                "ref-bare",
+                "ref-other-type",
+                "ref-prefixed",
+                "ref-versioned",
+            ],
+            "a bare id is polymorphic and tenant-scoped"
+        );
+        assert_eq!(
+            reference_search_ids(
+                &backend,
+                &tenant,
+                &observation_reference_query("subject", &["Patient/shared-id"]),
+            )
+            .await,
+            vec!["ref-prefixed", "ref-versioned"],
+            "Type/id remains exact and version-normalized"
+        );
+        assert_eq!(
+            reference_search_ids(
+                &backend,
+                &tenant,
+                &observation_reference_query("subject", &["shared-id", "Patient/patient-only"],),
+            )
+            .await,
+            vec![
+                "ref-absolute",
+                "ref-bare",
+                "ref-other-type",
+                "ref-patient-only",
+                "ref-prefixed",
+                "ref-versioned",
+            ],
+            "mixed bare and Type/id values are ORed"
+        );
+
+        for (value, expected) in [
+            ("literal%id", vec!["ref-percent".to_string()]),
+            ("literal_id", vec!["ref-underscore".to_string()]),
+            ("missing-id", Vec::new()),
+        ] {
+            assert_eq!(
+                reference_search_ids(
+                    &backend,
+                    &tenant,
+                    &observation_reference_query("subject", &[value]),
+                )
+                .await,
+                expected,
+                "bare reference value {value:?} must use literal equality"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_search_reference_bare_id_page_dedup_and_maintenance() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{SearchParamType, SortDirective, TotalMode};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("bare-reference-page");
+
+        for day in 1..=7 {
             backend
                 .create(
                     &tenant,
                     "Observation",
                     json!({
                         "resourceType": "Observation",
-                        "id": id,
-                        "subject": {"reference": subject},
+                        "id": format!("page-{day:02}"),
+                        "subject": {"reference": "Patient/page-target"},
+                        "effectiveDateTime": format!("2024-01-{day:02}T00:00:00Z"),
                         "code": {"coding": [{"code": "8867-4"}]},
                         "status": "final"
                     }),
@@ -7446,54 +7587,324 @@ mod postgres_integration {
                 .unwrap();
         }
 
-        let bare_id = |modifier: Option<SearchModifier>| {
-            SearchQuery::new("Observation").with_parameter(SearchParameter {
-                name: "subject".to_string(),
-                param_type: SearchParamType::Reference,
-                modifier,
-                values: vec![SearchValue::eq("patient-1")],
-                chain: vec![],
-                components: vec![],
-            })
+        let page_query = |reference: &str| {
+            let mut query = observation_reference_query("subject", &[reference])
+                .with_count(5)
+                .with_sort(
+                    SortDirective::parse("-date").with_param_type(Some(SearchParamType::Date)),
+                );
+            query.total = Some(TotalMode::Accurate);
+            query
+        };
+        let bare_page = backend
+            .search(&tenant, &page_query("page-target"))
+            .await
+            .unwrap();
+        let typed_page = backend
+            .search(&tenant, &page_query("Patient/page-target"))
+            .await
+            .unwrap();
+        let page_ids = |page: &helios_persistence::core::SearchResult| {
+            page.resources
+                .items
+                .iter()
+                .map(|resource| resource.id().to_string())
+                .collect::<Vec<_>>()
         };
 
-        for (label, query) in [
-            ("bare id", bare_id(None)),
-            (
-                ":Type + bare id",
-                bare_id(Some(SearchModifier::Type("Patient".to_string()))),
-            ),
-        ] {
-            let result = backend.search(&tenant, &query).await.unwrap();
-            let mut ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
-            ids.sort_unstable();
-            assert_eq!(
-                ids,
-                vec!["obs-1", "obs-2"],
-                "{label} must match Patient/patient-1 and not the decoy patient-2"
-            );
+        assert_eq!(bare_page.total, Some(7));
+        assert_eq!(bare_page.total, typed_page.total);
+        assert_eq!(
+            page_ids(&bare_page),
+            vec!["page-07", "page-06", "page-05", "page-04", "page-03"]
+        );
+        assert_eq!(
+            page_ids(&bare_page),
+            page_ids(&typed_page),
+            "bare id and Patient/id must return the same five-row descending page"
+        );
+
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "duplicate-reference-row",
+                    "performer": [
+                        {"reference": "Patient/duplicate-target"},
+                        {"reference": "Patient/duplicate-target"}
+                    ],
+                    "code": {"coding": [{"code": "8867-4"}]},
+                    "status": "final"
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            reference_search_ids(
+                &backend,
+                &tenant,
+                &observation_reference_query("performer", &["duplicate-target"]),
+            )
+            .await,
+            vec!["duplicate-reference-row"],
+            "duplicate index rows must not duplicate a resource"
+        );
+
+        let stored = create_subject_observation(
+            &backend,
+            &tenant,
+            "maintained-reference",
+            "Patient/old-target",
+        )
+        .await;
+        assert_eq!(
+            reference_search_ids(
+                &backend,
+                &tenant,
+                &observation_reference_query("subject", &["old-target"]),
+            )
+            .await,
+            vec!["maintained-reference"]
+        );
+        backend
+            .update(
+                &tenant,
+                &stored,
+                json!({
+                    "resourceType": "Observation",
+                    "id": "maintained-reference",
+                    "subject": {"reference": "Patient/new-target"},
+                    "code": {"coding": [{"code": "8867-4"}]},
+                    "status": "final"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            reference_search_ids(
+                &backend,
+                &tenant,
+                &observation_reference_query("subject", &["old-target"]),
+            )
+            .await
+            .is_empty(),
+            "an update must remove the old reference index entry"
+        );
+        assert_eq!(
+            reference_search_ids(
+                &backend,
+                &tenant,
+                &observation_reference_query("subject", &["new-target"]),
+            )
+            .await,
+            vec!["maintained-reference"]
+        );
+        backend
+            .delete(&tenant, "Observation", "maintained-reference")
+            .await
+            .unwrap();
+        assert!(
+            reference_search_ids(
+                &backend,
+                &tenant,
+                &observation_reference_query("subject", &["new-target"]),
+            )
+            .await
+            .is_empty(),
+            "a delete must remove the reference index entry"
+        );
+    }
+
+    /// The bare-id reference predicate must remain a four-column expression-index
+    /// seek when PostgreSQL plans the complete count query with or without bind
+    /// values available.
+    #[tokio::test]
+    async fn postgres_reference_bare_id_count_plan_uses_target_index_for_custom_and_generic_plans()
+    {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::TotalMode;
+
+        fn visit_plan_nodes(
+            plan: &serde_json::Value,
+            visitor: &mut impl FnMut(&serde_json::Value),
+        ) {
+            match plan {
+                serde_json::Value::Object(fields) => {
+                    if fields.contains_key("Node Type") {
+                        visitor(plan);
+                    }
+                    for value in fields.values() {
+                        visit_plan_nodes(value, visitor);
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for value in values {
+                        visit_plan_nodes(value, visitor);
+                    }
+                }
+                _ => {}
+            }
         }
 
-        // The suffix match must not become a wildcard: `subject=%` matches the
-        // literal id `%`, i.e. nothing, rather than every reference.
-        let wildcard = SearchQuery::new("Observation").with_parameter(SearchParameter {
-            name: "subject".to_string(),
-            param_type: SearchParamType::Reference,
-            modifier: None,
-            values: vec![SearchValue::eq("%")],
-            chain: vec![],
-            components: vec![],
-        });
-        assert!(
-            backend
-                .search(&tenant, &wildcard)
-                .await
-                .unwrap()
-                .resources
-                .items
-                .is_empty(),
-            "a LIKE metacharacter must be matched literally, not as a wildcard"
+        let backend = create_backend_with_max_connections(1).await;
+        let tenant = create_tenant("bare-reference-count-plan");
+        let tenant_id = tenant.tenant_id().as_str();
+        let target_id = "rare-plan-target";
+        let client = backend.get_client().await.unwrap();
+        client
+            .execute(
+                "INSERT INTO resources \
+                 (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted) \
+                 SELECT $1, 'Observation', 'bare-plan-' || series, '1', \
+                        jsonb_build_object('resourceType', 'Observation', 'id', 'bare-plan-' || series), \
+                        statement_timestamp(), FALSE \
+                 FROM generate_series(1, 20000) AS series",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap();
+        client
+            .execute(
+                "INSERT INTO search_index \
+                 (tenant_id, resource_type, resource_id, param_name, value_reference) \
+                 SELECT $1, 'Observation', 'bare-plan-' || series, 'subject', \
+                        CASE WHEN series = 1 THEN 'Patient/rare-plan-target' \
+                             ELSE 'Patient/decoy-' || series END \
+                 FROM generate_series(1, 20000) AS series",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap();
+        client
+            .batch_execute("ANALYZE resources; ANALYZE search_index")
+            .await
+            .unwrap();
+        drop(client);
+
+        let mut query = observation_reference_query("subject", &[target_id]);
+        query.total = Some(TotalMode::Accurate);
+        let result = backend.search(&tenant, &query).await.unwrap();
+        assert_eq!(result.total, Some(1));
+
+        // The pool has one connection, so this is the same PostgreSQL session
+        // on which search_count cached its actual statement.
+        let client = backend.get_client().await.unwrap();
+        let prepared_counts = client
+            .query(
+                "SELECT name, statement FROM pg_prepared_statements \
+                 WHERE statement LIKE 'SELECT COUNT(*) FROM resources%' \
+                   AND statement LIKE '%split_part(value_reference%' \
+                 ORDER BY name",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            prepared_counts.len(),
+            1,
+            "expected one cached bare-reference count statement, got: {:?}",
+            prepared_counts
+                .iter()
+                .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+                .collect::<Vec<_>>()
         );
+        let statement_name: String = prepared_counts[0].get(0);
+        let count_sql: String = prepared_counts[0].get(1);
+        assert!(
+            count_sql.starts_with(
+                "SELECT COUNT(*) FROM resources WHERE tenant_id = $1 AND resource_type = $2 \
+                 AND is_deleted = FALSE"
+            ),
+            "unexpected prepared count statement: {count_sql}"
+        );
+        assert!(
+            count_sql.contains(
+                "param_name = 'subject' AND ((value_reference IS NOT NULL AND \
+                 split_part(value_reference, '/', -1) = $3))"
+            ),
+            "prepared count must contain the indexed bare-id predicate: {count_sql}"
+        );
+        assert!(
+            !count_sql.contains(" LIKE ") && !count_sql.contains("%/"),
+            "prepared count must not contain the old suffix predicate: {count_sql}"
+        );
+        let quoted_statement_name = format!("\"{}\"", statement_name.replace('"', "\"\""));
+
+        let mut plans = Vec::new();
+        for mode in ["force_custom_plan", "force_generic_plan"] {
+            client
+                .batch_execute(&format!("SET plan_cache_mode = {mode}"))
+                .await
+                .unwrap();
+            let row = client
+                .query_one(
+                    &format!(
+                        "EXPLAIN (FORMAT JSON) EXECUTE {quoted_statement_name} \
+                         ('{tenant_id}', 'Observation', '{target_id}')"
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap();
+            plans.push((mode, row.get::<_, serde_json::Value>(0)));
+        }
+
+        client.batch_execute("RESET plan_cache_mode").await.unwrap();
+
+        for (mode, plan) in plans {
+            let mut target_index_conditions = Vec::new();
+            let mut filters = Vec::new();
+            visit_plan_nodes(&plan, &mut |node| {
+                if node.get("Index Name").and_then(serde_json::Value::as_str)
+                    == Some("idx_search_reference_target_id")
+                {
+                    target_index_conditions.push(
+                        node.get("Index Cond")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                    );
+                }
+                if let Some(filter) = node.get("Filter").and_then(serde_json::Value::as_str) {
+                    filters.push(filter.to_string());
+                }
+            });
+
+            assert_eq!(
+                target_index_conditions.len(),
+                1,
+                "{mode} must use idx_search_reference_target_id exactly once: {plan}"
+            );
+            let index_condition = &target_index_conditions[0];
+            assert!(
+                index_condition.contains("split_part(value_reference"),
+                "{mode} must constrain the indexed target-id expression: {index_condition}"
+            );
+            if mode == "force_generic_plan" {
+                assert!(
+                    index_condition.contains("$3"),
+                    "the generic plan must retain the target bind: {index_condition}"
+                );
+            } else {
+                assert!(
+                    index_condition.contains(target_id) && !index_condition.contains("$3"),
+                    "the custom plan must contain the known target value: {index_condition}"
+                );
+            }
+            assert!(
+                filters.iter().all(|filter| {
+                    !filter.contains("~~") && !filter.contains("LIKE") && !filter.contains("%/")
+                }),
+                "{mode} must not retain a suffix/LIKE filter: {filters:?}"
+            );
+            println!(
+                "{mode}: idx_search_reference_target_id Index Cond: {index_condition}; \
+                 Filters: {filters:?}"
+            );
+        }
     }
 
     #[tokio::test]
