@@ -14,8 +14,11 @@
 //!    the persistence layer, which would match the ValueSet URL as a literal
 //!    code. (`:above` / `:below` on a uri or reference are structural and need
 //!    no terminology server.)
-//! 4. A terminology modifier the parameter's type does not define (`name:in`)
-//!    is a `400` either way, and never reaches the terminology server.
+//! 4. A terminology modifier the parameter's type does not define (`name:in`,
+//!    `subject.name:in`, `_has:Observation:subject:date:in`) is a `400` either
+//!    way, and never reaches the terminology server. The terminal parameter of
+//!    a chained or `_has` search is typed by the chain resolver, which calls
+//!    back into the REST layer's expansion once the modifier has passed.
 //! 5. When the terminology server cannot be reached, the parameter is dropped
 //!    and the search continues without it (fail-open).
 //!
@@ -424,4 +427,381 @@ async fn test_terminology_modifier_on_wrong_parameter_type_is_rejected_before_ex
         .await;
     assert_eq!(response.status_code(), StatusCode::OK);
     assert_eq!(requests.lock().unwrap().len(), 1);
+}
+
+/// #1365: the same on the terminal parameter of a chained or `_has` search.
+/// `subject.name:in` used to be rewritten into `subject.name=<expanded codes>`
+/// before the chain resolver could type `name`, so it was a string search for
+/// the codes — a silent `200`. The terminal is now typed first: an invalid
+/// modifier is a `400` and never reaches the terminology server, a valid one
+/// is expanded (once), a structural one (uri / reference `:below`) is left to
+/// the backend, and `:not-in` is a `400` or a `501` as on a direct parameter.
+#[tokio::test]
+async fn test_chained_terminology_modifier_is_checked_against_the_terminal_type() {
+    // One expansion for every call: a code of each value set searched below.
+    let expansion = json!({
+        "resourceType": "ValueSet",
+        "expansion": { "contains": [
+            {"system": "http://loinc.org", "code": "1234-5"},
+            {"system": "http://snomed.info/sct", "code": "706767009"},
+            // What the wrong-typed searches would find, were they run.
+            {"system": "http://example.org/cs", "code": "Smith"},
+        ]}
+    });
+    let (ts_url, requests) = start_mock_hts(expansion).await;
+
+    let data_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data");
+    let backend = SqliteBackend::with_config(
+        ":memory:",
+        helios_persistence::backends::sqlite::SqliteBackendConfig {
+            data_dir: Some(data_dir),
+            ..Default::default()
+        },
+    )
+    .expect("SQLite in-memory failed");
+    backend.init_schema().expect("Schema init failed");
+    let config = ServerConfig {
+        terminology_server: Some(ts_url),
+        ..ServerConfig::for_testing()
+    };
+    let server = TestServer::new(create_app_with_config(backend, config)).unwrap();
+
+    for resource in [
+        json!({"resourceType": "Practitioner", "id": "gp"}),
+        json!({"resourceType": "Patient", "id": "p-match", "gender": "female",
+               "birthDate": "1980-01-01", "name": [{"family": "Smith"}],
+               "generalPractitioner": [{"reference": "Practitioner/gp"}]}),
+        json!({"resourceType": "Patient", "id": "p-other", "gender": "male",
+               "name": [{"family": "Jones"}]}),
+        json!({"resourceType": "Device", "id": "dev", "url": "http://dev.example.org/a/b",
+               "type": {"coding": [{"system": "http://snomed.info/sct", "code": "706767009"}]}}),
+        json!({"resourceType": "Observation", "id": "o-match", "status": "final",
+               "code": {"coding": [{"system": "http://loinc.org", "code": "1234-5"}]},
+               "effectiveDateTime": "2020-01-01",
+               "subject": {"reference": "Patient/p-match"}}),
+        json!({"resourceType": "Observation", "id": "o-other", "status": "final",
+               "code": {"coding": [{"system": "http://loinc.org", "code": "9999-9"}]},
+               "subject": {"reference": "Patient/p-other"}}),
+        json!({"resourceType": "Observation", "id": "o-dev", "status": "final",
+               "code": {"coding": [{"system": "http://loinc.org", "code": "9999-9"}]},
+               "subject": {"reference": "Device/dev"}}),
+        json!({"resourceType": "DiagnosticReport", "id": "d-match", "status": "final",
+               "code": {"text": "report"},
+               "result": [{"reference": "Observation/o-match"}]}),
+        json!({"resourceType": "DiagnosticReport", "id": "d-other", "status": "final",
+               "code": {"text": "report"},
+               "result": [{"reference": "Observation/o-other"}]}),
+        json!({"resourceType": "DiagnosticReport", "id": "d-dev", "status": "final",
+               "code": {"text": "report"},
+               "result": [{"reference": "Observation/o-dev"}]}),
+    ] {
+        let path = format!(
+            "/{}/{}",
+            resource["resourceType"].as_str().unwrap(),
+            resource["id"].as_str().unwrap()
+        );
+        let response = server.put(&path).json(&resource).await;
+        assert!(response.status_code().is_success(), "seeding {path}");
+    }
+
+    let ids = |body: &Value| -> Vec<String> {
+        let mut ids: Vec<String> = body["entry"]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|e| e["resource"]["id"].as_str().unwrap().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        ids.sort();
+        ids
+    };
+
+    // Positive controls: every chain used below resolves, on the terminal
+    // parameters the invalid modifiers are put on.
+    for (resource_type, key, value, expected) in [
+        ("Observation", "subject.name", "Smith", "o-match"),
+        (
+            "Observation",
+            "subject:Patient.birthdate",
+            "1980-01-01",
+            "o-match",
+        ),
+        (
+            "DiagnosticReport",
+            "result.subject:Patient.name",
+            "Smith",
+            "d-match",
+        ),
+        (
+            "Patient",
+            "_has:Observation:subject:date",
+            "2020-01-01",
+            "p-match",
+        ),
+        ("Observation", "subject.type", "706767009", "o-dev"),
+    ] {
+        let response = server
+            .get(&format!("/{resource_type}"))
+            .add_query_param(key, value)
+            .await;
+        assert_eq!(response.status_code(), StatusCode::OK, "{key}");
+        assert_eq!(ids(&response.json()), [expected], "{key}");
+    }
+
+    // Invalid for the terminal's type: `400`, with or without a `:Type`.
+    for (resource_type, key, value) in [
+        ("Observation", "subject.name:in", "http://example.org/vs"),
+        (
+            "Observation",
+            "subject:Patient.name:in",
+            "http://example.org/vs",
+        ),
+        (
+            "Observation",
+            "subject:Patient.name:not-in",
+            "http://example.org/vs",
+        ),
+        (
+            "Observation",
+            "subject:Patient.name:below",
+            "http://example.org/cs|Smith",
+        ),
+        (
+            "Observation",
+            "subject:Patient.birthdate:above",
+            "http://example.org/cs|1980",
+        ),
+        (
+            "DiagnosticReport",
+            "result.subject:Patient.name:in",
+            "http://example.org/vs",
+        ),
+        (
+            "DiagnosticReport",
+            "result.subject:Patient.name:above",
+            "http://example.org/cs|Smith",
+        ),
+        (
+            "Patient",
+            "_has:Observation:subject:date:in",
+            "http://example.org/vs",
+        ),
+        (
+            "Patient",
+            "_has:Observation:subject:date:not-in",
+            "http://example.org/vs",
+        ),
+        (
+            "Patient",
+            "_has:Observation:subject:date:below",
+            "http://example.org/cs|2020",
+        ),
+    ] {
+        let response = server
+            .get(&format!("/{resource_type}"))
+            .add_query_param(key, value)
+            .await;
+        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST, "{key}");
+        assert!(
+            response.json::<Value>()["issue"][0]
+                .to_string()
+                .contains("is not supported for"),
+            "{key}"
+        );
+    }
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "an invalid modifier must not reach the terminology server"
+    );
+
+    // Valid and structural (reference / uri `:below`): the backend's, and no
+    // business of the terminology server.
+    for (key, value, expected) in [
+        (
+            "subject:Patient.general-practitioner:below",
+            "Practitioner/gp",
+            "o-match",
+        ),
+        (
+            "subject:Device.url:below",
+            "http://dev.example.org/a",
+            "o-dev",
+        ),
+    ] {
+        let response = server.get("/Observation").add_query_param(key, value).await;
+        assert_eq!(response.status_code(), StatusCode::OK, "{key}");
+        assert_eq!(ids(&response.json()), [expected], "{key}");
+    }
+    assert!(requests.lock().unwrap().is_empty());
+
+    // Valid `:not-in` on a token terminal: the direct form's `501`.
+    for (resource_type, key) in [
+        ("Observation", "subject:Patient.gender:not-in"),
+        ("Patient", "_has:Observation:subject:code:not-in"),
+    ] {
+        let response = server
+            .get(&format!("/{resource_type}"))
+            .add_query_param(key, "http://example.org/vs")
+            .await;
+        assert_eq!(response.status_code(), StatusCode::NOT_IMPLEMENTED, "{key}");
+        assert!(
+            response.json::<Value>()["issue"][0]
+                .to_string()
+                .contains("search modifier ':not-in' is not supported"),
+            "{key}"
+        );
+    }
+    assert!(requests.lock().unwrap().is_empty());
+
+    // Valid on a token terminal: expanded, one `$expand` call each. The first
+    // is an untyped hop over a polymorphic reference: `type` is a token on
+    // every `Observation.subject` target that defines it.
+    let device_type = "http://snomed.info/sct|706767009";
+    for (resource_type, key, value, expected) in [
+        (
+            "Observation",
+            "subject.type:in",
+            "http://example.org/vs",
+            "o-dev",
+        ),
+        (
+            "Observation",
+            "subject:Device.type:in",
+            "http://example.org/vs",
+            "o-dev",
+        ),
+        (
+            "Observation",
+            "subject:Device.type:above",
+            device_type,
+            "o-dev",
+        ),
+        (
+            "Observation",
+            "subject:Device.type:below",
+            device_type,
+            "o-dev",
+        ),
+        (
+            "DiagnosticReport",
+            "result.subject:Device.type:in",
+            "http://example.org/vs",
+            "d-dev",
+        ),
+        (
+            "DiagnosticReport",
+            "result.code:below",
+            "http://loinc.org|1234-5",
+            "d-match",
+        ),
+        (
+            "Patient",
+            "_has:Observation:subject:code:in",
+            "http://example.org/vs",
+            "p-match",
+        ),
+        (
+            "Patient",
+            "_has:Observation:subject:code:above",
+            "http://loinc.org|1234-5",
+            "p-match",
+        ),
+    ] {
+        let before = requests.lock().unwrap().len();
+        let response = server
+            .get(&format!("/{resource_type}"))
+            .add_query_param(key, value)
+            .await;
+        assert_eq!(response.status_code(), StatusCode::OK, "{key}");
+        assert_eq!(ids(&response.json()), [expected], "{key}");
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            before + 1,
+            "{key}: expected one $expand call"
+        );
+    }
+}
+
+/// When the terminology server is unreachable, a chained `:in` fails open as a
+/// direct one does: the chained parameter is dropped and the search goes on
+/// without it.
+#[tokio::test]
+async fn test_chained_in_modifier_fails_open_on_hts_unavailable() {
+    let data_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data");
+    let backend = SqliteBackend::with_config(
+        ":memory:",
+        helios_persistence::backends::sqlite::SqliteBackendConfig {
+            data_dir: Some(data_dir),
+            ..Default::default()
+        },
+    )
+    .expect("SQLite in-memory failed");
+    backend.init_schema().expect("Schema init failed");
+    let config = ServerConfig {
+        // Nothing listens here.
+        terminology_server: Some("http://127.0.0.1:19999".to_string()),
+        ..ServerConfig::for_testing()
+    };
+    let server = TestServer::new(create_app_with_config(backend, config)).unwrap();
+
+    for resource in [
+        json!({"resourceType": "Patient", "id": "p1", "gender": "female"}),
+        json!({"resourceType": "Observation", "id": "o1", "status": "final",
+               "code": {"coding": [{"system": "http://loinc.org", "code": "1234-5"}]},
+               "subject": {"reference": "Patient/p1"}}),
+        json!({"resourceType": "Observation", "id": "o2", "status": "final",
+               "code": {"coding": [{"system": "http://loinc.org", "code": "9999-9"}]}}),
+    ] {
+        let path = format!(
+            "/{}/{}",
+            resource["resourceType"].as_str().unwrap(),
+            resource["id"].as_str().unwrap()
+        );
+        assert!(
+            server
+                .put(&path)
+                .json(&resource)
+                .await
+                .status_code()
+                .is_success()
+        );
+    }
+
+    // Positive control: the chain constrains the search.
+    let response = server
+        .get("/Observation")
+        .add_query_param("subject.gender", "female")
+        .await;
+    assert_eq!(
+        response.json::<Value>()["entry"].as_array().unwrap().len(),
+        1
+    );
+
+    for (resource_type, key, other, expected) in [
+        ("Observation", "subject.gender:in", None, 2),
+        (
+            "Observation",
+            "subject:Patient.gender:in",
+            Some(("code", "9999-9")),
+            1,
+        ),
+        ("Patient", "_has:Observation:subject:code:in", None, 1),
+    ] {
+        let mut request = server
+            .get(&format!("/{resource_type}"))
+            .add_query_param(key, "http://example.org/vs");
+        if let Some((k, v)) = other {
+            request = request.add_query_param(k, v);
+        }
+        let response = request.await;
+        assert_eq!(response.status_code(), StatusCode::OK, "{key}");
+        let body: Value = response.json();
+        assert_eq!(
+            body["entry"].as_array().map_or(0, Vec::len),
+            expected,
+            "{key}: {body}"
+        );
+    }
 }

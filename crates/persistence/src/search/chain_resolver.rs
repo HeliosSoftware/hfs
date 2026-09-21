@@ -24,18 +24,60 @@ use super::{
     parse_typed_values, resolve_param_type, split_unescaped_commas, validate_modifier,
 };
 
+/// What a [`TerminologyExpander`] made of a terminal parameter's value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminologyExpansion {
+    /// The modifier was resolved into a plain token search: the raw value to
+    /// search for instead — a comma-separated OR list of `system|code` tokens,
+    /// as a client would write it — with the modifier removed.
+    Tokens(String),
+    /// Nothing to expand (a hierarchy modifier whose value is not a
+    /// `system|code`): the terminal search runs with the value and the
+    /// modifier as written.
+    Unchanged,
+    /// The expansion failed and the caller's policy is to go on without the
+    /// filter: the whole chained / `_has` parameter is dropped from the search.
+    Dropped,
+}
+
+/// Expands a terminology-backed modifier (`:in`, token `:above` / `:below`) on
+/// the terminal parameter of a chained / `_has` search.
+///
+/// The resolver is the only place the terminal parameter's type is known, so
+/// it is the only place that can tell `subject.gender:in` (valid, to expand)
+/// from `subject.name:in` (invalid, a `400`) — a caller rewriting the key
+/// before the resolver runs cannot (#1365). It therefore asks the caller, who
+/// owns the terminology client, to expand the value once the modifier has been
+/// validated against the terminal's type.
+#[async_trait::async_trait]
+pub trait TerminologyExpander: Send + Sync {
+    /// Expands `value` — the parameter's raw value as the client wrote it,
+    /// commas included — for `modifier`, which is `:in`, `:above` or `:below`.
+    async fn expand(&self, modifier: &SearchModifier, value: &str) -> TerminologyExpansion;
+}
+
 /// What the caller can do for the resolver.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ChainResolveOptions {
-    /// Whether the caller has a terminology server and has already expanded the
-    /// terminology-backed modifiers (`:in`, token `:above` / `:below`) with it,
-    /// as the REST search handler does when `HFS_TERMINOLOGY_SERVER` is set.
+#[derive(Clone, Copy, Default)]
+pub struct ChainResolveOptions<'a> {
+    /// The caller's terminology server, if it has one — the REST search
+    /// handler's, when `HFS_TERMINOLOGY_SERVER` is set. A terminology-backed
+    /// modifier (`:in`, token `:above` / `:below`) on a chain's terminal
+    /// parameter is expanded through it, after the modifier has been checked
+    /// against the terminal's type.
     ///
-    /// When false — the default — such a modifier on a chain's terminal
-    /// parameter is rejected with [`SearchError::TerminologyRequired`], as it
-    /// is on a direct parameter: no backend can answer it, and the terminal
-    /// search would otherwise match literally or not at all (#1317).
-    pub terminology_available: bool,
+    /// When `None` — the default — such a modifier is rejected with
+    /// [`SearchError::TerminologyRequired`], as it is on a direct parameter:
+    /// no backend can answer it, and the terminal search would otherwise match
+    /// literally or not at all (#1317).
+    pub terminology: Option<&'a dyn TerminologyExpander>,
+}
+
+impl std::fmt::Debug for ChainResolveOptions<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChainResolveOptions")
+            .field("terminology", &self.terminology.is_some())
+            .finish()
+    }
 }
 
 /// Returns true if the query contains any chained or reverse-chained parameter.
@@ -67,7 +109,7 @@ pub async fn resolve_chains_with<S>(
     storage: &S,
     tenant: &TenantContext,
     query: &SearchQuery,
-    options: ChainResolveOptions,
+    options: ChainResolveOptions<'_>,
 ) -> StorageResult<SearchQuery>
 where
     S: SearchProvider + ?Sized,
@@ -97,8 +139,13 @@ where
                 },
             ));
         }
-        let ids = resolve_forward_chain(storage, tenant, &base_type, param, options).await?;
-        id_sets.push(ids.into_iter().collect());
+        // `None`: the terminal's terminology expansion failed open, and the
+        // chain no longer constrains the search.
+        if let Some(ids) =
+            resolve_forward_chain_opt(storage, tenant, &base_type, param, options).await?
+        {
+            id_sets.push(ids.into_iter().collect());
+        }
     }
 
     let max_reverse_depth = crate::types::ChainConfig::default().max_reverse_depth;
@@ -114,18 +161,25 @@ where
                 },
             ));
         }
-        let ids =
-            resolve_reverse_chain(storage, tenant, &base_type, reverse_chain, options).await?;
-        id_sets.push(ids.into_iter().collect());
+        if let Some(ids) =
+            resolve_reverse_chain_level(storage, tenant, &base_type, reverse_chain, options, "")
+                .await?
+        {
+            id_sets.push(ids.into_iter().collect());
+        }
     }
-
-    let matched_ids = intersect(id_sets);
 
     // Rewrite: keep non-chained params, drop chained params + reverse chains,
     // and add an `_id` filter for the resolved base-resource ids.
     let mut rewritten = query.clone();
     rewritten.parameters.retain(|p| p.chain.is_empty());
     rewritten.reverse_chains.clear();
+
+    // Every chain was dropped (see above): nothing left to filter on.
+    if id_sets.is_empty() {
+        return Ok(rewritten);
+    }
+    let matched_ids = intersect(id_sets);
 
     let id_values: Vec<SearchValue> = if matched_ids.is_empty() {
         // Sentinel that cannot match a real id, forcing an empty result.
@@ -217,20 +271,39 @@ pub(crate) async fn resolve_forward_chain<S>(
     tenant: &TenantContext,
     base_type: &str,
     param: &SearchParameter,
-    options: ChainResolveOptions,
+    options: ChainResolveOptions<'_>,
 ) -> StorageResult<Vec<String>>
+where
+    S: SearchProvider + ?Sized,
+{
+    // A dropped chain (`None`) has no place in an id list; it takes a
+    // terminology expander that fails open to get one.
+    resolve_forward_chain_opt(storage, tenant, base_type, param, options)
+        .await
+        .map(Option::unwrap_or_default)
+}
+
+/// [`resolve_forward_chain`], with `None` for a chain whose terminal parameter
+/// was dropped by the terminology expander ([`TerminologyExpansion::Dropped`]).
+async fn resolve_forward_chain_opt<S>(
+    storage: &S,
+    tenant: &TenantContext,
+    base_type: &str,
+    param: &SearchParameter,
+    options: ChainResolveOptions<'_>,
+) -> StorageResult<Option<Vec<String>>>
 where
     S: SearchProvider + ?Sized,
 {
     let hops = &param.chain;
     if hops.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Some(Vec::new()));
     }
     let terminal_param = &hops[hops.len() - 1].target_param;
 
     // Candidate parent/target types per hop, and the terminal param's type
     // and parsed values.
-    let (parent_types_per_hop, terminal_types, terminal_type, terminal_values) = {
+    let (parent_types_per_hop, terminal_types, mut terminal, expand) = {
         let reg = storage.search_param_registry(tenant);
         let registry = reg.read();
 
@@ -268,7 +341,45 @@ where
             .filter(|t| registry.get_param(t, terminal_param).is_some())
             .cloned()
             .collect();
-        let terminal_types = if defined.is_empty() { current } else { defined };
+        let mut terminal_types = if defined.is_empty() { current } else { defined };
+        // An untyped hop over a polymorphic reference can reach target types
+        // that type the terminal param differently (`Provenance?target.context`
+        // is a token on Questionnaire, a reference on ChargeItem). A modifier is
+        // accepted if it is valid on at least one of them, and the terminal
+        // search then only covers the types that type the param that way: the
+        // others contribute nothing, like the types that do not define the
+        // param at all. Invalid everywhere, it is the first type's error — a
+        // "needs terminology" (`501`) before an "invalid" (`400`), which is
+        // what the client would get by naming the type it is valid on.
+        if let Some(m) = param.modifier.as_ref() {
+            let type_of = |t: &String| {
+                parse_terminal_values(&registry, t, terminal_param, &param.values, Some(m), false).0
+            };
+            let check = |t: &String| {
+                check_terminal_modifier(
+                    &registry,
+                    t,
+                    terminal_param,
+                    type_of(t),
+                    Some(m),
+                    || forward_chain_display(param),
+                    options,
+                )
+            };
+            if let Some(accepted) = terminal_types.iter().find(|t| check(t).is_ok()) {
+                let accepted_type = type_of(accepted);
+                terminal_types.retain(|t| type_of(t) == accepted_type && check(t).is_ok());
+            } else if let Some(needs_terminology) = terminal_types.iter().find(|t| {
+                matches!(
+                    check(t),
+                    Err(StorageError::Search(
+                        SearchError::TerminologyRequired { .. }
+                    ))
+                )
+            }) {
+                terminal_types = vec![needs_terminology.clone()];
+            }
+        }
         // The chained parameter arrives typed as its *reference* hop, so its
         // values are still raw (already comma-split into the OR list). Only
         // here is the terminal param's type known, so this is where they are
@@ -283,7 +394,7 @@ where
         );
         // Likewise the modifier: a chained parameter's modifier belongs to the
         // terminal param, and only now can it be checked against that type.
-        check_terminal_modifier(
+        let expand = check_terminal_modifier(
             &registry,
             &terminal_types[0],
             terminal_param,
@@ -292,19 +403,47 @@ where
             || forward_chain_display(param),
             options,
         )?;
-        (parents, terminal_types, terminal_type, terminal_values)
+        let terminal = TerminalSearch {
+            param_type: terminal_type,
+            modifier: param.modifier.clone(),
+            values: terminal_values,
+        };
+        (parents, terminal_types, terminal, expand)
     };
+    if let Some(expander) = expand {
+        // The values were split into their OR alternatives by the query
+        // builder; the expander takes the value as the client wrote it.
+        let raw = param
+            .values
+            .iter()
+            .map(|v| v.value.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let expanded = expand_terminal(
+            storage,
+            tenant,
+            expander,
+            &terminal_types[0],
+            terminal_param,
+            &raw,
+            &mut terminal,
+        )
+        .await;
+        if !expanded {
+            return Ok(None);
+        }
+    }
 
     // Deepest hop: search each candidate terminal type, union the refs.
     let mut current_refs: Vec<String> = Vec::new();
     for terminal_target in &terminal_types {
         let terminal_query = SearchQuery::new(terminal_target).with_parameter(SearchParameter {
             name: terminal_param.clone(),
-            param_type: terminal_type,
+            param_type: terminal.param_type,
             // Set on the terminal search itself, so every check a backend runs
             // on a direct `name:exact` / `birthdate:missing` sees this one too.
-            modifier: param.modifier.clone(),
-            values: terminal_values.clone(),
+            modifier: terminal.modifier.clone(),
+            values: terminal.values.clone(),
             chain: vec![],
             components: vec![],
         });
@@ -316,7 +455,7 @@ where
         );
     }
     if current_refs.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Some(Vec::new()));
     }
 
     // Walk back out: for each reference hop, find parents pointing at the
@@ -358,11 +497,11 @@ where
         }
         current_refs = next_refs;
         if current_refs.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Some(Vec::new()));
         }
     }
 
-    Ok(current_refs)
+    Ok(Some(current_refs))
 }
 
 /// Resolves a reverse chain (`_has:Source:refParam:searchParam=value`) to a set
@@ -377,26 +516,33 @@ pub(crate) async fn resolve_reverse_chain<S>(
     tenant: &TenantContext,
     base_type: &str,
     reverse_chain: &ReverseChainedParameter,
-    options: ChainResolveOptions,
+    options: ChainResolveOptions<'_>,
 ) -> StorageResult<Vec<String>>
 where
     S: SearchProvider + ?Sized,
 {
-    resolve_reverse_chain_level(storage, tenant, base_type, reverse_chain, options, "").await
+    // As in `resolve_forward_chain`: `None` takes an expander that fails open.
+    resolve_reverse_chain_level(storage, tenant, base_type, reverse_chain, options, "")
+        .await
+        .map(Option::unwrap_or_default)
 }
 
 /// One level of [`resolve_reverse_chain`]. `outer` is the part of the key
 /// written before this level — `_has:Encounter:subject:` for the inner level of
 /// `_has:Encounter:subject:_has:Observation:encounter:code` — so an error on
 /// the terminal parameter can name the whole key, not just its last level.
+///
+/// `None` when the terminal parameter was dropped by the terminology expander
+/// ([`TerminologyExpansion::Dropped`]), at this level or a nested one: the
+/// whole `_has` then no longer constrains the search.
 async fn resolve_reverse_chain_level<S>(
     storage: &S,
     tenant: &TenantContext,
     base_type: &str,
     reverse_chain: &ReverseChainedParameter,
-    options: ChainResolveOptions,
+    options: ChainResolveOptions<'_>,
     outer: &str,
-) -> StorageResult<Vec<String>>
+) -> StorageResult<Option<Vec<String>>>
 where
     S: SearchProvider + ?Sized,
 {
@@ -409,7 +555,7 @@ where
     let source_query = if let Some(inner) = &reverse_chain.nested {
         // Nested: the inner chain decides which source resources qualify. Its
         // base type is *this* level's source type.
-        let inner_ids = Box::pin(resolve_reverse_chain_level(
+        let Some(inner_ids) = Box::pin(resolve_reverse_chain_level(
             storage,
             tenant,
             &reverse_chain.source_type,
@@ -417,9 +563,12 @@ where
             options,
             &level,
         ))
-        .await?;
+        .await?
+        else {
+            return Ok(None);
+        };
         if inner_ids.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Some(Vec::new()));
         }
         SearchQuery::new(&reverse_chain.source_type).with_parameter(SearchParameter {
             name: "_id".to_string(),
@@ -446,7 +595,7 @@ where
             })?),
             None => None,
         };
-        let (search_param_type, values) = {
+        let (mut terminal, expand) = {
             let reg = storage.search_param_registry(tenant);
             let registry = reg.read();
             let (search_param_type, values) = parse_terminal_values(
@@ -457,7 +606,7 @@ where
                 modifier.as_ref(),
                 true,
             );
-            check_terminal_modifier(
+            let expand = check_terminal_modifier(
                 &registry,
                 &reverse_chain.source_type,
                 search_param,
@@ -466,13 +615,37 @@ where
                 || format!("{level}{search_param}"),
                 options,
             )?;
-            (search_param_type, values)
+            let terminal = TerminalSearch {
+                param_type: search_param_type,
+                modifier,
+                values,
+            };
+            (terminal, expand)
         };
+        if let Some(expander) = expand {
+            let raw_value = reverse_chain
+                .value
+                .as_ref()
+                .map_or("", |v| v.value.as_str());
+            let expanded = expand_terminal(
+                storage,
+                tenant,
+                expander,
+                &reverse_chain.source_type,
+                search_param,
+                raw_value,
+                &mut terminal,
+            )
+            .await;
+            if !expanded {
+                return Ok(None);
+            }
+        }
         SearchQuery::new(&reverse_chain.source_type).with_parameter(SearchParameter {
             name: search_param.to_string(),
-            param_type: search_param_type,
-            modifier,
-            values,
+            param_type: terminal.param_type,
+            modifier: terminal.modifier,
+            values: terminal.values,
             chain: vec![],
             components: vec![],
         })
@@ -498,7 +671,7 @@ where
             }
         }
     }
-    Ok(ids)
+    Ok(Some(ids))
 }
 
 /// Parses the values of a chain's terminal parameter exactly as a direct search
@@ -553,34 +726,92 @@ fn parse_terminal_values(
 ///   is a terminology server to ask (#1339);
 /// * one that is valid but needs a terminology server the caller does not have
 ///   ([`param_requires_terminology`]), which the REST layer maps to a `501`.
+///   `:not-in` is always that: negated value-set membership cannot be turned
+///   into a token list, so a terminology server does not help.
+///
+/// Returns the caller's terminology expander when the modifier is valid, needs
+/// one and there is one: the terminal's value is then to be expanded with
+/// [`expand_terminal`] — once the registry guard this runs under is released.
 ///
 /// `display` names the parameter as the client wrote it, less the modifier —
 /// the whole chain or `_has` key, every level of a nested one. Both errors
 /// carry it: the terminal parameter's own name alone does not tell the client
 /// which part of the request was wrong.
-fn check_terminal_modifier(
+fn check_terminal_modifier<'a>(
     registry: &SearchParameterRegistry,
     resource_type: &str,
     param_name: &str,
     param_type: SearchParamType,
     modifier: Option<&SearchModifier>,
     display: impl Fn() -> String,
-    options: ChainResolveOptions,
-) -> StorageResult<()> {
+    options: ChainResolveOptions<'a>,
+) -> StorageResult<Option<&'a dyn TerminologyExpander>> {
     let Some(m) = modifier else {
-        return Ok(());
+        return Ok(None);
     };
     validate_modifier(registry, resource_type, param_name, param_type, m)
         .map_err(|message| query_error(format!("{message} (in '{}:{m}')", display())))?;
-    if !options.terminology_available
-        && param_requires_terminology(registry, resource_type, param_name, m)
-    {
-        return Err(StorageError::Search(SearchError::TerminologyRequired {
+    if !param_requires_terminology(registry, resource_type, param_name, m) {
+        return Ok(None);
+    }
+    match options.terminology {
+        Some(expander) if *m != SearchModifier::NotIn => Ok(Some(expander)),
+        _ => Err(StorageError::Search(SearchError::TerminologyRequired {
             modifier: m.to_string(),
             param: display(),
-        }));
+        })),
     }
-    Ok(())
+}
+
+/// The terminal search of a chain: what is searched for on the terminal
+/// parameter.
+struct TerminalSearch {
+    param_type: SearchParamType,
+    modifier: Option<SearchModifier>,
+    values: Vec<SearchValue>,
+}
+
+/// Expands the terminology-backed modifier of `terminal` through `expander`,
+/// turning it into the plain token search a direct `code:in` becomes: the
+/// expansion is parsed like any terminal value. `raw` is the value as the
+/// client wrote it. Returns false when the expander dropped the parameter.
+async fn expand_terminal<S>(
+    storage: &S,
+    tenant: &TenantContext,
+    expander: &dyn TerminologyExpander,
+    resource_type: &str,
+    param_name: &str,
+    raw: &str,
+    terminal: &mut TerminalSearch,
+) -> bool
+where
+    S: SearchProvider + ?Sized,
+{
+    let Some(modifier) = terminal.modifier.clone() else {
+        return true;
+    };
+    match expander.expand(&modifier, raw).await {
+        TerminologyExpansion::Tokens(tokens) => {
+            let reg = storage.search_param_registry(tenant);
+            let registry = reg.read();
+            let (param_type, values) = parse_terminal_values(
+                &registry,
+                resource_type,
+                param_name,
+                &[SearchValue::eq(tokens)],
+                None,
+                true,
+            );
+            *terminal = TerminalSearch {
+                param_type,
+                modifier: None,
+                values,
+            };
+            true
+        }
+        TerminologyExpansion::Unchanged => true,
+        TerminologyExpansion::Dropped => false,
+    }
 }
 
 /// A forward chain as the client wrote it, less the terminal modifier:
@@ -1393,14 +1624,6 @@ mod tests {
             of("above", "_has:Procedure:subject:status")
         );
 
-        // With terminology available the modifier is the caller's business
-        // (REST has expanded it away by now); whatever is left resolves.
-        let q = has("Patient", "Procedure", "subject", "status:in", "http://vs");
-        let options = ChainResolveOptions {
-            terminology_available: true,
-        };
-        assert!(resolve_chains_with(&b, &t, &q, options).await.is_ok());
-
         // Structural on a reference terminal: never needs terminology.
         // Procedure?subject:Patient.general-practitioner:below=Practitioner/x
         let q = forward_modified(
@@ -1414,9 +1637,13 @@ mod tests {
         // #1339: a terminology modifier the terminal's type does not define is
         // a parse error (`400`), not a missing terminology server (`501`) —
         // with or without one.
-        for options in [false, true].map(|terminology_available| ChainResolveOptions {
-            terminology_available,
-        }) {
+        let expander = FakeExpander::new(TerminologyExpansion::Tokens("completed".into()));
+        for options in [
+            ChainResolveOptions::default(),
+            ChainResolveOptions {
+                terminology: Some(&expander),
+            },
+        ] {
             for q in [
                 // Procedure?subject:Patient.birthdate:in=… / .family:below=…
                 forward_modified(
@@ -1442,6 +1669,243 @@ mod tests {
                 }
             }
         }
+        // … and the terminology server is never asked about it (#1365).
+        assert_eq!(expander.calls(), vec![]);
+    }
+
+    /// #1365: over an untyped polymorphic hop the terminal param can be typed
+    /// differently per target type. A modifier valid on at least one of them is
+    /// accepted, and only those types are searched.
+    #[tokio::test]
+    async fn terminal_modifier_valid_on_one_polymorphic_target_is_accepted() {
+        let b = backend();
+        let t = tenant();
+        for resource in [
+            json!({ "resourceType": "Questionnaire", "id": "q1", "status": "active",
+                    "useContext": [{ "code": { "code": "focus" },
+                                     "valueCodeableConcept": { "coding": [
+                                         { "system": "http://cs", "code": "focus" }] } }] }),
+            json!({ "resourceType": "Provenance", "id": "prov1", "recorded": "2020-01-01T00:00:00Z",
+                    "target": [{ "reference": "Questionnaire/q1" }],
+                    "agent": [{ "who": { "display": "x" } }] }),
+        ] {
+            let resource_type = resource["resourceType"].as_str().unwrap().to_string();
+            b.create(&t, &resource_type, resource, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+        let untyped = |modifier: Option<SearchModifier>, raw: &str| {
+            SearchQuery::new("Provenance").with_parameter(SearchParameter {
+                name: "target".to_string(),
+                param_type: SearchParamType::Reference,
+                modifier,
+                values: vec![SearchValue::eq(raw)],
+                chain: vec![crate::types::ChainedParameter {
+                    reference_param: "target".to_string(),
+                    target_type: None,
+                    target_param: "context".to_string(),
+                }],
+                components: vec![],
+            })
+        };
+
+        // Positive control: `context` is a token on Questionnaire …
+        assert_eq!(run(&b, &t, &untyped(None, "focus")).await, ["prov1"]);
+
+        // … and a reference on ChargeItem / MedicationStatement, where alone
+        // `:identifier` is valid. The first target type defining `context`
+        // (ActivityDefinition, a token) used to decide for all of them.
+        let q = untyped(Some(SearchModifier::Identifier), "http://ids|e1");
+        assert!(run(&b, &t, &q).await.is_empty());
+
+        // `:in` is valid on the token targets: a `501` without terminology,
+        // expanded with it.
+        let q = untyped(Some(SearchModifier::In), "http://vs");
+        assert!(matches!(
+            resolve_chains(&b, &t, &q).await,
+            Err(StorageError::Search(
+                SearchError::TerminologyRequired { .. }
+            ))
+        ));
+        let expander = FakeExpander::new(TerminologyExpansion::Tokens("http://cs|focus".into()));
+        assert_eq!(run_with(&b, &t, &q, &expander).await.unwrap(), ["prov1"]);
+        assert_eq!(expander.calls().len(), 1);
+
+        // Valid nowhere (`:exact` is a string modifier): still a parse error.
+        let q = untyped(Some(SearchModifier::Exact), "focus");
+        assert!(matches!(
+            resolve_chains(&b, &t, &q).await,
+            Err(StorageError::Search(SearchError::QueryParseError { .. }))
+        ));
+    }
+
+    /// A terminology expander answering every call the same way, and recording
+    /// what it was asked.
+    struct FakeExpander {
+        answer: TerminologyExpansion,
+        calls: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl FakeExpander {
+        fn new(answer: TerminologyExpansion) -> Self {
+            Self {
+                answer,
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<(String, String)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TerminologyExpander for FakeExpander {
+        async fn expand(&self, modifier: &SearchModifier, value: &str) -> TerminologyExpansion {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((modifier.to_string(), value.to_string()));
+            self.answer.clone()
+        }
+    }
+
+    async fn run_with(
+        b: &SqliteBackend,
+        t: &TenantContext,
+        query: &SearchQuery,
+        expander: &FakeExpander,
+    ) -> StorageResult<Vec<String>> {
+        let options = ChainResolveOptions {
+            terminology: Some(expander),
+        };
+        let rewritten = resolve_chains_with(b, t, query, options).await?;
+        let mut ids: Vec<String> = b
+            .search(t, &rewritten)
+            .await?
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        ids.sort();
+        Ok(ids)
+    }
+
+    /// #1365: a valid terminology modifier on a terminal parameter is expanded
+    /// through the caller's expander — once, after the terminal has been typed
+    /// — and the terminal search runs on the expansion.
+    #[tokio::test]
+    async fn terminal_terminology_modifier_is_expanded_by_the_caller() {
+        let b = backend();
+        let t = tenant();
+        seed_dated(&b, &t).await;
+        b.create(
+            &t,
+            "Patient",
+            json!({ "resourceType": "Patient", "id": "pf", "gender": "female" }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+        b.create(
+            &t,
+            "Procedure",
+            json!({ "resourceType": "Procedure", "id": "prf", "status": "completed",
+                    "subject": { "reference": "Patient/pf" } }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+        // Procedure?subject:Patient.gender:in=http://vs → gender=female,other
+        let tokens = TerminologyExpansion::Tokens("female,other".into());
+        let expander = FakeExpander::new(tokens.clone());
+        let q = forward_modified(
+            "Procedure",
+            &[("subject", "Patient", "gender")],
+            SearchModifier::In,
+            &["http://vs"],
+        );
+        assert_eq!(run_with(&b, &t, &q, &expander).await.unwrap(), ["prf"]);
+        assert_eq!(
+            expander.calls(),
+            [("in".to_string(), "http://vs".to_string())]
+        );
+
+        // Patient?_has:Procedure:subject:status:below=s|c — nobody has that status.
+        let expander = FakeExpander::new(tokens);
+        let q = has("Patient", "Procedure", "subject", "status:below", "s|c");
+        assert!(run_with(&b, &t, &q, &expander).await.unwrap().is_empty());
+        assert_eq!(expander.calls(), [("below".to_string(), "s|c".to_string())]);
+        let expander = FakeExpander::new(TerminologyExpansion::Tokens("completed".into()));
+        assert_eq!(
+            run_with(&b, &t, &q, &expander).await.unwrap(),
+            ["p80", "p90", "pf"]
+        );
+
+        // Dropped (the caller fails open): the chain no longer constrains.
+        let expander = FakeExpander::new(TerminologyExpansion::Dropped);
+        let q = forward_modified(
+            "Procedure",
+            &[("subject", "Patient", "gender")],
+            SearchModifier::In,
+            &["http://vs"],
+        );
+        assert_eq!(
+            run_with(&b, &t, &q, &expander).await.unwrap(),
+            ["pr1", "pr2", "pr3", "pr4", "prf"]
+        );
+
+        // A structural `:below` (reference terminal) is not the expander's.
+        let expander = FakeExpander::new(TerminologyExpansion::Dropped);
+        let q = forward_modified(
+            "Procedure",
+            &[("subject", "Patient", "general-practitioner")],
+            SearchModifier::Below,
+            &["Practitioner/x"],
+        );
+        assert!(run_with(&b, &t, &q, &expander).await.unwrap().is_empty());
+        assert_eq!(expander.calls(), vec![]);
+
+        // `:not-in` cannot be expanded: unanswerable with a server too, but
+        // only once it is known to be valid for the terminal's type.
+        for (q, valid) in [
+            (
+                has(
+                    "Patient",
+                    "Procedure",
+                    "subject",
+                    "status:not-in",
+                    "http://vs",
+                ),
+                true,
+            ),
+            (
+                has(
+                    "Patient",
+                    "Procedure",
+                    "subject",
+                    "date:not-in",
+                    "http://vs",
+                ),
+                false,
+            ),
+        ] {
+            match (run_with(&b, &t, &q, &expander).await, valid) {
+                (
+                    Err(StorageError::Search(SearchError::TerminologyRequired {
+                        modifier, ..
+                    })),
+                    true,
+                ) => {
+                    assert_eq!(modifier, "not-in")
+                }
+                (Err(StorageError::Search(SearchError::QueryParseError { .. })), false) => {}
+                (other, _) => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(expander.calls(), vec![]);
     }
 
     /// #1339: an error on the terminal parameter of a nested `_has` names the
