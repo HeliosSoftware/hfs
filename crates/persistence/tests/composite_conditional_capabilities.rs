@@ -221,7 +221,15 @@ async fn a_configured_version_scopes_the_type_qualifier_of_conditional_criteria(
     let criteria = "general-practitioner:ActorDefinition=a1";
 
     let r4 = composite_with_search_backend(Some(FhirVersion::R4));
-    match r4.conditional_delete(&t, "Patient", criteria).await {
+    match r4
+        .conditional_delete(
+            &t,
+            "Patient",
+            criteria,
+            &helios_persistence::core::EntityTagPrecondition::Absent,
+        )
+        .await
+    {
         Err(e) => assert!(
             e.to_string().contains("nor a resource type of FHIR R4"),
             "{e}"
@@ -233,14 +241,26 @@ async fn a_configured_version_scopes_the_type_qualifier_of_conditional_criteria(
     // and the criteria simply match nothing.
     let unset = composite_with_search_backend(None);
     assert!(matches!(
-        unset.conditional_delete(&t, "Patient", criteria).await,
+        unset
+            .conditional_delete(
+                &t,
+                "Patient",
+                criteria,
+                &helios_persistence::core::EntityTagPrecondition::Absent
+            )
+            .await,
         Ok(ConditionalDeleteResult::NoMatch)
     ));
 
     // Positive control: a type the version does have is accepted.
     assert!(matches!(
-        r4.conditional_delete(&t, "Patient", "general-practitioner:Practitioner=p1")
-            .await,
+        r4.conditional_delete(
+            &t,
+            "Patient",
+            "general-practitioner:Practitioner=p1",
+            &helios_persistence::core::EntityTagPrecondition::Absent,
+        )
+        .await,
         Ok(ConditionalDeleteResult::NoMatch)
     ));
 }
