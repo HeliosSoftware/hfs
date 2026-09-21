@@ -1013,6 +1013,67 @@ async fn bulk_submit_concurrent_ingest_preserves_order_and_writes_all() {
     }
 }
 
+/// The raw NDJSON archive is one object per batch holding every line (#1429),
+/// not one PUT per entry — the coalescing that drops a PUT per resource.
+#[tokio::test]
+async fn bulk_submit_raw_archive_is_one_object_per_batch() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+
+    let submission_id = SubmissionId::new("client-a", "sub-raw");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    let entries: Vec<NdjsonEntry> = (1..=3)
+        .map(|i| {
+            NdjsonEntry::new(
+                i,
+                "Patient",
+                json!({"resourceType": "Patient", "id": format!("r{i}")}),
+            )
+        })
+        .collect();
+    backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            entries,
+            &BulkProcessingOptions::new(),
+        )
+        .await
+        .unwrap();
+
+    let raw_puts = mock
+        .recorded_puts()
+        .into_iter()
+        .filter(|put| put.key.contains("/raw/"))
+        .count();
+    assert_eq!(
+        raw_puts, 1,
+        "the three-entry batch must archive its raw NDJSON in one object, not three"
+    );
+
+    // The resources themselves are still all stored.
+    for i in 1..=3 {
+        assert!(
+            backend
+                .read(&tenant, "Patient", &format!("r{i}"))
+                .await
+                .unwrap()
+                .is_some(),
+            "Patient/r{i} should be stored"
+        );
+    }
+}
+
 /// A batch with two entries for the same resource id is order-dependent
 /// (last write wins), so it ingests serially even with concurrency enabled —
 /// the concurrent path would race them to a non-deterministic result (#945).
@@ -1244,12 +1305,13 @@ async fn bulk_submit_entry_results_are_keyed_by_their_output_file() {
     );
 
     // The raw NDJSON archive is discriminated too, so the auditable copy of the
-    // first file's payload is not replaced by the second's.
+    // first file's payload is not replaced by the second's. Coalesced to one
+    // batch object per file (#1429), keyed by the batch's first line.
     let raw_keys: Vec<String> = mock
         .recorded_puts()
         .into_iter()
         .map(|put| put.key)
-        .filter(|key| key.contains("/raw/") && key.ends_with("line-1.ndjson"))
+        .filter(|key| key.contains("/raw/") && key.ends_with("batch-1.ndjson"))
         .collect();
     assert_eq!(raw_keys.len(), 2, "one raw archive put per file");
     assert_ne!(
