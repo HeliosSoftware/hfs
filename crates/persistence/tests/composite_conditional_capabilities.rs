@@ -25,8 +25,10 @@ use helios_persistence::core::{
     BackendKind, ConditionalDeleteResult, ConditionalInteraction, ConditionalPatchResult,
     ConditionalStorage, PatchFormat, ResourceStorage,
 };
-use helios_persistence::error::{BackendError, StorageError};
+use helios_persistence::core::{EntityTagPrecondition, SearchProvider};
+use helios_persistence::error::{ConcurrencyError, StorageError};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
+use helios_persistence::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
 use serde_json::{Value, json};
 
 fn tenant() -> TenantContext {
@@ -54,6 +56,14 @@ fn sqlite() -> SqliteBackend {
 /// A production-shaped composite: primary with its own index offloaded, a
 /// dedicated search secondary, synchronous sync.
 fn composite_with_search_backend(fhir_version: Option<FhirVersion>) -> CompositeStorage {
+    composite_and_its_primary(fhir_version).0
+}
+
+/// The same, with a handle on the primary so a test can write behind the
+/// composite's back — what leaves the search backend's copy stale.
+fn composite_and_its_primary(
+    fhir_version: Option<FhirVersion>,
+) -> (CompositeStorage, Arc<SqliteBackend>) {
     let mut primary = sqlite();
     primary.set_search_offloaded(true);
     let primary = Arc::new(primary);
@@ -75,11 +85,12 @@ fn composite_with_search_backend(fhir_version: Option<FhirVersion>) -> Composite
     providers.insert("sqlite".to_string(), primary.clone() as DynSearchProvider);
     providers.insert("search".to_string(), index as DynSearchProvider);
 
-    CompositeStorage::new(config, backends)
+    let composite = CompositeStorage::new(config, backends)
         .expect("composite")
         .with_search_providers(providers)
-        .with_full_primary(primary)
-        .start_sync_workers()
+        .with_full_primary(primary.clone())
+        .start_sync_workers();
+    (composite, primary)
 }
 
 /// A composite that is only its primary: the primary indexes and searches.
@@ -115,63 +126,186 @@ fn rename() -> PatchFormat {
     ]))
 }
 
-/// With a dedicated search backend the composite resolves create / update /
-/// delete criteria itself, and cannot serve patch: the primary applies
-/// patches, and resolves the criteria against an index that is offloaded and
-/// empty. It used to delegate anyway, so every conditional patch was a silent
-/// no-match; it now refuses, in step with what it declares.
+/// Finds Organizations by `name` through the composite — that is, through
+/// the search backend.
+async fn names_found(composite: &CompositeStorage, t: &TenantContext, name: &str) -> Vec<String> {
+    composite
+        .search(
+            t,
+            &SearchQuery::new("Organization").with_parameter(SearchParameter {
+                name: "name".to_string(),
+                param_type: SearchParamType::String,
+                values: vec![SearchValue::eq(name)],
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("search through composite")
+        .resources
+        .items
+        .iter()
+        .map(|r| r.id().to_string())
+        .collect()
+}
+
+/// With a dedicated search backend the composite resolves the criteria
+/// itself and needs only plain CRUD from the primary, for all four
+/// interactions. Patch was the exception until #1406: only the primary could
+/// apply one, and it resolved the criteria against an index that is offloaded
+/// and empty — a silent no-match before #1384, a refusal after. The applier is
+/// now shared, so the composite resolves through the search backend, reads and
+/// writes through the primary, and syncs the result like any update.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_dedicated_search_backend_serves_all_but_conditional_patch() {
+async fn a_dedicated_search_backend_serves_every_conditional_interaction() {
     let composite = composite_with_search_backend(None);
     let t = tenant();
 
     for interaction in ConditionalInteraction::ALL {
-        assert_eq!(
-            composite.supports_conditional(interaction),
-            interaction != ConditionalInteraction::Patch,
-            "{interaction}"
-        );
+        assert!(composite.supports_conditional(interaction), "{interaction}");
     }
 
     let created = composite
         .create(&t, "Organization", organization("ORG-P"), FhirVersion::R4)
         .await
         .expect("create through composite");
+    composite
+        .create(
+            &t,
+            "Organization",
+            organization("ORG-OTHER"),
+            FhirVersion::R4,
+        )
+        .await
+        .expect("create decoy");
+    let criteria = "identifier=urn:zzz:probe|ORG-P";
+
+    // A stale `If-Match` is refused and nothing is written.
+    let stale = EntityTagPrecondition::parse(["W/\"7\""]).expect("well-formed If-Match");
+    let result = composite
+        .conditional_patch(&t, "Organization", criteria, &rename(), &stale)
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(StorageError::Concurrency(
+                ConcurrencyError::OptimisticLockFailure { .. }
+            ))
+        ),
+        "{result:?}"
+    );
 
     match composite
         .conditional_patch(
             &t,
             "Organization",
-            "identifier=urn:zzz:probe|ORG-P",
+            criteria,
             &rename(),
-            &helios_persistence::core::EntityTagPrecondition::Absent,
+            &EntityTagPrecondition::Absent,
         )
         .await
+        .expect("conditional patch")
     {
-        Err(StorageError::Backend(BackendError::UnsupportedCapability { capability, .. })) => {
-            assert_eq!(capability, "conditional_patch");
+        ConditionalPatchResult::Patched(stored) => {
+            assert_eq!(stored.id(), created.id());
+            assert_eq!(stored.version_id(), "2");
+            assert_eq!(stored.content()["name"], "Patched");
         }
-        Ok(ConditionalPatchResult::NoMatch) => {
+        ConditionalPatchResult::NoMatch => {
             panic!("a matching resource exists: NoMatch is the silent failure this guards")
         }
-        other => panic!("expected UnsupportedCapability, got {other:?}"),
+        other => panic!("expected Patched, got {other:?}"),
     }
 
-    // Positive control: the same criteria do resolve on this composite, for an
-    // interaction it declares.
-    match composite
-        .conditional_delete(
+    // The primary holds the patched content ...
+    let read = composite
+        .read(&t, "Organization", created.id())
+        .await
+        .expect("read")
+        .expect("still there");
+    assert_eq!(read.version_id(), "2");
+    assert_eq!(read.content()["name"], "Patched");
+    // ... and the search backend was told: the new name is found, the old one
+    // is not, the decoy is untouched.
+    assert_eq!(names_found(&composite, &t, "Patched").await, [created.id()]);
+    assert_eq!(names_found(&composite, &t, "ZZZ Probe Org").await.len(), 1);
+
+    let result = composite
+        .conditional_patch(
             &t,
             "Organization",
-            "identifier=urn:zzz:probe|ORG-P",
-            &helios_persistence::core::EntityTagPrecondition::Absent,
+            "identifier=urn:zzz:probe|NOBODY",
+            &rename(),
+            &EntityTagPrecondition::Absent,
         )
+        .await;
+    assert!(
+        matches!(result, Ok(ConditionalPatchResult::NoMatch)),
+        "{result:?}"
+    );
+
+    // The same criteria resolve for the other interactions too.
+    match composite
+        .conditional_delete(&t, "Organization", criteria, &EntityTagPrecondition::Absent)
         .await
         .expect("conditional delete")
     {
         ConditionalDeleteResult::Deleted(deleted) => assert_eq!(deleted.id(), created.id()),
         other => panic!("expected Deleted, got {other:?}"),
     }
+}
+
+/// The match is found in the search backend; what gets patched is the
+/// primary's content. When the two disagree on the version — a write the
+/// search backend has not seen — the criteria were judged against content that
+/// is no longer current, so the patch is a `VersionConflict` and writes
+/// nothing, as conditional update and delete are through the primary's
+/// compare-and-swap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_search_copy_is_a_conflict_not_a_patch_over_unseen_content() {
+    let (composite, primary) = composite_and_its_primary(None);
+    let t = tenant();
+    let criteria = "identifier=urn:zzz:probe|ORG-S";
+
+    let created = composite
+        .create(&t, "Organization", organization("ORG-S"), FhirVersion::R4)
+        .await
+        .expect("create through composite");
+
+    // Behind the composite's back: the primary moves to version 2 and no
+    // longer carries the identifier; the search backend still has version 1.
+    let mut moved_on = created.content().clone();
+    moved_on["identifier"] = json!([{"system": "urn:zzz:probe", "value": "ORG-ELSEWHERE"}]);
+    primary
+        .update(&t, &created, moved_on)
+        .await
+        .expect("direct primary update");
+
+    let result = composite
+        .conditional_patch(
+            &t,
+            "Organization",
+            criteria,
+            &rename(),
+            &EntityTagPrecondition::Absent,
+        )
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(StorageError::Concurrency(
+                ConcurrencyError::VersionConflict { .. }
+            ))
+        ),
+        "{result:?}"
+    );
+
+    let read = composite
+        .read(&t, "Organization", created.id())
+        .await
+        .expect("read")
+        .expect("still there");
+    assert_eq!(read.version_id(), "2");
+    assert_eq!(read.content()["name"], "ZZZ Probe Org");
 }
 
 /// Without a dedicated search backend every conditional interaction is the
@@ -197,7 +331,7 @@ async fn without_a_search_backend_the_composite_follows_its_primary() {
             "Organization",
             "identifier=urn:zzz:probe|ORG-Q",
             &rename(),
-            &helios_persistence::core::EntityTagPrecondition::Absent,
+            &EntityTagPrecondition::Absent,
         )
         .await
         .expect("conditional patch")
@@ -222,12 +356,7 @@ async fn a_configured_version_scopes_the_type_qualifier_of_conditional_criteria(
 
     let r4 = composite_with_search_backend(Some(FhirVersion::R4));
     match r4
-        .conditional_delete(
-            &t,
-            "Patient",
-            criteria,
-            &helios_persistence::core::EntityTagPrecondition::Absent,
-        )
+        .conditional_delete(&t, "Patient", criteria, &EntityTagPrecondition::Absent)
         .await
     {
         Err(e) => assert!(
@@ -242,12 +371,7 @@ async fn a_configured_version_scopes_the_type_qualifier_of_conditional_criteria(
     let unset = composite_with_search_backend(None);
     assert!(matches!(
         unset
-            .conditional_delete(
-                &t,
-                "Patient",
-                criteria,
-                &helios_persistence::core::EntityTagPrecondition::Absent
-            )
+            .conditional_delete(&t, "Patient", criteria, &EntityTagPrecondition::Absent)
             .await,
         Ok(ConditionalDeleteResult::NoMatch)
     ));
@@ -258,7 +382,7 @@ async fn a_configured_version_scopes_the_type_qualifier_of_conditional_criteria(
             &t,
             "Patient",
             "general-practitioner:Practitioner=p1",
-            &helios_persistence::core::EntityTagPrecondition::Absent,
+            &EntityTagPrecondition::Absent,
         )
         .await,
         Ok(ConditionalDeleteResult::NoMatch)

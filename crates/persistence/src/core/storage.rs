@@ -1230,13 +1230,40 @@ pub trait ConditionalStorage: ResourceStorage {
     ///
     /// The default mirrors the trait itself: `conditional_create`,
     /// `conditional_update` and `conditional_delete` are required methods,
-    /// `conditional_patch` defaults to `UnsupportedCapability`. A backend whose
-    /// methods differ from that — S3 refuses all four, SQLite and PostgreSQL
-    /// implement patch — overrides it from its declared
-    /// [`BackendCapability`](crate::core::BackendCapability) list, the same
-    /// list `tests/backend_capability_contract.rs` pins.
+    /// while `conditional_patch` works only once
+    /// [`resolve_conditional_matches`](Self::resolve_conditional_matches) is
+    /// provided. A backend whose methods differ from that — S3 refuses all
+    /// four; SQLite, PostgreSQL and MongoDB serve patch — overrides it from its
+    /// declared [`BackendCapability`](crate::core::BackendCapability) list, the
+    /// same list `tests/backend_capability_contract.rs` pins.
     fn supports_conditional(&self, interaction: ConditionalInteraction) -> bool {
         !matches!(interaction, ConditionalInteraction::Patch)
+    }
+
+    /// Resolves conditional criteria to the resources they select — every
+    /// match, so the caller can tell one from several.
+    ///
+    /// This is the primitive the provided
+    /// [`conditional_patch`](Self::conditional_patch) is written in terms of.
+    /// Implementations build the query with
+    /// [`crate::search::build_conditional_query`], so criteria mean what they
+    /// mean as a direct search (#1312), and answer no match for empty criteria.
+    ///
+    /// The default refuses: a storage that cannot search cannot resolve
+    /// criteria.
+    async fn resolve_conditional_matches(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        search_params: &str,
+    ) -> StorageResult<Vec<StoredResource>> {
+        let _ = (tenant, resource_type, search_params);
+        Err(StorageError::Backend(
+            crate::error::BackendError::UnsupportedCapability {
+                backend_name: self.backend_name().to_string(),
+                capability: "conditional_patch".to_string(),
+            },
+        ))
     }
 
     /// Creates a resource only if no matching resource exists.
@@ -1336,8 +1363,35 @@ pub trait ConditionalStorage: ResourceStorage {
     ///
     /// # Errors
     ///
-    /// * `StorageError::Validation` - If the patch is invalid or would create invalid resource
-    /// * `StorageError::Backend(NotSupported)` - If conditional patch is not supported
+    /// * `StorageError::Validation(ValidationError::Patch(_))` - the patch is
+    ///   malformed, does not apply, changes `resourceType` / `id`, or is a
+    ///   FHIRPath Patch (not implemented); see [`PatchError`](super::PatchError)
+    /// * `StorageError::Concurrency(OptimisticLockFailure)` - `If-Match` was
+    ///   supplied and is not satisfied
+    /// * `StorageError::Concurrency(VersionConflict)` - the resource changed
+    ///   between resolving the criteria and writing
+    /// * `StorageError::Backend(UnsupportedCapability)` - this storage cannot
+    ///   resolve criteria
+    ///
+    /// # Provided implementation
+    ///
+    /// The one implementation every backend uses (#1406), in terms of
+    /// primitives each already has:
+    ///
+    /// 1. [`resolve_conditional_matches`](Self::resolve_conditional_matches);
+    ///    none is `NoMatch`, several `MultipleMatches`.
+    /// 2. `read` the match. On a [`CompositeStorage`](crate::composite) the
+    ///    criteria are resolved by the search backend while `read` and `update`
+    ///    go to the primary, so this is the authoritative content — the one the
+    ///    patch has to apply to. A search copy of another version than the
+    ///    primary's is a `VersionConflict`: the criteria were judged against
+    ///    content that is no longer current, and whether the current content
+    ///    still matches them is unknown. (Conditional update and delete reach
+    ///    the same answer through the primary's compare-and-swap.)
+    /// 3. [`conditional_if_match_gate`](super::conditional_if_match_gate).
+    /// 4. [`apply_patch`](super::apply_patch).
+    /// 5. `update(current, patched)`, which compares-and-swaps on `current`'s
+    ///    version: a writer landing after step 2 ends in `VersionConflict`.
     async fn conditional_patch(
         &self,
         tenant: &TenantContext,
@@ -1346,14 +1400,42 @@ pub trait ConditionalStorage: ResourceStorage {
         patch: &PatchFormat,
         if_match: &EntityTagPrecondition,
     ) -> StorageResult<ConditionalPatchResult> {
-        // Default implementation returns NotSupported
-        let _ = (tenant, resource_type, search_params, patch, if_match);
-        Err(StorageError::Backend(
-            crate::error::BackendError::UnsupportedCapability {
-                backend_name: "unknown".to_string(),
-                capability: "conditional_patch".to_string(),
-            },
-        ))
+        let mut matches = self
+            .resolve_conditional_matches(tenant, resource_type, search_params)
+            .await?;
+
+        let matched = match matches.len() {
+            0 => return Ok(ConditionalPatchResult::NoMatch),
+            1 => matches.remove(0),
+            n => return Ok(ConditionalPatchResult::MultipleMatches(n)),
+        };
+
+        let current = match self.read(tenant, resource_type, matched.id()).await {
+            Ok(Some(current)) => current,
+            // Deleted since the index last saw it: there is no match any more.
+            Ok(None) | Err(StorageError::Resource(crate::error::ResourceError::Gone { .. })) => {
+                return Ok(ConditionalPatchResult::NoMatch);
+            }
+            Err(e) => return Err(e),
+        };
+        if current.version_id() != matched.version_id() {
+            return Err(StorageError::Concurrency(
+                crate::error::ConcurrencyError::VersionConflict {
+                    resource_type: resource_type.to_string(),
+                    id: current.id().to_string(),
+                    expected_version: matched.version_id().to_string(),
+                    actual_version: current.version_id().to_string(),
+                },
+            ));
+        }
+
+        super::conditional_if_match_gate(if_match, resource_type, Some(&current))?;
+
+        let patched = super::apply_patch(current.content(), patch)
+            .map_err(crate::error::ValidationError::from)?;
+
+        let updated = self.update(tenant, &current, patched).await?;
+        Ok(ConditionalPatchResult::Patched(updated))
     }
 }
 

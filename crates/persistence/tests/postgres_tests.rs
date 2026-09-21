@@ -108,6 +108,11 @@ mod conditional_if_match_suite;
 #[path = "search/empty_value_suite.rs"]
 mod empty_value_suite;
 
+/// The backend-agnostic conditional patch suite (#1406). Same `#[path]`
+/// arrangement.
+#[path = "search/conditional_patch_suite.rs"]
+mod conditional_patch_suite;
+
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
 
@@ -19097,6 +19102,18 @@ mod postgres_integration {
         super::empty_value_suite::empty_values_are_rejected_on_every_path(
             &backend,
             &unique_base("empty_value"),
+        )
+        .await;
+    }
+
+    /// #1406: conditional patch is the trait's provided implementation over
+    /// the backend's criteria resolver and the shared patch applier.
+    #[tokio::test]
+    async fn postgres_integration_conditional_patch() {
+        let backend = create_backend().await;
+        super::conditional_patch_suite::conditional_patch_resolves_gates_applies_and_swaps(
+            &backend,
+            &unique_base("cond_patch_1406"),
         )
         .await;
     }

@@ -716,8 +716,8 @@ async fn mongodb_system_qualified_tokens_in_chains() {
 mod conditional_if_match_suite;
 
 /// #1381: `If-Match` is evaluated against the resource the criteria resolve
-/// to. MongoDB has no `conditional_patch`, so that arm asserts it stays
-/// unsupported. Needs the full registry: `identifier` is not embedded.
+/// to, on conditional update, delete and patch (#1406). Needs the full
+/// registry: `identifier` is not embedded.
 #[tokio::test]
 async fn mongodb_conditional_writes_honour_if_match() {
     let Some(backend) = create_backend_with_full_registry("cond_if_match_1381").await else {
@@ -727,7 +727,7 @@ async fn mongodb_conditional_writes_honour_if_match() {
     conditional_if_match_suite::if_match_is_evaluated_against_the_resolved_match(
         &backend,
         "cond-if-match-1381",
-        false,
+        true,
     )
     .await;
 }
@@ -757,6 +757,27 @@ async fn mongodb_empty_values_are_rejected_on_every_path() {
         return;
     };
     empty_value_suite::empty_values_are_rejected_on_every_path(&backend, "empty-value-1380").await;
+}
+
+/// The backend-agnostic conditional patch suite (#1406). Same `#[path]`
+/// arrangement.
+#[path = "search/conditional_patch_suite.rs"]
+mod conditional_patch_suite;
+
+/// #1406: MongoDB had no `conditional_patch`; it now serves the trait's
+/// provided implementation. Needs the full registry: `identifier` is not
+/// embedded.
+#[tokio::test]
+async fn mongodb_conditional_patch() {
+    let Some(backend) = create_backend_with_full_registry("cond_patch_1406").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    conditional_patch_suite::conditional_patch_resolves_gates_applies_and_swaps(
+        &backend,
+        "cond-patch-1406",
+    )
+    .await;
 }
 
 /// #1062: a comma-separated value list on one `SearchParameter` is OR per

@@ -208,8 +208,7 @@ pub enum BackendCapability {
     /// Conditional delete (`DELETE [type]?criteria`). Single-match only: more
     /// than one match is reported, never deleted.
     ConditionalDelete,
-    /// Conditional patch (`PATCH [type]?criteria`). MongoDB and S3 do not
-    /// implement it.
+    /// Conditional patch (`PATCH [type]?criteria`). S3 does not serve it.
     ConditionalPatch,
 }
 

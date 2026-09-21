@@ -224,22 +224,6 @@ fn serialization_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::SerializationError { message })
 }
 
-/// Extracts the `value[x]` payload from a FHIRPath Patch `Parameters.part`
-/// entry whose `name` is `"value"`. Returns the value of the first key
-/// matching `value[A-Z]…` (e.g. `valueString`, `valueQuantity`,
-/// `valueReference`), so every FHIR polymorphic variant is accepted rather
-/// than only the handful the patch handler used to special-case.
-fn extract_part_value(part: &Value) -> Option<Value> {
-    part.as_object()?.iter().find_map(|(k, v)| {
-        let suffix = k.strip_prefix("value")?;
-        suffix
-            .chars()
-            .next()?
-            .is_ascii_uppercase()
-            .then(|| v.clone())
-    })
-}
-
 #[async_trait]
 
 impl ResourceStorage for PostgresBackend {
@@ -3178,48 +3162,17 @@ impl ConditionalStorage for PostgresBackend {
         }
     }
 
-    async fn conditional_patch(
+    /// The criteria resolver the provided
+    /// [`ConditionalStorage::conditional_patch`] is written in terms of: this
+    /// backend has no patch code of its own (#1406).
+    async fn resolve_conditional_matches(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         search_params: &str,
-        patch: &crate::core::PatchFormat,
-        if_match: &crate::core::EntityTagPrecondition,
-    ) -> StorageResult<crate::core::ConditionalPatchResult> {
-        use crate::core::{ConditionalPatchResult, PatchFormat};
-
-        // Find matching resources based on search parameters
-        let matches = self
-            .find_matching_resources(tenant, resource_type, search_params)
-            .await?;
-
-        match matches.len() {
-            0 => Ok(ConditionalPatchResult::NoMatch),
-            1 => {
-                // Exactly one match - apply the patch
-                let existing = matches.into_iter().next().unwrap();
-                crate::core::conditional_if_match_gate(if_match, resource_type, Some(&existing))?;
-                let current_content = existing.content().clone();
-
-                // Apply the patch based on format
-                let patched_content = match patch {
-                    PatchFormat::JsonPatch(patch_doc) => {
-                        self.apply_json_patch(&current_content, patch_doc)?
-                    }
-                    PatchFormat::FhirPathPatch(patch_params) => {
-                        self.apply_fhirpath_patch(&current_content, patch_params)?
-                    }
-                    PatchFormat::MergePatch(merge_doc) => {
-                        self.apply_merge_patch(&current_content, merge_doc)
-                    }
-                };
-
-                // Update the resource with the patched content
-                let updated = self.update(tenant, &existing, patched_content).await?;
-                Ok(ConditionalPatchResult::Patched(updated))
-            }
-            n => Ok(ConditionalPatchResult::MultipleMatches(n)),
-        }
+    ) -> StorageResult<Vec<StoredResource>> {
+        self.find_matching_resources(tenant, resource_type, search_params)
+            .await
     }
 }
 
@@ -3289,166 +3242,6 @@ impl PostgresBackend {
             search_params_str,
             crate::search::ResourceTypeScope::version(self.config().fhir_version),
         )
-    }
-
-    // ========================================================================
-    // Patch Helper Methods
-    // ========================================================================
-
-    /// Applies a JSON Patch (RFC 6902) to a resource.
-    fn apply_json_patch(&self, resource: &Value, patch_doc: &Value) -> StorageResult<Value> {
-        use crate::error::ValidationError;
-
-        let patch: json_patch::Patch = serde_json::from_value(patch_doc.clone()).map_err(|e| {
-            StorageError::Validation(ValidationError::InvalidResource {
-                message: format!("Invalid JSON Patch document: {}", e),
-                details: vec![],
-            })
-        })?;
-
-        let mut patched = resource.clone();
-        json_patch::patch(&mut patched, &patch).map_err(|e| {
-            StorageError::Validation(ValidationError::InvalidResource {
-                message: format!("Failed to apply JSON Patch: {}", e),
-                details: vec![],
-            })
-        })?;
-
-        Ok(patched)
-    }
-
-    /// Applies a FHIRPath Patch to a resource.
-    fn apply_fhirpath_patch(&self, resource: &Value, patch_params: &Value) -> StorageResult<Value> {
-        use crate::error::ValidationError;
-
-        let parameter = patch_params.get("parameter").and_then(|p| p.as_array());
-        if parameter.is_none() {
-            return Err(StorageError::Validation(ValidationError::InvalidResource {
-                message: "FHIRPath Patch must have a 'parameter' array".to_string(),
-                details: vec![],
-            }));
-        }
-
-        let mut patched = resource.clone();
-
-        for operation in parameter.unwrap() {
-            let parts = operation.get("part").and_then(|p| p.as_array());
-            if parts.is_none() {
-                continue;
-            }
-
-            let mut op_type = None;
-            let mut op_path = None;
-            let mut op_name = None;
-            let mut op_value = None;
-
-            for part in parts.unwrap() {
-                match part.get("name").and_then(|n| n.as_str()) {
-                    Some("type") => {
-                        op_type = part
-                            .get("valueCode")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                    }
-                    Some("path") => {
-                        op_path = part
-                            .get("valueString")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                    }
-                    Some("name") => {
-                        op_name = part
-                            .get("valueString")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                    }
-                    Some("value") => {
-                        op_value = extract_part_value(part);
-                    }
-                    _ => {}
-                }
-            }
-
-            match op_type.as_deref() {
-                Some("replace") => {
-                    if let (Some(path), Some(value)) = (&op_path, &op_value) {
-                        self.fhirpath_replace(&mut patched, path, value)?;
-                    }
-                }
-                Some("add") => {
-                    if let (Some(path), Some(name), Some(value)) = (&op_path, &op_name, &op_value) {
-                        self.fhirpath_add(&mut patched, path, name, value)?;
-                    }
-                }
-                Some("delete") => {
-                    if let Some(path) = &op_path {
-                        self.fhirpath_delete(&mut patched, path)?;
-                    }
-                }
-                _ => {
-                    // Unsupported operation type - skip
-                }
-            }
-        }
-
-        Ok(patched)
-    }
-
-    /// Helper for FHIRPath replace operation.
-    fn fhirpath_replace(
-        &self,
-        resource: &mut Value,
-        path: &str,
-        value: &Value,
-    ) -> StorageResult<()> {
-        let parts: Vec<&str> = path.split('.').collect();
-        if parts.len() == 2 {
-            if let Some(obj) = resource.as_object_mut() {
-                obj.insert(parts[1].to_string(), value.clone());
-            }
-        }
-        Ok(())
-    }
-
-    /// Helper for FHIRPath add operation.
-    fn fhirpath_add(
-        &self,
-        resource: &mut Value,
-        path: &str,
-        name: &str,
-        value: &Value,
-    ) -> StorageResult<()> {
-        let parts: Vec<&str> = path.split('.').collect();
-        if parts.len() == 1
-            && parts[0]
-                == resource
-                    .get("resourceType")
-                    .and_then(|r| r.as_str())
-                    .unwrap_or("")
-        {
-            if let Some(obj) = resource.as_object_mut() {
-                obj.insert(name.to_string(), value.clone());
-            }
-        }
-        Ok(())
-    }
-
-    /// Helper for FHIRPath delete operation.
-    fn fhirpath_delete(&self, resource: &mut Value, path: &str) -> StorageResult<()> {
-        let parts: Vec<&str> = path.split('.').collect();
-        if parts.len() == 2 {
-            if let Some(obj) = resource.as_object_mut() {
-                obj.remove(parts[1]);
-            }
-        }
-        Ok(())
-    }
-
-    /// Applies a JSON Merge Patch (RFC 7386) to a resource.
-    fn apply_merge_patch(&self, resource: &Value, merge_doc: &Value) -> Value {
-        let mut patched = resource.clone();
-        json_patch::merge(&mut patched, merge_doc);
-        patched
     }
 }
 
