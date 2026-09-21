@@ -93,7 +93,6 @@ async fn sqlite_conditional_writers_with_the_same_if_match_admit_one() {
     conditional_if_match_suite::concurrent_writers_with_the_same_if_match_admit_one(
         &backend,
         "cond-if-match-race-1381",
-        true,
     )
     .await;
 }
@@ -136,6 +135,19 @@ async fn sqlite_concurrent_update_and_versioned_delete_admit_one() {
     versioned_write_race_suite::concurrent_update_and_versioned_delete_admit_one(
         backend,
         "delete-race-1404",
+        40,
+    )
+    .await;
+}
+
+/// #1404: an update racing an unconditional delete leaves a contiguous history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn sqlite_concurrent_update_and_plain_delete_stay_consistent() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = std::sync::Arc::new(create_file_backend(&dir));
+    versioned_write_race_suite::concurrent_update_and_plain_delete_stay_consistent(
+        backend,
+        "plain-delete-race-1404",
         40,
     )
     .await;

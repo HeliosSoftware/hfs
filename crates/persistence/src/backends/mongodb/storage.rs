@@ -61,6 +61,67 @@ pub(super) fn is_duplicate_key_error(err: &MongoError) -> bool {
     err.to_string().contains("E11000")
 }
 
+/// The server's `WriteConflict` code.
+const WRITE_CONFLICT_CODE: i32 = 112;
+
+/// Pause before the single retry of an unconditional delete that hit a write
+/// conflict: long enough for the winner's transaction to commit, so the retry
+/// does not just collide with it again.
+const WRITE_CONFLICT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Why one attempt at a versioned write failed.
+enum WriteAttemptError {
+    /// The server refused the write because a concurrent writer got there
+    /// first ([`is_write_conflict`]); nothing was written.
+    Conflict(MongoError),
+    /// Anything else, already in its final form.
+    Storage(StorageError),
+}
+
+impl WriteAttemptError {
+    /// Classifies a driver error raised inside the attempt's session.
+    fn driver(context: &str, err: MongoError) -> Self {
+        if is_write_conflict(&err) {
+            Self::Conflict(err)
+        } else {
+            Self::Storage(internal_error(format!("{}: {}", context, err)))
+        }
+    }
+}
+
+impl<E: Into<StorageError>> From<E> for WriteAttemptError {
+    fn from(err: E) -> Self {
+        Self::Storage(err.into())
+    }
+}
+
+/// True when the server refused (and rolled back) a write because another
+/// operation got to the document first.
+///
+/// Inside a multi-document transaction MongoDB does not queue behind a
+/// conflicting writer the way PostgreSQL queues behind a row lock: the loser's
+/// write fails at once with `WriteConflict` (112), labelled
+/// `TransientTransactionError`, and its transaction is aborted. The label on
+/// its own means the same thing for our purposes — the transaction did not and
+/// will not commit, and running it again is safe — so both are classified.
+/// `UnknownTransactionCommitResult` is deliberately not: there the write may
+/// have landed.
+///
+/// This used to reach the client as `BackendError::Internal` -> 500 (#1405):
+/// "the server failed", for what is "you lost a race, read and retry".
+pub(super) fn is_write_conflict(err: &MongoError) -> bool {
+    if err.contains_label(mongodb::error::TRANSIENT_TRANSACTION_ERROR) {
+        return true;
+    }
+    match err.kind.as_ref() {
+        MongoErrorKind::Command(command) => command.code == WRITE_CONFLICT_CODE,
+        MongoErrorKind::Write(mongodb::error::WriteFailure::WriteError(write)) => {
+            write.code == WRITE_CONFLICT_CODE
+        }
+        _ => false,
+    }
+}
+
 pub(super) fn ensure_resource_identity(resource_type: &str, id: &str, resource: &mut Value) {
     if let Some(obj) = resource.as_object_mut() {
         obj.insert(
@@ -616,17 +677,28 @@ async fn commit_best_effort_multi_write_session(
     transaction_active: bool,
     operation: &str,
 ) -> StorageResult<()> {
+    try_commit_best_effort_multi_write_session(session, transaction_active)
+        .await
+        .map_err(|e| {
+            internal_error(format!(
+                "Failed to commit MongoDB transaction after {}: {}",
+                operation, e
+            ))
+        })
+}
+
+/// [`commit_best_effort_multi_write_session`] with the driver's error intact,
+/// for the writes that classify a commit-time `WriteConflict`.
+async fn try_commit_best_effort_multi_write_session(
+    session: &mut Option<ClientSession>,
+    transaction_active: bool,
+) -> Result<(), MongoError> {
     if !transaction_active {
         return Ok(());
     }
 
     if let Some(active_session) = session.as_mut() {
-        active_session.commit_transaction().await.map_err(|e| {
-            internal_error(format!(
-                "Failed to commit MongoDB transaction after {}: {}",
-                operation, e
-            ))
-        })?;
+        active_session.commit_transaction().await?;
     }
 
     Ok(())
@@ -945,192 +1017,23 @@ impl ResourceStorage for MongoBackend {
         current: &StoredResource,
         resource: Value,
     ) -> StorageResult<StoredResource> {
-        let resource_type = current.resource_type();
-        tenant.check_permission(Operation::Update, resource_type)?;
-
-        let db = self.get_database().await?;
-        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
-        let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
-        let (mut session, transaction_active) = begin_best_effort_multi_write_session(&db).await;
-        let tenant_id = tenant.tenant_id().as_str();
-        let id = current.id();
-
-        let current_filter = doc! {
-            "tenant_id": tenant_id,
-            "resource_type": resource_type,
-            "id": id,
-            "is_deleted": false,
-        };
-
-        let maybe_existing = if let Some(active_session) = session.as_mut() {
-            resources
-                .find_one(current_filter.clone())
-                .session(active_session)
-                .await
-                .map_err(|e| {
-                    internal_error(format!("Failed to load current resource (session): {}", e))
-                })?
-        } else {
-            resources
-                .find_one(current_filter)
-                .await
-                .map_err(|e| internal_error(format!("Failed to load current resource: {}", e)))?
-        };
-
-        let Some(existing_doc) = maybe_existing else {
-            return Err(StorageError::Resource(ResourceError::NotFound {
-                resource_type: resource_type.to_string(),
-                id: id.to_string(),
-            }));
-        };
-
-        let actual_version = existing_doc
-            .get_str("version_id")
-            .map_err(|e| internal_error(format!("Missing current version: {}", e)))?
-            .to_string();
-
-        if actual_version != current.version_id() {
-            return Err(StorageError::Concurrency(
-                ConcurrencyError::VersionConflict {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                    expected_version: current.version_id().to_string(),
-                    actual_version,
-                },
-            ));
+        // No retry: `update` always carries a precondition (`current`'s
+        // version), and a writer that beat us to the document has, or is about
+        // to have, moved it on. The honest answer is the one PostgreSQL gives
+        // for the same race — `VersionConflict` -> 409 — not a second attempt.
+        match self.update_attempt(tenant, current, resource).await {
+            Ok(stored) => Ok(stored),
+            Err(WriteAttemptError::Storage(e)) => Err(e),
+            Err(WriteAttemptError::Conflict(e)) => Err(self
+                .lost_race(
+                    tenant,
+                    current.resource_type(),
+                    current.id(),
+                    current.version_id(),
+                    &e,
+                )
+                .await),
         }
-
-        let new_version = next_version(current.version_id())?;
-
-        let mut resource = resource;
-        ensure_resource_identity(resource_type, id, &mut resource);
-        let payload = value_to_document(&resource)?;
-
-        let now = Utc::now();
-        let now_bson = chrono_to_bson(now);
-        let fhir_version = current.fhir_version();
-        let fhir_version_str = fhir_version.as_mime_param().to_string();
-
-        let update_filter = doc! {
-            "tenant_id": tenant_id,
-            "resource_type": resource_type,
-            "id": id,
-            "version_id": current.version_id(),
-            "is_deleted": false,
-        };
-        let update_doc = doc! {
-            "$set": {
-                "version_id": &new_version,
-                "data": Bson::Document(payload.clone()),
-                "last_updated": now_bson,
-                "is_deleted": false,
-                "deleted_at": Bson::Null,
-                "fhir_version": &fhir_version_str,
-            }
-        };
-
-        let update_result = if let Some(active_session) = session.as_mut() {
-            resources
-                .update_one(update_filter.clone(), update_doc.clone())
-                .session(active_session)
-                .await
-                .map_err(|e| {
-                    internal_error(format!("Failed to update resource (session): {}", e))
-                })?
-        } else {
-            resources
-                .update_one(update_filter, update_doc)
-                .await
-                .map_err(|e| internal_error(format!("Failed to update resource: {}", e)))?
-        };
-
-        if update_result.matched_count == 0 {
-            let latest = resources
-                .find_one(doc! {
-                    "tenant_id": tenant_id,
-                    "resource_type": resource_type,
-                    "id": id,
-                })
-                .await
-                .map_err(|e| {
-                    internal_error(format!("Failed to reload version conflict state: {}", e))
-                })?;
-
-            let actual = latest
-                .as_ref()
-                .and_then(|d| d.get_str("version_id").ok())
-                .unwrap_or("unknown")
-                .to_string();
-
-            return Err(StorageError::Concurrency(
-                ConcurrencyError::VersionConflict {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                    expected_version: current.version_id().to_string(),
-                    actual_version: actual,
-                },
-            ));
-        }
-
-        let created_at = extract_created_at(&existing_doc, now);
-
-        let history_doc = doc! {
-            "tenant_id": tenant_id,
-            "resource_type": resource_type,
-            "id": id,
-            "version_id": &new_version,
-            "data": Bson::Document(payload),
-            "created_at": chrono_to_bson(created_at),
-            "last_updated": now_bson,
-            "is_deleted": false,
-            "deleted_at": Bson::Null,
-            "fhir_version": fhir_version_str,
-        };
-
-        if let Some(active_session) = session.as_mut() {
-            history
-                .insert_one(history_doc)
-                .session(active_session)
-                .await
-                .map_err(|e| {
-                    internal_error(format!(
-                        "Failed to insert updated history row (session): {}",
-                        e
-                    ))
-                })?;
-        } else {
-            history.insert_one(history_doc).await.map_err(|e| {
-                internal_error(format!("Failed to insert updated history row: {}", e))
-            })?;
-        }
-
-        self.index_resource(&db, tenant_id, resource_type, id, &resource, &mut session)
-            .await?;
-
-        commit_best_effort_multi_write_session(&mut session, transaction_active, "update").await?;
-
-        // A SearchParameter update may change a tenant's overlay (status flips,
-        // expression edits): refresh the stored-param cache and drop registries.
-        // This must run after the commit above: `reload_stored_cache` reads the
-        // `resources` collection without the session, so it cannot observe the
-        // update while the transaction is still open.
-        if resource_type == "SearchParameter" {
-            if let Err(e) = self.reload_stored_cache().await {
-                tracing::warn!("SearchParameter cache reload failed: {e}");
-            }
-        }
-
-        Ok(StoredResource::from_storage(
-            resource_type,
-            id,
-            new_version,
-            tenant.tenant_id().clone(),
-            resource,
-            created_at,
-            now,
-            None,
-            fhir_version,
-        ))
     }
 
     async fn delete(
@@ -1819,6 +1722,207 @@ impl SearchIndexDocuments {
 }
 
 impl MongoBackend {
+    /// One attempt at [`ResourceStorage::update`]: the compare-and-swap on
+    /// `current`'s version, the history row and the search index, in one
+    /// transaction where the deployment has them. A write the server refused
+    /// because another writer holds the document comes back as
+    /// [`WriteAttemptError::Conflict`] rather than as an `Internal` error.
+    async fn update_attempt(
+        &self,
+        tenant: &TenantContext,
+        current: &StoredResource,
+        resource: Value,
+    ) -> Result<StoredResource, WriteAttemptError> {
+        let resource_type = current.resource_type();
+        tenant.check_permission(Operation::Update, resource_type)?;
+
+        let db = self.get_database().await?;
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
+        let (mut session, transaction_active) = begin_best_effort_multi_write_session(&db).await;
+        let tenant_id = tenant.tenant_id().as_str();
+        let id = current.id();
+
+        let current_filter = doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "id": id,
+            "is_deleted": false,
+        };
+
+        let maybe_existing = if let Some(active_session) = session.as_mut() {
+            resources
+                .find_one(current_filter.clone())
+                .session(active_session)
+                .await
+                .map_err(|e| {
+                    WriteAttemptError::driver("Failed to load current resource (session)", e)
+                })?
+        } else {
+            resources
+                .find_one(current_filter)
+                .await
+                .map_err(|e| internal_error(format!("Failed to load current resource: {}", e)))?
+        };
+
+        let Some(existing_doc) = maybe_existing else {
+            return Err(StorageError::Resource(ResourceError::NotFound {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+            })
+            .into());
+        };
+
+        let actual_version = existing_doc
+            .get_str("version_id")
+            .map_err(|e| internal_error(format!("Missing current version: {}", e)))?
+            .to_string();
+
+        if actual_version != current.version_id() {
+            return Err(
+                StorageError::Concurrency(ConcurrencyError::VersionConflict {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                    expected_version: current.version_id().to_string(),
+                    actual_version,
+                })
+                .into(),
+            );
+        }
+
+        let new_version = next_version(current.version_id())?;
+
+        let mut resource = resource;
+        ensure_resource_identity(resource_type, id, &mut resource);
+        let payload = value_to_document(&resource)?;
+
+        let now = Utc::now();
+        let now_bson = chrono_to_bson(now);
+        let fhir_version = current.fhir_version();
+        let fhir_version_str = fhir_version.as_mime_param().to_string();
+
+        let update_filter = doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "id": id,
+            "version_id": current.version_id(),
+            "is_deleted": false,
+        };
+        let update_doc = doc! {
+            "$set": {
+                "version_id": &new_version,
+                "data": Bson::Document(payload.clone()),
+                "last_updated": now_bson,
+                "is_deleted": false,
+                "deleted_at": Bson::Null,
+                "fhir_version": &fhir_version_str,
+            }
+        };
+
+        let update_result = if let Some(active_session) = session.as_mut() {
+            resources
+                .update_one(update_filter.clone(), update_doc.clone())
+                .session(active_session)
+                .await
+                .map_err(|e| WriteAttemptError::driver("Failed to update resource (session)", e))?
+        } else {
+            resources
+                .update_one(update_filter, update_doc)
+                .await
+                .map_err(|e| internal_error(format!("Failed to update resource: {}", e)))?
+        };
+
+        if update_result.matched_count == 0 {
+            let latest = resources
+                .find_one(doc! {
+                    "tenant_id": tenant_id,
+                    "resource_type": resource_type,
+                    "id": id,
+                })
+                .await
+                .map_err(|e| {
+                    internal_error(format!("Failed to reload version conflict state: {}", e))
+                })?;
+
+            let actual = latest
+                .as_ref()
+                .and_then(|d| d.get_str("version_id").ok())
+                .unwrap_or("unknown")
+                .to_string();
+
+            return Err(
+                StorageError::Concurrency(ConcurrencyError::VersionConflict {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                    expected_version: current.version_id().to_string(),
+                    actual_version: actual,
+                })
+                .into(),
+            );
+        }
+
+        let created_at = extract_created_at(&existing_doc, now);
+
+        let history_doc = doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "id": id,
+            "version_id": &new_version,
+            "data": Bson::Document(payload),
+            "created_at": chrono_to_bson(created_at),
+            "last_updated": now_bson,
+            "is_deleted": false,
+            "deleted_at": Bson::Null,
+            "fhir_version": fhir_version_str,
+        };
+
+        if let Some(active_session) = session.as_mut() {
+            history
+                .insert_one(history_doc)
+                .session(active_session)
+                .await
+                .map_err(|e| {
+                    WriteAttemptError::driver("Failed to insert updated history row (session)", e)
+                })?;
+        } else {
+            history.insert_one(history_doc).await.map_err(|e| {
+                internal_error(format!("Failed to insert updated history row: {}", e))
+            })?;
+        }
+
+        self.index_resource(&db, tenant_id, resource_type, id, &resource, &mut session)
+            .await?;
+
+        try_commit_best_effort_multi_write_session(&mut session, transaction_active)
+            .await
+            .map_err(|e| {
+                WriteAttemptError::driver("Failed to commit MongoDB transaction after update", e)
+            })?;
+
+        // A SearchParameter update may change a tenant's overlay (status flips,
+        // expression edits): refresh the stored-param cache and drop registries.
+        // This must run after the commit above: `reload_stored_cache` reads the
+        // `resources` collection without the session, so it cannot observe the
+        // update while the transaction is still open.
+        if resource_type == "SearchParameter" {
+            if let Err(e) = self.reload_stored_cache().await {
+                tracing::warn!("SearchParameter cache reload failed: {e}");
+            }
+        }
+
+        Ok(StoredResource::from_storage(
+            resource_type,
+            id,
+            new_version,
+            tenant.tenant_id().clone(),
+            resource,
+            created_at,
+            now,
+            None,
+            fhir_version,
+        ))
+    }
+
     /// The version of the live (not deleted) resource, read outside any
     /// session — what a write that just lost a race reports as the version it
     /// lost to.
@@ -1857,6 +1961,109 @@ impl MongoBackend {
         id: &str,
         expected_version: Option<&str>,
     ) -> StorageResult<()> {
+        let mut retried = false;
+        loop {
+            let conflict = match self
+                .soft_delete_attempt(tenant, resource_type, id, expected_version)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(WriteAttemptError::Storage(e)) => return Err(e),
+                Err(WriteAttemptError::Conflict(e)) => e,
+            };
+
+            // ONE more attempt, and only for a delete with no precondition:
+            // "delete whatever is current" means the same thing after the
+            // other writer commits, which is the driver's recommended handling
+            // of a transient transaction error. A delete that names a version
+            // is never run again — the writer it lost to has moved the resource
+            // on, and the client must see that (`VersionConflict` -> 409).
+            if expected_version.is_none() && !retried {
+                retried = true;
+                tracing::debug!(
+                    resource_type,
+                    id,
+                    error = %conflict,
+                    "MongoDB write conflict on an unconditional delete; retrying once"
+                );
+                tokio::time::sleep(WRITE_CONFLICT_RETRY_DELAY).await;
+                continue;
+            }
+
+            return Err(self
+                .lost_race(
+                    tenant,
+                    resource_type,
+                    id,
+                    expected_version.unwrap_or("unknown"),
+                    &conflict,
+                )
+                .await);
+        }
+    }
+
+    /// Reports a write the server refused with `WriteConflict` as the
+    /// concurrency error it is: `VersionConflict` against whatever is live now,
+    /// or `NotFound` when the winner was a delete. The winner may not have
+    /// committed yet, in which case the live version still reads as the
+    /// expected one and is reported as `unknown` rather than as a conflict of a
+    /// version with itself. A failure of this read must not turn a 409 back
+    /// into a 500, so it degrades to `unknown` too.
+    async fn lost_race(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: &str,
+        conflict: &MongoError,
+    ) -> StorageError {
+        tracing::debug!(
+            resource_type,
+            id,
+            expected_version,
+            error = %conflict,
+            "MongoDB write conflict: a concurrent writer won"
+        );
+
+        let live = match self.get_database().await {
+            Ok(db) => {
+                let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+                self.live_version(&resources, tenant.tenant_id().as_str(), resource_type, id)
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+
+        match live {
+            Ok(None) => StorageError::Resource(ResourceError::NotFound {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+            }),
+            Ok(Some(actual)) if actual != expected_version => {
+                StorageError::Concurrency(ConcurrencyError::VersionConflict {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                    expected_version: expected_version.to_string(),
+                    actual_version: actual,
+                })
+            }
+            Ok(Some(_)) | Err(_) => StorageError::Concurrency(ConcurrencyError::VersionConflict {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+                expected_version: expected_version.to_string(),
+                actual_version: "unknown".to_string(),
+            }),
+        }
+    }
+
+    /// One attempt at [`Self::soft_delete`]; see [`Self::update_attempt`].
+    async fn soft_delete_attempt(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: Option<&str>,
+    ) -> Result<(), WriteAttemptError> {
         tenant.check_permission(Operation::Delete, resource_type)?;
 
         let db = self.get_database().await?;
@@ -1878,10 +2085,7 @@ impl MongoBackend {
                 .session(active_session)
                 .await
                 .map_err(|e| {
-                    internal_error(format!(
-                        "Failed to check resource before delete (session): {}",
-                        e
-                    ))
+                    WriteAttemptError::driver("Failed to check resource before delete (session)", e)
                 })?
         } else {
             resources
@@ -1896,7 +2100,8 @@ impl MongoBackend {
             return Err(StorageError::Resource(ResourceError::NotFound {
                 resource_type: resource_type.to_string(),
                 id: id.to_string(),
-            }));
+            })
+            .into());
         };
 
         let current_version = existing_doc
@@ -1906,14 +2111,15 @@ impl MongoBackend {
         if let Some(expected) = expected_version
             && expected != current_version
         {
-            return Err(StorageError::Concurrency(
-                ConcurrencyError::VersionConflict {
+            return Err(
+                StorageError::Concurrency(ConcurrencyError::VersionConflict {
                     resource_type: resource_type.to_string(),
                     id: id.to_string(),
                     expected_version: expected.to_string(),
                     actual_version: current_version,
-                },
-            ));
+                })
+                .into(),
+            );
         }
         let new_version = next_version(&current_version)?;
 
@@ -1952,7 +2158,7 @@ impl MongoBackend {
                 .session(active_session)
                 .await
                 .map_err(|e| {
-                    internal_error(format!("Failed to soft-delete resource (session): {}", e))
+                    WriteAttemptError::driver("Failed to soft-delete resource (session)", e)
                 })?
         } else {
             resources
@@ -1969,19 +2175,21 @@ impl MongoBackend {
                     .live_version(&resources, tenant_id, resource_type, id)
                     .await?
             {
-                return Err(StorageError::Concurrency(
-                    ConcurrencyError::VersionConflict {
+                return Err(
+                    StorageError::Concurrency(ConcurrencyError::VersionConflict {
                         resource_type: resource_type.to_string(),
                         id: id.to_string(),
                         expected_version: expected.to_string(),
                         actual_version: actual,
-                    },
-                ));
+                    })
+                    .into(),
+                );
             }
             return Err(StorageError::Resource(ResourceError::NotFound {
                 resource_type: resource_type.to_string(),
                 id: id.to_string(),
-            }));
+            })
+            .into());
         }
 
         let history_doc = doc! {
@@ -2003,10 +2211,7 @@ impl MongoBackend {
                 .session(active_session)
                 .await
                 .map_err(|e| {
-                    internal_error(format!(
-                        "Failed to insert deletion history row (session): {}",
-                        e
-                    ))
+                    WriteAttemptError::driver("Failed to insert deletion history row (session)", e)
                 })?;
         } else {
             history.insert_one(history_doc).await.map_err(|e| {
@@ -2017,7 +2222,11 @@ impl MongoBackend {
         self.delete_search_index(&db, tenant_id, resource_type, id, &mut session)
             .await?;
 
-        commit_best_effort_multi_write_session(&mut session, transaction_active, "delete").await?;
+        try_commit_best_effort_multi_write_session(&mut session, transaction_active)
+            .await
+            .map_err(|e| {
+                WriteAttemptError::driver("Failed to commit MongoDB transaction after delete", e)
+            })?;
 
         // A SearchParameter delete may remove a tenant's overlay entry: refresh
         // the stored-param cache and drop registries. This must run after the

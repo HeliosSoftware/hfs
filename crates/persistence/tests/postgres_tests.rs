@@ -19089,7 +19089,6 @@ mod postgres_integration {
         super::conditional_if_match_suite::concurrent_writers_with_the_same_if_match_admit_one(
             &backend,
             &unique_base("cond_if_match_race_1381"),
-            true,
         )
         .await;
     }
@@ -19215,6 +19214,19 @@ mod postgres_integration {
         super::versioned_write_race_suite::concurrent_update_and_versioned_delete_admit_one(
             std::sync::Arc::new(backend),
             &unique_base("delete_race_1404"),
+            10,
+        )
+        .await;
+    }
+
+    /// #1404: an update racing an unconditional delete leaves a contiguous
+    /// history.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn postgres_integration_concurrent_update_and_plain_delete_stay_consistent() {
+        let backend = create_backend().await;
+        super::versioned_write_race_suite::concurrent_update_and_plain_delete_stay_consistent(
+            std::sync::Arc::new(backend),
+            &unique_base("plain_delete_race_1404"),
             10,
         )
         .await;

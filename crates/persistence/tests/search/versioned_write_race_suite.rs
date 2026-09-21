@@ -274,6 +274,107 @@ pub async fn concurrent_update_and_versioned_delete_admit_one<S>(
     }
 }
 
+/// Half the tasks `update` from version 1 and half `delete` with no
+/// precondition. A plain delete removes whatever is current, so an update and
+/// a delete may both land (as versions 2 and 3) — but only one of each, every
+/// other task is refused cleanly, and the history is contiguous. On MongoDB
+/// this is the path with the one bounded retry of a write conflict (#1405).
+pub async fn concurrent_update_and_plain_delete_stay_consistent<S>(
+    backend: Arc<S>,
+    base: &str,
+    rounds: usize,
+) where
+    S: ResourceStorage + VersionedStorage + Send + Sync + 'static,
+{
+    let t = tenant(base, "plain-delete-race");
+
+    for round in 0..rounds {
+        let id = format!("race-{round}");
+        let current = seed(backend.as_ref(), &t, &id).await;
+        let barrier = Arc::new(Barrier::new(WRITERS));
+
+        let mut tasks = Vec::new();
+        for n in 0..WRITERS {
+            let (backend, t, current, barrier, id) = (
+                backend.clone(),
+                t.clone(),
+                current.clone(),
+                barrier.clone(),
+                id.clone(),
+            );
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                if n % 2 == 0 {
+                    match backend
+                        .update(&t, &current, patient(&id, &format!("Writer{n}")))
+                        .await
+                    {
+                        Ok(stored) => Outcome::Updated(stored),
+                        Err(e) => Outcome::Failed(e),
+                    }
+                } else {
+                    match backend.delete(&t, "Patient", &id).await {
+                        Ok(()) => Outcome::Deleted,
+                        Err(e) => Outcome::Failed(e),
+                    }
+                }
+            }));
+        }
+        let mut outcomes = Vec::new();
+        for task in tasks {
+            outcomes.push(task.await.expect("writer task"));
+        }
+        let context = format!("round {round}");
+
+        let updates = outcomes
+            .iter()
+            .filter(|o| matches!(o, Outcome::Updated(_)))
+            .count();
+        let deletes = outcomes
+            .iter()
+            .filter(|o| matches!(o, Outcome::Deleted))
+            .count();
+        assert!(
+            updates <= 1,
+            "{context}: one update from version 1: {outcomes:?}"
+        );
+        assert!(
+            deletes <= 1,
+            "{context}: a resource is deleted once: {outcomes:?}"
+        );
+        assert!(
+            updates + deletes >= 1,
+            "{context}: somebody wins: {outcomes:?}"
+        );
+        assert_losers_are_concurrency_errors(&outcomes, true, &context);
+
+        let expected_versions: Vec<String> =
+            (1..=1 + updates + deletes).map(|v| v.to_string()).collect();
+        assert_eq!(
+            backend
+                .list_versions(&t, "Patient", &id)
+                .await
+                .expect("list versions"),
+            expected_versions,
+            "{context}: one version per successful write, no gap, no duplicate: {outcomes:?}"
+        );
+
+        let after = backend.read(&t, "Patient", &id).await;
+        if deletes == 1 {
+            assert!(
+                matches!(
+                    after,
+                    Ok(None) | Err(StorageError::Resource(ResourceError::Gone { .. }))
+                ),
+                "{context}: a delete landed, so nothing is live: {after:?}"
+            );
+        } else {
+            let stored = after.expect("read after race").expect("still live");
+            assert_eq!(stored.version_id(), "2", "{context}");
+        }
+    }
+}
+
 /// `delete_versioned` is a compare-and-swap on the *current* version: a stale
 /// version is refused and deletes nothing, the current one deletes, and a
 /// second delete of the same version finds nothing live.
