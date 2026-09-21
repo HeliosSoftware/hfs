@@ -2,6 +2,7 @@
 
 use serde_json::{Value, json};
 
+use crate::search::{IMPLICIT_TOKEN_SYSTEM, implicit_system_candidates};
 use crate::types::{SearchModifier, SearchParameter};
 
 /// Builds an ES query clause for a token search parameter.
@@ -42,21 +43,29 @@ fn build_token_condition(
 
     if let Some((system, code)) = value.split_once('|') {
         if system.is_empty() && !code.is_empty() {
-            // |code - code with no system
+            // |code - code with no system. A `code` element has no system
+            // property either; its entry carries the marker (#1379).
             must_conditions.push(json!({ "term": { "search_params.token.code": code } }));
             must_conditions.push(json!({
                 "bool": {
-                    "must_not": [
-                        { "exists": { "field": "search_params.token.system" } }
-                    ]
+                    "should": [
+                        { "bool": { "must_not": [
+                            { "exists": { "field": "search_params.token.system" } }
+                        ] } },
+                        { "term": { "search_params.token.system": IMPLICIT_TOKEN_SYSTEM } }
+                    ],
+                    "minimum_should_match": 1
                 }
             }));
         } else if !system.is_empty() && code.is_empty() {
             // system| - any code in system
             must_conditions.push(json!({ "term": { "search_params.token.system": system } }));
         } else {
-            // system|code - both must match
-            must_conditions.push(json!({ "term": { "search_params.token.system": system } }));
+            // system|code - both must match; or a `code` element, whose
+            // system is implicit and not verifiable here (#1379).
+            must_conditions.push(json!({
+                "terms": { "search_params.token.system": implicit_system_candidates(system) }
+            }));
             must_conditions.push(json!({ "term": { "search_params.token.code": code } }));
         }
     } else {
@@ -209,6 +218,34 @@ mod tests {
         let s = serde_json::to_string(&clause).unwrap();
         assert!(s.contains("http://loinc.org"));
         assert!(s.contains("8867-4"));
+    }
+
+    /// #1379: `system|code` accepts the named system or the marker of a `code`
+    /// element; `|code` counts the marker as "no system"; `system|` does not
+    /// mention it.
+    #[test]
+    fn test_implicit_system_marker() {
+        let param = make_param("gender", None);
+        let must = |value: &str| {
+            build_clause(&param, value).unwrap()["nested"]["query"]["bool"]["must"].clone()
+        };
+
+        assert_eq!(
+            must("http://hl7.org/fhir/administrative-gender|female")[1],
+            json!({ "terms": { "search_params.token.system": [
+                "http://hl7.org/fhir/administrative-gender",
+                IMPLICIT_TOKEN_SYSTEM
+            ] } })
+        );
+        assert_eq!(
+            must("|female")[2]["bool"]["should"][1],
+            json!({ "term": { "search_params.token.system": IMPLICIT_TOKEN_SYSTEM } })
+        );
+        assert!(
+            !must("http://hl7.org/fhir/administrative-gender|")
+                .to_string()
+                .contains(IMPLICIT_TOKEN_SYSTEM)
+        );
     }
 
     #[test]

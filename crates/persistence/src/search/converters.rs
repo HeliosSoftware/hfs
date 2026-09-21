@@ -10,6 +10,31 @@ use crate::types::{DatePrecision, SearchParamType};
 
 use super::errors::ExtractionError;
 
+/// The token `system` stored for an element that has no system of its own
+/// because FHIR makes it implicit: a `code` primitive, a bare JSON string
+/// whose system "is defined in the value set" of the element's binding (#1379).
+///
+/// The index does not know that binding, so it cannot store the real system.
+/// It stores this marker instead, and a `system|code` search accepts a marked
+/// row whatever system it names — see [`implicit_system_candidates`]. A
+/// `Coding` that merely lacks a `system` is NOT marked (its system stays
+/// `None`) and keeps failing `system|code`, which is the distinction the
+/// marker exists to draw.
+///
+/// The value contains spaces on purpose: a FHIR `uri` cannot (`\S*`), so no
+/// valid `Coding.system` or `Identifier.system` can collide with it.
+///
+/// Rows indexed before the marker existed have no system at all, exactly like
+/// a system-less `Coding`; they keep their old behaviour until the resource is
+/// reindexed.
+pub const IMPLICIT_TOKEN_SYSTEM: &str = "urn:x-helios:implicit code system";
+
+/// The stored systems a `system|code` search for `system` must accept: the
+/// system itself, and the [`IMPLICIT_TOKEN_SYSTEM`] marker.
+pub fn implicit_system_candidates(system: &str) -> [&str; 2] {
+    [system, IMPLICIT_TOKEN_SYSTEM]
+}
+
 /// A value extracted and converted for the search index.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum IndexValue {
@@ -96,6 +121,12 @@ impl IndexValue {
             identifier_type_system: None,
             identifier_type_code: None,
         }
+    }
+
+    /// Creates a token index value for a `code` primitive, whose system is
+    /// implicit: see [`IMPLICIT_TOKEN_SYSTEM`].
+    pub fn token_implicit_system(code: impl Into<String>) -> Self {
+        Self::token(Some(IMPLICIT_TOKEN_SYSTEM.to_string()), code)
     }
 
     /// Creates a token index value with display text for :text modifier.
@@ -348,8 +379,11 @@ impl ValueConverter {
 
         match value {
             Value::String(s) => {
-                // Simple code
-                results.push(IndexValue::token_code(s.clone()));
+                // Simple code: the system is implicit, not absent (#1379).
+                // The extractor evaluates schema-less JSON, so a token
+                // parameter on a `string`/`uri`/`id` element lands here too;
+                // FHIR forbids the `system|` form for those.
+                results.push(IndexValue::token_implicit_system(s.clone()));
             }
             Value::Bool(b) => {
                 results.push(IndexValue::token_code(b.to_string()));
@@ -776,6 +810,34 @@ mod tests {
             assert_eq!(system.as_ref().unwrap(), "http://loinc.org");
             assert_eq!(code, "12345-6");
         }
+    }
+
+    /// #1379: a `code` primitive's system is implicit, a system-less Coding's
+    /// is absent. The index has to keep the two apart, or `system|code` either
+    /// never matches the first or starts matching the second.
+    #[test]
+    fn test_convert_token_marks_code_primitives_only() {
+        let systems = |value: Value| -> Vec<Option<String>> {
+            ValueConverter::convert(&value, SearchParamType::Token, "p")
+                .unwrap()
+                .into_iter()
+                .map(|v| match v {
+                    IndexValue::Token { system, .. } => system,
+                    other => panic!("expected a token, got {other:?}"),
+                })
+                .collect()
+        };
+        let implicit = Some(IMPLICIT_TOKEN_SYSTEM.to_string());
+
+        assert_eq!(systems(json!("female")), vec![implicit]);
+        // A Coding, bare or in a CodeableConcept, and an Identifier: absent.
+        assert_eq!(systems(json!({"code": "1234-5"})), vec![None]);
+        assert_eq!(systems(json!({"coding": [{"code": "1234-5"}]})), vec![None]);
+        assert_eq!(systems(json!({"value": "mrn-1"})), vec![None]);
+        // Booleans: FHIR forbids the `system|` form for them.
+        assert_eq!(systems(json!(true)), vec![None]);
+        // The marker is not a valid FHIR `uri`, so no real system collides.
+        assert!(IMPLICIT_TOKEN_SYSTEM.contains(char::is_whitespace));
     }
 
     /// Returns the `display` of every token value, in order.

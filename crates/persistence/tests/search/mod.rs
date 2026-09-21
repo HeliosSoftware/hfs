@@ -79,4 +79,7 @@ pub mod pagination_tests;
 pub mod quantity_tests;
 pub mod reference_tests;
 pub mod string_tests;
+/// Backend-agnostic scenarios, shared with the PostgreSQL, MongoDB and
+/// Elasticsearch test binaries via `#[path]` (#1379).
+pub mod token_code_system_suite;
 pub mod token_tests;

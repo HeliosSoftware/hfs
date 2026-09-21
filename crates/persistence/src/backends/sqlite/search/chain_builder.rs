@@ -12,7 +12,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use crate::error::{BackendError, StorageResult};
-use crate::search::SearchParameterRegistry;
+use crate::search::{IMPLICIT_TOKEN_SYSTEM, SearchParameterRegistry};
 use crate::types::{ChainConfig, ReverseChainedParameter, SearchParamType, SearchValue};
 
 use super::query_builder::{SqlFragment, SqlParam};
@@ -456,18 +456,19 @@ impl ChainQueryBuilder {
                     if system.is_empty() {
                         (
                             format!(
-                                "({}.value_token_system IS NULL OR {}.value_token_system = '') \
+                                "({}.value_token_system IS NULL OR {}.value_token_system IN ('', '{}')) \
                                  AND {}.value_token_code = ?{}",
-                                alias, alias, alias, param_num
+                                alias, alias, IMPLICIT_TOKEN_SYSTEM, alias, param_num
                             ),
                             SqlParam::String(code.to_string()),
                         )
                     } else {
                         (
                             format!(
-                                "{}.value_token_system = '{}' AND {}.value_token_code = ?{}",
+                                "{}.value_token_system IN ('{}', '{}') AND {}.value_token_code = ?{}",
                                 alias,
                                 system.replace('\'', "''"),
+                                IMPLICIT_TOKEN_SYSTEM,
                                 alias,
                                 param_num
                             ),
@@ -682,18 +683,19 @@ impl ChainQueryBuilder {
                     if system.is_empty() {
                         (
                             format!(
-                                "({}.value_token_system IS NULL OR {}.value_token_system = '') \
+                                "({}.value_token_system IS NULL OR {}.value_token_system IN ('', '{}')) \
                                  AND {}.value_token_code = ?{}",
-                                alias, alias, alias, param_num
+                                alias, alias, IMPLICIT_TOKEN_SYSTEM, alias, param_num
                             ),
                             SqlParam::String(code.to_string()),
                         )
                     } else {
                         (
                             format!(
-                                "{}.value_token_system = '{}' AND {}.value_token_code = ?{}",
+                                "{}.value_token_system IN ('{}', '{}') AND {}.value_token_code = ?{}",
                                 alias,
                                 system.replace('\'', "''"),
+                                IMPLICIT_TOKEN_SYSTEM,
                                 alias,
                                 param_num
                             ),
@@ -961,6 +963,34 @@ mod tests {
         assert!(fragment.sql.contains("subject"));
         assert!(fragment.sql.contains("code"));
         assert!(fragment.sql.contains("Patient/%"));
+    }
+
+    /// #1379: the chain terminal is a separate copy of the token match, and
+    /// has to accept the implicit-system marker of a `code` element the same
+    /// way `TokenHandler` does — for `system|code` and for `|code`.
+    #[test]
+    fn a_chained_system_qualified_token_accepts_the_implicit_system() {
+        let registry = create_test_registry();
+        let builder = ChainQueryBuilder::new("tenant1", "Patient", registry);
+        for (value, expected) in [
+            (
+                "http://loinc.org|1234-5",
+                format!("value_token_system IN ('http://loinc.org', '{IMPLICIT_TOKEN_SYSTEM}')"),
+            ),
+            (
+                "|1234-5",
+                format!("value_token_system IN ('', '{IMPLICIT_TOKEN_SYSTEM}')"),
+            ),
+        ] {
+            let rc = ReverseChainedParameter::terminal(
+                "Observation",
+                "subject",
+                "code",
+                SearchValue::eq(value),
+            );
+            let fragment = builder.build_reverse_chain_sql(&rc).unwrap();
+            assert!(fragment.sql.contains(&expected), "{}", fragment.sql);
+        }
     }
 
     #[test]

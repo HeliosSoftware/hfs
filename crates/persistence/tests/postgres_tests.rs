@@ -93,6 +93,11 @@ mod contained_suite;
 #[path = "search/numeric_validation_suite.rs"]
 mod numeric_validation_suite;
 
+/// The backend-agnostic `system|code` on `code` elements suite (#1379). Same
+/// `#[path]` arrangement.
+#[path = "search/token_code_system_suite.rs"]
+mod token_code_system_suite;
+
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
 
@@ -18982,6 +18987,53 @@ mod postgres_integration {
             &backend,
             &unique_base("number_exponent"),
             true,
+        )
+        .await;
+    }
+
+    /// #1379: `gender=<system>|female` never matched a `code` element.
+    #[tokio::test]
+    async fn postgres_integration_system_qualified_tokens_match_code_elements() {
+        let backend = create_backend().await;
+        super::token_code_system_suite::system_qualified_tokens_match_code_elements(
+            &backend,
+            &unique_base("token_code_system"),
+            false,
+        )
+        .await;
+    }
+
+    /// #1379: a row indexed before the marker existed has no system at all and
+    /// keeps its old behaviour until the resource is reindexed.
+    #[tokio::test]
+    async fn postgres_integration_unmarked_code_rows_keep_their_old_behaviour() {
+        let backend = create_backend().await;
+        let tenant = super::token_code_system_suite::seed_for_unmarked_rows(
+            &backend,
+            &unique_base("token_code_system_old"),
+        )
+        .await;
+        let client = backend.get_client().await.unwrap();
+        let stripped = client
+            .execute(
+                "UPDATE search_index SET value_token_system = NULL \
+                 WHERE tenant_id = $1 AND param_name = 'gender'",
+                &[&tenant.tenant_id().as_str()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(stripped, 1);
+        super::token_code_system_suite::unmarked_rows_keep_their_old_behaviour(&backend, &tenant)
+            .await;
+    }
+
+    /// #1379: the same predicate as a chain terminal.
+    #[tokio::test]
+    async fn postgres_integration_system_qualified_tokens_in_chains() {
+        let backend = create_backend().await;
+        super::token_code_system_suite::system_qualified_tokens_in_chains(
+            &backend,
+            &unique_base("token_code_system_chain"),
         )
         .await;
     }

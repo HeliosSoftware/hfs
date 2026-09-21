@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 
 use crate::backends::postgres::schema::IndexLayout;
 use crate::error::SearchError;
+use crate::search::IMPLICIT_TOKEN_SYSTEM;
 use crate::search::fold_text;
 use crate::search::{DatePredicate, FhirDateValue, StorageResolution};
 use crate::types::{
@@ -1519,13 +1520,15 @@ impl PostgresQueryBuilder {
                     ));
                     params.push(SqlParam::text(system));
                 } else {
-                    // system|code - exact match
+                    // system|code - exact match, or a `code` element, whose
+                    // system is implicit and not verifiable here (#1379). The
+                    // marker is a constant, inlined so this form still binds 2.
                     let s = next + 1;
                     let c = next + 2;
                     next += 2;
                     predicates.push(format!(
-                        "(value_token_system = ${} AND value_token_code = ${})",
-                        s, c
+                        "(value_token_system IN (${}, '{}') AND value_token_code = ${})",
+                        s, IMPLICIT_TOKEN_SYSTEM, c
                     ));
                     params.push(SqlParam::text(system));
                     params.push(SqlParam::text(code));
@@ -2038,8 +2041,10 @@ impl PostgresQueryBuilder {
                         ))
                     } else {
                         Some((
+                            // Or a `code` component, whose system is
+                            // implicit (#1379); see `build_token_condition`.
                             format!(
-                                "{token_system} = ${} AND {token_code} = ${}",
+                                "{token_system} IN (${}, '{IMPLICIT_TOKEN_SYSTEM}') AND {token_code} = ${}",
                                 offset + 1,
                                 offset + 2
                             ),
@@ -3234,7 +3239,7 @@ mod tests {
             .expect("composite should produce a condition");
 
         assert!(frag.sql.contains("param_name = 'code-value-quantity'"));
-        assert!(frag.sql.contains("value_token_system = $3"));
+        assert!(frag.sql.contains("value_token_system IN ($3, "));
         assert!(frag.sql.contains("value_token_code = $4"));
         assert!(frag.sql.contains("value_quantity_value < $5"));
         // token (system+code) = 2 params, quantity (no unit) = 1 param.
@@ -3307,13 +3312,16 @@ mod tests {
         ));
         let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
 
+        // The named system, or the marker of a `code` component (#1379).
         assert_eq!(
             frag.sql,
-            "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 \
-             AND resource_type = $2 AND param_name = 'combo-code-value-quantity' \
-             AND composite_group IS NOT NULL \
-             AND (value_token_system = $3 AND value_token_code = $4) \
-             AND (value_quantity_value > $5))",
+            format!(
+                "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 \
+                 AND resource_type = $2 AND param_name = 'combo-code-value-quantity' \
+                 AND composite_group IS NOT NULL \
+                 AND (value_token_system IN ($3, '{IMPLICIT_TOKEN_SYSTEM}') AND value_token_code = $4) \
+                 AND (value_quantity_value > $5))"
+            ),
             "{}",
             frag.sql
         );
@@ -4383,7 +4391,7 @@ mod tests {
 
         assert_eq!(frag.params.len(), 3);
         assert!(frag.sql.contains("value_token_code = $3"));
-        assert!(frag.sql.contains("value_token_system = $4"));
+        assert!(frag.sql.contains("value_token_system IN ($4, "));
         assert!(frag.sql.contains("value_token_code = $5"));
         assert!(!frag.sql.contains("$6"));
     }
@@ -5024,7 +5032,10 @@ mod tests {
             .expect("a lone membership test is extractable");
         assert_eq!(
             pred,
-            "param_name = 'class' AND ((value_token_system = $3 AND value_token_code = $4))"
+            format!(
+                "param_name = 'class' AND ((value_token_system IN ($3, '{IMPLICIT_TOKEN_SYSTEM}') \
+                 AND value_token_code = $4))"
+            )
         );
         assert_eq!(frag.params.len(), 2);
         match (&frag.params[0], &frag.params[1]) {

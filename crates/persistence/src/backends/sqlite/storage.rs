@@ -7935,6 +7935,83 @@ mod tests {
         );
     }
 
+    /// #1379: a `code` element's row carries the implicit-system marker, and
+    /// `system|code` accepts it. A row written before the marker existed has
+    /// no system at all, exactly like a system-less Coding, so it cannot be
+    /// told apart and must keep its old behaviour — never over-match — until
+    /// the resource is reindexed.
+    #[tokio::test]
+    async fn test_unmarked_code_rows_keep_their_old_behaviour() {
+        use crate::search::IMPLICIT_TOKEN_SYSTEM;
+
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "pt-f", "gender": "female"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let ids = |modifier: Option<crate::types::SearchModifier>, value: &str| {
+            let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+                name: "gender".to_string(),
+                param_type: SearchParamType::Token,
+                modifier,
+                values: vec![SearchValue::eq(value)],
+                chain: vec![],
+                components: vec![],
+            });
+            let backend = &backend;
+            let tenant = &tenant;
+            async move {
+                let found = backend.search(tenant, &query).await.unwrap();
+                found
+                    .resources
+                    .items
+                    .iter()
+                    .map(|r| r.id().to_string())
+                    .collect::<Vec<_>>()
+            }
+        };
+        let qualified = "http://hl7.org/fhir/administrative-gender|female";
+        let not = Some(crate::types::SearchModifier::Not);
+
+        // As indexed today.
+        let stored: Option<String> = backend
+            .get_connection()
+            .unwrap()
+            .query_row(
+                "SELECT value_token_system FROM search_index
+                 WHERE resource_id = 'pt-f' AND param_name = 'gender'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some(IMPLICIT_TOKEN_SYSTEM));
+        assert_eq!(ids(None, qualified).await, vec!["pt-f"]);
+        assert!(ids(not.clone(), qualified).await.is_empty());
+
+        // As indexed before #1379.
+        let updated = backend
+            .get_connection()
+            .unwrap()
+            .execute(
+                "UPDATE search_index SET value_token_system = NULL
+                 WHERE resource_id = 'pt-f' AND param_name = 'gender'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(updated, 1);
+        assert_eq!(ids(None, "female").await, vec!["pt-f"], "positive control");
+        assert_eq!(ids(None, "|female").await, vec!["pt-f"]);
+        assert!(ids(None, qualified).await.is_empty());
+        assert_eq!(ids(not, qualified).await, vec!["pt-f"]);
+    }
+
     #[tokio::test]
     async fn test_search_index_identifier_type_populated() {
         let backend = create_test_backend();

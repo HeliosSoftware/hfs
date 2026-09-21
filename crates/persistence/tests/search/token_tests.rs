@@ -419,3 +419,29 @@ async fn test_token_search_no_results() {
 
     assert!(result.resources.is_empty());
 }
+
+/// The shared table for `system|code` on `code` elements (#1379); PostgreSQL,
+/// MongoDB and Elasticsearch run the same one.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_system_qualified_tokens_match_code_elements() {
+    let backend = super::make_sqlite_backend();
+    super::token_code_system_suite::system_qualified_tokens_match_code_elements(
+        &backend,
+        "token-code-system",
+        true,
+    )
+    .await;
+}
+
+/// #1379: the same predicate as a chain terminal.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_system_qualified_tokens_in_chains() {
+    let backend = super::make_sqlite_backend();
+    super::token_code_system_suite::system_qualified_tokens_in_chains(
+        &backend,
+        "token-code-system-chain",
+    )
+    .await;
+}
