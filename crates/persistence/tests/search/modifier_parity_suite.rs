@@ -75,15 +75,27 @@ struct Case {
     param_type: SearchParamType,
     modifier: SearchModifier,
     value: String,
+    /// A second, unmodified token parameter ANDed with the first, so the
+    /// modified one is also exercised where it does not drive the search.
+    and: Option<(&'static str, &'static str)>,
     expect: Expect,
 }
 
 impl Case {
     fn label(&self) -> String {
+        let and = self
+            .and
+            .map(|(param, value)| format!("&{param}={value}"))
+            .unwrap_or_default();
         format!(
-            "{}?{}:{}={}",
+            "{}?{}:{}={}{and}",
             self.resource_type, self.param, self.modifier, self.value
         )
+    }
+
+    fn and(mut self, param: &'static str, value: &'static str) -> Self {
+        self.and = Some((param, value));
+        self
     }
 }
 
@@ -101,6 +113,7 @@ fn case(
         param_type,
         modifier,
         value: value.into(),
+        and: None,
         expect,
     }
 }
@@ -483,6 +496,44 @@ fn cases() -> Vec<Case> {
             format!("{ABS_PATIENT}/_history/1"),
             Ids(&["ob-abs"]),
         ),
+        // Another tenant's Patient `p1` carries MRN 77777; this tenant's does
+        // not, and its references must not match on the strength of it.
+        case(
+            "Observation",
+            "subject",
+            T::Reference,
+            M::Identifier,
+            format!("{MRN}|77777"),
+            Ids(&[]),
+        ),
+        // ANDed with a plain parameter, in both directions of selectivity.
+        case(
+            "Observation",
+            "subject",
+            T::Reference,
+            M::Identifier,
+            format!("{MRN}|12345"),
+            Ids(&["ob-pat"]),
+        )
+        .and("code", "1234-5"),
+        case(
+            "Observation",
+            "subject",
+            T::Reference,
+            patient(),
+            "p1",
+            Ids(&["ob-ver"]),
+        )
+        .and("code", "9999-9"),
+        case(
+            "Patient",
+            "identifier",
+            T::Token,
+            M::OfType,
+            format!("{V2_0203}||12345"),
+            Ids(&["p2"]),
+        )
+        .and("family", "smithson"),
         // ---- uri -----------------------------------------------------
         case(
             "ValueSet",
@@ -593,6 +644,32 @@ fn query(
             ..Default::default()
         })
         .with_count(100)
+}
+
+/// The query of one cell: the modified parameter, plus its companion if any.
+fn case_query(case: &Case) -> SearchQuery {
+    let query = query(
+        case.resource_type,
+        case.param,
+        case.param_type,
+        Some(case.modifier.clone()),
+        &case.value,
+    );
+    match case.and {
+        Some((param, value)) => query.with_parameter(SearchParameter {
+            name: param.to_string(),
+            // `family` is the one string companion; the rest are tokens.
+            param_type: if param == "family" {
+                SearchParamType::String
+            } else {
+                SearchParamType::Token
+            },
+            modifier: None,
+            values: vec![SearchValue::eq(value)],
+            ..Default::default()
+        }),
+        None => query,
+    }
 }
 
 /// Runs one query and reduces the result to what the table compares.
@@ -793,6 +870,22 @@ pub async fn every_valid_modifier_agrees_across_backends<S>(
     let tenant = TenantContext::new(TenantId::new(tenant_base), TenantPermissions::full_access());
     seed(backend, &tenant).await;
 
+    // The same Patient id under another tenant, with an identifier this
+    // tenant's `p1` does not have.
+    let other = TenantContext::new(
+        TenantId::new(format!("{tenant_base}-other")),
+        TenantPermissions::full_access(),
+    );
+    backend
+        .create(
+            &other,
+            "Patient",
+            json!({"id": "p1", "identifier": [{"system": MRN, "value": "77777"}]}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create the other tenant's Patient/p1 failed: {e}"));
+
     // Positive controls: the unmodified search on every parameter the matrix
     // uses. Polled because Elasticsearch is near-real-time. A failure here
     // means the parameter did not index — a backend built without the spec
@@ -863,20 +956,23 @@ pub async fn every_valid_modifier_agrees_across_backends<S>(
     let mut failures = Vec::new();
     for case in &table {
         let label = case.label();
-        let got = outcome(
-            backend,
-            &tenant,
-            &query(
-                case.resource_type,
-                case.param,
-                case.param_type,
-                Some(case.modifier.clone()),
-                &case.value,
-            ),
-        )
-        .await;
+        let query = case_query(case);
+        let got = outcome(backend, &tenant, &query).await;
         let shown = render(&got);
         println!("{label} -> {shown}");
+
+        // `search_count` takes its own route through some backends; it must
+        // count what `search` returns.
+        if let Ok(ids) = &got {
+            match backend.search_count(&tenant, &query).await {
+                Ok(count) if count == ids.len() as u64 => {}
+                Ok(count) => failures.push(format!(
+                    "{label}: search_count is {count}, search returned {}",
+                    ids.len()
+                )),
+                Err(e) => failures.push(format!("{label}: search_count failed: {e}")),
+            }
+        }
 
         let agreed = render_expect(&case.expect);
         match divergences.iter().find(|d| d.label == label) {

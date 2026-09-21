@@ -1136,6 +1136,10 @@ mod es_integration {
                     label: "Observation?subject:Patient=p1,nobody",
                     expect: Expect::Ids(&["ob-abs", "ob-pat"]),
                 },
+                Divergence {
+                    label: "Observation?subject:Patient=p1&code=9999-9",
+                    expect: Expect::Ids(&["ob-abs"]),
+                },
                 // `:identifier` looks for token rows under the reference parameter's own
                 // name, which nothing writes: it never matches.
                 Divergence {
@@ -1148,6 +1152,10 @@ mod es_integration {
                 },
                 Divergence {
                     label: "Observation?subject:identifier=12345",
+                    expect: Expect::Ids(&[]),
+                },
+                Divergence {
+                    label: "Observation?subject:identifier=http://example.org/mrn|12345&code=1234-5",
                     expect: Expect::Ids(&[]),
                 },
             ],
