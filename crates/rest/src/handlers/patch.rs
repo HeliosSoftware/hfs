@@ -191,7 +191,7 @@ where
 ///   was supplied and is not satisfied
 /// - `415 Unsupported Media Type` - unknown patch format
 /// - `501 Not Implemented` - FHIRPath Patch, as for [`patch_handler`]; or a
-///   backend without conditional patch (MongoDB)
+///   storage without conditional patch (S3 on its own)
 ///
 /// # `If-Match`
 ///

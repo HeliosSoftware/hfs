@@ -174,8 +174,8 @@ where
     let revinclude_by_target = build_revinclude_index(&registry);
 
     // The conditional interactions are the storage's to declare, not literals:
-    // MongoDB has no conditional patch, S3 none at all, and a composite's
-    // answer depends on how it is composed (#1384). The conditional handlers
+    // S3 serves none on its own, and a composite's answer depends on how it
+    // is composed (#1384). The conditional handlers
     // refuse with `501` from this same source.
     let conditionals = super::conditional_support::advertised(state.storage(), version);
 
