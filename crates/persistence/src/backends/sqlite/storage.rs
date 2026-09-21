@@ -3158,6 +3158,7 @@ impl ConditionalStorage for SqliteBackend {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn conditional_update(
         &self,
         tenant: &TenantContext,
@@ -3166,6 +3167,7 @@ impl ConditionalStorage for SqliteBackend {
         search_params: &str,
         upsert: bool,
         fhir_version: FhirVersion,
+        if_match: &crate::core::EntityTagPrecondition,
     ) -> StorageResult<ConditionalUpdateResult> {
         // Find matching resources based on search parameters
         let matches = self
@@ -3174,6 +3176,9 @@ impl ConditionalStorage for SqliteBackend {
 
         match matches.len() {
             0 => {
+                // `If-Match` names a version; nothing matched, so nothing
+                // can carry it and the create below must not run (#1381).
+                crate::core::conditional_if_match_gate(if_match, resource_type, None)?;
                 if upsert {
                     // No match, but upsert is true - create new resource
                     let created = self
@@ -3186,8 +3191,11 @@ impl ConditionalStorage for SqliteBackend {
                 }
             }
             1 => {
-                // Exactly one match - update it (preserves existing FHIR version)
+                // Exactly one match - update it (preserves existing FHIR version).
+                // `update` compares-and-swaps on `existing`'s version, the one
+                // `If-Match` is evaluated against here.
                 let existing = matches.into_iter().next().unwrap();
+                crate::core::conditional_if_match_gate(if_match, resource_type, Some(&existing))?;
                 let updated = self.update(tenant, &existing, resource).await?;
                 Ok(ConditionalUpdateResult::Updated(updated))
             }
@@ -3203,6 +3211,7 @@ impl ConditionalStorage for SqliteBackend {
         tenant: &TenantContext,
         resource_type: &str,
         search_params: &str,
+        if_match: &crate::core::EntityTagPrecondition,
     ) -> StorageResult<ConditionalDeleteResult> {
         // Find matching resources based on search parameters
         let matches = self
@@ -3211,12 +3220,15 @@ impl ConditionalStorage for SqliteBackend {
 
         match matches.len() {
             0 => {
-                // No match
+                // No match. A supplied `If-Match` fails against it, as it
+                // does on `DELETE [type]/[id]` for a missing resource.
+                crate::core::conditional_if_match_gate(if_match, resource_type, None)?;
                 Ok(ConditionalDeleteResult::NoMatch)
             }
             1 => {
                 // Exactly one match - delete it
                 let existing = matches.into_iter().next().unwrap();
+                crate::core::conditional_if_match_gate(if_match, resource_type, Some(&existing))?;
                 self.delete(tenant, resource_type, existing.id()).await?;
                 Ok(ConditionalDeleteResult::Deleted(existing))
             }
@@ -3242,6 +3254,7 @@ impl ConditionalStorage for SqliteBackend {
         resource_type: &str,
         search_params: &str,
         patch: &crate::core::PatchFormat,
+        if_match: &crate::core::EntityTagPrecondition,
     ) -> StorageResult<crate::core::ConditionalPatchResult> {
         use crate::core::{ConditionalPatchResult, PatchFormat};
 
@@ -3255,6 +3268,7 @@ impl ConditionalStorage for SqliteBackend {
             1 => {
                 // Exactly one match - apply the patch
                 let existing = matches.into_iter().next().unwrap();
+                crate::core::conditional_if_match_gate(if_match, resource_type, Some(&existing))?;
                 let current_content = existing.content().clone();
 
                 // Apply the patch based on format
@@ -7425,6 +7439,7 @@ mod tests {
                 "identifier=12345",
                 false,
                 FhirVersion::default(),
+                &crate::core::EntityTagPrecondition::Absent,
             )
             .await
             .unwrap();
@@ -7451,6 +7466,7 @@ mod tests {
                 "identifier=99999",
                 false,
                 FhirVersion::default(),
+                &crate::core::EntityTagPrecondition::Absent,
             )
             .await
             .unwrap();
@@ -7475,6 +7491,7 @@ mod tests {
                 "identifier=new-id",
                 true,
                 FhirVersion::default(),
+                &crate::core::EntityTagPrecondition::Absent,
             )
             .await
             .unwrap();
@@ -7505,7 +7522,12 @@ mod tests {
 
         // Conditional delete
         let result = backend
-            .conditional_delete(&tenant, "Patient", "_id=p1")
+            .conditional_delete(
+                &tenant,
+                "Patient",
+                "_id=p1",
+                &crate::core::EntityTagPrecondition::Absent,
+            )
             .await
             .unwrap();
 
@@ -7530,7 +7552,12 @@ mod tests {
 
         // Conditional delete with no match
         let result = backend
-            .conditional_delete(&tenant, "Patient", "_id=nonexistent")
+            .conditional_delete(
+                &tenant,
+                "Patient",
+                "_id=nonexistent",
+                &crate::core::EntityTagPrecondition::Absent,
+            )
             .await
             .unwrap();
 
@@ -7605,7 +7632,13 @@ mod tests {
         ]));
 
         let result = backend
-            .conditional_patch(&tenant, "Patient", "_id=p1", &patch)
+            .conditional_patch(
+                &tenant,
+                "Patient",
+                "_id=p1",
+                &patch,
+                &crate::core::EntityTagPrecondition::Absent,
+            )
             .await
             .unwrap();
 
@@ -7642,7 +7675,13 @@ mod tests {
         }));
 
         let result = backend
-            .conditional_patch(&tenant, "Patient", "_id=p1", &patch)
+            .conditional_patch(
+                &tenant,
+                "Patient",
+                "_id=p1",
+                &patch,
+                &crate::core::EntityTagPrecondition::Absent,
+            )
             .await
             .unwrap();
 
@@ -7667,7 +7706,13 @@ mod tests {
         ]));
 
         let result = backend
-            .conditional_patch(&tenant, "Patient", "_id=nonexistent", &patch)
+            .conditional_patch(
+                &tenant,
+                "Patient",
+                "_id=nonexistent",
+                &patch,
+                &crate::core::EntityTagPrecondition::Absent,
+            )
             .await
             .unwrap();
 

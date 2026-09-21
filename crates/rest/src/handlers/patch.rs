@@ -190,25 +190,26 @@ where
 /// a 412 Precondition Failed error".
 ///
 /// - `200 OK` - the single match was patched
-/// - `400 Bad Request` - no criteria, criteria that cannot be evaluated, an
-///   invalid patch document, or an `If-Match` header (see below)
+/// - `400 Bad Request` - no criteria, criteria that cannot be evaluated, or an
+///   invalid patch document
 /// - `404 Not Found` - nothing matched; nothing is created
 /// - `405 Method Not Allowed` - `AuditEvent` resources are immutable
-/// - `412 Precondition Failed` - more than one resource matched
+/// - `412 Precondition Failed` - more than one resource matched, or `If-Match`
+///   was supplied and is not satisfied
 /// - `415 Unsupported Media Type` - unknown patch format
 /// - `501 Not Implemented` - FHIRPath Patch, as for [`patch_handler`]; or a
 ///   backend without conditional patch (MongoDB)
 ///
 /// # `If-Match`
 ///
-/// [`ConditionalStorage::conditional_patch`] searches and writes inside the
-/// backend and never surfaces the version it is about to replace, so the header
-/// cannot be honoured here (the same limit [`conditional_delete_handler`]
-/// documents). A version precondition that is silently discarded is worse than
-/// one that is refused, so the request is refused; a client that wants both
-/// resolves the id first and sends `PATCH [type]/[id]` with `If-Match`.
-///
-/// [`conditional_delete_handler`]: super::delete::conditional_delete_handler
+/// Honoured, as on conditional update and delete (#1381; it was refused with
+/// `400` before). [`ConditionalStorage::conditional_patch`] evaluates it
+/// against the one resource the criteria resolve to and hands that same row to
+/// the compare-and-swap that writes the patched content, so a writer landing in
+/// between ends in `409`, never in a patch over a version the client did not
+/// name. A malformed value fails the precondition. With no match the answer
+/// stays `404` — what `PATCH [type]/[id]` answers for a missing resource,
+/// `If-Match` or not — and nothing is written.
 #[allow(clippy::too_many_arguments)]
 pub async fn conditional_patch_handler<S>(
     State(state): State<AppState<S>>,
@@ -254,16 +255,7 @@ where
         });
     }
 
-    if conditional.has_if_match() {
-        return Err(RestError::BadRequest {
-            message: format!(
-                "If-Match is not supported on a conditional patch (PATCH {resource_type}?…): \
-                 the version precondition cannot be checked against a resource selected by \
-                 criteria. Nothing was written; resolve the id and send PATCH \
-                 {resource_type}/[id] with If-Match instead"
-            ),
-        });
-    }
+    let if_match = super::update::conditional_if_match(&conditional)?;
 
     let content_type = headers
         .get(header::CONTENT_TYPE)
@@ -285,8 +277,10 @@ where
             &resource_type,
             &search_params,
             &patch_format,
+            if_match,
         )
-        .await?;
+        .await
+        .map_err(|e| super::update::conditional_write_error(e, &resource_type))?;
 
     use helios_persistence::core::ConditionalPatchResult;
     match result {

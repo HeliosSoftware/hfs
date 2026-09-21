@@ -1448,6 +1448,7 @@ impl ConditionalStorage for CompositeStorage {
         Ok(result)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn conditional_update(
         &self,
         tenant: &TenantContext,
@@ -1456,6 +1457,7 @@ impl ConditionalStorage for CompositeStorage {
         search_params: &str,
         upsert: bool,
         fhir_version: FhirVersion,
+        if_match: &crate::core::EntityTagPrecondition,
     ) -> StorageResult<ConditionalUpdateResult> {
         if self.has_dedicated_search_backend() {
             let matches = self
@@ -1464,6 +1466,9 @@ impl ConditionalStorage for CompositeStorage {
 
             return match matches.len() {
                 0 => {
+                    // `If-Match` names a version; nothing matched, so nothing
+                    // can carry it and the create below must not run (#1381).
+                    crate::core::conditional_if_match_gate(if_match, resource_type, None)?;
                     if upsert {
                         let created = self
                             .primary
@@ -1492,7 +1497,16 @@ impl ConditionalStorage for CompositeStorage {
                     }
                 }
                 1 => {
+                    // The match — and so the version `If-Match` is evaluated
+                    // against — is the search backend's copy. The primary's
+                    // `update` compares-and-swaps on that same version, so a
+                    // stale copy ends in `VersionConflict`, not in a write.
                     let current = matches.into_iter().next().expect("single match must exist");
+                    crate::core::conditional_if_match_gate(
+                        if_match,
+                        resource_type,
+                        Some(&current),
+                    )?;
                     let updated = self.primary.update(tenant, &current, resource).await?;
 
                     if let Err(e) = self
@@ -1530,6 +1544,7 @@ impl ConditionalStorage for CompositeStorage {
                 search_params,
                 upsert,
                 fhir_version,
+                if_match,
             )
             .await?;
 
@@ -1575,6 +1590,7 @@ impl ConditionalStorage for CompositeStorage {
         tenant: &TenantContext,
         resource_type: &str,
         search_params: &str,
+        if_match: &crate::core::EntityTagPrecondition,
     ) -> StorageResult<ConditionalDeleteResult> {
         if self.has_dedicated_search_backend() {
             let matches = self
@@ -1582,9 +1598,17 @@ impl ConditionalStorage for CompositeStorage {
                 .await?;
 
             return match matches.len() {
-                0 => Ok(ConditionalDeleteResult::NoMatch),
+                0 => {
+                    crate::core::conditional_if_match_gate(if_match, resource_type, None)?;
+                    Ok(ConditionalDeleteResult::NoMatch)
+                }
                 1 => {
                     let current = matches.into_iter().next().expect("single match must exist");
+                    crate::core::conditional_if_match_gate(
+                        if_match,
+                        resource_type,
+                        Some(&current),
+                    )?;
                     self.primary
                         .delete(tenant, resource_type, current.id())
                         .await?;
@@ -1614,7 +1638,7 @@ impl ConditionalStorage for CompositeStorage {
         })?;
 
         let result = storage
-            .conditional_delete(tenant, resource_type, search_params)
+            .conditional_delete(tenant, resource_type, search_params, if_match)
             .await?;
 
         // The primary resolved the criteria and performed the delete; its
@@ -1640,6 +1664,7 @@ impl ConditionalStorage for CompositeStorage {
         resource_type: &str,
         search_params: &str,
         patch: &PatchFormat,
+        if_match: &crate::core::EntityTagPrecondition,
     ) -> StorageResult<ConditionalPatchResult> {
         let storage = self.conditional_storage.as_ref().ok_or_else(|| {
             StorageError::Backend(BackendError::UnsupportedCapability {
@@ -1649,7 +1674,7 @@ impl ConditionalStorage for CompositeStorage {
         })?;
 
         let result = storage
-            .conditional_patch(tenant, resource_type, search_params, patch)
+            .conditional_patch(tenant, resource_type, search_params, patch, if_match)
             .await?;
 
         // Sync patched resource to secondaries
