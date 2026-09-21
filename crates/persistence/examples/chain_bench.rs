@@ -839,20 +839,26 @@ fn plan(corpus: &Corpus) -> Vec<Case> {
     // #1389 item 1: `system|` on a chained token terminal — "any code in this
     // system". A correctness probe; it selects every observation, so it is the
     // widest `_has` in the plan as well.
+    //
+    // Only on a corpus of up to 150,000 observations: the resolver fetches every
+    // one of them, a page of 1,000 at a time, and on 545,000 that single probe
+    // was still running after twenty minutes.
     let system = codes[0].0.split('|').next().unwrap_or_default().to_string();
-    cases.push(Case {
-        family: "_has system|",
-        selectivity: "all",
-        base: "Patient",
-        spec: Spec::Has(ReverseChainedParameter::terminal(
-            "Observation",
-            "subject",
-            "code",
-            SearchValue::eq(format!("{system}|")),
-        )),
-        terminal: Some(("Observation", "code", format!("{system}|"))),
-        explain: false,
-    });
+    if observations <= 150_000 {
+        cases.push(Case {
+            family: "_has system|",
+            selectivity: "all",
+            base: "Patient",
+            spec: Spec::Has(ReverseChainedParameter::terminal(
+                "Observation",
+                "subject",
+                "code",
+                SearchValue::eq(format!("{system}|")),
+            )),
+            terminal: Some(("Observation", "code", format!("{system}|"))),
+            explain: false,
+        });
+    }
     cases
 }
 
@@ -1093,6 +1099,18 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
+    // Past half a minute a run is not repeated: the one instrumented pass is
+    // the sample (`n=1`). The resolver pages with OFFSET, so a wide hop costs
+    // quadratically more, and five more runs of a ten-minute resolution would
+    // say nothing the first did not.
+    if first > Duration::from_secs(30) {
+        return Timing {
+            n: 1,
+            min: first,
+            median: first,
+            p95: first,
+        };
+    }
     let slow = first > Duration::from_millis(args.slow_ms);
     let (warmup, iters) = if slow {
         (1, args.iters.min(5))
