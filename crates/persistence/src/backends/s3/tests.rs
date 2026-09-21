@@ -1013,6 +1013,63 @@ async fn bulk_submit_concurrent_ingest_preserves_order_and_writes_all() {
     }
 }
 
+/// A batch with two entries for the same resource id is order-dependent
+/// (last write wins), so it ingests serially even with concurrency enabled —
+/// the concurrent path would race them to a non-deterministic result (#945).
+#[tokio::test]
+async fn bulk_submit_same_id_entries_stay_ordered() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+
+    let submission_id = SubmissionId::new("client-a", "sub-dup");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    // Same id, different content: the second entry must be the one that lands.
+    let entries = vec![
+        NdjsonEntry::new(
+            1,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "dup", "gender": "male"}),
+        ),
+        NdjsonEntry::new(
+            2,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "dup", "gender": "female"}),
+        ),
+    ];
+
+    let results = backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            entries,
+            &BulkProcessingOptions::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 2);
+
+    let stored = backend
+        .read(&tenant, "Patient", "dup")
+        .await
+        .unwrap()
+        .expect("the resource is stored");
+    assert_eq!(
+        stored.content()["gender"],
+        "female",
+        "the last write in the batch must win"
+    );
+}
+
 /// Two output files of one manifest, both starting at line 1, must each keep
 /// their own entry result and raw archive (issue #457).
 ///
