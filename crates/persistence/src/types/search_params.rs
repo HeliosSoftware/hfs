@@ -272,32 +272,18 @@ impl SearchPrefix {
     /// `ne`: on a string, token, uri, reference, composite or special
     /// parameter the two leading characters are part of the value
     /// (`family=nelson`, `code=eq77`), never a prefix (#1307).
+    ///
+    /// `sa` / `eb` are included for number: the FHIR prefix table applies all
+    /// nine prefixes to number, date and quantity alike, REST and
+    /// [`SearchValue::parse_for_type`] have always stripped them before a
+    /// number, and every backend compares a number under `sa` / `eb` as under
+    /// `gt` / `lt`. This predicate used to say otherwise, contradicting the
+    /// parser it describes.
     pub fn is_valid_for(&self, param_type: SearchParamType) -> bool {
-        match self {
-            SearchPrefix::Eq
-            | SearchPrefix::Ne
-            | SearchPrefix::Gt
-            | SearchPrefix::Lt
-            | SearchPrefix::Ge
-            | SearchPrefix::Le => {
-                matches!(
-                    param_type,
-                    SearchParamType::Number | SearchParamType::Date | SearchParamType::Quantity
-                )
-            }
-            // Per the FHIR spec, `sa`/`eb` (starts-after / ends-before) apply to
-            // date and quantity ordered types (not number).
-            SearchPrefix::Sa | SearchPrefix::Eb => matches!(
-                param_type,
-                SearchParamType::Date | SearchParamType::Quantity
-            ),
-            SearchPrefix::Ap => {
-                matches!(
-                    param_type,
-                    SearchParamType::Number | SearchParamType::Date | SearchParamType::Quantity
-                )
-            }
-        }
+        matches!(
+            param_type,
+            SearchParamType::Number | SearchParamType::Date | SearchParamType::Quantity
+        )
     }
 }
 
@@ -1054,10 +1040,13 @@ mod tests {
         assert!(SearchPrefix::Gt.is_valid_for(SearchParamType::Date));
         assert!(!SearchPrefix::Gt.is_valid_for(SearchParamType::String));
         assert!(SearchPrefix::Sa.is_valid_for(SearchParamType::Date));
-        // `sa`/`eb` apply to date and quantity, but not number, per the spec.
         assert!(SearchPrefix::Sa.is_valid_for(SearchParamType::Quantity));
         assert!(SearchPrefix::Eb.is_valid_for(SearchParamType::Quantity));
-        assert!(!SearchPrefix::Sa.is_valid_for(SearchParamType::Number));
+        // `sa`/`eb` apply to number too: the parser strips them there, and
+        // this predicate has to agree with the parser.
+        assert!(SearchPrefix::Sa.is_valid_for(SearchParamType::Number));
+        assert!(SearchPrefix::Eb.is_valid_for(SearchParamType::Number));
+        assert!(!SearchPrefix::Sa.is_valid_for(SearchParamType::String));
     }
 
     /// Every prefix against every parameter type (#1307). `eq` and `ne` used
@@ -1100,8 +1089,8 @@ mod tests {
             (P::Lt, &[T::Number, T::Date, T::Quantity]),
             (P::Ge, &[T::Number, T::Date, T::Quantity]),
             (P::Le, &[T::Number, T::Date, T::Quantity]),
-            (P::Sa, &[T::Date, T::Quantity]),
-            (P::Eb, &[T::Date, T::Quantity]),
+            (P::Sa, &[T::Number, T::Date, T::Quantity]),
+            (P::Eb, &[T::Number, T::Date, T::Quantity]),
             (P::Ap, &[T::Number, T::Date, T::Quantity]),
         ];
         for (prefix, valid) in table {
@@ -1110,6 +1099,48 @@ mod tests {
                     prefix.is_valid_for(param_type),
                     valid.contains(&param_type),
                     "{prefix} on {param_type}"
+                );
+            }
+        }
+    }
+
+    /// The predicate and the parser are two statements of one rule; this pins
+    /// them to each other so they cannot drift apart again (they did, on
+    /// `sa` / `eb` before a number).
+    #[test]
+    fn test_prefix_validity_agrees_with_parse_for_type() {
+        use SearchParamType as T;
+        use SearchPrefix as P;
+
+        for param_type in [
+            T::String,
+            T::Uri,
+            T::Number,
+            T::Date,
+            T::Quantity,
+            T::Token,
+            T::Reference,
+            T::Composite,
+            T::Special,
+        ] {
+            for prefix in [
+                P::Eq,
+                P::Ne,
+                P::Gt,
+                P::Lt,
+                P::Ge,
+                P::Le,
+                P::Sa,
+                P::Eb,
+                P::Ap,
+            ] {
+                let raw = format!("{prefix}10");
+                let parsed = SearchValue::parse_for_type(&raw, param_type);
+                let stripped = parsed.value == "10" && parsed.prefix == prefix;
+                assert_eq!(
+                    stripped,
+                    prefix.is_valid_for(param_type),
+                    "{raw} on {param_type}: parser stripped={stripped}"
                 );
             }
         }
