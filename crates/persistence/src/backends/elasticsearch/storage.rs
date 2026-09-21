@@ -29,7 +29,10 @@ use crate::types::StoredResource;
 
 use super::backend::ElasticsearchBackend;
 use super::schema;
-use super::search_impl::{ReadOp, send_read_with_retry};
+use super::search_impl::{
+    EsFailureClass, MAX_SEARCH_RETRIES, RETRY_BASE_DELAY_MS, ReadOp, classify_es_failure,
+    is_index_not_found, send_read_with_retry,
+};
 
 /// Upper bound on operations per `_bulk` request, on top of the configured byte
 /// budget ([`ElasticsearchConfig::bulk_max_bytes`](super::backend::ElasticsearchConfig::bulk_max_bytes)).
@@ -603,6 +606,307 @@ pub(crate) fn build_es_contained_document(
     doc
 }
 
+// ============================================================================
+// Single-request writes
+//
+// Every write that is one HTTP request — index a document, delete a document,
+// delete by query — goes through `send_write_with_retry`, the write-side
+// sibling of `search_impl::send_read_with_retry` (#1382). `_bulk` keeps its own
+// loop (`send_bulk_index`): it retries per item and splits oversized requests,
+// neither of which applies to a single document.
+//
+// Retrying is safe because every one of these requests is repeatable:
+//
+// - Documents are indexed under an explicit `_id` with plain index semantics.
+//   HFS never sends `op_type=create`, an external `version`, or
+//   `if_seq_no`/`if_primary_term`, so a resend whose first attempt was applied
+//   but whose response was lost overwrites the document with itself; it cannot
+//   be answered `409`. (A `409` is therefore not expected at all, and is a
+//   permanent failure like any other 4xx.)
+// - A resent delete-by-id that was already applied is answered `not_found`,
+//   which after a failed attempt is read as success — see `WriteOp::Delete`.
+// - A delete-by-query that is run again deletes what is still there.
+// ============================================================================
+
+/// The write APIs that share one attempt/retry/classify path.
+#[derive(Debug, Clone, Copy)]
+enum WriteOp<'a> {
+    /// `PUT {index}/_doc/{doc_id}`, with the body as the document.
+    Index {
+        doc_id: &'a str,
+        refresh: Option<Refresh>,
+    },
+    /// `DELETE {index}/_doc/{doc_id}`; the body is not sent.
+    ///
+    /// Answers [`WriteOutcome::NotFound`] only when the *first* attempt is told
+    /// the document is absent. On a resend the same answer most likely means
+    /// the earlier attempt was applied and its response lost (a dropped
+    /// connection, a gateway's `503`/`504`); either way the document is gone,
+    /// which is what was asked for, so it is [`WriteOutcome::Done`].
+    Delete {
+        doc_id: &'a str,
+        refresh: Option<Refresh>,
+    },
+    /// `POST {index}/_delete_by_query` with a forced refresh, the body as the
+    /// query. `index` may be a pattern; missing indices are not an error.
+    ///
+    /// Version conflicts do not abort it (`conflicts=proceed`), but a run that
+    /// reports conflicts, shard failures or a timeout left documents behind and
+    /// is repeated like a transient failure. The `deleted` of the outcome is
+    /// the total over all runs.
+    DeleteByQuery,
+}
+
+/// What a write that did not fail achieved.
+enum WriteOutcome {
+    /// Applied. Carries the response body of a delete-by-query (the only one
+    /// read); `Value::Null` for the others.
+    Done(Value),
+    /// Elasticsearch says the document to delete (or its index) does not exist.
+    NotFound,
+}
+
+/// Result of a single write attempt.
+enum WriteAttempt {
+    Done(Value),
+    NotFound,
+    /// The cluster could not be reached, or asked to be retried.
+    Retryable(String),
+    /// A delete-by-query answered `200` but left documents behind.
+    Incomplete {
+        deleted: u64,
+        message: String,
+    },
+    Failed(StorageError),
+}
+
+/// Whether a `404` is Elasticsearch saying "this index exists and has no
+/// document with that id": the delete API answers exactly that with
+/// `"result": "not_found"`. The bare status proves nothing — a proxy or a wrong
+/// base path answers `404` too (see `search_impl::is_document_not_found`).
+fn is_delete_not_found(status: u16, body: &str) -> bool {
+    status == 404
+        && serde_json::from_str::<Value>(body)
+            .is_ok_and(|parsed| parsed.get("result").and_then(Value::as_str) == Some("not_found"))
+}
+
+/// Sends one write request and classifies the response. `what` names the write
+/// in error messages ("index document").
+async fn send_write_once(
+    backend: &ElasticsearchBackend,
+    op: WriteOp<'_>,
+    index: &str,
+    body: &Value,
+    what: &str,
+) -> WriteAttempt {
+    let client = backend.client();
+    let response = match op {
+        WriteOp::Index { doc_id, refresh } => {
+            let mut request = client.index(IndexParts::IndexId(index, doc_id)).body(body);
+            if let Some(refresh) = refresh {
+                request = request.refresh(refresh);
+            }
+            request.send().await
+        }
+        WriteOp::Delete { doc_id, refresh } => {
+            let mut request = client.delete(DeleteParts::IndexId(index, doc_id));
+            if let Some(refresh) = refresh {
+                request = request.refresh(refresh);
+            }
+            request.send().await
+        }
+        WriteOp::DeleteByQuery => {
+            client
+                .delete_by_query(DeleteByQueryParts::Index(&[index]))
+                .ignore_unavailable(true)
+                .refresh(true)
+                .conflicts(elasticsearch::params::Conflicts::Proceed)
+                .body(body)
+                .send()
+                .await
+        }
+    };
+
+    let response = match response {
+        Ok(response) => response,
+        // The cluster stopped answering. Unlike a refused connection this is
+        // not resent: each further attempt would wait out another full request
+        // timeout (and under `refresh=wait_for` a slow answer is the normal
+        // cost of the write, not a fault), as `send_bulk_index` found for a
+        // lone document (#1125).
+        Err(e) if e.is_timeout() => {
+            return WriteAttempt::Failed(unavailable_error(format!(
+                "Failed to {what}: no answer within {} ms: {e}",
+                backend.request_timeout_ms()
+            )));
+        }
+        Err(e) => return WriteAttempt::Retryable(format!("Elasticsearch unreachable: {e}")),
+    };
+
+    let status = response.status_code().as_u16();
+    if (200..300).contains(&status) {
+        if !matches!(op, WriteOp::DeleteByQuery) {
+            // An acknowledged write is done; nothing in its body is needed.
+            return WriteAttempt::Done(Value::Null);
+        }
+        let payload: Value = match response.json().await {
+            Ok(payload) => payload,
+            Err(e) => {
+                return WriteAttempt::Failed(internal_error(format!(
+                    "Failed to {what}: unreadable delete-by-query response (status {status}): {e}"
+                )));
+            }
+        };
+        // How many documents went is what the caller reports; an answer that
+        // does not say is not an answer of `0`.
+        let Some(deleted) = payload.get("deleted").and_then(Value::as_u64) else {
+            return WriteAttempt::Failed(internal_error(format!(
+                "Failed to {what}: delete-by-query response carries no deleted count: {payload}"
+            )));
+        };
+        let conflicts = payload
+            .get("version_conflicts")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let failures = payload
+            .get("failures")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        let timed_out = payload.get("timed_out").and_then(Value::as_bool) == Some(true);
+        if conflicts > 0 || failures > 0 || timed_out {
+            return WriteAttempt::Incomplete {
+                deleted,
+                message: format!(
+                    "delete-by-query left documents behind ({conflicts} version conflicts, \
+                     {failures} failures, timed_out={timed_out})"
+                ),
+            };
+        }
+        return WriteAttempt::Done(payload);
+    }
+
+    let text = response.text().await.unwrap_or_default();
+    match op {
+        WriteOp::Delete { .. }
+            if is_index_not_found(status, &text) || is_delete_not_found(status, &text) =>
+        {
+            return WriteAttempt::NotFound;
+        }
+        // `ignore_unavailable` already covers this; kept for a cluster or
+        // proxy that answers it anyway. Nothing there means nothing to delete.
+        WriteOp::DeleteByQuery if is_index_not_found(status, &text) => {
+            return WriteAttempt::Done(json!({ "deleted": 0 }));
+        }
+        _ => {}
+    }
+
+    match classify_es_failure(status, &text) {
+        EsFailureClass::Retryable => WriteAttempt::Retryable(format!("status {status}: {text}")),
+        // `BadQuery` is about search values; on a write it is a rejection of
+        // the document (or of the query HFS built) like any other.
+        EsFailureClass::BadQuery | EsFailureClass::Permanent => WriteAttempt::Failed(
+            internal_error(format!("Failed to {what} (status {status}): {text}")),
+        ),
+    }
+}
+
+/// Sends a write and retries it while the failure is one the cluster may
+/// recover from — `429`, `502`/`503`/`504`, a rejected execution, a refused
+/// connection — on the schedule the reads use ([`MAX_SEARCH_RETRIES`] resends,
+/// [`RETRY_BASE_DELAY_MS`] doubling: at most ~300 ms of waiting). A permanent
+/// rejection (any other 4xx, a bare `500`) is never resent.
+///
+/// An exhausted retry is [`BackendError::Unavailable`], as `ensure_index`
+/// reports the same condition: the cluster never judged the write, so repeating
+/// it later (the composite's own retry, a `$reindex`) can succeed. A rejection
+/// is [`BackendError::Internal`].
+///
+/// Under `write_refresh=wait_for` every attempt that reaches the cluster also
+/// waits for the next refresh, so a resend after a gateway error can pay that
+/// wait again; attempts Elasticsearch itself rejected did not wait for one.
+async fn send_write_with_retry(
+    backend: &ElasticsearchBackend,
+    op: WriteOp<'_>,
+    index: &str,
+    body: &Value,
+    what: &str,
+) -> StorageResult<WriteOutcome> {
+    let mut last_failure = String::new();
+    // Documents removed by delete-by-query runs that then had to be repeated.
+    let mut already_deleted = 0u64;
+
+    for attempt in 0..=MAX_SEARCH_RETRIES {
+        match send_write_once(backend, op, index, body, what).await {
+            WriteAttempt::Done(mut payload) => {
+                if already_deleted > 0 {
+                    let total = payload.get("deleted").and_then(Value::as_u64).unwrap_or(0)
+                        + already_deleted;
+                    payload["deleted"] = json!(total);
+                }
+                return Ok(WriteOutcome::Done(payload));
+            }
+            WriteAttempt::NotFound if attempt > 0 => return Ok(WriteOutcome::Done(Value::Null)),
+            WriteAttempt::NotFound => return Ok(WriteOutcome::NotFound),
+            WriteAttempt::Failed(error) => return Err(error),
+            WriteAttempt::Retryable(message) => last_failure = message,
+            WriteAttempt::Incomplete { deleted, message } => {
+                already_deleted += deleted;
+                last_failure = message;
+            }
+        }
+
+        if attempt < MAX_SEARCH_RETRIES {
+            let delay_ms = RETRY_BASE_DELAY_MS << attempt;
+            tracing::warn!(
+                attempt = attempt + 1,
+                max = MAX_SEARCH_RETRIES + 1,
+                delay_ms,
+                index,
+                failure = %last_failure,
+                "Retryable ES write failure ({what}), retrying"
+            );
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+    }
+
+    let attempts = MAX_SEARCH_RETRIES + 1;
+    Err(unavailable_error(format!(
+        "Failed to {what} after {attempts} attempts: {last_failure}"
+    )))
+}
+
+/// Indexes one document under `doc_id` with the given refresh policy.
+async fn index_document(
+    backend: &ElasticsearchBackend,
+    index: &str,
+    doc_id: &str,
+    doc: &Value,
+    refresh: Option<Refresh>,
+    what: &str,
+) -> StorageResult<()> {
+    let op = WriteOp::Index { doc_id, refresh };
+    send_write_with_retry(backend, op, index, doc, what)
+        .await
+        .map(|_| ())
+}
+
+// Contained-document maintenance.
+//
+// A container's `contained[]` resources are separate documents, written after
+// the container's own. Elasticsearch has no transaction to put around the two,
+// so a failure here leaves them out of step: the container is indexed (or
+// deleted) and its contained documents are stale. Such a failure FAILS THE
+// WRITE, on every path alike (`create`, `update`, `create_or_update`, `delete`,
+// `write_search_entries`), with an error that says the container's own document
+// was already written. It is not reported as a success with a warning because:
+//
+// - Elasticsearch is only ever a search secondary, so "the write failed" never
+//   loses the resource — the primary has it — while a swallowed failure leaves
+//   `_contained` searches wrong with nothing on record (#1382).
+// - Every step is repeatable, so the caller's remedy is to repeat the write:
+//   the container document is overwritten with itself, the sweep and the
+//   contained documents are redone. A repeated `delete` finds the container
+//   gone and still runs the sweep (see `delete`).
 impl ElasticsearchBackend {
     /// Deletes all contained-resource docs derived from the given container
     /// (across the tenant's indices), used before re-indexing or on container
@@ -622,16 +926,16 @@ impl ElasticsearchBackend {
                 { "term": { "container_id": container_id } }
             ]}}
         });
-        // Missing indices are fine (nothing to delete).
-        let _ = self
-            .client()
-            .delete_by_query(DeleteByQueryParts::Index(&[&pattern]))
-            .ignore_unavailable(true)
-            .refresh(true)
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| internal_error(format!("Failed to delete contained docs: {}", e)))?;
+        // Missing indices are fine (nothing to delete). Anything else that is
+        // not a completed sweep is an error: the response used to be discarded
+        // whole, so a `503` left the stale documents matching `_contained`
+        // searches while the write reported success (#1382).
+        let what = format!(
+            "delete the stale contained documents of {container_type}/{container_id} \
+             (its own document is already written; repeat the write or reindex the \
+             resource to bring them back in step)"
+        );
+        delete_by_query_scoped(self, &pattern, body, &what).await?;
         Ok(())
     }
 
@@ -673,24 +977,21 @@ impl ElasticsearchBackend {
                 &contained.contained_type,
                 &contained_resource_id(container_id, &contained.local_id),
             );
-            let mut request = self
-                .client()
-                .index(IndexParts::IndexId(&index, &doc_id))
-                .body(doc);
-            if let Some(refresh) = self.write_refresh_param() {
-                request = request.refresh(refresh);
-            }
-            let response = request
-                .send()
-                .await
-                .map_err(|e| internal_error(format!("Failed to index contained doc: {}", e)))?;
-            if !response.status_code().is_success() {
-                let body = response.text().await.unwrap_or_default();
-                return Err(internal_error(format!(
-                    "Failed to index contained doc: {}",
-                    body
-                )));
-            }
+            let what = format!(
+                "index contained document {}#{} of {container_type}/{container_id} \
+                 (its own document is already written; repeat the write or reindex the \
+                 resource to bring them back in step)",
+                contained.contained_type, contained.local_id
+            );
+            index_document(
+                self,
+                &index,
+                &doc_id,
+                &doc,
+                self.write_refresh_param(),
+                &what,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -764,26 +1065,15 @@ impl ResourceStorage for ElasticsearchBackend {
         let index = self.index_name(tenant_id, resource_type);
         let doc_id = Self::document_id(resource_type, &id);
 
-        let mut request = self
-            .client()
-            .index(IndexParts::IndexId(&index, &doc_id))
-            .body(doc);
-        if let Some(refresh) = self.write_refresh_param() {
-            request = request.refresh(refresh);
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|e| internal_error(format!("Failed to index document: {}", e)))?;
-
-        let status = response.status_code();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(internal_error(format!(
-                "Failed to index document (status {}): {}",
-                status, body
-            )));
-        }
+        index_document(
+            self,
+            &index,
+            &doc_id,
+            &doc,
+            self.write_refresh_param(),
+            "index document",
+        )
+        .await?;
 
         // Index any contained resources for `_contained` search. New resource,
         // so no stale docs to delete first.
@@ -1076,26 +1366,15 @@ impl ResourceStorage for ElasticsearchBackend {
         // Ensure index exists
         schema::ensure_index(self, tenant_id, resource_type).await?;
 
-        let mut request = self
-            .client()
-            .index(IndexParts::IndexId(&index, &doc_id))
-            .body(doc);
-        if let Some(refresh) = self.write_refresh_param() {
-            request = request.refresh(refresh);
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|e| internal_error(format!("Failed to index document: {}", e)))?;
-
-        let status = response.status_code();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(internal_error(format!(
-                "Failed to index document (status {}): {}",
-                status, body
-            )));
-        }
+        index_document(
+            self,
+            &index,
+            &doc_id,
+            &doc,
+            self.write_refresh_param(),
+            "index document",
+        )
+        .await?;
 
         // Re-sync contained docs (delete stale, then re-index) so updates that
         // add/remove/change `contained[]` entries are reflected.
@@ -1224,26 +1503,29 @@ impl ResourceStorage for ElasticsearchBackend {
         let index = self.index_name(tenant_id, resource_type);
         let doc_id = Self::document_id(resource_type, id);
 
-        let mut request = self
-            .client()
-            .index(IndexParts::IndexId(&index, &doc_id))
-            .body(doc);
-        if let Some(refresh) = self.write_refresh_param() {
-            request = request.refresh(refresh);
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|e| internal_error(format!("Failed to update document: {}", e)))?;
+        index_document(
+            self,
+            &index,
+            &doc_id,
+            &doc,
+            self.write_refresh_param(),
+            "update document",
+        )
+        .await?;
 
-        let status = response.status_code();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(internal_error(format!(
-                "Failed to update document (status {}): {}",
-                status, body
-            )));
-        }
+        // Re-sync contained docs exactly as `create_or_update` does. This path
+        // used to skip it, so an update that changed `contained[]` left the old
+        // contained documents matching `_contained` searches (#1382).
+        self.index_contained_docs(
+            tenant_id,
+            resource_type,
+            id,
+            &resource,
+            fhir_version,
+            &version_id,
+            true,
+        )
+        .await?;
 
         let now = Utc::now();
         Ok(StoredResource::from_storage(
@@ -1271,35 +1553,31 @@ impl ResourceStorage for ElasticsearchBackend {
         let index = self.index_name(tenant_id, resource_type);
         let doc_id = Self::document_id(resource_type, id);
 
-        let mut request = self.client().delete(DeleteParts::IndexId(&index, &doc_id));
-        if let Some(refresh) = self.write_refresh_param() {
-            request = request.refresh(refresh);
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|e| internal_error(format!("Failed to delete document: {}", e)))?;
+        // "Not found" is a claim only Elasticsearch can make — by
+        // `"result": "not_found"` or an `index_not_found_exception`. A bare
+        // `404` (a proxy, a wrong base path) used to be taken for it; it is an
+        // error now, as it is for `read` (#1364, #1382).
+        let op = WriteOp::Delete {
+            doc_id: &doc_id,
+            refresh: self.write_refresh_param(),
+        };
+        let outcome =
+            send_write_with_retry(self, op, &index, &Value::Null, "delete document").await?;
 
-        let status = response.status_code();
-        if !status.is_success() {
-            if status.as_u16() == 404 {
-                return Err(StorageError::Resource(ResourceError::NotFound {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                }));
-            }
-            let body = response.text().await.unwrap_or_default();
-            return Err(internal_error(format!(
-                "Failed to delete document (status {}): {}",
-                status, body
-            )));
-        }
-
-        // Remove any contained-resource docs derived from this container.
+        // Remove any contained-resource docs derived from this container —
+        // also when the container's own document is already gone: a delete that
+        // is repeated because this sweep failed finds exactly that, and the
+        // stale contained documents must not outlive every repeat.
         self.delete_contained_docs(tenant_id, resource_type, id)
             .await?;
 
-        Ok(())
+        match outcome {
+            WriteOutcome::Done(_) => Ok(()),
+            WriteOutcome::NotFound => Err(StorageError::Resource(ResourceError::NotFound {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+            })),
+        }
     }
 
     async fn count(
@@ -1355,20 +1633,13 @@ impl ResourceStorage for ElasticsearchBackend {
                 { "term": { "tenant_id": id } }
             ]}}
         });
-        // Missing indices are fine (nothing to delete).
-        let response = self
-            .client()
-            .delete_by_query(DeleteByQueryParts::Index(&[&pattern]))
-            .ignore_unavailable(true)
-            .refresh(true)
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| internal_error(format!("purge_tenant_data: {}", e)))?;
-        let body: Value = response.json().await.unwrap_or_default();
+        // Missing indices are fine (nothing to delete). A failed purge is not:
+        // the status used to go unread here, so any failure at all was a
+        // successful purge of `0` documents (#1382).
+        //
         // Deleted-doc count (includes contained/tombstone docs) — informational;
         // the composite reports the primary's count to the admin API.
-        Ok(body.get("deleted").and_then(|d| d.as_u64()).unwrap_or(0))
+        delete_by_query_scoped(self, &pattern, body, "purge tenant data").await
     }
 }
 
@@ -1461,10 +1732,11 @@ impl PurgableStorage for ElasticsearchBackend {
 
         let deleted = delete_by_query_scoped(
             self,
-            &[&index],
+            &index,
             json!({ "query": { "bool": { "filter": [
                 { "term": { "tenant_id": tenant_id } }
             ]}}}),
+            "purge all documents of a type",
         )
         .await?;
 
@@ -1473,12 +1745,13 @@ impl PurgableStorage for ElasticsearchBackend {
         let pattern = tenant_index_pattern(self, tenant_id);
         delete_by_query_scoped(
             self,
-            &[&pattern],
+            &pattern,
             json!({ "query": { "bool": { "filter": [
                 { "term": { "tenant_id": tenant_id } },
                 { "term": { "is_contained": true } },
                 { "term": { "container_type": resource_type } }
             ]}}}),
+            "purge the contained documents of a type (its own documents are already purged)",
         )
         .await?;
 
@@ -2065,25 +2338,15 @@ impl ReindexTarget for ElasticsearchBackend {
         let index = self.index_name(tenant_id, resource_type);
         let doc_id = Self::document_id(resource_type, resource_id);
 
-        let mut request = self
-            .client()
-            .index(IndexParts::IndexId(&index, &doc_id))
-            .body(doc);
-        if let Some(refresh) = self.write_refresh_param() {
-            request = request.refresh(refresh);
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|e| internal_error(format!("Failed to index document: {e}")))?;
-
-        let status = response.status_code();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(internal_error(format!(
-                "Failed to index document (status {status}): {body}"
-            )));
-        }
+        index_document(
+            self,
+            &index,
+            &doc_id,
+            &doc,
+            self.write_refresh_param(),
+            "index document",
+        )
+        .await?;
 
         self.index_contained_docs(
             tenant_id,
@@ -2112,10 +2375,11 @@ impl ReindexTarget for ElasticsearchBackend {
         let pattern = tenant_index_pattern(self, tenant_id);
         delete_by_query_scoped(
             self,
-            &[&pattern],
+            &pattern,
             json!({ "query": { "bool": { "filter": [
                 { "term": { "tenant_id": tenant_id } }
             ]}}}),
+            "clear the search index",
         )
         .await
     }
@@ -2262,33 +2526,24 @@ fn tenant_index_pattern(backend: &ElasticsearchBackend, tenant_id: &str) -> Stri
 /// Runs a delete-by-query and returns how many documents it removed.
 ///
 /// Missing indices are not an error — a tenant that has never been written to
-/// simply has nothing to delete.
+/// simply has nothing to delete. Everything else that is not a completed
+/// delete is: transient failures are retried ([`send_write_with_retry`]), and a
+/// `200` that does not say how many documents it deleted is not a delete of `0`
+/// (#1382). `what` names the delete in error messages.
 async fn delete_by_query_scoped(
     backend: &ElasticsearchBackend,
-    indices: &[&str],
+    index: &str,
     body: Value,
+    what: &str,
 ) -> StorageResult<u64> {
-    let response = backend
-        .client()
-        .delete_by_query(DeleteByQueryParts::Index(indices))
-        .ignore_unavailable(true)
-        .refresh(true)
-        .conflicts(elasticsearch::params::Conflicts::Proceed)
-        .body(body)
-        .send()
-        .await
-        .map_err(|e| internal_error(format!("Failed to delete by query: {e}")))?;
-
-    if !response.status_code().is_success() {
-        let status = response.status_code();
-        let text = response.text().await.unwrap_or_default();
-        return Err(internal_error(format!(
-            "Failed to delete by query (status {status}): {text}"
-        )));
+    match send_write_with_retry(backend, WriteOp::DeleteByQuery, index, &body, what).await? {
+        WriteOutcome::Done(payload) => payload
+            .get("deleted")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| internal_error(format!("Failed to {what}: no deleted count"))),
+        // Only a delete-by-id answers this.
+        WriteOutcome::NotFound => Ok(0),
     }
-
-    let payload: Value = response.json().await.unwrap_or_default();
-    Ok(payload.get("deleted").and_then(|d| d.as_u64()).unwrap_or(0))
 }
 
 #[cfg(test)]
