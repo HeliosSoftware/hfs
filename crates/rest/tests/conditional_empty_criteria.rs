@@ -12,11 +12,12 @@
 //! * `identifier=` alone left no criteria at all, so a conditional create or
 //!   update created unguarded.
 //!
-//! Direct search does neither: `GET /Patient?identifier=` evaluates the empty
-//! token and finds nothing (asserted below). A read can afford that; the
-//! precondition of a write cannot mean "nothing" (duplicates) any more than
+//! Direct search *does* ignore the parameter: `GET /Patient?identifier=` is
+//! the search without it, as FHIR says of an empty parameter (#1380; asserted
+//! below). A read can afford that; the precondition of a write cannot mean
 //! "whatever the other criteria say" (wrong target), so it is a `400` naming
-//! the parameter — whatever `Prefer: handling` says.
+//! the parameter — whatever `Prefer: handling` says. An empty *alternative*
+//! (`family=Jones,`) is a `400` in a search as well.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -193,10 +194,10 @@ const EMPTY_VALUE_CRITERIA: [(&str, &str); 10] = [
 ];
 
 /// Positive control, and the difference from direct search stated on the
-/// record: a search evaluates the empty token and finds nothing; it does not
-/// drop the parameter (which would find Jones).
+/// record: a search ignores a parameter with no value (#1380) — which finds
+/// Jones, and is exactly what the criteria of a write must not do.
 #[tokio::test]
-async fn direct_search_evaluates_an_empty_value_instead_of_dropping_it() {
+async fn direct_search_ignores_a_parameter_with_no_value() {
     let server = test_server().await;
     seed(&server).await;
 
@@ -207,12 +208,21 @@ async fn direct_search_evaluates_an_empty_value_instead_of_dropping_it() {
         ["intended", "other"]
     );
 
-    assert!(search_ids(&server, "identifier=").await.is_empty());
-    assert!(
-        search_ids(&server, "identifier=&family=Jones")
-            .await
-            .is_empty()
+    assert_eq!(
+        search_ids(&server, "identifier=").await,
+        ["intended", "jones", "other"]
     );
+    assert_eq!(
+        search_ids(&server, "identifier=&family=Jones").await,
+        ["jones"]
+    );
+
+    // An empty alternative is malformed, in a search too.
+    let response = server
+        .get("/Patient?family=Jones,")
+        .add_header(X_TENANT_ID, tenant())
+        .await;
+    assert_rejected_naming(&response, "family", "GET /Patient?family=Jones,");
 }
 
 #[tokio::test]

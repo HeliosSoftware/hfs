@@ -103,6 +103,11 @@ mod token_code_system_suite;
 #[path = "search/conditional_if_match_suite.rs"]
 mod conditional_if_match_suite;
 
+/// The backend-agnostic empty search value suite (#1380). Same `#[path]`
+/// arrangement.
+#[path = "search/empty_value_suite.rs"]
+mod empty_value_suite;
+
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
 
@@ -19080,6 +19085,18 @@ mod postgres_integration {
             &backend,
             &unique_base("cond_if_match_race_1381"),
             true,
+        )
+        .await;
+    }
+
+    /// #1380: `family=Zzz,` is a prefix match on `""`, which is every family
+    /// name; an empty value or alternative is an error on every search path.
+    #[tokio::test]
+    async fn postgres_integration_empty_values_are_rejected_on_every_path() {
+        let backend = create_backend().await;
+        super::empty_value_suite::empty_values_are_rejected_on_every_path(
+            &backend,
+            &unique_base("empty_value"),
         )
         .await;
     }

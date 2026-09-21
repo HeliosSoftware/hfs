@@ -1445,7 +1445,10 @@ impl MongoBackend {
         // other backend, reported the same way (#1295).
         crate::search::validate_date_values(query)?;
         // And its numeric sibling (#1340).
-        crate::search::validate_numeric_values(query)
+        crate::search::validate_numeric_values(query)?;
+        // And a value that is empty, or has an empty alternative: `family=Zzz,`
+        // is a prefix match on `""`, which is every family name (#1380).
+        crate::search::validate_value_presence(query)
     }
 
     /// Search with `_sort` on an indexed parameter (#881): pages over the id
@@ -1805,6 +1808,15 @@ impl MongoBackend {
         query: &SearchQuery,
     ) -> StorageResult<Option<HashSet<String>>> {
         let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+
+        // Defence in depth behind `validate_value_presence` (#1380): an empty
+        // value is a prefix of every string, so a parameter carrying one
+        // matches nothing — and with it the search, parameters being ANDed —
+        // rather than whatever the filters below would make of it (`:not`
+        // included: "nothing" negates into "everything").
+        if query.parameters.iter().any(crate::search::has_empty_value) {
+            return Ok(Some(HashSet::new()));
+        }
 
         let mut normal: Vec<&SearchParameter> = Vec::new();
         let mut missing: Vec<&SearchParameter> = Vec::new();

@@ -646,6 +646,11 @@ async fn mongodb_invalid_numbers_are_rejected_in_conditional_criteria() {
 #[path = "search/token_code_system_suite.rs"]
 mod token_code_system_suite;
 
+/// The backend-agnostic empty search value suite (#1380). Same `#[path]`
+/// arrangement.
+#[path = "search/empty_value_suite.rs"]
+mod empty_value_suite;
+
 /// #1379: `gender=<system>|female` never matched a `code` element. Needs the
 /// full registry so `gender`, `status` and `code` extract into the search
 /// index — the suite's positive controls fail loudly if they did not.
@@ -740,6 +745,18 @@ async fn mongodb_conditional_writers_with_the_same_if_match_admit_one() {
         false,
     )
     .await;
+}
+
+/// #1380: `family=Zzz,` is a prefix match on `""`, which is every family name;
+/// an empty value or alternative is an error on every search path. Needs the
+/// spec search parameters.
+#[tokio::test]
+async fn mongodb_empty_values_are_rejected_on_every_path() {
+    let Some(backend) = create_backend_with_full_registry("empty_value").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    empty_value_suite::empty_values_are_rejected_on_every_path(&backend, "empty-value-1380").await;
 }
 
 /// #1062: a comma-separated value list on one `SearchParameter` is OR per

@@ -97,6 +97,8 @@ where
     // Build the compartment reference
     let compartment_ref = format!("{}/{}", compartment_type, compartment_id);
 
+    // A parameter with no value is ignored, as in a type-level search (#1380).
+    let pairs = crate::extractors::drop_empty_parameters(pairs);
     let mut search_params = SearchParams::from_pairs(pairs);
 
     // Unknown search parameters. Per FHIR search error handling these may be
@@ -228,6 +230,8 @@ where
 {
     let fhir_version = version.storage_version_or(state.config().default_fhir_version);
     let compartment_ref = format!("{}/{}", compartment_type, compartment_id);
+    // A parameter with no value is ignored, as in a type-level search (#1380).
+    let pairs = crate::extractors::drop_empty_parameters(pairs);
     let mut search_params = SearchParams::from_pairs(pairs);
 
     // Member types of this compartment, resolved once: they decide both which

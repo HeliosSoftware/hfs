@@ -8,9 +8,14 @@
 //! (the [chain resolver](super::chain_resolver)) both go through it, so a
 //! chained `birthdate=ge1980-01-01` means exactly what the direct one does.
 
-use crate::types::{SearchModifier, SearchParamType, SearchValue};
+use crate::error::{SearchError, StorageError, StorageResult};
+use crate::types::{
+    ReverseChainedParameter, SearchModifier, SearchParamType, SearchParameter, SearchQuery,
+    SearchValue,
+};
 
 use super::registry::{SearchParameterRegistry, resolve_param_type};
+use super::text_fold::fold_text;
 
 /// Splits a FHIR search value into its comma-separated OR-alternatives,
 /// respecting backslash escaping.
@@ -80,6 +85,154 @@ pub fn parse_typed_values(
         .collect();
 
     (param_type, values)
+}
+
+/// Refuses a search value that is empty, or has an empty alternative in its
+/// comma-separated OR-list: `family=Zzz,`, `family=,Zzz`, `family=a,,b`,
+/// `family=,` — and `family=` itself, when it gets this far.
+///
+/// An empty alternative is not "no constraint" to a backend; it is the value
+/// `""`, and what that matches depends on the parameter. A string search is a
+/// prefix match and every string starts with `""`, so `family=Zzz,` returned
+/// every Patient that has a family name; `:contains` and `:text` likewise, a
+/// token's `:not=` every resource, and `:of-type=` or a uri's `:below=` every
+/// resource on some backends and none on others (#1380). A trailing comma is
+/// what joining a list with an empty element renders as: a client bug the
+/// client should hear about, as it does for a date or a number that is not one
+/// ([`validate_date_values`](super::validate_date_values),
+/// [`validate_numeric_values`](super::validate_numeric_values)). As there,
+/// `Prefer: handling` is not consulted — the parameter is known, its value is
+/// malformed.
+///
+/// FHIR has a parameter with no value at all (`family=`) *ignored* rather than
+/// refused, and the REST search handlers drop such a pair before a query is
+/// built. That is a decision about a request, which only an entry point can
+/// make: criteria that guard a write refuse it instead
+/// ([`reject_empty_criterion_values`](super::conditional::reject_empty_criterion_values)).
+/// A storage backend cannot ignore what it is handed, so here it is an error,
+/// never a query.
+///
+/// Covers direct parameters, the components of a composite value, the raw
+/// values of a chained parameter and the (unsplit) value of a `_has`. Under
+/// `:missing` the value is the boolean literal, checked where it is parsed.
+/// An escaped comma (`family=a\,`) is data, not a separator.
+pub fn validate_value_presence(query: &SearchQuery) -> StorageResult<()> {
+    for param in &query.parameters {
+        if has_empty_value(param) {
+            return Err(empty_value(display_name(param)));
+        }
+    }
+    for reverse_chain in &query.reverse_chains {
+        validate_has_value_presence(reverse_chain)?;
+    }
+    Ok(())
+}
+
+/// Whether `param` carries a value [`validate_value_presence`] refuses: an
+/// empty (or whitespace-only) one, a string that folds to one, or a composite
+/// value with such a component.
+///
+/// The storage backends ask this again where they build a parameter's
+/// condition, and answer a `true` with one that matches **nothing** — the
+/// whole parameter, `:not` included, since negating "nothing" is "everything".
+/// The gate reports the error on every ordinary path; this is what stands
+/// behind it should a caller ever skip it.
+pub fn has_empty_value(param: &SearchParameter) -> bool {
+    // A `_filter` value is an expression, whose string literals may hold
+    // anything, doubled commas included; its parser judges it.
+    if matches!(param.modifier, Some(SearchModifier::Missing)) || param.name == "_filter" {
+        return false;
+    }
+    let composite = param.chain.is_empty() && param.param_type == SearchParamType::Composite;
+    // String matching compares accent-folded text (except under `:exact`), and
+    // a value made of combining marks alone folds to nothing: as empty as `""`.
+    let folded = param.chain.is_empty()
+        && param.param_type == SearchParamType::String
+        && !matches!(param.modifier, Some(SearchModifier::Exact));
+    param.values.iter().any(|value| {
+        is_blank(&value.value)
+            || folded && is_blank(&fold_text(&value.value))
+            || composite
+                && split_composite_components(&value.value)
+                    .iter()
+                    .any(|c| is_blank(c))
+    })
+}
+
+fn validate_has_value_presence(has: &ReverseChainedParameter) -> StorageResult<()> {
+    if let Some(nested) = &has.nested {
+        return validate_has_value_presence(nested);
+    }
+    let Some(value) = &has.value else {
+        return Ok(());
+    };
+    if has.terminal_param().1 == Some("missing") {
+        return Ok(());
+    }
+    // A `_has` value reaches the chain resolver unsplit.
+    if split_unescaped_commas(&value.value)
+        .iter()
+        .any(|alternative| alternative.is_empty())
+    {
+        return Err(empty_value(format!(
+            "_has:{}:{}:{}",
+            has.source_type, has.reference_param, has.search_param
+        )));
+    }
+    Ok(())
+}
+
+/// The parameter as the client wrote it, as nearly as the parsed form tells:
+/// `family:exact`, `subject.family` (a longer chain's intermediate hops are
+/// not repeated).
+fn display_name(param: &SearchParameter) -> String {
+    let mut out = param.name.clone();
+    if let Some(hop) = param.chain.last() {
+        out.push('.');
+        out.push_str(&hop.target_param);
+    }
+    match &param.modifier {
+        // `Display` writes the legacy camelCase spelling.
+        Some(SearchModifier::OfType) => out.push_str(":of-type"),
+        Some(modifier) => {
+            out.push(':');
+            out.push_str(&modifier.to_string());
+        }
+        None => {}
+    }
+    out
+}
+
+fn is_blank(value: &str) -> bool {
+    value.trim().is_empty()
+}
+
+/// The `$`-separated components of a composite value; `\$` is data.
+fn split_composite_components(value: &str) -> Vec<String> {
+    let mut parts = vec![String::new()];
+    let mut chars = value.chars().peekable();
+    while let Some(c) = chars.next() {
+        let last = parts.len() - 1;
+        match c {
+            '\\' if chars.peek() == Some(&'$') => {
+                chars.next();
+                parts[last].push('$');
+            }
+            '$' => parts.push(String::new()),
+            _ => parts[last].push(c),
+        }
+    }
+    parts
+}
+
+/// What is wrong with a value [`validate_value_presence`] refuses, worded for
+/// the client.
+pub const EMPTY_VALUE_REASON: &str = "the value is empty, or has an empty alternative in its \
+     comma-separated list (a leading, trailing or doubled comma); a comma that belongs to the \
+     value is written '\\,'";
+
+fn empty_value(param: String) -> StorageError {
+    StorageError::Search(SearchError::EmptyValue { param })
 }
 
 /// Checks that `modifier` can be applied to the parameter `name` of
@@ -208,6 +361,235 @@ mod tests {
         );
         assert_eq!(split_unescaped_commas("a\\\\,b"), vec!["a\\", "b"]);
         assert_eq!(split_unescaped_commas("sys\\|code"), vec!["sys\\|code"]);
+    }
+
+    fn param(
+        name: &str,
+        param_type: SearchParamType,
+        modifier: Option<SearchModifier>,
+        values: &[&str],
+    ) -> SearchParameter {
+        SearchParameter {
+            name: name.to_string(),
+            param_type,
+            modifier,
+            values: values.iter().map(|v| SearchValue::eq(*v)).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// The parameter the gate names, or `None` when it lets the query through.
+    fn refused(query: &SearchQuery) -> Option<String> {
+        match validate_value_presence(query) {
+            Ok(()) => None,
+            Err(StorageError::Search(SearchError::EmptyValue { param })) => Some(param),
+            Err(other) => panic!("unexpected error: {other}"),
+        }
+    }
+
+    fn refused_value(param_type: SearchParamType, raw: &str) -> bool {
+        let values = split_unescaped_commas(raw);
+        let values: Vec<&str> = values.iter().map(String::as_str).collect();
+        refused(&SearchQuery::new("Patient").with_parameter(param("p", param_type, None, &values)))
+            .is_some()
+    }
+
+    #[test]
+    fn an_empty_value_or_alternative_is_refused_for_every_type() {
+        use SearchParamType as T;
+        for t in [
+            T::String,
+            T::Token,
+            T::Reference,
+            T::Uri,
+            T::Date,
+            T::Number,
+            T::Quantity,
+            T::Composite,
+            T::Special,
+        ] {
+            for raw in ["a,", ",a", "a,,b", "", ",", ",,", " ", "a, ", " ,a"] {
+                assert!(refused_value(t, raw), "{t} {raw:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn values_that_are_not_empty_pass() {
+        use SearchParamType as T;
+        for raw in [
+            "a",
+            "a,b",
+            // An escaped comma is data: the value `a,`, then the values `,` and `a`.
+            "a\\,",
+            "\\,,a",
+            // Token forms with an empty part are not empty values.
+            "|",
+            "http://loinc.org|",
+            "|8480-6",
+        ] {
+            for t in [T::String, T::Token, T::Reference, T::Uri] {
+                assert!(!refused_value(t, raw), "{t} {raw:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_error_names_the_parameter_as_written() {
+        use SearchParamType as T;
+        let query = |p| SearchQuery::new("Patient").with_parameter(p);
+        assert_eq!(
+            refused(&query(param("family", T::String, None, &["Zzz", ""]))).as_deref(),
+            Some("family")
+        );
+        assert_eq!(
+            refused(&query(param(
+                "gender",
+                T::Token,
+                Some(SearchModifier::Not),
+                &[""]
+            )))
+            .as_deref(),
+            Some("gender:not")
+        );
+        assert_eq!(
+            refused(&query(param(
+                "identifier",
+                T::Token,
+                Some(SearchModifier::OfType),
+                &[""]
+            )))
+            .as_deref(),
+            Some("identifier:of-type")
+        );
+        // A `_filter` expression is its parser's business.
+        assert_eq!(
+            refused(&query(param(
+                "_filter",
+                T::Special,
+                None,
+                &["given eq \"a", "", "b\""]
+            ))),
+            None
+        );
+        let mut chained = param("subject", T::Reference, None, &["Zzz", ""]);
+        chained.chain = vec![crate::types::ChainedParameter {
+            reference_param: "subject".to_string(),
+            target_type: Some("Patient".to_string()),
+            target_param: "family".to_string(),
+        }];
+        assert_eq!(
+            refused(&SearchQuery::new("Observation").with_parameter(chained)).as_deref(),
+            Some("subject.family")
+        );
+        let error = validate_value_presence(&query(param("family", T::String, None, &[""])))
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            error.contains("'family'") && error.contains("empty"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn missing_takes_a_boolean_and_is_left_alone() {
+        let query = SearchQuery::new("Patient").with_parameter(param(
+            "family",
+            SearchParamType::String,
+            Some(SearchModifier::Missing),
+            &[""],
+        ));
+        assert_eq!(refused(&query), None);
+    }
+
+    #[test]
+    fn a_string_that_folds_to_nothing_is_empty_except_under_exact() {
+        let accent = "\u{301}";
+        let query = |modifier| {
+            SearchQuery::new("Patient").with_parameter(param(
+                "family",
+                SearchParamType::String,
+                modifier,
+                &[accent],
+            ))
+        };
+        assert!(refused(&query(None)).is_some());
+        assert!(refused(&query(Some(SearchModifier::Contains))).is_some());
+        assert_eq!(refused(&query(Some(SearchModifier::Exact))), None);
+        // Only strings are folded.
+        let token = SearchQuery::new("Patient").with_parameter(param(
+            "gender",
+            SearchParamType::Token,
+            None,
+            &[accent],
+        ));
+        assert_eq!(refused(&token), None);
+    }
+
+    #[test]
+    fn a_composite_with_an_empty_component_is_refused() {
+        let composite = |value| {
+            SearchQuery::new("Observation").with_parameter(param(
+                "code-value-quantity",
+                SearchParamType::Composite,
+                None,
+                &[value],
+            ))
+        };
+        for value in ["$5.4", "8480-6$", "$", "8480-6$ ", "a$$b"] {
+            assert!(refused(&composite(value)).is_some(), "{value:?}");
+        }
+        // `\$` is data.
+        for value in ["8480-6$5.4", "a\\$$5.4"] {
+            assert_eq!(refused(&composite(value)), None, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn a_has_value_is_split_before_it_is_judged() {
+        let has = |search_param: &str, value: &str| {
+            let mut query = SearchQuery::new("Patient");
+            query.reverse_chains = vec![ReverseChainedParameter::terminal(
+                "Observation",
+                "subject",
+                search_param,
+                SearchValue::eq(value),
+            )];
+            query
+        };
+        for value in ["a,", ",a", "a,,b", "", ",", " "] {
+            assert_eq!(
+                refused(&has("code", value)).as_deref(),
+                Some("_has:Observation:subject:code"),
+                "{value:?}"
+            );
+            assert_eq!(
+                refused(&has("code:text", value)).as_deref(),
+                Some("_has:Observation:subject:code:text"),
+                "{value:?}"
+            );
+        }
+        for value in ["a", "a,b", "a\\,"] {
+            assert_eq!(refused(&has("code", value)), None, "{value:?}");
+        }
+        assert_eq!(refused(&has("code:missing", "")), None);
+
+        // The terminal of a nested `_has` carries the value.
+        let mut nested = SearchQuery::new("Patient");
+        nested.reverse_chains = vec![ReverseChainedParameter::nested(
+            "Observation",
+            "subject",
+            ReverseChainedParameter::terminal(
+                "Provenance",
+                "target",
+                "agent",
+                SearchValue::eq("x,"),
+            ),
+        )];
+        assert_eq!(
+            refused(&nested).as_deref(),
+            Some("_has:Provenance:target:agent")
+        );
     }
 
     #[test]

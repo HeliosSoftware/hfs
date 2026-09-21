@@ -970,6 +970,10 @@ impl From<SearchError> for RestError {
                 param,
                 message: reason,
             },
+            SearchError::EmptyValue { param } => RestError::InvalidParameter {
+                param,
+                message: helios_persistence::search::EMPTY_VALUE_REASON.to_string(),
+            },
             SearchError::UnsupportedParameterType { .. }
             | SearchError::UnsupportedModifier { .. }
             | SearchError::InvalidComposite { .. }
