@@ -4348,8 +4348,9 @@ mod tests {
     /// A conditional write is refused per-entry and never reaches storage.
     ///
     /// What is still refused after #511: criteria on a POST (FHIR expresses a
-    /// conditional create through `ifNoneExist`), and `ifMatch` paired with any
-    /// conditional interaction. `DelayStorage`'s conditional reply is
+    /// conditional create through `ifNoneExist`), and `ifMatch` paired with
+    /// `ifNoneExist` — beside URL criteria on PUT and DELETE it is honoured
+    /// (#1381; `tests/conditional_if_match.rs`). `DelayStorage`'s conditional reply is
     /// unscripted, so this panics rather than merely failing if a refusal is
     /// ever moved after dispatch.
     #[tokio::test]
@@ -4363,21 +4364,6 @@ mod tests {
                 {
                     "request": { "method": "POST", "url": "Patient?identifier=x" },
                     "resource": { "resourceType": "Patient" }
-                },
-                {
-                    "request": {
-                        "method": "PUT",
-                        "url": "Patient?identifier=x",
-                        "ifMatch": "W/\"1\""
-                    },
-                    "resource": { "resourceType": "Patient" }
-                },
-                {
-                    "request": {
-                        "method": "DELETE",
-                        "url": "Patient?identifier=x",
-                        "ifMatch": "W/\"1\""
-                    }
                 },
                 {
                     "request": {
@@ -4397,17 +4383,17 @@ mod tests {
 
         let response = run_batch(&state, &bundle, None).await;
         let entries = response["entry"].as_array().unwrap();
-        assert_eq!(entries.len(), 5);
+        assert_eq!(entries.len(), 3);
         for (index, entry) in entries.iter().enumerate() {
             assert_eq!(
                 entry["response"]["status"], "400 Bad Request",
                 "entry {index}: {entry}"
             );
         }
-        // The five refusals were indistinguishable below the status line until
+        // The refusals were indistinguishable below the status line until
         // #504 — every one carried `processing`. Two are a url whose value FHIR
         // gives no meaning (`POST` criteria, criteria decoding to nothing); the
-        // other three are pairings in which both elements are individually
+        // other is a pairing in which both elements are individually
         // well-formed, so `invalid` — the parent of `value` — is as precise as
         // the fault allows.
         let codes: Vec<&str> = entries
@@ -4418,10 +4404,7 @@ mod tests {
                     .unwrap()
             })
             .collect();
-        assert_eq!(
-            codes,
-            vec!["value", "invalid", "invalid", "invalid", "value"]
-        );
+        assert_eq!(codes, vec!["value", "invalid", "value"]);
         assert_eq!(state.storage().peak(), 0, "no entry may reach storage");
         assert!(state.storage().conditional_calls().is_empty());
     }
