@@ -278,9 +278,26 @@ where
         }
     };
     if let Ok(fallbacks) = loader.load_embedded() {
+        // A fallback whose base is not a resource type of this FHIR version
+        // (`ViewDefinition-url`/`-version`, from the SQL-on-FHIR IG) is not a
+        // valid SearchParameter there: `base` is bound to the version's
+        // resource types. Stored, it fails validation wherever it surfaces —
+        // a system `$export` for one. The in-memory registry carries these
+        // fallbacks regardless of what is stored, so search is unaffected.
+        // The spec bundle is the list of known bases; without one, nothing can
+        // be judged and every fallback is kept.
+        let known_bases: std::collections::HashSet<String> = resources
+            .iter()
+            .filter_map(|resource| resource.get("base")?.as_array())
+            .flatten()
+            .filter_map(|base| base.as_str().map(str::to_string))
+            .collect();
         resources.extend(
             fallbacks
                 .iter()
+                .filter(|def| {
+                    known_bases.is_empty() || def.base.iter().all(|b| known_bases.contains(b))
+                })
                 .map(SearchParameterLoader::definition_to_fhir_resource),
         );
     }
