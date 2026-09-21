@@ -185,7 +185,7 @@ where
             helios_persistence::core::delete_under_precondition(
                 state.storage(),
                 tenant.context(),
-                &if_match,
+                if_match,
                 current,
             )
             .await?
