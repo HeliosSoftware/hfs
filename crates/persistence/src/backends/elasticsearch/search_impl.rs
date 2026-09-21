@@ -999,6 +999,22 @@ impl ElasticsearchBackend {
             return Ok(Vec::new());
         };
 
+        // One request returns at most `max_result_window` hits, and the result
+        // list is de-duplicated from the hits, so past that bound the list —
+        // and with it `_total`, `search_count` and the pages beyond it — is
+        // truncated. It cannot be repaired from `hits.total`, which counts
+        // documents, not containers. Say so rather than report a short total
+        // as if it were exact (#1407).
+        let hit_count = body["hits"]["hits"].as_array().map_or(0, Vec::len);
+        if hit_count >= self.config().max_result_window as usize {
+            tracing::warn!(
+                resource_type = %resource_type,
+                max_result_window = self.config().max_result_window,
+                "_contained search reached max_result_window: the result list and its \
+                 _total are truncated to the first {hit_count} hits"
+            );
+        }
+
         let mut keys: Vec<ContainedKey> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for hit in body["hits"]["hits"].as_array().into_iter().flatten() {
