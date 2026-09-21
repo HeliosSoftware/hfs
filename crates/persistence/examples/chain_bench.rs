@@ -182,7 +182,9 @@ impl Corpus {
 fn name_parts(resource: &Value) -> Vec<String> {
     let mut parts = Vec::new();
     match resource.get("name") {
-        Some(Value::String(s)) => parts.extend(s.split_whitespace().map(str::to_lowercase)),
+        // `Organization.name` is one string, and a string search matches from
+        // its start — not from the start of each word.
+        Some(Value::String(s)) => parts.push(s.to_lowercase()),
         Some(Value::Array(names)) => {
             for name in names {
                 if let Some(f) = name.get("family").and_then(Value::as_str) {
@@ -450,6 +452,11 @@ fn load_synthea(dir: &Path, patients: usize) -> Corpus {
         description: format!("Synthea export {}", dir.display()),
     };
     let mut by_identifier: HashMap<String, String> = HashMap::new();
+    // Name parts by reference. Only the organizations and practitioners the
+    // selected patients' encounters point at go into the statistics: a terminal
+    // value picked from the other thousand starts a chain that leads nowhere.
+    let mut names: HashMap<String, Vec<String>> = HashMap::new();
+    let mut referenced: HashSet<String> = HashSet::new();
     for resource_type in ["Organization", "Practitioner"] {
         let mut out = Vec::new();
         let mut count = 0;
@@ -464,11 +471,7 @@ fn load_synthea(dir: &Path, patients: usize) -> Corpus {
                     );
                 }
             }
-            if resource_type == "Organization" {
-                corpus.stats.organization_names.push(name_parts(&r));
-            } else {
-                corpus.stats.practitioner_names.push(name_parts(&r));
-            }
+            names.insert(format!("{resource_type}/{id}"), name_parts(&r));
             out.extend(line.as_bytes());
             out.push(b'\n');
             count += 1;
@@ -504,6 +507,7 @@ fn load_synthea(dir: &Path, patients: usize) -> Corpus {
         let mut fix = |reference: Option<&mut Value>| {
             if let Some(v) = reference {
                 if let Some(literal) = v.as_str().and_then(|s| by_identifier.get(s)) {
+                    referenced.insert(literal.clone());
                     *v = Value::String(literal.clone());
                 } else if v.as_str().is_some_and(|s| s.contains('?')) {
                     unresolved += 1;
@@ -521,6 +525,16 @@ fn load_synthea(dir: &Path, patients: usize) -> Corpus {
         count += 1;
     }
     assert_eq!(unresolved, 0, "conditional references left unresolved");
+    let mut referenced: Vec<&String> = referenced.iter().collect();
+    referenced.sort();
+    for reference in referenced {
+        let parts = names.get(reference).cloned().unwrap_or_default();
+        if reference.starts_with("Organization/") {
+            corpus.stats.organization_names.push(parts);
+        } else {
+            corpus.stats.practitioner_names.push(parts);
+        }
+    }
     corpus.push("Encounter", out, count);
 
     let mut out = Vec::new();
@@ -599,8 +613,9 @@ fn prefix_matching(names: &[Vec<String>], target: usize) -> (String, usize) {
     for parts in names {
         let mut seen: HashSet<&str> = HashSet::new();
         for part in parts {
-            // Only ASCII name parts, so a byte slice is a character slice.
-            if !part.is_ascii() {
+            // Only ASCII name parts, so a byte slice is a character slice;
+            // and no comma, which would make the value an OR list.
+            if !part.is_ascii() || part.contains(',') {
                 continue;
             }
             for len in (1..=part.len().min(4)).chain([part.len()]) {
