@@ -1139,152 +1139,18 @@ impl ResourceStorage for MongoBackend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<()> {
-        tenant.check_permission(Operation::Delete, resource_type)?;
+        self.soft_delete(tenant, resource_type, id, None).await
+    }
 
-        let db = self.get_database().await?;
-        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
-        let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
-        let (mut session, transaction_active) = begin_best_effort_multi_write_session(&db).await;
-        let tenant_id = tenant.tenant_id().as_str();
-
-        let delete_lookup_filter = doc! {
-            "tenant_id": tenant_id,
-            "resource_type": resource_type,
-            "id": id,
-            "is_deleted": false,
-        };
-
-        let maybe_existing = if let Some(active_session) = session.as_mut() {
-            resources
-                .find_one(delete_lookup_filter.clone())
-                .session(active_session)
-                .await
-                .map_err(|e| {
-                    internal_error(format!(
-                        "Failed to check resource before delete (session): {}",
-                        e
-                    ))
-                })?
-        } else {
-            resources
-                .find_one(delete_lookup_filter)
-                .await
-                .map_err(|e| {
-                    internal_error(format!("Failed to check resource before delete: {}", e))
-                })?
-        };
-
-        let Some(existing_doc) = maybe_existing else {
-            return Err(StorageError::Resource(ResourceError::NotFound {
-                resource_type: resource_type.to_string(),
-                id: id.to_string(),
-            }));
-        };
-
-        let current_version = existing_doc
-            .get_str("version_id")
-            .map_err(|e| internal_error(format!("Missing current version: {}", e)))?
-            .to_string();
-        let new_version = next_version(&current_version)?;
-
-        let payload = existing_doc
-            .get_document("data")
-            .map_err(|e| internal_error(format!("Missing resource payload: {}", e)))?
-            .clone();
-        let fhir_version = existing_doc
-            .get_str("fhir_version")
-            .unwrap_or("4.0")
-            .to_string();
-        let created_at = extract_created_at(&existing_doc, Utc::now());
-
-        let now = Utc::now();
-        let now_bson = chrono_to_bson(now);
-
-        let delete_update_filter = doc! {
-            "tenant_id": tenant_id,
-            "resource_type": resource_type,
-            "id": id,
-            "version_id": &current_version,
-            "is_deleted": false,
-        };
-        let delete_update_doc = doc! {
-            "$set": {
-                "version_id": &new_version,
-                "is_deleted": true,
-                "deleted_at": now_bson,
-                "last_updated": now_bson,
-            }
-        };
-
-        let update_result = if let Some(active_session) = session.as_mut() {
-            resources
-                .update_one(delete_update_filter.clone(), delete_update_doc.clone())
-                .session(active_session)
-                .await
-                .map_err(|e| {
-                    internal_error(format!("Failed to soft-delete resource (session): {}", e))
-                })?
-        } else {
-            resources
-                .update_one(delete_update_filter, delete_update_doc)
-                .await
-                .map_err(|e| internal_error(format!("Failed to soft-delete resource: {}", e)))?
-        };
-
-        if update_result.matched_count == 0 {
-            return Err(StorageError::Resource(ResourceError::NotFound {
-                resource_type: resource_type.to_string(),
-                id: id.to_string(),
-            }));
-        }
-
-        let history_doc = doc! {
-            "tenant_id": tenant_id,
-            "resource_type": resource_type,
-            "id": id,
-            "version_id": &new_version,
-            "data": Bson::Document(payload),
-            "created_at": chrono_to_bson(created_at),
-            "last_updated": now_bson,
-            "is_deleted": true,
-            "deleted_at": now_bson,
-            "fhir_version": fhir_version,
-        };
-
-        if let Some(active_session) = session.as_mut() {
-            history
-                .insert_one(history_doc)
-                .session(active_session)
-                .await
-                .map_err(|e| {
-                    internal_error(format!(
-                        "Failed to insert deletion history row (session): {}",
-                        e
-                    ))
-                })?;
-        } else {
-            history.insert_one(history_doc).await.map_err(|e| {
-                internal_error(format!("Failed to insert deletion history row: {}", e))
-            })?;
-        }
-
-        self.delete_search_index(&db, tenant_id, resource_type, id, &mut session)
-            .await?;
-
-        commit_best_effort_multi_write_session(&mut session, transaction_active, "delete").await?;
-
-        // A SearchParameter delete may remove a tenant's overlay entry: refresh
-        // the stored-param cache and drop registries. This must run after the
-        // commit above: `reload_stored_cache` reads the `resources` collection
-        // without the session, so it cannot observe the delete while the
-        // transaction is still open.
-        if resource_type == "SearchParameter" {
-            if let Err(e) = self.reload_stored_cache().await {
-                tracing::warn!("SearchParameter cache reload failed: {e}");
-            }
-        }
-
-        Ok(())
+    async fn delete_versioned(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: &str,
+    ) -> StorageResult<()> {
+        self.soft_delete(tenant, resource_type, id, Some(expected_version))
+            .await
     }
 
     async fn exists(
@@ -1953,6 +1819,220 @@ impl SearchIndexDocuments {
 }
 
 impl MongoBackend {
+    /// The version of the live (not deleted) resource, read outside any
+    /// session — what a write that just lost a race reports as the version it
+    /// lost to.
+    async fn live_version(
+        &self,
+        resources: &Collection<Document>,
+        tenant_id: &str,
+        resource_type: &str,
+        id: &str,
+    ) -> StorageResult<Option<String>> {
+        let live = resources
+            .find_one(doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "id": id,
+                "is_deleted": false,
+            })
+            .await
+            .map_err(|e| internal_error(format!("Failed to reload current version: {}", e)))?;
+        Ok(live.and_then(|d| d.get_str("version_id").ok().map(str::to_string)))
+    }
+
+    /// Soft-deletes a resource, optionally only at `expected_version`
+    /// ([`ResourceStorage::delete`] / [`ResourceStorage::delete_versioned`]).
+    ///
+    /// The tombstone `update_one` carries the version in its filter, so the
+    /// comparison and the delete are one conditional write whether or not the
+    /// deployment supports transactions. `expected_version` is checked against
+    /// the document that filter is then built from: a `DELETE` with `If-Match`
+    /// used to be evaluated above this layer against an earlier read and then
+    /// deleted whatever version was current by the time it got here (#1404).
+    async fn soft_delete(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: Option<&str>,
+    ) -> StorageResult<()> {
+        tenant.check_permission(Operation::Delete, resource_type)?;
+
+        let db = self.get_database().await?;
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
+        let (mut session, transaction_active) = begin_best_effort_multi_write_session(&db).await;
+        let tenant_id = tenant.tenant_id().as_str();
+
+        let delete_lookup_filter = doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "id": id,
+            "is_deleted": false,
+        };
+
+        let maybe_existing = if let Some(active_session) = session.as_mut() {
+            resources
+                .find_one(delete_lookup_filter.clone())
+                .session(active_session)
+                .await
+                .map_err(|e| {
+                    internal_error(format!(
+                        "Failed to check resource before delete (session): {}",
+                        e
+                    ))
+                })?
+        } else {
+            resources
+                .find_one(delete_lookup_filter)
+                .await
+                .map_err(|e| {
+                    internal_error(format!("Failed to check resource before delete: {}", e))
+                })?
+        };
+
+        let Some(existing_doc) = maybe_existing else {
+            return Err(StorageError::Resource(ResourceError::NotFound {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+            }));
+        };
+
+        let current_version = existing_doc
+            .get_str("version_id")
+            .map_err(|e| internal_error(format!("Missing current version: {}", e)))?
+            .to_string();
+        if let Some(expected) = expected_version
+            && expected != current_version
+        {
+            return Err(StorageError::Concurrency(
+                ConcurrencyError::VersionConflict {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                    expected_version: expected.to_string(),
+                    actual_version: current_version,
+                },
+            ));
+        }
+        let new_version = next_version(&current_version)?;
+
+        let payload = existing_doc
+            .get_document("data")
+            .map_err(|e| internal_error(format!("Missing resource payload: {}", e)))?
+            .clone();
+        let fhir_version = existing_doc
+            .get_str("fhir_version")
+            .unwrap_or("4.0")
+            .to_string();
+        let created_at = extract_created_at(&existing_doc, Utc::now());
+
+        let now = Utc::now();
+        let now_bson = chrono_to_bson(now);
+
+        let delete_update_filter = doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "id": id,
+            "version_id": &current_version,
+            "is_deleted": false,
+        };
+        let delete_update_doc = doc! {
+            "$set": {
+                "version_id": &new_version,
+                "is_deleted": true,
+                "deleted_at": now_bson,
+                "last_updated": now_bson,
+            }
+        };
+
+        let update_result = if let Some(active_session) = session.as_mut() {
+            resources
+                .update_one(delete_update_filter.clone(), delete_update_doc.clone())
+                .session(active_session)
+                .await
+                .map_err(|e| {
+                    internal_error(format!("Failed to soft-delete resource (session): {}", e))
+                })?
+        } else {
+            resources
+                .update_one(delete_update_filter, delete_update_doc)
+                .await
+                .map_err(|e| internal_error(format!("Failed to soft-delete resource: {}", e)))?
+        };
+
+        if update_result.matched_count == 0 {
+            // A writer got in after the read above (only possible without a
+            // transaction). A versioned delete says which way it lost.
+            if let Some(expected) = expected_version
+                && let Some(actual) = self
+                    .live_version(&resources, tenant_id, resource_type, id)
+                    .await?
+            {
+                return Err(StorageError::Concurrency(
+                    ConcurrencyError::VersionConflict {
+                        resource_type: resource_type.to_string(),
+                        id: id.to_string(),
+                        expected_version: expected.to_string(),
+                        actual_version: actual,
+                    },
+                ));
+            }
+            return Err(StorageError::Resource(ResourceError::NotFound {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+            }));
+        }
+
+        let history_doc = doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "id": id,
+            "version_id": &new_version,
+            "data": Bson::Document(payload),
+            "created_at": chrono_to_bson(created_at),
+            "last_updated": now_bson,
+            "is_deleted": true,
+            "deleted_at": now_bson,
+            "fhir_version": fhir_version,
+        };
+
+        if let Some(active_session) = session.as_mut() {
+            history
+                .insert_one(history_doc)
+                .session(active_session)
+                .await
+                .map_err(|e| {
+                    internal_error(format!(
+                        "Failed to insert deletion history row (session): {}",
+                        e
+                    ))
+                })?;
+        } else {
+            history.insert_one(history_doc).await.map_err(|e| {
+                internal_error(format!("Failed to insert deletion history row: {}", e))
+            })?;
+        }
+
+        self.delete_search_index(&db, tenant_id, resource_type, id, &mut session)
+            .await?;
+
+        commit_best_effort_multi_write_session(&mut session, transaction_active, "delete").await?;
+
+        // A SearchParameter delete may remove a tenant's overlay entry: refresh
+        // the stored-param cache and drop registries. This must run after the
+        // commit above: `reload_stored_cache` reads the `resources` collection
+        // without the session, so it cannot observe the delete while the
+        // transaction is still open.
+        if resource_type == "SearchParameter" {
+            if let Err(e) = self.reload_stored_cache().await {
+                tracing::warn!("SearchParameter cache reload failed: {e}");
+            }
+        }
+
+        Ok(())
+    }
+
     /// Brings a soft-deleted resource back to life with new content.
     ///
     /// FHIR permits a deleted resource to be restored by a subsequent update
@@ -2687,7 +2767,13 @@ impl VersionedStorage for MongoBackend {
             ));
         }
 
-        self.delete(tenant, resource_type, id).await
+        // Delete exactly the version the precondition was evaluated against.
+        // A plain `delete` here was check-then-act: a writer landing after the
+        // read above was deleted along with the version the client named
+        // (#1404).
+        let actual = actual.to_string();
+        self.delete_versioned(tenant, resource_type, id, &actual)
+            .await
     }
 
     async fn list_versions(

@@ -496,6 +496,44 @@ pub fn conditional_if_match_gate(
     ))
 }
 
+/// Deletes `current` — the resource an `If-Match` precondition has just been
+/// evaluated against — so that the evaluation and the delete are one step.
+///
+/// With a precondition the delete goes through
+/// [`ResourceStorage::delete_versioned`](super::ResourceStorage::delete_versioned),
+/// pinned to `current`'s version: a writer landing after the evaluation ends
+/// in `VersionConflict` instead of being deleted along with the version the
+/// client named (#1404). Without one it is the plain, unconditional
+/// [`delete`](super::ResourceStorage::delete) it always was — FHIR's delete
+/// carries no precondition of its own.
+///
+/// Shared by `DELETE [type]/[id]` and every
+/// [`ConditionalStorage::conditional_delete`](super::ConditionalStorage::conditional_delete).
+pub async fn delete_under_precondition<S>(
+    storage: &S,
+    tenant: &crate::tenant::TenantContext,
+    if_match: &EntityTagPrecondition,
+    current: &StoredResource,
+) -> crate::error::StorageResult<()>
+where
+    S: super::ResourceStorage + ?Sized,
+{
+    if if_match.is_present() {
+        storage
+            .delete_versioned(
+                tenant,
+                current.resource_type(),
+                current.id(),
+                current.version_id(),
+            )
+            .await
+    } else {
+        storage
+            .delete(tenant, current.resource_type(), current.id())
+            .await
+    }
+}
+
 /// Builds the `412` bundle entry result used by every backend.
 pub fn precondition_failed_entry(diagnostics: &str) -> BundleEntryResult {
     BundleEntryResult::error(

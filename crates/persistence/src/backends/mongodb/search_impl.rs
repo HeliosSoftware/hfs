@@ -873,7 +873,7 @@ impl ConditionalStorage for MongoBackend {
             1 => {
                 let current = matches.into_iter().next().expect("single match must exist");
                 crate::core::conditional_if_match_gate(if_match, resource_type, Some(&current))?;
-                self.delete(tenant, resource_type, current.id()).await?;
+                crate::core::delete_under_precondition(self, tenant, if_match, &current).await?;
                 Ok(ConditionalDeleteResult::Deleted(current))
             }
             n => Ok(ConditionalDeleteResult::MultipleMatches(n)),

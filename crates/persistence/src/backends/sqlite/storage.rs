@@ -3301,7 +3301,7 @@ impl ConditionalStorage for SqliteBackend {
                 // Exactly one match - delete it
                 let existing = matches.into_iter().next().unwrap();
                 crate::core::conditional_if_match_gate(if_match, resource_type, Some(&existing))?;
-                self.delete(tenant, resource_type, existing.id()).await?;
+                crate::core::delete_under_precondition(self, tenant, if_match, &existing).await?;
                 Ok(ConditionalDeleteResult::Deleted(existing))
             }
             n => {

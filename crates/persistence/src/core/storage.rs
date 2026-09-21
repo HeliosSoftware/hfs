@@ -574,9 +574,11 @@ pub trait ResourceStorage: Send + Sync {
     /// # Errors
     ///
     /// * `StorageError::Resource(NotFound)` - If no live resource exists
-    ///   (never created, or already deleted)
+    ///   (never created, or already deleted; S3 reports the latter as `Gone`,
+    ///   as its `delete` does)
     /// * `StorageError::Concurrency(VersionConflict)` - If the current version
-    ///   is not `expected_version`; nothing is deleted
+    ///   is not `expected_version`; nothing is deleted. S3 reports a writer
+    ///   that lands after its comparison as `OptimisticLockFailure`.
     /// * `StorageError::Tenant` - If the tenant doesn't have delete permission
     async fn delete_versioned(
         &self,

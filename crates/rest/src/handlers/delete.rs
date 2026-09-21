@@ -37,6 +37,8 @@ use crate::state::AppState;
 /// - `200 OK` - Resource deleted, returning OperationOutcome
 /// - `404 Not Found` - Resource does not exist, or is already deleted
 /// - `412 Precondition Failed` - `If-Match` was supplied and is not satisfied
+/// - `409 Conflict` - `If-Match` was satisfied, but another writer changed the
+///   resource before the delete landed (#1404); nothing is deleted
 /// - `405 Method Not Allowed` - `AuditEvent` resources are immutable
 ///
 /// # The `If-Match` precondition
@@ -169,10 +171,32 @@ where
 
     // Perform the delete. Everything above this line is a refusal path; nothing
     // below it may run for a request that failed its precondition.
-    state
-        .storage()
-        .delete(tenant.context(), &resource_type, &id)
-        .await?;
+    //
+    // With `If-Match` the delete is pinned to the version the precondition was
+    // just evaluated against, inside storage's own compare-and-swap. A plain
+    // `delete` here was check-then-act: a writer landing after the read above
+    // was deleted along with the version the client named, one it never saw
+    // (#1404). Losing that race is `VersionConflict` -> 409, what `PUT` with
+    // `If-Match` answers for the same race. A satisfied precondition implies a
+    // current resource, so the `None` arm is the precondition-less delete of
+    // something absent: storage's own `NotFound` -> 404, as before.
+    match existing_resource.as_ref() {
+        Some(current) => {
+            helios_persistence::core::delete_under_precondition(
+                state.storage(),
+                tenant.context(),
+                &if_match,
+                current,
+            )
+            .await?
+        }
+        None => {
+            state
+                .storage()
+                .delete(tenant.context(), &resource_type, &id)
+                .await?
+        }
+    }
 
     debug!(
         resource_type = %resource_type,
