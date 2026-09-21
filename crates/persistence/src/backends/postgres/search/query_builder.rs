@@ -1138,11 +1138,10 @@ impl PostgresQueryBuilder {
     /// rejected before this point by the backend's search entry point, so
     /// only `None` and `Some(SearchModifier::Not)` are handled here.
     ///
-    /// A single negated value composes to `id <> $n`; several compose to
-    /// `id NOT IN ($n, $m, ...)` — chosen over `NOT (id = $n OR ...)`
-    /// because it stays a single flat predicate `SqlFragment` can build
-    /// directly, the same shape the positive-match `OR` chain below already
-    /// uses.
+    /// A single value composes to `id = $n` (or `id <> $n` when negated).
+    /// Several values compose to the flat predicates `id IN ($n, $m, ...)`
+    /// or `id NOT IN ($n, $m, ...)`, avoiding a left-deep `OR` tree that can
+    /// exhaust PostgreSQL's parser memory for wide chain-resolution rewrites.
     fn build_id_condition(param: &SearchParameter, offset: usize) -> Option<SqlFragment> {
         if param.values.is_empty() {
             return None;
@@ -1167,19 +1166,22 @@ impl PostgresQueryBuilder {
             return Some(SqlFragment::with_params(sql, params));
         }
 
-        let mut conditions = Vec::new();
-        for (i, value) in param.values.iter().enumerate() {
-            let param_num = offset + i + 1;
-            conditions.push(SqlFragment::with_params(
-                format!("id = ${}", param_num),
-                vec![SqlParam::text(&value.value)],
-            ));
-        }
-        let mut combined = conditions.remove(0);
-        for cond in conditions {
-            combined = combined.or(cond);
-        }
-        Some(combined)
+        let mut params = Vec::with_capacity(param.values.len());
+        let placeholders: Vec<String> = param
+            .values
+            .iter()
+            .enumerate()
+            .map(|(i, value)| {
+                params.push(SqlParam::text(&value.value));
+                format!("${}", offset + i + 1)
+            })
+            .collect();
+        let sql = if placeholders.len() == 1 {
+            format!("id = {}", placeholders[0])
+        } else {
+            format!("id IN ({})", placeholders.join(", "))
+        };
+        Some(SqlFragment::with_params(sql, params))
     }
 
     /// Builds the `_text` / `_content` full-text condition against

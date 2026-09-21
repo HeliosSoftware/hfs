@@ -213,7 +213,7 @@ mod query_builder_tests {
         let result = PostgresQueryBuilder::build_search_query(&query, 2);
         assert!(result.is_some());
         let fragment = result.unwrap();
-        assert!(fragment.sql.contains("id = $"));
+        assert_eq!(fragment.sql, "id = $3");
         assert_eq!(fragment.params.len(), 1);
         match &fragment.params[0] {
             SqlParam::Text(s) => assert_eq!(s, "123"),
@@ -715,7 +715,7 @@ mod query_builder_tests {
     }
 
     #[test]
-    fn test_multiple_values_or() {
+    fn test_multiple_id_values_use_flat_in() {
         let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
             name: "_id".to_string(),
             param_type: SearchParamType::Token,
@@ -728,9 +728,15 @@ mod query_builder_tests {
         let result = PostgresQueryBuilder::build_search_query(&query, 2);
         assert!(result.is_some());
         let fragment = result.unwrap();
-        // Multiple _id values should be OR'd
-        assert!(fragment.sql.contains("OR"));
-        assert_eq!(fragment.params.len(), 2);
+        assert_eq!(fragment.sql, "id IN ($3, $4)");
+        assert!(!fragment.sql.contains("OR"));
+        match &fragment.params[..] {
+            [SqlParam::Text(first), SqlParam::Text(second)] => {
+                assert_eq!(first, "123");
+                assert_eq!(second, "456");
+            }
+            other => panic!("expected ordered text binds, got {other:?}"),
+        }
     }
 
     #[test]
@@ -5912,6 +5918,74 @@ mod postgres_integration {
             .collect();
         assert_eq!(ids_two, vec!["c"], "_id:not=a,b must exclude both a and b");
         assert_eq!(result_two.total, Some(1));
+    }
+
+    /// #1413: chain resolution can rewrite a broad result set into thousands
+    /// of positive `_id` alternatives. PostgreSQL exhausts memory while
+    /// parsing the former left-deep `id = $n OR ...` tree, even when only a
+    /// handful of those ids exist for the tenant. Both result and count paths
+    /// must accept the same wide, flat predicate.
+    #[tokio::test]
+    async fn postgres_integration_search_wide_id_list_uses_flat_predicate() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        const ID_COUNT: usize = 12_000;
+        const MATCHING_IDS: [&str; 3] = ["wide-id-0", "wide-id-5999", "wide-id-11999"];
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("wide-id-list");
+
+        for id in MATCHING_IDS {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({ "resourceType": "Patient", "id": id }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: (0..ID_COUNT)
+                .map(|i| SearchValue::eq(format!("wide-id-{i}")))
+                .collect(),
+            chain: vec![],
+            components: vec![],
+        });
+        assert_eq!(
+            query.total, None,
+            "the result path must not run an implicit count"
+        );
+
+        let result = backend
+            .search(&tenant, &query)
+            .await
+            .expect("the result query accepts a wide positive _id list");
+        assert_eq!(result.total, None);
+        let mut ids: Vec<String> = result
+            .resources
+            .items
+            .iter()
+            .map(|resource| resource.id().to_string())
+            .collect();
+        ids.sort();
+        let mut expected: Vec<String> = MATCHING_IDS.iter().map(ToString::to_string).collect();
+        expected.sort();
+        assert_eq!(ids, expected);
+
+        let count = backend
+            .search_count(&tenant, &query)
+            .await
+            .expect("the count query accepts a wide positive _id list");
+        assert_eq!(count, MATCHING_IDS.len() as u64);
     }
 
     /// #1092: modifiers the `_id` builder cannot honour must be rejected
