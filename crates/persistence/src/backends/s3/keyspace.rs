@@ -343,6 +343,34 @@ impl S3Keyspace {
         ])
     }
 
+    /// Key for one ingest batch's coalesced change log — every change the batch
+    /// recorded, in a single object rather than one per resource (#1429).
+    ///
+    /// Sits under the same `changes/` prefix that [`Self::submit_change_key`]
+    /// writes and that `load_changes` lists, but nested by manifest and file so
+    /// batches never collide: like the raw archive and the entry receipts, the
+    /// key is discriminated by `file_url` (line numbers restart per file, see
+    /// [`submit_file_segment`]) and keyed by the batch's first line.
+    pub fn submit_change_batch_key(
+        &self,
+        submitter: &str,
+        submission_id: &str,
+        manifest_id: &str,
+        file_url: Option<&str>,
+        first_line: u64,
+    ) -> String {
+        self.join(&[
+            "bulk",
+            "submit",
+            submitter,
+            submission_id,
+            "changes",
+            manifest_id,
+            &submit_file_segment(file_url),
+            &format!("batch-{}.json", first_line),
+        ])
+    }
+
     /// Key for one finalized status-manifest artifact row of a submission.
     ///
     /// The identity is `(submitter, submission_id, manifest_id, file_type,

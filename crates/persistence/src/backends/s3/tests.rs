@@ -24,7 +24,8 @@ use crate::backends::s3::user_settings::settings_object_id;
 use crate::core::bulk_export::{ExportDataProvider, ExportRequest};
 use crate::core::bulk_submit::{
     BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider, CANCELLED_ABORT_REASON,
-    CancelToken, NdjsonEntry, StreamingBulkSubmitProvider, SubmissionId, SubmissionStatus,
+    CancelToken, NdjsonEntry, StreamingBulkSubmitProvider, SubmissionChange, SubmissionId,
+    SubmissionStatus,
 };
 use crate::core::history::{
     HistoryParams, InstanceHistoryProvider, SystemHistoryProvider, TypeHistoryProvider,
@@ -1072,6 +1073,131 @@ async fn bulk_submit_raw_archive_is_one_object_per_batch() {
             "Patient/r{i} should be stored"
         );
     }
+}
+
+/// A batch records its rollback changes in one coalesced object, not one PUT
+/// per resource, and `list_changes` still reads every change back (#1429).
+#[tokio::test]
+async fn bulk_submit_change_log_is_one_object_per_batch() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+
+    let submission_id = SubmissionId::new("client-a", "sub-changes");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    let entries: Vec<NdjsonEntry> = (1..=3)
+        .map(|i| {
+            NdjsonEntry::new(
+                i,
+                "Patient",
+                json!({"resourceType": "Patient", "id": format!("c{i}")}),
+            )
+        })
+        .collect();
+    backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            entries,
+            &BulkProcessingOptions::new(),
+        )
+        .await
+        .unwrap();
+
+    let change_puts = mock
+        .recorded_puts()
+        .into_iter()
+        .filter(|put| put.key.contains("/changes/"))
+        .count();
+    assert_eq!(
+        change_puts, 1,
+        "the three-entry batch must record its changes in one object, not three"
+    );
+
+    let changes = backend
+        .list_changes(&tenant, &submission_id, 10, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        changes.len(),
+        3,
+        "all three changes must be readable back from the coalesced object"
+    );
+}
+
+/// `load_changes` reads both shapes under the `changes/` prefix: the coalesced
+/// batch array (#1429) and a legacy single-change object — such as one the
+/// rollback trait's `record_change` still writes for composite backends.
+#[tokio::test]
+async fn bulk_submit_change_log_reads_batch_and_legacy_objects() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+
+    let submission_id = SubmissionId::new("client-a", "sub-mixed");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    // A batch writes the coalesced array form.
+    let entries: Vec<NdjsonEntry> = (1..=2)
+        .map(|i| {
+            NdjsonEntry::new(
+                i,
+                "Patient",
+                json!({"resourceType": "Patient", "id": format!("m{i}")}),
+            )
+        })
+        .collect();
+    backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            entries,
+            &BulkProcessingOptions::new(),
+        )
+        .await
+        .unwrap();
+
+    // A single change written through the trait method takes the legacy shape.
+    let legacy = SubmissionChange::create(&manifest.manifest_id, "Observation", "legacy-1", "1");
+    backend
+        .record_change(&tenant, &submission_id, &legacy)
+        .await
+        .unwrap();
+
+    let changes = backend
+        .list_changes(&tenant, &submission_id, 10, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        changes.len(),
+        3,
+        "both the two-change batch object and the one legacy object must be read"
+    );
+    assert!(
+        changes.iter().any(|c| c.resource_id == "legacy-1"),
+        "the legacy single-change object must be read back"
+    );
+    assert!(
+        changes.iter().any(|c| c.resource_id == "m1"),
+        "the coalesced batch changes must be read back"
+    );
 }
 
 /// A batch with two entries for the same resource id is order-dependent
