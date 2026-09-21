@@ -351,61 +351,113 @@ impl BulkSubmitProvider for S3Backend {
         // exhausted, max errors reached, or a storage error part-way — the
         // entries it already wrote are reported before that outcome
         // propagates (#1078).
-        let walked: StorageResult<()> = async {
-            for entry in entries {
-                if options.max_errors > 0 && error_count >= options.max_errors {
-                    if !options.continue_on_error {
-                        return Err(StorageError::BulkSubmit(
-                            BulkSubmitError::MaxErrorsExceeded {
-                                submission_id: submission_id.submission_id.clone(),
-                                max_errors: options.max_errors,
-                            },
-                        ));
+        //
+        // With no per-entry error cap (the default, and the bulk fast-load
+        // path) there is no early-stop, so the entries are independent and run
+        // with bounded concurrency to overlap their PUT latencies (#945).
+        // `buffered` keeps receipts in input order. A hard store failure on any
+        // entry is captured and propagated after the successful receipts are
+        // reported, matching the serial block's #1078 contract. A cap keeps the
+        // serial early-stop semantics.
+        let concurrency = Self::s3_ingest_concurrency();
+        let walked: StorageResult<()> = if options.max_errors == 0 && concurrency > 1 {
+            use futures::stream::{self, StreamExt};
+            let outcomes: Vec<StorageResult<BulkEntryResult>> = stream::iter(entries)
+                .map(|entry| {
+                    self.process_one_entry(
+                        &location,
+                        tenant,
+                        submission_id,
+                        manifest_id,
+                        file_url,
+                        entry,
+                        options,
+                    )
+                })
+                .buffered(concurrency)
+                .collect()
+                .await;
+            // `error_count` is only the serial path's early-stop counter; with
+            // no cap the final tallies come from `results` below, so it is not
+            // touched here.
+            let mut first_err = None;
+            for outcome in outcomes {
+                match outcome {
+                    Ok(result) => results.push(result),
+                    Err(err) => {
+                        if first_err.is_none() {
+                            first_err = Some(err);
+                        }
+                    }
+                }
+            }
+            match first_err {
+                Some(err) => Err(err),
+                None => Ok(()),
+            }
+        } else {
+            async {
+                for entry in entries {
+                    if options.max_errors > 0 && error_count >= options.max_errors {
+                        if !options.continue_on_error {
+                            return Err(StorageError::BulkSubmit(
+                                BulkSubmitError::MaxErrorsExceeded {
+                                    submission_id: submission_id.submission_id.clone(),
+                                    max_errors: options.max_errors,
+                                },
+                            ));
+                        }
+
+                        let skipped = BulkEntryResult::skipped(
+                            entry.line_number,
+                            &entry.resource_type,
+                            "max errors exceeded",
+                        );
+                        self.persist_entry_result(
+                            &location,
+                            submission_id,
+                            manifest_id,
+                            file_url,
+                            &skipped,
+                        )
+                        .await?;
+                        results.push(skipped);
+                        continue;
                     }
 
-                    let skipped = BulkEntryResult::skipped(
-                        entry.line_number,
-                        &entry.resource_type,
-                        "max errors exceeded",
-                    );
+                    self.persist_raw_entry(&location, submission_id, manifest_id, file_url, &entry)
+                        .await?;
+
+                    let result = match self
+                        .process_single_entry(tenant, submission_id, manifest_id, &entry, options)
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(err) => BulkEntryResult::processing_error(
+                            entry.line_number,
+                            &entry.resource_type,
+                            Self::bulk_submit_operation_outcome(&err),
+                        ),
+                    };
+
+                    if result.is_error() {
+                        error_count += 1;
+                    }
+
                     self.persist_entry_result(
                         &location,
                         submission_id,
                         manifest_id,
                         file_url,
-                        &skipped,
+                        &result,
                     )
                     .await?;
-                    results.push(skipped);
-                    continue;
+                    results.push(result);
                 }
-
-                self.persist_raw_entry(&location, submission_id, manifest_id, file_url, &entry)
-                    .await?;
-
-                let result = match self
-                    .process_single_entry(tenant, submission_id, manifest_id, &entry, options)
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(err) => BulkEntryResult::processing_error(
-                        entry.line_number,
-                        &entry.resource_type,
-                        Self::bulk_submit_operation_outcome(&err),
-                    ),
-                };
-
-                if result.is_error() {
-                    error_count += 1;
-                }
-
-                self.persist_entry_result(&location, submission_id, manifest_id, file_url, &result)
-                    .await?;
-                results.push(result);
+                Ok(())
             }
-            Ok(())
-        }
-        .await;
+            .await
+        };
         // Entries are written one by one and not kept, so observers that need
         // the resources re-read the ids from the primary (#1127).
         options
@@ -756,6 +808,53 @@ impl BulkSubmitRollbackProvider for S3Backend {
 }
 
 impl S3Backend {
+    /// Processes one ingest entry end to end — writes its raw line, runs it,
+    /// and writes its receipt — returning the receipt. This is the unit the
+    /// batch runs, serially or concurrently. A per-entry *processing* failure
+    /// becomes a `processing-error` receipt (not an error); only a hard store
+    /// failure writing the raw line or the receipt propagates.
+    #[allow(clippy::too_many_arguments)]
+    async fn process_one_entry(
+        &self,
+        location: &TenantLocation,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        file_url: Option<&str>,
+        entry: NdjsonEntry,
+        options: &BulkProcessingOptions,
+    ) -> StorageResult<BulkEntryResult> {
+        self.persist_raw_entry(location, submission_id, manifest_id, file_url, &entry)
+            .await?;
+        let result = match self
+            .process_single_entry(tenant, submission_id, manifest_id, &entry, options)
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => BulkEntryResult::processing_error(
+                entry.line_number,
+                &entry.resource_type,
+                Self::bulk_submit_operation_outcome(&err),
+            ),
+        };
+        self.persist_entry_result(location, submission_id, manifest_id, file_url, &result)
+            .await?;
+        Ok(result)
+    }
+
+    /// How many ingest entries run at once on S3 when no per-entry error cap is
+    /// set. Each entry is several sequential PUTs and the bottleneck is PUT
+    /// round-trip latency, not CPU, so overlapping entries multiplies write
+    /// throughput (#945). Tunable with `HFS_BULK_SUBMIT_S3_INGEST_CONCURRENCY`
+    /// (default 8, min 1) — raise it against higher-latency (real AWS) S3.
+    fn s3_ingest_concurrency() -> usize {
+        std::env::var("HFS_BULK_SUBMIT_S3_INGEST_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(8)
+    }
+
     /// Processes a single NDJSON entry: validates it, upserts the resource,
     /// and records a change log entry for rollback.
     ///

@@ -950,6 +950,69 @@ async fn bulk_submit_lifecycle_and_processing() {
     assert_eq!(completed.status, SubmissionStatus::Complete);
 }
 
+/// With no per-entry error cap, entries ingest with bounded concurrency to
+/// overlap their PUT latencies (#945). However the writes interleave, every
+/// entry must be written and the receipts must stay in input (line) order.
+#[tokio::test]
+async fn bulk_submit_concurrent_ingest_preserves_order_and_writes_all() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+
+    let submission_id = SubmissionId::new("client-a", "sub-conc");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    let entries: Vec<NdjsonEntry> = (1..=20)
+        .map(|i| {
+            NdjsonEntry::new(
+                i,
+                "Patient",
+                json!({"resourceType": "Patient", "id": format!("p{i}")}),
+            )
+        })
+        .collect();
+
+    let results = backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            entries,
+            // Default options: max_errors == 0, so the concurrent path runs.
+            &BulkProcessingOptions::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(results.len(), 20);
+    assert!(results.iter().all(|r| r.is_success()), "{results:?}");
+    // Receipts stay in input order despite the concurrent writes.
+    let lines: Vec<u64> = results.iter().map(|r| r.line_number).collect();
+    assert_eq!(lines, (1..=20).collect::<Vec<u64>>());
+
+    let counts = backend
+        .get_entry_counts(&tenant, &submission_id, &manifest.manifest_id)
+        .await
+        .unwrap();
+    assert_eq!((counts.total, counts.success), (20, 20));
+
+    // Every resource is actually stored.
+    for i in 1..=20 {
+        let read = backend
+            .read(&tenant, "Patient", &format!("p{i}"))
+            .await
+            .unwrap();
+        assert!(read.is_some(), "Patient/p{i} should be stored");
+    }
+}
+
 /// Two output files of one manifest, both starting at line 1, must each keep
 /// their own entry result and raw archive (issue #457).
 ///
