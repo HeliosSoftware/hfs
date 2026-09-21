@@ -539,7 +539,15 @@ where
 /// of functionality.
 pub fn create_minimal_routes<S>(state: AppState<S>) -> Router
 where
-    S: ResourceStorage + SearchProvider + BundleProvider + Send + Sync + 'static,
+    // `ConditionalStorage`: `/metadata` reads which conditional interactions
+    // the storage serves (#1384).
+    S: ResourceStorage
+        + ConditionalStorage
+        + SearchProvider
+        + BundleProvider
+        + Send
+        + Sync
+        + 'static,
 {
     Router::new()
         .route("/health", get(handlers::health_handler::<S>))

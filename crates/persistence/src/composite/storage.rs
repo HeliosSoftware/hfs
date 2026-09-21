@@ -206,14 +206,16 @@ impl CompositeStorage {
         let query = {
             let registry_arc = self.search_param_registry(tenant);
             let registry = registry_arc.read();
-            // A composite has no FHIR version of its own to judge a `:[type]`
-            // qualifier against, so any enabled version's type passes here.
-            crate::search::build_conditional_query(
-                &registry,
-                resource_type,
-                search_params,
-                crate::search::ResourceTypeScope::any_enabled(),
-            )?
+            // A `:[type]` qualifier is judged against the version the
+            // composite was configured with — `conditional_delete` carries
+            // none of its own, and the one on create/update is the content
+            // version of the resource being written. Left unset, any enabled
+            // version's type passes (#1384).
+            let types = self.config.fhir_version.map_or_else(
+                crate::search::ResourceTypeScope::any_enabled,
+                crate::search::ResourceTypeScope::version,
+            );
+            crate::search::build_conditional_query(&registry, resource_type, search_params, types)?
         };
         let Some(query) = query else {
             return Ok(Vec::new());
@@ -1376,6 +1378,22 @@ impl SearchProvider for CompositeStorage {
 
 #[async_trait]
 impl ConditionalStorage for CompositeStorage {
+    /// Composed, not copied from the primary (#1384). With a dedicated search
+    /// backend the composite resolves the criteria itself and needs only plain
+    /// CRUD from the primary for create / update / delete — which is how
+    /// `s3-elasticsearch` serves them over a primary that declares none. Patch
+    /// is the reverse: only the primary can apply one, and it resolves the
+    /// criteria against its own index, which a dedicated search backend leaves
+    /// offloaded and empty — so no such composite supports it.
+    fn supports_conditional(&self, interaction: crate::core::ConditionalInteraction) -> bool {
+        if self.has_dedicated_search_backend() {
+            return interaction != crate::core::ConditionalInteraction::Patch;
+        }
+        self.conditional_storage
+            .as_ref()
+            .is_some_and(|primary| primary.supports_conditional(interaction))
+    }
+
     async fn conditional_create(
         &self,
         tenant: &TenantContext,
@@ -1672,6 +1690,19 @@ impl ConditionalStorage for CompositeStorage {
                 capability: "ConditionalStorage".to_string(),
             })
         })?;
+
+        // Patch application lives in the primary, and the primary resolves the
+        // criteria against its own index — which, with a dedicated search
+        // backend, is offloaded and empty (even `_id` enumerates index rows on
+        // SQLite). Handed the criteria it matched nothing, so every conditional
+        // patch was a silent no-match; refuse instead, in step with
+        // `supports_conditional` (#1384).
+        if !self.supports_conditional(crate::core::ConditionalInteraction::Patch) {
+            return Err(StorageError::Backend(BackendError::UnsupportedCapability {
+                backend_name: "composite".to_string(),
+                capability: "conditional_patch".to_string(),
+            }));
+        }
 
         let result = storage
             .conditional_patch(tenant, resource_type, search_params, patch, if_match)

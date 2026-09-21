@@ -25,6 +25,7 @@ pub mod bulk_submit;
 pub mod bulk_submit_jwks;
 pub mod capabilities;
 pub mod compartment;
+mod conditional_support;
 pub mod console_metrics;
 pub mod create;
 pub mod dashboard_counts;

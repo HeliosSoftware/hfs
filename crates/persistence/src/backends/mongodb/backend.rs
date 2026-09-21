@@ -275,6 +275,11 @@ impl MongoBackend {
             BackendCapability::BulkSubmitIngest,
             BackendCapability::BulkSubmitRestWorker,
             BackendCapability::InDbSofRunner,
+            BackendCapability::ConditionalCreate,
+            BackendCapability::ConditionalUpdate,
+            BackendCapability::ConditionalDelete,
+            // No `ConditionalPatch`: `conditional_patch` answers
+            // `UnsupportedCapability` on this backend.
             BackendCapability::SharedSchema,
         ]
     }

@@ -3200,6 +3200,83 @@ fn tenant_location_matches_the_declared_tenancy_topology() {
     );
 }
 
+/// S3 has no search to resolve conditional criteria with. What it declares —
+/// the source of `rest.resource.conditional*` and of the REST layer's `501` —
+/// must be what its methods do: refuse, all four (#1384).
+#[tokio::test]
+async fn no_conditional_interaction_is_declared_or_served() {
+    use crate::core::{ConditionalInteraction, ConditionalStorage, PatchFormat};
+
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+    let patient = json!({"resourceType": "Patient", "active": true});
+
+    for interaction in ConditionalInteraction::ALL {
+        assert!(!backend.supports_conditional(interaction), "{interaction}");
+    }
+
+    let refused = |capability: &str, err: crate::error::StorageError| match err {
+        crate::error::StorageError::Backend(
+            crate::error::BackendError::UnsupportedCapability { capability: c, .. },
+        ) => assert_eq!(c, capability),
+        other => panic!("{capability}: expected UnsupportedCapability, got {other:?}"),
+    };
+    refused(
+        "conditional_create",
+        backend
+            .conditional_create(
+                &tenant,
+                "Patient",
+                patient.clone(),
+                "active=true",
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap_err(),
+    );
+    refused(
+        "conditional_update",
+        backend
+            .conditional_update(
+                &tenant,
+                "Patient",
+                patient,
+                "active=true",
+                true,
+                FhirVersion::R4,
+                &crate::core::EntityTagPrecondition::Absent,
+            )
+            .await
+            .unwrap_err(),
+    );
+    refused(
+        "conditional_delete",
+        backend
+            .conditional_delete(
+                &tenant,
+                "Patient",
+                "active=true",
+                &crate::core::EntityTagPrecondition::Absent,
+            )
+            .await
+            .unwrap_err(),
+    );
+    refused(
+        "conditional_patch",
+        backend
+            .conditional_patch(
+                &tenant,
+                "Patient",
+                "active=true",
+                &PatchFormat::MergePatch(json!({"active": false})),
+                &crate::core::EntityTagPrecondition::Absent,
+            )
+            .await
+            .unwrap_err(),
+    );
+}
+
 /// A transaction bundle must be refused outright, and refused *before* any
 /// object is written.
 ///
