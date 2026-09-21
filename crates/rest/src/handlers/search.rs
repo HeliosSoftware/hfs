@@ -131,10 +131,11 @@ where
 }
 
 /// What a client is told when it attempts a system-level search (#1338).
-const SYSTEM_SEARCH_NOT_SUPPORTED: &str = "system-level search (GET [base]?[parameters] and POST \
-     [base]/_search, with or without _type) is not supported by this server; search one \
-     resource type at a time instead: GET [base]/[type]?[parameters] or POST \
-     [base]/[type]/_search";
+/// Worded to sit inside [`RestError::NotImplemented`]'s "Feature '…' is not
+/// implemented." sentence.
+const SYSTEM_SEARCH_NOT_SUPPORTED: &str = "system-level search (GET [base]?[parameters] or POST \
+     [base]/_search, with or without _type); search one resource type at a time instead, with \
+     GET [base]/[type]?[parameters] or POST [base]/[type]/_search";
 
 /// Handler that refuses system-level search.
 ///
