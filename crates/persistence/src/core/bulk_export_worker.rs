@@ -801,11 +801,21 @@ where
         let request = &view.request;
 
         // Resolve the resource types to export.
-        let types = self
+        let mut types = self
             .data
             .list_export_types(tenant, request)
             .await
             .map_err(LeaseError::Storage)?;
+
+        // `list_export_types` is level-agnostic: with no `_type` it returns
+        // every type the tenant holds. A Patient-level export is scoped to the
+        // Patient compartment, so drop the rest — otherwise the conformance
+        // resources seeded into every tenant (SearchParameter,
+        // CompartmentDefinition) ride along in each unfiltered patient export.
+        // An explicit `_type` is the client's call and is left alone.
+        if matches!(view.level, ExportLevel::Patient) && request.resource_types.is_empty() {
+            types.retain(|t| in_patient_compartment(view.fhir_version, t));
+        }
 
         // Every `_typeFilter` must carry the query compiled against the search
         // parameter registry at kick-off (T4). A filter persisted before that
@@ -1198,6 +1208,13 @@ pub fn abandoned_export_message(attempts: u32) -> String {
     let unit = if attempts == 1 { "attempt" } else { "attempts" };
     let cause = "each worker that claimed it lost its lease before finishing";
     format!("export abandoned after {attempts} {unit}: {cause}")
+}
+
+/// Whether `resource_type` belongs to the Patient compartment: `Patient`
+/// itself, or any type the CompartmentDefinition links to it.
+fn in_patient_compartment(version: helios_fhir::FhirVersion, resource_type: &str) -> bool {
+    resource_type == "Patient"
+        || !helios_fhir::get_compartment_params(version, "Patient", resource_type).is_empty()
 }
 
 /// Applies `_elements` projection to an NDJSON line.
@@ -1648,6 +1665,84 @@ mod tests {
             let manifest = backend.get_export_manifest(&tenant, &job_id).await.unwrap();
             let total: u64 = manifest.output.iter().map(|e| e.count).sum();
             assert_eq!(total, 3);
+        }
+
+        /// A Patient-level export with no `_type` covers the Patient compartment
+        /// only. The conformance resources seeded into every tenant
+        /// (SearchParameter, CompartmentDefinition) used to ride along, which
+        /// put ~1,400 SearchParameters in every unfiltered patient export.
+        #[tokio::test]
+        async fn test_patient_export_without_type_skips_non_compartment_types() {
+            let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+            backend.init_schema().unwrap();
+            let tenant = tenant();
+
+            for (rt, body) in [
+                (
+                    "Patient",
+                    serde_json::json!({"resourceType": "Patient", "id": "p1"}),
+                ),
+                (
+                    "Observation",
+                    serde_json::json!({
+                        "resourceType": "Observation",
+                        "id": "o1",
+                        "status": "final",
+                        "code": {"text": "x"},
+                        "subject": {"reference": "Patient/p1"}
+                    }),
+                ),
+                (
+                    "SearchParameter",
+                    serde_json::json!({"resourceType": "SearchParameter", "id": "sp1"}),
+                ),
+            ] {
+                backend
+                    .create(&tenant, rt, body, helios_fhir::FhirVersion::default())
+                    .await
+                    .unwrap();
+            }
+
+            let tmp = tempfile::tempdir().unwrap();
+            let output = Arc::new(LocalFsOutputStore::new(tmp.path(), "http://localhost:8080"));
+
+            let job_id = backend
+                .start_export(
+                    &tenant,
+                    StartExportInput {
+                        request: ExportRequest::patient(),
+                        transaction_time: Utc::now(),
+                        request_url: "http://localhost/Patient/$export".to_string(),
+                        owner_subject: Some("sub".to_string()),
+                        fhir_version: helios_fhir::FhirVersion::default(),
+                    },
+                )
+                .await
+                .unwrap();
+
+            let worker_id = WorkerId::new("w1");
+            let worker = DefaultExportWorker::new(
+                Arc::clone(&backend),
+                Arc::clone(&backend),
+                Arc::clone(&output),
+                worker_id.clone(),
+            );
+            let lease = backend
+                .claim_next(&worker_id, Duration::from_secs(60), TEST_MAX_ATTEMPTS)
+                .await
+                .unwrap()
+                .expect("job claimable");
+            worker.run_job(lease).await.unwrap();
+
+            let manifest = backend.get_export_manifest(&tenant, &job_id).await.unwrap();
+            let mut exported: Vec<&str> = manifest
+                .output
+                .iter()
+                .map(|e| e.resource_type.as_str())
+                .collect();
+            exported.sort_unstable();
+            exported.dedup();
+            assert_eq!(exported, ["Observation", "Patient"]);
         }
 
         /// Wraps [`LocalFsOutputStore`], recording the export status the worker
