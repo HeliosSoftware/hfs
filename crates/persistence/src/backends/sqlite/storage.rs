@@ -3124,6 +3124,11 @@ impl DifferentialHistoryProvider for SqliteBackend {
 
 #[async_trait]
 impl ConditionalStorage for SqliteBackend {
+    fn supports_conditional(&self, interaction: crate::core::ConditionalInteraction) -> bool {
+        // One declaration: the capability list the contract test pins (#1384).
+        crate::core::Backend::supports(self, interaction.capability())
+    }
+
     async fn conditional_create(
         &self,
         tenant: &TenantContext,

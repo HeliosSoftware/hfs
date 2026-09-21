@@ -2399,6 +2399,7 @@ async fn start_sqlite_elasticsearch(
         .primary("sqlite", BackendKind::Sqlite)
         .search_backend("es", BackendKind::Elasticsearch)
         .sync_mode(composite_sync_mode_from_env())
+        .fhir_version(config.default_fhir_version)
         .build()?;
 
     // Build backends map for CompositeStorage
@@ -2701,6 +2702,7 @@ async fn start_postgres_elasticsearch(
         .primary("postgres", BackendKind::Postgres)
         .search_backend("es", BackendKind::Elasticsearch)
         .sync_mode(composite_sync_mode_from_env())
+        .fhir_version(config.default_fhir_version)
         .build()?;
 
     // Build backends map for CompositeStorage
@@ -2919,6 +2921,7 @@ async fn start_mongodb_elasticsearch(
         .primary("mongodb", BackendKind::MongoDB)
         .search_backend("es", BackendKind::Elasticsearch)
         .sync_mode(composite_sync_mode_from_env())
+        .fhir_version(config.default_fhir_version)
         .build()?;
 
     // Build backends map for CompositeStorage
@@ -3361,6 +3364,7 @@ async fn start_s3_elasticsearch(
         .primary("s3", BackendKind::S3)
         .search_backend("es", BackendKind::Elasticsearch)
         .sync_mode(composite_sync_mode_from_env())
+        .fhir_version(config.default_fhir_version)
         .build()?;
 
     let mut backends = HashMap::new();
