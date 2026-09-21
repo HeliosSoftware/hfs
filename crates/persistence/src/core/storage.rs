@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use crate::core::preconditions::EntityTagPrecondition;
 use crate::core::sof_runner::SofRunner;
-use crate::error::{BackendError, ResourceError, StorageError, StorageResult};
+use crate::error::{BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
 
 /// A cheap per-tenant change detector for committed writes (#1078).
@@ -545,6 +545,68 @@ pub trait ResourceStorage: Send + Sync {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<()>;
+
+    /// Deletes a resource (soft delete) only if `expected_version` is still its
+    /// current version — the delete half of optimistic locking, as
+    /// [`update`](Self::update) is the update half.
+    ///
+    /// This is what a `DELETE` carrying `If-Match` must go through. Evaluating
+    /// the precondition against one read and then calling
+    /// [`delete`](Self::delete) is check-then-act: a writer landing in between
+    /// is deleted along with the version the client named, a version the
+    /// client never saw (#1404).
+    ///
+    /// `expected_version` is a bare version id (`3`), not an `If-Match` field
+    /// value; [`VersionedStorage::delete_with_match`] takes the latter.
+    ///
+    /// # Atomicity
+    ///
+    /// SQLite, PostgreSQL and MongoDB implement this as ONE conditional write
+    /// carrying the version in its predicate, so the comparison and the delete
+    /// cannot be separated. S3 makes the tombstone write conditional on the
+    /// object it compared. The **default implementation is not atomic**: it
+    /// reads, compares and calls [`delete`](Self::delete), which narrows the
+    /// window to this call but does not close it. It exists so that stores
+    /// which are never the system of record for a version (search secondaries,
+    /// test doubles) need not invent a guarantee they cannot give; a wrapper
+    /// around a real backend MUST delegate rather than inherit it.
+    ///
+    /// # Errors
+    ///
+    /// * `StorageError::Resource(NotFound)` - If no live resource exists
+    ///   (never created, or already deleted)
+    /// * `StorageError::Concurrency(VersionConflict)` - If the current version
+    ///   is not `expected_version`; nothing is deleted
+    /// * `StorageError::Tenant` - If the tenant doesn't have delete permission
+    async fn delete_versioned(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: &str,
+    ) -> StorageResult<()> {
+        let current = match self.read(tenant, resource_type, id).await {
+            Ok(Some(current)) => current,
+            Ok(None) | Err(StorageError::Resource(ResourceError::Gone { .. })) => {
+                return Err(StorageError::Resource(ResourceError::NotFound {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                }));
+            }
+            Err(e) => return Err(e),
+        };
+        if current.version_id() != expected_version {
+            return Err(StorageError::Concurrency(
+                ConcurrencyError::VersionConflict {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                    expected_version: expected_version.to_string(),
+                    actual_version: current.version_id().to_string(),
+                },
+            ));
+        }
+        self.delete(tenant, resource_type, id).await
+    }
 
     /// Checks if a resource exists.
     ///
