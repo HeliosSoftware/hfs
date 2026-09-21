@@ -4718,7 +4718,9 @@ mod contained_search {
                 let (status, body) = get(&server, &url).await;
                 assert_eq!(status, StatusCode::BAD_REQUEST, "{url}: {body}");
                 assert_eq!(body["resourceType"], "OperationOutcome", "{url}");
-                let text = body["issue"][0]["diagnostics"].as_str().unwrap_or_default();
+                let text = body["issue"][0]["details"]["text"]
+                    .as_str()
+                    .unwrap_or_default();
                 assert!(
                     text.contains(named) && text.contains("_contained"),
                     "{url}: {body}"

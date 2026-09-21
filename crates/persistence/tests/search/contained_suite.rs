@@ -692,10 +692,7 @@ where
 
     let mut query = probe.query.clone();
     query.total = Some(TotalMode::Accurate);
-    let found = backend
-        .search(tenant, &query)
-        .await
-        .map_err(search_error)?;
+    let found = backend.search(tenant, &query).await.map_err(search_error)?;
     let ids = sorted_ids(&found);
 
     let counted = backend
@@ -709,10 +706,7 @@ where
         let mut query = query.clone();
         query.count = Some(2);
         query.offset = Some(page * 2);
-        let found = backend
-            .search(tenant, &query)
-            .await
-            .map_err(search_error)?;
+        let found = backend.search(tenant, &query).await.map_err(search_error)?;
         if found.resources.items.is_empty() {
             break;
         }
@@ -842,11 +836,8 @@ where
             Container,
             Ok(&["u-one"]),
             |q| {
-                q.parameters.push(literal(
-                    "subject",
-                    SearchParamType::Reference,
-                    "Patient/p2",
-                ))
+                q.parameters
+                    .push(literal("subject", SearchParamType::Reference, "Patient/p2"))
             },
         ),
         probe(
@@ -988,15 +979,21 @@ where
         probe("_has [both]", Both, Container, Err("_has"), has_provenance),
         probe("_list [true]", On, Container, Err("_list"), in_list),
         probe("_list [both]", Both, Contained, Err("_list"), in_list),
-        probe("subject.name=x [true]", On, Container, Err("subject"), |q| {
-            let mut chained = literal("subject", SearchParamType::Reference, "x");
-            chained.chain = vec![ChainedParameter {
-                reference_param: "subject".to_string(),
-                target_type: Some("Patient".to_string()),
-                target_param: "name".to_string(),
-            }];
-            q.parameters.push(chained);
-        }),
+        probe(
+            "subject.name=x [true]",
+            On,
+            Container,
+            Err("subject"),
+            |q| {
+                let mut chained = literal("subject", SearchParamType::Reference, "x");
+                chained.chain = vec![ChainedParameter {
+                    reference_param: "subject".to_string(),
+                    target_type: Some("Patient".to_string()),
+                    target_param: "name".to_string(),
+                }];
+                q.parameters.push(chained);
+            },
+        ),
     ];
 
     let mut failures = Vec::new();

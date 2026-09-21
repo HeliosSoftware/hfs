@@ -301,8 +301,12 @@ impl QueryBuilder {
     ///
     /// Param layout: `?1` = tenant, `?2` = contained type, then value params.
     /// The `HAVING` aggregates repeat the `WHERE` branches verbatim, reusing
-    /// their numbered placeholders rather than binding again. Returns `None`
-    /// when no parameter contributes a condition.
+    /// their numbered placeholders rather than binding again.
+    ///
+    /// `query.compartment` is one more branch, on the contained resource's
+    /// own references. With no criterion at all the result is every contained
+    /// resource of the type (#1383), so this always returns `Some`; rows come
+    /// back in a stable order for the caller to page over.
     pub fn build_contained(&self, query: &SearchQuery) -> Option<SqlFragment> {
         // (branch, negated)
         let mut branches: Vec<(String, bool)> = Vec::new();
@@ -358,10 +362,38 @@ impl QueryBuilder {
             distinct_names.insert(param.name.clone());
         }
 
-        if branches.is_empty() && entity_filters.is_empty() {
-            return None;
+        // Compartment membership is a criterion on the contained resource like
+        // any other: it references the compartment through ANY of the
+        // membership parameters (#1383). That one branch spans several
+        // parameter names, so the names an entity matched no longer prove
+        // every branch did.
+        let mut names_prove_branches = true;
+        if let Some(comp) = &query.compartment {
+            if !comp.params.is_empty() && !comp.reference.is_empty() {
+                let in_list = comp
+                    .params
+                    .iter()
+                    .map(|p| format!("'{}'", p.replace('\'', "''")))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let base = strip_reference_version(&comp.reference);
+                branches.push((
+                    format!(
+                        "(param_name IN ({in_list}) AND value_reference IS NOT NULL \
+                         AND (value_reference = ?{} OR value_reference LIKE ?{} || '/_history/%'))",
+                        offset + 1,
+                        offset + 2
+                    ),
+                    false,
+                ));
+                params.push(SqlParam::string(base));
+                params.push(SqlParam::string(base));
+                names_prove_branches = false;
+            }
         }
 
+        // With no criterion at all, every contained resource of the type
+        // matches (#1383): the grouping below lists each of them once.
         let any_negated = branches.iter().any(|(_, negated)| *negated);
         let mut sql = String::from(
             "SELECT resource_type, resource_id, contained_local_id FROM search_index \
@@ -376,25 +408,28 @@ impl QueryBuilder {
         }
         sql.push_str(" GROUP BY resource_type, resource_id, contained_local_id");
         if !branches.is_empty() {
-            let having = if !any_negated && distinct_names.len() == branches.len() {
-                format!("COUNT(DISTINCT param_name) >= {}", distinct_names.len())
-            } else {
-                // A repeated name or a negation: one row can satisfy only some
-                // of the branches, so state each. The placeholders are reused,
-                // not rebound.
-                branches
-                    .iter()
-                    .map(|(branch, negated)| {
-                        format!(
-                            "MAX(CASE WHEN {branch} THEN 1 ELSE 0 END) = {}",
-                            if *negated { 0 } else { 1 }
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" AND ")
-            };
+            let having =
+                if !any_negated && names_prove_branches && distinct_names.len() == branches.len() {
+                    format!("COUNT(DISTINCT param_name) >= {}", distinct_names.len())
+                } else {
+                    // A repeated name or a negation: one row can satisfy only some
+                    // of the branches, so state each. The placeholders are reused,
+                    // not rebound.
+                    branches
+                        .iter()
+                        .map(|(branch, negated)| {
+                            format!(
+                                "MAX(CASE WHEN {branch} THEN 1 ELSE 0 END) = {}",
+                                if *negated { 0 } else { 1 }
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" AND ")
+                };
             sql.push_str(&format!(" HAVING {having}"));
         }
+        // A stable order: the caller pages over these rows.
+        sql.push_str(" ORDER BY resource_type, resource_id, contained_local_id");
         Some(SqlFragment::with_params(sql, params))
     }
 
@@ -468,9 +503,26 @@ impl QueryBuilder {
     /// [`Self::build_contained`] cannot apply, naming it (#1363). Such
     /// criteria used to be skipped, so the search answered a wider question
     /// than the one asked. A no-op for `_contained=false`.
+    ///
+    /// `_has` and `_list` live outside `query.parameters` and select
+    /// *top-level* resources, which a contained resource never is: nothing
+    /// outside its container can reference it. They are refused too (#1383).
     pub fn reject_unsupported_contained(query: &SearchQuery) -> Result<(), SearchError> {
         if query.contained == ContainedMode::Off {
             return Ok(());
+        }
+        for (present, name) in [
+            (!query.reverse_chains.is_empty(), "_has"),
+            (!query.list.is_empty(), "_list"),
+        ] {
+            if present {
+                return Err(SearchError::QueryParseError {
+                    message: format!(
+                        "'{name}' cannot be combined with _contained=true or both: it selects \
+                         top-level resources, which a contained resource is not"
+                    ),
+                });
+            }
         }
         for param in &query.parameters {
             if let Some(reason) = Self::contained_unsupported_reason(param) {
