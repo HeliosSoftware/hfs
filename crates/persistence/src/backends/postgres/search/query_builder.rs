@@ -1379,7 +1379,6 @@ impl PostgresQueryBuilder {
     /// - `:exact` — `value_string = $n` on the bare column, served by
     ///   `idx_search_string`.
     fn build_string_condition(param: &SearchParameter, offset: usize) -> Option<SqlFragment> {
-        let modifier = param.modifier.as_ref();
         let mut conditions = Vec::new();
         // A value does not always cost exactly one bind parameter — the
         // starts-with form binds a low and a high bound — so the placeholder
@@ -1387,91 +1386,12 @@ impl PostgresQueryBuilder {
         let mut next = offset;
 
         for value in param.values.iter() {
-            let condition = match modifier {
-                Some(SearchModifier::Exact) => {
-                    next += 1;
-                    SqlFragment::with_params(
-                        format!(
-                            "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_string = ${})",
-                            param.name, next
-                        ),
-                        vec![SqlParam::text(&value.value)],
-                    )
-                }
-                // `:text` on a string is a case-insensitive partial match,
-                // implemented here as a substring match (same as `:contains`).
-                // Match the accent-folded column (falling back to the raw column
-                // for not-yet-reindexed rows) against a folded pattern.
-                //
-                // A leading `%` is not btree-sargable, so this is served by the
-                // trigram GIN index v34 adds — which is why the
-                // `value_string IS NOT NULL` conjunct is absent here too. It cost
-                // the same 200x row-estimate error it cost the starts-with form,
-                // and on that estimate the planner never costed the GIN scan
-                // competitively. `~~` is strict in the COALESCE, so it proves both
-                // the trigram index's predicate and the btree pattern index's
-                // without help. Where the extension is unavailable the btree
-                // pattern index serves it at parity with the pre-v34 plan.
-                Some(SearchModifier::Contains | SearchModifier::Text) => {
-                    next += 1;
-                    SqlFragment::with_params(
-                        format!(
-                            "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND {} LIKE ${} ESCAPE '\\')",
-                            param.name, FOLDED_STRING_EXPR, next
-                        ),
-                        vec![SqlParam::text(&format!(
-                            "%{}%",
-                            like_escape(&fold_text(&value.value))
-                        ))],
-                    )
-                }
-                _ => {
-                    // Default: starts-with (case- and accent-insensitive).
-                    //
-                    // Emitted as an explicit bytewise range rather than
-                    // `LIKE 'prefix%'`. The two are exactly equivalent —
-                    // `like_escape` makes the pattern a pure literal prefix, and
-                    // `prefix_upper_bound` is the same bound Postgres derives
-                    // itself — but a range is sargable unconditionally, whereas
-                    // `LIKE` is only sargable when the planner can see the
-                    // pattern as a `Const`. It never can here: the pattern is a
-                    // bind parameter, and any generic plan turns the whole
-                    // predicate into `~~ like_escape($n, '\')`, a function call
-                    // on a parameter, from which no prefix can be extracted.
-                    let folded = fold_text(&value.value);
-                    match prefix_upper_bound(&folded) {
-                        Some(upper) => {
-                            let lo = next + 1;
-                            let hi = next + 2;
-                            next += 2;
-                            SqlFragment::with_params(
-                                format!(
-                                    "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND {expr} ~>=~ ${lo} AND {expr} ~<~ ${hi})",
-                                    param.name,
-                                    expr = FOLDED_STRING_EXPR,
-                                ),
-                                vec![SqlParam::text(&folded), SqlParam::text(&upper)],
-                            )
-                        }
-                        // No upper bound exists: an empty search value (which
-                        // matches every indexed value) or an all-`char::MAX`
-                        // prefix. Fall back to the `LIKE` form. The strict `~~`
-                        // still proves the index predicate, so this needs no
-                        // conjunct either.
-                        None => {
-                            next += 1;
-                            SqlFragment::with_params(
-                                format!(
-                                    "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND {} LIKE ${} ESCAPE '\\')",
-                                    param.name, FOLDED_STRING_EXPR, next
-                                ),
-                                vec![SqlParam::text(&format!("{}%", like_escape(&folded)))],
-                            )
-                        }
-                    }
-                }
-            };
-            conditions.push(condition);
+            let (predicate, params) =
+                Self::string_value_predicate(param.modifier.as_ref(), value, &mut next);
+            conditions.push(SqlFragment::with_params(
+                Self::index_membership(&param.name, &predicate),
+                params,
+            ));
         }
 
         if conditions.is_empty() {
@@ -1482,6 +1402,109 @@ impl PostgresQueryBuilder {
             combined = combined.or(cond);
         }
         Some(combined)
+    }
+
+    /// Wraps a bare `search_index` row predicate into the top-level membership
+    /// test `id IN (SELECT resource_id FROM search_index WHERE … AND
+    /// param_name = '<p>' AND <predicate>)`.
+    ///
+    /// The `*_value_predicate` functions below build the bare predicate for one
+    /// search value; the `build_*_condition` functions wrap it with this, and
+    /// `build_contained` — which groups the contained rows itself and needs
+    /// only the row predicate — uses it bare (#1407). The text is exactly what
+    /// each builder used to inline: [`Self::single_index_predicate`] and
+    /// [`Self::or_values`] recognize it by [`Self::INDEX_MEMBERSHIP_PREFIX`].
+    fn index_membership(param_name: &str, predicate: &str) -> String {
+        format!(
+            "{}param_name = '{}' AND {})",
+            Self::INDEX_MEMBERSHIP_PREFIX,
+            param_name,
+            predicate
+        )
+    }
+
+    /// The bare row predicate for one value of a `string` parameter. See
+    /// [`Self::build_string_condition`] for the three index shapes. The
+    /// starts-with form is an unparenthesized conjunction of two bounds.
+    fn string_value_predicate(
+        modifier: Option<&SearchModifier>,
+        value: &SearchValue,
+        next: &mut usize,
+    ) -> (String, Vec<SqlParam>) {
+        match modifier {
+            Some(SearchModifier::Exact) => {
+                *next += 1;
+                (
+                    format!("value_string = ${}", next),
+                    vec![SqlParam::text(&value.value)],
+                )
+            }
+            // `:text` on a string is a case-insensitive partial match,
+            // implemented here as a substring match (same as `:contains`).
+            // Match the accent-folded column (falling back to the raw column
+            // for not-yet-reindexed rows) against a folded pattern.
+            //
+            // A leading `%` is not btree-sargable, so this is served by the
+            // trigram GIN index v34 adds — which is why the
+            // `value_string IS NOT NULL` conjunct is absent here too. It cost
+            // the same 200x row-estimate error it cost the starts-with form,
+            // and on that estimate the planner never costed the GIN scan
+            // competitively. `~~` is strict in the COALESCE, so it proves both
+            // the trigram index's predicate and the btree pattern index's
+            // without help. Where the extension is unavailable the btree
+            // pattern index serves it at parity with the pre-v34 plan.
+            Some(SearchModifier::Contains | SearchModifier::Text) => {
+                *next += 1;
+                (
+                    format!("{} LIKE ${} ESCAPE '\\'", FOLDED_STRING_EXPR, next),
+                    vec![SqlParam::text(&format!(
+                        "%{}%",
+                        like_escape(&fold_text(&value.value))
+                    ))],
+                )
+            }
+            _ => {
+                // Default: starts-with (case- and accent-insensitive).
+                //
+                // Emitted as an explicit bytewise range rather than
+                // `LIKE 'prefix%'`. The two are exactly equivalent —
+                // `like_escape` makes the pattern a pure literal prefix, and
+                // `prefix_upper_bound` is the same bound Postgres derives
+                // itself — but a range is sargable unconditionally, whereas
+                // `LIKE` is only sargable when the planner can see the
+                // pattern as a `Const`. It never can here: the pattern is a
+                // bind parameter, and any generic plan turns the whole
+                // predicate into `~~ like_escape($n, '\')`, a function call
+                // on a parameter, from which no prefix can be extracted.
+                let folded = fold_text(&value.value);
+                match prefix_upper_bound(&folded) {
+                    Some(upper) => {
+                        let lo = *next + 1;
+                        let hi = *next + 2;
+                        *next += 2;
+                        (
+                            format!(
+                                "{expr} ~>=~ ${lo} AND {expr} ~<~ ${hi}",
+                                expr = FOLDED_STRING_EXPR,
+                            ),
+                            vec![SqlParam::text(&folded), SqlParam::text(&upper)],
+                        )
+                    }
+                    // No upper bound exists: an empty search value (which
+                    // matches every indexed value) or an all-`char::MAX`
+                    // prefix. Fall back to the `LIKE` form. The strict `~~`
+                    // still proves the index predicate, so this needs no
+                    // conjunct either.
+                    None => {
+                        *next += 1;
+                        (
+                            format!("{} LIKE ${} ESCAPE '\\'", FOLDED_STRING_EXPR, next),
+                            vec![SqlParam::text(&format!("{}%", like_escape(&folded)))],
+                        )
+                    }
+                }
+            }
+        }
     }
 
     fn build_token_condition(param: &SearchParameter, offset: usize) -> Option<SqlFragment> {
@@ -1499,19 +1522,13 @@ impl PostgresQueryBuilder {
         ) {
             let starts_with = matches!(param.modifier, Some(SearchModifier::CodeText));
             let mut conditions = Vec::new();
-            for (i, value) in param.values.iter().enumerate() {
-                let param_num = offset + i + 1;
-                let pattern = if starts_with {
-                    format!("{}%", value.value)
-                } else {
-                    format!("%{}%", value.value)
-                };
+            let mut next = offset;
+            for value in param.values.iter() {
+                let (predicate, params) =
+                    Self::token_display_predicate(starts_with, value, &mut next);
                 conditions.push(SqlFragment::with_params(
-                    format!(
-                        "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_token_display ILIKE ${})",
-                        param.name, param_num
-                    ),
-                    vec![SqlParam::text(&pattern)],
+                    Self::index_membership(&param.name, &predicate),
+                    params,
                 ));
             }
             if conditions.is_empty() {
@@ -1546,65 +1563,9 @@ impl PostgresQueryBuilder {
         let mut next = offset;
 
         for value in param.values.iter() {
-            if let Some((system, code)) = value.value.split_once('|') {
-                if system.is_empty() {
-                    // |code - match any system
-                    next += 1;
-                    predicates.push(format!("value_token_code = ${}", next));
-                    params.push(SqlParam::text(code));
-                } else if code.is_empty() {
-                    // system| - match any code in system.
-                    //
-                    // `value_token_code IS NOT NULL` is a deliberate,
-                    // row-set-preserving conjunct, not a filter: it is what makes
-                    // the partial `idx_search_token_code_recent` (v22, `WHERE
-                    // value_token_code IS NOT NULL`) a legal candidate for this
-                    // shape, so a *broad* system streams recent-first and stops
-                    // at the LIMIT instead of heap-fetching and sorting its whole
-                    // match set. v31 measures 1074 buffers -> 26 for a 66,667-row
-                    // system, and it is the reason v31 could replace the 2,283 MB
-                    // `idx_search_token` with a seek-only index.
-                    //
-                    // As of v32 it is not merely helpful, it is LOAD-BEARING:
-                    // v32 dropped `idx_search_token_system` (the planner pointed
-                    // `system|code` at it — 80,089,347 tuples read, 358 ms p99),
-                    // so `idx_search_token_code_recent` is now the ONLY index a
-                    // `system|` predicate can reach. Remove this conjunct and the
-                    // form falls back to a sequential-scale scan of the
-                    // (tenant, type) slice.
-                    //
-                    // It excludes nothing. `IndexValue::Token` declares
-                    // `code: String`, and both writer paths set the column
-                    // unconditionally beside the system —
-                    // `IndexRow::from_extracted` and `CompositeRow::place` — so
-                    // no row this backend has ever written has a system without
-                    // a code. An empty code is a non-NULL empty string.
-                    next += 1;
-                    predicates.push(format!(
-                        "(value_token_code IS NOT NULL AND value_token_system = ${})",
-                        next
-                    ));
-                    params.push(SqlParam::text(system));
-                } else {
-                    // system|code - exact match, or a `code` element, whose
-                    // system is implicit and not verifiable here (#1379). The
-                    // marker is a constant, inlined so this form still binds 2.
-                    let s = next + 1;
-                    let c = next + 2;
-                    next += 2;
-                    predicates.push(format!(
-                        "(value_token_system IN (${}, '{}') AND value_token_code = ${})",
-                        s, IMPLICIT_TOKEN_SYSTEM, c
-                    ));
-                    params.push(SqlParam::text(system));
-                    params.push(SqlParam::text(code));
-                }
-            } else {
-                // code only - match any system
-                next += 1;
-                predicates.push(format!("value_token_code = ${}", next));
-                params.push(SqlParam::text(&value.value));
-            }
+            let (predicate, value_params) = Self::token_value_predicate(value, &mut next);
+            predicates.push(predicate);
+            params.extend(value_params);
         }
 
         if predicates.is_empty() {
@@ -1612,11 +1573,7 @@ impl PostgresQueryBuilder {
         }
 
         let mut combined = SqlFragment::with_params(
-            format!(
-                "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND ({}))",
-                param.name,
-                predicates.join(" OR ")
-            ),
+            Self::index_membership(&param.name, &format!("({})", predicates.join(" OR "))),
             params,
         );
 
@@ -1631,6 +1588,96 @@ impl PostgresQueryBuilder {
         Some(combined)
     }
 
+    /// The bare row predicate for one value of a token `:text` (contains) or
+    /// `:code-text` (starts-with) search, on the token's display text.
+    fn token_display_predicate(
+        starts_with: bool,
+        value: &SearchValue,
+        next: &mut usize,
+    ) -> (String, Vec<SqlParam>) {
+        *next += 1;
+        let pattern = if starts_with {
+            format!("{}%", value.value)
+        } else {
+            format!("%{}%", value.value)
+        };
+        (
+            format!("value_token_display ILIKE ${}", next),
+            vec![SqlParam::text(&pattern)],
+        )
+    }
+
+    /// The bare row predicate for one value of a plain token search, in its
+    /// four forms: `code`, `|code`, `system|` and `system|code`.
+    fn token_value_predicate(value: &SearchValue, next: &mut usize) -> (String, Vec<SqlParam>) {
+        if let Some((system, code)) = value.value.split_once('|') {
+            if system.is_empty() {
+                // |code - match any system
+                *next += 1;
+                (
+                    format!("value_token_code = ${}", next),
+                    vec![SqlParam::text(code)],
+                )
+            } else if code.is_empty() {
+                // system| - match any code in system.
+                //
+                // `value_token_code IS NOT NULL` is a deliberate,
+                // row-set-preserving conjunct, not a filter: it is what makes
+                // the partial `idx_search_token_code_recent` (v22, `WHERE
+                // value_token_code IS NOT NULL`) a legal candidate for this
+                // shape, so a *broad* system streams recent-first and stops
+                // at the LIMIT instead of heap-fetching and sorting its whole
+                // match set. v31 measures 1074 buffers -> 26 for a 66,667-row
+                // system, and it is the reason v31 could replace the 2,283 MB
+                // `idx_search_token` with a seek-only index.
+                //
+                // As of v32 it is not merely helpful, it is LOAD-BEARING:
+                // v32 dropped `idx_search_token_system` (the planner pointed
+                // `system|code` at it — 80,089,347 tuples read, 358 ms p99),
+                // so `idx_search_token_code_recent` is now the ONLY index a
+                // `system|` predicate can reach. Remove this conjunct and the
+                // form falls back to a sequential-scale scan of the
+                // (tenant, type) slice.
+                //
+                // It excludes nothing. `IndexValue::Token` declares
+                // `code: String`, and both writer paths set the column
+                // unconditionally beside the system —
+                // `IndexRow::from_extracted` and `CompositeRow::place` — so
+                // no row this backend has ever written has a system without
+                // a code. An empty code is a non-NULL empty string.
+                *next += 1;
+                (
+                    format!(
+                        "(value_token_code IS NOT NULL AND value_token_system = ${})",
+                        next
+                    ),
+                    vec![SqlParam::text(system)],
+                )
+            } else {
+                // system|code - exact match, or a `code` element, whose
+                // system is implicit and not verifiable here (#1379). The
+                // marker is a constant, inlined so this form still binds 2.
+                let s = *next + 1;
+                let c = *next + 2;
+                *next += 2;
+                (
+                    format!(
+                        "(value_token_system IN (${}, '{}') AND value_token_code = ${})",
+                        s, IMPLICIT_TOKEN_SYSTEM, c
+                    ),
+                    vec![SqlParam::text(system), SqlParam::text(code)],
+                )
+            }
+        } else {
+            // code only - match any system
+            *next += 1;
+            (
+                format!("value_token_code = ${}", next),
+                vec![SqlParam::text(&value.value)],
+            )
+        }
+    }
+
     /// Builds an `:of-type` identifier condition (token modifier).
     ///
     /// Value form: `type-system|type-code|identifier-value`. Empty parts are
@@ -1641,38 +1688,12 @@ impl PostgresQueryBuilder {
         let mut current = offset;
 
         for value in &param.values {
-            let parts: Vec<&str> = value.value.splitn(3, '|').collect();
-            if parts.len() != 3 {
+            let Some((predicate, params)) = Self::of_type_value_predicate(value, &mut current)
+            else {
                 continue;
-            }
-            let (type_system, type_code, identifier_value) = (parts[0], parts[1], parts[2]);
-
-            let mut conds = Vec::new();
-            // Identifier value (matched against the token code column).
-            if !identifier_value.is_empty() {
-                current += 1;
-                conds.push(format!("value_token_code = ${}", current));
-                all_params.push(SqlParam::text(identifier_value));
-            }
-            if !type_system.is_empty() {
-                current += 1;
-                conds.push(format!("value_identifier_type_system = ${}", current));
-                all_params.push(SqlParam::text(type_system));
-            }
-            if !type_code.is_empty() {
-                current += 1;
-                conds.push(format!("value_identifier_type_code = ${}", current));
-                all_params.push(SqlParam::text(type_code));
-            }
-            if conds.is_empty() {
-                continue;
-            }
-
-            value_conditions.push(format!(
-                "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND {})",
-                param.name,
-                conds.join(" AND ")
-            ));
+            };
+            all_params.extend(params);
+            value_conditions.push(Self::index_membership(&param.name, &predicate));
         }
 
         if value_conditions.is_empty() {
@@ -1682,6 +1703,43 @@ impl PostgresQueryBuilder {
             value_conditions.join(" OR "),
             all_params,
         ))
+    }
+
+    /// The bare row predicate for one `:of-type` value — an unparenthesized
+    /// conjunction over the identifier columns of one row — or `None` when the
+    /// value is not in the three-part form or names nothing.
+    fn of_type_value_predicate(
+        value: &SearchValue,
+        next: &mut usize,
+    ) -> Option<(String, Vec<SqlParam>)> {
+        let parts: Vec<&str> = value.value.splitn(3, '|').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+        let (type_system, type_code, identifier_value) = (parts[0], parts[1], parts[2]);
+
+        let mut conds = Vec::new();
+        let mut params: Vec<SqlParam> = Vec::new();
+        // Identifier value (matched against the token code column).
+        if !identifier_value.is_empty() {
+            *next += 1;
+            conds.push(format!("value_token_code = ${}", next));
+            params.push(SqlParam::text(identifier_value));
+        }
+        if !type_system.is_empty() {
+            *next += 1;
+            conds.push(format!("value_identifier_type_system = ${}", next));
+            params.push(SqlParam::text(type_system));
+        }
+        if !type_code.is_empty() {
+            *next += 1;
+            conds.push(format!("value_identifier_type_code = ${}", next));
+            params.push(SqlParam::text(type_code));
+        }
+        if conds.is_empty() {
+            return None;
+        }
+        Some((conds.join(" AND "), params))
     }
 
     /// Builds a composite-parameter condition.
@@ -2336,54 +2394,14 @@ impl PostgresQueryBuilder {
         let mut next = offset; // running 0-based param offset
 
         for value in &param.values {
-            let (filter, params): (String, Vec<SqlParam>) = match value.value.split_once('|') {
-                Some(("", code)) => {
-                    next += 1;
-                    (
-                        format!(
-                            "(idx.value_token_system IS NULL OR idx.value_token_system = '') AND idx.value_token_code = ${next}"
-                        ),
-                        vec![SqlParam::text(code)],
-                    )
-                }
-                Some((system, "")) => {
-                    next += 1;
-                    (
-                        format!("idx.value_token_system = ${next}"),
-                        vec![SqlParam::text(system)],
-                    )
-                }
-                Some((system, code)) => {
-                    let s = next + 1;
-                    let c = next + 2;
-                    next += 2;
-                    (
-                        format!("idx.value_token_system = ${s} AND idx.value_token_code = ${c}"),
-                        vec![SqlParam::text(system), SqlParam::text(code)],
-                    )
-                }
-                None => {
-                    next += 1;
-                    (
-                        format!("idx.value_token_code = ${next}"),
-                        vec![SqlParam::text(&value.value)],
-                    )
-                }
-            };
-            // The target's `Type/id`, compared against the stored reference.
-            // `idx.tenant_id = $1` is load-bearing, not defensive: without it the
-            // sub-select yields any tenant's target, and this tenant's rows match
-            // on the strength of another tenant's identifiers.
+            let (filter, params) = Self::reference_identifier_filter(value, &mut next);
             conditions.push(SqlFragment::with_params(
                 format!(
                     "id IN (SELECT ref.resource_id FROM search_index ref \
                      WHERE ref.tenant_id = $1 AND ref.resource_type = $2 AND ref.param_name = '{}' \
-                     AND ref.value_reference IN \
-                       (SELECT idx.resource_type || '/' || idx.resource_id \
-                          FROM search_index idx \
-                         WHERE idx.tenant_id = $1 AND idx.param_name = 'identifier' \
-                           AND {filter}))",
-                    param.name
+                     AND {})",
+                    param.name,
+                    Self::reference_identifier_predicate("ref.value_reference", &filter)
                 ),
                 params,
             ));
@@ -2397,6 +2415,66 @@ impl PostgresQueryBuilder {
             combined = combined.or(cond);
         }
         Some(combined)
+    }
+
+    /// The filter on the target's `identifier` rows (`idx`) for one
+    /// `:identifier` value, in its four forms.
+    fn reference_identifier_filter(
+        value: &SearchValue,
+        next: &mut usize,
+    ) -> (String, Vec<SqlParam>) {
+        match value.value.split_once('|') {
+            Some(("", code)) => {
+                *next += 1;
+                (
+                    format!(
+                        "(idx.value_token_system IS NULL OR idx.value_token_system = '') AND idx.value_token_code = ${next}"
+                    ),
+                    vec![SqlParam::text(code)],
+                )
+            }
+            Some((system, "")) => {
+                *next += 1;
+                (
+                    format!("idx.value_token_system = ${next}"),
+                    vec![SqlParam::text(system)],
+                )
+            }
+            Some((system, code)) => {
+                let s = *next + 1;
+                let c = *next + 2;
+                *next += 2;
+                (
+                    format!("idx.value_token_system = ${s} AND idx.value_token_code = ${c}"),
+                    vec![SqlParam::text(system), SqlParam::text(code)],
+                )
+            }
+            None => {
+                *next += 1;
+                (
+                    format!("idx.value_token_code = ${next}"),
+                    vec![SqlParam::text(&value.value)],
+                )
+            }
+        }
+    }
+
+    /// The bare row predicate of an `:identifier` search: `column` — the
+    /// reference row's `value_reference`, qualified as the caller needs — is
+    /// among the `Type/id` of the resources whose `identifier` rows pass
+    /// `filter`.
+    ///
+    /// `idx.tenant_id = $1` is load-bearing, not defensive: without it the
+    /// sub-select yields any tenant's target, and this tenant's rows match
+    /// on the strength of another tenant's identifiers.
+    fn reference_identifier_predicate(column: &str, filter: &str) -> String {
+        format!(
+            "{column} IN \
+               (SELECT idx.resource_type || '/' || idx.resource_id \
+                  FROM search_index idx \
+                 WHERE idx.tenant_id = $1 AND idx.param_name = 'identifier' \
+                   AND {filter})"
+        )
     }
 
     /// Builds the condition for a reference parameter.
@@ -2458,90 +2536,16 @@ impl PostgresQueryBuilder {
 
         let mut conditions: Vec<String> = Vec::new();
         let mut params: Vec<SqlParam> = Vec::new();
-        // :contains - case-insensitive substring on the stored reference.
-        // :text (contains) / :code-text (starts-with) match the indexed
-        // Reference.display text.
-        let modifier = param.modifier.as_ref();
-        let is_contains = matches!(modifier, Some(SearchModifier::Contains));
-        let is_text = matches!(modifier, Some(SearchModifier::Text));
-        let is_code_text = matches!(modifier, Some(SearchModifier::CodeText));
-        let is_below = matches!(modifier, Some(SearchModifier::Below));
-        let is_above = matches!(modifier, Some(SearchModifier::Above));
-        let type_modifier = match modifier {
-            Some(SearchModifier::Type(type_name)) => Some(type_name.as_str()),
-            _ => None,
-        };
-
-        // The plain path binds a variable number of parameters per value (two for
-        // a type-prefixed reference, three for a bare id), so `param_num` runs as
+        // The plain path binds a variable number of parameters per value (one for
+        // a type-prefixed reference, two for a bare id), so `param_num` runs as
         // a counter rather than `offset + i`. `build_search_query` advances the
         // next parameter's offset by `params.len()`, so this stays consistent.
         let mut param_num = offset;
         for value in &param.values {
-            let predicate = if is_text {
-                param_num += 1;
-                params.push(SqlParam::text(&value.value));
-                format!("value_reference_display ILIKE '%' || ${} || '%'", param_num)
-            } else if is_code_text {
-                param_num += 1;
-                params.push(SqlParam::text(&value.value));
-                format!("value_reference_display ILIKE ${} || '%'", param_num)
-            } else if is_contains {
-                param_num += 1;
-                params.push(SqlParam::text(&value.value));
-                format!("value_reference ILIKE '%' || ${} || '%'", param_num)
-            } else if is_below {
-                // URL/path-prefix hierarchy (canonical |version not handled).
-                param_num += 1;
-                params.push(SqlParam::text(&value.value));
-                format!(
-                    "(value_reference = ${0} OR value_reference LIKE ${0} || '/%')",
-                    param_num
-                )
-            } else if is_above {
-                param_num += 1;
-                params.push(SqlParam::text(&value.value));
-                format!(
-                    "(${0} = value_reference OR ${0} LIKE value_reference || '/%')",
-                    param_num
-                )
-            } else {
-                // Plain reference match. Normalize `:Type` + bare id to `Type/id`,
-                // then match version-agnostically off the version-stripped base.
-                let stripped = strip_reference_version(&value.value);
-                let base = match type_modifier {
-                    Some(type_name) if !stripped.contains('/') => {
-                        format!("{}/{}", type_name, stripped)
-                    }
-                    _ => stripped.to_string(),
-                };
-                let escaped = like_escape(&base);
-
-                if base.contains('/') {
-                    // `Type/id` or an absolute URL. One equality: the stored
-                    // value is the version-agnostic base (schema v33), so a
-                    // stored version cannot hide a match from it.
-                    let exact = param_num + 1;
-                    param_num += 1;
-                    params.push(SqlParam::text(&base));
-                    format!("value_reference = ${exact}")
-                } else {
-                    // Bare logical id: also match any reference ending in `/id`.
-                    // The suffix arm is a leading-wildcard `LIKE` and is not
-                    // sargable in any operator class — see the note on this
-                    // function about what that costs.
-                    let exact = param_num + 1;
-                    let suffix = param_num + 2;
-                    param_num += 2;
-                    params.push(SqlParam::text(&base));
-                    params.push(SqlParam::text(&format!("%/{}", escaped)));
-                    format!(
-                        "(value_reference = ${exact} \
-                          OR value_reference LIKE ${suffix} ESCAPE '\\')"
-                    )
-                }
-            };
+            let (predicate, value_params) =
+                Self::reference_value_predicate(param.modifier.as_ref(), value, &mut param_num);
             conditions.push(predicate);
+            params.extend(value_params);
         }
 
         if conditions.is_empty() {
@@ -2562,43 +2566,107 @@ impl PostgresQueryBuilder {
         ))
     }
 
-    fn build_uri_condition(param: &SearchParameter, offset: usize) -> Option<SqlFragment> {
-        let modifier = param.modifier.as_ref();
-        let mut conditions = Vec::new();
+    /// The bare row predicate for one value of a reference search (every form
+    /// but `:identifier`, which spans two index rows — see
+    /// [`Self::reference_identifier_predicate`]).
+    fn reference_value_predicate(
+        modifier: Option<&SearchModifier>,
+        value: &SearchValue,
+        param_num: &mut usize,
+    ) -> (String, Vec<SqlParam>) {
+        // :contains - case-insensitive substring on the stored reference.
+        // :text (contains) / :code-text (starts-with) match the indexed
+        // Reference.display text.
+        let type_modifier = match modifier {
+            Some(SearchModifier::Type(type_name)) => Some(type_name.as_str()),
+            _ => None,
+        };
+        let mut params: Vec<SqlParam> = Vec::new();
 
-        for (i, value) in param.values.iter().enumerate() {
-            let param_num = offset + i + 1;
-            let condition = match modifier {
-                Some(SearchModifier::Contains) => SqlFragment::with_params(
+        let predicate = match modifier {
+            Some(SearchModifier::Text) => {
+                *param_num += 1;
+                params.push(SqlParam::text(&value.value));
+                format!("value_reference_display ILIKE '%' || ${} || '%'", param_num)
+            }
+            Some(SearchModifier::CodeText) => {
+                *param_num += 1;
+                params.push(SqlParam::text(&value.value));
+                format!("value_reference_display ILIKE ${} || '%'", param_num)
+            }
+            Some(SearchModifier::Contains) => {
+                *param_num += 1;
+                params.push(SqlParam::text(&value.value));
+                format!("value_reference ILIKE '%' || ${} || '%'", param_num)
+            }
+            Some(SearchModifier::Below) => {
+                // URL/path-prefix hierarchy (canonical |version not handled).
+                *param_num += 1;
+                params.push(SqlParam::text(&value.value));
+                format!(
+                    "(value_reference = ${0} OR value_reference LIKE ${0} || '/%')",
+                    param_num
+                )
+            }
+            Some(SearchModifier::Above) => {
+                *param_num += 1;
+                params.push(SqlParam::text(&value.value));
+                format!(
+                    "(${0} = value_reference OR ${0} LIKE value_reference || '/%')",
+                    param_num
+                )
+            }
+            _ => {
+                // Plain reference match. Normalize `:Type` + bare id to `Type/id`,
+                // then match version-agnostically off the version-stripped base.
+                let stripped = strip_reference_version(&value.value);
+                let base = match type_modifier {
+                    Some(type_name) if !stripped.contains('/') => {
+                        format!("{}/{}", type_name, stripped)
+                    }
+                    _ => stripped.to_string(),
+                };
+                let escaped = like_escape(&base);
+
+                if base.contains('/') {
+                    // `Type/id` or an absolute URL. One equality: the stored
+                    // value is the version-agnostic base (schema v33), so a
+                    // stored version cannot hide a match from it.
+                    let exact = *param_num + 1;
+                    *param_num += 1;
+                    params.push(SqlParam::text(&base));
+                    format!("value_reference = ${exact}")
+                } else {
+                    // Bare logical id: also match any reference ending in `/id`.
+                    // The suffix arm is a leading-wildcard `LIKE` and is not
+                    // sargable in any operator class — see the note on
+                    // `build_reference_condition` about what that costs.
+                    let exact = *param_num + 1;
+                    let suffix = *param_num + 2;
+                    *param_num += 2;
+                    params.push(SqlParam::text(&base));
+                    params.push(SqlParam::text(&format!("%/{}", escaped)));
                     format!(
-                        "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_uri ILIKE '%' || ${} || '%')",
-                        param.name, param_num
-                    ),
-                    vec![SqlParam::text(&value.value)],
-                ),
-                Some(SearchModifier::Below) => SqlFragment::with_params(
-                    format!(
-                        "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_uri LIKE ${} || '%')",
-                        param.name, param_num
-                    ),
-                    vec![SqlParam::text(&value.value)],
-                ),
-                Some(SearchModifier::Above) => SqlFragment::with_params(
-                    format!(
-                        "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND ${} LIKE value_uri || '%')",
-                        param.name, param_num
-                    ),
-                    vec![SqlParam::text(&value.value)],
-                ),
-                _ => SqlFragment::with_params(
-                    format!(
-                        "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_uri = ${})",
-                        param.name, param_num
-                    ),
-                    vec![SqlParam::text(&value.value)],
-                ),
-            };
-            conditions.push(condition);
+                        "(value_reference = ${exact} \
+                          OR value_reference LIKE ${suffix} ESCAPE '\\')"
+                    )
+                }
+            }
+        };
+        (predicate, params)
+    }
+
+    fn build_uri_condition(param: &SearchParameter, offset: usize) -> Option<SqlFragment> {
+        let mut conditions = Vec::new();
+        let mut next = offset;
+
+        for value in param.values.iter() {
+            let (predicate, params) =
+                Self::uri_value_predicate(param.modifier.as_ref(), value, &mut next);
+            conditions.push(SqlFragment::with_params(
+                Self::index_membership(&param.name, &predicate),
+                params,
+            ));
         }
 
         if conditions.is_empty() {
@@ -2609,6 +2677,23 @@ impl PostgresQueryBuilder {
             combined = combined.or(cond);
         }
         Some(combined)
+    }
+
+    /// The bare row predicate for one value of a `uri` search: equality, or
+    /// the `:contains` / `:below` / `:above` string forms.
+    fn uri_value_predicate(
+        modifier: Option<&SearchModifier>,
+        value: &SearchValue,
+        next: &mut usize,
+    ) -> (String, Vec<SqlParam>) {
+        *next += 1;
+        let predicate = match modifier {
+            Some(SearchModifier::Contains) => format!("value_uri ILIKE '%' || ${} || '%'", next),
+            Some(SearchModifier::Below) => format!("value_uri LIKE ${} || '%'", next),
+            Some(SearchModifier::Above) => format!("${} LIKE value_uri || '%'", next),
+            _ => format!("value_uri = ${}", next),
+        };
+        (predicate, vec![SqlParam::text(&value.value)])
     }
 
     /// Converts a FHIR search prefix to a SQL comparison operator.
