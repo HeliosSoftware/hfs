@@ -382,18 +382,32 @@ async fn index_writes_do_not_retry_permanent_failures() {
     }
 }
 
+/// A cluster nothing listens on: `127.0.0.1:1`.
+///
+/// What this must produce is a *refused connection* — retried, then reported
+/// as unavailable — not a *request timeout*, which is deliberately never
+/// retried (each resend would wait out another full timeout). Which of the two
+/// happens first depends on the platform: Linux refuses a closed local port at
+/// once, while Windows retries the connect for about two seconds before
+/// reporting the refusal. With a 2 s request timeout the timeout won that race
+/// on the Windows runner, so the write was not retried and the health probe —
+/// three slow refusals — outlived its own 5 s budget. The request timeout here
+/// only has to be comfortably longer than the slowest platform's refusal.
+fn unreachable_config() -> ElasticsearchConfig {
+    ElasticsearchConfig {
+        nodes: vec!["http://127.0.0.1:1".to_string()],
+        request_timeout_ms: 15_000,
+        ..Default::default()
+    }
+}
+
 /// An unreachable cluster is retried like the reads retry it, then reported as
 /// unavailable.
 #[tokio::test]
 async fn index_write_on_an_unreachable_cluster_is_unavailable() {
     // Nothing listens on port 1. (`update` skips nothing: `ensure_index` is the
     // first request and fails the same way.)
-    let config = ElasticsearchConfig {
-        nodes: vec!["http://127.0.0.1:1".to_string()],
-        request_timeout_ms: 2_000,
-        ..Default::default()
-    };
-    let es = ElasticsearchBackend::new(config).expect("client construction is lazy");
+    let es = ElasticsearchBackend::new(unreachable_config()).expect("client construction is lazy");
     let error = es
         .delete(&tenant(), "Patient", "p1")
         .await
@@ -902,14 +916,12 @@ async fn a_failed_health_probe_reads_as_unhealthy() {
     );
     assert_eq!(server.received_requests().await.unwrap().len(), 3);
 
-    // Nor is one that cannot be reached.
-    let config = ElasticsearchConfig {
-        nodes: vec!["http://127.0.0.1:1".to_string()],
-        request_timeout_ms: 2_000,
-        ..Default::default()
-    };
-    let unreachable = ElasticsearchBackend::new(config).unwrap();
-    let result = HealthMonitor::check_backend(&unreachable, Duration::from_secs(5)).await;
+    // Nor is one that cannot be reached. The probe timeout leaves room for
+    // three refused connects on a platform that is slow to refuse one (see
+    // `unreachable_config`): a probe that runs out of time is `Timeout`, a
+    // different answer from the one asserted here.
+    let unreachable = ElasticsearchBackend::new(unreachable_config()).unwrap();
+    let result = HealthMonitor::check_backend(&unreachable, Duration::from_secs(30)).await;
     assert!(
         matches!(result, HealthCheckResult::Unhealthy { .. }),
         "{result:?}"
