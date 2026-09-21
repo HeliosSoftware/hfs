@@ -338,6 +338,48 @@ impl QueryBuilder {
                 continue;
             }
 
+            // A composite is decided per `composite_group` of one contained
+            // entity — every component satisfied by a row of the same group —
+            // which is not a predicate on one row, so it narrows the entities
+            // like `_id` does rather than joining the branches (#1407). Same
+            // pairing as `build_composite_parameter_condition`, keyed on the
+            // contained entity instead of `resource_key`.
+            if param.param_type == SearchParamType::Composite {
+                let mut alternatives = Vec::new();
+                for value in &param.values {
+                    match CompositeHandler::build_component_fragments(
+                        value,
+                        &param.components,
+                        offset,
+                    ) {
+                        Some(fragments) if !fragments.is_empty() => {
+                            let havings: Vec<String> = fragments
+                                .iter()
+                                .map(|f| format!("MAX(CASE WHEN {} THEN 1 ELSE 0 END) = 1", f.sql))
+                                .collect();
+                            for f in fragments {
+                                offset += f.params.len();
+                                params.extend(f.params);
+                            }
+                            alternatives.push(format!(
+                                "(resource_type, resource_id, contained_local_id) IN \
+                                 (SELECT resource_type, resource_id, contained_local_id \
+                                 FROM search_index WHERE tenant_id = ?1 AND is_contained = 1 \
+                                 AND contained_type = ?2 AND param_name = '{}' \
+                                 GROUP BY resource_type, resource_id, contained_local_id, \
+                                 composite_group HAVING {})",
+                                param.name,
+                                havings.join(" AND ")
+                            ));
+                        }
+                        // Unparseable: fail closed, as the top-level builder does.
+                        _ => alternatives.push("0 = 1".to_string()),
+                    }
+                }
+                entity_filters.push(format!("({})", alternatives.join(" OR ")));
+                continue;
+            }
+
             let mut or_conditions = Vec::new();
             let mut local_offset = offset;
             for value in &param.values {
@@ -443,8 +485,8 @@ impl QueryBuilder {
     /// - `_text`, `_content`, `_filter` and the other `_`-parameters that are
     ///   resolved against `resources` or the FTS tables, which only know the
     ///   container;
-    /// - composites, whose `composite_group` pairing `build_contained` does
-    ///   not reproduce, and chains, which it does not follow;
+    /// - chains, which it does not follow (composites are paired per
+    ///   `composite_group` of the contained entity, #1407);
     /// - `:missing`, refused here since the modifier was introduced and pinned
     ///   as a 400 by the REST and PostgreSQL suites, and the modifiers that are
     ///   not a predicate on one index row.
@@ -467,7 +509,15 @@ impl QueryBuilder {
             return Some("this parameter is".to_string());
         }
         let row_level = match (&param.modifier, param.param_type) {
-            (_, SearchParamType::Composite) => return Some("composite parameters are".to_string()),
+            // Paired per `composite_group` by `build_contained`. Without its
+            // components (the REST layer resolves them) there is nothing to
+            // pair, and no modifier applies to a composite.
+            (None, SearchParamType::Composite) if !param.components.is_empty() => true,
+            (_, SearchParamType::Composite) => {
+                return Some(
+                    "composite parameters with a modifier or no components are".to_string(),
+                );
+            }
             (_, SearchParamType::Special) => return Some("special parameters are".to_string()),
             (None | Some(SearchModifier::Not), _) => true,
             (
@@ -1970,6 +2020,50 @@ mod tests {
         assert!(frag.sql.contains("param_name = '_tag'"), "{}", frag.sql);
         assert!(frag.sql.contains("param_name = '_profile'"), "{}", frag.sql);
         assert!(QueryBuilder::reject_unsupported_contained(&query).is_ok());
+    }
+
+    /// A composite narrows the contained entities by a per-`composite_group`
+    /// pairing (#1407); its placeholders continue the numbering.
+    #[test]
+    fn contained_composite_is_paired_per_group_of_the_entity() {
+        let mut composite = contained_param(
+            "code-value-quantity",
+            SearchParamType::Composite,
+            None,
+            &["X$gt5"],
+        );
+        composite.components = vec![
+            crate::types::CompositeSearchComponent {
+                param_type: SearchParamType::Token,
+                param_name: "code".to_string(),
+            },
+            crate::types::CompositeSearchComponent {
+                param_type: SearchParamType::Quantity,
+                param_name: "value-quantity".to_string(),
+            },
+        ];
+        let query = contained_query(vec![
+            contained_param("status", SearchParamType::Token, None, &["final"]),
+            composite,
+        ]);
+        assert!(QueryBuilder::reject_unsupported_contained(&query).is_ok());
+        let frag = QueryBuilder::new("t", "Observation")
+            .build_contained(&query)
+            .unwrap();
+        assert!(
+            frag.sql.contains(
+                "AND ((resource_type, resource_id, contained_local_id) IN (SELECT resource_type, \
+                 resource_id, contained_local_id FROM search_index WHERE tenant_id = ?1 AND \
+                 is_contained = 1 AND contained_type = ?2 AND param_name = 'code-value-quantity' \
+                 GROUP BY resource_type, resource_id, contained_local_id, composite_group HAVING "
+            ),
+            "{}",
+            frag.sql
+        );
+        // `status` binds ?3; the composite's components follow, gap-free.
+        let highest = (3..=frag.params.len() + 2).all(|n| frag.sql.contains(&format!("?{n}")));
+        assert!(highest, "{} / {} params", frag.sql, frag.params.len());
+        assert!(!frag.sql.contains(&format!("?{}", frag.params.len() + 3)));
     }
 
     #[test]

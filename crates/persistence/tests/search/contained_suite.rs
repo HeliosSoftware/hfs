@@ -139,6 +139,26 @@ fn code_value_quantity(value: &str) -> SearchParameter {
     parameter
 }
 
+/// `component-code-value-quantity`, whose components repeat within a resource.
+fn component_code_value_quantity(value: &str) -> SearchParameter {
+    let mut parameter = literal(
+        "component-code-value-quantity",
+        SearchParamType::Composite,
+        value,
+    );
+    parameter.components = vec![
+        CompositeSearchComponent {
+            param_type: SearchParamType::Token,
+            param_name: "component-code".to_string(),
+        },
+        CompositeSearchComponent {
+            param_type: SearchParamType::Quantity,
+            param_name: "component-value-quantity".to_string(),
+        },
+    ];
+    parameter
+}
+
 fn observation(id: &str, code: &str, date: &str, categories: &[&str]) -> Value {
     let categories: Vec<Value> = categories
         .iter()
@@ -429,6 +449,8 @@ where
 /// - `m-str`: `s1` — `valueString` "hello"
 /// - `m-other`: `o1` — code Y with text "Glucose level", `valueString`
 ///   "Hello World"
+/// - `m-comp`: `c1` — code Z, components A = 1 mg and B = 9 mg: a composite
+///   must pair a code with the quantity of the *same* component
 pub async fn criteria_are_applied_or_rejected<S>(backend: &S, tenant_base: &str)
 where
     S: ResourceStorage + SearchProvider,
@@ -469,6 +491,17 @@ where
     let mut other = observation("o1", "Y", "2020-06-15", &["cat1"]);
     other["code"]["text"] = json!("Glucose level");
     other["valueString"] = json!("Hello World");
+    let mut components = observation("c1", "Z", "2020-06-15", &["cat1"]);
+    components["component"] = json!([
+        {
+            "code": {"coding": [{"system": "http://loinc.org", "code": "A"}]},
+            "valueQuantity": quantity(1.0),
+        },
+        {
+            "code": {"coding": [{"system": "http://loinc.org", "code": "B"}]},
+            "valueQuantity": quantity(9.0),
+        },
+    ]);
 
     seed_containers(
         backend,
@@ -478,6 +511,7 @@ where
             ("m-plain", vec![plain]),
             ("m-str", vec![string]),
             ("m-other", vec![other]),
+            ("m-comp", vec![components]),
         ],
     )
     .await;
@@ -595,11 +629,39 @@ where
             vec![code_x(), code_value_quantity("X$gt5")],
             Expect::IdsOrRejected(&["m-tagged"], "code-value-quantity"),
         ),
+        // Pairing: code A goes with 1 mg and code B with 9 mg. `A$gt5` holds
+        // for no single component, though A and a quantity > 5 both occur.
+        Case::new(
+            "component-code-value-quantity=A$lt5",
+            vec![component_code_value_quantity("A$lt5")],
+            Expect::IdsOrRejected(&["m-comp"], "component-code-value-quantity"),
+        ),
+        Case::new(
+            "component-code-value-quantity=A$gt5",
+            vec![component_code_value_quantity("A$gt5")],
+            Expect::IdsOrRejected(&[], "component-code-value-quantity"),
+        ),
+        Case::new(
+            "component-code-value-quantity=A$gt5,B$gt5",
+            vec![SearchParameter {
+                values: vec![
+                    SearchValue::new(SearchPrefix::Eq, "A$gt5"),
+                    SearchValue::new(SearchPrefix::Eq, "B$gt5"),
+                ],
+                ..component_code_value_quantity("")
+            }],
+            Expect::IdsOrRejected(&["m-comp"], "component-code-value-quantity"),
+        ),
+        Case::new(
+            "code=X&code-value-quantity=X$lt5",
+            vec![code_x(), code_value_quantity("X$lt5")],
+            Expect::IdsOrRejected(&["m-plain"], "code-value-quantity"),
+        ),
         // 3. Modifiers.
         Case::new(
             "code:not=X",
             vec![with_modifier(code_x(), SearchModifier::Not)],
-            Expect::IdsOrRejected(&["m-other"], "code"),
+            Expect::IdsOrRejected(&["m-comp", "m-other"], "code"),
         ),
         Case::new(
             "code:text=glucose",
@@ -630,7 +692,7 @@ where
         Case::new(
             "value-string:missing=true",
             vec![with_modifier(value_string("true"), SearchModifier::Missing)],
-            Expect::IdsOrRejected(&["m-plain", "m-tagged"], "value-string"),
+            Expect::IdsOrRejected(&["m-comp", "m-plain", "m-tagged"], "value-string"),
         ),
         Case::new(
             "value-string:missing=false",
