@@ -109,6 +109,11 @@ pub fn get_resource_type_names() -> &'static [&'static str] {
 /// assert!(!is_valid_resource_type("InvalidType"));
 /// assert!(!is_valid_resource_type("patient")); // Case-sensitive
 /// ```
+// In a single-version build only one `#[cfg]` branch below survives, collapsing
+// the chain to a single `if cond { return true; } false` that clippy flags as
+// needless_bool. The chain is required for multi-version builds, where more than
+// one branch survives.
+#[allow(clippy::needless_bool)]
 pub fn is_valid_resource_type(type_name: &str) -> bool {
     // One `|=` per enabled version rather than a chain of early returns: in a
     // single-version build that chain is `if x { return true; } false`, which
@@ -142,6 +147,9 @@ pub fn is_valid_resource_type(type_name: &str) -> bool {
 /// the FHIR router and gets a client error instead of being reinterpreted as a
 /// tenant prefix. Write handlers still require the exact, case-sensitive name
 /// for the request's effective FHIR version through [`admit_resource_type`].
+// See the `#[allow]` on `is_valid_resource_type` above: same single-version
+// collapse applies here.
+#[allow(clippy::needless_bool)]
 pub fn is_reserved_resource_path(type_name: &str) -> bool {
     // Same shape as `is_valid_resource_type`, for the same reason.
     let mut reserved = false;
