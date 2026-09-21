@@ -1146,6 +1146,58 @@ pub enum PatchFormat {
     MergePatch(Value),
 }
 
+/// One of the four conditional interactions a [`ConditionalStorage`] may or
+/// may not really implement.
+///
+/// What the CapabilityStatement advertises in `rest.resource.conditional*`
+/// and what the REST layer answers `501` for are both read from
+/// [`ConditionalStorage::supports_conditional`], so the two cannot disagree
+/// (#1384).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConditionalInteraction {
+    /// `POST [type]` with `If-None-Exist`.
+    Create,
+    /// `PUT [type]?criteria`.
+    Update,
+    /// `DELETE [type]?criteria`.
+    Delete,
+    /// `PATCH [type]?criteria`.
+    Patch,
+}
+
+impl ConditionalInteraction {
+    /// Every conditional interaction, in CapabilityStatement element order.
+    pub const ALL: [ConditionalInteraction; 4] = [
+        ConditionalInteraction::Create,
+        ConditionalInteraction::Update,
+        ConditionalInteraction::Delete,
+        ConditionalInteraction::Patch,
+    ];
+
+    /// The [`BackendCapability`](crate::core::BackendCapability) a backend
+    /// declares when it implements this interaction.
+    pub fn capability(self) -> crate::core::BackendCapability {
+        use crate::core::BackendCapability;
+        match self {
+            ConditionalInteraction::Create => BackendCapability::ConditionalCreate,
+            ConditionalInteraction::Update => BackendCapability::ConditionalUpdate,
+            ConditionalInteraction::Delete => BackendCapability::ConditionalDelete,
+            ConditionalInteraction::Patch => BackendCapability::ConditionalPatch,
+        }
+    }
+}
+
+impl std::fmt::Display for ConditionalInteraction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ConditionalInteraction::Create => "conditional create",
+            ConditionalInteraction::Update => "conditional update",
+            ConditionalInteraction::Delete => "conditional delete",
+            ConditionalInteraction::Patch => "conditional patch",
+        })
+    }
+}
+
 /// Extension trait for conditional operations based on search criteria.
 ///
 /// Every `search_params` argument is the query portion of a search URL as it
@@ -1173,6 +1225,20 @@ pub enum PatchFormat {
 /// nothing either way.
 #[async_trait]
 pub trait ConditionalStorage: ResourceStorage {
+    /// Whether this storage really implements `interaction`, as opposed to
+    /// answering `UnsupportedCapability` for it.
+    ///
+    /// The default mirrors the trait itself: `conditional_create`,
+    /// `conditional_update` and `conditional_delete` are required methods,
+    /// `conditional_patch` defaults to `UnsupportedCapability`. A backend whose
+    /// methods differ from that — S3 refuses all four, SQLite and PostgreSQL
+    /// implement patch — overrides it from its declared
+    /// [`BackendCapability`](crate::core::BackendCapability) list, the same
+    /// list `tests/backend_capability_contract.rs` pins.
+    fn supports_conditional(&self, interaction: ConditionalInteraction) -> bool {
+        !matches!(interaction, ConditionalInteraction::Patch)
+    }
+
     /// Creates a resource only if no matching resource exists.
     ///
     /// # Arguments
