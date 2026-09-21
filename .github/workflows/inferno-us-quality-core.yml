@@ -2,6 +2,15 @@ name: Inferno US Quality Core Test Suite
 
 on:
   workflow_dispatch: # Manual trigger
+    inputs:
+      test_kit_ref:
+        description: "Test kit branch, tag or SHA in the fork to run instead of the pinned TEST_KIT_REF (e.g. to try a kit fix)"
+        required: false
+        default: ""
+      backends:
+        description: 'JSON array of backends to run, e.g. ["sqlite"]. Blank runs all of them'
+        required: false
+        default: ""
   schedule:
     # Weekly US Quality Core conformance tracking run — Saturday 08:00 UTC.
     # Kept off Sunday 08:00 (inferno-us-core, ~2.5h) and clear of the daily
@@ -21,9 +30,12 @@ env:
   # Pinned commit of our fork of inferno-framework/us-quality-core-test-kit.
   # Provides both the Inferno stack and the fixture bundles loaded into HFS,
   # so the suite and its data always move together. The fork carries no
-  # upstream tags, so pin by SHA: 41fc954 is upstream v0.2.0.
+  # upstream tags, so pin by SHA: 4b8bc2b is the fork's helios/ci-combined-fixes,
+  # upstream v0.2.0 (41fc954) plus our two fixes that are open upstream as
+  # inferno-framework/us-quality-core-test-kit#45 and #46. Move the pin back
+  # to an upstream release once one includes them.
   TEST_KIT_REPO: HeliosSoftware/us-quality-core-test-kit
-  TEST_KIT_REF: 41fc954beee8e9046e7935a043e470966de9b890
+  TEST_KIT_REF: ${{ inputs.test_kit_ref || '4b8bc2b814ee253058cf5820d35aab6e13d0640e' }}
   # Remote Docker host (set via GitHub repository secrets or variables; leave unset for local Docker)
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
   DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
@@ -214,16 +226,7 @@ jobs:
         suite_id: [us_quality_core_v100_ballot]
         # Same backend set as inferno-us-core.yml; the service-container and
         # HFS start steps below are ported from it.
-        backend:
-          [
-            sqlite,
-            sqlite-elasticsearch,
-            postgres,
-            postgres-elasticsearch,
-            mongodb,
-            mongodb-elasticsearch,
-            s3-elasticsearch,
-          ]
+        backend: ${{ fromJSON(inputs.backends || '["sqlite","sqlite-elasticsearch","postgres","postgres-elasticsearch","mongodb","mongodb-elasticsearch","s3-elasticsearch"]') }}
         include:
           - { suite_id: us_quality_core_v100_ballot, version_label: "v1.0.0-ballot" }
     steps:
@@ -271,16 +274,10 @@ jobs:
           # An entry here must suppress a *real* failure in the suite it is
           # emitted for (#492); the "Report omissions that suppressed nothing"
           # step below keeps the list honest. Baseline against the kit's own
-          # fixtures on sqlite: 578 pass / 1 skip / 1 fail, the fail being:
-
-          # simple_observation multiple-or status search: a test-kit/fixture
-          # gap, not an HFS one. The test searches category=sdoh (its first
-          # fixed category value) with every status OR'd, but takes the
-          # statuses it expects back (final, cancelled) from the patient's
-          # simple observations of *any* category. The kit's example bundle
-          # has no sdoh-category Observation at all, so the correct answer is
-          # an empty Bundle and the test fails against any conformant server.
-          OMITTED="\"${SUITE}-${SUITE}_fhir_api-${SUITE}_simple_observation-${SUITE}_simple_observation_patient_category_status_search_test\""
+          # fixtures at the pinned ref: 580 pass on every backend, so the list
+          # is empty. Upstream v0.2.0 was 578 pass / 1 skip / 1 fail; both were
+          # test-kit gaps, fixed in the pinned ref (see TEST_KIT_REF).
+          OMITTED=""
 
           echo "OMITTED_TESTS=[${OMITTED}]" >> $GITHUB_ENV
 

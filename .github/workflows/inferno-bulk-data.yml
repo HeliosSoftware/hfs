@@ -180,7 +180,7 @@ jobs:
           exit 1
 
   inferno-bulk-data-test:
-    name: Inferno Bulk Data v2.0.0 Tests
+    name: Inferno Bulk Data v4.0.0-ballot Tests
     needs: [build, inferno-stack-up]
     runs-on: [self-hosted, Linux]
     timeout-minutes: 90
