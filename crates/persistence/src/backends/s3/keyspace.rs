@@ -275,13 +275,20 @@ impl S3Keyspace {
     ///
     /// `file_url` names the manifest output file the line came from; see
     /// [`submit_file_segment`] for why it is part of the key.
-    pub fn submit_raw_line_key(
+    /// Key for the raw NDJSON archive of one ingest batch (chunk) of a file.
+    ///
+    /// One object holds every line of the batch, keyed by the batch's first
+    /// line number so successive chunks of the same file (each a separate
+    /// `process_entries` call) never collide (#1429). `file_url` names the
+    /// manifest output file the lines came from; see [`submit_file_segment`]
+    /// for why it is part of the key (two files' line-1 batches must differ).
+    pub fn submit_raw_batch_key(
         &self,
         submitter: &str,
         submission_id: &str,
         manifest_id: &str,
         file_url: Option<&str>,
-        line: u64,
+        first_line: u64,
     ) -> String {
         self.join(&[
             "bulk",
@@ -291,7 +298,7 @@ impl S3Keyspace {
             "raw",
             manifest_id,
             &submit_file_segment(file_url),
-            &format!("line-{}.ndjson", line),
+            &format!("batch-{}.ndjson", first_line),
         ])
     }
 
