@@ -423,6 +423,75 @@ impl RequestSettings {
             .and_then(|rails| rails.get(page.key()));
         RailState::from_raw(raw)
     }
+
+    /// The sanitized [`DashboardSelection`] the Home chart last stored, scoped
+    /// to `tenant` — the fallback the dashboard reads when the request carries
+    /// no explicit `?types=` selection. Like [`rail`](Self::rail), pure
+    /// in-memory navigation over the already-fetched document.
+    pub(crate) fn dashboard(&self, tenant: &str) -> DashboardSelection {
+        let Some(document) = &self.document else {
+            return DashboardSelection::default();
+        };
+        let projected = project_for_tenant(document, tenant);
+        DashboardSelection::from_raw(projected.get("dashboard"))
+    }
+}
+
+/// The maximum number of charted types kept in the stored selection. Mirrors
+/// `CHART_MAX_SERIES` in `lib.rs` (the chart's palette/legend cap): storing more
+/// than the chart can ever draw is pointless, and it bounds the settings value.
+const DASHBOARD_MAX_TYPES: usize = 6;
+
+/// The Home "FHIR resources over time" chart selection persisted per user and
+/// per tenant under the settings document's `dashboard` key (#1358): the charted
+/// resource types, the time window slug (`1h`/`24h`/`30d`), and the "View all
+/// resources" toggle. All fields are optional on read — an absent or malformed
+/// value reads as the empty default, which the dashboard treats as "no stored
+/// selection" and falls through to the provider default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct DashboardSelection {
+    /// Charted resource type names, already sanitized (ASCII-alphanumeric,
+    /// capped at [`DASHBOARD_MAX_TYPES`]). Empty means "nothing stored".
+    pub(crate) types: Vec<String>,
+    /// The time-window slug, if one was stored. `None` means "use the default".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) window: Option<String>,
+    /// The "View all resources" toggle.
+    pub(crate) all: bool,
+}
+
+impl DashboardSelection {
+    /// Reads and sanitizes a stored `dashboard` value, tolerating anything a
+    /// hand-edit or an older schema might hold: unknown fields are ignored,
+    /// non-string / non-alphanumeric type names are dropped, and the type list
+    /// is de-duplicated and capped. Never errors — a malformed value is the
+    /// empty default.
+    fn from_raw(raw: Option<&Value>) -> Self {
+        let Some(obj) = raw.and_then(Value::as_object) else {
+            return Self::default();
+        };
+        let mut seen = HashSet::new();
+        let types: Vec<String> = obj
+            .get("types")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric()))
+                    .filter(|t| seen.insert(t.to_string()))
+                    .take(DASHBOARD_MAX_TYPES)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let window = obj
+            .get("window")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let all = obj.get("all").and_then(Value::as_bool).unwrap_or(false);
+        Self { types, window, all }
+    }
 }
 
 impl<S> axum::extract::FromRequestParts<S> for RequestSettings
@@ -500,6 +569,37 @@ pub(crate) async fn persist(
     }
 }
 
+/// Writes the Home chart's `selection` to the settings document's `dashboard`
+/// key, scoped to `tenant` (#1358). Same best-effort, last-write-wins,
+/// no-precondition contract as [`persist`]: a `None` store is a silent no-op, a
+/// store error is logged and swallowed, and the tenant scoping is applied by
+/// [`scope_merge_patch`] so the value lands under `byTenant.<tenant>.dashboard`.
+pub(crate) async fn persist_dashboard(
+    settings: &Option<Arc<dyn SettingsStore>>,
+    user_key: &str,
+    tenant: &str,
+    selection: &DashboardSelection,
+) {
+    let Some(store) = settings else {
+        return;
+    };
+
+    let value = match serde_json::to_value(selection) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to serialize dashboard selection");
+            return;
+        }
+    };
+    let mut patch = Map::new();
+    patch.insert("dashboard".to_string(), value);
+    let patch = scope_merge_patch(Value::Object(patch), tenant);
+
+    if let Err(error) = store.patch_settings(user_key, patch, None).await {
+        tracing::warn!(tenant, error = %error, "failed to persist dashboard selection");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,6 +654,103 @@ mod tests {
 
         let other = settings.rail(RailPage::Resources, "gamma");
         assert_eq!(other, RailState::default());
+    }
+
+    #[test]
+    fn dashboard_selection_reads_the_tenant_subtree_and_sanitizes() {
+        let document = json!({
+            "byTenant": {
+                "acme": {"dashboard": {
+                    "types": ["Patient", "bad name", "Observation", "Patient", "Enc$", "A", "B", "C", "D", "E"],
+                    "window": "24h",
+                    "all": true
+                }},
+                "beta": {"dashboard": {"types": ["Condition"], "window": "1h", "all": false}}
+            }
+        });
+        let settings = RequestSettings {
+            user_key: "l2:".to_string(),
+            document: Some(document),
+            version: 1,
+        };
+        let acme = settings.dashboard("acme");
+        // Non-alphanumeric names dropped, duplicate Patient collapsed, capped at 6.
+        assert_eq!(
+            acme.types,
+            vec!["Patient", "Observation", "A", "B", "C", "D"]
+        );
+        assert_eq!(acme.window.as_deref(), Some("24h"));
+        assert!(acme.all);
+
+        // Another tenant's selection is not visible here.
+        let gamma = settings.dashboard("gamma");
+        assert_eq!(gamma, DashboardSelection::default());
+    }
+
+    #[test]
+    fn dashboard_selection_from_a_malformed_value_is_empty() {
+        // Absent document, wrong-typed value, and a non-object all read empty.
+        let none = RequestSettings {
+            user_key: "l2:".to_string(),
+            document: None,
+            version: 0,
+        };
+        assert_eq!(none.dashboard("acme"), DashboardSelection::default());
+
+        let settings = RequestSettings {
+            user_key: "l2:".to_string(),
+            document: Some(json!({"byTenant": {"acme": {"dashboard": "nonsense"}}})),
+            version: 0,
+        };
+        assert_eq!(settings.dashboard("acme"), DashboardSelection::default());
+    }
+
+    #[tokio::test]
+    async fn persist_dashboard_writes_a_tenant_scoped_patch_and_nothing_else() {
+        let store = Arc::new(mock_store::MockSettingsStore::default());
+        // Pre-existing content on another tenant, and this tenant's rails, must
+        // survive untouched.
+        store
+            .patch_settings(
+                "l2:",
+                json!({"theme": "dark", "byTenant": {
+                    "acme": {"rails": {"resources": {"last": "Patient", "recent": []}}},
+                    "beta": {"dashboard": {"types": ["X"], "all": false}}
+                }}),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let settings: Option<Arc<dyn SettingsStore>> = Some(store.clone());
+        let selection = DashboardSelection {
+            types: vec!["Patient".to_string(), "Observation".to_string()],
+            window: Some("30d".to_string()),
+            all: true,
+        };
+        persist_dashboard(&settings, "l2:", "acme", &selection).await;
+
+        let document = store.get_settings("l2:").await.unwrap().unwrap().document;
+        assert_eq!(
+            document["byTenant"]["acme"]["dashboard"],
+            json!({"types": ["Patient", "Observation"], "window": "30d", "all": true})
+        );
+        assert_eq!(
+            document["byTenant"]["acme"]["rails"]["resources"]["last"], "Patient",
+            "the same tenant's rails must be untouched"
+        );
+        assert_eq!(
+            document["byTenant"]["beta"]["dashboard"]["types"][0], "X",
+            "another tenant's dashboard must be untouched"
+        );
+        assert_eq!(document["theme"], "dark");
+    }
+
+    #[tokio::test]
+    async fn persist_dashboard_is_a_silent_no_op_with_no_settings_store() {
+        let settings: Option<Arc<dyn SettingsStore>> = None;
+        // Must not panic.
+        persist_dashboard(&settings, "l2:", "acme", &DashboardSelection::default()).await;
     }
 
     /// A pre-#313 legacy document with `rails` at the top level is read
