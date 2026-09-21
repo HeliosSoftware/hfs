@@ -305,8 +305,8 @@ impl QueryBuilder {
     ///
     /// `query.compartment` is one more branch, on the contained resource's
     /// own references. With no criterion at all the result is every contained
-    /// resource of the type (#1383), so this always returns `Some`; rows come
-    /// back in a stable order for the caller to page over.
+    /// resource of the type (#1383), so this always returns `Some`. The rows
+    /// are unordered; the caller sorts them before paging.
     pub fn build_contained(&self, query: &SearchQuery) -> Option<SqlFragment> {
         // (branch, negated)
         let mut branches: Vec<(String, bool)> = Vec::new();
@@ -428,8 +428,6 @@ impl QueryBuilder {
                 };
             sql.push_str(&format!(" HAVING {having}"));
         }
-        // A stable order: the caller pages over these rows.
-        sql.push_str(" ORDER BY resource_type, resource_id, contained_local_id");
         Some(SqlFragment::with_params(sql, params))
     }
 
@@ -1860,6 +1858,76 @@ mod tests {
             "{}",
             frag.sql
         );
+    }
+
+    /// #1383: no criterion is every contained resource of the type, and
+    /// compartment membership is one explicit branch over several names.
+    #[test]
+    fn contained_without_criteria_and_with_a_compartment() {
+        let builder = QueryBuilder::new("t", "Observation");
+        let frag = builder.build_contained(&contained_query(vec![])).unwrap();
+        assert!(
+            frag.sql.ends_with(
+                "contained_type = ?2 GROUP BY resource_type, resource_id, contained_local_id"
+            ),
+            "{}",
+            frag.sql
+        );
+        assert!(frag.params.is_empty());
+
+        let mut query = contained_query(vec![contained_param(
+            "code",
+            SearchParamType::Token,
+            None,
+            &["X"],
+        )]);
+        query.compartment = Some(CompartmentMembership {
+            params: vec!["subject".to_string(), "performer".to_string()],
+            reference: "Patient/p1/_history/2".to_string(),
+        });
+        let frag = builder.build_contained(&query).unwrap();
+        // The `HAVING` reuses the `WHERE` placeholders; none is bound twice.
+        let filter = frag.sql.split(" HAVING ").next().unwrap();
+        assert_eq!(numbered_placeholders(filter), vec![1, 2, 3, 4, 5]);
+        assert_eq!(frag.params.len(), 3);
+        let having = frag.sql.split(" HAVING ").nth(1).expect(&frag.sql);
+        // Counting names would let `subject` stand in for `code`.
+        assert!(!having.contains("COUNT(DISTINCT"), "{having}");
+        assert!(
+            having.contains(
+                "MAX(CASE WHEN (param_name IN ('subject', 'performer') AND value_reference IS NOT NULL"
+            ),
+            "{having}"
+        );
+        assert!(
+            matches!(&frag.params[1], SqlParam::String(s) if s == "Patient/p1"),
+            "{:?}",
+            frag.params
+        );
+    }
+
+    /// #1383: `_has` and `_list` select top-level resources.
+    #[test]
+    fn contained_refuses_has_and_list_by_name() {
+        let mut has = contained_query(vec![]);
+        has.reverse_chains
+            .push(crate::types::ReverseChainedParameter::terminal(
+                "Provenance",
+                "target",
+                "agent",
+                SearchValue::eq("Practitioner/x"),
+            ));
+        let mut list = contained_query(vec![]);
+        list.list.push("l1".to_string());
+        for (query, name) in [(has, "'_has'"), (list, "'_list'")] {
+            let message = QueryBuilder::reject_unsupported_contained(&query)
+                .unwrap_err()
+                .to_string();
+            assert!(message.contains(name), "{message}");
+            let mut off = query.clone();
+            off.contained = ContainedMode::Off;
+            assert!(QueryBuilder::reject_unsupported_contained(&off).is_ok());
+        }
     }
 
     #[test]

@@ -1023,8 +1023,9 @@ impl SqliteBackend {
         } else {
             keys.retain(|key| key.2.is_some());
         }
-        let mut seen = HashSet::new();
-        keys.retain(|key| seen.insert(key.clone()));
+        // A stable order to page over, one key per result.
+        keys.sort();
+        keys.dedup();
 
         if query.contained != ContainedMode::Both {
             return Ok(ContainedPlan {
@@ -1073,7 +1074,7 @@ impl SqliteBackend {
     }
 
     /// Resolves the contained matches of `query` →
-    /// `(container_type, container_id, local_id)`, in a stable order.
+    /// `(container_type, container_id, local_id)`, unordered.
     /// Synchronous: the connection is not `Send` and must not live across an
     /// await.
     fn contained_matches(
