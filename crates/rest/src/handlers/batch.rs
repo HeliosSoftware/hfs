@@ -585,7 +585,8 @@ where
         // so what passes here is what executes (#1366).
         crate::extractors::build_search_query_from_pairs(
             &search_type,
-            &pairs,
+            // As `execute_search_bundle` will (#1380).
+            &crate::extractors::drop_empty_parameters(pairs),
             &registry,
             state.config().default_fhir_version,
         )

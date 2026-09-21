@@ -222,8 +222,41 @@ fn build_query(
     // until #1332 (#1319); SQLite, MongoDB and Elasticsearch took `inf` and
     // `nan` for numbers, so `ltinf` matched every row (#1340).
     helios_persistence::search::validate_numeric_values(&query)?;
+    // And an empty value or OR-alternative (`family=Zzz,`, `gender:not=`): to a
+    // backend that is the value `""`, a prefix of every string, and the search
+    // matched everything (#1380). The search handlers have already dropped a
+    // parameter with no value at all ([`drop_empty_parameters`]); whoever
+    // builds a query without doing so — a conditional reference, a
+    // `_typeFilter` — gets the error instead of a wider match.
+    helios_persistence::search::validate_value_presence(&query)?;
 
     Ok(query)
+}
+
+/// Drops every parameter that has no value: `family=`, a bare `family`, a
+/// value that is only whitespace.
+///
+/// FHIR search: "Empty parameters are not an error - they are just ignored by
+/// the server." It is what an HTML form submits for a field left blank, and
+/// the search handlers call this before anything else reads the pairs, so the
+/// parameter is absent from the query, from unknown-parameter handling and
+/// from the self link alike — under `Prefer: handling=strict` too. It used to
+/// reach the backends as the value `""`: a string parameter then matched every
+/// resource that had one, a token none, a date was a `400` (#1380).
+///
+/// `name:missing=` is kept: its value is a boolean literal, and an absent one
+/// is refused where it is parsed. So is a value that merely *contains* an empty
+/// alternative (`family=Zzz,`, `family=,`), which is malformed rather than
+/// empty — see `helios_persistence::search::validate_value_presence`.
+///
+/// Only a search request may do this. Criteria that guard a write — a
+/// conditional operation, a conditional reference — must refuse an empty
+/// value, since dropping it widens the match (#1360).
+pub fn drop_empty_parameters(pairs: Vec<(String, String)>) -> Vec<(String, String)> {
+    pairs
+        .into_iter()
+        .filter(|(name, value)| !value.trim().is_empty() || name.ends_with(":missing"))
+        .collect()
 }
 
 /// The `_`-prefixed global/result parameters this server actually honours.

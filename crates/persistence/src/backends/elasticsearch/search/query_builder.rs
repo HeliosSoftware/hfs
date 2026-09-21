@@ -255,6 +255,15 @@ impl<'a> EsQueryBuilder<'a> {
             return modifier_handlers::build_missing_clause(param);
         }
 
+        // Defence in depth behind `validate_value_presence` (#1380): an empty
+        // value is a prefix of every string, so it matches nothing here rather
+        // than whatever the handler below would make of it — the whole
+        // parameter, since under `:not` "nothing" negates into "everything".
+        // `match_none`, never `None`: a `None` drops the constraint.
+        if crate::search::has_empty_value(param) {
+            return Some(date::match_none());
+        }
+
         // Handle special parameters
         match param.name.as_str() {
             "_id" => return self.build_id_clause(param),

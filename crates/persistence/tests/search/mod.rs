@@ -55,6 +55,9 @@ pub mod chained_tests;
 pub mod date_minute_index_suite;
 pub mod date_precision_suite;
 pub mod date_tests;
+/// Backend-agnostic scenarios, shared with the PostgreSQL, MongoDB and
+/// Elasticsearch test binaries via `#[path]` (#1380).
+pub mod empty_value_suite;
 /// Backend-agnostic scenarios, shared with the PostgreSQL test binary via
 /// `#[path]` (issue #386).
 pub mod fts_purge_suite;

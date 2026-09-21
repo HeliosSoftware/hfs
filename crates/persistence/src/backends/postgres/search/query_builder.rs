@@ -1035,6 +1035,14 @@ impl PostgresQueryBuilder {
             return Some(Self::build_missing_condition(param));
         }
 
+        // Defence in depth behind `validate_value_presence` (#1380): an empty
+        // value is a prefix of every string, so it matches nothing here rather
+        // than whatever the builder below would make of it — the whole
+        // parameter, since under `:not` "nothing" negates into "everything".
+        if crate::search::has_empty_value(param) {
+            return Some(match_nothing());
+        }
+
         // Handle special parameters
         match param.name.as_str() {
             "_id" => return Self::build_id_condition(param, param_offset),

@@ -52,7 +52,10 @@ fn reject_unsupported_metadata_modifier(query: &SearchQuery) -> StorageResult<()
     crate::search::reject_unsupported_metadata_modifier(query)?;
     crate::search::validate_date_values(query)?;
     // And a number or quantity value that is not a number (#1319, #1340).
-    crate::search::validate_numeric_values(query)
+    crate::search::validate_numeric_values(query)?;
+    // And a value that is empty, or has an empty alternative: `family=Zzz,`
+    // is a prefix match on `""`, which is every family name (#1380).
+    crate::search::validate_value_presence(query)
 }
 
 /// Refuses what `_contained` matching cannot apply. `:missing` was once the

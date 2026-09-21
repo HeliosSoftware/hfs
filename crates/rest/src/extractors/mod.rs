@@ -26,7 +26,7 @@ pub use peer::PeerIp;
 pub use search_params::SearchParams;
 pub use search_query_builder::{
     GLOBAL_SEARCH_PARAMS, build_search_query_for_version, build_search_query_from_pairs,
-    unknown_search_params,
+    drop_empty_parameters, unknown_search_params,
 };
 pub use tenant::TenantExtractor;
 pub use user::UserKey;

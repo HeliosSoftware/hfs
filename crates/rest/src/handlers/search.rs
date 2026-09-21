@@ -219,6 +219,10 @@ where
     // spec's placeholder `Resource.id` expression: an identity test on
     // PostgreSQL, an unfiltered result set on SQLite. Use `_list` for List
     // membership.
+    // A parameter with no value (`family=`) is ignored, per FHIR; from here on
+    // it is as if the client had not sent it (#1380).
+    let pairs = crate::extractors::drop_empty_parameters(pairs);
+
     const UNSUPPORTED_PARAMS: [&str; 2] = ["_query", "_in"];
     if let Some((key, _)) = pairs
         .iter()
@@ -781,7 +785,8 @@ async fn execute_system_search<S>(
 where
     S: ResourceStorage + MultiTypeSearchProvider + Send + Sync,
 {
-    let search_params = SearchParams::from_pairs(pairs);
+    // A parameter with no value is ignored, as in a type-level search (#1380).
+    let search_params = SearchParams::from_pairs(crate::extractors::drop_empty_parameters(pairs));
 
     // Get resource types from _type parameter (if specified)
     let type_param = search_params.get("_type").cloned();

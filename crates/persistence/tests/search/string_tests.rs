@@ -712,3 +712,15 @@ async fn test_repeated_parameter_and_semantics() {
         );
     }
 }
+
+/// #1380: `family=Zzz,` is a prefix match on `""`, which is every family name;
+/// an empty value or alternative is an error on every search path. The
+/// scenarios are backend-agnostic (`empty_value_suite.rs`): PostgreSQL, MongoDB
+/// and Elasticsearch run the same ones.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_empty_value_suite() {
+    let backend = super::make_sqlite_backend();
+    super::empty_value_suite::empty_values_are_rejected_on_every_path(&backend, "empty-value")
+        .await;
+}

@@ -545,6 +545,14 @@ impl QueryBuilder {
             return Some(build_missing_condition(param, is_missing));
         }
 
+        // Defence in depth behind `validate_value_presence` (#1380): an empty
+        // value is a prefix of every string, so it matches nothing here rather
+        // than whatever the handler below would make of it — the whole
+        // parameter, since under `:not` "nothing" negates into "everything".
+        if crate::search::has_empty_value(param) {
+            return Some(SqlFragment::new("1 = 0"));
+        }
+
         // Handle special parameters. `_tag`/`_profile`/`_security`/`_source`/
         // `_language` are NOT special on the query side: the extractor indexes
         // them from `meta` (and, for `_language`, from `Resource.language`)
