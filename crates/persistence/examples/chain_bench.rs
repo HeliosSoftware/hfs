@@ -685,6 +685,21 @@ fn plan(corpus: &Corpus) -> Vec<Case> {
         }
     }
 
+    // A comma is OR: either of the low- and the medium-selectivity name.
+    let (low, _) = prefix_matching(&stats.patient_names, 1);
+    let (medium, _) = prefix_matching(&stats.patient_names, (patients / 100).max(2));
+    cases.push(Case {
+        family: "2-hop name OR list",
+        selectivity: "probe",
+        base: "Observation",
+        spec: Spec::Forward {
+            chain: "subject:Patient.name".into(),
+            value: format!("{low},{medium}"),
+        },
+        terminal: Some(("Patient", "name", format!("{low},{medium}"))),
+        explain: false,
+    });
+
     // FHIR string search is starts-with. "son" ends family names (Johnson,
     // Wilson, Anderson) far more often than it starts a name part, so a path
     // that matches it as a substring answers a different question.
@@ -1153,11 +1168,11 @@ async fn try_count<S: SearchProvider>(
     param: &str,
     value: &str,
 ) -> StorageResult<u64> {
+    let raw: Vec<String> = value.split(',').map(str::to_string).collect();
     let parameter = {
         let reg = backend.search_param_registry(tenant);
         let registry = reg.read();
-        let (param_type, values) =
-            parse_typed_values(&registry, resource_type, param, &[value.to_string()]);
+        let (param_type, values) = parse_typed_values(&registry, resource_type, param, &raw);
         SearchParameter {
             name: param.to_string(),
             param_type,
