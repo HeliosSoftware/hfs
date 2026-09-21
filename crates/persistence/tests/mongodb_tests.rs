@@ -758,6 +758,27 @@ async fn mongodb_empty_values_are_rejected_on_every_path() {
     empty_value_suite::empty_values_are_rejected_on_every_path(&backend, "empty-value-1380").await;
 }
 
+/// The backend-agnostic modifier parity suite (#1408). Same `#[path]`
+/// arrangement.
+#[path = "search/modifier_parity_suite.rs"]
+mod modifier_parity_suite;
+
+/// #1408: `:of-type`, reference `:identifier` and reference `:[type]` were
+/// refused as unsupported modifiers. Needs the full registry.
+#[tokio::test]
+async fn mongodb_modifier_parity() {
+    let Some(backend) = create_backend_with_full_registry("modifier_parity").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    modifier_parity_suite::every_valid_modifier_agrees_across_backends(
+        &backend,
+        "modifier-parity-1408",
+        &[],
+    )
+    .await;
+}
+
 /// The backend-agnostic race suite for version-aware writes (#1404, #1405).
 /// Same `#[path]` arrangement.
 #[path = "search/versioned_write_race_suite.rs"]

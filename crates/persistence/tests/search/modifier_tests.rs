@@ -1375,3 +1375,55 @@ async fn test_of_type_modifier_type_discrimination() {
     let _dl_result = backend.search(&tenant, &dl_query.with_count(100)).await;
     let _pp_result = backend.search(&tenant, &pp_query.with_count(100)).await;
 }
+
+/// #1408: every modifier `SearchModifier::is_valid_for` allows, on every
+/// parameter type, over one data set. The scenarios are backend-agnostic
+/// (`modifier_parity_suite.rs`): PostgreSQL, MongoDB and Elasticsearch run the
+/// same ones.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_modifier_parity_suite() {
+    use super::modifier_parity_suite::{Divergence, Expect};
+
+    let backend = create_sqlite_backend();
+    super::modifier_parity_suite::every_valid_modifier_agrees_across_backends(
+        &backend,
+        "modifier-parity",
+        &[
+            // A short `:of-type` value is read as `type-code|value`, or `value`.
+            Divergence {
+                label: "Patient?identifier:ofType=MR|12345",
+                expect: Expect::Ids(&["p1"]),
+            },
+            Divergence {
+                label: "Patient?identifier:ofType=12345",
+                expect: Expect::Ids(&["p1", "p2"]),
+            },
+            // Terminology-backed token modifiers are not refused but degraded:
+            // `:in` / `:not-in` match nothing, `:above` / `:below` match the code
+            // itself. Unreachable over REST, which expands them or answers 501 first.
+            Divergence {
+                label: "Observation?code:in=http://example.org/fhir/ValueSet/a",
+                expect: Expect::Ids(&[]),
+            },
+            Divergence {
+                label: "Observation?code:not-in=http://example.org/fhir/ValueSet/a",
+                expect: Expect::Ids(&[]),
+            },
+            Divergence {
+                label: "Observation?code:above=http://loinc.org|1234-5",
+                expect: Expect::Ids(&["ob-pat"]),
+            },
+            Divergence {
+                label: "Observation?code:below=http://loinc.org|1234-5",
+                expect: Expect::Ids(&["ob-pat"]),
+            },
+            // A value naming another type wins over the `:[type]` modifier.
+            Divergence {
+                label: "Observation?subject:Patient=Group/p1",
+                expect: Expect::Ids(&["ob-grp"]),
+            },
+        ],
+    )
+    .await;
+}
