@@ -3264,7 +3264,12 @@ impl PostgresBackend {
     ) -> StorageResult<Option<SearchQuery>> {
         let registry_arc = self.tenant_registry(tenant.tenant_id().as_str());
         let registry = registry_arc.read();
-        crate::search::build_conditional_query(&registry, resource_type, search_params_str)
+        crate::search::build_conditional_query(
+            &registry,
+            resource_type,
+            search_params_str,
+            crate::search::ResourceTypeScope::version(self.config().fhir_version),
+        )
     }
 
     // ========================================================================

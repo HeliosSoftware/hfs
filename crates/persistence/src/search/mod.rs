@@ -78,6 +78,7 @@ pub mod reindex;
 pub mod seeder;
 pub mod tenant_registries;
 pub mod text_fold;
+pub mod type_qualifier;
 pub mod uri;
 pub mod value_parser;
 pub mod writer;
@@ -121,6 +122,7 @@ pub use seeder::{
 };
 pub use tenant_registries::{StoredParamLoader, TenantSearchRegistries};
 pub use text_fold::fold_text;
+pub use type_qualifier::ResourceTypeScope;
 pub use uri::compute_parent_uris;
 pub use value_parser::{
     modifier_requires_terminology, param_requires_terminology, parse_typed_values,

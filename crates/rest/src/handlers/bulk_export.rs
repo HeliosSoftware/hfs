@@ -224,8 +224,15 @@ where
                     unknown.join(", ")
                 )));
             }
-            build_search_query_from_pairs(rt, &filter_pairs, &registry)
-                .map_err(|e| bad_request(format!("_typeFilter '{raw}': {e}")))?
+            // The worker runs the compiled filter as a search, so it is judged
+            // against the version searches resolve in (#1366).
+            build_search_query_from_pairs(
+                rt,
+                &filter_pairs,
+                &registry,
+                state.config().default_fhir_version,
+            )
+            .map_err(|e| bad_request(format!("_typeFilter '{raw}': {e}")))?
         };
         type_filters.push(TypeFilter::new(rt, query).with_compiled(compiled));
     }
