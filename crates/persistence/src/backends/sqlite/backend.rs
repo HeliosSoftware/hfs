@@ -274,6 +274,10 @@ impl SqliteBackend {
             BackendCapability::Include,
             BackendCapability::Revinclude,
             BackendCapability::InDbSofRunner,
+            BackendCapability::ConditionalCreate,
+            BackendCapability::ConditionalUpdate,
+            BackendCapability::ConditionalDelete,
+            BackendCapability::ConditionalPatch,
             BackendCapability::SharedSchema,
         ]
     }

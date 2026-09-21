@@ -950,6 +950,69 @@ async fn bulk_submit_lifecycle_and_processing() {
     assert_eq!(completed.status, SubmissionStatus::Complete);
 }
 
+/// With no per-entry error cap, entries ingest with bounded concurrency to
+/// overlap their PUT latencies (#945). However the writes interleave, every
+/// entry must be written and the receipts must stay in input (line) order.
+#[tokio::test]
+async fn bulk_submit_concurrent_ingest_preserves_order_and_writes_all() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+
+    let submission_id = SubmissionId::new("client-a", "sub-conc");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    let entries: Vec<NdjsonEntry> = (1..=20)
+        .map(|i| {
+            NdjsonEntry::new(
+                i,
+                "Patient",
+                json!({"resourceType": "Patient", "id": format!("p{i}")}),
+            )
+        })
+        .collect();
+
+    let results = backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            entries,
+            // Default options: max_errors == 0, so the concurrent path runs.
+            &BulkProcessingOptions::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(results.len(), 20);
+    assert!(results.iter().all(|r| r.is_success()), "{results:?}");
+    // Receipts stay in input order despite the concurrent writes.
+    let lines: Vec<u64> = results.iter().map(|r| r.line_number).collect();
+    assert_eq!(lines, (1..=20).collect::<Vec<u64>>());
+
+    let counts = backend
+        .get_entry_counts(&tenant, &submission_id, &manifest.manifest_id)
+        .await
+        .unwrap();
+    assert_eq!((counts.total, counts.success), (20, 20));
+
+    // Every resource is actually stored.
+    for i in 1..=20 {
+        let read = backend
+            .read(&tenant, "Patient", &format!("p{i}"))
+            .await
+            .unwrap();
+        assert!(read.is_some(), "Patient/p{i} should be stored");
+    }
+}
+
 /// Two output files of one manifest, both starting at line 1, must each keep
 /// their own entry result and raw archive (issue #457).
 ///
@@ -3197,6 +3260,83 @@ fn tenant_location_matches_the_declared_tenancy_topology() {
         a.keyspace.resources_prefix(),
         b.keyspace.resources_prefix(),
         "PrefixPerTenant must separate tenants by key prefix"
+    );
+}
+
+/// S3 has no search to resolve conditional criteria with. What it declares —
+/// the source of `rest.resource.conditional*` and of the REST layer's `501` —
+/// must be what its methods do: refuse, all four (#1384).
+#[tokio::test]
+async fn no_conditional_interaction_is_declared_or_served() {
+    use crate::core::{ConditionalInteraction, ConditionalStorage, PatchFormat};
+
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+    let patient = json!({"resourceType": "Patient", "active": true});
+
+    for interaction in ConditionalInteraction::ALL {
+        assert!(!backend.supports_conditional(interaction), "{interaction}");
+    }
+
+    let refused = |capability: &str, err: crate::error::StorageError| match err {
+        crate::error::StorageError::Backend(
+            crate::error::BackendError::UnsupportedCapability { capability: c, .. },
+        ) => assert_eq!(c, capability),
+        other => panic!("{capability}: expected UnsupportedCapability, got {other:?}"),
+    };
+    refused(
+        "conditional_create",
+        backend
+            .conditional_create(
+                &tenant,
+                "Patient",
+                patient.clone(),
+                "active=true",
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap_err(),
+    );
+    refused(
+        "conditional_update",
+        backend
+            .conditional_update(
+                &tenant,
+                "Patient",
+                patient,
+                "active=true",
+                true,
+                FhirVersion::R4,
+                &crate::core::EntityTagPrecondition::Absent,
+            )
+            .await
+            .unwrap_err(),
+    );
+    refused(
+        "conditional_delete",
+        backend
+            .conditional_delete(
+                &tenant,
+                "Patient",
+                "active=true",
+                &crate::core::EntityTagPrecondition::Absent,
+            )
+            .await
+            .unwrap_err(),
+    );
+    refused(
+        "conditional_patch",
+        backend
+            .conditional_patch(
+                &tenant,
+                "Patient",
+                "active=true",
+                &PatchFormat::MergePatch(json!({"active": false})),
+                &crate::core::EntityTagPrecondition::Absent,
+            )
+            .await
+            .unwrap_err(),
     );
 }
 

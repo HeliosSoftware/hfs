@@ -350,6 +350,8 @@ pub async fn conditional_update_handler<S>(
 where
     S: ResourceStorage + ConditionalStorage + Send + Sync,
 {
+    super::conditional_support::require_update(state.storage())?;
+
     // Determine FHIR version from header or use server default
     let fhir_version = version.storage_version_or(state.config().default_fhir_version);
 

@@ -173,9 +173,10 @@ pub use search::{
 };
 pub use sof_runner::{RowStream, SofError, SofRunner, ViewFilters, ViewRow};
 pub use storage::{
-    ActivityCell, ConditionalCreateResult, ConditionalDeleteResult, ConditionalPatchResult,
-    ConditionalStorage, ConditionalUpdateResult, DailyResourceCount, PatchFormat, PurgableStorage,
-    ResourceCountDelta, ResourceStorage, TenantRecord, WriteMarker, bucket_floor,
+    ActivityCell, ConditionalCreateResult, ConditionalDeleteResult, ConditionalInteraction,
+    ConditionalPatchResult, ConditionalStorage, ConditionalUpdateResult, DailyResourceCount,
+    PatchFormat, PurgableStorage, ResourceCountDelta, ResourceStorage, TenantRecord, WriteMarker,
+    bucket_floor,
 };
 pub use transaction::{
     BundleEntry, BundleEntryEffect, BundleEntryResult, BundleMethod, BundleProvider, BundleResult,
