@@ -242,123 +242,27 @@ impl Rng {
     }
 }
 
+#[rustfmt::skip]
 const FAMILIES: &[&str] = &[
-    "Smith",
-    "Johnson",
-    "Williams",
-    "Brown",
-    "Jones",
-    "Garcia",
-    "Miller",
-    "Davis",
-    "Rodriguez",
-    "Martinez",
-    "Hernandez",
-    "Lopez",
-    "Gonzalez",
-    "Wilson",
-    "Anderson",
-    "Thomas",
-    "Taylor",
-    "Moore",
-    "Jackson",
-    "Martin",
-    "Lee",
-    "Perez",
-    "Thompson",
-    "White",
-    "Harris",
-    "Sanchez",
-    "Clark",
-    "Ramirez",
-    "Lewis",
-    "Robinson",
-    "Walker",
-    "Young",
-    "Allen",
-    "King",
-    "Wright",
-    "Scott",
-    "Torres",
-    "Nguyen",
-    "Hill",
-    "Flores",
-    "Green",
-    "Adams",
-    "Nelson",
-    "Baker",
-    "Hall",
-    "Rivera",
-    "Campbell",
-    "Mitchell",
-    "Carter",
-    "Roberts",
-    "Okafor",
-    "Ivanov",
-    "Yamamoto",
-    "Schneider",
-    "Dubois",
-    "Kowalski",
-    "Eriksson",
-    "Quispe",
-    "Underwood",
-    "Vasquez",
+    "Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller", "Davis", "Rodriguez",
+    "Martinez", "Hernandez", "Lopez", "Gonzalez", "Wilson", "Anderson", "Thomas", "Taylor",
+    "Moore", "Jackson", "Martin", "Lee", "Perez", "Thompson", "White", "Harris", "Sanchez",
+    "Clark", "Ramirez", "Lewis", "Robinson", "Walker", "Young", "Allen", "King", "Wright",
+    "Scott", "Torres", "Nguyen", "Hill", "Flores", "Green", "Adams", "Nelson", "Baker", "Hall",
+    "Rivera", "Campbell", "Mitchell", "Carter", "Roberts", "Okafor", "Ivanov", "Yamamoto",
+    "Schneider", "Dubois", "Kowalski", "Eriksson", "Quispe", "Underwood", "Vasquez",
 ];
+#[rustfmt::skip]
 const GIVENS: &[&str] = &[
-    "James",
-    "Mary",
-    "Robert",
-    "Patricia",
-    "John",
-    "Jennifer",
-    "Michael",
-    "Linda",
-    "David",
-    "Elizabeth",
-    "William",
-    "Barbara",
-    "Richard",
-    "Susan",
-    "Joseph",
-    "Jessica",
-    "Thomas",
-    "Sarah",
-    "Carlos",
-    "Karen",
-    "Daniel",
-    "Lisa",
-    "Matthew",
-    "Nancy",
-    "Anthony",
-    "Betty",
-    "Mark",
-    "Sandra",
-    "Felipe",
-    "Ashley",
-    "Hiro",
-    "Ingrid",
-    "Omar",
-    "Priya",
-    "Wei",
-    "Zofia",
+    "James", "Mary", "Robert", "Patricia", "John", "Jennifer", "Michael", "Linda", "David",
+    "Elizabeth", "William", "Barbara", "Richard", "Susan", "Joseph", "Jessica", "Thomas",
+    "Sarah", "Carlos", "Karen", "Daniel", "Lisa", "Matthew", "Nancy", "Anthony", "Betty",
+    "Mark", "Sandra", "Felipe", "Ashley", "Hiro", "Ingrid", "Omar", "Priya", "Wei", "Zofia",
 ];
+#[rustfmt::skip]
 const ORG_WORDS: &[&str] = &[
-    "Mercy",
-    "General",
-    "Riverside",
-    "Summit",
-    "Lakeside",
-    "Harbor",
-    "Valley",
-    "Northside",
-    "Cedar",
-    "Pioneer",
-    "Unity",
-    "Beacon",
-    "Evergreen",
-    "Horizon",
-    "Atlas",
-    "Juniper",
+    "Mercy", "General", "Riverside", "Summit", "Lakeside", "Harbor", "Valley", "Northside",
+    "Cedar", "Pioneer", "Unity", "Beacon", "Evergreen", "Horizon", "Atlas", "Juniper",
 ];
 const ORG_KINDS: &[&str] = &["Hospital", "Clinic", "Medical Center", "Health Partners"];
 
@@ -765,6 +669,21 @@ fn plan(corpus: &Corpus) -> Vec<Case> {
             });
         }
     }
+
+    // FHIR string search is starts-with. "son" ends family names (Johnson,
+    // Wilson, Anderson) far more often than it starts a name part, so a path
+    // that matches it as a substring answers a different question.
+    cases.push(Case {
+        family: "2-hop name infix",
+        selectivity: "probe",
+        base: "Observation",
+        spec: Spec::Forward {
+            chain: "subject:Patient.name".into(),
+            value: "son".into(),
+        },
+        terminal: Some(("Patient", "name", "son".into())),
+        explain: false,
+    });
 
     let mut births = stats.birthdates.clone();
     births.sort();
@@ -1212,13 +1131,13 @@ where
     );
 }
 
-async fn count<S: SearchProvider>(
+async fn try_count<S: SearchProvider>(
     backend: &S,
     tenant: &TenantContext,
     resource_type: &str,
     param: &str,
     value: &str,
-) -> u64 {
+) -> StorageResult<u64> {
     let parameter = {
         let reg = backend.search_param_registry(tenant);
         let registry = reg.read();
@@ -1238,6 +1157,17 @@ async fn count<S: SearchProvider>(
             tenant,
             &SearchQuery::new(resource_type).with_parameter(parameter),
         )
+        .await
+}
+
+async fn count<S: SearchProvider>(
+    backend: &S,
+    tenant: &TenantContext,
+    resource_type: &str,
+    param: &str,
+    value: &str,
+) -> u64 {
+    try_count(backend, tenant, resource_type, param, value)
         .await
         .unwrap_or_else(|e| panic!("count {resource_type}?{param}={value}: {e}"))
 }
@@ -1310,7 +1240,9 @@ where
     for case in cases {
         let name = case.label();
         let terminal = match &case.terminal {
-            Some((t, p, v)) => count(&*backend, tenant, t, p, v).await.to_string(),
+            Some((t, p, v)) => try_count(&*backend, tenant, t, p, v)
+                .await
+                .map_or_else(|_| "error".to_string(), |n| n.to_string()),
             None => "-".to_string(),
         };
         let query = chained_query(&*backend, tenant, case);
@@ -1713,10 +1645,21 @@ async fn main() {
                 backend.init_schema().await.expect("init schema");
                 let backend = Arc::new(backend);
                 ingest(&*backend, &tenant, &corpus).await;
+                // Planner statistics first. Straight after a bulk load, before
+                // autovacuum's analyze has run, PostgreSQL plans the index
+                // tables as if they were empty: a plain `Observation?code=`
+                // count then runs into the backend's 30 s statement timeout on
+                // 10,000 observations. Both paths are measured with statistics.
+                backend
+                    .get_client()
+                    .await
+                    .expect("client")
+                    .batch_execute("ANALYZE")
+                    .await
+                    .expect("analyze");
                 assert_indexed(&*backend, &tenant, &corpus).await;
                 {
                     let client = backend.get_client().await.expect("client");
-                    client.batch_execute("ANALYZE").await.expect("analyze");
                     let rows: i64 = client
                         .query_one("SELECT COUNT(*) FROM search_index", &[])
                         .await
