@@ -198,6 +198,41 @@ async fn seeding_with_missing_spec_bundle_seeds_only_fallbacks() {
     assert_eq!(outcome.failed, 0);
 }
 
+/// The `ViewDefinition-url`/`-version` fallbacks have a base that is not an R4
+/// resource type, so as stored R4 SearchParameters they are invalid (`base` is
+/// bound to the version's resource types) and fail validation in a `$export`.
+/// They are not seeded; the registry still resolves them for search.
+#[tokio::test]
+async fn seeding_skips_fallbacks_whose_base_is_not_a_spec_resource_type() {
+    let backend = create_backend();
+
+    seed_spec_search_parameters(
+        &backend,
+        FhirVersion::R4,
+        &workspace_data_dir(),
+        "default",
+        None,
+    )
+    .await
+    .expect("seed");
+
+    for id in ["ViewDefinition-url", "ViewDefinition-version"] {
+        let stored = backend
+            .read(&tenant("default"), "SearchParameter", id)
+            .await
+            .expect("read");
+        assert!(stored.is_none(), "{id} should not be stored under R4");
+    }
+    assert!(
+        backend
+            .search_param_registry(&tenant("default"))
+            .read()
+            .get_param("ViewDefinition", "url")
+            .is_some(),
+        "the registry still carries the fallback"
+    );
+}
+
 /// Per-tenant registries: a tenant's stored SearchParameter enters that
 /// tenant's search resolution (write-hook invalidation + lazy rebuild), stays
 /// isolated from other tenants, and leaves on delete.
