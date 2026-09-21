@@ -58,6 +58,16 @@ async fn sqlite_contained_criteria_are_applied_or_rejected() {
     contained_suite::criteria_are_applied_or_rejected(&backend, "contained-criteria-1363").await;
 }
 
+/// #1383: `_contained` alone is every contained resource of the type;
+/// `_total`, `search_count` and paging agree; compartment membership is
+/// applied; `_has`, `_list` and chains are refused by name.
+#[tokio::test]
+async fn sqlite_contained_unconstrained_and_out_of_band_constraints() {
+    let backend = create_backend();
+    contained_suite::unconstrained_and_out_of_band_constraints(&backend, "contained-gaps-1383")
+        .await;
+}
+
 /// The backend-agnostic conditional `If-Match` suite (#1381). Same `#[path]`
 /// arrangement.
 #[path = "search/conditional_if_match_suite.rs"]

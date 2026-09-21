@@ -570,6 +570,19 @@ async fn mongodb_contained_criteria_are_applied_or_rejected() {
     contained_suite::criteria_are_applied_or_rejected(&backend, "contained-criteria-1363").await;
 }
 
+/// #1383: `_contained` alone is every contained resource of the type;
+/// `_total`, `search_count` and paging agree; compartment membership is
+/// applied; `_has`, `_list` and chains are refused by name.
+#[tokio::test]
+async fn mongodb_contained_unconstrained_and_out_of_band_constraints() {
+    let Some(backend) = create_backend_with_full_registry("contained_gaps").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    contained_suite::unconstrained_and_out_of_band_constraints(&backend, "contained-gaps-1383")
+        .await;
+}
+
 /// The backend-agnostic suite for exponent-form number and quantity search
 /// values (#1337). Same `#[path]` arrangement.
 #[path = "search/number_exponent_suite.rs"]
