@@ -4,6 +4,8 @@
 //! with $N parameter placeholders, ILIKE for case-insensitive matching,
 //! and native TIMESTAMPTZ comparisons.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 
 use crate::backends::postgres::schema::IndexLayout;
@@ -613,10 +615,80 @@ impl PostgresQueryBuilder {
         param_offset: usize,
         layout: IndexLayout,
     ) -> Option<SqlFragment> {
+        // Repeated occurrences of one parameter name are independent candidate
+        // sets ANDed together (`?date=ge2020&date=le2021`). Built as one
+        // `id IN (…)` per occurrence the conjunction is two semi-joins, and
+        // PostgreSQL may execute the pair as a nested loop that re-runs one
+        // branch's scan once per candidate from the other — on the manual-QA
+        // corpus 37.5M discarded rows and a ~20 s page (#1416). The same
+        // occurrences built as one membership test over their `INTERSECT` are a
+        // set operation evaluated once per arm, so the rescanning shape is not
+        // in the plan space at all.
+        let grouped = Self::foldable_groups(query, param_offset, layout);
+
         let mut conditions = Vec::new();
         let mut current_offset = param_offset;
 
-        for param in &query.parameters {
+        for (index, param) in query.parameters.iter().enumerate() {
+            if let Some(members) = grouped[index].as_ref() {
+                if members[0] != index {
+                    // Emitted with the group's first occurrence, which is where
+                    // the intersection is written.
+                    continue;
+                }
+
+                // Rebuild the group at its emission offsets: the fold moves its
+                // occurrences together (`?date=a&gender=m&date=b` emits both date
+                // arms before `gender`), so the numbering the plan pass saw no
+                // longer holds. Rebuilding in emission order is what keeps the
+                // placeholders ascending and `SqlFragment::params` in the order
+                // the caller binds them.
+                let mut built: Vec<(usize, SqlFragment)> = Vec::with_capacity(members.len());
+                for &member in members {
+                    let fragment = Self::build_parameter_condition(
+                        &query.parameters[member],
+                        current_offset,
+                        layout,
+                    )
+                    .expect("a foldable occurrence builds: the plan pass built it");
+                    current_offset += fragment.params.len();
+                    built.push((member, fragment));
+                }
+
+                // The arms are the group's own selects, concatenated verbatim
+                // under one `id IN (…)`: nothing is re-derived, so every scoping
+                // and every modifier the per-occurrence builders applied
+                // survives unchanged.
+                let arms: Option<Vec<String>> = built
+                    .iter()
+                    .map(|(member, fragment)| {
+                        Self::simple_membership_arm(&fragment.sql, &query.parameters[*member].name)
+                            .map(str::to_string)
+                    })
+                    .collect();
+
+                match arms {
+                    Some(arms) => {
+                        let params: Vec<SqlParam> =
+                            built.into_iter().flat_map(|(_, f)| f.params).collect();
+                        conditions.push(SqlFragment::with_params(
+                            format!(
+                                "{}{})",
+                                Self::INDEX_MEMBERSHIP_OPEN,
+                                arms.join(" INTERSECT ")
+                            ),
+                            params,
+                        ));
+                    }
+                    // Unreachable: an offset only numbers placeholders, so a
+                    // member cannot stop being the test the plan pass saw. If one
+                    // somehow did, the conjunction it was built from is kept
+                    // rather than a constraint dropped.
+                    None => conditions.extend(built.into_iter().map(|(_, fragment)| fragment)),
+                }
+                continue;
+            }
+
             if let Some(condition) = Self::build_parameter_condition(param, current_offset, layout)
             {
                 current_offset += condition.params.len();
@@ -644,6 +716,56 @@ impl PostgresQueryBuilder {
         }
 
         Some(combined)
+    }
+
+    /// Groups the parameter occurrences that may be folded into one membership
+    /// test, keyed by occurrence index.
+    ///
+    /// A group is foldable when a name repeats and *every* one of its
+    /// occurrences builds as a simple positive `search_index` membership test on
+    /// that name ([`Self::simple_membership_arm`]). One ineligible occurrence
+    /// disqualifies the whole name, which then keeps the previous
+    /// per-occurrence conjunction byte for byte: `?date=bogus` (the builder fails
+    /// closed with a bare `FALSE`), a `:missing` presence test, a `:not`
+    /// negation, an FTS or `:identifier` sub-select, a `_id` or `_lastUpdated`
+    /// column predicate, an occurrence that builds no condition at all, and the
+    /// legacy composite aggregate are all of that kind.
+    ///
+    /// Keying on the name rather than on adjacency is what catches
+    /// `?date=a&gender=m&date=b`, and `members` is in occurrence order, so
+    /// `members[0]` is both the group's first occurrence and the one that emits
+    /// it.
+    fn foldable_groups(
+        query: &SearchQuery,
+        offset: usize,
+        layout: IndexLayout,
+    ) -> Vec<Option<Vec<usize>>> {
+        let mut groups: Vec<Option<Vec<usize>>> = vec![None; query.parameters.len()];
+        let mut occurrences: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (index, param) in query.parameters.iter().enumerate() {
+            occurrences
+                .entry(param.name.as_str())
+                .or_default()
+                .push(index);
+        }
+
+        // A name that occurs once cannot fold, and that is every parameter of the
+        // common query — so only a repeat is built here at all.
+        for members in occurrences.values().filter(|members| members.len() >= 2) {
+            let foldable = members.iter().all(|&index| {
+                let param = &query.parameters[index];
+                Self::build_parameter_condition(param, offset, layout).is_some_and(|fragment| {
+                    Self::simple_membership_arm(&fragment.sql, &param.name).is_some()
+                })
+            });
+            if foldable {
+                for &index in members {
+                    groups[index] = Some(members.clone());
+                }
+            }
+        }
+
+        groups
     }
 
     /// Builds the compartment-membership subquery: matches resources that
@@ -990,6 +1112,12 @@ impl PostgresQueryBuilder {
         format!("ORDER BY {}", clauses.join(", "))
     }
 
+    /// The opening of the membership wrapper every single-parameter condition is
+    /// built with, whose matching `)` closes it. The wrapper's contents are the
+    /// select the condition closes over, which is what a repeated parameter's
+    /// occurrences are concatenated as (#1416).
+    const INDEX_MEMBERSHIP_OPEN: &'static str = "id IN (";
+
     /// The membership wrapper every single-parameter condition is built with.
     ///
     /// `SqlFragment::and` parenthesizes both sides, so a conjunction never
@@ -1011,6 +1139,52 @@ impl PostgresQueryBuilder {
             return None;
         }
         Some(inner)
+    }
+
+    /// Returns the `SELECT` a membership test closes over, when `sql` is exactly
+    /// one such test **on `name`**.
+    ///
+    /// [`Self::single_index_predicate`] only asks whether a lone test is there,
+    /// because its caller splices the predicate into a query that is already
+    /// scoped. Folding a repeated parameter needs to know *which* parameter the
+    /// test is scoped to instead, because it concatenates the tests of one name:
+    /// the compartment clause shares the wrapper but matches `param_name IN (…)`
+    /// over the compartment's own membership params, so the name check is what
+    /// keeps a compartment out of a parameter it has nothing to do with. A name
+    /// that only ever appears inside a modifier's own predicate (`:identifier`,
+    /// the FTS sub-selects) fails the same check, and the legacy composite
+    /// aggregate fails the table and aggregate checks [`Self::single_index_predicate`]
+    /// makes.
+    ///
+    /// A set operator of its own is refused too: `s1 UNION s2 INTERSECT s3` binds
+    /// as `s1 UNION (s2 INTERSECT s3)`, so an arm that is itself a set expression
+    /// cannot be concatenated. No builder emits one today — the check is what
+    /// keeps that from becoming a silent mis-plan if one ever does.
+    ///
+    /// `name` is compared as SQL would quote it, so a name carrying a quote is
+    /// left to the conjunction rather than matched loosely.
+    fn simple_membership_arm<'a>(sql: &'a str, name: &str) -> Option<&'a str> {
+        let select = sql
+            .strip_prefix(Self::INDEX_MEMBERSHIP_OPEN)?
+            .strip_suffix(')')?;
+        // `Self::INDEX_MEMBERSHIP_PREFIX` is this head with the wrapper's opening
+        // in front of it, so the two cannot drift apart.
+        let head = Self::INDEX_MEMBERSHIP_PREFIX
+            .strip_prefix(Self::INDEX_MEMBERSHIP_OPEN)
+            .expect("INDEX_MEMBERSHIP_PREFIX opens with INDEX_MEMBERSHIP_OPEN");
+        let predicate = select
+            .strip_prefix(head)?
+            .strip_prefix(&format!("param_name = '{}' AND ", name.replace('\'', "''")))?;
+        if predicate.contains("FROM search_index")
+            || predicate.contains("GROUP BY")
+            || predicate.contains("HAVING")
+            || predicate.contains(" UNION ")
+            || predicate.contains(" EXCEPT ")
+            || predicate.contains(" INTERSECT ")
+        {
+            return None;
+        }
+        Some(select)
     }
 
     /// Returns the keyset sort key for cursor pagination, or `None` when the
@@ -2687,6 +2861,18 @@ mod tests {
         found
     }
 
+    /// The caller-owned `$1`/`$2` ignored, the order in which the rest first
+    /// appear — so "sequential and gap-free" is checkable from the text alone.
+    fn bind_numbers(sql: &str, offset: usize) -> Vec<usize> {
+        let mut seen: Vec<usize> = Vec::new();
+        for n in placeholders(sql) {
+            if n > offset && !seen.contains(&n) {
+                seen.push(n);
+            }
+        }
+        seen
+    }
+
     #[test]
     fn date_or_list_is_a_single_extractable_sublink() {
         // `date=2013-04-05,2020-06-01`: the values of one parameter are
@@ -2848,12 +3034,18 @@ mod tests {
         );
     }
 
+    /// A repeated parameter is two occurrences of one name, and a repeat is an
+    /// AND of two independent candidate sets. Built as two `id IN (…)` sublinks
+    /// that is two semi-joins, and PostgreSQL may run the pair as a nested loop
+    /// that re-runs one arm's scan once per candidate from the other — 37.5M
+    /// discarded rows and a ~20 s page on the manual-QA corpus (#1416). One
+    /// membership test over the occurrences' `INTERSECT` is a set operation
+    /// evaluated once per arm, so that shape is not in the plan space at all.
     #[test]
-    fn or_list_inside_a_conjunction_stays_parenthesized_and_unextractable() {
-        // `date=2013-04-05,2020-06-01&date=gt2019-01-01`: the repeated parameter
-        // is a second `SearchParameter`, ANDed in `build_search_query_for`. The
-        // OR belongs to the first one only, and the second one's placeholders
-        // continue after all four of the first's.
+    fn repeated_date_occurrences_become_one_intersection() {
+        // `date=2013-04-05,2020-06-01&date=gt2019-01-01`: the first occurrence
+        // is itself an OR-list, and its ranges keep their parentheses — the `OR`
+        // must not escape the scoping the sublink carries.
         let query = SearchQuery::new("Procedure")
             .with_parameter(multi_value_param(
                 "date",
@@ -2866,16 +3058,417 @@ mod tests {
             .with_parameter(date_param("date", SearchPrefix::Gt, "2019-01-01"));
         let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
 
-        let (left, right) = frag
-            .sql
-            .split_once(") AND (")
-            .expect("two parameters are a conjunction");
-        assert!(left.starts_with("(id IN ("), "{}", frag.sql);
-        assert!(left.contains(") OR (value_date >= $5"), "{}", frag.sql);
-        assert!(right.contains("value_date >= $7"), "{}", frag.sql);
-        assert!(!right.contains(" OR "), "{}", frag.sql);
-        assert_eq!(frag.params.len(), 5);
+        assert_eq!(
+            frag.sql,
+            "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND \
+             resource_type = $2 AND param_name = 'date' AND ((value_date >= $3 AND \
+             value_date < $4) OR (value_date >= $5 AND value_date < $6)) INTERSECT \
+             SELECT resource_id FROM search_index WHERE tenant_id = $1 AND \
+             resource_type = $2 AND param_name = 'date' AND value_date >= $7)"
+        );
+        // One test, one row predicate, one scan per occurrence — and no `AND` of
+        // two sublinks left for the planner to nest.
+        assert_eq!(frag.sql.matches("id IN (").count(), 1);
+        assert_eq!(frag.sql.matches("FROM search_index").count(), 2);
+        assert_eq!(frag.sql.matches(" INTERSECT ").count(), 1);
+        assert!(!frag.sql.contains(") AND ("), "{}", frag.sql);
+
+        // The arms are the occurrences' own binds, in occurrence order: the
+        // OR-list's two day ranges, then `gt`'s first instant after the day.
+        assert_eq!(bind_numbers(&frag.sql, 2), vec![3, 4, 5, 6, 7]);
+        assert_eq!(
+            timestamps(&frag.params),
+            [
+                "2013-04-05T00:00:00+00:00",
+                "2013-04-06T00:00:00+00:00",
+                "2020-06-01T00:00:00+00:00",
+                "2020-06-02T00:00:00+00:00",
+                "2019-01-02T00:00:00+00:00",
+            ]
+        );
+
+        // A set operation is still not a single row predicate, so the page keeps
+        // falling back to the join-everything path — as it did for the
+        // conjunction this replaces.
         assert!(PostgresQueryBuilder::single_index_predicate(&frag.sql).is_none());
+    }
+
+    /// The fold moves a name's occurrences together, so it renumbers their
+    /// placeholders: `?date=a&gender=m&date=b` emits both date arms first, and the
+    /// binds must follow the text rather than the request, or `$4` would receive
+    /// the value written for `$5`.
+    #[test]
+    fn an_intervening_parameter_follows_its_group_with_binds_in_emit_order() {
+        let query = SearchQuery::new("Encounter")
+            .with_parameter(date_param("date", SearchPrefix::Ge, "2020-01-01"))
+            .with_parameter(token_param("status", None, "finished"))
+            .with_parameter(date_param("date", SearchPrefix::Le, "2021-01-01"));
+
+        for offset in [2, 4] {
+            let frag = PostgresQueryBuilder::build_search_query(&query, offset).expect("condition");
+
+            // The intersection is written where the group's first occurrence is,
+            // and the parameter that sat in between follows it.
+            let (fused, rest) = frag
+                .sql
+                .split_once(" INTERSECT ")
+                .unwrap_or_else(|| panic!("offset {offset}: {}", frag.sql));
+            assert!(
+                fused.starts_with("(id IN (SELECT"),
+                "offset {offset}: {}",
+                frag.sql
+            );
+            assert!(
+                rest.contains("param_name = 'date' AND value_date < "),
+                "offset {offset}: {}",
+                frag.sql
+            );
+            assert!(
+                rest.contains(") AND (id IN (SELECT"),
+                "offset {offset}: {}",
+                frag.sql
+            );
+            assert!(
+                rest.contains("param_name = 'status'"),
+                "offset {offset}: {}",
+                frag.sql
+            );
+            assert_eq!(rest.matches(" INTERSECT ").count(), 0, "{}", frag.sql);
+
+            // Every bind, in the order its placeholder first appears.
+            let expected: Vec<usize> = (offset + 1..=offset + frag.params.len()).collect();
+            assert_eq!(bind_numbers(&frag.sql, offset), expected, "{}", frag.sql);
+            match frag.params.as_slice() {
+                [
+                    SqlParam::Timestamp(ge),
+                    SqlParam::Timestamp(le),
+                    SqlParam::Text(status),
+                ] => {
+                    assert_eq!(ge.to_rfc3339(), "2020-01-01T00:00:00+00:00");
+                    assert_eq!(le.to_rfc3339(), "2021-01-02T00:00:00+00:00");
+                    assert_eq!(status, "finished");
+                }
+                other => {
+                    panic!("offset {offset}: expected both date arms then `status`, got {other:?}")
+                }
+            }
+        }
+    }
+
+    /// Three occurrences, and a name whose values repeat: each occurrence is one
+    /// arm, in occurrence order, with no placeholder left over or reused.
+    #[test]
+    fn every_occurrence_of_a_name_becomes_its_own_arm() {
+        for (label, values) in [
+            ("three days", ["2020-01-01", "2021-01-01", "2022-01-01"]),
+            ("the same day three times", ["2020-01-01"; 3]),
+        ] {
+            let mut query = SearchQuery::new("Encounter");
+            for value in values {
+                query = query.with_parameter(date_param("date", SearchPrefix::Eq, value));
+            }
+            let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+
+            assert_eq!(
+                frag.sql.matches("id IN (").count(),
+                1,
+                "{label}: {}",
+                frag.sql
+            );
+            assert_eq!(
+                frag.sql.matches("FROM search_index").count(),
+                3,
+                "{label}: {}",
+                frag.sql
+            );
+            assert_eq!(
+                frag.sql.matches(" INTERSECT ").count(),
+                2,
+                "{label}: {}",
+                frag.sql
+            );
+            assert_eq!(
+                frag.sql.matches("param_name = 'date' AND").count(),
+                3,
+                "{label}: {}",
+                frag.sql
+            );
+            // `eq` on a whole day is a half-open range, so each arm binds two.
+            assert_eq!(
+                bind_numbers(&frag.sql, 2),
+                (3..=8).collect::<Vec<_>>(),
+                "{label}"
+            );
+            assert_eq!(frag.params.len(), 6, "{label}");
+        }
+    }
+
+    /// Each repeated name gets its own membership test, and names keep away from
+    /// each other: only a repeat of one name is a set operation.
+    #[test]
+    fn repeated_names_fold_independently_of_each_other() {
+        let query = SearchQuery::new("Encounter")
+            .with_parameter(date_param("date", SearchPrefix::Ge, "2020-01-01"))
+            .with_parameter(token_param("status", None, "finished"))
+            .with_parameter(date_param("date", SearchPrefix::Le, "2021-01-01"))
+            .with_parameter(token_param("status", None, "in-progress"));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+
+        assert_eq!(frag.sql.matches(" INTERSECT ").count(), 2, "{}", frag.sql);
+        assert_eq!(frag.sql.matches("id IN (").count(), 2, "{}", frag.sql);
+        assert_eq!(frag.sql.matches(") AND (").count(), 1, "{}", frag.sql);
+        assert_eq!(bind_numbers(&frag.sql, 2), vec![3, 4, 5, 6], "{}", frag.sql);
+
+        // The dates' arms come first, from the first occurrence's position, then
+        // the status arms — and the binds follow the text, not the request order.
+        let (dates, status) = frag.sql.split_once(") AND (").expect("two names");
+        assert_eq!(dates.matches("param_name = 'date'").count(), 2, "{dates}");
+        assert_eq!(
+            status.matches("param_name = 'status'").count(),
+            2,
+            "{status}"
+        );
+        assert!(dates.contains("$3") && dates.contains("$4"), "{dates}");
+        assert!(status.contains("$5") && status.contains("$6"), "{status}");
+        match frag.params.as_slice() {
+            [
+                SqlParam::Timestamp(first),
+                SqlParam::Timestamp(second),
+                SqlParam::Text(finished),
+                SqlParam::Text(in_progress),
+            ] => {
+                assert_eq!(first.to_rfc3339(), "2020-01-01T00:00:00+00:00");
+                assert_eq!(second.to_rfc3339(), "2021-01-02T00:00:00+00:00");
+                assert_eq!(finished, "finished");
+                assert_eq!(in_progress, "in-progress");
+            }
+            other => panic!("expected both date arms then both statuses, got {other:?}"),
+        }
+    }
+
+    /// One occurrence is untouched: the fold is a repeat's shape, and a lone test
+    /// is exactly what the fast path extracts.
+    #[test]
+    fn one_occurrence_keeps_the_extractable_form() {
+        let query = SearchQuery::new("Encounter").with_parameter(date_param(
+            "date",
+            SearchPrefix::Ge,
+            "2020-01-01",
+        ));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+
+        assert!(!frag.sql.contains("INTERSECT"), "{}", frag.sql);
+        assert_eq!(
+            frag.sql,
+            "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND \
+             resource_type = $2 AND param_name = 'date' AND value_date >= $3)"
+        );
+        assert_eq!(
+            PostgresQueryBuilder::single_index_predicate(&frag.sql),
+            Some("param_name = 'date' AND value_date >= $3")
+        );
+    }
+
+    /// One occurrence the fold cannot express disqualifies the whole *name*, in
+    /// either order: the conjunction it came from is kept rather than a constraint
+    /// dropped, a presence test read as a match, or a negation read as a positive
+    /// membership test.
+    #[test]
+    fn one_ineligible_occurrence_keeps_the_whole_name_a_conjunction() {
+        let mut missing_true = date_param("date", SearchPrefix::Eq, "true");
+        missing_true.modifier = Some(SearchModifier::Missing);
+        let mut missing_false = date_param("date", SearchPrefix::Eq, "false");
+        missing_false.modifier = Some(SearchModifier::Missing);
+        let eligible_date = || date_param("date", SearchPrefix::Ge, "2020-01-01");
+        let eligible_status = || token_param("status", None, "finished");
+
+        for (label, eligible, ineligible, marker) in [
+            (
+                "a value that is not a date",
+                eligible_date(),
+                date_param("date", SearchPrefix::Eq, "not-a-date"),
+                "param_name = 'date' AND value_date >= ",
+            ),
+            (
+                ":missing=true",
+                eligible_date(),
+                missing_true,
+                "param_name = 'date' AND value_date >= ",
+            ),
+            (
+                ":missing=false",
+                eligible_date(),
+                missing_false,
+                "param_name = 'date' AND value_date >= ",
+            ),
+            // `:not` is `NOT (id IN (…))`. It reaches the builder on a token; the
+            // REST layer refuses it on a date before a query is built.
+            (
+                ":not",
+                eligible_status(),
+                token_param("status", Some(SearchModifier::Not), "in-progress"),
+                "param_name = 'status' AND (value_token_code = ",
+            ),
+        ] {
+            for ineligible_first in [false, true] {
+                let pair = if ineligible_first {
+                    vec![ineligible.clone(), eligible.clone()]
+                } else {
+                    vec![eligible.clone(), ineligible.clone()]
+                };
+                let mut query = SearchQuery::new("Encounter");
+                for param in pair {
+                    query = query.with_parameter(param);
+                }
+                let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+                let at = if ineligible_first { "first" } else { "last" };
+                assert!(
+                    !frag.sql.contains("INTERSECT"),
+                    "{label} ({at}): {}",
+                    frag.sql
+                );
+                assert!(frag.sql.contains(") AND ("), "{label} ({at}): {}", frag.sql);
+                assert!(
+                    frag.sql.contains(marker),
+                    "{label} ({at}): the eligible occurrence survives: {}",
+                    frag.sql
+                );
+            }
+        }
+    }
+
+    /// Two occurrences of two different names are not a repeat: they stay two
+    /// tests ANDed, and neither is intersected with the other.
+    #[test]
+    fn different_names_are_never_intersected() {
+        let query = SearchQuery::new("Encounter")
+            .with_parameter(date_param("date", SearchPrefix::Ge, "2020-01-01"))
+            .with_parameter(date_param("birthdate", SearchPrefix::Le, "2000-01-01"));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+
+        assert!(!frag.sql.contains("INTERSECT"), "{}", frag.sql);
+        assert_eq!(frag.sql.matches("id IN (").count(), 2, "{}", frag.sql);
+        assert_eq!(frag.sql.matches(") AND (").count(), 1, "{}", frag.sql);
+        assert_eq!(bind_numbers(&frag.sql, 2), vec![3, 4], "{}", frag.sql);
+    }
+
+    /// The fold is decided by the arm's shape, not by the parameter's type or the
+    /// database's layout: a date occurrence is the same `search_index` test under
+    /// either layout, a denormalized composite is one row predicate and folds, and
+    /// the legacy composite is an aggregate — no row predicate for `INTERSECT` to
+    /// take as an arm — so it keeps its conjunction.
+    #[test]
+    fn composite_occurrences_fold_only_in_the_form_that_is_a_row_predicate() {
+        let composite = || {
+            SearchQuery::new("Observation")
+                .with_parameter(composite_param("combo-code-value-quantity", "8867-4$gt100"))
+                .with_parameter(composite_param("combo-code-value-quantity", "8867-4$lt200"))
+        };
+        let flat = PostgresQueryBuilder::build_search_query_for(
+            &composite(),
+            2,
+            IndexLayout::Denormalized,
+        )
+        .expect("condition");
+        assert_eq!(flat.sql.matches(" INTERSECT ").count(), 1, "{}", flat.sql);
+        assert_eq!(
+            flat.sql.matches("FROM search_index").count(),
+            2,
+            "{}",
+            flat.sql
+        );
+        assert!(!flat.sql.contains("GROUP BY"), "{}", flat.sql);
+
+        let legacy =
+            PostgresQueryBuilder::build_search_query_for(&composite(), 2, IndexLayout::Legacy)
+                .expect("condition");
+        assert!(!legacy.sql.contains("INTERSECT"), "{}", legacy.sql);
+        assert_eq!(
+            legacy
+                .sql
+                .matches("GROUP BY resource_id, composite_group HAVING")
+                .count(),
+            2,
+            "{}",
+            legacy.sql
+        );
+
+        let dated = || {
+            SearchQuery::new("Encounter")
+                .with_parameter(date_param("date", SearchPrefix::Ge, "2020-01-01"))
+                .with_parameter(date_param("date", SearchPrefix::Le, "2021-01-01"))
+        };
+        for layout in [IndexLayout::Denormalized, IndexLayout::Legacy] {
+            let frag = PostgresQueryBuilder::build_search_query_for(&dated(), 2, layout)
+                .expect("condition");
+            assert_eq!(
+                frag.sql.matches(" INTERSECT ").count(),
+                1,
+                "{layout:?}: {}",
+                frag.sql
+            );
+        }
+    }
+
+    /// The gate, on hand-built strings: the shapes that share the wrapper but are
+    /// not one test scoped to the name. The query-level tests above cover the
+    /// eligible forms and representative ineligible ones: an unparseable date,
+    /// both `:missing` values, `:not`, and the legacy composite aggregate.
+    /// Wrapper-like exclusions that have no query-level case, such as the
+    /// compartment clause's `param_name IN (...)` list and a set-expression
+    /// arm, are pinned by shape here.
+    #[test]
+    fn only_one_test_scoped_to_the_name_is_an_arm() {
+        let prefix = PostgresQueryBuilder::INDEX_MEMBERSHIP_PREFIX;
+        let arm =
+            |name: &str, predicate: &str| format!("{prefix}param_name = '{name}' AND {predicate})");
+        let plain = arm("date", "value_date >= $3");
+
+        assert_eq!(
+            PostgresQueryBuilder::simple_membership_arm(&plain, "date"),
+            Some(
+                "SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = \
+                 $2 AND param_name = 'date' AND value_date >= $3"
+            )
+        );
+
+        for (label, sql, name) in [
+            // Another parameter's test.
+            ("another name", arm("birthdate", "value_date >= $3"), "date"),
+            // The compartment clause, which matches `param_name IN (…)` over the
+            // compartment's own membership params.
+            (
+                "a compartment list",
+                format!("{prefix}param_name IN ('subject', 'encounter') AND value_reference = $3)"),
+                "date",
+            ),
+            // A conjunction of two tests: everything after the first predicate is
+            // another sub-select, which is not one arm.
+            ("a conjunction", format!("({plain}) AND ({plain})"), "date"),
+            // A negation, from `:not` or `:missing=true`.
+            ("a negation", format!("NOT ({plain})"), "date"),
+            // Already folded, so not one test either.
+            (
+                "an intersection",
+                arm("date", "value_date >= $3 INTERSECT SELECT 1"),
+                "date",
+            ),
+            // An arm that is itself a set expression: concatenating it would bind
+            // as `s1 UNION (s2 INTERSECT s3)`.
+            (
+                "a set expression",
+                arm(
+                    "date",
+                    "value_date IN (SELECT d FROM a UNION SELECT d FROM b)",
+                ),
+                "date",
+            ),
+        ] {
+            assert!(
+                PostgresQueryBuilder::simple_membership_arm(&sql, name).is_none(),
+                "{label} is not an arm: {sql}"
+            );
+        }
     }
 
     #[test]

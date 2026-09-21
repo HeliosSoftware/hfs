@@ -18565,7 +18565,7 @@ mod postgres_integration {
     async fn postgres_integration_comma_list_is_or_and_repeated_param_is_and() {
         use helios_persistence::core::SearchProvider;
         use helios_persistence::types::{
-            SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
+            SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue, TotalMode,
         };
 
         let backend = create_backend().await;
@@ -18872,6 +18872,202 @@ mod postgres_integration {
             .await,
             sorted(&risk_ids),
             "probability=0.2,0.8"
+        );
+
+        // A boundary pair naming one day is the same window from both sides: both
+        // arms are satisfied by the one indexed value, and the next day stays out.
+        let mut birth_dates = Vec::new();
+        for birth in ["1990-06-06", "1990-06-07"] {
+            let stored = backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "birthDate": birth}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            birth_dates.push(stored.id().to_string());
+        }
+        assert_eq!(
+            search(
+                "Patient",
+                vec![
+                    param(
+                        "birthdate",
+                        date,
+                        vec![SearchValue::new(SearchPrefix::Ge, "1990-06-06")]
+                    ),
+                    param(
+                        "birthdate",
+                        date,
+                        vec![SearchValue::new(SearchPrefix::Le, "1990-06-06")]
+                    ),
+                ]
+            )
+            .await,
+            vec![birth_dates[0].clone()],
+            "birthdate=ge1990-06-06&birthdate=le1990-06-06"
+        );
+
+        // The repeat is an intersection of *resources*, not of ranges. An
+        // Encounter period carries two date values, so its start can satisfy one
+        // arm and its end the other; the second and third Encounters fail one arm
+        // each, so a fold that read the two occurrences as one window — or that
+        // matched both arms against the same value — would return them.
+        let mut encounters = Vec::new();
+        for (label, start, end) in [
+            ("one arm each", "2019-01-01", "2021-06-01"),
+            ("the first arm only", "2022-01-01", "2022-12-31"),
+            ("the second arm only", "2010-01-01", "2010-12-31"),
+        ] {
+            let stored = backend
+                .create(
+                    &tenant,
+                    "Encounter",
+                    json!({
+                        "resourceType": "Encounter",
+                        "status": "finished",
+                        "subject": {"reference": "Patient/or-list"},
+                        "period": {"start": start, "end": end}
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            encounters.push((label, stored.id().to_string()));
+        }
+        let repeated_dates = || {
+            vec![
+                param(
+                    "date",
+                    date,
+                    vec![SearchValue::new(SearchPrefix::Ge, "2019-01-01")],
+                ),
+                param(
+                    "date",
+                    date,
+                    vec![SearchValue::new(SearchPrefix::Le, "2021-12-31")],
+                ),
+            ]
+        };
+        assert_eq!(
+            search("Encounter", repeated_dates()).await,
+            vec![encounters[0].1.clone()],
+            "date=ge2019-01-01&date=le2021-12-31 over Encounter.period"
+        );
+
+        // The count and `_total` run the same builder as the page, so all three
+        // must agree — `search_count` at the plain offset, a page behind a
+        // cursor at the keyset one.
+        let window = || {
+            let mut query = SearchQuery::new("Procedure");
+            for p in [
+                param(
+                    "date",
+                    date,
+                    vec![SearchValue::new(SearchPrefix::Ge, "2013-01-01")],
+                ),
+                param(
+                    "date",
+                    date,
+                    vec![SearchValue::new(SearchPrefix::Le, "2020-12-31")],
+                ),
+            ] {
+                query = query.with_parameter(p);
+            }
+            query
+        };
+        assert_eq!(
+            backend.search_count(&tenant, &window()).await.unwrap(),
+            2,
+            "search_count must see the set the page returns"
+        );
+        for mode in [TotalMode::Accurate, TotalMode::Estimate] {
+            let mut query = window();
+            query.total = Some(mode);
+            let result = backend.search(&tenant, &query).await.unwrap();
+            let ids: Vec<String> = result
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect();
+            assert_eq!(result.total, Some(2), "{mode:?}");
+            assert_eq!(sorted(&ids), sorted(&procedure_ids), "{mode:?}");
+        }
+
+        // Paging over the same criteria, both ways round: `_offset` takes the
+        // plain path and the keyset cursor the fast path's `$4` layout, and the
+        // two pages must be the two Procedures with nothing lost or repeated.
+        let mut paged = window();
+        paged.count = Some(1);
+        let first = backend.search(&tenant, &paged).await.unwrap();
+        assert_eq!(first.resources.items.len(), 1);
+        let cursor = first
+            .resources
+            .page_info
+            .next_cursor
+            .clone()
+            .expect("a first page of two has a next cursor");
+        let second = backend
+            .search(&tenant, &paged.clone().with_cursor(cursor))
+            .await
+            .unwrap();
+
+        let mut offset_page = window();
+        offset_page.count = Some(1);
+        offset_page.offset = Some(1);
+        let offset_second = backend.search(&tenant, &offset_page).await.unwrap();
+
+        let via_cursor: Vec<String> = first
+            .resources
+            .items
+            .iter()
+            .chain(second.resources.items.iter())
+            .map(|r| r.id().to_string())
+            .collect();
+        let via_offset: Vec<String> = first
+            .resources
+            .items
+            .iter()
+            .chain(offset_second.resources.items.iter())
+            .map(|r| r.id().to_string())
+            .collect();
+        assert_eq!(via_cursor.len(), 2, "cursor: {via_cursor:?}");
+        assert_eq!(sorted(&via_cursor), sorted(&procedure_ids));
+        assert_eq!(sorted(&via_offset), sorted(&procedure_ids));
+
+        // …and the fold's arms stay inside the caller's tenant: a look-alike in
+        // another tenant satisfies the same criteria there, and only there.
+        let other_tenant = create_tenant("or_list_other");
+        let look_alike = backend
+            .create(
+                &other_tenant,
+                "Procedure",
+                json!({
+                    "resourceType": "Procedure",
+                    "status": "completed",
+                    "subject": {"reference": "Patient/or-list"},
+                    "performedDateTime": "2013-04-05"
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let other_ids: Vec<String> = backend
+            .search(&other_tenant, &window())
+            .await
+            .unwrap()
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        assert_eq!(
+            other_ids,
+            vec![look_alike.id().to_string()],
+            "another tenant's look-alike is not this tenant's match"
         );
     }
 
