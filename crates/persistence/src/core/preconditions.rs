@@ -460,7 +460,8 @@ pub fn if_match_field_satisfied(raw: &str, current_version_id: &str) -> bool {
 /// this between resolving the match and writing, and then hands *that* row to
 /// `update`, whose compare-and-swap is keyed on the version evaluated here. A
 /// writer landing in between therefore ends in `VersionConflict`, never in a
-/// write over a version the client did not name.
+/// write over a version the client did not name. A delete gets the same
+/// guarantee from [`delete_under_precondition`].
 ///
 /// The failure is [`ConcurrencyError::OptimisticLockFailure`], which the REST
 /// layer already renders as `412`. `id` is empty when nothing matched.
@@ -494,6 +495,44 @@ pub fn conditional_if_match_gate(
             actual_etag: current_version.map(|v| format!("W/\"{v}\"")),
         },
     ))
+}
+
+/// Deletes `current` — the resource an `If-Match` precondition has just been
+/// evaluated against — so that the evaluation and the delete are one step.
+///
+/// With a precondition the delete goes through
+/// [`ResourceStorage::delete_versioned`](super::ResourceStorage::delete_versioned),
+/// pinned to `current`'s version: a writer landing after the evaluation ends
+/// in `VersionConflict` instead of being deleted along with the version the
+/// client named (#1404). Without one it is the plain, unconditional
+/// [`delete`](super::ResourceStorage::delete) it always was — FHIR's delete
+/// carries no precondition of its own.
+///
+/// Shared by `DELETE [type]/[id]` and every
+/// [`ConditionalStorage::conditional_delete`](super::ConditionalStorage::conditional_delete).
+pub async fn delete_under_precondition<S>(
+    storage: &S,
+    tenant: &crate::tenant::TenantContext,
+    if_match: &EntityTagPrecondition,
+    current: &StoredResource,
+) -> crate::error::StorageResult<()>
+where
+    S: super::ResourceStorage + ?Sized,
+{
+    if if_match.is_present() {
+        storage
+            .delete_versioned(
+                tenant,
+                current.resource_type(),
+                current.id(),
+                current.version_id(),
+            )
+            .await
+    } else {
+        storage
+            .delete(tenant, current.resource_type(), current.id())
+            .await
+    }
 }
 
 /// Builds the `412` bundle entry result used by every backend.

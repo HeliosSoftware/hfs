@@ -1082,6 +1082,57 @@ impl ResourceStorage for CompositeStorage {
         Ok(())
     }
 
+    /// The primary is the system of record for versions, so the compare-and-
+    /// swap is its alone; secondaries are told about the delete only once it
+    /// has won. Inheriting the trait's default here would turn the primary's
+    /// atomic delete back into read-compare-delete (#1404).
+    #[instrument(skip(self, tenant), fields(resource_type = %resource_type, id = %id))]
+    async fn delete_versioned(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: &str,
+    ) -> StorageResult<()> {
+        let result = self
+            .primary
+            .delete_versioned(tenant, resource_type, id, expected_version)
+            .await;
+
+        // A refused precondition is the primary working, not the primary
+        // failing: racing clients must not be able to mark it unhealthy.
+        let refused = matches!(
+            result,
+            Err(StorageError::Concurrency(_) | StorageError::Resource(_))
+        );
+        let primary_id = self.config.primary_id().unwrap_or("primary");
+        self.update_health(
+            primary_id,
+            result.is_ok() || refused,
+            result
+                .as_ref()
+                .err()
+                .filter(|_| !refused)
+                .map(|e| e.to_string()),
+        );
+
+        result?;
+
+        // Sync to secondaries
+        if let Err(e) = self
+            .sync_to_secondaries(SyncEvent::Delete {
+                resource_type: resource_type.to_string(),
+                resource_id: id.to_string(),
+                tenant_id: tenant.tenant_id().clone(),
+            })
+            .await
+        {
+            warn!(error = %e, "Failed to sync delete to secondaries");
+        }
+
+        Ok(())
+    }
+
     async fn count(
         &self,
         tenant: &TenantContext,
@@ -1658,9 +1709,16 @@ impl ConditionalStorage for CompositeStorage {
                         resource_type,
                         Some(&current),
                     )?;
-                    self.primary
-                        .delete(tenant, resource_type, current.id())
-                        .await?;
+                    // `current` is the search backend's copy; the primary's
+                    // compare-and-swap runs on its version, so a stale copy
+                    // is a 409, not a delete (#1404).
+                    crate::core::delete_under_precondition(
+                        self.primary.as_ref(),
+                        tenant,
+                        if_match,
+                        &current,
+                    )
+                    .await?;
 
                     if let Err(e) = self
                         .sync_to_secondaries(SyncEvent::Delete {
