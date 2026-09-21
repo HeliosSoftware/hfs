@@ -447,6 +447,55 @@ pub fn if_match_field_satisfied(raw: &str, current_version_id: &str) -> bool {
     super::versioned::normalize_etag(raw) == super::versioned::normalize_etag(current_version_id)
 }
 
+/// Evaluates `If-Match` for a conditional interaction (`PUT`/`PATCH`/`DELETE
+/// [type]?[criteria]`) against the one resource its criteria resolved to.
+///
+/// `matched` is `None` when the criteria matched nothing. A supplied
+/// precondition then fails, `*` included: it names a version of a resource
+/// that does not exist, so a conditional update must not fall through to its
+/// create (#1381) — the same rule [`bundle_if_match_gate`] applies to an
+/// instance `PUT` that would otherwise create.
+///
+/// Every [`ConditionalStorage`](super::ConditionalStorage) implementation calls
+/// this between resolving the match and writing, and then hands *that* row to
+/// `update`, whose compare-and-swap is keyed on the version evaluated here. A
+/// writer landing in between therefore ends in `VersionConflict`, never in a
+/// write over a version the client did not name.
+///
+/// The failure is [`ConcurrencyError::OptimisticLockFailure`], which the REST
+/// layer already renders as `412`. `id` is empty when nothing matched.
+///
+/// [`ConcurrencyError::OptimisticLockFailure`]: crate::error::ConcurrencyError::OptimisticLockFailure
+pub fn conditional_if_match_gate(
+    if_match: &EntityTagPrecondition,
+    resource_type: &str,
+    matched: Option<&StoredResource>,
+) -> crate::error::StorageResult<()> {
+    let current_version = matched.map(StoredResource::version_id);
+    if if_match.if_match_satisfied(current_version) {
+        return Ok(());
+    }
+
+    let expected_etag = match if_match {
+        EntityTagPrecondition::Tags(tags) => tags
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+        // `Absent` is always satisfied and never reaches this point.
+        EntityTagPrecondition::Any | EntityTagPrecondition::Absent => "*".to_string(),
+    };
+
+    Err(crate::error::StorageError::Concurrency(
+        crate::error::ConcurrencyError::OptimisticLockFailure {
+            resource_type: resource_type.to_string(),
+            id: matched.map(|m| m.id().to_string()).unwrap_or_default(),
+            expected_etag,
+            actual_etag: current_version.map(|v| format!("W/\"{v}\"")),
+        },
+    ))
+}
+
 /// Builds the `412` bundle entry result used by every backend.
 pub fn precondition_failed_entry(diagnostics: &str) -> BundleEntryResult {
     BundleEntryResult::error(

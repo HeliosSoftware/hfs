@@ -3080,6 +3080,7 @@ async fn test_conditional_update_with_identifier() {
             "identifier=http://hospital.org/mrn|MRN-UPDATE-1",
             false,
             FhirVersion::default(),
+            &helios_persistence::core::EntityTagPrecondition::Absent,
         )
         .await
         .unwrap();
@@ -3117,6 +3118,7 @@ async fn test_conditional_update_with_upsert() {
             "identifier=http://hospital.org/mrn|MRN-UPSERT-1",
             true, // upsert=true
             FhirVersion::default(),
+            &helios_persistence::core::EntityTagPrecondition::Absent,
         )
         .await
         .unwrap();
@@ -3149,6 +3151,7 @@ async fn test_conditional_delete_with_identifier() {
             &tenant,
             "Patient",
             "identifier=http://hospital.org/mrn|MRN-DELETE-1",
+            &helios_persistence::core::EntityTagPrecondition::Absent,
         )
         .await
         .unwrap();

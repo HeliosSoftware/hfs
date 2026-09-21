@@ -780,6 +780,7 @@ impl ConditionalStorage for MongoBackend {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn conditional_update(
         &self,
         tenant: &TenantContext,
@@ -788,6 +789,7 @@ impl ConditionalStorage for MongoBackend {
         search_params: &str,
         upsert: bool,
         fhir_version: FhirVersion,
+        if_match: &crate::core::EntityTagPrecondition,
     ) -> StorageResult<ConditionalUpdateResult> {
         let matches = self
             .find_matching_resources(tenant, resource_type, search_params)
@@ -795,6 +797,9 @@ impl ConditionalStorage for MongoBackend {
 
         match matches.len() {
             0 => {
+                // `If-Match` names a version; nothing matched, so nothing
+                // can carry it and the create below must not run (#1381).
+                crate::core::conditional_if_match_gate(if_match, resource_type, None)?;
                 if upsert {
                     let created = self
                         .create(tenant, resource_type, resource, fhir_version)
@@ -805,7 +810,10 @@ impl ConditionalStorage for MongoBackend {
                 }
             }
             1 => {
+                // `update` compares-and-swaps on `current`'s version, the one
+                // `If-Match` is evaluated against here.
                 let current = matches.into_iter().next().expect("single match must exist");
+                crate::core::conditional_if_match_gate(if_match, resource_type, Some(&current))?;
                 let updated = self.update(tenant, &current, resource).await?;
                 Ok(ConditionalUpdateResult::Updated(updated))
             }
@@ -818,15 +826,22 @@ impl ConditionalStorage for MongoBackend {
         tenant: &TenantContext,
         resource_type: &str,
         search_params: &str,
+        if_match: &crate::core::EntityTagPrecondition,
     ) -> StorageResult<ConditionalDeleteResult> {
         let matches = self
             .find_matching_resources(tenant, resource_type, search_params)
             .await?;
 
         match matches.len() {
-            0 => Ok(ConditionalDeleteResult::NoMatch),
+            0 => {
+                // A supplied `If-Match` fails against no match, as it does on
+                // `DELETE [type]/[id]` for a missing resource.
+                crate::core::conditional_if_match_gate(if_match, resource_type, None)?;
+                Ok(ConditionalDeleteResult::NoMatch)
+            }
             1 => {
                 let current = matches.into_iter().next().expect("single match must exist");
+                crate::core::conditional_if_match_gate(if_match, resource_type, Some(&current))?;
                 self.delete(tenant, resource_type, current.id()).await?;
                 Ok(ConditionalDeleteResult::Deleted(current))
             }
@@ -840,8 +855,9 @@ impl ConditionalStorage for MongoBackend {
         resource_type: &str,
         search_params: &str,
         patch: &PatchFormat,
+        if_match: &crate::core::EntityTagPrecondition,
     ) -> StorageResult<ConditionalPatchResult> {
-        let _ = (tenant, resource_type, search_params, patch);
+        let _ = (tenant, resource_type, search_params, patch, if_match);
         Err(StorageError::Backend(BackendError::UnsupportedCapability {
             backend_name: "mongodb".to_string(),
             capability: "conditional_patch".to_string(),

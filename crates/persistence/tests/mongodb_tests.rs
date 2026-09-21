@@ -7146,6 +7146,7 @@ async fn mongodb_integration_conditional_update_delete_and_no_match() {
             "identifier=http://hospital.org/mrn|MRN-COND-UPDATE",
             false,
             FhirVersion::default(),
+            &helios_persistence::core::EntityTagPrecondition::Absent,
         )
         .await
         .unwrap();
@@ -7163,6 +7164,7 @@ async fn mongodb_integration_conditional_update_delete_and_no_match() {
             &tenant,
             "Patient",
             "identifier=http://hospital.org/mrn|MRN-COND-UPDATE",
+            &helios_persistence::core::EntityTagPrecondition::Absent,
         )
         .await
         .unwrap();
@@ -7173,6 +7175,7 @@ async fn mongodb_integration_conditional_update_delete_and_no_match() {
             &tenant,
             "Patient",
             "identifier=http://hospital.org/mrn|MRN-COND-UPDATE",
+            &helios_persistence::core::EntityTagPrecondition::Absent,
         )
         .await
         .unwrap();
@@ -7253,6 +7256,7 @@ async fn mongodb_integration_conditional_patch_not_supported() {
             "Patient",
             "identifier=http://hospital.org/mrn|MRN-COND-PATCH",
             &PatchFormat::MergePatch(json!({ "active": true })),
+            &helios_persistence::core::EntityTagPrecondition::Absent,
         )
         .await;
 

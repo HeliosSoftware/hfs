@@ -1757,6 +1757,7 @@ impl ConditionalStorage for S3Backend {
         }))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn conditional_update(
         &self,
         _tenant: &TenantContext,
@@ -1765,6 +1766,7 @@ impl ConditionalStorage for S3Backend {
         _search_params: &str,
         _upsert: bool,
         _fhir_version: FhirVersion,
+        _if_match: &crate::core::EntityTagPrecondition,
     ) -> StorageResult<ConditionalUpdateResult> {
         Err(StorageError::Backend(BackendError::UnsupportedCapability {
             backend_name: "S3".to_string(),
@@ -1777,6 +1779,7 @@ impl ConditionalStorage for S3Backend {
         _tenant: &TenantContext,
         _resource_type: &str,
         _search_params: &str,
+        _if_match: &crate::core::EntityTagPrecondition,
     ) -> StorageResult<ConditionalDeleteResult> {
         Err(StorageError::Backend(BackendError::UnsupportedCapability {
             backend_name: "S3".to_string(),

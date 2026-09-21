@@ -7840,6 +7840,7 @@ mod postgres_integration {
                 "identifier=http://hospital.org/mrn|MRN-UPDATE-1",
                 false,
                 FhirVersion::default(),
+                &helios_persistence::core::EntityTagPrecondition::Absent,
             )
             .await
             .unwrap();
@@ -8067,6 +8068,7 @@ mod postgres_integration {
                 &tenant,
                 "Patient",
                 "identifier=http://hospital.org/mrn|MRN-DELETE-1",
+                &helios_persistence::core::EntityTagPrecondition::Absent,
             )
             .await
             .unwrap();
