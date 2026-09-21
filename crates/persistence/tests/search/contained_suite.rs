@@ -238,7 +238,11 @@ where
             (Expect::Ids(expected), Ok(found)) => *found == ids(expected),
             (Expect::Ids(_), Err(_)) => false,
             (Expect::IdsOrRejected(expected, _), Ok(found)) => *found == ids(expected),
-            (Expect::IdsOrRejected(_, name), Err(message)) => message.contains(name),
+            // A refusal names the parameter, or — from a backend's general
+            // modifier gate — the modifier it does not support.
+            (Expect::IdsOrRejected(_, name), Err(message)) => {
+                message.contains(name) || message.contains("unsupported modifier")
+            }
         };
         let expected = match case.expect {
             Expect::Ids(expected) => format!("{expected:?}"),
@@ -419,7 +423,8 @@ where
 /// Containers (DiagnosticReport → one contained Observation each, code X
 /// unless noted):
 /// - `m-tagged`: `t1` — `meta.tag` foo, `meta.profile` …/p1, `meta.security`
-///   R, `valueQuantity` 7 mg
+///   R, `valueQuantity` 7 mg, `subject` Patient/pt1, an `identifier` of type
+///   MR with value MR7
 /// - `m-plain`: `p1` — no `meta`, `valueQuantity` 3 mg
 /// - `m-str`: `s1` — `valueString` "hello"
 /// - `m-other`: `o1` — code Y with text "Glucose level", `valueString`
@@ -448,6 +453,15 @@ where
         })
     };
     tagged["valueQuantity"] = quantity(7.0);
+    tagged["subject"] = json!({"reference": "Patient/pt1"});
+    tagged["identifier"] = json!([{
+        "type": {"coding": [{
+            "system": "http://terminology.hl7.org/CodeSystem/v2-0203",
+            "code": "MR",
+        }]},
+        "system": "http://example.org/obs",
+        "value": "MR7",
+    }]);
     let mut plain = observation("p1", "X", "2020-06-15", &["cat1"]);
     plain["valueQuantity"] = quantity(3.0);
     let mut string = observation("s1", "X", "2020-06-15", &["cat1"]);
@@ -469,6 +483,7 @@ where
     .await;
 
     let value_string = |value: &str| literal("value-string", SearchParamType::String, value);
+    let subject = |value: &str| literal("subject", SearchParamType::Reference, value);
     let controls = [
         Case::new(
             "code=X",
@@ -632,6 +647,98 @@ where
                 with_modifier(value_string("true"), SearchModifier::Missing),
             ],
             Expect::IdsOrRejected(&["m-plain", "m-tagged"], "value-string"),
+        ),
+        Case::new(
+            "code:code-text=gluc",
+            vec![with_modifier(
+                token("code", "gluc"),
+                SearchModifier::CodeText,
+            )],
+            Expect::IdsOrRejected(&["m-other"], "code"),
+        ),
+        Case::new(
+            "identifier:of-type=…v2-0203|MR|MR7",
+            vec![with_modifier(
+                token(
+                    "identifier",
+                    "http://terminology.hl7.org/CodeSystem/v2-0203|MR|MR7",
+                ),
+                SearchModifier::OfType,
+            )],
+            Expect::IdsOrRejected(&["m-tagged"], "identifier"),
+        ),
+        Case::new(
+            "identifier:of-type=…v2-0203|MR|other",
+            vec![with_modifier(
+                token(
+                    "identifier",
+                    "http://terminology.hl7.org/CodeSystem/v2-0203|MR|other",
+                ),
+                SearchModifier::OfType,
+            )],
+            Expect::IdsOrRejected(&[], "identifier"),
+        ),
+        // 4. The forms of a reference (#1407): `Type/id`, the bare id and
+        // `:Type`. `:identifier` has a scenario of its own, below.
+        Case::new(
+            "subject=Patient/pt1",
+            vec![subject("Patient/pt1")],
+            Expect::Ids(&["m-tagged"]),
+        ),
+        Case::new(
+            "subject=pt1",
+            vec![subject("pt1")],
+            Expect::Ids(&["m-tagged"]),
+        ),
+        Case::new("subject=t1", vec![subject("t1")], Expect::Ids(&[])),
+        Case::new(
+            "subject:Patient=pt1",
+            vec![with_modifier(
+                subject("pt1"),
+                SearchModifier::Type("Patient".to_string()),
+            )],
+            Expect::IdsOrRejected(&["m-tagged"], "subject"),
+        ),
+        Case::new(
+            "subject:Group=pt1",
+            vec![with_modifier(
+                subject("pt1"),
+                SearchModifier::Type("Group".to_string()),
+            )],
+            Expect::IdsOrRejected(&[], "subject"),
+        ),
+        // 5. uri forms, on the one uri parameter an Observation has.
+        Case::new(
+            "_profile:below=http://example.org/StructureDefinition",
+            vec![with_modifier(
+                literal(
+                    "_profile",
+                    SearchParamType::Uri,
+                    "http://example.org/StructureDefinition",
+                ),
+                SearchModifier::Below,
+            )],
+            Expect::IdsOrRejected(&["m-tagged"], "_profile"),
+        ),
+        Case::new(
+            "_profile:below=http://example.org/Other",
+            vec![with_modifier(
+                literal("_profile", SearchParamType::Uri, "http://example.org/Other"),
+                SearchModifier::Below,
+            )],
+            Expect::IdsOrRejected(&[], "_profile"),
+        ),
+        Case::new(
+            "_profile:above=http://example.org/StructureDefinition/p1/extra",
+            vec![with_modifier(
+                literal(
+                    "_profile",
+                    SearchParamType::Uri,
+                    "http://example.org/StructureDefinition/p1/extra",
+                ),
+                SearchModifier::Above,
+            )],
+            Expect::IdsOrRejected(&["m-tagged"], "_profile"),
         ),
     ];
 
@@ -1309,4 +1416,113 @@ where
         }
     }
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// `reference:identifier` under `_contained`, for the backends that resolve it
+/// through the reference's *target* (SQLite, PostgreSQL): the contained
+/// resource's `subject` names a top-level Patient, and the search names that
+/// Patient by one of its identifiers (#1407).
+///
+/// Not part of the all-backend scenarios because the backends do not agree on
+/// what `:identifier` reads even for a top-level search: Elasticsearch matches
+/// `Reference.identifier` token values (which the shared extractor does not
+/// index under the reference parameter), and MongoDB refuses the modifier.
+///
+/// Containers (DiagnosticReport → contained Observation, code X): `i-mrn`
+/// (`subject` Patient/ip1) and `i-other` (`subject` Patient/ip2); top-level
+/// Patients `ip1` (identifier `http://example.org/mrn|42`) and `ip2` (`|43`).
+/// The container `i-decoy` holds a contained *Patient* `ip9` with identifier
+/// `|44` and an Observation about `DiagnosticReport/i-decoy`: a contained
+/// resource's identifier rows are stored under its container, and must not
+/// make the container a target.
+pub async fn reference_identifier_resolves_the_target<S>(backend: &S, tenant_base: &str)
+where
+    S: ResourceStorage + SearchProvider,
+{
+    let tenant = TenantContext::new(TenantId::new(tenant_base), TenantPermissions::full_access());
+    let mrn = |value: &str| json!([{"system": "http://example.org/mrn", "value": value}]);
+    let about = |id: &str, reference: &str| {
+        let mut resource = observation(id, "X", "2020-06-15", &["cat1"]);
+        resource["subject"] = json!({"reference": reference});
+        resource
+    };
+    for (id, value) in [("ip1", "42"), ("ip2", "43")] {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": id, "identifier": mrn(value)}),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("seed patient");
+    }
+    seed_containers(
+        backend,
+        &tenant,
+        vec![
+            ("i-mrn", vec![about("o1", "Patient/ip1")]),
+            ("i-other", vec![about("o1", "Patient/ip2")]),
+            (
+                "i-decoy",
+                vec![
+                    json!({"resourceType": "Patient", "id": "ip9", "identifier": mrn("44")}),
+                    about("o1", "DiagnosticReport/i-decoy"),
+                ],
+            ),
+        ],
+    )
+    .await;
+
+    let subject = |value: &str| literal("subject", SearchParamType::Reference, value);
+    let by_identifier =
+        |value: &str| vec![with_modifier(subject(value), SearchModifier::Identifier)];
+    let controls = [
+        Case::new(
+            "subject=Patient/ip1",
+            vec![subject("Patient/ip1")],
+            Expect::Ids(&["i-mrn"]),
+        ),
+        Case::new(
+            "code=X",
+            vec![token("code", "X")],
+            Expect::Ids(&["i-decoy", "i-mrn", "i-other"]),
+        ),
+    ];
+    let cases = [
+        Case::new(
+            "subject:identifier=http://example.org/mrn|42",
+            by_identifier("http://example.org/mrn|42"),
+            Expect::Ids(&["i-mrn"]),
+        ),
+        Case::new(
+            "subject:identifier=42,43",
+            vec![SearchParameter {
+                values: vec![SearchValue::eq("42"), SearchValue::eq("43")],
+                ..by_identifier("42").remove(0)
+            }],
+            Expect::Ids(&["i-mrn", "i-other"]),
+        ),
+        Case::new(
+            "subject:identifier=http://example.org/mrn|nope",
+            by_identifier("http://example.org/mrn|nope"),
+            Expect::Ids(&[]),
+        ),
+        Case::new(
+            "subject:identifier=http://example.org/mrn|44 (a contained Patient's)",
+            by_identifier("http://example.org/mrn|44"),
+            Expect::Ids(&[]),
+        ),
+        Case::new(
+            "code=X&subject:identifier=…|43 [contained]",
+            vec![
+                token("code", "X"),
+                by_identifier("http://example.org/mrn|43").remove(0),
+            ],
+            Expect::Ids(&["o1"]),
+        )
+        .returning_contained(),
+    ];
+
+    assert_cases(backend, &tenant, &controls, &cases).await;
 }

@@ -693,7 +693,10 @@ impl PostgresQueryBuilder {
     /// searched type (`contained_type = $2`) matching every parameter,
     /// keyed on the contained entity `(resource_id, contained_local_id)` via
     /// `GROUP BY ... HAVING COUNT(DISTINCT param_name) >= n`. Value predicates are
-    /// the bare column conditions shared with composite-component matching.
+    /// the bare row predicates of the top-level builders (`*_value_predicate`,
+    /// modifier-aware, #1407) for string, reference, uri and the token display
+    /// and `:of-type` forms, and the column conditions shared with
+    /// composite-component matching for plain token, number, quantity and date.
     ///
     /// Each occurrence of a parameter is its own AND-ed branch (values within an
     /// occurrence are ORed). Counting distinct names only proves every branch
@@ -750,28 +753,72 @@ impl PostgresQueryBuilder {
                 continue;
             }
 
+            // Defence in depth behind `validate_value_presence` (#1380), as in
+            // `build_parameter_condition`: an empty value matches nothing.
+            if crate::search::has_empty_value(param) {
+                entity_filters.push("FALSE".to_string());
+                continue;
+            }
+
+            let modifier = param.modifier.as_ref();
             let mut or_parts: Vec<String> = Vec::new();
             for value in &param.values {
-                let predicate = match param.param_type {
-                    SearchParamType::Token
-                    | SearchParamType::String
-                    | SearchParamType::Number
-                    | SearchParamType::Quantity
-                    | SearchParamType::Date => {
+                // The bare row predicates of the top-level builders (#1407).
+                // Each is parenthesized: some are unparenthesized conjunctions.
+                let mut next = offset;
+                let row_predicate = |(sql, ps): (String, Vec<SqlParam>)| (format!("({sql})"), ps);
+                let predicate = match (param.param_type, modifier) {
+                    (SearchParamType::Token, Some(SearchModifier::OfType)) => {
+                        // A value not in the three-part form names nothing:
+                        // fail closed rather than drop the criterion.
+                        Some(
+                            Self::of_type_value_predicate(value, &mut next)
+                                .map(row_predicate)
+                                .unwrap_or_else(|| (match_nothing().sql, Vec::new())),
+                        )
+                    }
+                    (
+                        SearchParamType::Token,
+                        Some(m @ (SearchModifier::Text | SearchModifier::CodeText)),
+                    ) => Some(row_predicate(Self::token_display_predicate(
+                        matches!(m, SearchModifier::CodeText),
+                        value,
+                        &mut next,
+                    ))),
+                    (SearchParamType::String, _) => Some(row_predicate(
+                        Self::string_value_predicate(modifier, value, &mut next),
+                    )),
+                    (
+                        SearchParamType::Token
+                        | SearchParamType::Number
+                        | SearchParamType::Quantity
+                        | SearchParamType::Date,
+                        _,
+                    ) => {
                         // Not a composite: this reuses the component predicate
                         // builder for an ordinary single-valued parameter, which
                         // always lives in slot 1.
                         Self::build_composite_component(value, param.param_type, offset, 1)
                     }
-                    SearchParamType::Reference => Some((
-                        format!("value_reference = ${}", offset + 1),
-                        vec![SqlParam::text(strip_reference_version(&value.value))],
+                    (SearchParamType::Reference, Some(SearchModifier::Identifier)) => {
+                        // The targets are top-level resources: a contained
+                        // resource's identifier rows name its container.
+                        let (filter, ps) = Self::reference_identifier_filter(value, &mut next);
+                        Some((
+                            Self::reference_identifier_predicate(
+                                "value_reference",
+                                &format!("idx.is_contained = FALSE AND {filter}"),
+                            ),
+                            ps,
+                        ))
+                    }
+                    (SearchParamType::Reference, _) => Some(row_predicate(
+                        Self::reference_value_predicate(modifier, value, &mut next),
                     )),
-                    SearchParamType::Uri => Some((
-                        format!("value_uri = ${}", offset + 1),
-                        vec![SqlParam::text(&value.value)],
-                    )),
-                    SearchParamType::Composite | SearchParamType::Special => None,
+                    (SearchParamType::Uri, _) => Some(row_predicate(Self::uri_value_predicate(
+                        modifier, value, &mut next,
+                    ))),
+                    (SearchParamType::Composite | SearchParamType::Special, _) => None,
                 };
                 if let Some((sql, ps)) = predicate {
                     offset += ps.len();
@@ -871,12 +918,13 @@ impl PostgresQueryBuilder {
     /// - composites, which the writer leaves unfolded on contained rows and
     ///   `build_contained` does not pair up, and chains, which it does not
     ///   follow;
-    /// - any modifier but `:not`. The value predicates here are the bare column
-    ///   conditions of `build_composite_component`, which takes no modifier;
-    ///   the modifier-aware builders all wrap their predicate in a top-level
-    ///   `id IN (…)`. Until those are split, `:exact`, `:contains`, `:text`,
-    ///   `:of-type`, … are refused rather than read as a plain match.
-    ///   `:missing` has been refused here since it was introduced.
+    /// - `:missing`, refused here since the modifier was introduced and pinned
+    ///   as a 400 by the REST and PostgreSQL suites, and the modifiers that are
+    ///   not a predicate on one index row (`:in`, `:not-in`, token
+    ///   `:above`/`:below`, …). The row-level ones — `:exact`, `:contains`,
+    ///   `:text`, `:code-text`, `:of-type`, uri `:below`/`:above`,
+    ///   `:identifier`, `:Type` — reuse the top-level builders' bare
+    ///   `*_value_predicate` (#1407), the same set SQLite applies.
     fn contained_unsupported_reason(param: &SearchParameter) -> Option<String> {
         if !param.chain.is_empty() {
             return Some("chained parameters are".to_string());
@@ -895,12 +943,35 @@ impl PostgresQueryBuilder {
         {
             return Some("this parameter is".to_string());
         }
-        match (&param.modifier, param.param_type) {
-            (_, SearchParamType::Composite) => Some("composite parameters are".to_string()),
-            (_, SearchParamType::Special) => Some("special parameters are".to_string()),
-            (None | Some(SearchModifier::Not), _) => None,
-            (Some(m), _) => Some(format!("the ':{m}' modifier is")),
+        let row_level = match (&param.modifier, param.param_type) {
+            (_, SearchParamType::Composite) => return Some("composite parameters are".to_string()),
+            (_, SearchParamType::Special) => return Some("special parameters are".to_string()),
+            (None | Some(SearchModifier::Not), _) => true,
+            (
+                Some(SearchModifier::Exact | SearchModifier::Contains | SearchModifier::Text),
+                SearchParamType::String,
+            ) => true,
+            (
+                Some(SearchModifier::Text | SearchModifier::CodeText | SearchModifier::OfType),
+                SearchParamType::Token,
+            ) => true,
+            (
+                Some(SearchModifier::Contains | SearchModifier::Below | SearchModifier::Above),
+                SearchParamType::Uri,
+            ) => true,
+            (
+                Some(SearchModifier::Identifier | SearchModifier::Type(_)),
+                SearchParamType::Reference,
+            ) => true,
+            _ => false,
+        };
+        if row_level {
+            return None;
         }
+        param
+            .modifier
+            .as_ref()
+            .map(|m| format!("the ':{m}' modifier is"))
     }
 
     /// Refuses a `_contained=true|both` search carrying a criterion
@@ -4228,18 +4299,19 @@ mod tests {
             target_type: Some("Patient".to_string()),
             target_param: "name".to_string(),
         }];
-        let mut exact = token_param("value-string", Some(SearchModifier::Exact), "hello");
-        exact.param_type = SearchParamType::String;
+        let mut exact_token = token_param("code", Some(SearchModifier::Exact), "hello");
+        exact_token.param_type = SearchParamType::Token;
         let refused = [
             date_param("_lastUpdated", SearchPrefix::Gt, "2020"),
             special_param("_text", vec![SearchValue::new(SearchPrefix::Eq, "x")]),
             token_param("_id", Some(SearchModifier::Not), "a"),
             composite_param("code-value-quantity", "X$5"),
-            // The bare column predicates take no modifier: before #1363 these
-            // were read as a plain match.
-            token_param("code", Some(SearchModifier::Text), "glucose"),
+            // Not a predicate on one index row, or not a modifier of the type:
+            // before #1363 these were read as a plain match.
+            token_param("code", Some(SearchModifier::In), "http://vs"),
+            token_param("code", Some(SearchModifier::Below), "X"),
             token_param("code", Some(SearchModifier::Missing), "true"),
-            exact,
+            exact_token,
             chained,
         ];
         for param in refused {
@@ -4254,6 +4326,134 @@ mod tests {
             query.contained = ContainedMode::Off;
             assert!(PostgresQueryBuilder::reject_unsupported_contained(&query).is_ok());
         }
+    }
+
+    /// The row-level modifiers reuse the top-level builders' bare value
+    /// predicates under `_contained` (#1407): same text, without the
+    /// `id IN (…)` wrapper, numbered after `$1`/`$2`.
+    #[test]
+    fn contained_row_level_modifiers_reuse_the_bare_value_predicates() {
+        let branch = |param: SearchParameter| {
+            let query = contained_query(vec![param]);
+            assert!(PostgresQueryBuilder::reject_unsupported_contained(&query).is_ok());
+            let frag = PostgresQueryBuilder::build_contained(&query).unwrap();
+            let sql = frag
+                .sql
+                .split_once("contained_type = $2 AND (")
+                .and_then(|(_, rest)| rest.split_once(") GROUP BY"))
+                .map(|(branch, _)| branch.to_string())
+                .unwrap_or_else(|| panic!("no branch in {}", frag.sql));
+            (sql, frag.params.len())
+        };
+        let string = |modifier, value| string_param("name", modifier, value);
+
+        assert_eq!(
+            branch(string(Some(SearchModifier::Exact), "Ward 7")),
+            (
+                "(param_name = 'name' AND ((value_string = $3)))".to_string(),
+                1
+            )
+        );
+        assert_eq!(
+            branch(string(Some(SearchModifier::Contains), "ard")),
+            (
+                format!("(param_name = 'name' AND (({FOLDED_STRING_EXPR} LIKE $3 ESCAPE '\\')))"),
+                1
+            )
+        );
+        // The default is the accent-folded, wildcard-safe range, two binds a value.
+        assert_eq!(
+            branch(SearchParameter {
+                values: vec![
+                    SearchValue::new(SearchPrefix::Eq, "wa"),
+                    SearchValue::new(SearchPrefix::Eq, "x%"),
+                ],
+                ..string(None, "")
+            }),
+            (
+                format!(
+                    "(param_name = 'name' AND (({e} ~>=~ $3 AND {e} ~<~ $4) OR ({e} ~>=~ $5 AND {e} ~<~ $6)))",
+                    e = FOLDED_STRING_EXPR
+                ),
+                4
+            )
+        );
+        assert_eq!(
+            branch(token_param("code", Some(SearchModifier::Text), "gluc")),
+            (
+                "(param_name = 'code' AND ((value_token_display ILIKE $3)))".to_string(),
+                1
+            )
+        );
+        assert_eq!(
+            branch(token_param(
+                "identifier",
+                Some(SearchModifier::OfType),
+                "http://t|MR|123"
+            )),
+            (
+                "(param_name = 'identifier' AND ((value_token_code = $3 AND \
+                 value_identifier_type_system = $4 AND value_identifier_type_code = $5)))"
+                    .to_string(),
+                3
+            )
+        );
+        // A malformed `:of-type` value fails closed instead of being dropped.
+        assert_eq!(
+            branch(token_param(
+                "identifier",
+                Some(SearchModifier::OfType),
+                "123"
+            )),
+            ("(param_name = 'identifier' AND (FALSE))".to_string(), 0)
+        );
+        // Reference: bare id, `:Type`, absolute URL.
+        assert_eq!(
+            branch(reference_param("subject", None, "p1")),
+            (
+                "(param_name = 'subject' AND (((value_reference = $3 OR value_reference LIKE $4 ESCAPE '\\'))))"
+                    .to_string(),
+                2
+            )
+        );
+        assert_eq!(
+            branch(reference_param(
+                "subject",
+                Some(SearchModifier::Type("Patient".to_string())),
+                "p1"
+            )),
+            (
+                "(param_name = 'subject' AND ((value_reference = $3)))".to_string(),
+                1
+            )
+        );
+        let (identifier, binds) = branch(reference_param(
+            "subject",
+            Some(SearchModifier::Identifier),
+            "http://mrn|42",
+        ));
+        assert!(
+            identifier.starts_with(
+                "(param_name = 'subject' AND (value_reference IN (SELECT idx.resource_type || '/' || idx.resource_id FROM search_index idx WHERE idx.tenant_id = $1 AND idx.param_name = 'identifier' AND idx.is_contained = FALSE AND idx.value_token_system = $3 AND idx.value_token_code = $4)"
+            ),
+            "{identifier}"
+        );
+        assert_eq!(binds, 2);
+        let uri = |modifier| SearchParameter {
+            param_type: SearchParamType::Uri,
+            ..token_param("url", modifier, "http://x/")
+        };
+        assert_eq!(
+            branch(uri(Some(SearchModifier::Below))),
+            (
+                "(param_name = 'url' AND ((value_uri LIKE $3 || '%')))".to_string(),
+                1
+            )
+        );
+        assert_eq!(
+            branch(uri(None)),
+            ("(param_name = 'url' AND ((value_uri = $3)))".to_string(), 1)
+        );
     }
 
     /// Values that reach the number and quantity builders but are not numbers:

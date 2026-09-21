@@ -76,6 +76,15 @@ async fn sqlite_contained_sort_and_id_only_contained() {
     contained_suite::sort_and_id_only_contained(&backend, "contained-sort-1407").await;
 }
 
+/// #1407: `reference:identifier` under `_contained` resolves the reference's
+/// top-level target.
+#[tokio::test]
+async fn sqlite_contained_reference_identifier_resolves_the_target() {
+    let backend = create_backend();
+    contained_suite::reference_identifier_resolves_the_target(&backend, "contained-ident-1407")
+        .await;
+}
+
 /// The backend-agnostic conditional `If-Match` suite (#1381). Same `#[path]`
 /// arrangement.
 #[path = "search/conditional_if_match_suite.rs"]
