@@ -222,7 +222,7 @@ fn spawn_secondary_sync_repair(
                     still_failing = report.still_failing,
                     dropped = report.dropped,
                     remaining = report.remaining,
-                    "Repaired failed secondary syncs"
+                    "Secondary sync repair pass finished"
                 ),
                 Ok(_) => {}
                 Err(e) => tracing::warn!("Repair of failed secondary syncs could not run: {e}"),

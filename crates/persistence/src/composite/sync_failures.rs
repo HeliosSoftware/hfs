@@ -200,10 +200,15 @@ fn event_subjects(event: &SyncEvent) -> Vec<(String, String, SyncOperation, Opti
             resource_type.clone(),
             resource_id.clone(),
             SyncOperation::Create,
-            content
-                .pointer("/meta/versionId")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
+            // A stored body need not carry `meta`; a create is version 1
+            // unless the content says otherwise.
+            Some(
+                content
+                    .pointer("/meta/versionId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("1")
+                    .to_string(),
+            ),
         )],
         SyncEvent::Update {
             resource_type,
