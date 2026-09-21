@@ -949,4 +949,64 @@ mod tests {
         assert_eq!(outcome["issue"][0]["code"], "not-supported");
         assert_eq!(outcome["issue"][0]["diagnostics"], "why");
     }
+
+    // ── Conditional-write gate (#1381) ───────────────────────────────────────
+
+    #[test]
+    fn conditional_gate_passes_an_absent_precondition_match_or_not() {
+        let absent = EntityTagPrecondition::Absent;
+        assert!(conditional_if_match_gate(&absent, "Patient", None).is_ok());
+        assert!(conditional_if_match_gate(&absent, "Patient", Some(&stored("p"))).is_ok());
+    }
+
+    #[test]
+    fn conditional_gate_compares_against_the_matched_version() {
+        // `StoredResource::new` starts at version 1.
+        let matched = stored("p");
+        for ok in [r#"W/"1""#, r#""1""#, "*", r#"W/"7", W/"1""#] {
+            let precondition = EntityTagPrecondition::parse([ok]).unwrap();
+            assert!(
+                conditional_if_match_gate(&precondition, "Patient", Some(&matched)).is_ok(),
+                "{ok}"
+            );
+        }
+
+        let stale = EntityTagPrecondition::parse([r#"W/"7", W/"8""#]).unwrap();
+        match conditional_if_match_gate(&stale, "Patient", Some(&matched)) {
+            Err(crate::error::StorageError::Concurrency(
+                crate::error::ConcurrencyError::OptimisticLockFailure {
+                    resource_type,
+                    id,
+                    expected_etag,
+                    actual_etag,
+                },
+            )) => {
+                assert_eq!(resource_type, "Patient");
+                assert_eq!(id, "p");
+                assert_eq!(expected_etag, r#"W/"7", W/"8""#);
+                assert_eq!(actual_etag.as_deref(), Some(r#"W/"1""#));
+            }
+            other => panic!("expected OptimisticLockFailure, got {other:?}"),
+        }
+    }
+
+    /// Nothing matched: every supplied precondition fails, `*` included, and
+    /// the failure names no id — so a no-match update cannot go on to create.
+    #[test]
+    fn conditional_gate_fails_every_precondition_when_nothing_matched() {
+        for raw in [r#"W/"1""#, "*"] {
+            let precondition = EntityTagPrecondition::parse([raw]).unwrap();
+            match conditional_if_match_gate(&precondition, "Patient", None) {
+                Err(crate::error::StorageError::Concurrency(
+                    crate::error::ConcurrencyError::OptimisticLockFailure {
+                        id, actual_etag, ..
+                    },
+                )) => {
+                    assert!(id.is_empty(), "{raw}");
+                    assert_eq!(actual_etag, None, "{raw}");
+                }
+                other => panic!("{raw}: expected OptimisticLockFailure, got {other:?}"),
+            }
+        }
+    }
 }

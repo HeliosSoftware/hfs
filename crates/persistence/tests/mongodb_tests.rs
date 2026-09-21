@@ -692,6 +692,43 @@ async fn mongodb_system_qualified_tokens_in_chains() {
     .await;
 }
 
+/// The backend-agnostic conditional `If-Match` suite (#1381). Same `#[path]`
+/// arrangement.
+#[path = "search/conditional_if_match_suite.rs"]
+mod conditional_if_match_suite;
+
+/// #1381: `If-Match` is evaluated against the resource the criteria resolve
+/// to. MongoDB has no `conditional_patch`, so that arm asserts it stays
+/// unsupported. Needs the full registry: `identifier` is not embedded.
+#[tokio::test]
+async fn mongodb_conditional_writes_honour_if_match() {
+    let Some(backend) = create_backend_with_full_registry("cond_if_match_1381").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    conditional_if_match_suite::if_match_is_evaluated_against_the_resolved_match(
+        &backend,
+        "cond-if-match-1381",
+        false,
+    )
+    .await;
+}
+
+/// #1381: of several writers holding the same `If-Match`, one writes.
+#[tokio::test]
+async fn mongodb_conditional_writers_with_the_same_if_match_admit_one() {
+    let Some(backend) = create_backend_with_full_registry("cond_if_match_race_1381").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    conditional_if_match_suite::concurrent_writers_with_the_same_if_match_admit_one(
+        &backend,
+        "cond-if-match-race-1381",
+        false,
+    )
+    .await;
+}
+
 /// #1062: a comma-separated value list on one `SearchParameter` is OR per
 /// FHIR (https://build.fhir.org/search.html#combining) — for date same as
 /// every other type. Drives the real `SearchProvider::search` /
