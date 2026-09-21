@@ -7327,33 +7327,49 @@ async fn mongodb_integration_conditional_create_multiple_matches() {
     }
 }
 
+/// Was `..._not_supported`, asserting `UnsupportedCapability`: MongoDB had no
+/// `conditional_patch` until #1406. `_id` is one of the embedded parameters,
+/// so this needs no spec registry; `mongodb_conditional_patch` is the full
+/// suite.
 #[tokio::test]
-async fn mongodb_integration_conditional_patch_not_supported() {
-    let Some(backend) = create_backend("conditional_patch_not_supported").await else {
+async fn mongodb_integration_conditional_patch_is_supported() {
+    let Some(backend) = create_backend("conditional_patch_supported").await else {
         eprintln!(
-            "Skipping mongodb_integration_conditional_patch_not_supported (requires Docker or HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_conditional_patch_is_supported (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
 
     let tenant = create_tenant("tenant-conditional-patch");
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "cond-patch-1", "active": false}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
 
     let result = backend
         .conditional_patch(
             &tenant,
             "Patient",
-            "identifier=http://hospital.org/mrn|MRN-COND-PATCH",
+            "_id=cond-patch-1",
             &PatchFormat::MergePatch(json!({ "active": true })),
             &helios_persistence::core::EntityTagPrecondition::Absent,
         )
-        .await;
+        .await
+        .unwrap();
 
-    assert!(matches!(
-        result,
-        Err(StorageError::Backend(
-            BackendError::UnsupportedCapability { .. }
-        ))
-    ));
+    match result {
+        helios_persistence::core::ConditionalPatchResult::Patched(stored) => {
+            assert_eq!(stored.id(), "cond-patch-1");
+            assert_eq!(stored.version_id(), "2");
+            assert_eq!(stored.content()["active"], json!(true));
+        }
+        other => panic!("expected Patched, got {:?}", other),
+    }
 }
 
 #[tokio::test]

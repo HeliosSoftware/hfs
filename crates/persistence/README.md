@@ -354,7 +354,7 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
 | [Batch Bundles](https://build.fhir.org/http.html#batch)                     | ✓      | ✓          | ✓       | ○         | ○     | ○             | ✓   |
 | [Transaction Bundles](https://build.fhir.org/http.html#transaction)         | ✓      | ✓          | ✓       | ✗         | ○     | ✗             | ◐   |
 | [Conditional Operations](https://build.fhir.org/http.html#cond-update)      | ✓      | ✓          | ✓       | ✗         | ○     | ○             | ✗   |
-| [Conditional Patch](https://build.fhir.org/http.html#patch)                 | ✓      | ✓          | ○       | ✗         | ○     | ○             | ✗   |
+| [Conditional Patch](https://build.fhir.org/http.html#patch)                 | ✓      | ✓          | ✓       | ✗         | ○     | ○             | ✗   |
 | [Delete History](https://build.fhir.org/http.html#delete)                   | ✓      | ✓          | ○       | ✗         | ○     | ✗             | ✗   |
 | Per-User Settings (`/_user/settings`)                                       | ✓      | ✓          | ✓       | ✗         | ✗     | ✗             | ✓   |
 | **Multitenancy**                                                            |

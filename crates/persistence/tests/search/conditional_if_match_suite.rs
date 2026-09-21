@@ -134,8 +134,9 @@ fn is_precondition_failure<T: std::fmt::Debug>(result: &Result<T, StorageError>)
 /// `OptimisticLockFailure` that leaves storage untouched, and a no-match
 /// update does not fall through to its create.
 ///
-/// `supports_patch` is `false` for a backend without `conditional_patch`
-/// (MongoDB), which must then refuse it whatever the precondition says.
+/// `supports_patch` is `false` for a backend that declines `conditional_patch`
+/// (none of the current callers, since #1406), which must then refuse it
+/// whatever the precondition says.
 pub async fn if_match_is_evaluated_against_the_resolved_match<S>(
     backend: &S,
     base: &str,
