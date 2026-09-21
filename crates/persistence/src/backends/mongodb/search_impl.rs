@@ -128,6 +128,11 @@ const PROBE_ROW_LIMIT: u64 = 100_000;
 // 300k × ~45 bytes/UUID ≈ 13.5 MB — safely under the 16 MB BSON document cap.
 const MAX_RESULT_ID_SET: usize = 300_000;
 
+/// Targets a reference `:identifier` search may resolve to (#1408). They
+/// travel in one `$in`, two entries each; 10 000 stays near 1 MB, well under
+/// the 16 MB BSON limit. Past it the search is refused, never truncated.
+const MAX_IDENTIFIER_TARGETS: usize = 10_000;
+
 async fn collect_documents(mut cursor: Cursor<Document>) -> StorageResult<Vec<Document>> {
     let mut docs = Vec::new();
     while cursor
@@ -1371,10 +1376,11 @@ impl MongoBackend {
         for param in &query.parameters {
             // `:in`/`:not-in` are unsupported for every parameter type.
             // `:above`/`:below` are served for `uri` by `build_uri_filter`
-            // (segment-aware, mirroring SQLite/Elasticsearch, #1002) but stay
-            // rejected for token/reference: token `:above`/`:below` need
-            // terminology subsumption and reference `:above`/`:below` need
-            // hierarchy resolution, neither of which is implemented here.
+            // (segment-aware, mirroring SQLite/Elasticsearch, #1002) and for
+            // `reference` by `build_reference_filter` (the same URL/path
+            // hierarchy on the stored reference, #1408) but stay rejected for
+            // token: token `:above`/`:below` need terminology subsumption,
+            // which is not implemented here.
             // Every modifier on a composite (#1206) is rejected here except
             // `:missing`: `composite_search::component_param` hardcodes
             // `modifier: None` when building each component's filter, so any
@@ -1395,12 +1401,14 @@ impl MongoBackend {
             ) || (matches!(
                 param.modifier,
                 Some(SearchModifier::Above) | Some(SearchModifier::Below)
-            ) && param.param_type != SearchParamType::Uri)
-                || (param.param_type == SearchParamType::Composite
-                    && param
-                        .modifier
-                        .as_ref()
-                        .is_some_and(|m| !matches!(m, SearchModifier::Missing)));
+            ) && !matches!(
+                param.param_type,
+                SearchParamType::Uri | SearchParamType::Reference
+            )) || (param.param_type == SearchParamType::Composite
+                && param
+                    .modifier
+                    .as_ref()
+                    .is_some_and(|m| !matches!(m, SearchModifier::Missing)));
             if modifier_unsupported {
                 return Err(StorageError::Search(SearchError::UnsupportedModifier {
                     modifier: param
@@ -1859,6 +1867,31 @@ impl MongoBackend {
                 .await;
         }
 
+        // Reference `:identifier` (#1408) names its targets by their
+        // identifier, which a filter document cannot join on: each such
+        // parameter is resolved to its complete filter here, once, and no
+        // target at all empties the search (parameters are ANDed).
+        let mut identifier_filters: HashMap<usize, Document> = HashMap::new();
+        for (i, param) in normal.iter().enumerate() {
+            if param.param_type == SearchParamType::Reference
+                && matches!(param.modifier, Some(SearchModifier::Identifier))
+            {
+                match self
+                    .resolve_reference_identifier(&search_index, tenant_id, resource_type, param)
+                    .await?
+                {
+                    Some(filter) => identifier_filters.insert(i, filter),
+                    None => return Ok(Some(HashSet::new())),
+                };
+            }
+        }
+        let normal_filter = |i: usize| -> StorageResult<Document> {
+            match identifier_filters.get(&i) {
+                Some(filter) => Ok(filter.clone()),
+                None => self.build_search_index_filter(tenant_id, resource_type, normal[i]),
+            }
+        };
+
         // #1206: a composite's probe must run over its component filters
         // regardless of how many normal params there are — unlike a plain
         // param, its own filter isn't a single document to count, and the
@@ -1892,7 +1925,7 @@ impl MongoBackend {
                         }
                     }
                 } else {
-                    let filter = self.build_search_index_filter(tenant_id, resource_type, param)?;
+                    let filter = normal_filter(i)?;
                     let count = search_index
                         .count_documents(filter)
                         .limit(PROBE_ROW_LIMIT)
@@ -1917,7 +1950,7 @@ impl MongoBackend {
         let driver_filter = if let Some((filter, _)) = composite_probes.remove(&driver_idx) {
             filter
         } else {
-            self.build_search_index_filter(tenant_id, resource_type, normal[driver_idx])?
+            normal_filter(driver_idx)?
         };
 
         let mut driver_cursor = search_index
@@ -1969,8 +2002,7 @@ impl MongoBackend {
                 if i == driver_idx {
                     continue;
                 }
-                let param_filter =
-                    self.build_search_index_filter(tenant_id, resource_type, param)?;
+                let param_filter = normal_filter(i)?;
                 let bounded = doc! {
                     "$and": [
                         param_filter,
@@ -2787,6 +2819,7 @@ impl MongoBackend {
                     "value_token_display": { "$regex": regex, "$options": "i" }
                 });
             }
+            Some(SearchModifier::OfType) => return Ok(Self::build_of_type_filter(&value.value)),
             Some(other) => {
                 return Err(StorageError::Search(SearchError::UnsupportedModifier {
                     modifier: other.to_string(),
@@ -2812,6 +2845,178 @@ impl MongoBackend {
             }
         } else {
             Ok(doc! { "value_token_code": &value.value })
+        }
+    }
+
+    /// Builds the `:of-type` predicate (#1408): `type-system|type-code|value`
+    /// against the identifier row's `value_identifier_type_system` /
+    /// `value_identifier_type_code` / `value_token_code`.
+    ///
+    /// An empty part is not compared, as on SQLite and PostgreSQL
+    /// (`|MR|12345` is "typed MR, in any system"). Anything but three parts
+    /// matches nothing, as on PostgreSQL and Elasticsearch: the spec requires
+    /// all three, and guessing which one is absent would over-match. A row
+    /// written without the type fields — an identifier with no `type`, or one
+    /// indexed before they were stored — simply fails the equality.
+    fn build_of_type_filter(value: &str) -> Document {
+        let parts: Vec<&str> = value.splitn(3, '|').collect();
+        let [type_system, type_code, identifier_value] = parts[..] else {
+            return Self::match_nothing();
+        };
+
+        let mut filter = Document::new();
+        if !identifier_value.is_empty() {
+            filter.insert("value_token_code", identifier_value);
+        }
+        if !type_system.is_empty() {
+            filter.insert("value_identifier_type_system", type_system);
+        }
+        if !type_code.is_empty() {
+            filter.insert("value_identifier_type_code", type_code);
+        }
+        if filter.is_empty() {
+            return Self::match_nothing();
+        }
+        filter
+    }
+
+    /// A `search_index` predicate no row satisfies.
+    fn match_nothing() -> Document {
+        doc! { "resource_id": { "$in": Bson::Array(Vec::new()) } }
+    }
+
+    /// The `Type/id` (or absolute URL) a `:[type]` reference search names, or
+    /// `None` when the value names another type (`subject:Patient=Group/1`),
+    /// which no reference can satisfy.
+    fn typed_reference(type_name: &str, value: &str) -> Option<String> {
+        let base = strip_reference_version(value);
+        if !base.contains('/') {
+            return Some(format!("{type_name}/{base}"));
+        }
+        let mut segments = base.rsplit('/');
+        let _id = segments.next();
+        (segments.next() == Some(type_name)).then(|| base.to_string())
+    }
+
+    /// The identifier-row predicate of one `:identifier` value, in the token
+    /// grammar SQLite and PostgreSQL use for it: `system|value`, `system|`,
+    /// `|value` (no system) or a bare value.
+    fn identifier_predicate(value: &str) -> Document {
+        match value.split_once('|') {
+            Some(("", code)) => doc! {
+                "value_token_system": { "$in": [Bson::Null, Bson::String(String::new())] },
+                "value_token_code": code,
+            },
+            Some((system, "")) => doc! { "value_token_system": system },
+            Some((system, code)) => doc! {
+                "value_token_system": system,
+                "value_token_code": code,
+            },
+            None => doc! { "value_token_code": value },
+        }
+    }
+
+    /// Resolves a reference `:identifier` parameter (#1408) into its complete
+    /// `search_index` filter, or `None` when no resource carries the
+    /// identifier — and so nothing can match.
+    ///
+    /// Same meaning as SQLite and PostgreSQL give it: the reference's *target*
+    /// has the identifier. Those backends express it as a sub-select on the
+    /// target's `identifier` rows; MongoDB has no join a filter document can
+    /// carry, so the targets are read first and the parameter becomes one
+    /// `$in` over their `Type/id` — each with an anchored `_history` regex, so
+    /// a versioned reference matches too and every entry stays index-bounded.
+    ///
+    /// The lookup is scoped to the tenant, which is load-bearing (another
+    /// tenant's identifiers must not decide this tenant's matches), and to the
+    /// parameter's declared target types, which is what lets it use the token
+    /// index: every value index leads with `resource_type`.
+    async fn resolve_reference_identifier(
+        &self,
+        search_index: &mongodb::Collection<Document>,
+        tenant_id: &str,
+        resource_type: &str,
+        param: &SearchParameter,
+    ) -> StorageResult<Option<Document>> {
+        let predicates: Vec<Bson> = param
+            .values
+            .iter()
+            .map(|value| Bson::Document(Self::identifier_predicate(&value.value)))
+            .collect();
+
+        let targets: Vec<String> = {
+            let registry = self.tenant_registry(tenant_id);
+            let registry = registry.read();
+            crate::search::resolve_param_targets(&registry, resource_type, &param.name)
+        };
+
+        let mut lookup = doc! { "tenant_id": tenant_id };
+        if !targets.is_empty() {
+            lookup.insert("resource_type", doc! { "$in": targets });
+        }
+        lookup.insert("param_name", "identifier");
+        lookup.insert("$or", Bson::Array(predicates));
+
+        let mut cursor = search_index
+            .find(lookup)
+            .projection(doc! { "resource_type": 1, "resource_id": 1, "_id": 0 })
+            .await
+            .or_query_error("Failed to resolve :identifier targets")?;
+
+        let mut found: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        loop {
+            let batch = read_cursor_batch(&mut cursor, CANDIDATE_BATCH_SIZE).await?;
+            let read = batch.len();
+            for row in &batch {
+                if let (Ok(target_type), Ok(target_id)) =
+                    (row.get_str("resource_type"), row.get_str("resource_id"))
+                {
+                    found.insert(format!("{target_type}/{target_id}"));
+                }
+            }
+            if found.len() > MAX_IDENTIFIER_TARGETS {
+                return Err(StorageError::Search(SearchError::TooManyResults {
+                    count: found.len(),
+                    max: MAX_IDENTIFIER_TARGETS,
+                }));
+            }
+            if read < CANDIDATE_BATCH_SIZE {
+                break;
+            }
+        }
+        if found.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(Self::identifier_targets_filter(
+            tenant_id,
+            resource_type,
+            &param.name,
+            found,
+        )))
+    }
+
+    /// The filter a resolved `:identifier` parameter becomes: the referencing
+    /// rows whose `value_reference` is one of `targets`, at any version.
+    fn identifier_targets_filter(
+        tenant_id: &str,
+        resource_type: &str,
+        param_name: &str,
+        targets: impl IntoIterator<Item = String>,
+    ) -> Document {
+        let mut references: Vec<Bson> = Vec::new();
+        for target in targets {
+            references.push(Bson::RegularExpression(bson::Regex {
+                pattern: format!("^{}/_history/", regex_escape(&target)),
+                options: String::new(),
+            }));
+            references.push(Bson::String(target));
+        }
+        doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "param_name": param_name,
+            "value_reference": { "$in": references },
         }
     }
 
@@ -2875,20 +3080,63 @@ impl MongoBackend {
             });
         }
 
-        if let Some(modifier) = &param.modifier {
-            return Err(StorageError::Search(SearchError::UnsupportedModifier {
-                modifier: modifier.to_string(),
-                param_type: "reference".to_string(),
-            }));
+        // `:below` / `:above` - URL/path hierarchy on the stored reference,
+        // the shapes `build_uri_filter` uses (#1408). Canonical `|version`
+        // comparison is not implemented, as on the other backends.
+        if matches!(param.modifier.as_ref(), Some(SearchModifier::Below)) {
+            return Ok(doc! {
+                "value_reference": {
+                    "$regex": format!(
+                        "^{}(/|$)",
+                        regex_escape(value.value.trim_end_matches('/'))
+                    )
+                }
+            });
+        }
+        if matches!(param.modifier.as_ref(), Some(SearchModifier::Above)) {
+            return Ok(doc! {
+                "value_reference": {
+                    "$in": crate::search::compute_parent_uris(&value.value)
+                }
+            });
         }
 
-        if value.value.contains('/') {
+        // `:[type]` (#1408): `subject:Patient=123` is `subject=Patient/123`,
+        // so it takes the qualified branch below and can never match
+        // `Group/123`.
+        let typed;
+        let reference = match param.modifier.as_ref() {
+            None => value.value.as_str(),
+            Some(SearchModifier::Type(type_name)) => {
+                match Self::typed_reference(type_name, &value.value) {
+                    Some(reference) => {
+                        typed = reference;
+                        typed.as_str()
+                    }
+                    None => return Ok(Self::match_nothing()),
+                }
+            }
+            // `:identifier` is resolved by `resolve_reference_identifier`
+            // before any filter is built; a path that does not do that has
+            // no way to honour it.
+            Some(modifier) => {
+                return Err(StorageError::Search(SearchError::UnsupportedModifier {
+                    modifier: modifier.to_string(),
+                    param_type: "reference".to_string(),
+                }));
+            }
+        };
+
+        if reference.contains('/') {
+            // Version-agnostic, like every other backend: a versioned search
+            // value names the resource, not one version of it.
+            let base = strip_reference_version(reference);
             return Ok(doc! {
                 "$or": [
-                    { "value_reference": &value.value },
+                    { "value_reference": base },
                     {
                         "value_reference": {
-                            "$regex": format!("^{}/_history/", regex_escape(&value.value))
+                            "$regex": format!("^{}/_history/", regex_escape(base))
                         }
                     }
                 ]
@@ -5555,5 +5803,374 @@ mod cursor_keyset_tests {
             err,
             StorageError::Search(SearchError::InvalidCursor { .. })
         ));
+    }
+}
+
+/// #1408: token `:of-type`, reference `:[type]`, `:identifier`, `:above` and
+/// `:below` — refused as unsupported modifiers before.
+#[cfg(test)]
+mod modifier_parity_filter_tests {
+    use super::*;
+    use crate::backends::mongodb::MongoBackendConfig;
+
+    const V2_0203: &str = "http://terminology.hl7.org/CodeSystem/v2-0203";
+
+    fn backend() -> MongoBackend {
+        MongoBackend::new(MongoBackendConfig::default()).unwrap()
+    }
+
+    fn param(
+        name: &str,
+        param_type: SearchParamType,
+        modifier: SearchModifier,
+        values: &[&str],
+    ) -> SearchParameter {
+        SearchParameter {
+            name: name.to_string(),
+            param_type,
+            modifier: Some(modifier),
+            values: values.iter().map(|v| SearchValue::eq(*v)).collect(),
+            chain: vec![],
+            components: vec![],
+        }
+    }
+
+    fn filter(param: &SearchParameter) -> Document {
+        backend()
+            .build_search_index_filter("t1", "Observation", param)
+            .unwrap()
+    }
+
+    fn subject(modifier: SearchModifier, value: &str) -> Document {
+        filter(&param(
+            "subject",
+            SearchParamType::Reference,
+            modifier,
+            &[value],
+        ))
+    }
+
+    fn patient() -> SearchModifier {
+        SearchModifier::Type("Patient".to_string())
+    }
+
+    /// The envelope every filter carries, so a predicate is never evaluated
+    /// against another tenant's, type's or parameter's rows.
+    fn envelope(name: &str) -> Document {
+        doc! { "tenant_id": "t1", "resource_type": "Observation", "param_name": name }
+    }
+
+    fn with(mut envelope: Document, predicate: Document) -> Document {
+        envelope.extend(predicate);
+        envelope
+    }
+
+    #[test]
+    fn the_gate_admits_the_new_modifiers_and_still_refuses_terminology() {
+        let backend = backend();
+        let admitted = [
+            param(
+                "identifier",
+                SearchParamType::Token,
+                SearchModifier::OfType,
+                &["s|c|v"],
+            ),
+            param("subject", SearchParamType::Reference, patient(), &["1"]),
+            param(
+                "subject",
+                SearchParamType::Reference,
+                SearchModifier::Identifier,
+                &["s|v"],
+            ),
+            param(
+                "subject",
+                SearchParamType::Reference,
+                SearchModifier::Above,
+                &["http://example.org/fhir/Patient/1"],
+            ),
+            param(
+                "subject",
+                SearchParamType::Reference,
+                SearchModifier::Below,
+                &["http://example.org/fhir"],
+            ),
+        ];
+        for param in admitted {
+            let shown = format!("{param:?}");
+            let query = SearchQuery::new("Observation").with_parameter(param);
+            assert!(backend.validate_query_support(&query).is_ok(), "{shown}");
+        }
+
+        for modifier in [
+            SearchModifier::In,
+            SearchModifier::NotIn,
+            SearchModifier::Above,
+            SearchModifier::Below,
+        ] {
+            let query = SearchQuery::new("Observation").with_parameter(param(
+                "code",
+                SearchParamType::Token,
+                modifier.clone(),
+                &["http://loinc.org|1234-5"],
+            ));
+            assert!(
+                matches!(
+                    backend.validate_query_support(&query),
+                    Err(StorageError::Search(
+                        SearchError::UnsupportedModifier { .. }
+                    ))
+                ),
+                "token :{modifier} must stay refused"
+            );
+        }
+    }
+
+    #[test]
+    fn of_type_compares_type_system_type_code_and_value() {
+        let of_type = |value: &str| {
+            filter(&param(
+                "identifier",
+                SearchParamType::Token,
+                SearchModifier::OfType,
+                &[value],
+            ))
+        };
+
+        assert_eq!(
+            of_type(&format!("{V2_0203}|MR|12345")),
+            with(
+                envelope("identifier"),
+                doc! {
+                    "value_token_code": "12345",
+                    "value_identifier_type_system": V2_0203,
+                    "value_identifier_type_code": "MR",
+                }
+            )
+        );
+        // An empty part is not compared.
+        assert_eq!(
+            of_type("|MR|12345"),
+            with(
+                envelope("identifier"),
+                doc! { "value_token_code": "12345", "value_identifier_type_code": "MR" }
+            )
+        );
+        // The identifier value may itself contain a pipe.
+        assert_eq!(
+            of_type("|MR|a|b"),
+            with(
+                envelope("identifier"),
+                doc! { "value_token_code": "a|b", "value_identifier_type_code": "MR" }
+            )
+        );
+    }
+
+    /// Fewer than three parts — or three empty ones — must match nothing:
+    /// dropping the condition instead would return every resource of the type.
+    #[test]
+    fn a_malformed_of_type_value_matches_nothing() {
+        for value in ["12345", "MR|12345", "||"] {
+            let built = filter(&param(
+                "identifier",
+                SearchParamType::Token,
+                SearchModifier::OfType,
+                &[value],
+            ));
+            assert_eq!(
+                built,
+                with(envelope("identifier"), MongoBackend::match_nothing()),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn of_type_values_are_ored() {
+        let built = filter(&param(
+            "identifier",
+            SearchParamType::Token,
+            SearchModifier::OfType,
+            &["|MR|1", "|SS|2"],
+        ));
+        assert_eq!(
+            built.get_array("$or").unwrap(),
+            &vec![
+                Bson::Document(
+                    doc! { "value_token_code": "1", "value_identifier_type_code": "MR" }
+                ),
+                Bson::Document(
+                    doc! { "value_token_code": "2", "value_identifier_type_code": "SS" }
+                ),
+            ]
+        );
+    }
+
+    /// `subject:Patient=123` is `subject=Patient/123`: the same filter, and so
+    /// never `Group/123`.
+    #[test]
+    fn type_modifier_is_the_qualified_reference() {
+        let plain = filter(&SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: vec![SearchValue::eq("Patient/123")],
+            chain: vec![],
+            components: vec![],
+        });
+        assert_eq!(
+            plain,
+            with(
+                envelope("subject"),
+                doc! { "$or": [
+                    { "value_reference": "Patient/123" },
+                    { "value_reference": { "$regex": "^Patient/123/_history/" } },
+                ]}
+            )
+        );
+        assert_eq!(subject(patient(), "123"), plain);
+        assert_eq!(subject(patient(), "Patient/123"), plain);
+        // Version-agnostic, with or without the modifier.
+        assert_eq!(subject(patient(), "123/_history/2"), plain);
+        assert_eq!(subject(patient(), "Patient/123/_history/2"), plain);
+        assert_eq!(
+            filter(&SearchParameter {
+                name: "subject".to_string(),
+                param_type: SearchParamType::Reference,
+                modifier: None,
+                values: vec![SearchValue::eq("Patient/123/_history/2")],
+                chain: vec![],
+                components: vec![],
+            }),
+            plain
+        );
+    }
+
+    #[test]
+    fn type_modifier_keeps_an_absolute_url_of_that_type() {
+        assert_eq!(
+            subject(patient(), "http://example.org/fhir/Patient/123"),
+            with(
+                envelope("subject"),
+                doc! { "$or": [
+                    { "value_reference": "http://example.org/fhir/Patient/123" },
+                    { "value_reference": {
+                        "$regex": "^http://example\\.org/fhir/Patient/123/_history/"
+                    } },
+                ]}
+            )
+        );
+    }
+
+    #[test]
+    fn type_modifier_and_a_value_of_another_type_match_nothing() {
+        for value in ["Group/123", "http://example.org/fhir/Group/123"] {
+            assert_eq!(
+                subject(patient(), value),
+                with(envelope("subject"), MongoBackend::match_nothing()),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn type_modifier_escapes_regex_metacharacters() {
+        let built = subject(patient(), "1.5");
+        let arms = built.get_array("$or").unwrap();
+        assert_eq!(
+            arms[1].as_document().unwrap(),
+            &doc! { "value_reference": { "$regex": "^Patient/1\\.5/_history/" } }
+        );
+    }
+
+    #[test]
+    fn reference_below_and_above_mirror_the_uri_shapes() {
+        assert_eq!(
+            subject(SearchModifier::Below, "http://example.org/fhir/"),
+            with(
+                envelope("subject"),
+                doc! { "value_reference": { "$regex": "^http://example\\.org/fhir(/|$)" } }
+            )
+        );
+        let above = subject(SearchModifier::Above, "http://example.org/fhir/Patient/1");
+        let parents = above
+            .get_document("value_reference")
+            .unwrap()
+            .get_array("$in")
+            .unwrap();
+        assert!(parents.contains(&Bson::String(
+            "http://example.org/fhir/Patient/1".to_string()
+        )));
+        assert!(parents.contains(&Bson::String("http://example.org/fhir".to_string())));
+    }
+
+    /// `:identifier` needs the database; a path that did not resolve it must
+    /// refuse rather than treat the identifier as a reference.
+    #[test]
+    fn an_unresolved_identifier_modifier_is_refused_by_the_builder() {
+        let error = backend()
+            .build_search_index_filter(
+                "t1",
+                "Observation",
+                &param(
+                    "subject",
+                    SearchParamType::Reference,
+                    SearchModifier::Identifier,
+                    &["http://example.org/mrn|12345"],
+                ),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            StorageError::Search(SearchError::UnsupportedModifier { ref modifier, .. })
+                if modifier == "identifier"
+        ));
+    }
+
+    #[test]
+    fn identifier_predicates_follow_the_token_grammar() {
+        assert_eq!(
+            MongoBackend::identifier_predicate("http://example.org/mrn|12345"),
+            doc! { "value_token_system": "http://example.org/mrn", "value_token_code": "12345" }
+        );
+        assert_eq!(
+            MongoBackend::identifier_predicate("http://example.org/mrn|"),
+            doc! { "value_token_system": "http://example.org/mrn" }
+        );
+        assert_eq!(
+            MongoBackend::identifier_predicate("12345"),
+            doc! { "value_token_code": "12345" }
+        );
+        assert_eq!(
+            MongoBackend::identifier_predicate("|12345"),
+            doc! {
+                "value_token_system": { "$in": [Bson::Null, Bson::String(String::new())] },
+                "value_token_code": "12345",
+            }
+        );
+    }
+
+    /// Each resolved target is matched exactly or at any version — never as a
+    /// prefix of another id (`Patient/p1` must not admit `Patient/p10`).
+    #[test]
+    fn resolved_identifier_targets_are_one_bounded_in() {
+        let built = MongoBackend::identifier_targets_filter(
+            "t1",
+            "Observation",
+            "subject",
+            vec!["Patient/p.1".to_string()],
+        );
+        assert_eq!(
+            built,
+            with(
+                envelope("subject"),
+                doc! { "value_reference": { "$in": [
+                    Bson::RegularExpression(bson::Regex {
+                        pattern: "^Patient/p\\.1/_history/".to_string(),
+                        options: String::new(),
+                    }),
+                    Bson::String("Patient/p.1".to_string()),
+                ]}}
+            )
+        );
     }
 }
