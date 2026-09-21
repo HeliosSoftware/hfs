@@ -64,6 +64,9 @@ use super::config::{CompositeConfig, SyncMode};
 use super::merger::{MergeOptions, ResultMerger};
 use super::router::{QueryRouter, RoutingDecision, RoutingError};
 use super::sync::{SyncEvent, SyncManager, SyncStatus};
+use super::sync_failures::{
+    SecondarySyncFailureLedger, SecondarySyncObserver, SyncFailureRecorder,
+};
 
 /// A dynamically typed storage backend.
 pub type DynStorage = Arc<dyn ResourceStorage + Send + Sync>;
@@ -472,11 +475,56 @@ impl CompositeStorage {
     }
 
     /// Synchronizes a resource change to secondary backends.
+    ///
+    /// `Err` means the event could not even be handed over (the asynchronous
+    /// queue is gone). A secondary that *took* the event and then refused it
+    /// after retries is not an error here — the primary has committed and the
+    /// write stands (#1334) — but it is never silent either: the
+    /// [`SyncManager`] reports every final outcome, from the synchronous path
+    /// and from the asynchronous worker alike, to its
+    /// [`SyncFailureRecorder`], which counts it, emits the structured event
+    /// and records the resource as needing a reindex.
     pub(crate) async fn sync_to_secondaries(&self, event: SyncEvent) -> StorageResult<()> {
         if let Some(ref sync_manager) = self.sync_manager {
-            sync_manager.sync(&event, &self.secondaries).await?;
+            let statuses = sync_manager.sync(&event, &self.secondaries).await?;
+            for status in statuses.iter().filter(|status| !status.success) {
+                // Already counted, logged and recorded by the recorder; this
+                // only ties the failure to the request's own trace span.
+                debug!(
+                    backend_id = %status.backend_id,
+                    retries = status.retry_count,
+                    "Write committed on the primary; secondary sync failed and was recorded"
+                );
+            }
         }
         Ok(())
+    }
+
+    /// Keeps "needs reindex" records for failed secondary syncs in `ledger`
+    /// — normally the primary backend — so they survive a restart and
+    /// [`repair_secondary_sync_failures`](Self::repair_secondary_sync_failures)
+    /// can work through them (#1334). Without one, failures are still counted
+    /// and logged, just not listed.
+    pub fn with_sync_failure_ledger(self, ledger: Arc<dyn SecondarySyncFailureLedger>) -> Self {
+        if let Some(recorder) = self.sync_failure_recorder() {
+            recorder.set_ledger(ledger);
+        }
+        self
+    }
+
+    /// Forwards secondary sync failures to a metrics exporter (#1334).
+    pub fn with_sync_observer(self, observer: Arc<dyn SecondarySyncObserver>) -> Self {
+        if let Some(recorder) = self.sync_failure_recorder() {
+            recorder.set_observer(observer);
+        }
+        self
+    }
+
+    /// Where secondary sync outcomes are reported; `None` without secondaries.
+    pub fn sync_failure_recorder(&self) -> Option<&Arc<SyncFailureRecorder>> {
+        self.sync_manager
+            .as_ref()
+            .map(|manager| manager.failure_recorder())
     }
 
     /// Routes and executes a search query.

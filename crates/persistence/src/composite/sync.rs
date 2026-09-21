@@ -36,14 +36,15 @@ use parking_lot::RwLock;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::sleep;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 use crate::core::ResourceStorage;
-use crate::error::{BackendError, StorageError, StorageResult};
+use crate::error::{BackendError, ResourceError, StorageError, StorageResult};
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 use crate::types::StoredResource;
 
 use super::config::{RetryConfig, SyncConfig, SyncMode};
+use super::sync_failures::{SyncFailureKey, SyncFailureRecorder, SyncOperation};
 
 /// A synchronization event to propagate to secondary backends.
 #[derive(Debug, Clone)]
@@ -166,6 +167,10 @@ pub struct SyncManager {
 
     /// Sync status per backend.
     status: Arc<RwLock<HashMap<String, BackendSyncStatus>>>,
+
+    /// Where every final outcome is reported (#1334): the failure metric,
+    /// the structured event, and the durable "needs reindex" record.
+    recorder: Arc<SyncFailureRecorder>,
 }
 
 /// Status tracking for a backend.
@@ -220,7 +225,13 @@ impl SyncManager {
             config,
             event_sender: None,
             status: Arc::new(RwLock::new(HashMap::new())),
+            recorder: Arc::new(SyncFailureRecorder::default()),
         }
+    }
+
+    /// The recorder every final sync outcome is reported to (#1334).
+    pub fn failure_recorder(&self) -> &Arc<SyncFailureRecorder> {
+        &self.recorder
     }
 
     /// Starts the async sync worker.
@@ -233,9 +244,10 @@ impl SyncManager {
 
         let config = self.config.clone();
         let status = self.status.clone();
+        let recorder = self.recorder.clone();
 
         tokio::spawn(async move {
-            Self::async_worker(receiver, backends, config, status).await;
+            Self::async_worker(receiver, backends, config, status, recorder).await;
         })
     }
 
@@ -245,6 +257,7 @@ impl SyncManager {
         backends: HashMap<String, Arc<dyn ResourceStorage + Send + Sync>>,
         config: SyncConfig,
         status: Arc<RwLock<HashMap<String, BackendSyncStatus>>>,
+        recorder: Arc<SyncFailureRecorder>,
     ) {
         let mut batch = Vec::new();
         let batch_timeout = Duration::from_millis(100);
@@ -302,6 +315,22 @@ impl SyncManager {
                         )
                         .await;
 
+                        // Nobody is waiting on this event any more: the
+                        // recorder is the only witness of how it ended.
+                        match &result {
+                            Ok(()) => recorder.sync_succeeded(&queued.event, backend_id).await,
+                            Err(e) => {
+                                recorder
+                                    .sync_failed(
+                                        &queued.event,
+                                        backend_id,
+                                        e,
+                                        config.retry.max_retries + 1,
+                                    )
+                                    .await
+                            }
+                        }
+
                         // Update status
                         let mut status_map = status.write();
                         let backend_status = status_map.entry(backend_id.clone()).or_default();
@@ -312,14 +341,7 @@ impl SyncManager {
                                 backend_status.total_synced += 1;
                                 backend_status.healthy = true;
                             }
-                            Err(e) => {
-                                backend_status.total_errors += 1;
-                                error!(
-                                    backend = %backend_id,
-                                    error = %e,
-                                    "Async sync failed"
-                                );
-                            }
+                            Err(_) => backend_status.total_errors += 1,
                         }
 
                         if backend_status.pending_events > 0 {
@@ -416,9 +438,16 @@ impl SyncManager {
             let backend = backend.clone();
             let backend_id = backend_id.clone();
             let retry_config = self.config.retry.clone();
+            let recorder = self.recorder.clone();
 
             tasks.spawn(async move {
                 let start = std::time::Instant::now();
+                let key = |resource_id: &str| SyncFailureKey {
+                    tenant_id: tenant.tenant_id().as_str().to_string(),
+                    resource_type: resource_type.clone(),
+                    resource_id: resource_id.to_string(),
+                    backend_id: backend_id.clone(),
+                };
                 let contents = resources
                     .iter()
                     .map(|(_, content)| content.clone())
@@ -434,6 +463,7 @@ impl SyncManager {
                 for ((resource_id, content), result) in resources.iter().zip(results) {
                     let Err(batch_error) = result else {
                         synced += 1;
+                        recorder.resource_sync_succeeded(key(resource_id)).await;
                         continue;
                     };
                     warn!(
@@ -452,9 +482,22 @@ impl SyncManager {
                     };
                     match Self::sync_event_to_backend(&event, backend.as_ref(), &retry_config).await
                     {
-                        Ok(()) => synced += 1,
+                        Ok(()) => {
+                            synced += 1;
+                            recorder.resource_sync_succeeded(key(resource_id)).await;
+                        }
                         Err(e) => {
                             errors += 1;
+                            recorder
+                                .resource_sync_failed(
+                                    key(resource_id),
+                                    SyncOperation::Create,
+                                    content.pointer("/meta/versionId").and_then(|v| v.as_str()),
+                                    &e,
+                                    // The batch attempt, then the retried single sync.
+                                    retry_config.max_retries + 2,
+                                )
+                                .await;
                             last_error = Some(e.to_string());
                             failed_resource_ids.push(resource_id.clone());
                         }
@@ -522,11 +565,22 @@ impl SyncManager {
             let backend = backend.clone();
             let backend_id = backend_id.clone();
             let retry_config = self.config.retry.clone();
+            let recorder = self.recorder.clone();
 
             tasks.spawn(async move {
                 let start = std::time::Instant::now();
 
-                match Self::sync_event_to_backend(&event, backend.as_ref(), &retry_config).await {
+                let result =
+                    Self::sync_event_to_backend(&event, backend.as_ref(), &retry_config).await;
+                match &result {
+                    Ok(()) => recorder.sync_succeeded(&event, &backend_id).await,
+                    Err(e) => {
+                        recorder
+                            .sync_failed(&event, &backend_id, e, retry_config.max_retries + 1)
+                            .await
+                    }
+                }
+                match result {
                     Ok(_) => SyncStatus {
                         backend_id,
                         success: true,
@@ -682,7 +736,16 @@ impl SyncManager {
                 } => {
                     let tenant =
                         TenantContext::new(tenant_id.clone(), TenantPermissions::full_access());
-                    backend.delete(&tenant, resource_type, resource_id).await
+                    match backend.delete(&tenant, resource_type, resource_id).await {
+                        // The secondary does not have it, which is the state
+                        // the delete asks for: a create that never reached it,
+                        // or a delete whose answer was lost. Retrying cannot
+                        // change that, and it is not a failure (#1334).
+                        Err(StorageError::Resource(
+                            ResourceError::NotFound { .. } | ResourceError::Gone { .. },
+                        )) => Ok(()),
+                        other => other,
+                    }
                 }
                 SyncEvent::BulkSync {
                     resources,
