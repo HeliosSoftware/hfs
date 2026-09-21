@@ -108,7 +108,7 @@ pub fn parse_typed_values(
 /// refused, and the REST search handlers drop such a pair before a query is
 /// built. That is a decision about a request, which only an entry point can
 /// make: criteria that guard a write refuse it instead
-/// ([`reject_empty_criterion_values`](super::reject_empty_criterion_values)).
+/// ([`reject_empty_criterion_values`](super::conditional::reject_empty_criterion_values)).
 /// A storage backend cannot ignore what it is handed, so here it is an error,
 /// never a query.
 ///
