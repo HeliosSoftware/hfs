@@ -760,6 +760,66 @@ impl PostgresQueryBuilder {
                 continue;
             }
 
+            // A composite is decided per `composite_group` of one contained
+            // entity, which is not a predicate on one row, so it narrows the
+            // entities like `_id` does rather than joining the branches
+            // (#1407). Contained rows are always in the one-row-per-component
+            // form — `build_contained_rows` does not fold them, whatever the
+            // database's layout — so this is the pairing of
+            // `build_composite_condition_legacy`, keyed on the contained
+            // entity, with every component on the base (slot 1) columns.
+            if param.param_type == SearchParamType::Composite {
+                let mut alternatives: Vec<String> = Vec::new();
+                for value in &param.values {
+                    let parts: Vec<&str> = value.value.split('$').collect();
+                    // Staged, and committed only once every component parsed.
+                    let mut staged: Vec<SqlParam> = Vec::new();
+                    let mut predicates: Vec<String> = Vec::new();
+                    let mut ok = parts.len() == param.components.len();
+                    for (part, component) in parts.iter().zip(&param.components) {
+                        if !ok {
+                            break;
+                        }
+                        let cv = Self::parse_component_value(part, component.param_type);
+                        match Self::build_composite_component(
+                            &cv,
+                            component.param_type,
+                            offset + staged.len(),
+                            1,
+                        ) {
+                            Some((sql, ps)) => {
+                                staged.extend(ps);
+                                predicates.push(sql);
+                            }
+                            None => ok = false,
+                        }
+                    }
+                    if !ok || predicates.is_empty() {
+                        alternatives.push(match_nothing().sql);
+                        continue;
+                    }
+                    offset += staged.len();
+                    params.extend(staged);
+                    let havings: Vec<String> =
+                        predicates.iter().map(|p| format!("bool_or({p})")).collect();
+                    let prefilter: Vec<String> =
+                        predicates.iter().map(|p| format!("({p})")).collect();
+                    alternatives.push(format!(
+                        "(resource_type, resource_id, contained_local_id) IN \
+                         (SELECT resource_type, resource_id, contained_local_id FROM search_index \
+                         WHERE tenant_id = $1 AND is_contained = TRUE AND contained_type = $2 \
+                         AND param_name = '{}' AND ({}) \
+                         GROUP BY resource_type, resource_id, contained_local_id, composite_group \
+                         HAVING {})",
+                        param.name,
+                        prefilter.join(" OR "),
+                        havings.join(" AND ")
+                    ));
+                }
+                entity_filters.push(format!("({})", alternatives.join(" OR ")));
+                continue;
+            }
+
             let modifier = param.modifier.as_ref();
             let mut or_parts: Vec<String> = Vec::new();
             for value in &param.values {
@@ -915,9 +975,8 @@ impl PostgresQueryBuilder {
     ///   own, and the container's is not on these rows;
     /// - `_text`, `_content` and the other `_`-parameters that are resolved
     ///   against `resources` or `resource_fts`, which only know the container;
-    /// - composites, which the writer leaves unfolded on contained rows and
-    ///   `build_contained` does not pair up, and chains, which it does not
-    ///   follow;
+    /// - chains, which it does not follow (composites are paired per
+    ///   `composite_group` of the contained entity, #1407);
     /// - `:missing`, refused here since the modifier was introduced and pinned
     ///   as a 400 by the REST and PostgreSQL suites, and the modifiers that are
     ///   not a predicate on one index row (`:in`, `:not-in`, token
@@ -944,7 +1003,15 @@ impl PostgresQueryBuilder {
             return Some("this parameter is".to_string());
         }
         let row_level = match (&param.modifier, param.param_type) {
-            (_, SearchParamType::Composite) => return Some("composite parameters are".to_string()),
+            // Paired per `composite_group` by `build_contained`. Without its
+            // components (the REST layer resolves them) there is nothing to
+            // pair, and no modifier applies to a composite.
+            (None, SearchParamType::Composite) if !param.components.is_empty() => true,
+            (_, SearchParamType::Composite) => {
+                return Some(
+                    "composite parameters with a modifier or no components are".to_string(),
+                );
+            }
             (_, SearchParamType::Special) => return Some("special parameters are".to_string()),
             (None | Some(SearchModifier::Not), _) => true,
             (
@@ -4305,7 +4372,11 @@ mod tests {
             date_param("_lastUpdated", SearchPrefix::Gt, "2020"),
             special_param("_text", vec![SearchValue::new(SearchPrefix::Eq, "x")]),
             token_param("_id", Some(SearchModifier::Not), "a"),
-            composite_param("code-value-quantity", "X$5"),
+            // A composite whose components were never resolved cannot be paired.
+            SearchParameter {
+                components: vec![],
+                ..composite_param("code-value-quantity", "X$5")
+            },
             // Not a predicate on one index row, or not a modifier of the type:
             // before #1363 these were read as a plain match.
             token_param("code", Some(SearchModifier::In), "http://vs"),
@@ -4454,6 +4525,51 @@ mod tests {
             branch(uri(None)),
             ("(param_name = 'url' AND ((value_uri = $3)))".to_string(), 1)
         );
+    }
+
+    /// A composite narrows the contained entities by a per-`composite_group`
+    /// pairing over the unfolded contained rows (#1407); its placeholders
+    /// continue the numbering, and an unparseable component fails closed.
+    #[test]
+    fn contained_composite_is_paired_per_group_of_the_entity() {
+        let query = contained_query(vec![
+            token_param("status", None, "final"),
+            SearchParameter {
+                values: vec![
+                    SearchValue::new(SearchPrefix::Eq, "X$gt5"),
+                    SearchValue::new(SearchPrefix::Eq, "X$abc"),
+                ],
+                ..composite_param("code-value-quantity", "")
+            },
+            token_param("category", None, "lab"),
+        ]);
+        assert!(PostgresQueryBuilder::reject_unsupported_contained(&query).is_ok());
+        let frag = PostgresQueryBuilder::build_contained(&query).unwrap();
+        assert!(
+            frag.sql.contains(
+                "AND ((resource_type, resource_id, contained_local_id) IN (SELECT resource_type, \
+                 resource_id, contained_local_id FROM search_index WHERE tenant_id = $1 AND \
+                 is_contained = TRUE AND contained_type = $2 AND param_name = \
+                 'code-value-quantity' AND ((value_token_code = $4) OR ("
+            ),
+            "{}",
+            frag.sql
+        );
+        assert!(
+            frag.sql.contains(
+                "GROUP BY resource_type, resource_id, contained_local_id, composite_group \
+                 HAVING bool_or(value_token_code = $4) AND bool_or("
+            ),
+            "{}",
+            frag.sql
+        );
+        // `X$abc`: the quantity component is not a number and can never hold.
+        assert!(frag.sql.contains("AND bool_or(FALSE))"), "{}", frag.sql);
+        let mut seen = placeholders(&frag.sql);
+        seen.sort_unstable();
+        seen.dedup();
+        let expected: Vec<usize> = (1..=frag.params.len() + 2).collect();
+        assert_eq!(seen, expected, "{}", frag.sql);
     }
 
     /// Values that reach the number and quantity builders but are not numbers:
