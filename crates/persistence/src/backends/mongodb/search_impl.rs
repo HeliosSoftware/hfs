@@ -393,6 +393,17 @@ fn reject_contained_composite(query: &SearchQuery) -> StorageResult<()> {
             }));
         }
     }
+    // `_sort` orders by the *contained* resource's values, which
+    // `matching_contained` only matches on: it lists matches by container
+    // type, id and local id, after the top-level page for `both`. Refused
+    // rather than answered in that order (#1407).
+    if !query.sort.is_empty() {
+        return Err(StorageError::Search(SearchError::QueryParseError {
+            message: "'_sort' cannot be combined with _contained=true or both: sorting \
+                      contained matches is not supported on MongoDB"
+                .to_string(),
+        }));
+    }
     match query
         .parameters
         .iter()

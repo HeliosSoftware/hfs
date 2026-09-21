@@ -826,6 +826,15 @@ impl ElasticsearchBackend {
     /// for itself — and this materializes the `_offset`/`_count` window of it
     /// (no keyset cursor). `_total` and `search_count` are the length of that
     /// same list (#1383).
+    ///
+    /// `_sort` is applied, by the query itself, to each hit's own values — a
+    /// contained document carries the contained resource's search values, so
+    /// `_sort=date` orders by the *contained* resource's date, across the
+    /// top-level and contained hits of `both` alike. A container stands where
+    /// its first matching contained resource does. A contained resource has no
+    /// `meta.lastUpdated` of its own: its document carries the container's, and
+    /// that is what `_sort=_lastUpdated` reads. The SQL backends and MongoDB
+    /// refuse `_sort` here instead (#1407).
     async fn search_contained(
         &self,
         tenant: &TenantContext,

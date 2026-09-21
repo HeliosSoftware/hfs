@@ -911,7 +911,8 @@ impl PostgresQueryBuilder {
     ///
     /// `_has` and `_list` live outside `query.parameters` and select
     /// *top-level* resources, which a contained resource never is: nothing
-    /// outside its container can reference it. They are refused too (#1383).
+    /// outside its container can reference it. They are refused too (#1383),
+    /// and so is `_sort`, which this path would otherwise ignore (#1407).
     pub fn reject_unsupported_contained(query: &SearchQuery) -> Result<(), SearchError> {
         if query.contained == ContainedMode::Off {
             return Ok(());
@@ -928,6 +929,19 @@ impl PostgresQueryBuilder {
                     ),
                 });
             }
+        }
+        // `_sort` orders by the *contained* resource's values, which live on
+        // index rows this path only groups — it lists matches by container
+        // type, id and local id, and `_contained=both` appends them to the
+        // top-level page. Returning that order for a `_sort` the client asked
+        // for is the silent ignore #1363 rules out, so it is refused (#1407).
+        if !query.sort.is_empty() {
+            return Err(SearchError::QueryParseError {
+                message: format!(
+                    "'_sort' cannot be combined with _contained=true or both: sorting \
+                     contained matches is not supported on PostgreSQL"
+                ),
+            });
         }
         for param in &query.parameters {
             if let Some(reason) = Self::contained_unsupported_reason(param) {
@@ -4104,7 +4118,13 @@ mod tests {
             ));
         let mut list = contained_query(vec![]);
         list.list.push("l1".to_string());
-        for (query, name) in [(has, "'_has'"), (list, "'_list'")] {
+        // `_sort` would be ignored by the contained path, so it is refused too
+        // (#1407).
+        let mut sorted = contained_query(vec![]);
+        sorted
+            .sort
+            .push(crate::types::SortDirective::parse("-date"));
+        for (query, name) in [(has, "'_has'"), (list, "'_list'"), (sorted, "'_sort'")] {
             let message = PostgresQueryBuilder::reject_unsupported_contained(&query)
                 .unwrap_err()
                 .to_string();

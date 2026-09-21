@@ -1025,3 +1025,288 @@ where
     }
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
+
+/// The ids of a search in the order returned, or the refusal's text.
+async fn ordered_ids<S>(
+    backend: &S,
+    tenant: &TenantContext,
+    query: &SearchQuery,
+) -> Result<Vec<String>, String>
+where
+    S: ResourceStorage + SearchProvider,
+{
+    match backend.search(tenant, query).await {
+        Ok(found) => Ok(found
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect()),
+        Err(StorageError::Search(e)) => Err(e.to_string()),
+        Err(other) => panic!("not a search error: {other}"),
+    }
+}
+
+/// `_sort` under `_contained`, and a contained resource nothing but its id is
+/// known about (#1407).
+///
+/// - `_sort` is applied — to the *contained* resource's values, a container
+///   standing where its first matching contained resource does — or the search
+///   is refused with an error naming `_sort`. Returning the matches in some
+///   other order with a 200 is the one thing not allowed.
+/// - A contained resource with no indexed value other than its id is still a
+///   contained resource of its type: `_contained=true` alone and `_id` find it.
+///
+/// Containers (DiagnosticReport, created in this order → contained):
+/// - `s-a`: Observation `oa` (code X, 2020-03-01)
+/// - `s-b`: Observation `ob` (code X, 2020-01-01)
+/// - `s-c`: Observation `oc` (code X, 2020-02-01)
+/// - `s-bare`: `{"resourceType": "Location", "id": "bare"}` — a valid Location
+///   that yields no search value except `_id`
+/// - `s-named`: Location `named` with a `name`, the positive control for it
+///
+/// plus the top-level Observation `s-top` (code X, 2020-02-15). The three
+/// orders that could be mistaken for one another all differ: by container id
+/// `s-a, s-b, s-c`; most recently updated first `s-c, s-b, s-a`; by date
+/// `s-b, s-c, s-a`.
+pub async fn sort_and_id_only_contained<S>(backend: &S, tenant_base: &str)
+where
+    S: ResourceStorage + SearchProvider,
+{
+    use ContainedMode::{Both, Off, On};
+    use ContainedReturn::{Contained, Container};
+    use helios_persistence::types::SortDirective;
+
+    type Sort<'a> = &'a [(&'a str, Option<SearchParamType>)];
+
+    let tenant = TenantContext::new(TenantId::new(tenant_base), TenantPermissions::full_access());
+    for (container, local, when) in [
+        ("s-a", "oa", "2020-03-01"),
+        ("s-b", "ob", "2020-01-01"),
+        ("s-c", "oc", "2020-02-01"),
+    ] {
+        seed_containers(
+            backend,
+            &tenant,
+            vec![(container, vec![observation(local, "X", when, &["cat1"])])],
+        )
+        .await;
+        // `_lastUpdated` orders the containers; keep their timestamps apart.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    seed_containers(
+        backend,
+        &tenant,
+        vec![
+            (
+                "s-bare",
+                vec![json!({"resourceType": "Location", "id": "bare"})],
+            ),
+            (
+                "s-named",
+                vec![json!({"resourceType": "Location", "id": "named", "name": "Ward 7"})],
+            ),
+        ],
+    )
+    .await;
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            observation("s-top", "X", "2020-02-15", &["cat1"]),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed top-level observation");
+
+    let build = |resource_type: &str,
+                 mode: ContainedMode,
+                 returns: ContainedReturn,
+                 parameters: Vec<SearchParameter>,
+                 sort: Sort| {
+        let mut query = SearchQuery::new(resource_type);
+        query.contained = mode;
+        query.contained_return = returns;
+        query.parameters = parameters;
+        query.sort = sort
+            .iter()
+            .map(|(by, ty)| SortDirective::parse(by).with_param_type(*ty))
+            .collect();
+        query
+    };
+    let code_x = || vec![token("code", "X")];
+    let by_date: Sort = &[("date", Some(SearchParamType::Date))];
+    let by_date_desc: Sort = &[("-date", Some(SearchParamType::Date))];
+
+    // Positive controls: every row the cases rely on is indexed, and `_sort`
+    // itself works on this backend for a top-level search.
+    let controls: Vec<(&str, SearchQuery, &[&str])> = vec![
+        (
+            "code=X [true]",
+            build("Observation", On, Container, code_x(), &[]),
+            &["s-a", "s-b", "s-c"],
+        ),
+        (
+            "Location?name=Ward [true]",
+            build(
+                "Location",
+                On,
+                Container,
+                vec![literal("name", SearchParamType::String, "Ward")],
+                &[],
+            ),
+            &["s-named"],
+        ),
+        (
+            "code=X&_sort=date [false]",
+            build("Observation", Off, Container, code_x(), by_date),
+            &["s-top"],
+        ),
+    ];
+    for (label, query, expected) in &controls {
+        let expected: Vec<String> = expected.iter().map(|id| id.to_string()).collect();
+        for attempt in 0..60 {
+            let got = ordered_ids(backend, &tenant, query).await.map(|mut found| {
+                found.sort();
+                found
+            });
+            if got.as_ref().ok() == Some(&expected) {
+                break;
+            }
+            assert!(
+                attempt < 59,
+                "positive control {label} never held: got {got:?}, expected {expected:?} — \
+                 is the backend built with the spec search parameters?"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+
+    // (label, query, the ids expected — in this order when the query sorts —
+    // and the parameter a refusal may name instead, if one is acceptable)
+    let sort = Some("_sort");
+    let cases: Vec<(&str, SearchQuery, &[&str], Option<&str>)> = vec![
+        (
+            "code=X&_sort=date [true]",
+            build("Observation", On, Container, code_x(), by_date),
+            &["s-b", "s-c", "s-a"],
+            sort,
+        ),
+        (
+            "code=X&_sort=-date [true]",
+            build("Observation", On, Container, code_x(), by_date_desc),
+            &["s-a", "s-c", "s-b"],
+            sort,
+        ),
+        (
+            "code=X&_sort=-date [true, contained]",
+            build("Observation", On, Contained, code_x(), by_date_desc),
+            &["oa", "oc", "ob"],
+            sort,
+        ),
+        (
+            "_sort=date, no criterion [true, contained]",
+            build("Observation", On, Contained, vec![], by_date),
+            &["ob", "oc", "oa"],
+            sort,
+        ),
+        // `both` is one list: the top-level match sorts among the containers.
+        (
+            "code=X&_sort=date [both]",
+            build("Observation", Both, Container, code_x(), by_date),
+            &["s-b", "s-c", "s-top", "s-a"],
+            sort,
+        ),
+        // A contained resource has no `meta.lastUpdated`; its container's is
+        // the only one there is.
+        (
+            "code=X&_sort=_lastUpdated [true]",
+            build(
+                "Observation",
+                On,
+                Container,
+                code_x(),
+                &[("_lastUpdated", None)],
+            ),
+            &["s-a", "s-b", "s-c"],
+            sort,
+        ),
+        (
+            "code=X&_sort=-_lastUpdated [true]",
+            build(
+                "Observation",
+                On,
+                Container,
+                code_x(),
+                &[("-_lastUpdated", None)],
+            ),
+            &["s-c", "s-b", "s-a"],
+            sort,
+        ),
+        // The id-only contained resource.
+        (
+            "Location [true]",
+            build("Location", On, Container, vec![], &[]),
+            &["s-bare", "s-named"],
+            None,
+        ),
+        (
+            "Location [true, contained]",
+            build("Location", On, Contained, vec![], &[]),
+            &["bare", "named"],
+            None,
+        ),
+        (
+            "Location?_id=bare [true]",
+            build("Location", On, Container, vec![token("_id", "bare")], &[]),
+            &["s-bare"],
+            None,
+        ),
+        (
+            "Location?name:missing=true [true]",
+            build(
+                "Location",
+                On,
+                Container,
+                vec![with_modifier(
+                    literal("name", SearchParamType::String, "true"),
+                    SearchModifier::Missing,
+                )],
+                &[],
+            ),
+            &["s-bare"],
+            Some("name"),
+        ),
+    ];
+
+    let mut failures = Vec::new();
+    for (label, query, expected, may_refuse) in &cases {
+        let got = ordered_ids(backend, &tenant, query).await.map(|mut found| {
+            if query.sort.is_empty() {
+                found.sort();
+            }
+            found
+        });
+        let ok = match (&got, may_refuse) {
+            (Ok(found), _) => found
+                .iter()
+                .map(String::as_str)
+                .eq(expected.iter().copied()),
+            (Err(message), Some(name)) => message.contains(name) && message.contains("_contained"),
+            (Err(_), None) => false,
+        };
+        eprintln!(
+            "[contained_suite] {} {label} -> {got:?}",
+            if ok { "ok  " } else { "FAIL" }
+        );
+        if !ok {
+            let or_refused = may_refuse
+                .map(|name| format!(" or an error naming '{name}' and _contained"))
+                .unwrap_or_default();
+            failures.push(format!(
+                "{label}: got {got:?}, expected {expected:?}{or_refused}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
