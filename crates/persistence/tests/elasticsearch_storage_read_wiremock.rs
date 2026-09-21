@@ -413,6 +413,12 @@ async fn accept_the_write(server: &MockServer) {
         ResponseTemplate::new(201).set_body_json(json!({ "result": "created" }))
     })
     .await;
+    // The sweep of stale contained documents; its answer is no longer
+    // discarded (#1382), so an unstubbed `404` would fail the write.
+    on(server, "POST", "/hfs_read-stub_*/_delete_by_query", |_| {
+        ResponseTemplate::new(200).set_body_json(json!({ "deleted": 0 }))
+    })
+    .await;
 }
 
 /// "New, start at version 1" needs Elasticsearch to say the document is

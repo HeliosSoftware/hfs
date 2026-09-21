@@ -69,14 +69,14 @@ fn reject_unsupported_metadata_modifier(query: &SearchQuery) -> StorageResult<()
 /// Maximum retry attempts for transient ES search failures (in addition to the
 /// initial attempt). Transient failures observed in CI: shard allocation
 /// flapping during recovery/relocation, brief master-node hiccups.
-const MAX_SEARCH_RETRIES: u32 = 2;
+pub(super) const MAX_SEARCH_RETRIES: u32 = 2;
 
 /// Initial backoff before retrying a transient ES error. Doubled per attempt.
-const RETRY_BASE_DELAY_MS: u64 = 100;
+pub(super) const RETRY_BASE_DELAY_MS: u64 = 100;
 
 /// How a non-success Elasticsearch response is handled (#1294).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EsFailureClass {
+pub(super) enum EsFailureClass {
     /// The cluster could not answer right now; the same request may succeed
     /// shortly. Retried with backoff.
     Retryable,
@@ -164,7 +164,7 @@ fn es_error_types(body: &str) -> Vec<String> {
 /// A `search_phase_execution_exception` wrapper is deliberately not evidence of
 /// anything by itself: it used to be matched as a substring and treated as
 /// transient, which retried every malformed-query `400` (#1294).
-fn classify_es_failure(status: u16, body: &str) -> EsFailureClass {
+pub(super) fn classify_es_failure(status: u16, body: &str) -> EsFailureClass {
     let types = es_error_types(body);
     let names_any = |wanted: &[&str]| types.iter().any(|t| wanted.contains(&t.as_str()));
 
@@ -192,7 +192,7 @@ fn classify_es_failure(status: u16, body: &str) -> EsFailureClass {
 /// is empty, and a query value that happens to contain the exception's name is
 /// echoed back inside other errors. Substring matching on these bodies is what
 /// #1294 was.
-fn is_index_not_found(status: u16, body: &str) -> bool {
+pub(super) fn is_index_not_found(status: u16, body: &str) -> bool {
     const INDEX_NOT_FOUND: &str = "index_not_found_exception";
     if status != 404 {
         return false;

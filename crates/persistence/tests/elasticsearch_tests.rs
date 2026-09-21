@@ -6350,6 +6350,121 @@ mod es_integration {
             "a malformed count query must be a QueryParseError, got: {err:?}"
         );
     }
+
+    /// The write paths against a real cluster (#1382; the failure paths are in
+    /// `elasticsearch_storage_write_wiremock.rs`): what Elasticsearch really
+    /// answers for an absent document or index is still `NotFound`, `update`
+    /// keeps the contained documents in step, and `delete`/`purge_all` remove
+    /// them and report real counts.
+    #[tokio::test]
+    async fn es_integration_writes_keep_contained_documents_in_step() {
+        use helios_persistence::core::{PurgableStorage, SearchProvider};
+        use helios_persistence::error::ResourceError;
+        use helios_persistence::types::{
+            ContainedMode, ContainedReturn, SearchParamType, SearchParameter, SearchQuery,
+            SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("write-path-tenant");
+        let containers_of = |org_name: &str| {
+            let mut q = SearchQuery::new("Organization");
+            q.contained = ContainedMode::On;
+            q.contained_return = ContainedReturn::Container;
+            q.parameters.push(SearchParameter {
+                name: "name".to_string(),
+                param_type: SearchParamType::String,
+                modifier: None,
+                values: vec![SearchValue::eq(org_name)],
+                chain: vec![],
+                components: vec![],
+            });
+            q
+        };
+        let search_urls = |q: SearchQuery| {
+            let backend = &backend;
+            let tenant = &tenant;
+            async move {
+                backend
+                    .refresh_index("write-path-tenant", "Organization")
+                    .await
+                    .ok();
+                let found = backend.search(tenant, &q).await.unwrap();
+                let mut urls: Vec<String> = found.resources.items.iter().map(|r| r.url()).collect();
+                urls.sort();
+                urls
+            }
+        };
+        let is_not_found = |r: Result<(), StorageError>| {
+            matches!(
+                r,
+                Err(StorageError::Resource(ResourceError::NotFound { .. }))
+            )
+        };
+        let patient = |id: &str, org: &str| {
+            json!({
+                "resourceType": "Patient", "id": id,
+                "contained": [{ "resourceType": "Organization", "id": "org", "name": org }],
+                "managingOrganization": { "reference": "#org" }
+            })
+        };
+
+        // No index yet: Elasticsearch's `index_not_found_exception`.
+        assert!(is_not_found(backend.delete(&tenant, "Patient", "p1").await));
+
+        let created = backend
+            .create(
+                &tenant,
+                "Patient",
+                patient("p1", "Acme"),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                patient("p2", "Acme"),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            search_urls(containers_of("Acme")).await,
+            vec!["Patient/p1", "Patient/p2"],
+            "positive control: contained documents are indexed and found"
+        );
+
+        // The index exists now: Elasticsearch's `"result": "not_found"`.
+        assert!(is_not_found(
+            backend.delete(&tenant, "Patient", "absent").await
+        ));
+        backend
+            .purge(&tenant, "Patient", "absent")
+            .await
+            .expect("purging an absent document is idempotent");
+
+        // `update` replaces the contained documents (it used to leave them).
+        backend
+            .update(&tenant, &created, patient("p1", "Globex"))
+            .await
+            .unwrap();
+        assert_eq!(search_urls(containers_of("Acme")).await, vec!["Patient/p2"]);
+        assert_eq!(
+            search_urls(containers_of("Globex")).await,
+            vec!["Patient/p1"]
+        );
+
+        // `delete` sweeps them.
+        backend.delete(&tenant, "Patient", "p1").await.unwrap();
+        assert!(search_urls(containers_of("Globex")).await.is_empty());
+
+        // `purge_all` reports what it removed and sweeps the rest.
+        assert_eq!(backend.purge_all(&tenant, "Patient").await.unwrap(), 1);
+        assert!(search_urls(containers_of("Acme")).await.is_empty());
+        assert_eq!(backend.purge_all(&tenant, "Patient").await.unwrap(), 0);
+    }
 }
 
 // ============================================================================
