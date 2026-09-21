@@ -352,8 +352,27 @@ impl BulkSubmitProvider for S3Backend {
         // entry is captured and propagated after the successful receipts are
         // reported, matching the serial block's #1078 contract. A cap keeps the
         // serial early-stop semantics.
+        //
+        // Two entries in one batch that target the same resource id are
+        // order-dependent — last write wins — so processing them concurrently
+        // would race to a non-deterministic result. A batch with any such id
+        // collision therefore stays serial (a bulk file usually carries
+        // distinct resources, so the common case still parallelizes). Entries
+        // with no client id are server-assigned a unique one and never collide.
+        let has_id_collision = {
+            let mut seen = std::collections::HashSet::new();
+            !entries
+                .iter()
+                .all(|entry| match entry.resource_id.as_deref() {
+                    Some(id) => seen.insert((entry.resource_type.as_str(), id)),
+                    None => true,
+                })
+        };
         let concurrency = Self::s3_ingest_concurrency();
-        let walked: StorageResult<()> = if options.max_errors == 0 && concurrency > 1 {
+        let walked: StorageResult<()> = if options.max_errors == 0
+            && concurrency > 1
+            && !has_id_collision
+        {
             use futures::stream::{self, StreamExt};
             let outcomes: Vec<StorageResult<BulkEntryResult>> = stream::iter(entries)
                 .map(|entry| {
