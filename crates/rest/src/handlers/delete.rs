@@ -266,10 +266,11 @@ where
 /// below — as it does on `DELETE [type]/[id]` for a resource that does not
 /// exist: no current representation satisfies `If-Match` (RFC 9110 §13.1.1).
 ///
-/// The check and the delete are not one atomic step. No backend's `delete`
-/// compares-and-swaps on a version (`update` does), so a writer landing between
-/// the two is deleted along with the version the client named — the same
-/// window [`delete_handler`] has, not a wider one.
+/// The check and the delete are one step (#1404): with `If-Match` the backend
+/// deletes through `ResourceStorage::delete_versioned`, pinned to the version
+/// it evaluated, so a writer landing between the two is answered `409` instead
+/// of being deleted along with the version the client named — as on
+/// [`delete_handler`].
 ///
 /// # No match
 ///

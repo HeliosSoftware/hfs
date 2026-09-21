@@ -460,7 +460,8 @@ pub fn if_match_field_satisfied(raw: &str, current_version_id: &str) -> bool {
 /// this between resolving the match and writing, and then hands *that* row to
 /// `update`, whose compare-and-swap is keyed on the version evaluated here. A
 /// writer landing in between therefore ends in `VersionConflict`, never in a
-/// write over a version the client did not name.
+/// write over a version the client did not name. A delete gets the same
+/// guarantee from [`delete_under_precondition`].
 ///
 /// The failure is [`ConcurrencyError::OptimisticLockFailure`], which the REST
 /// layer already renders as `412`. `id` is empty when nothing matched.
