@@ -569,8 +569,9 @@ const MULTI_BATCH_ROWS: usize = 4096;
 /// value column; `sort_expression` maps both to the bare columns rather than
 /// the correlated `search_index` subquery it uses for indexed parameters;
 /// `build_missing_condition` selects from `resources`; `primary_keyset_key`
-/// pages on `last_updated`; and `build_contained_condition` excludes
-/// `_`-prefixed parameters outright. `ChainQueryBuilder` was the one path that
+/// pages on `last_updated`; and `build_contained` answers `_id` from the
+/// `contained_local_id` column and refuses `_lastUpdated` (#1373).
+/// `ChainQueryBuilder` was the one path that
 /// still read the rows, for a chained or reverse-chained terminal such as
 /// `Observation?subject:Patient._id=p1`, and it now reads `resources` too.
 ///
@@ -1084,10 +1085,15 @@ impl PostgresSearchIndexWriter {
     /// Flattens the values extracted from one `contained[]` entry into rows.
     ///
     /// [`Self::drop_resources_backed`] applies here too, and did not before.
-    /// `build_contained` (`search/query_builder.rs`) skips every parameter whose
-    /// name `starts_with('_')` outright, so a contained `_id` or `_lastUpdated`
-    /// row has no reader at all — not "answered from `resources`" as on the
-    /// plain path, but genuinely unreachable.
+    /// `build_contained` (`search/query_builder.rs`) reads neither row: since
+    /// #1373 it answers `_id` from the `contained_local_id` column every
+    /// contained row carries and refuses `_lastUpdated` (a contained resource
+    /// has none of its own), so a contained `_id` or `_lastUpdated` row has no
+    /// reader at all — not "answered from `resources`" as on the plain path,
+    /// but genuinely unreachable. (The other `_`-parameters — `_tag`,
+    /// `_profile`, `_security`, `_source`, `_language` — are read, and kept.)
+    /// One consequence: a contained resource that yields no other indexed
+    /// value has no row here, and `_contained` search cannot see it (#1383).
     ///
     /// The `_id` row is worse than merely unread: it is a byte-for-byte
     /// restatement of a column the same row already carries. On the benchmark's

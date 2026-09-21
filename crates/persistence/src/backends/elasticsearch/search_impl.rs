@@ -765,6 +765,13 @@ impl SearchProvider for ElasticsearchBackend {
     ) -> StorageResult<u64> {
         reject_unsupported_metadata_modifier(query)?;
 
+        // Under `_contained` the count is of what `search` returns (#1383): a
+        // plain document count would count contained documents, not the
+        // containers they stand for, and would misread `_id`.
+        if query.contained != crate::types::ContainedMode::Off {
+            return Ok(self.contained_keys(tenant, query).await?.len() as u64);
+        }
+
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
         let index = self.index_name(tenant_id, resource_type);
@@ -808,17 +815,113 @@ impl SearchProvider for ElasticsearchBackend {
 
 impl ElasticsearchBackend {
     /// Executes a `_contained=true|both` search. The query builder restricts the
-    /// hit set (`is_contained=true` for `on`; no restriction for `both`); this
-    /// post-processes each hit: contained-doc hits resolve to their container
-    /// (`_containedType=container`, default) or the contained resource itself
-    /// (`_containedType=contained`), while top-level hits (only present for
-    /// `both`) pass through. Single window (no keyset cursor).
+    /// hit set (`is_contained=true` for `on`; no restriction for `both`);
+    /// [`Self::contained_keys`] turns the hits into the result list — a
+    /// contained-doc hit stands for its container (`_containedType=container`,
+    /// default) or for the contained resource itself
+    /// (`_containedType=contained`), a top-level hit (only present for `both`)
+    /// for itself — and this materializes the `_offset`/`_count` window of it
+    /// (no keyset cursor). `_total` and `search_count` are the length of that
+    /// same list (#1383).
     async fn search_contained(
         &self,
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
+        let tenant_id = tenant.tenant_id().as_str();
+        let index = self.index_name(tenant_id, &query.resource_type);
+
+        let keys = self.contained_keys(tenant, query).await?;
+        let total = query.wants_total().then_some(keys.len() as u64);
+        let count = query.count.unwrap_or(100) as usize;
+        let offset = query.offset.unwrap_or(0) as usize;
+        let window: Vec<&ContainedKey> = keys.iter().skip(offset).take(count).collect();
+
+        // Top-level and contained documents are returned from their own
+        // `content`: fetch the window's documents in one request.
+        let doc_ids: Vec<&str> = window
+            .iter()
+            .filter_map(|key| match key {
+                ContainedKey::Document { doc_id, .. } => Some(doc_id.as_str()),
+                ContainedKey::Container { .. } => None,
+            })
+            .collect();
+        let mut sources: HashMap<String, Value> = HashMap::new();
+        if !doc_ids.is_empty() {
+            let body = json!({
+                "query": { "ids": { "values": doc_ids } },
+                "size": doc_ids.len(),
+            });
+            if let Some(found) = send_search_with_retry(self, &index, body).await? {
+                for hit in found["hits"]["hits"].as_array().into_iter().flatten() {
+                    if let (Some(id), Some(source)) =
+                        (hit.get("_id").and_then(Value::as_str), hit.get("_source"))
+                    {
+                        sources.insert(id.to_string(), source.clone());
+                    }
+                }
+            }
+        }
+
+        let mut items: Vec<StoredResource> = Vec::new();
+        for key in window {
+            match key {
+                ContainedKey::Container {
+                    container_type,
+                    container_id,
+                } => {
+                    if let Some(container) = self.read(tenant, container_type, container_id).await?
+                    {
+                        items.push(container);
+                    }
+                }
+                ContainedKey::Document { doc_id, local_id } => {
+                    let Some(source) = sources.get(doc_id) else {
+                        continue;
+                    };
+                    let Some(stored) = parse_hit_to_stored_resource(source, tenant)? else {
+                        continue;
+                    };
+                    match local_id {
+                        // The contained doc's `content` IS the contained
+                        // resource; return it under its local id.
+                        Some(local_id) => items.push(StoredResource::from_storage(
+                            stored.resource_type().to_string(),
+                            local_id.to_string(),
+                            stored.version_id().to_string(),
+                            tenant.tenant_id().clone(),
+                            stored.content().clone(),
+                            stored.created_at(),
+                            stored.last_modified(),
+                            None,
+                            stored.fhir_version(),
+                        )),
+                        None => items.push(stored),
+                    }
+                }
+            }
+        }
+
+        let page = Page::new(items, PageInfo::end());
+        let mut result = SearchResult::new(page);
+        if let Some(t) = total {
+            result = result.with_total(t);
+        }
+        Ok(result)
+    }
+
+    /// The result list of a `_contained=true|both` search, unmaterialized and
+    /// de-duplicated, in the query's sort order: every hit, reduced to the
+    /// fields that identify what it stands for. Bounded by the index's
+    /// `max_result_window`, like any single Elasticsearch request.
+    async fn contained_keys(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<Vec<ContainedKey>> {
         use crate::types::ContainedReturn;
+
+        reject_contained_out_of_band(query)?;
 
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
@@ -837,7 +940,6 @@ impl ElasticsearchBackend {
         let mut standard_query = query.clone();
         standard_query.parameters = parameters;
 
-        // Fetch a generous window of candidate hits (offset/count applied below).
         let mut es_query =
             EsQueryBuilder::new(tenant_id, resource_type, index.clone()).build(&standard_query);
         for param in &id_params {
@@ -863,112 +965,128 @@ impl ElasticsearchBackend {
                 None => *clauses = json!([matches_id]),
             }
         }
-        let count = query.count.unwrap_or(100) as usize;
-        let offset = query.offset.unwrap_or(0) as usize;
         if let Some(obj) = es_query.body.as_object_mut() {
-            obj.insert("size".to_string(), json!(offset + count));
+            obj.insert("size".to_string(), json!(self.config().max_result_window));
+            obj.insert(
+                "_source".to_string(),
+                json!([
+                    "is_deleted",
+                    "is_contained",
+                    "resource_type",
+                    "resource_id",
+                    "container_type",
+                    "container_id",
+                    "contained_local_id",
+                ]),
+            );
             obj.remove("from");
             obj.remove("search_after");
         }
 
-        let body = match send_search_with_retry(self, &index, es_query.body).await? {
-            Some(v) => v,
-            None => return Ok(empty_index_result()),
+        let Some(body) = send_search_with_retry(self, &index, es_query.body).await? else {
+            return Ok(Vec::new());
         };
-        let hits = body
-            .get("hits")
-            .and_then(|h| h.get("hits"))
-            .and_then(|h| h.as_array())
-            .cloned()
-            .unwrap_or_default();
 
-        let mut items: Vec<StoredResource> = Vec::new();
+        let mut keys: Vec<ContainedKey> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for hit in &hits {
-            let Some(source) = hit.get("_source") else {
+        for hit in body["hits"]["hits"].as_array().into_iter().flatten() {
+            let (Some(doc_id), Some(source)) =
+                (hit.get("_id").and_then(Value::as_str), hit.get("_source"))
+            else {
                 continue;
             };
-            if source
-                .get("is_deleted")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-            {
+            let text = |field: &str| source.get(field).and_then(Value::as_str);
+            let flag = |field: &str| source.get(field).and_then(Value::as_bool).unwrap_or(false);
+            if flag("is_deleted") {
                 continue;
             }
 
-            let is_contained = source
-                .get("is_contained")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-
-            if !is_contained {
-                // Top-level hit (only in `both` mode) — pass through.
-                if let Some(stored) = parse_hit_to_stored_resource(source, tenant)? {
-                    if seen.insert(stored.url()) {
-                        items.push(stored);
-                    }
+            if !flag("is_contained") {
+                // Top-level hit (only in `both` mode) — stands for itself.
+                let (Some(rtype), Some(rid)) = (text("resource_type"), text("resource_id")) else {
+                    continue;
+                };
+                if seen.insert(format!("{rtype}/{rid}")) {
+                    keys.push(ContainedKey::Document {
+                        doc_id: doc_id.to_string(),
+                        local_id: None,
+                    });
                 }
                 continue;
             }
 
-            let (Some(container_type), Some(container_id)) = (
-                source.get("container_type").and_then(|v| v.as_str()),
-                source.get("container_id").and_then(|v| v.as_str()),
-            ) else {
+            let (Some(container_type), Some(container_id)) =
+                (text("container_type"), text("container_id"))
+            else {
                 continue;
             };
-
             match query.contained_return {
                 ContainedReturn::Container => {
-                    if !seen.insert(format!("{container_type}/{container_id}")) {
-                        continue;
-                    }
-                    if let Some(container) = self.read(tenant, container_type, container_id).await?
-                    {
-                        items.push(container);
+                    if seen.insert(format!("{container_type}/{container_id}")) {
+                        keys.push(ContainedKey::Container {
+                            container_type: container_type.to_string(),
+                            container_id: container_id.to_string(),
+                        });
                     }
                 }
                 ContainedReturn::Contained => {
-                    // The contained doc's `content` IS the contained resource;
-                    // return it directly with its local id.
-                    if let Some(stored) = parse_hit_to_stored_resource(source, tenant)? {
-                        let local_id = source
-                            .get("contained_local_id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_else(|| stored.id());
-                        let key = format!("{container_type}/{container_id}#{local_id}");
-                        if seen.insert(key) {
-                            let rebuilt = StoredResource::from_storage(
-                                stored.resource_type().to_string(),
-                                local_id.to_string(),
-                                stored.version_id().to_string(),
-                                tenant.tenant_id().clone(),
-                                stored.content().clone(),
-                                stored.created_at(),
-                                stored.last_modified(),
-                                None,
-                                stored.fhir_version(),
-                            );
-                            items.push(rebuilt);
-                        }
+                    let Some(local_id) = text("contained_local_id").or(text("resource_id")) else {
+                        continue;
+                    };
+                    if seen.insert(format!("{container_type}/{container_id}#{local_id}")) {
+                        keys.push(ContainedKey::Document {
+                            doc_id: doc_id.to_string(),
+                            local_id: Some(local_id.to_string()),
+                        });
                     }
                 }
             }
         }
+        Ok(keys)
+    }
+}
 
-        // Apply the offset/count window.
-        let total = if query.wants_total() {
-            Some(items.len() as u64)
-        } else {
-            None
-        };
-        let windowed: Vec<StoredResource> = items.into_iter().skip(offset).take(count).collect();
-        let page = Page::new(windowed, PageInfo::end());
-        let mut result = SearchResult::new(page);
-        if let Some(t) = total {
-            result = result.with_total(t);
-        }
-        Ok(result)
+/// One entry of a `_contained` result list.
+enum ContainedKey {
+    /// A container, read from storage when its page is materialized.
+    Container {
+        container_type: String,
+        container_id: String,
+    },
+    /// A document returned from its own `content`: a top-level resource
+    /// (`local_id` is `None`) or a contained one, under its local id.
+    Document {
+        doc_id: String,
+        local_id: Option<String>,
+    },
+}
+
+/// Refuses the `_contained=true|both` constraints that select *top-level*
+/// resources — `_has`, `_list`, chained parameters — which a contained
+/// resource never is: nothing outside its container can reference it (#1383).
+/// They used to be dropped here (`_has`, `_list`) or to match nothing (chains).
+fn reject_contained_out_of_band(query: &SearchQuery) -> StorageResult<()> {
+    let refused = if !query.reverse_chains.is_empty() {
+        Some("_has")
+    } else if !query.list.is_empty() {
+        Some("_list")
+    } else {
+        query
+            .parameters
+            .iter()
+            .find(|p| !p.chain.is_empty())
+            .map(|p| p.name.as_str())
+    };
+    match refused {
+        Some(name) => Err(crate::error::StorageError::Search(
+            crate::error::SearchError::QueryParseError {
+                message: format!(
+                    "'{name}' cannot be combined with _contained=true or both: it selects \
+                     top-level resources, which a contained resource is not"
+                ),
+            },
+        )),
+        None => Ok(()),
     }
 }
 
