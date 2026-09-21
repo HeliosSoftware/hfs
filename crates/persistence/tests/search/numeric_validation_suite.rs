@@ -634,7 +634,12 @@ where
         ("probability=gt0.5", "Deleted(ra-high)"),
     ] {
         let actual = match backend
-            .conditional_delete(&tenant, "RiskAssessment", criteria)
+            .conditional_delete(
+                &tenant,
+                "RiskAssessment",
+                criteria,
+                &helios_persistence::core::EntityTagPrecondition::Absent,
+            )
             .await
         {
             Ok(ConditionalDeleteResult::Deleted(stored)) => format!("Deleted({})", stored.id()),

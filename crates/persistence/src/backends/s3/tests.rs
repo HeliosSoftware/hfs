@@ -3245,6 +3245,7 @@ async fn no_conditional_interaction_is_declared_or_served() {
                 "active=true",
                 true,
                 FhirVersion::R4,
+                &crate::core::EntityTagPrecondition::Absent,
             )
             .await
             .unwrap_err(),
@@ -3252,7 +3253,12 @@ async fn no_conditional_interaction_is_declared_or_served() {
     refused(
         "conditional_delete",
         backend
-            .conditional_delete(&tenant, "Patient", "active=true")
+            .conditional_delete(
+                &tenant,
+                "Patient",
+                "active=true",
+                &crate::core::EntityTagPrecondition::Absent,
+            )
             .await
             .unwrap_err(),
     );
@@ -3264,6 +3270,7 @@ async fn no_conditional_interaction_is_declared_or_served() {
                 "Patient",
                 "active=true",
                 &PatchFormat::MergePatch(json!({"active": false})),
+                &crate::core::EntityTagPrecondition::Absent,
             )
             .await
             .unwrap_err(),

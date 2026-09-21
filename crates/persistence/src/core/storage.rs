@@ -11,6 +11,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use helios_fhir::FhirVersion;
 use serde_json::Value;
 
+use crate::core::preconditions::EntityTagPrecondition;
 use crate::core::sof_runner::SofRunner;
 use crate::error::{BackendError, ResourceError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
@@ -1203,6 +1204,25 @@ impl std::fmt::Display for ConditionalInteraction {
 /// appears on the wire — form-urlencoded, exactly what `If-None-Exist` and a
 /// conditional URL carry. Callers pass it through undecoded; it is decoded
 /// once, by [`crate::search::parse_conditional_criteria`] (#1322).
+///
+/// # `If-Match`
+///
+/// The update, delete and patch methods take the request's `If-Match`
+/// precondition ([`EntityTagPrecondition::Absent`] when none was sent). The
+/// criteria are resolved *inside* these methods, so only they ever hold the
+/// resource the precondition is about; a caller comparing versions itself
+/// would be checking a row the write never sees (#1381). Implementations call
+/// [`conditional_if_match_gate`](super::conditional_if_match_gate) on the
+/// resolved match before writing and fail with
+/// `StorageError::Concurrency(OptimisticLockFailure)` — `412` — when it is not
+/// satisfied.
+///
+/// When nothing matched, each method answers what its instance twin answers
+/// for a resource that does not exist. Update and delete fail the precondition
+/// (RFC 9110 §13.1.1: no current representation satisfies `If-Match`, `*`
+/// included), so a conditional update does **not** fall through to its create.
+/// Patch reports `NoMatch` — `404`, as `PATCH [type]/[id]` does — and writes
+/// nothing either way.
 #[async_trait]
 pub trait ConditionalStorage: ResourceStorage {
     /// Whether this storage really implements `interaction`, as opposed to
@@ -1253,6 +1273,7 @@ pub trait ConditionalStorage: ResourceStorage {
     /// * `search_params` - Search parameters to find the resource
     /// * `upsert` - If true, create if no match found
     /// * `fhir_version` - The FHIR specification version for this resource (used if creating)
+    /// * `if_match` - The `If-Match` version precondition; see the trait docs
     ///
     /// # Returns
     ///
@@ -1260,6 +1281,7 @@ pub trait ConditionalStorage: ResourceStorage {
     /// * `Created` - If no match was found and upsert is true
     /// * `NoMatch` - If no match was found and upsert is false
     /// * `MultipleMatches` - If multiple matches were found (error)
+    #[allow(clippy::too_many_arguments)]
     async fn conditional_update(
         &self,
         tenant: &TenantContext,
@@ -1268,6 +1290,7 @@ pub trait ConditionalStorage: ResourceStorage {
         search_params: &str,
         upsert: bool,
         fhir_version: FhirVersion,
+        if_match: &EntityTagPrecondition,
     ) -> StorageResult<ConditionalUpdateResult>;
 
     /// Deletes a resource based on search criteria.
@@ -1277,6 +1300,7 @@ pub trait ConditionalStorage: ResourceStorage {
     /// * `tenant` - The tenant context
     /// * `resource_type` - The FHIR resource type
     /// * `search_params` - Search parameters to find the resource
+    /// * `if_match` - The `If-Match` version precondition; see the trait docs
     ///
     /// # Returns
     ///
@@ -1288,6 +1312,7 @@ pub trait ConditionalStorage: ResourceStorage {
         tenant: &TenantContext,
         resource_type: &str,
         search_params: &str,
+        if_match: &EntityTagPrecondition,
     ) -> StorageResult<ConditionalDeleteResult>;
 
     /// Patches a resource based on search criteria.
@@ -1301,6 +1326,7 @@ pub trait ConditionalStorage: ResourceStorage {
     /// * `resource_type` - The FHIR resource type
     /// * `search_params` - Search parameters to find the resource
     /// * `patch` - The patch to apply (JSON Patch, FHIRPath Patch, or Merge Patch)
+    /// * `if_match` - The `If-Match` version precondition; see the trait docs
     ///
     /// # Returns
     ///
@@ -1318,9 +1344,10 @@ pub trait ConditionalStorage: ResourceStorage {
         resource_type: &str,
         search_params: &str,
         patch: &PatchFormat,
+        if_match: &EntityTagPrecondition,
     ) -> StorageResult<ConditionalPatchResult> {
         // Default implementation returns NotSupported
-        let _ = (tenant, resource_type, search_params, patch);
+        let _ = (tenant, resource_type, search_params, patch, if_match);
         Err(StorageError::Backend(
             crate::error::BackendError::UnsupportedCapability {
                 backend_name: "unknown".to_string(),

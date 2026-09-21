@@ -3097,6 +3097,7 @@ impl ConditionalStorage for PostgresBackend {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn conditional_update(
         &self,
         tenant: &TenantContext,
@@ -3105,6 +3106,7 @@ impl ConditionalStorage for PostgresBackend {
         search_params: &str,
         upsert: bool,
         fhir_version: FhirVersion,
+        if_match: &crate::core::EntityTagPrecondition,
     ) -> StorageResult<ConditionalUpdateResult> {
         // Find matching resources based on search parameters
         let matches = self
@@ -3113,6 +3115,9 @@ impl ConditionalStorage for PostgresBackend {
 
         match matches.len() {
             0 => {
+                // `If-Match` names a version; nothing matched, so nothing
+                // can carry it and the create below must not run (#1381).
+                crate::core::conditional_if_match_gate(if_match, resource_type, None)?;
                 if upsert {
                     // No match, but upsert is true - create new resource
                     let created = self
@@ -3125,8 +3130,11 @@ impl ConditionalStorage for PostgresBackend {
                 }
             }
             1 => {
-                // Exactly one match - update it (preserves existing FHIR version)
+                // Exactly one match - update it (preserves existing FHIR version).
+                // `update` compares-and-swaps on `existing`'s version, the one
+                // `If-Match` is evaluated against here.
                 let existing = matches.into_iter().next().unwrap();
+                crate::core::conditional_if_match_gate(if_match, resource_type, Some(&existing))?;
                 let updated = self.update(tenant, &existing, resource).await?;
                 Ok(ConditionalUpdateResult::Updated(updated))
             }
@@ -3142,6 +3150,7 @@ impl ConditionalStorage for PostgresBackend {
         tenant: &TenantContext,
         resource_type: &str,
         search_params: &str,
+        if_match: &crate::core::EntityTagPrecondition,
     ) -> StorageResult<ConditionalDeleteResult> {
         // Find matching resources based on search parameters
         let matches = self
@@ -3150,12 +3159,15 @@ impl ConditionalStorage for PostgresBackend {
 
         match matches.len() {
             0 => {
-                // No match
+                // No match. A supplied `If-Match` fails against it, as it
+                // does on `DELETE [type]/[id]` for a missing resource.
+                crate::core::conditional_if_match_gate(if_match, resource_type, None)?;
                 Ok(ConditionalDeleteResult::NoMatch)
             }
             1 => {
                 // Exactly one match - delete it
                 let existing = matches.into_iter().next().unwrap();
+                crate::core::conditional_if_match_gate(if_match, resource_type, Some(&existing))?;
                 self.delete(tenant, resource_type, existing.id()).await?;
                 Ok(ConditionalDeleteResult::Deleted(existing))
             }
@@ -3172,6 +3184,7 @@ impl ConditionalStorage for PostgresBackend {
         resource_type: &str,
         search_params: &str,
         patch: &crate::core::PatchFormat,
+        if_match: &crate::core::EntityTagPrecondition,
     ) -> StorageResult<crate::core::ConditionalPatchResult> {
         use crate::core::{ConditionalPatchResult, PatchFormat};
 
@@ -3185,6 +3198,7 @@ impl ConditionalStorage for PostgresBackend {
             1 => {
                 // Exactly one match - apply the patch
                 let existing = matches.into_iter().next().unwrap();
+                crate::core::conditional_if_match_gate(if_match, resource_type, Some(&existing))?;
                 let current_content = existing.content().clone();
 
                 // Apply the patch based on format

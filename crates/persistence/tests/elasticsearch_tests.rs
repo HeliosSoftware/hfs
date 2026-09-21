@@ -684,6 +684,11 @@ mod numeric_validation_suite;
 #[path = "search/token_code_system_suite.rs"]
 mod token_code_system_suite;
 
+/// The backend-agnostic empty search value suite (#1380). Same `#[path]`
+/// arrangement.
+#[path = "search/empty_value_suite.rs"]
+mod empty_value_suite;
+
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
 
@@ -990,6 +995,19 @@ mod es_integration {
         .await;
     }
 
+    /// #1383: `_contained` alone is every contained resource of the type;
+    /// `_total`, `search_count` and paging agree; compartment membership is
+    /// applied; `_has`, `_list` and chains are refused by name.
+    #[tokio::test]
+    async fn es_contained_unconstrained_and_out_of_band_constraints() {
+        let backend = create_backend().await;
+        super::contained_suite::unconstrained_and_out_of_band_constraints(
+            &backend,
+            "contained-gaps-1383",
+        )
+        .await;
+    }
+
     /// #1337: `1e2` is one significant figure, `[50, 150)`.
     #[tokio::test]
     async fn es_exponent_values_use_significant_figures() {
@@ -1034,6 +1052,18 @@ mod es_integration {
         super::token_code_system_suite::system_qualified_tokens_in_chains(
             &backend,
             "token-code-system-chain-1379",
+        )
+        .await;
+    }
+
+    /// #1380: `family=Zzz,` is a prefix match on `""`, which is every family
+    /// name; an empty value or alternative is an error on every search path.
+    #[tokio::test]
+    async fn es_empty_values_are_rejected_on_every_path() {
+        let backend = create_backend().await;
+        super::empty_value_suite::empty_values_are_rejected_on_every_path(
+            &backend,
+            "empty-value-1380",
         )
         .await;
     }

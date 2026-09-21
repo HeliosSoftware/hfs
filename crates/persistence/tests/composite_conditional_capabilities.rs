@@ -144,6 +144,7 @@ async fn a_dedicated_search_backend_serves_all_but_conditional_patch() {
             "Organization",
             "identifier=urn:zzz:probe|ORG-P",
             &rename(),
+            &helios_persistence::core::EntityTagPrecondition::Absent,
         )
         .await
     {
@@ -159,7 +160,12 @@ async fn a_dedicated_search_backend_serves_all_but_conditional_patch() {
     // Positive control: the same criteria do resolve on this composite, for an
     // interaction it declares.
     match composite
-        .conditional_delete(&t, "Organization", "identifier=urn:zzz:probe|ORG-P")
+        .conditional_delete(
+            &t,
+            "Organization",
+            "identifier=urn:zzz:probe|ORG-P",
+            &helios_persistence::core::EntityTagPrecondition::Absent,
+        )
         .await
         .expect("conditional delete")
     {
@@ -191,6 +197,7 @@ async fn without_a_search_backend_the_composite_follows_its_primary() {
             "Organization",
             "identifier=urn:zzz:probe|ORG-Q",
             &rename(),
+            &helios_persistence::core::EntityTagPrecondition::Absent,
         )
         .await
         .expect("conditional patch")

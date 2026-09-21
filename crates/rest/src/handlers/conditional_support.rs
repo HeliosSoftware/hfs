@@ -227,6 +227,7 @@ mod tests {
             _search_params: &str,
             _upsert: bool,
             _fhir_version: FhirVersion,
+            _if_match: &helios_persistence::core::EntityTagPrecondition,
         ) -> StorageResult<ConditionalUpdateResult> {
             unimplemented!()
         }
@@ -236,6 +237,7 @@ mod tests {
             _tenant: &TenantContext,
             _resource_type: &str,
             _search_params: &str,
+            _if_match: &helios_persistence::core::EntityTagPrecondition,
         ) -> StorageResult<ConditionalDeleteResult> {
             unimplemented!()
         }

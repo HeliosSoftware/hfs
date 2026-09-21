@@ -61,15 +61,8 @@ use crate::state::AppState;
 /// succeeds but the response is lost, the retry sees a bumped version and
 /// answers `412`. That is correct RFC 9110 behavior, not a regression.
 ///
-/// # Deliberately NOT covered
-///
-/// [`conditional_delete_handler`] (`DELETE [base]/[type]?[search]`) does not
-/// honor `If-Match`. That is a scope decision, not an oversight:
-/// [`ConditionalStorage::conditional_delete`] searches and deletes inside the
-/// backend and never surfaces a version to compare against, so honoring the
-/// header there means threading a precondition through all four backends. FHIR
-/// R6 does define it (`delete-conditional-single` lists `O: If-Match`); R4 and
-/// R5 are silent. Tracked as a follow-up, not silently forgotten.
+/// [`conditional_delete_handler`] (`DELETE [base]/[type]?[search]`) honours the
+/// header the same way; see its documentation.
 ///
 /// # Example
 ///
@@ -237,7 +230,22 @@ where
 ///   empty value, …); nothing is deleted
 /// - `405 Method Not Allowed` - `AuditEvent` resources are immutable
 /// - `412 Precondition Failed` - more than one resource matched
-///   (`conditionalDelete` is advertised as `single`)
+///   (`conditionalDelete` is advertised as `single`), or `If-Match` was
+///   supplied and is not satisfied
+///
+/// # `If-Match`
+///
+/// Honoured (#1381; FHIR R6 lists `O: If-Match` on `delete-conditional-single`,
+/// R4–R5 are silent). [`ConditionalStorage::conditional_delete`] evaluates it
+/// against the one resource the criteria resolve to, immediately before the
+/// delete. With no match a supplied precondition fails — `412`, not the `204`
+/// below — as it does on `DELETE [type]/[id]` for a resource that does not
+/// exist: no current representation satisfies `If-Match` (RFC 9110 §13.1.1).
+///
+/// The check and the delete are not one atomic step. No backend's `delete`
+/// compares-and-swaps on a version (`update` does), so a writer landing between
+/// the two is deleted along with the version the client named — the same
+/// window [`delete_handler`] has, not a wider one.
 ///
 /// # No match
 ///
@@ -256,6 +264,7 @@ pub async fn conditional_delete_handler<S>(
     Path(resource_type): Path<String>,
     tenant: TenantExtractor,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+    conditional: ConditionalHeaders,
 ) -> RestResult<Response>
 where
     S: ResourceStorage + ConditionalStorage + Send + Sync,
@@ -283,10 +292,13 @@ where
         "Processing conditional delete request"
     );
 
+    let if_match = super::update::conditional_if_match(&conditional)?;
+
     let result = state
         .storage()
-        .conditional_delete(tenant.context(), &resource_type, &search_params)
-        .await?;
+        .conditional_delete(tenant.context(), &resource_type, &search_params, if_match)
+        .await
+        .map_err(|e| super::update::conditional_write_error(e, &resource_type))?;
 
     use helios_persistence::core::ConditionalDeleteResult;
     match result {

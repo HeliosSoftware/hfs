@@ -144,14 +144,16 @@ async fn a_batch_entry_reports_the_issue_code_for_its_failure() {
             "value",
         ),
         (
-            // `ifMatch` names a version of one instance; a conditional entry
-            // names no instance until the server resolves it. Both elements are
-            // individually well-formed, so the fault is the pairing and
-            // `invalid` — the parent of `value` — is as precise as it gets.
+            // `ifMatch` names a version of an existing instance; `ifNoneExist`
+            // asks for a create. Both elements are individually well-formed, so
+            // the fault is the pairing and `invalid` — the parent of `value` —
+            // is as precise as it gets. (`ifMatch` beside URL criteria on PUT
+            // and DELETE is honoured since #1381.)
             json!({
                 "request": {
-                    "method": "PUT",
-                    "url": "Patient?identifier=x",
+                    "method": "POST",
+                    "url": "Patient",
+                    "ifNoneExist": "identifier=x",
                     "ifMatch": "W/\"1\""
                 },
                 "resource": { "resourceType": "Patient" }

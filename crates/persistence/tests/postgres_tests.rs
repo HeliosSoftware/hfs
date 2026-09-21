@@ -98,6 +98,16 @@ mod numeric_validation_suite;
 #[path = "search/token_code_system_suite.rs"]
 mod token_code_system_suite;
 
+/// The backend-agnostic conditional `If-Match` suite (#1381). Same `#[path]`
+/// arrangement.
+#[path = "search/conditional_if_match_suite.rs"]
+mod conditional_if_match_suite;
+
+/// The backend-agnostic empty search value suite (#1380). Same `#[path]`
+/// arrangement.
+#[path = "search/empty_value_suite.rs"]
+mod empty_value_suite;
+
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
 
@@ -7840,6 +7850,7 @@ mod postgres_integration {
                 "identifier=http://hospital.org/mrn|MRN-UPDATE-1",
                 false,
                 FhirVersion::default(),
+                &helios_persistence::core::EntityTagPrecondition::Absent,
             )
             .await
             .unwrap();
@@ -8067,6 +8078,7 @@ mod postgres_integration {
                 &tenant,
                 "Patient",
                 "identifier=http://hospital.org/mrn|MRN-DELETE-1",
+                &helios_persistence::core::EntityTagPrecondition::Absent,
             )
             .await
             .unwrap();
@@ -18979,6 +18991,19 @@ mod postgres_integration {
         .await;
     }
 
+    /// #1383: `_contained` alone is every contained resource of the type;
+    /// `_total`, `search_count` and paging agree; compartment membership is
+    /// applied; `_has`, `_list` and chains are refused by name.
+    #[tokio::test]
+    async fn postgres_integration_contained_unconstrained_and_out_of_band_constraints() {
+        let backend = create_backend().await;
+        super::contained_suite::unconstrained_and_out_of_band_constraints(
+            &backend,
+            &unique_base("contained_gaps"),
+        )
+        .await;
+    }
+
     /// #1337: `1e2` is one significant figure, `[50, 150)`.
     #[tokio::test]
     async fn postgres_integration_exponent_values_use_significant_figures() {
@@ -19034,6 +19059,44 @@ mod postgres_integration {
         super::token_code_system_suite::system_qualified_tokens_in_chains(
             &backend,
             &unique_base("token_code_system_chain"),
+        )
+        .await;
+    }
+
+    /// #1381: `If-Match` is evaluated against the resource the criteria
+    /// resolve to, on conditional update, delete and patch.
+    #[tokio::test]
+    async fn postgres_integration_conditional_writes_honour_if_match() {
+        let backend = create_backend().await;
+        super::conditional_if_match_suite::if_match_is_evaluated_against_the_resolved_match(
+            &backend,
+            &unique_base("cond_if_match_1381"),
+            true,
+        )
+        .await;
+    }
+
+    /// #1381: of several writers holding the same `If-Match`, one writes —
+    /// the precondition and the write share `update`'s compare-and-swap.
+    #[tokio::test]
+    async fn postgres_integration_conditional_writers_with_the_same_if_match_admit_one() {
+        let backend = create_backend().await;
+        super::conditional_if_match_suite::concurrent_writers_with_the_same_if_match_admit_one(
+            &backend,
+            &unique_base("cond_if_match_race_1381"),
+            true,
+        )
+        .await;
+    }
+
+    /// #1380: `family=Zzz,` is a prefix match on `""`, which is every family
+    /// name; an empty value or alternative is an error on every search path.
+    #[tokio::test]
+    async fn postgres_integration_empty_values_are_rejected_on_every_path() {
+        let backend = create_backend().await;
+        super::empty_value_suite::empty_values_are_rejected_on_every_path(
+            &backend,
+            &unique_base("empty_value"),
         )
         .await;
     }

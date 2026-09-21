@@ -255,6 +255,15 @@ impl<'a> EsQueryBuilder<'a> {
             return modifier_handlers::build_missing_clause(param);
         }
 
+        // Defence in depth behind `validate_value_presence` (#1380): an empty
+        // value is a prefix of every string, so it matches nothing here rather
+        // than whatever the handler below would make of it — the whole
+        // parameter, since under `:not` "nothing" negates into "everything".
+        // `match_none`, never `None`: a `None` drops the constraint.
+        if crate::search::has_empty_value(param) {
+            return Some(date::match_none());
+        }
+
         // Handle special parameters
         match param.name.as_str() {
             "_id" => return self.build_id_clause(param),
@@ -1072,5 +1081,49 @@ mod tests {
         let room = builder.build(&SearchQuery::new("Patient").with_count(10));
         assert_eq!(room.body["size"], json!(11));
         assert!(room.over_fetched);
+    }
+
+    /// #1380: `family=Zzz,` reached the builder as the values `Zzz` and `""`,
+    /// and a prefix match on `""` is every row. The search gate
+    /// (`validate_value_presence`) rejects it before a query is built; if one
+    /// is built anyway, the parameter matches nothing — the whole parameter, or
+    /// `:not` would negate it into everything — and as `match_none`, since a
+    /// `None` clause is dropped.
+    #[test]
+    fn a_parameter_with_an_empty_value_matches_nothing() {
+        use SearchModifier as M;
+        use SearchParamType as T;
+        let cases: Vec<(&str, SearchParamType, Option<SearchModifier>, Vec<&str>)> = vec![
+            ("family", T::String, None, vec!["Zzz", ""]),
+            ("family", T::String, None, vec![""]),
+            ("family", T::String, Some(M::Contains), vec!["", "Zzz"]),
+            ("family", T::String, Some(M::Text), vec![" "]),
+            ("gender", T::Token, None, vec![""]),
+            ("gender", T::Token, Some(M::Not), vec!["female", ""]),
+            ("gender", T::Token, Some(M::Text), vec![""]),
+            ("identifier", T::Token, Some(M::OfType), vec![""]),
+            ("_id", T::Token, None, vec!["a", ""]),
+            ("_tag", T::Token, None, vec![""]),
+            ("general-practitioner", T::Reference, None, vec![""]),
+            ("url", T::Uri, Some(M::Below), vec![""]),
+            ("url", T::Uri, Some(M::Contains), vec!["", "x"]),
+        ];
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        for (name, param_type, modifier, values) in cases {
+            let context = format!("{name} {modifier:?} {values:?}");
+            let param = SearchParameter {
+                name: name.to_string(),
+                param_type,
+                modifier,
+                values: values.into_iter().map(SearchValue::eq).collect(),
+                chain: vec![],
+                components: vec![],
+            };
+            assert_eq!(
+                builder.build_parameter_clause(&param),
+                Some(json!({ "match_none": {} })),
+                "{context}"
+            );
+        }
     }
 }

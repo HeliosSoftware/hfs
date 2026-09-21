@@ -219,6 +219,10 @@ where
     // spec's placeholder `Resource.id` expression: an identity test on
     // PostgreSQL, an unfiltered result set on SQLite. Use `_list` for List
     // membership.
+    // A parameter with no value (`family=`) is ignored, per FHIR; from here on
+    // it is as if the client had not sent it (#1380).
+    let pairs = crate::extractors::drop_empty_parameters(pairs);
+
     const UNSUPPORTED_PARAMS: [&str; 2] = ["_query", "_in"];
     if let Some((key, _)) = pairs
         .iter()
@@ -436,6 +440,35 @@ where
         return Err(RestError::NotImplemented {
             feature: "'_contained' search is not supported by this storage backend".to_string(),
         });
+    }
+
+    // `_list`, `_has` and chained parameters select top-level resources and are
+    // resolved below into an `_id` filter — but under `_contained`, `_id` names
+    // a contained resource by its *local* id, so the resolved ids would select
+    // unrelated contained resources that happen to share one (#1383). Nothing
+    // outside its container can reference a contained resource, so there is
+    // nothing to apply: refuse, before any resolution.
+    if query.contained != helios_persistence::types::ContainedMode::Off {
+        let chained = query.parameters.iter().find(|p| !p.chain.is_empty());
+        let refused = if !query.list.is_empty() {
+            Some("_list".to_string())
+        } else if !query.reverse_chains.is_empty() {
+            Some("_has".to_string())
+        } else {
+            chained.map(|p| {
+                let path: Vec<&str> = p.chain.iter().map(|c| c.target_param.as_str()).collect();
+                format!("{}.{}", p.name, path.join("."))
+            })
+        };
+        if let Some(param) = refused {
+            return Err(RestError::InvalidParameter {
+                message: format!(
+                    "'{param}' cannot be combined with _contained=true or both: it selects \
+                     top-level resources, which a contained resource is not"
+                ),
+                param,
+            });
+        }
     }
 
     // Clamp page size to the configured default/maximum.
@@ -781,7 +814,8 @@ async fn execute_system_search<S>(
 where
     S: ResourceStorage + MultiTypeSearchProvider + Send + Sync,
 {
-    let search_params = SearchParams::from_pairs(pairs);
+    // A parameter with no value is ignored, as in a type-level search (#1380).
+    let search_params = SearchParams::from_pairs(crate::extractors::drop_empty_parameters(pairs));
 
     // Get resource types from _type parameter (if specified)
     let type_param = search_params.get("_type").cloned();
