@@ -61,6 +61,17 @@
   var etag = null;
   var lang = document.documentElement.lang || undefined;
 
+  /* Result-header counts follow the page's own locale (#1426), the same way
+   * `whenText` localizes dates: `lang` is the negotiated `<html lang>`, and
+   * an absent attribute leaves the choice to the platform. Only the rendered
+   * text is grouped — the wire query, `Bundle.total`, paging, and the numbers
+   * the script keeps for itself are untouched. */
+  function formatCount(value) {
+    var count = Number(value);
+    if (!Number.isFinite(count)) return String(value);
+    return count.toLocaleString(lang);
+  }
+
   function fetchDocument() {
     return fetch(SETTINGS, {
       headers: { Accept: "application/json" },
@@ -2589,11 +2600,11 @@
       !hasTotal && hasNext
         ? results.card.dataset.msgTotalPartial
         : results.card.dataset.msgTotal
-    ).replace("{count}", total);
+    ).replace("{count}", formatCount(total));
     if (included > 0)
       meta +=
         " · " +
-        results.card.dataset.msgIncluded.replace("{count}", included);
+        results.card.dataset.msgIncluded.replace("{count}", formatCount(included));
 
     var columns = elementColumns(context.query);
     /* No _elements: one column per attribute the server actually returned, so
