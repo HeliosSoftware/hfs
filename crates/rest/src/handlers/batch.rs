@@ -1264,7 +1264,7 @@ where
                 // malformed precondition is a 412, not a 422.
                 let if_match = match conditional_entry_if_match(if_match) {
                     Ok(if_match) => if_match,
-                    Err(failure) => return failure,
+                    Err(failure) => return *failure,
                 };
 
                 if let Err(e) = state
@@ -1421,7 +1421,7 @@ where
             if let Some(criteria) = criteria {
                 let if_match = match conditional_entry_if_match(if_match) {
                     Ok(if_match) => if_match,
-                    Err(failure) => return failure,
+                    Err(failure) => return *failure,
                 };
 
                 return match state
@@ -2162,10 +2162,10 @@ fn entry_failure(err: RestError) -> BundleEntryResult {
 /// precondition.
 fn conditional_entry_if_match(
     if_match: Option<&str>,
-) -> Result<helios_persistence::core::EntityTagPrecondition, BundleEntryResult> {
+) -> Result<helios_persistence::core::EntityTagPrecondition, Box<BundleEntryResult>> {
     helios_persistence::core::EntityTagPrecondition::parse(if_match).map_err(|e| {
-        helios_persistence::core::precondition_failed_entry(&format!(
-            "If-Match precondition failed: {e}"
+        Box::new(helios_persistence::core::precondition_failed_entry(
+            &format!("If-Match precondition failed: {e}"),
         ))
     })
 }
