@@ -33,12 +33,13 @@ use std::collections::BTreeSet;
 use serde_json::{Value, json};
 
 use helios_fhir::FhirVersion;
-use helios_persistence::core::{ResourceStorage, SearchProvider};
+use helios_persistence::core::{ResourceStorage, SearchProvider, SearchResult};
 use helios_persistence::error::StorageError;
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{
-    CompositeSearchComponent, ContainedMode, ContainedReturn, SearchModifier, SearchParamType,
-    SearchParameter, SearchPrefix, SearchQuery, SearchValue,
+    ChainedParameter, CompartmentMembership, CompositeSearchComponent, ContainedMode,
+    ContainedReturn, ReverseChainedParameter, SearchModifier, SearchParamType, SearchParameter,
+    SearchPrefix, SearchQuery, SearchValue, TotalMode,
 };
 
 /// What a case must produce.
@@ -635,4 +636,395 @@ where
     ];
 
     assert_cases(backend, &tenant, &controls, &cases).await;
+}
+
+/// One probe of the third scenario: a whole query (not only its parameters)
+/// and what it must produce.
+struct Probe {
+    label: &'static str,
+    query: SearchQuery,
+    /// `Ok`: the ids of every match, sorted, duplicates kept (two containers
+    /// may each hold a contained resource with the same local id).
+    /// `Err`: text the refusal must contain.
+    expect: Result<&'static [&'static str], &'static str>,
+}
+
+fn probe(
+    label: &'static str,
+    mode: ContainedMode,
+    returns: ContainedReturn,
+    expect: Result<&'static [&'static str], &'static str>,
+    customize: impl FnOnce(&mut SearchQuery),
+) -> Probe {
+    let mut query = SearchQuery::new("Observation");
+    query.contained = mode;
+    query.contained_return = returns;
+    customize(&mut query);
+    Probe {
+        label,
+        query,
+        expect,
+    }
+}
+
+fn sorted_ids(result: &SearchResult) -> Vec<String> {
+    let mut found: Vec<String> = result
+        .resources
+        .items
+        .iter()
+        .map(|r| r.id().to_string())
+        .collect();
+    found.sort();
+    found
+}
+
+/// What a probe produced: the ids of the search, the `_total` it reported,
+/// `search_count`, and the ids gathered by walking it two at a time — which
+/// must all describe the same set.
+async fn run_probe<S>(backend: &S, tenant: &TenantContext, probe: &Probe) -> Result<String, String>
+where
+    S: ResourceStorage + SearchProvider,
+{
+    let search_error = |e: StorageError| match e {
+        StorageError::Search(e) => e.to_string(),
+        other => panic!("{}: not a search error: {other}", probe.label),
+    };
+
+    let mut query = probe.query.clone();
+    query.total = Some(TotalMode::Accurate);
+    let found = backend
+        .search(tenant, &query)
+        .await
+        .map_err(search_error)?;
+    let ids = sorted_ids(&found);
+
+    let counted = backend
+        .search_count(tenant, &probe.query)
+        .await
+        .map_err(search_error)?;
+
+    let mut paged = Vec::new();
+    let mut page_totals = BTreeSet::new();
+    for page in 0..20u32 {
+        let mut query = query.clone();
+        query.count = Some(2);
+        query.offset = Some(page * 2);
+        let found = backend
+            .search(tenant, &query)
+            .await
+            .map_err(search_error)?;
+        if found.resources.items.is_empty() {
+            break;
+        }
+        page_totals.insert(found.total);
+        assert!(
+            found.resources.items.len() <= 2,
+            "{}: _count=2 returned {} items",
+            probe.label,
+            found.resources.items.len()
+        );
+        paged.extend(sorted_ids(&found));
+    }
+    paged.sort();
+
+    Ok(format!(
+        "ids={ids:?} total={:?} search_count={counted} paged={paged:?} page_totals={page_totals:?}",
+        found.total
+    ))
+}
+
+fn expected_probe_outcome(ids: &[&str]) -> String {
+    let n = ids.len() as u64;
+    let page_totals = if ids.is_empty() {
+        BTreeSet::new()
+    } else {
+        BTreeSet::from([Some(n)])
+    };
+    format!(
+        "ids={ids:?} total={:?} search_count={n} paged={ids:?} page_totals={page_totals:?}",
+        Some(n)
+    )
+}
+
+/// `_contained` with nothing else to go on, and with the constraints that live
+/// outside `SearchQuery::parameters` (#1383).
+///
+/// - `_contained=true` alone is every contained resource of the type, in the
+///   form `_containedType` asks for; `_total`, `search_count` and an
+///   `_offset`/`_count` walk all describe that same set.
+/// - Compartment membership is decided on the contained resource's own
+///   references, like any other criterion.
+/// - `_has`, `_list` and chained parameters select *top-level* resources. The
+///   REST layer resolves them into an `_id` filter, and under `_contained`
+///   `_id` is a contained resource's local id — so they are refused by name,
+///   never resolved, dropped or misread.
+///
+/// Containers (DiagnosticReport → contained Observations):
+/// - `u-one`: `o1` (code X, subject Patient/p1) and `o2` (Y, Patient/p2)
+/// - `u-two`: `o1` (X, Patient/p1) — the same local id as in `u-one`
+/// - `u-none`: a contained Specimen, no Observation
+///
+/// plus top-level Observations `top-1` (X, Patient/p1) and `o1` (Y,
+/// Patient/p2) — the latter sharing its id with two contained resources.
+pub async fn unconstrained_and_out_of_band_constraints<S>(backend: &S, tenant_base: &str)
+where
+    S: ResourceStorage + SearchProvider,
+{
+    use ContainedMode::{Both, Off, On};
+    use ContainedReturn::{Contained, Container};
+
+    let tenant = TenantContext::new(TenantId::new(tenant_base), TenantPermissions::full_access());
+    let about = |id: &str, code: &str, patient: &str| {
+        let mut resource = observation(id, code, "2020-06-15", &["cat1"]);
+        resource["subject"] = json!({"reference": format!("Patient/{patient}")});
+        resource
+    };
+    seed_containers(
+        backend,
+        &tenant,
+        vec![
+            (
+                "u-one",
+                vec![about("o1", "X", "p1"), about("o2", "Y", "p2")],
+            ),
+            ("u-two", vec![about("o1", "X", "p1")]),
+            (
+                "u-none",
+                vec![json!({"resourceType": "Specimen", "id": "s1", "status": "available"})],
+            ),
+        ],
+    )
+    .await;
+    for resource in [about("top-1", "X", "p1"), about("o1", "Y", "p2")] {
+        backend
+            .create(&tenant, "Observation", resource, FhirVersion::default())
+            .await
+            .expect("seed top-level observation");
+    }
+
+    fn in_compartment(patient: &'static str) -> impl Fn(&mut SearchQuery) {
+        move |q: &mut SearchQuery| {
+            q.compartment = Some(CompartmentMembership {
+                params: vec!["subject".to_string(), "performer".to_string()],
+                reference: format!("Patient/{patient}"),
+            });
+        }
+    }
+    fn code_x(q: &mut SearchQuery) {
+        q.parameters.push(token("code", "X"));
+    }
+    fn has_provenance(q: &mut SearchQuery) {
+        q.reverse_chains.push(ReverseChainedParameter::terminal(
+            "Provenance",
+            "target",
+            "agent",
+            SearchValue::new(SearchPrefix::Eq, "Practitioner/x"),
+        ));
+    }
+    fn in_list(q: &mut SearchQuery) {
+        q.list.push("some-list".to_string());
+    }
+
+    // Positive controls: the contained rows, the top-level rows and the
+    // reference rows compartment membership reads are all indexed.
+    let controls = [
+        probe(
+            "code=X [true]",
+            On,
+            Container,
+            Ok(&["u-one", "u-two"]),
+            code_x,
+        ),
+        probe("code=X [false]", Off, Container, Ok(&["top-1"]), code_x),
+        probe(
+            "subject=Patient/p2 [true]",
+            On,
+            Container,
+            Ok(&["u-one"]),
+            |q| {
+                q.parameters.push(literal(
+                    "subject",
+                    SearchParamType::Reference,
+                    "Patient/p2",
+                ))
+            },
+        ),
+        probe(
+            "Patient/p1/Observation [false]",
+            Off,
+            Container,
+            Ok(&["top-1"]),
+            in_compartment("p1"),
+        ),
+    ];
+    for control in &controls {
+        // Only what `search` finds is waited for; the controls' `_total`,
+        // `search_count` and paging are checked with the probes below.
+        let expected: Vec<String> = control
+            .expect
+            .expect("a control is not refused")
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+        for attempt in 0..60 {
+            let got = backend
+                .search(&tenant, &control.query)
+                .await
+                .map(|found| sorted_ids(&found));
+            if got.as_ref().ok() == Some(&expected) {
+                break;
+            }
+            assert!(
+                attempt < 59,
+                "positive control {} never held:\n       got {got:?}\n  expected {expected:?}\n\
+                 is the backend built with the spec search parameters?",
+                control.label
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+
+    let probes = [
+        // No criterion at all: every contained Observation.
+        probe(
+            "(none) [true]",
+            On,
+            Container,
+            Ok(&["u-one", "u-two"]),
+            |_| {},
+        ),
+        probe(
+            "(none) [true, contained]",
+            On,
+            Contained,
+            Ok(&["o1", "o1", "o2"]),
+            |_| {},
+        ),
+        probe(
+            "(none) [both]",
+            Both,
+            Container,
+            Ok(&["o1", "top-1", "u-one", "u-two"]),
+            |_| {},
+        ),
+        // The top-level `o1` and the two contained `o1` are three resources.
+        probe(
+            "(none) [both, contained]",
+            Both,
+            Contained,
+            Ok(&["o1", "o1", "o1", "o2", "top-1"]),
+            |_| {},
+        ),
+        // With a criterion: `_total` / `search_count` / paging agree too.
+        probe(
+            "code=X [true, contained]",
+            On,
+            Contained,
+            Ok(&["o1", "o1"]),
+            code_x,
+        ),
+        probe(
+            "code=X [both]",
+            Both,
+            Container,
+            Ok(&["top-1", "u-one", "u-two"]),
+            code_x,
+        ),
+        probe(
+            "code=X [both, contained]",
+            Both,
+            Contained,
+            Ok(&["o1", "o1", "top-1"]),
+            code_x,
+        ),
+        // Compartment membership, on the contained resource's own references.
+        probe(
+            "Patient/p1/Observation [true]",
+            On,
+            Container,
+            Ok(&["u-one", "u-two"]),
+            in_compartment("p1"),
+        ),
+        probe(
+            "Patient/p2/Observation [true]",
+            On,
+            Container,
+            Ok(&["u-one"]),
+            in_compartment("p2"),
+        ),
+        probe(
+            "Patient/p2/Observation [true, contained]",
+            On,
+            Contained,
+            Ok(&["o2"]),
+            in_compartment("p2"),
+        ),
+        probe(
+            "Patient/p2/Observation?code=X [true]",
+            On,
+            Container,
+            Ok(&[]),
+            |q| {
+                in_compartment("p2")(q);
+                code_x(q);
+            },
+        ),
+        probe(
+            "Patient/p2/Observation [both]",
+            Both,
+            Container,
+            Ok(&["o1", "u-one"]),
+            in_compartment("p2"),
+        ),
+        probe(
+            "Patient/nobody/Observation [true]",
+            On,
+            Container,
+            Ok(&[]),
+            in_compartment("nobody"),
+        ),
+        // Constraints on top-level resources: refused by name.
+        probe("_has [true]", On, Container, Err("_has"), has_provenance),
+        probe("_has [both]", Both, Container, Err("_has"), has_provenance),
+        probe("_list [true]", On, Container, Err("_list"), in_list),
+        probe("_list [both]", Both, Contained, Err("_list"), in_list),
+        probe("subject.name=x [true]", On, Container, Err("subject"), |q| {
+            let mut chained = literal("subject", SearchParamType::Reference, "x");
+            chained.chain = vec![ChainedParameter {
+                reference_param: "subject".to_string(),
+                target_type: Some("Patient".to_string()),
+                target_param: "name".to_string(),
+            }];
+            q.parameters.push(chained);
+        }),
+    ];
+
+    let mut failures = Vec::new();
+    for probe in controls.iter().chain(&probes) {
+        let got = run_probe(backend, &tenant, probe).await;
+        let (ok, expected) = match (&probe.expect, &got) {
+            (Ok(ids), Ok(outcome)) => {
+                let expected = expected_probe_outcome(ids);
+                (*outcome == expected, expected)
+            }
+            (Ok(ids), Err(_)) => (false, expected_probe_outcome(ids)),
+            (Err(name), Ok(_)) => (false, format!("an error naming '{name}'")),
+            (Err(name), Err(message)) => (
+                message.contains(name) && message.contains("_contained"),
+                format!("an error naming '{name}' and _contained"),
+            ),
+        };
+        eprintln!(
+            "[contained_suite] {} {} -> {got:?}",
+            if ok { "ok  " } else { "FAIL" },
+            probe.label
+        );
+        if !ok {
+            failures.push(format!(
+                "{}:\n       got {got:?}\n  expected {expected}",
+                probe.label
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
