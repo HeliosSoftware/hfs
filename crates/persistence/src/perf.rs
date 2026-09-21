@@ -133,11 +133,17 @@ pub enum Phase {
     /// as opposed to `extract`, which sums the CPU time across the pool's
     /// threads. The gap between the two is the parallel speed-up.
     PrepareBatch,
+    /// S3: the raw NDJSON line archived under `raw/…` before the upsert.
+    RawEntryPut,
+    /// S3: the type- and system-level history index events (two PUTs).
+    HistoryIndexPut,
+    /// S3: submission state + registry touch at the end of a batch.
+    SubmissionSave,
 }
 
 impl Phase {
     /// All phases, in report order.
-    pub const ALL: [Phase; 33] = [
+    pub const ALL: [Phase; 36] = [
         Phase::NdjsonParse,
         Phase::Entry,
         Phase::EntryRead,
@@ -171,15 +177,20 @@ impl Phase {
         Phase::ReindexCommit,
         Phase::ReindexFallback,
         Phase::PrepareBatch,
+        Phase::RawEntryPut,
+        Phase::HistoryIndexPut,
+        Phase::SubmissionSave,
     ];
 
     /// The phase this one is measured inside of, if any. Drives the report's
     /// indentation, and warns the reader that the two overlap.
     pub fn nested_in(self) -> Option<Phase> {
         match self {
-            Phase::EntryRead | Phase::Create | Phase::Update | Phase::Bookkeeping => {
-                Some(Phase::Entry)
-            }
+            Phase::EntryRead
+            | Phase::Create
+            | Phase::Update
+            | Phase::Bookkeeping
+            | Phase::RawEntryPut => Some(Phase::Entry),
             Phase::ResourceUpdate => Some(Phase::Update),
             Phase::BookkeepingChange | Phase::BookkeepingResult => Some(Phase::Bookkeeping),
             Phase::EntryClone => Some(Phase::Create),
@@ -190,6 +201,7 @@ impl Phase {
             | Phase::Serialize
             | Phase::ResourceInsert
             | Phase::HistoryInsert
+            | Phase::HistoryIndexPut
             | Phase::Index => Some(Phase::Create),
             Phase::IndexDelete | Phase::Extract | Phase::IndexInsert | Phase::Fts => {
                 Some(Phase::Index)
@@ -243,11 +255,14 @@ impl Phase {
             Phase::ReindexCommit => "reindex_commit",
             Phase::ReindexFallback => "reindex_fallback",
             Phase::PrepareBatch => "prepare_batch (wall)",
+            Phase::RawEntryPut => "raw_entry_put",
+            Phase::HistoryIndexPut => "history_index_put (x2)",
+            Phase::SubmissionSave => "submission_state_save",
         }
     }
 }
 
-const PHASE_COUNT: usize = 33;
+const PHASE_COUNT: usize = 36;
 
 #[allow(clippy::declare_interior_mutable_const)]
 const ZERO: AtomicU64 = AtomicU64::new(0);

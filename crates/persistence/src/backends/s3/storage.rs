@@ -189,10 +189,17 @@ impl S3Backend {
             resource.id(),
             resource.version_id(),
         );
-        let payload = self.serialize_json(resource)?;
-        self.put_json_object(&location.bucket, &history_key, &payload, None, None)
-            .await?;
+        let payload = {
+            let _span = crate::perf::span(crate::perf::Phase::Serialize);
+            self.serialize_json(resource)?
+        };
+        {
+            let _span = crate::perf::span(crate::perf::Phase::HistoryInsert);
+            self.put_json_object(&location.bucket, &history_key, &payload, None, None)
+                .await?;
+        }
 
+        let _index_span = crate::perf::span(crate::perf::Phase::HistoryIndexPut);
         let event = HistoryIndexEvent {
             resource_type: resource.resource_type().to_string(),
             id: resource.id().to_string(),
@@ -734,6 +741,7 @@ impl ResourceStorage for S3Backend {
         fhir_version: FhirVersion,
     ) -> StorageResult<StoredResource> {
         tenant.check_permission(Operation::Create, resource_type)?;
+        let _create_span = crate::perf::span(crate::perf::Phase::Create);
 
         let location = self.tenant_location(tenant)?;
 
@@ -745,13 +753,15 @@ impl ResourceStorage for S3Backend {
 
         let current_key = location.keyspace.current_resource_key(resource_type, &id);
 
-        if self
-            .client
-            .head_object(&location.bucket, &current_key)
-            .await
-            .map_err(|e| self.map_client_error(e))?
-            .is_some()
-        {
+        let exists = {
+            let _span = crate::perf::span(crate::perf::Phase::CreateExists);
+            self.client
+                .head_object(&location.bucket, &current_key)
+                .await
+                .map_err(|e| self.map_client_error(e))?
+                .is_some()
+        };
+        if exists {
             return Err(StorageError::Resource(ResourceError::AlreadyExists {
                 resource_type: resource_type.to_string(),
                 id,
@@ -767,11 +777,16 @@ impl ResourceStorage for S3Backend {
             fhir_version,
         );
 
-        let payload = self.serialize_json(&stored)?;
-        match self
-            .put_json_object(&location.bucket, &current_key, &payload, None, Some("*"))
-            .await
-        {
+        let payload = {
+            let _span = crate::perf::span(crate::perf::Phase::Serialize);
+            self.serialize_json(&stored)?
+        };
+        let put = {
+            let _span = crate::perf::span(crate::perf::Phase::ResourceInsert);
+            self.put_json_object(&location.bucket, &current_key, &payload, None, Some("*"))
+                .await
+        };
+        match put {
             Ok(_) => {
                 self.put_history_and_indexes(&location, &stored, HistoryMethod::Post)
                     .await?;

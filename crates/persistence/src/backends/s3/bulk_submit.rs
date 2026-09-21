@@ -330,13 +330,15 @@ impl BulkSubmitProvider for S3Backend {
 
         // Both manifest writes in this function go through compare-and-swap
         // and touch only what a batch owns — never the lease fields (#1229).
-        self.mutate_manifest_state(&location, submission_id, manifest_id, |state| {
-            state.manifest.status = ManifestStatus::Processing;
-        })
-        .await?;
+        {
+            let _span = crate::perf::span(crate::perf::Phase::Commit);
+            self.mutate_manifest_state(&location, submission_id, manifest_id, |state| {
+                state.manifest.status = ManifestStatus::Processing;
+            })
+            .await?;
+        }
 
         let mut results = Vec::new();
-        let mut error_count = 0u32;
         let file_url = options.file_url.as_deref();
 
         // S3 writes each entry on its own, so an entry is durable as soon as
@@ -344,61 +346,68 @@ impl BulkSubmitProvider for S3Backend {
         // exhausted, max errors reached, or a storage error part-way — the
         // entries it already wrote are reported before that outcome
         // propagates (#1078).
-        let walked: StorageResult<()> = async {
-            for entry in entries {
-                if options.max_errors > 0 && error_count >= options.max_errors {
-                    if !options.continue_on_error {
-                        return Err(StorageError::BulkSubmit(
-                            BulkSubmitError::MaxErrorsExceeded {
-                                submission_id: submission_id.submission_id.clone(),
-                                max_errors: options.max_errors,
-                            },
-                        ));
+        let batch_started = std::time::Instant::now();
+        let batch_type = entries
+            .first()
+            .map(|e| e.resource_type.clone())
+            .unwrap_or_default();
+        let concurrency = submit_entry_concurrency();
+        let walked: StorageResult<()> = if concurrency > 1 {
+            // Prototype (#1229 follow-up, perf): entries of one batch are
+            // independent objects, so their round trips can overlap. Results
+            // come back in completion order and are re-sorted by line below.
+            use futures::StreamExt;
+            let errors = std::sync::atomic::AtomicU32::new(0);
+            let location = &location;
+            let errors = &errors;
+            let mut in_flight = futures::stream::iter(entries.into_iter().map(|entry| {
+                self.ingest_entry(
+                    tenant,
+                    location,
+                    submission_id,
+                    manifest_id,
+                    file_url,
+                    entry,
+                    options,
+                    errors,
+                )
+            }))
+            .buffer_unordered(concurrency);
+            let mut outcome = Ok(());
+            while let Some(done) = in_flight.next().await {
+                match done {
+                    Ok(result) => results.push(result),
+                    Err(err) => {
+                        outcome = Err(err);
+                        break;
                     }
-
-                    let skipped = BulkEntryResult::skipped(
-                        entry.line_number,
-                        &entry.resource_type,
-                        "max errors exceeded",
-                    );
-                    self.persist_entry_result(
-                        &location,
-                        submission_id,
-                        manifest_id,
-                        file_url,
-                        &skipped,
-                    )
-                    .await?;
-                    results.push(skipped);
-                    continue;
                 }
-
-                self.persist_raw_entry(&location, submission_id, manifest_id, file_url, &entry)
-                    .await?;
-
-                let result = match self
-                    .process_single_entry(tenant, submission_id, manifest_id, &entry, options)
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(err) => BulkEntryResult::processing_error(
-                        entry.line_number,
-                        &entry.resource_type,
-                        Self::bulk_submit_operation_outcome(&err),
-                    ),
-                };
-
-                if result.is_error() {
-                    error_count += 1;
-                }
-
-                self.persist_entry_result(&location, submission_id, manifest_id, file_url, &result)
-                    .await?;
-                results.push(result);
             }
-            Ok(())
-        }
-        .await;
+            drop(in_flight);
+            results.sort_by_key(|r| r.line_number);
+            outcome
+        } else {
+            let errors = std::sync::atomic::AtomicU32::new(0);
+            async {
+                for entry in entries {
+                    let result = self
+                        .ingest_entry(
+                            tenant,
+                            &location,
+                            submission_id,
+                            manifest_id,
+                            file_url,
+                            entry,
+                            options,
+                            &errors,
+                        )
+                        .await?;
+                    results.push(result);
+                }
+                Ok(())
+            }
+            .await
+        };
         // Entries are written one by one and not kept, so observers that need
         // the resources re-read the ids from the primary (#1127).
         options
@@ -433,6 +442,7 @@ impl BulkSubmitProvider for S3Backend {
         // put a fenced-out holder's `worker_id` and `fencing_token` back over
         // the new holder's.
         let walked_entries = results.len() as u64;
+        let commit_span = crate::perf::span(crate::perf::Phase::Commit);
         self.mutate_manifest_state(&location, submission_id, manifest_id, |state| {
             state.manifest.total_entries += walked_entries;
             state.manifest.processed_entries += success_count;
@@ -452,7 +462,9 @@ impl BulkSubmitProvider for S3Backend {
             }
         })
         .await?;
+        drop(commit_span);
 
+        let submission_span = crate::perf::span(crate::perf::Phase::SubmissionSave);
         submission.summary.total_entries += results.len() as u64;
         submission.summary.success_count += success_count;
         submission.summary.error_count += failed_count;
@@ -462,6 +474,8 @@ impl BulkSubmitProvider for S3Backend {
             .await?;
         self.touch_submit_registry(tenant, submission_id, submission.summary.status)
             .await?;
+        drop(submission_span);
+        crate::perf::log_ingest_progress(&batch_type, walked_entries, batch_started.elapsed());
 
         Ok(results)
     }
@@ -685,6 +699,7 @@ impl BulkSubmitRollbackProvider for S3Backend {
         submission_id: &SubmissionId,
         change: &SubmissionChange,
     ) -> StorageResult<()> {
+        let _span = crate::perf::span(crate::perf::Phase::BookkeepingChange);
         let location = self.tenant_location(tenant)?;
         let key = location.keyspace.submit_change_key(
             &submission_id.submitter,
@@ -764,7 +779,87 @@ impl BulkSubmitRollbackProvider for S3Backend {
     }
 }
 
+/// Entries of one batch written concurrently (`HFS_S3_SUBMIT_ENTRY_CONCURRENCY`,
+/// default 1 = the sequential loop). Prototype knob for the write-path sweep.
+fn submit_entry_concurrency() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("HFS_S3_SUBMIT_ENTRY_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1)
+    })
+}
+
 impl S3Backend {
+    /// One entry of a batch, end to end: raw archive, upsert, result receipt.
+    /// `errors` is the batch's running error count, shared so the max-errors
+    /// rule holds when entries run concurrently.
+    #[allow(clippy::too_many_arguments)]
+    async fn ingest_entry(
+        &self,
+        tenant: &TenantContext,
+        location: &TenantLocation,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        file_url: Option<&str>,
+        entry: NdjsonEntry,
+        options: &BulkProcessingOptions,
+        errors: &std::sync::atomic::AtomicU32,
+    ) -> StorageResult<BulkEntryResult> {
+        use std::sync::atomic::Ordering;
+        let _entry_span = crate::perf::span(crate::perf::Phase::Entry);
+        if options.max_errors > 0 && errors.load(Ordering::Relaxed) >= options.max_errors {
+            if !options.continue_on_error {
+                return Err(StorageError::BulkSubmit(
+                    BulkSubmitError::MaxErrorsExceeded {
+                        submission_id: submission_id.submission_id.clone(),
+                        max_errors: options.max_errors,
+                    },
+                ));
+            }
+
+            let skipped = BulkEntryResult::skipped(
+                entry.line_number,
+                &entry.resource_type,
+                "max errors exceeded",
+            );
+            self.persist_entry_result(location, submission_id, manifest_id, file_url, &skipped)
+                .await?;
+            return Ok(skipped);
+        }
+
+        {
+            let _span = crate::perf::span(crate::perf::Phase::RawEntryPut);
+            self.persist_raw_entry(location, submission_id, manifest_id, file_url, &entry)
+                .await?;
+        }
+
+        let result = match self
+            .process_single_entry(tenant, submission_id, manifest_id, &entry, options)
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => BulkEntryResult::processing_error(
+                entry.line_number,
+                &entry.resource_type,
+                Self::bulk_submit_operation_outcome(&err),
+            ),
+        };
+
+        if result.is_error() {
+            errors.fetch_add(1, Ordering::Relaxed);
+        }
+
+        {
+            let _span = crate::perf::span(crate::perf::Phase::BookkeepingResult);
+            self.persist_entry_result(location, submission_id, manifest_id, file_url, &result)
+                .await?;
+        }
+        Ok(result)
+    }
+
     /// Processes a single NDJSON entry: validates it, upserts the resource,
     /// and records a change log entry for rollback.
     ///
@@ -800,7 +895,11 @@ impl S3Backend {
         }
 
         if let Some(id) = entry.resource_id.as_deref() {
-            match self.read(tenant, &entry.resource_type, id).await {
+            let current = {
+                let _span = crate::perf::span(crate::perf::Phase::EntryRead);
+                self.read(tenant, &entry.resource_type, id).await
+            };
+            match current {
                 Ok(Some(current)) => {
                     if !options.allow_updates {
                         return Ok(BulkEntryResult::skipped(
@@ -812,7 +911,10 @@ impl S3Backend {
 
                     // Update the resource, honoring the submission's import mode.
                     let content = options.content_for_update(current.content(), &entry.resource);
-                    let updated = self.update(tenant, &current, content).await?;
+                    let updated = {
+                        let _span = crate::perf::span(crate::perf::Phase::Update);
+                        self.update(tenant, &current, content).await?
+                    };
 
                     let change = SubmissionChange::update(
                         manifest_id,
