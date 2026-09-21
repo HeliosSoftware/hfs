@@ -333,6 +333,7 @@ compressed when the client sends `Accept-Encoding`.
 | `HFS_MONGODB_MAX_CONNECTIONS` | `10` | Connection pool size |
 | `HFS_MONGODB_CONNECT_TIMEOUT_MS` | `5000` | TCP handshake timeout (ms) |
 | `HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS` | `15000` | How long an operation waits for a usable server before failing (ms). This, not the connect timeout, bounds how quickly an unreachable MongoDB surfaces an error. |
+| `HFS_MONGODB_INDEX_BUILD` | `background` | When the generation-2 `search_index` indexes are built: `background` serves immediately and builds after boot, `inline` waits for the build before serving, `off` only warns so an operator can pre-build (see `docs/mongodb/search-indexes.md`). |
 
 **S3**
 

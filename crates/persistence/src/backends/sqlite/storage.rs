@@ -25,8 +25,8 @@ use crate::error::{
 use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage, SkippedResource};
 use crate::tenant::{Operation, TenantContext};
 use crate::types::Pagination;
+use crate::types::SearchQuery;
 use crate::types::{CursorValue, Page, PageCursor, PageInfo, StoredResource};
-use crate::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
 
 use super::SqliteBackend;
 use super::search::writer::{SqlValue, SqliteSearchIndexWriter};
@@ -657,11 +657,15 @@ impl ResourceStorage for SqliteBackend {
         .map_err(|e| internal_error(format!("Failed to insert deletion history: {}", e)))?;
 
         // Delete search index entries (skip when search is offloaded). Keyed on
-        // resource_key so it rides idx_search_composite; the soft-delete keeps
+        // resource_key. The tenant_id/resource_type prefix is required for the
+        // delete to seek idx_search_composite instead of full-scanning
+        // search_index (see delete_search_index, #1197); the soft-delete keeps
         // the resources row, so the subquery resolves.
         if !self.is_search_offloaded() {
             conn.execute(
-                "DELETE FROM search_index WHERE resource_key = (
+                "DELETE FROM search_index
+                  WHERE tenant_id = ?1 AND resource_type = ?2
+                    AND resource_key = (
                      SELECT rowid FROM resources
                       WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3
                  )",
@@ -1834,15 +1838,22 @@ impl SqliteBackend {
             return Ok(0);
         }
 
-        // Delete from main search index, keyed on the integer `resource_key`
-        // so the delete rides `idx_search_composite` (rekeyed to resource_key
-        // in v30) instead of scanning the type. Every caller of this method
-        // deletes while the `resources` row still exists (update, re-index,
-        // soft-delete), so the subquery resolves; the purge path, which removes
-        // the `resources` row first, deletes by `resource_id` inline instead.
+        // Delete from main search index by resource_key. The `tenant_id` and
+        // `resource_type` equality prefix is load-bearing, not redundant with
+        // the subquery: `idx_search_composite` leads with
+        // `(tenant_id, resource_type, resource_key, …)`, so a predicate on
+        // `resource_key` alone cannot use it and SQLite falls back to a full
+        // scan of `search_index` — O(rows) per delete, which is O(rows) per
+        // resource UPDATE and per re-indexed resource (#1197). With the prefix
+        // the delete is a covering seek. Every caller runs while the `resources`
+        // row still exists (update, re-index, soft-delete), so the subquery
+        // resolves; the purge path removes `resources` first and deletes by
+        // `resource_id` inline instead.
         let deleted = conn
             .prepare_cached(
-                "DELETE FROM search_index WHERE resource_key = (
+                "DELETE FROM search_index
+                  WHERE tenant_id = ?1 AND resource_type = ?2
+                    AND resource_key = (
                      SELECT rowid FROM resources
                       WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3
                  )",
@@ -3111,24 +3122,13 @@ impl DifferentialHistoryProvider for SqliteBackend {
     }
 }
 
-// Helper function to parse simple search parameters
-// Supports basic formats like: identifier=X, _id=Y, name=Z
-fn parse_simple_search_params(params: &str) -> Vec<(String, String)> {
-    params
-        .split('&')
-        .filter_map(|pair| {
-            let parts: Vec<&str> = pair.splitn(2, '=').collect();
-            if parts.len() == 2 {
-                Some((parts[0].to_string(), parts[1].to_string()))
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
 #[async_trait]
 impl ConditionalStorage for SqliteBackend {
+    fn supports_conditional(&self, interaction: crate::core::ConditionalInteraction) -> bool {
+        // One declaration: the capability list the contract test pins (#1384).
+        crate::core::Backend::supports(self, interaction.capability())
+    }
+
     async fn conditional_create(
         &self,
         tenant: &TenantContext,
@@ -3163,6 +3163,7 @@ impl ConditionalStorage for SqliteBackend {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn conditional_update(
         &self,
         tenant: &TenantContext,
@@ -3171,6 +3172,7 @@ impl ConditionalStorage for SqliteBackend {
         search_params: &str,
         upsert: bool,
         fhir_version: FhirVersion,
+        if_match: &crate::core::EntityTagPrecondition,
     ) -> StorageResult<ConditionalUpdateResult> {
         // Find matching resources based on search parameters
         let matches = self
@@ -3179,6 +3181,9 @@ impl ConditionalStorage for SqliteBackend {
 
         match matches.len() {
             0 => {
+                // `If-Match` names a version; nothing matched, so nothing
+                // can carry it and the create below must not run (#1381).
+                crate::core::conditional_if_match_gate(if_match, resource_type, None)?;
                 if upsert {
                     // No match, but upsert is true - create new resource
                     let created = self
@@ -3191,8 +3196,11 @@ impl ConditionalStorage for SqliteBackend {
                 }
             }
             1 => {
-                // Exactly one match - update it (preserves existing FHIR version)
+                // Exactly one match - update it (preserves existing FHIR version).
+                // `update` compares-and-swaps on `existing`'s version, the one
+                // `If-Match` is evaluated against here.
                 let existing = matches.into_iter().next().unwrap();
+                crate::core::conditional_if_match_gate(if_match, resource_type, Some(&existing))?;
                 let updated = self.update(tenant, &existing, resource).await?;
                 Ok(ConditionalUpdateResult::Updated(updated))
             }
@@ -3208,6 +3216,7 @@ impl ConditionalStorage for SqliteBackend {
         tenant: &TenantContext,
         resource_type: &str,
         search_params: &str,
+        if_match: &crate::core::EntityTagPrecondition,
     ) -> StorageResult<ConditionalDeleteResult> {
         // Find matching resources based on search parameters
         let matches = self
@@ -3216,12 +3225,15 @@ impl ConditionalStorage for SqliteBackend {
 
         match matches.len() {
             0 => {
-                // No match
+                // No match. A supplied `If-Match` fails against it, as it
+                // does on `DELETE [type]/[id]` for a missing resource.
+                crate::core::conditional_if_match_gate(if_match, resource_type, None)?;
                 Ok(ConditionalDeleteResult::NoMatch)
             }
             1 => {
                 // Exactly one match - delete it
                 let existing = matches.into_iter().next().unwrap();
+                crate::core::conditional_if_match_gate(if_match, resource_type, Some(&existing))?;
                 self.delete(tenant, resource_type, existing.id()).await?;
                 Ok(ConditionalDeleteResult::Deleted(existing))
             }
@@ -3247,6 +3259,7 @@ impl ConditionalStorage for SqliteBackend {
         resource_type: &str,
         search_params: &str,
         patch: &crate::core::PatchFormat,
+        if_match: &crate::core::EntityTagPrecondition,
     ) -> StorageResult<crate::core::ConditionalPatchResult> {
         use crate::core::{ConditionalPatchResult, PatchFormat};
 
@@ -3260,6 +3273,7 @@ impl ConditionalStorage for SqliteBackend {
             1 => {
                 // Exactly one match - apply the patch
                 let existing = matches.into_iter().next().unwrap();
+                crate::core::conditional_if_match_gate(if_match, resource_type, Some(&existing))?;
                 let current_content = existing.content().clone();
 
                 // Apply the patch based on format
@@ -3327,85 +3341,24 @@ impl SqliteBackend {
     /// Builds the search a conditional interaction's criteria describe, or
     /// `None` when the criteria are empty — matching everything would be the
     /// literal reading, but no conditional interaction means that.
+    ///
+    /// The parsing is [`crate::search::build_conditional_query`], shared by
+    /// every backend so criteria mean what they mean as a direct search
+    /// (#1312).
     fn conditional_query(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         search_params_str: &str,
     ) -> StorageResult<Option<SearchQuery>> {
-        // Parse search parameters into (name, value) pairs
-        let parsed_params = parse_simple_search_params(search_params_str);
-
-        if parsed_params.is_empty() {
-            return Ok(None);
-        }
-
-        // Build SearchParameter objects by looking up types from the registry
-        let search_params = self.build_search_parameters(tenant, resource_type, &parsed_params)?;
-
-        Ok(Some(SearchQuery {
-            resource_type: resource_type.to_string(),
-            parameters: search_params,
-            // No pagination limit for conditional operations - we need all matches
-            count: Some(1000), // Reasonable upper limit for conditional matching
-            ..Default::default()
-        }))
-    }
-
-    /// Builds SearchParameter objects from parsed (name, value) pairs.
-    ///
-    /// Looks up the parameter type from the registry, falling back to sensible defaults
-    /// for common parameters when not found.
-    fn build_search_parameters(
-        &self,
-        tenant: &TenantContext,
-        resource_type: &str,
-        params: &[(String, String)],
-    ) -> StorageResult<Vec<SearchParameter>> {
         let registry_arc = self.tenant_registry(tenant.tenant_id().as_str());
         let registry = registry_arc.read();
-        let mut search_params = Vec::with_capacity(params.len());
-
-        for (name, value) in params {
-            // Look up the parameter definition to get its type, falling back to
-            // the shared registry-miss guess when it is not registered.
-            let param_type = self
-                .lookup_param_type(&registry, resource_type, name)
-                .unwrap_or_else(|| crate::search::fallback_param_type(name));
-
-            search_params.push(SearchParameter {
-                name: name.clone(),
-                param_type,
-                modifier: None,
-                values: vec![SearchValue::parse(value)],
-                chain: vec![],
-                components: vec![],
-            });
-        }
-
-        Ok(search_params)
-    }
-
-    /// Looks up a search parameter type from the registry.
-    ///
-    /// Checks both the specific resource type and "Resource" base type for common params.
-    fn lookup_param_type(
-        &self,
-        registry: &crate::search::SearchParameterRegistry,
-        resource_type: &str,
-        param_name: &str,
-    ) -> Option<SearchParamType> {
-        // First try the specific resource type
-        if let Some(def) = registry.get_param(resource_type, param_name) {
-            return Some(def.param_type);
-        }
-
-        // Then try "Resource" for common parameters like _id, _lastUpdated
-        if let Some(def) = registry.get_param("Resource", param_name) {
-            return Some(def.param_type);
-        }
-
-        None
+        crate::search::build_conditional_query(
+            &registry,
+            resource_type,
+            search_params_str,
+            crate::search::ResourceTypeScope::version(self.config().fhir_version),
+        )
     }
 
     // ========================================================================
@@ -4536,6 +4489,7 @@ mod tests {
     use super::*;
     use crate::core::history::HistoryParams;
     use crate::tenant::{TenantId, TenantPermissions};
+    use crate::types::{SearchParamType, SearchParameter, SearchValue};
     use serde_json::json;
     use std::path::PathBuf;
 
@@ -7490,6 +7444,7 @@ mod tests {
                 "identifier=12345",
                 false,
                 FhirVersion::default(),
+                &crate::core::EntityTagPrecondition::Absent,
             )
             .await
             .unwrap();
@@ -7516,6 +7471,7 @@ mod tests {
                 "identifier=99999",
                 false,
                 FhirVersion::default(),
+                &crate::core::EntityTagPrecondition::Absent,
             )
             .await
             .unwrap();
@@ -7540,6 +7496,7 @@ mod tests {
                 "identifier=new-id",
                 true,
                 FhirVersion::default(),
+                &crate::core::EntityTagPrecondition::Absent,
             )
             .await
             .unwrap();
@@ -7570,7 +7527,12 @@ mod tests {
 
         // Conditional delete
         let result = backend
-            .conditional_delete(&tenant, "Patient", "_id=p1")
+            .conditional_delete(
+                &tenant,
+                "Patient",
+                "_id=p1",
+                &crate::core::EntityTagPrecondition::Absent,
+            )
             .await
             .unwrap();
 
@@ -7595,7 +7557,12 @@ mod tests {
 
         // Conditional delete with no match
         let result = backend
-            .conditional_delete(&tenant, "Patient", "_id=nonexistent")
+            .conditional_delete(
+                &tenant,
+                "Patient",
+                "_id=nonexistent",
+                &crate::core::EntityTagPrecondition::Absent,
+            )
             .await
             .unwrap();
 
@@ -7670,7 +7637,13 @@ mod tests {
         ]));
 
         let result = backend
-            .conditional_patch(&tenant, "Patient", "_id=p1", &patch)
+            .conditional_patch(
+                &tenant,
+                "Patient",
+                "_id=p1",
+                &patch,
+                &crate::core::EntityTagPrecondition::Absent,
+            )
             .await
             .unwrap();
 
@@ -7707,7 +7680,13 @@ mod tests {
         }));
 
         let result = backend
-            .conditional_patch(&tenant, "Patient", "_id=p1", &patch)
+            .conditional_patch(
+                &tenant,
+                "Patient",
+                "_id=p1",
+                &patch,
+                &crate::core::EntityTagPrecondition::Absent,
+            )
             .await
             .unwrap();
 
@@ -7732,7 +7711,13 @@ mod tests {
         ]));
 
         let result = backend
-            .conditional_patch(&tenant, "Patient", "_id=nonexistent", &patch)
+            .conditional_patch(
+                &tenant,
+                "Patient",
+                "_id=nonexistent",
+                &patch,
+                &crate::core::EntityTagPrecondition::Absent,
+            )
             .await
             .unwrap();
 
@@ -7998,6 +7983,83 @@ mod tests {
             Some("Heart rate"),
             "Display text should be 'Heart rate'"
         );
+    }
+
+    /// #1379: a `code` element's row carries the implicit-system marker, and
+    /// `system|code` accepts it. A row written before the marker existed has
+    /// no system at all, exactly like a system-less Coding, so it cannot be
+    /// told apart and must keep its old behaviour — never over-match — until
+    /// the resource is reindexed.
+    #[tokio::test]
+    async fn test_unmarked_code_rows_keep_their_old_behaviour() {
+        use crate::search::IMPLICIT_TOKEN_SYSTEM;
+
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "pt-f", "gender": "female"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let ids = |modifier: Option<crate::types::SearchModifier>, value: &str| {
+            let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+                name: "gender".to_string(),
+                param_type: SearchParamType::Token,
+                modifier,
+                values: vec![SearchValue::eq(value)],
+                chain: vec![],
+                components: vec![],
+            });
+            let backend = &backend;
+            let tenant = &tenant;
+            async move {
+                let found = backend.search(tenant, &query).await.unwrap();
+                found
+                    .resources
+                    .items
+                    .iter()
+                    .map(|r| r.id().to_string())
+                    .collect::<Vec<_>>()
+            }
+        };
+        let qualified = "http://hl7.org/fhir/administrative-gender|female";
+        let not = Some(crate::types::SearchModifier::Not);
+
+        // As indexed today.
+        let stored: Option<String> = backend
+            .get_connection()
+            .unwrap()
+            .query_row(
+                "SELECT value_token_system FROM search_index
+                 WHERE resource_id = 'pt-f' AND param_name = 'gender'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some(IMPLICIT_TOKEN_SYSTEM));
+        assert_eq!(ids(None, qualified).await, vec!["pt-f"]);
+        assert!(ids(not.clone(), qualified).await.is_empty());
+
+        // As indexed before #1379.
+        let updated = backend
+            .get_connection()
+            .unwrap()
+            .execute(
+                "UPDATE search_index SET value_token_system = NULL
+                 WHERE resource_id = 'pt-f' AND param_name = 'gender'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(updated, 1);
+        assert_eq!(ids(None, "female").await, vec!["pt-f"], "positive control");
+        assert_eq!(ids(None, "|female").await, vec!["pt-f"]);
+        assert!(ids(None, qualified).await.is_empty());
+        assert_eq!(ids(not, qualified).await, vec!["pt-f"]);
     }
 
     #[tokio::test]

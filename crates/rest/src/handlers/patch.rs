@@ -1,12 +1,14 @@
 //! Patch interaction handler.
 //!
 //! Implements the FHIR [patch interaction](https://hl7.org/fhir/http.html#patch):
-//! `PATCH [base]/[type]/[id]`
+//! `PATCH [base]/[type]/[id]`, and its conditional form
+//! `PATCH [base]/[type]?[search-params]`.
 //!
 //! Supports multiple patch formats:
 //! - JSON Patch (RFC 6902) - application/json-patch+json
 //! - JSON Merge Patch (RFC 7386) - application/merge-patch+json
-//! - FHIRPath Patch - application/fhir+json with Parameters resource
+//! - FHIRPath Patch - application/fhir+json with Parameters resource (recognised,
+//!   answered `501 Not Implemented`)
 
 use axum::{
     Json,
@@ -169,28 +171,72 @@ where
 
 /// Conditional patch handler.
 ///
-/// Patches a resource based on search criteria.
+/// Patches the one resource a search selects, instead of one named by id.
 ///
 /// # HTTP Request
 ///
 /// `PATCH [base]/[type]?[search-params]`
+///
+/// The criteria go through the pipeline every conditional interaction shares
+/// (`helios_persistence::search::conditional`): the raw query, decoded once,
+/// unknown parameters and empty values refused.
+///
+/// # Response
+///
+/// FHIR R4, R4B and R5 word the three outcomes identically
+/// ([conditional patch](https://hl7.org/fhir/R4/http.html#patch)): "No matches:
+/// The server returns a 404 Not Found"; "One Match: The server performs the
+/// update against the matching resource"; "Multiple matches: The server returns
+/// a 412 Precondition Failed error".
+///
+/// - `200 OK` - the single match was patched
+/// - `400 Bad Request` - no criteria, criteria that cannot be evaluated, or an
+///   invalid patch document
+/// - `404 Not Found` - nothing matched; nothing is created
+/// - `405 Method Not Allowed` - `AuditEvent` resources are immutable
+/// - `412 Precondition Failed` - more than one resource matched, or `If-Match`
+///   was supplied and is not satisfied
+/// - `415 Unsupported Media Type` - unknown patch format
+/// - `501 Not Implemented` - FHIRPath Patch, as for [`patch_handler`]; or a
+///   backend without conditional patch (MongoDB)
+///
+/// # `If-Match`
+///
+/// Honoured, as on conditional update and delete (#1381; it was refused with
+/// `400` before). [`ConditionalStorage::conditional_patch`] evaluates it
+/// against the one resource the criteria resolve to and hands that same row to
+/// the compare-and-swap that writes the patched content, so a writer landing in
+/// between ends in `409`, never in a patch over a version the client did not
+/// name. A malformed value fails the precondition. With no match the answer
+/// stays `404` — what `PATCH [type]/[id]` answers for a missing resource,
+/// `If-Match` or not — and nothing is written.
+#[allow(clippy::too_many_arguments)]
 pub async fn conditional_patch_handler<S>(
     State(state): State<AppState<S>>,
     Path(resource_type): Path<String>,
     headers: HeaderMap,
     tenant: TenantExtractor,
-    query: axum::extract::Query<std::collections::HashMap<String, String>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+    conditional: ConditionalHeaders,
     prefer: PreferHeader,
     body: Bytes,
 ) -> RestResult<Response>
 where
     S: ResourceStorage + ConditionalStorage + Send + Sync,
 {
-    let search_params: String = query
-        .iter()
-        .map(|(k, v)| format!("{}={}", k, v))
-        .collect::<Vec<_>>()
-        .join("&");
+    super::conditional_support::require_patch(state.storage())?;
+
+    // AuditEvent resources are immutable — block write operations
+    if resource_type == "AuditEvent" {
+        return Err(RestError::MethodNotAllowed {
+            method: "PATCH".to_string(),
+            resource_type: resource_type.to_string(),
+        });
+    }
+
+    // The raw query, as written: every occurrence of a repeated parameter
+    // (#1321), decoded once by the shared criteria builder (#1322).
+    let search_params = raw_query.unwrap_or_default();
 
     debug!(
         resource_type = %resource_type,
@@ -199,12 +245,32 @@ where
         "Processing conditional patch request"
     );
 
+    // `PATCH /Patient` names neither an instance nor criteria. The backend
+    // would answer "no match", and a 404 for a missing id or query string
+    // sends the client looking for a resource that was never named.
+    if helios_persistence::search::parse_conditional_criteria(&search_params).is_empty() {
+        return Err(RestError::BadRequest {
+            message: format!(
+                "PATCH {resource_type} names no resource: use PATCH {resource_type}/[id], or \
+                 PATCH {resource_type}?[search parameters] for a conditional patch"
+            ),
+        });
+    }
+
+    let if_match = super::update::conditional_if_match(&conditional)?;
+
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/json-patch+json");
 
     let patch_format = parse_patch_format(content_type, &body)?;
+
+    // Hold the patch to what `patch_handler` accepts *before* the backend sees
+    // it: the backend applies the document itself, and its FHIRPath Patch is a
+    // stub that ignores every path but `Type.element` and still writes a new
+    // version.
+    check_conditional_patch(&resource_type, &patch_format)?;
 
     let result = state
         .storage()
@@ -213,8 +279,10 @@ where
             &resource_type,
             &search_params,
             &patch_format,
+            if_match,
         )
-        .await?;
+        .await
+        .map_err(|e| super::update::conditional_write_error(e, &resource_type))?;
 
     use helios_persistence::core::ConditionalPatchResult;
     match result {
@@ -252,6 +320,45 @@ where
             count,
         }),
     }
+}
+
+/// The refusals [`patch_handler`] makes while or after applying a patch, made
+/// up front for a conditional patch, where the backend does the applying.
+///
+/// * FHIRPath Patch is not implemented (`501`), exactly as on the instance
+///   endpoint.
+/// * `resourceType` cannot be patched (`400`). Backends re-assert the stored
+///   type and id on every update, so a patch naming them could not corrupt the
+///   row — it would be silently undone, and answered with a `200`.
+fn check_conditional_patch(resource_type: &str, patch: &PatchFormat) -> RestResult<()> {
+    let changes_type = match patch {
+        PatchFormat::FhirPathPatch(_) => {
+            return Err(RestError::NotImplemented {
+                feature: "FHIRPath Patch".to_string(),
+            });
+        }
+        PatchFormat::JsonPatch(operations) => operations.as_array().is_some_and(|ops| {
+            ops.iter().any(|op| {
+                // `test` and the source of a `copy` only read the element.
+                let writes =
+                    |key: &str| op.get(key).and_then(Value::as_str) == Some("/resourceType");
+                match op.get("op").and_then(Value::as_str) {
+                    Some("test") => false,
+                    Some("move") => writes("path") || writes("from"),
+                    _ => writes("path"),
+                }
+            })
+        }),
+        PatchFormat::MergePatch(merge_doc) => merge_doc
+            .get("resourceType")
+            .is_some_and(|t| t.as_str() != Some(resource_type)),
+    };
+    if changes_type {
+        return Err(RestError::BadRequest {
+            message: "Cannot change resourceType via patch".to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Parses the patch format from Content-Type and body.

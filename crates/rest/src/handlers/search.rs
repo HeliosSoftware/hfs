@@ -18,8 +18,12 @@ use helios_persistence::core::{
     is_include_truncation_marker, resolve_includes_iterate_continuation,
     resolve_includes_iterative,
 };
+use helios_persistence::error::{SearchError, StorageError};
+use helios_persistence::search::{
+    TerminologyExpander, TerminologyExpansion, param_requires_terminology, validate_modifier,
+};
 use helios_persistence::types::{
-    IncludeDirective, SearchBundle, SearchParamType, StoredResource, TotalMode,
+    IncludeDirective, SearchBundle, SearchModifier, SearchParamType, StoredResource, TotalMode,
 };
 use tracing::{debug, warn};
 
@@ -27,7 +31,9 @@ use helios_fhir::FhirVersion;
 
 use crate::error::{RestError, RestResult};
 use crate::extractors::query_pairs::{last_value, parse_query_pairs};
-use crate::extractors::{SearchParams, TenantExtractor, build_search_query, unknown_search_params};
+use crate::extractors::{
+    SearchParams, TenantExtractor, build_search_query_for_version, unknown_search_params,
+};
 use crate::middleware::content_type::{FhirFormat, negotiate_format};
 use crate::middleware::prefer::PreferHeader;
 use crate::responses::format_resource_response;
@@ -213,6 +219,10 @@ where
     // spec's placeholder `Resource.id` expression: an identity test on
     // PostgreSQL, an unfiltered result set on SQLite. Use `_list` for List
     // membership.
+    // A parameter with no value (`family=`) is ignored, per FHIR; from here on
+    // it is as if the client had not sent it (#1380).
+    let pairs = crate::extractors::drop_empty_parameters(pairs);
+
     const UNSUPPORTED_PARAMS: [&str; 2] = ["_query", "_in"];
     if let Some((key, _)) = pairs
         .iter()
@@ -224,11 +234,64 @@ where
         });
     }
 
+    // A terminology-backed modifier (`:in` / `:not-in` / `:above` / `:below`)
+    // the parameter's type does not define is a client error — `name:in`,
+    // `birthdate:below` — and must be the `400` any other mismatched modifier
+    // gets, not one of the `501`s below, which are for a *valid* modifier this
+    // server cannot answer (#1339). It has to be settled here, ahead of the
+    // query builder's own `validate_modifier` call: with a terminology server
+    // `expand_terminology_params` would otherwise rewrite the key into a plain
+    // parameter, and without one the guard would answer first.
+    //
+    // Direct parameters only, like everything else down to the expansion: the
+    // terminal parameter of a chained or `_has` search is typed — and checked,
+    // expanded or rejected, in this same order — by the chain resolver
+    // (`check_terminal_modifier`), the only place its type is known (#1365).
+    {
+        let reg = state.storage().search_param_registry(tenant.context());
+        let registry = reg.read();
+        for (key, _) in &pairs {
+            if is_chained_key(key) {
+                continue;
+            }
+            let Some((base, modifier)) = key.split_once(':') else {
+                continue;
+            };
+            let Some(
+                parsed @ (SearchModifier::In
+                | SearchModifier::NotIn
+                | SearchModifier::Above
+                | SearchModifier::Below),
+            ) = SearchModifier::parse(modifier)
+            else {
+                continue;
+            };
+            // An unregistered parameter has no declared type to check against
+            // (`validate_modifier` only gates registered ones).
+            let Some(param_type) = registry
+                .get_param(resource_type, base)
+                .or_else(|| registry.get_param("Resource", base))
+                .map(|p| p.param_type)
+            else {
+                continue;
+            };
+            validate_modifier(&registry, resource_type, base, param_type, &parsed).map_err(
+                |message| RestError::InvalidParameter {
+                    param: key.clone(),
+                    message,
+                },
+            )?;
+        }
+    }
+
     // `:not-in` requires negated value-set filtering, which no backend
     // implements. Reject it explicitly (501) regardless of whether a terminology
     // server is configured, rather than silently ignoring it (which would return
     // a superset of the intended results).
-    if let Some((key, _)) = pairs.iter().find(|(k, _)| k.ends_with(":not-in")) {
+    if let Some((key, _)) = pairs
+        .iter()
+        .find(|(k, _)| k.ends_with(":not-in") && !is_chained_key(k))
+    {
         return Err(RestError::NotImplemented {
             feature: format!(
                 "search modifier ':not-in' is not supported ({key}); \
@@ -247,29 +310,33 @@ where
         // `:in` is token-only, so it always needs terminology; `:above`/`:below`
         // also apply to reference/uri, which resolve locally — only reject those
         // when the parameter is a token. See assessment item A2c.
+        //
+        // This sees direct parameters only. The terminal parameter of a chained
+        // or `_has` search is typed by the chain resolver, which asks the same
+        // question (`param_requires_terminology`) and raises the same error
+        // (#1317) — see `resolve_chains_with` below.
         {
             let reg = state.storage().search_param_registry(tenant.context());
             let registry = reg.read();
             for (key, _) in &pairs {
+                // A chain's terminal modifier is the resolver's to judge: only
+                // it knows the terminal's type, and so whether the modifier is
+                // valid there at all (`subject.name:in` is a `400`).
+                if is_chained_key(key) {
+                    continue;
+                }
                 let Some((base, modifier)) = key.split_once(':') else {
                     continue;
                 };
-                let needs_terminology = match modifier {
-                    "in" => true,
-                    "above" | "below" => registry
-                        .get_param(resource_type, base)
-                        .or_else(|| registry.get_param("Resource", base))
-                        .map(|p| p.param_type == SearchParamType::Token)
-                        .unwrap_or(false),
-                    _ => false,
+                let Some(parsed) = SearchModifier::parse(modifier) else {
+                    continue;
                 };
-                if needs_terminology {
-                    return Err(RestError::NotImplemented {
-                        feature: format!(
-                            "search modifier ':{modifier}' on token parameter '{base}' requires a \
-                             configured terminology server (set HFS_TERMINOLOGY_SERVER)"
-                        ),
-                    });
+                if param_requires_terminology(&registry, resource_type, base, &parsed) {
+                    return Err(SearchError::TerminologyRequired {
+                        modifier: modifier.to_string(),
+                        param: base.to_string(),
+                    }
+                    .into());
                 }
             }
         }
@@ -331,7 +398,10 @@ where
     let mut query = {
         let reg = state.storage().search_param_registry(tenant.context());
         let registry = reg.read();
-        let built = build_search_query(resource_type, &search_params, &registry)?;
+        // Against the version the search resolves in (see above), so a
+        // `:[type]` qualifier cannot name a type only another version has.
+        let built =
+            build_search_query_for_version(resource_type, &search_params, &registry, fhir_version)?;
         // Under strict handling, reject a `_sort` on a field the server cannot
         // actually sort by (it would otherwise silently fall back to `id`). Only
         // `_id`, `_lastUpdated`, and registered indexed typed params sort
@@ -372,6 +442,35 @@ where
         });
     }
 
+    // `_list`, `_has` and chained parameters select top-level resources and are
+    // resolved below into an `_id` filter — but under `_contained`, `_id` names
+    // a contained resource by its *local* id, so the resolved ids would select
+    // unrelated contained resources that happen to share one (#1383). Nothing
+    // outside its container can reference a contained resource, so there is
+    // nothing to apply: refuse, before any resolution.
+    if query.contained != helios_persistence::types::ContainedMode::Off {
+        let chained = query.parameters.iter().find(|p| !p.chain.is_empty());
+        let refused = if !query.list.is_empty() {
+            Some("_list".to_string())
+        } else if !query.reverse_chains.is_empty() {
+            Some("_has".to_string())
+        } else {
+            chained.map(|p| {
+                let path: Vec<&str> = p.chain.iter().map(|c| c.target_param.as_str()).collect();
+                format!("{}.{}", p.name, path.join("."))
+            })
+        };
+        if let Some(param) = refused {
+            return Err(RestError::InvalidParameter {
+                message: format!(
+                    "'{param}' cannot be combined with _contained=true or both: it selects \
+                     top-level resources, which a contained resource is not"
+                ),
+                param,
+            });
+        }
+    }
+
     // Clamp page size to the configured default/maximum.
     let count = query
         .count
@@ -407,12 +506,42 @@ where
     // Resolve chained / reverse-chained (`_has`) parameters into an `_id` filter
     // via application-side joins, so any backend's `search()` can execute them.
     let query = if helios_persistence::search::query_has_chains(&query) {
-        helios_persistence::search::resolve_chains(state.storage(), tenant.context(), &query)
-            .await
-            .map_err(|e| {
-                warn!(error = %e, "Chained search resolution failed");
-                RestError::from(e)
-            })?
+        // A terminology-backed modifier on a chain's terminal parameter is the
+        // resolver's: it types the terminal, rejects a modifier that type does
+        // not define (`400`), and only then has a valid one expanded — through
+        // the same code as a direct parameter's — or, without a terminology
+        // server, rejects it as the guard above does a direct one (`501`).
+        let expander = state
+            .terminology_server_url()
+            .map(|ts_url| ChainTerminologyExpander { ts_url });
+        let options = helios_persistence::search::ChainResolveOptions {
+            terminology: expander.as_ref().map(|e| e as &dyn TerminologyExpander),
+        };
+        helios_persistence::search::resolve_chains_with(
+            state.storage(),
+            tenant.context(),
+            &query,
+            options,
+        )
+        .await
+        .map_err(|e| {
+            warn!(error = %e, "Chained search resolution failed");
+            match e {
+                // A valid `:not-in` is unanswerable with a terminology server
+                // too: report it as the direct form is, above.
+                StorageError::Search(SearchError::TerminologyRequired { modifier, param })
+                    if modifier == "not-in" =>
+                {
+                    RestError::NotImplemented {
+                        feature: format!(
+                            "search modifier ':not-in' is not supported ({param}:not-in); \
+                             use ':in' or remove this modifier"
+                        ),
+                    }
+                }
+                e => RestError::from(e),
+            }
+        })?
     } else {
         query
     };
@@ -626,7 +755,13 @@ fn drain_truncation_markers(included: &mut Vec<StoredResource>) -> Vec<String> {
 ///
 /// FHIR allows an unsupported parameter to be ignored only if the server says
 /// so; the self link already omits it, and this outcome names it explicitly.
-fn append_ignored_params_outcome(bundle_json: &mut serde_json::Value, ignored: &[String]) {
+///
+/// Shared with [`crate::handlers::compartment`], whose searchsets report
+/// ignored parameters exactly the same way.
+pub(crate) fn append_ignored_params_outcome(
+    bundle_json: &mut serde_json::Value,
+    ignored: &[String],
+) {
     append_warning_outcome(
         bundle_json,
         &format!(
@@ -679,7 +814,8 @@ async fn execute_system_search<S>(
 where
     S: ResourceStorage + MultiTypeSearchProvider + Send + Sync,
 {
-    let search_params = SearchParams::from_pairs(pairs);
+    // A parameter with no value is ignored, as in a type-level search (#1380).
+    let search_params = SearchParams::from_pairs(crate::extractors::drop_empty_parameters(pairs));
 
     // Get resource types from _type parameter (if specified)
     let type_param = search_params.get("_type").cloned();
@@ -696,7 +832,12 @@ where
     let mut query = {
         let reg = state.storage().search_param_registry(tenant.context());
         let registry = reg.read();
-        build_search_query("Resource", &search_params, &registry)?
+        build_search_query_for_version(
+            "Resource",
+            &search_params,
+            &registry,
+            state.config().default_fhir_version,
+        )?
     };
 
     // Clamp page size to the configured default/maximum.
@@ -891,22 +1032,81 @@ mod urlencoding {
     }
 }
 
-/// Pre-processes search params that contain `:in` or `:not-in` modifiers by
-/// expanding the referenced ValueSet via the terminology server.
+/// Whether a query key is a chained (`subject.name`, `subject:Patient.name`)
+/// or reverse-chained (`_has:…`) parameter. The modifier such a key ends in
+/// belongs to the chain's terminal parameter, whose type only the chain
+/// resolver knows.
+fn is_chained_key(key: &str) -> bool {
+    key.contains('.') || key.starts_with("_has:")
+}
+
+/// The REST layer's terminology server, lent to the chain resolver: expands a
+/// terminology-backed modifier on the terminal parameter of a chained / `_has`
+/// search exactly as [`expand_terminology_params`] does a direct parameter's —
+/// same requests, same empty-expansion sentinel, same fail-open policy.
+struct ChainTerminologyExpander<'a> {
+    ts_url: &'a str,
+}
+
+#[async_trait::async_trait]
+impl TerminologyExpander for ChainTerminologyExpander<'_> {
+    async fn expand(&self, modifier: &SearchModifier, value: &str) -> TerminologyExpansion {
+        // The direct form of the terminal parameter; its name does not matter.
+        let key = format!("terminal:{modifier}");
+        let pairs = vec![(key.clone(), value.to_string())];
+        match expand_terminology_params(pairs, self.ts_url).await {
+            Ok(pairs) => match pairs.into_iter().next() {
+                Some((k, _)) if k == key => TerminologyExpansion::Unchanged,
+                Some((_, tokens)) => TerminologyExpansion::Tokens(tokens),
+                None => TerminologyExpansion::Dropped,
+            },
+            // `:not-in` only, which the resolver rejects itself.
+            Err(_) => TerminologyExpansion::Unchanged,
+        }
+    }
+}
+
+/// Rewrites the terminology-backed modifiers — `:in`, and `:above` / `:below`
+/// on a token — of direct parameters into plain token parameters, using the
+/// terminology server at `ts_url`.
 ///
-/// **`:in` modifier** — The ValueSet at the given URL is expanded.  The
-/// parameter is replaced with a plain token parameter whose value is the
-/// expanded codes joined by commas (FHIR OR semantics).
+/// Only called when a terminology server is configured. Without one the caller
+/// (`execute_search_bundle`) rejects these modifiers with a `501` instead —
+/// direct parameters in its own guard, chain terminals in the chain resolver —
+/// rather than let them reach a backend, which would match the ValueSet URL or
+/// the bare code literally. A modifier the parameter's type does not define
+/// (`name:in`) has already been rejected with a `400` by then.
+///
+/// Keys are matched by suffix, the parameter's type unseen, which is why a
+/// chained or `_has` key (`subject:Patient.gender:in`) is passed through
+/// untouched: whether its modifier is valid depends on the terminal parameter's
+/// type, which only the chain resolver knows. The resolver calls back here —
+/// [`ChainTerminologyExpander`] — once it has checked the modifier, so
+/// `subject.name:in` is a `400` instead of a search for `subject.name=<codes>`
+/// (#1365).
+///
+/// **`:in`** — The ValueSet at the given URL is expanded, and the parameter is
+/// replaced with a plain token parameter whose value is the expanded codes
+/// joined by commas (FHIR OR semantics).
 /// Example: `code:in=http://example.org/vs` → `code=http://cs|A,http://cs|B`
 ///
-/// **`:not-in` modifier** — Returns `Err(RestError::NotImplemented)` so the
-/// caller can surface an explicit 501 to the client.  Silently dropping a
-/// negation filter would return incorrect results (all resources instead of
-/// the expected subset), which is worse than an honest error.
+/// **`:below` / `:above`** — For a `system|code` value, the code is expanded to
+/// itself plus its descendants (`is-a`) / ancestors (`generalizes`), and the
+/// parameter is replaced the same way. A value without a `|` is the uri /
+/// reference form, which is structural: it is passed through with its modifier
+/// for the backend to resolve natively.
 ///
-/// All other parameters pass through unchanged. On individual expansion
-/// failures the problematic parameter is skipped with a warning so a single
-/// bad ValueSet URL does not abort the entire search.
+/// **`:not-in`** — Returns `Err(RestError::NotImplemented)`, a `501`. Silently
+/// dropping a negation filter would return all resources instead of the
+/// expected subset, which is worse than an honest error. (The caller rejects
+/// `:not-in` itself before getting here; this arm keeps the function safe to
+/// call on its own.)
+///
+/// All other parameters pass through unchanged. An empty expansion is replaced
+/// by a sentinel value that matches nothing. If an expansion *fails*, the
+/// parameter is dropped with a warning and the search continues without that
+/// filter (fail-open), so an unreachable terminology server or a single bad
+/// ValueSet URL does not abort the entire search.
 async fn expand_terminology_params(
     pairs: Vec<(String, String)>,
     ts_url: &str,
@@ -915,7 +1115,9 @@ async fn expand_terminology_params(
     let mut result: Vec<(String, String)> = Vec::with_capacity(pairs.len());
 
     for (key, value) in pairs {
-        if let Some(param_name) = key.strip_suffix(":in") {
+        if is_chained_key(&key) {
+            result.push((key, value));
+        } else if let Some(param_name) = key.strip_suffix(":in") {
             // Expand the ValueSet and join codes with commas for OR token search.
             match client.expand_value_set(&value).await {
                 Ok(codes) if !codes.is_empty() => {
@@ -1290,6 +1492,28 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["Smith", "Jones"]);
         assert_eq!(as_map(&result).get("_count"), Some(&"10".to_string()));
+    }
+
+    /// #1365: a chained or `_has` key keeps its terminology modifier — the chain
+    /// resolver types the terminal parameter first, then expands. (The
+    /// unreachable server would otherwise drop the `:in` keys, and `:not-in`
+    /// would be an error.)
+    #[tokio::test]
+    async fn test_expand_terminology_params_leaves_chained_keys_to_the_resolver() {
+        let params: Vec<(String, String)> = [
+            ("subject.name:in", "http://example.org/vs"),
+            ("subject:Patient.gender:below", "http://cs|male"),
+            ("_has:Observation:subject:code:in", "http://example.org/vs"),
+            ("subject.gender:not-in", "http://example.org/vs"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+        let result = expand_terminology_params(params.clone(), "http://127.0.0.1:19999")
+            .await
+            .unwrap();
+        assert_eq!(result, params);
     }
 
     /// Verifies that a `:not-in` parameter returns `NotImplemented` rather than

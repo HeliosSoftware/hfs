@@ -29,13 +29,7 @@
     <system value="http://hl7.org/fhir/sid/eui-48"/>
     <value value="00-09-1F-80-07-3A"/>
   </identifier>
-  <definition/>
-  <location>
-    <reference value="Location/2"/>
-  </location>
-  <parent>
-    <reference value="Device/345675"/>
-  </parent>
+  <definition value="http://hl7.org/fhir/DeviceDefinition/example"/>
   <udiCarrier>
     <deviceIdentifier value="39183189818"/>
     <issuer value="http://hl7.org/fhir/NamingSystem/gs1-di"/>
@@ -63,6 +57,16 @@
     </coding>
     <text value="MDC_MOC_VMS_MDS_SIMP: Personal Health Device"/>
   </type>
+  <deviceVersion>
+    <type>
+      <coding>
+        <system value="urn:iso:std:iso:11073:10101"/>
+        <code value="532352"/>
+      </coding>
+      <text value="MDC_REG_CERT_DATA_CONTINUA_VERSION: Continua version"/>
+    </type>
+    <value value="1.0"/>
+  </deviceVersion>
   <conformsTo>
     <specification>
       <coding>
@@ -109,4 +113,10 @@
     </type>
     <valueBoolean value="true"/>
   </property>
+  <location>
+    <reference value="Location/2"/>
+  </location>
+  <parent>
+    <reference value="Device/345675"/>
+  </parent>
 </Device>

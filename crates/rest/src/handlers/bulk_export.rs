@@ -55,6 +55,18 @@ fn not_implemented() -> RestError {
     }
 }
 
+/// The export flow is enabled by configuration but the active storage backend
+/// provides no export job store / output store (e.g. `s3`, `mongodb`). This is a
+/// backend capability gap, not the `HFS_BULK_EXPORT_ENABLED` flag, so it must not
+/// blame that flag the operator never touched (#1226). Uses the same wording as
+/// the `UnsupportedCapability` arm of `map_storage_err`, so kick-off and the
+/// worker's mid-run capability check speak with one voice.
+fn export_unsupported_by_backend() -> RestError {
+    RestError::NotImplemented {
+        feature: "bulk export not supported by this backend".to_string(),
+    }
+}
+
 fn bad_request(msg: impl Into<String>) -> RestError {
     RestError::BadRequest {
         message: msg.into(),
@@ -128,7 +140,9 @@ where
     if !cfg.enabled {
         return Err(not_implemented());
     }
-    let jobs = state.bulk_export_jobs().ok_or_else(not_implemented)?;
+    let jobs = state
+        .bulk_export_jobs()
+        .ok_or_else(export_unsupported_by_backend)?;
 
     if !has_respond_async(headers) {
         return Err(bad_request(
@@ -210,8 +224,15 @@ where
                     unknown.join(", ")
                 )));
             }
-            build_search_query_from_pairs(rt, &filter_pairs, &registry)
-                .map_err(|e| bad_request(format!("_typeFilter '{raw}': {e}")))?
+            // The worker runs the compiled filter as a search, so it is judged
+            // against the version searches resolve in (#1366).
+            build_search_query_from_pairs(
+                rt,
+                &filter_pairs,
+                &registry,
+                state.config().default_fhir_version,
+            )
+            .map_err(|e| bad_request(format!("_typeFilter '{raw}': {e}")))?
         };
         type_filters.push(TypeFilter::new(rt, query).with_compiled(compiled));
     }
@@ -249,12 +270,15 @@ where
         // Validate each patient reference resolves.
         for pref in &patient_refs {
             let id = pref.strip_prefix("Patient/").unwrap_or(pref);
-            let exists = state
-                .storage()
-                .read(tenant.context(), "Patient", id)
-                .await
-                .map_err(map_storage_err)?
-                .is_some();
+            // Same `Ok(None)` / `Err(Resource(Gone))` split as the Group gate
+            // above: a soft-deleted Patient is "does not resolve" for export
+            // purposes, so it joins the 400 below rather than escaping as a
+            // 410 that would read as "the $export endpoint is gone".
+            let exists = match state.storage().read(tenant.context(), "Patient", id).await {
+                Ok(found) => found.is_some(),
+                Err(StorageError::Resource(ResourceError::Gone { .. })) => false,
+                Err(e) => return Err(map_storage_err(e)),
+            };
             if !exists {
                 return Err(bad_request(format!("unknown patient reference '{pref}'")));
             }
@@ -405,9 +429,15 @@ fn map_storage_err(e: StorageError) -> RestError {
         }) => RestError::NotImplemented {
             feature: "bulk export not supported by this backend".to_string(),
         },
-        other => RestError::InternalError {
-            message: other.to_string(),
-        },
+        // Everything else is classified by the shared `From<StorageError>`
+        // conversion instead of being flattened into a 500. The SQLite
+        // kick-off insert that waits out `busy_timeout` behind a search-index
+        // rebuild arrives here as `BackendError::Unavailable`; that impl turns
+        // it into a 503 with `Retry-After`, which is what it is — a transient,
+        // retryable condition rather than a server fault (#1185). Collapsing
+        // it to a 500 also dropped the message, so the client saw only the
+        // generic "An internal error occurred" sentence.
+        other => RestError::from(other),
     }
 }
 
@@ -547,8 +577,12 @@ where
     if !cfg.enabled {
         return Err(not_implemented());
     }
-    let jobs = state.bulk_export_jobs().ok_or_else(not_implemented)?;
-    let output = state.bulk_export_output().ok_or_else(not_implemented)?;
+    let jobs = state
+        .bulk_export_jobs()
+        .ok_or_else(export_unsupported_by_backend)?;
+    let output = state
+        .bulk_export_output()
+        .ok_or_else(export_unsupported_by_backend)?;
     let principal = request.extensions().get::<Principal>().cloned();
     let job_id = ExportJobId::from_string(job_id);
 
@@ -708,8 +742,12 @@ where
     if !cfg.enabled {
         return Err(not_implemented());
     }
-    let jobs = state.bulk_export_jobs().ok_or_else(not_implemented)?;
-    let output = state.bulk_export_output().ok_or_else(not_implemented)?;
+    let jobs = state
+        .bulk_export_jobs()
+        .ok_or_else(export_unsupported_by_backend)?;
+    let output = state
+        .bulk_export_output()
+        .ok_or_else(export_unsupported_by_backend)?;
     let principal = request.extensions().get::<Principal>().cloned();
     let job_id = ExportJobId::from_string(job_id);
 
@@ -778,9 +816,15 @@ where
     if !cfg.enabled {
         return Err(not_implemented());
     }
-    let jobs = state.bulk_export_jobs().ok_or_else(not_implemented)?;
-    let output = state.bulk_export_output().ok_or_else(not_implemented)?;
-    let file_auth = state.bulk_export_file_auth().ok_or_else(not_implemented)?;
+    let jobs = state
+        .bulk_export_jobs()
+        .ok_or_else(export_unsupported_by_backend)?;
+    let output = state
+        .bulk_export_output()
+        .ok_or_else(export_unsupported_by_backend)?;
+    let file_auth = state
+        .bulk_export_file_auth()
+        .ok_or_else(export_unsupported_by_backend)?;
     let principal = request.extensions().get::<Principal>().cloned();
     let job_id = ExportJobId::from_string(job_id);
 
@@ -890,6 +934,7 @@ fn owns_job(principal: Option<&Principal>, owner_subject: Option<&str>) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use helios_persistence::error::BackendError;
 
     #[tokio::test]
     async fn streamed_export_body_propagates_reader_errors() {
@@ -921,6 +966,158 @@ mod tests {
         assert_eq!(
             advertised_download_url(&protected, || "https://public.example/artifact".to_string()),
             "https://public.example/artifact"
+        );
+    }
+
+    /// #1185: on SQLite a kick-off insert that waits out `busy_timeout` behind
+    /// a search-index rebuild fails with `SQLITE_BUSY`, which the backend
+    /// classifies as `BackendError::Unavailable`. It used to reach the client
+    /// as a bare 500 with no `Retry-After` and a generic message, so nothing
+    /// retried and the operator had no idea the database was merely busy.
+    #[test]
+    fn map_storage_err_turns_a_busy_backend_into_a_retryable_503() {
+        let busy = StorageError::Backend(BackendError::Unavailable {
+            backend_name: "sqlite".to_string(),
+            message: "Failed to create export job: database is locked".to_string(),
+        });
+
+        let (status, code, message) = map_storage_err(busy).client_response();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code, "transient");
+        assert_eq!(
+            message, "Failed to create export job: database is locked",
+            "a transient failure keeps its detail; only genuine faults are sanitized"
+        );
+
+        let response = axum::response::IntoResponse::into_response(map_storage_err(
+            StorageError::Backend(BackendError::Unavailable {
+                backend_name: "sqlite".to_string(),
+                message: "database is locked".to_string(),
+            }),
+        ));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let retry_after = response
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .expect("a 503 must tell the client when to come back");
+        assert!(
+            retry_after
+                .to_str()
+                .expect("Retry-After is ASCII")
+                .parse::<u32>()
+                .expect("Retry-After is delta-seconds")
+                > 0
+        );
+    }
+
+    /// The remaining backend conditions must keep the classification the shared
+    /// `From<BackendError>` conversion gives them, rather than all collapsing
+    /// onto one status.
+    #[test]
+    fn map_storage_err_separates_transient_backends_from_real_faults() {
+        let cases = [
+            (
+                BackendError::ConnectionFailed {
+                    backend_name: "sqlite".to_string(),
+                    message: "no such file".to_string(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                BackendError::PoolExhausted {
+                    backend_name: "sqlite".to_string(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                BackendError::Timeout {
+                    backend_name: "postgres".to_string(),
+                    message: "statement timeout".to_string(),
+                },
+                StatusCode::GATEWAY_TIMEOUT,
+            ),
+            (
+                BackendError::Internal {
+                    backend_name: "sqlite".to_string(),
+                    message: "malformed row".to_string(),
+                    source: None,
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ];
+
+        for (backend_err, expected) in cases {
+            let label = backend_err.to_string();
+            let (status, _, _) =
+                map_storage_err(StorageError::Backend(backend_err)).client_response();
+            assert_eq!(status, expected, "wrong status for {label}");
+        }
+    }
+
+    /// Delegating the catch-all must not swallow the three specialisations the
+    /// export routes layer on top: they are matched before it and stay put.
+    /// `BulkExport(_)` in particular is a 500 in the generic conversion, so a
+    /// missing job would regress to 500 if its arm ever moved after the
+    /// delegation.
+    #[test]
+    fn map_storage_err_keeps_its_bulk_export_specialisations() {
+        let missing_job = map_storage_err(StorageError::BulkExport(BulkExportError::JobNotFound {
+            job_id: "job-1".to_string(),
+        }));
+        assert!(
+            matches!(&missing_job, RestError::NotFound { resource_type, id }
+                if resource_type == "export-job" && id == "job-1"),
+            "unexpected mapping: {missing_job:?}"
+        );
+        assert_eq!(missing_job.client_response().0, StatusCode::NOT_FOUND);
+
+        let missing_group =
+            map_storage_err(StorageError::BulkExport(BulkExportError::GroupNotFound {
+                group_id: "g-1".to_string(),
+            }));
+        assert!(
+            matches!(&missing_group, RestError::NotFound { resource_type, id }
+                if resource_type == "Group" && id == "g-1"),
+            "unexpected mapping: {missing_group:?}"
+        );
+
+        let unsupported =
+            map_storage_err(StorageError::Backend(BackendError::UnsupportedCapability {
+                backend_name: "mongodb".to_string(),
+                capability: "bulk_export".to_string(),
+            }));
+        assert!(
+            matches!(&unsupported, RestError::NotImplemented { feature }
+                if feature == "bulk export not supported by this backend"),
+            "the export-specific wording must survive: {unsupported:?}"
+        );
+        assert_eq!(unsupported.client_response().0, StatusCode::NOT_IMPLEMENTED);
+    }
+
+    /// The two 501s the export routes raise must be told apart: a backend with no
+    /// job/output store (s3, mongodb) must not blame `HFS_BULK_EXPORT_ENABLED`,
+    /// which the operator never set (#1226). Both stay 501; only the text differs,
+    /// and the backend case reuses the `map_storage_err` wording.
+    #[test]
+    fn disabled_by_env_and_unsupported_backend_are_distinct_messages() {
+        let (env_status, _, env_text) = not_implemented().client_response();
+        assert_eq!(env_status, StatusCode::NOT_IMPLEMENTED);
+        assert!(
+            env_text.contains("HFS_BULK_EXPORT_ENABLED=false"),
+            "the env-disabled 501 must still name the flag: {env_text}"
+        );
+
+        let (backend_status, backend_code, backend_text) =
+            export_unsupported_by_backend().client_response();
+        assert_eq!(backend_status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(backend_code, "not-supported");
+        assert!(
+            backend_text.contains("not supported by this backend"),
+            "the backend-gap 501 must say it is a backend limitation: {backend_text}"
+        );
+        assert!(
+            !backend_text.contains("HFS_BULK_EXPORT_ENABLED"),
+            "the backend-gap 501 must not blame the env flag: {backend_text}"
         );
     }
 }

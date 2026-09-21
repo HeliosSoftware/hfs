@@ -1425,20 +1425,30 @@ mod conditional_entries {
         assert_eq!(family_of(&backend, "p1").await, "Decoded");
     }
 
+    /// `ifMatch` on a conditional entry is evaluated against the resource the
+    /// criteria resolve to (#1381; it was a `400` before). The full matrix is
+    /// `tests/conditional_if_match.rs`.
     #[tokio::test]
-    async fn if_match_on_a_conditional_entry_is_400_and_writes_nothing() {
+    async fn if_match_on_a_conditional_entry_is_honoured() {
         let (server, backend) = create_test_server().await;
         seed_patient_with_identifier(&backend, "p1", "Nguyen").await;
 
         let mut bundle = conditional_put("Patient?identifier=http://example.org|12345", "Stale");
-        bundle["entry"][0]["request"]["ifMatch"] = json!("W/\"1\"");
+        bundle["entry"][0]["request"]["ifMatch"] = json!("W/\"7\"");
         let body = post_batch(&server, bundle).await;
 
         assert_eq!(
-            body["entry"][0]["response"]["status"], "400 Bad Request",
+            body["entry"][0]["response"]["status"], "412 Precondition Failed",
             "{body}"
         );
         assert_eq!(family_of(&backend, "p1").await, "Nguyen");
+
+        let mut bundle = conditional_put("Patient?identifier=http://example.org|12345", "Fresh");
+        bundle["entry"][0]["request"]["ifMatch"] = json!("W/\"1\"");
+        let body = post_batch(&server, bundle).await;
+
+        assert_eq!(body["entry"][0]["response"]["status"], "200 OK", "{body}");
+        assert_eq!(family_of(&backend, "p1").await, "Fresh");
     }
 
     // ── DELETE [type]?[criteria] ─────────────────────────────────────────────

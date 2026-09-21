@@ -100,6 +100,7 @@ fn unknown_key_negative_every_modeled_root_key_is_accepted() {
     let doc: Value = serde_json::from_str(
         r#"{
         "resourceType": "ViewDefinition",
+        "resourceDefinition": "http://hl7.org/fhir/StructureDefinition/ViewDefinition|3.0.0-ballot",
         "id": "vd1",
         "meta": {},
         "implicitRules": "http://example.org",

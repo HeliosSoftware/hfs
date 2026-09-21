@@ -25,6 +25,10 @@
           <display value="Lyophilised powder for conventional release solution for injection"/>
         </coding>
       </doseForm>
+      <instance>
+        <lotNumber value="12345"/>
+        <expirationDate value="2019-10-31"/>
+      </instance>
     </Medication>
   </contained>
   <identifier>
@@ -55,5 +59,64 @@
     <reference value="Practitioner/f007"/>
     <display value="Patrick Pump"/>
   </requester>
-  <dosageInstruction/>
+  <dosageInstruction>
+    <step>
+      <component>
+        <text value="1.8 mg/kg IV infusion over 20 minutes every 3 weeks for 16 cycles"/>
+        <timing>
+          <repeat>
+            <count value="16"/>
+            <frequency value="1"/>
+            <period value="3"/>
+            <periodUnit value="wk"/>
+          </repeat>
+        </timing>
+        <route>
+          <coding>
+            <system value="http://snomed.info/sct"/>
+            <code value="255560000"/>
+            <display value="Intravenous"/>
+          </coding>
+        </route>
+        <doseAndRate>
+          <type>
+            <coding>
+              <system value="http://terminology.hl7.org/CodeSystem/dose-rate-type"/>
+              <code value="ordered"/>
+              <display value="Ordered"/>
+            </coding>
+          </type>
+          <doseQuantity>
+            <value value="1.8"/>
+            <unit value="mg/kg"/>
+            <system value="http://unitsofmeasure.org"/>
+            <code value="mg/kg"/>
+          </doseQuantity>
+          <rateRatio>
+            <numerator>
+              <value value="1.8"/>
+              <system value="http://unitsofmeasure.org"/>
+              <code value="mg/kg"/>
+            </numerator>
+            <denominator>
+              <value value="20"/>
+              <system value="http://unitsofmeasure.org"/>
+              <code value="min"/>
+            </denominator>
+          </rateRatio>
+        </doseAndRate>
+        <safety>
+          <doseLimit>
+            <valueQuantity>
+              <value value="400"/>
+              <unit value="mg"/>
+              <system value="http://unitsofmeasure.org"/>
+              <code value="mg"/>
+            </valueQuantity>
+            <scope value="administration"/>
+          </doseLimit>
+        </safety>
+      </component>
+    </step>
+  </dosageInstruction>
 </MedicationRequest>

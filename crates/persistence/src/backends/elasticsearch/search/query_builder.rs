@@ -255,6 +255,15 @@ impl<'a> EsQueryBuilder<'a> {
             return modifier_handlers::build_missing_clause(param);
         }
 
+        // Defence in depth behind `validate_value_presence` (#1380): an empty
+        // value is a prefix of every string, so it matches nothing here rather
+        // than whatever the handler below would make of it — the whole
+        // parameter, since under `:not` "nothing" negates into "everything".
+        // `match_none`, never `None`: a `None` drops the constraint.
+        if crate::search::has_empty_value(param) {
+            return Some(date::match_none());
+        }
+
         // Handle special parameters
         match param.name.as_str() {
             "_id" => return self.build_id_clause(param),
@@ -322,12 +331,30 @@ impl<'a> EsQueryBuilder<'a> {
     }
 
     /// Builds a clause for the _id special parameter.
+    ///
+    /// `_id` is dispatched here by name (`build_parameter_clause`, above),
+    /// bypassing the generic `:not` handling that wraps every other
+    /// parameter's clauses in `must_not` — so `_id:not=a` used to build the
+    /// exact same `term`/`terms` clause as a bare `_id=a` and match precisely
+    /// the resource the caller asked to exclude (#1092). `:missing` is
+    /// resolved earlier, in `build_parameter_clause`, and any other modifier
+    /// is rejected before this point by the backend's search entry point, so
+    /// only `None` and `Some(SearchModifier::Not)` are handled here.
     fn build_id_clause(&self, param: &SearchParameter) -> Option<Value> {
+        if param.values.is_empty() {
+            return None;
+        }
         let ids: Vec<&str> = param.values.iter().map(|v| v.value.as_str()).collect();
-        if ids.len() == 1 {
-            Some(json!({ "term": { "resource_id": ids[0] } }))
+        let clause = if ids.len() == 1 {
+            json!({ "term": { "resource_id": ids[0] } })
         } else {
-            Some(json!({ "terms": { "resource_id": ids } }))
+            json!({ "terms": { "resource_id": ids } })
+        };
+
+        if matches!(param.modifier, Some(SearchModifier::Not)) {
+            Some(json!({ "bool": { "must_not": [clause] } }))
+        } else {
+            Some(clause)
         }
     }
 
@@ -346,10 +373,13 @@ impl<'a> EsQueryBuilder<'a> {
             .iter()
             .map(
                 |value| match date::field_range("last_updated", &value.value, value.prefix) {
-                    date::DateRange::Within(range) => range,
-                    date::DateRange::Outside(range) => {
+                    Some(date::DateRange::Within(range)) => range,
+                    Some(date::DateRange::Outside(range)) => {
                         json!({ "bool": { "must_not": [range] } })
                     }
+                    // Not a date: a clause that matches nothing. Dropping the
+                    // value instead would return every resource (#1293).
+                    None => date::match_none(),
                 },
             )
             .collect();
@@ -542,6 +572,90 @@ mod tests {
         assert!(body_str.contains("resource_id"));
     }
 
+    /// #1092: `_id` is dispatched through `build_id_clause`, bypassing the
+    /// generic `:not` handling that wraps every other parameter's clauses in
+    /// `must_not` — so `_id:not=a` used to build the exact same `term`
+    /// clause as a bare `_id=a` and match precisely the resource the caller
+    /// asked to exclude.
+    #[test]
+    fn id_no_modifier_control_is_a_term_clause() {
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("a")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let es_query = builder.build(&query);
+        let clause = &es_query.body["query"]["bool"]["must"][0];
+
+        assert_eq!(clause, &json!({ "term": { "resource_id": "a" } }));
+    }
+
+    /// Matches the SQL backends' `_id` builders, which both guard on
+    /// `values.is_empty()` and contribute no condition rather than an
+    /// empty `terms: []` clause (which would match nothing rather than
+    /// leaving the parameter's absence unconstrained).
+    #[test]
+    fn id_with_no_values_produces_no_clause() {
+        let param = SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![],
+            chain: vec![],
+            components: vec![],
+        };
+
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        assert!(builder.build_id_clause(&param).is_none());
+    }
+
+    #[test]
+    fn id_not_single_value_is_negated_with_must_not() {
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::Not),
+            values: vec![SearchValue::eq("a")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let es_query = builder.build(&query);
+        let clause = &es_query.body["query"]["bool"]["must"][0];
+
+        assert_eq!(
+            clause,
+            &json!({ "bool": { "must_not": [ { "term": { "resource_id": "a" } } ] } })
+        );
+    }
+
+    #[test]
+    fn id_not_two_values_is_negated_with_must_not() {
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::Not),
+            values: vec![SearchValue::eq("a"), SearchValue::eq("b")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let es_query = builder.build(&query);
+        let clause = &es_query.body["query"]["bool"]["must"][0];
+
+        assert_eq!(
+            clause,
+            &json!({ "bool": { "must_not": [ { "terms": { "resource_id": ["a", "b"] } } ] } })
+        );
+    }
+
     #[test]
     fn missing_precedes_id_and_last_updated_dispatch() {
         let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
@@ -620,6 +734,49 @@ mod tests {
         assert_eq!(clause["bool"]["minimum_should_match"], 1);
         assert_eq!(should[0]["range"]["last_updated"]["gte"], "2026-09-01");
         assert_eq!(should[1]["range"]["last_updated"]["gte"], "2026-09-03");
+    }
+
+    /// #1293: a value that is not a date used to be read as the year 2000, so
+    /// `_lastUpdated=gtnot-a-date` returned every resource. The search gate
+    /// rejects it before a query is built; if one is built anyway, the clause
+    /// matches nothing and is never dropped from the query.
+    #[test]
+    fn a_date_value_that_is_not_a_date_matches_nothing() {
+        let clause = last_updated_query(vec![SearchValue::new(SearchPrefix::Gt, "not-a-date")]);
+        assert_eq!(clause, json!({ "match_none": {} }));
+
+        // In an OR list the bad value contributes nothing; the good one stays.
+        let clause = last_updated_query(vec![
+            SearchValue::new(SearchPrefix::Ne, "2024-13-45"),
+            SearchValue::eq("2026-09-03"),
+        ]);
+        let should = clause["bool"]["should"].as_array().expect("bool.should");
+        assert_eq!(should[0], json!({ "match_none": {} }));
+        assert_eq!(should[1]["range"]["last_updated"]["gte"], "2026-09-03");
+
+        // An indexed date parameter: `filter_map` must not get a `None` to drop.
+        let query = SearchQuery::new("Procedure").with_parameter(SearchParameter {
+            name: "date".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: vec![SearchValue::new(SearchPrefix::Gt, "abcd")],
+            chain: vec![],
+            components: vec![],
+        });
+        let builder = EsQueryBuilder::new("acme", "Procedure", "hfs_acme_procedure".to_string());
+        assert_eq!(
+            builder.build(&query).body["query"]["bool"]["must"][0],
+            json!({ "match_none": {} })
+        );
+    }
+
+    #[test]
+    fn last_updated_second_precision_is_the_whole_second() {
+        let clause = last_updated_query(vec![SearchValue::eq("2026-09-06T04:44:27-04:00")]);
+        assert_eq!(
+            clause["range"]["last_updated"],
+            json!({ "gte": "2026-09-06T08:44:27.000Z", "lt": "2026-09-06T08:44:28.000Z" })
+        );
     }
 
     fn not_param(values: Vec<SearchValue>) -> SearchQuery {
@@ -924,5 +1081,49 @@ mod tests {
         let room = builder.build(&SearchQuery::new("Patient").with_count(10));
         assert_eq!(room.body["size"], json!(11));
         assert!(room.over_fetched);
+    }
+
+    /// #1380: `family=Zzz,` reached the builder as the values `Zzz` and `""`,
+    /// and a prefix match on `""` is every row. The search gate
+    /// (`validate_value_presence`) rejects it before a query is built; if one
+    /// is built anyway, the parameter matches nothing — the whole parameter, or
+    /// `:not` would negate it into everything — and as `match_none`, since a
+    /// `None` clause is dropped.
+    #[test]
+    fn a_parameter_with_an_empty_value_matches_nothing() {
+        use SearchModifier as M;
+        use SearchParamType as T;
+        let cases: Vec<(&str, SearchParamType, Option<SearchModifier>, Vec<&str>)> = vec![
+            ("family", T::String, None, vec!["Zzz", ""]),
+            ("family", T::String, None, vec![""]),
+            ("family", T::String, Some(M::Contains), vec!["", "Zzz"]),
+            ("family", T::String, Some(M::Text), vec![" "]),
+            ("gender", T::Token, None, vec![""]),
+            ("gender", T::Token, Some(M::Not), vec!["female", ""]),
+            ("gender", T::Token, Some(M::Text), vec![""]),
+            ("identifier", T::Token, Some(M::OfType), vec![""]),
+            ("_id", T::Token, None, vec!["a", ""]),
+            ("_tag", T::Token, None, vec![""]),
+            ("general-practitioner", T::Reference, None, vec![""]),
+            ("url", T::Uri, Some(M::Below), vec![""]),
+            ("url", T::Uri, Some(M::Contains), vec!["", "x"]),
+        ];
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        for (name, param_type, modifier, values) in cases {
+            let context = format!("{name} {modifier:?} {values:?}");
+            let param = SearchParameter {
+                name: name.to_string(),
+                param_type,
+                modifier,
+                values: values.into_iter().map(SearchValue::eq).collect(),
+                chain: vec![],
+                components: vec![],
+            };
+            assert_eq!(
+                builder.build_parameter_clause(&param),
+                Some(json!({ "match_none": {} })),
+                "{context}"
+            );
+        }
     }
 }

@@ -1630,6 +1630,34 @@ select.field__input {
   margin-top: 6px;
 }
 
+/* A radio option inside a `fieldset.field` (#1108): the control and its
+   label text share the first row, and the hint sits on the second row
+   indented under the text — not under the radio. The 16px control plus the
+   10px gap match `.choice-card`, so the two radio treatments read alike. */
+.field--choice {
+  display: grid;
+  grid-template-columns: 16px 1fr;
+  column-gap: 10px;
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+.field--choice > input[type="radio"] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.field__choice-label {
+  color: var(--text);
+}
+
+.field--choice > .field__hint {
+  grid-column: 2;
+  margin-top: 2px;
+}
+
 .addbox__actions {
   margin-top: 4px;
   display: flex;
@@ -2198,6 +2226,14 @@ select.field__input {
   margin: 0;
   font-size: 13px;
   color: var(--muted);
+}
+
+/* #1184: give the rebuild notice a small gap above it so it reads as its own
+   element, not a continuation of the lede. Scoped to `.page-head` so the shared
+   `.notice` rule (used flush inside cards) is untouched, and so the dashboard's
+   in-chart notice keeps its own spacing. */
+.page-head [data-rebuild-notice] {
+  margin-top: 12px;
 }
 
 .back-link,
@@ -2979,6 +3015,12 @@ details.json-fold[open] > summary .icon {
   font-size: 11px;
   color: var(--muted);
   font-variant-numeric: tabular-nums;
+}
+
+/* An estimated rail count ("≈1234"): its title explains the estimate, so
+   the cursor advertises the tooltip. */
+.count--approximate {
+  cursor: help;
 }
 
 /* Appended to <body> and positioned from the focused/hovered truncated-name

@@ -531,7 +531,10 @@ impl FilterSqlGenerator {
                 _ => None,
             };
             if let Some(prefix) = prefix {
-                let (sql, bound) = super::parameter_handlers::date::date_condition(
+                // A `_filter` date literal is not seen by the search gate; one
+                // that is not a date matches nothing rather than whatever
+                // `datetime()` would have made of it.
+                let (sql, bound) = super::parameter_handlers::date::date_condition_or_nothing(
                     column, prefix, value, param_num,
                 );
                 return (column, sql, bound);

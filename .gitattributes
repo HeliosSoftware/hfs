@@ -19,3 +19,8 @@ locales/** text eol=lf
 # re-synced upstream copy noisy with spurious line-ending churn, defeating the
 # byte-verbatim comparison the re-sync workflow depends on.
 crates/sof/tests/sql-on-fhir/tests/*.json text eol=lf
+
+# Generated mongosh scripts are compared byte-for-byte against
+# mongosh_script() output via include_str! in search_index_catalog.rs
+# (#1059, #1084); a CRLF Windows checkout would fail that comparison.
+docs/mongodb/*.mongosh.js text eol=lf

@@ -283,6 +283,11 @@ pub enum ManifestPhase {
     Sizing,
     /// Ingesting the `output` files (before the first counters flush).
     Downloading,
+    /// Every `output` file has been pulled to its end; what remains is the
+    /// manifest's own wind-down (deleted files, receipts, artifacts, and the
+    /// per-manifest reindex under deferred indexing). Reported so a poller can
+    /// tell "still pulling files" from "all files in" (#1218).
+    Downloaded,
 }
 
 impl std::fmt::Display for ManifestPhase {
@@ -291,6 +296,7 @@ impl std::fmt::Display for ManifestPhase {
             Self::ReadingManifest => write!(f, "reading-manifest"),
             Self::Sizing => write!(f, "sizing"),
             Self::Downloading => write!(f, "downloading"),
+            Self::Downloaded => write!(f, "downloaded"),
         }
     }
 }
@@ -303,6 +309,7 @@ impl std::str::FromStr for ManifestPhase {
             "reading-manifest" | "reading_manifest" => Ok(Self::ReadingManifest),
             "sizing" => Ok(Self::Sizing),
             "downloading" => Ok(Self::Downloading),
+            "downloaded" => Ok(Self::Downloaded),
             _ => Err(format!("unknown manifest phase: {}", s)),
         }
     }
@@ -454,6 +461,13 @@ pub struct BulkEntryResult {
     pub resource_id: Option<String>,
     /// Whether a new resource was created (vs updated).
     pub created: bool,
+    /// Whether a success left an existing resource untouched because the
+    /// submitted content matched what was already stored (opt-in
+    /// [`BulkProcessingOptions::skip_unchanged`], #1127): no new version, no
+    /// history row, no rollback record. Always `false` when `created` is
+    /// `true`. Reported to batch observers; not persisted with the receipt.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unchanged: bool,
     /// Processing outcome.
     pub outcome: BulkEntryOutcome,
     /// OperationOutcome if there was an error.
@@ -474,8 +488,23 @@ impl BulkEntryResult {
             resource_type: resource_type.into(),
             resource_id: Some(resource_id.into()),
             created,
+            unchanged: false,
             outcome: BulkEntryOutcome::Success,
             operation_outcome: None,
+        }
+    }
+
+    /// Creates a success result for an existing resource the submission left
+    /// untouched because its content was identical (#1127): `created` and
+    /// the write are both absent, `unchanged` is `true`.
+    pub fn success_unchanged(
+        line_number: u64,
+        resource_type: impl Into<String>,
+        resource_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            unchanged: true,
+            ..Self::success(line_number, resource_type, resource_id, false)
         }
     }
 
@@ -490,6 +519,7 @@ impl BulkEntryResult {
             resource_type: resource_type.into(),
             resource_id: None,
             created: false,
+            unchanged: false,
             outcome: BulkEntryOutcome::ValidationError,
             operation_outcome: Some(outcome),
         }
@@ -506,6 +536,7 @@ impl BulkEntryResult {
             resource_type: resource_type.into(),
             resource_id: None,
             created: false,
+            unchanged: false,
             outcome: BulkEntryOutcome::ProcessingError,
             operation_outcome: Some(outcome),
         }
@@ -518,6 +549,7 @@ impl BulkEntryResult {
             resource_type: resource_type.into(),
             resource_id: None,
             created: false,
+            unchanged: false,
             outcome: BulkEntryOutcome::Skipped,
             operation_outcome: Some(serde_json::json!({
                 "resourceType": "OperationOutcome",
@@ -884,6 +916,15 @@ pub struct BatchCommitted<'a> {
     /// re-ingested id (a reclaimed manifest re-walking its files) reads as an
     /// update, never as a second create.
     pub results: &'a [BulkEntryResult],
+    /// The resources the batch wrote, exactly as committed (version, content,
+    /// timestamps), in input order of their successful entries — populated
+    /// only when some observer asked for them through
+    /// [`BatchCommitObserver::wants_resources`], and only by engines that hold
+    /// them at commit time (SQLite, PostgreSQL). Empty otherwise: an observer
+    /// that needs the content and finds this empty re-reads the successful
+    /// entries' ids from the primary. Entries left
+    /// [`BulkEntryResult::unchanged`] wrote nothing and are not included.
+    pub resources: &'a [crate::types::StoredResource],
 }
 
 /// Told about every ingestion batch as soon as its writes are durable (#1078).
@@ -892,11 +933,23 @@ pub struct BatchCommitted<'a> {
 /// return such as [`crate::error::BulkSubmitError::MaxErrorsExceeded`] and before separate
 /// bookkeeping statements — so committed work is reported even when the file
 /// later fails, the worker's lease is lost, or the ingest is cancelled.
-/// Called synchronously on the ingest task: implementations must be cheap and
-/// must not block.
+/// Awaited on the ingest task, between batches: the next batch does not start
+/// until every observer returned. Implementations must bound their own wait
+/// (a queue send under a timeout, never an unbounded flush) — a slow observer
+/// stalls the writer and, with it, everything behind the database's write
+/// lock, the lease heartbeat included (#1127). They must never block the
+/// runtime thread either: no synchronous I/O, no blocking locks.
+#[async_trait]
 pub trait BatchCommitObserver: Send + Sync {
     /// A batch committed.
-    fn batch_committed(&self, batch: &BatchCommitted<'_>);
+    async fn batch_committed(&self, batch: &BatchCommitted<'_>);
+
+    /// Whether this observer needs [`BatchCommitted::resources`]. Engines
+    /// collect the committed resources only when some observer says yes, so
+    /// observers that only count entries (the default) cost no extra memory.
+    fn wants_resources(&self) -> bool {
+        false
+    }
 }
 
 /// Shared handle to a [`BatchCommitObserver`], so [`BulkProcessingOptions`]
@@ -957,8 +1010,18 @@ pub struct BulkProcessingOptions {
     /// per committed batch keeps the figures smooth, splits creates from
     /// updates, and keeps committed work reported when the file later fails
     /// or the lease is lost.
+    ///
+    /// Several can be attached — live counts and, when enabled, the
+    /// index-during-ingest sink (#1127) — and each is told about every batch,
+    /// in the order they were attached.
     #[serde(skip)]
-    pub batch_observer: Option<BatchObserverHandle>,
+    pub batch_observers: Vec<BatchObserverHandle>,
+    /// Leave an existing resource untouched when the submitted content is
+    /// identical to what is stored, ignoring `meta.versionId` and
+    /// `meta.lastUpdated` (#1127). Replaying a manifest then writes no new
+    /// versions. Off by default: a replay has always produced new versions.
+    #[serde(default)]
+    pub skip_unchanged: bool,
 }
 
 fn default_submit_batch_size() -> u32 {
@@ -992,7 +1055,8 @@ impl BulkProcessingOptions {
             defer_indexing: false,
             byte_progress: None,
             cancel: None,
-            batch_observer: None,
+            batch_observers: Vec::new(),
+            skip_unchanged: false,
         }
     }
 
@@ -1020,37 +1084,57 @@ impl BulkProcessingOptions {
         self
     }
 
-    /// Attaches the observer told about every committed batch (#1078).
+    /// Adds an observer told about every committed batch (#1078). Observers
+    /// already attached stay attached.
     pub fn with_batch_observer(
         mut self,
         observer: std::sync::Arc<dyn BatchCommitObserver>,
     ) -> Self {
-        self.batch_observer = Some(BatchObserverHandle(observer));
+        self.batch_observers.push(BatchObserverHandle(observer));
         self
     }
 
-    /// Reports a committed batch to the [`Self::batch_observer`], if any.
+    /// Leaves content-identical resources untouched (#1127).
+    pub fn with_skip_unchanged(mut self, skip_unchanged: bool) -> Self {
+        self.skip_unchanged = skip_unchanged;
+        self
+    }
+
+    /// Whether any attached observer wants [`BatchCommitted::resources`].
+    /// Engines check it once per batch before collecting them.
+    pub fn wants_committed_resources(&self) -> bool {
+        self.batch_observers
+            .iter()
+            .any(|BatchObserverHandle(observer)| observer.wants_resources())
+    }
+
+    /// Reports a committed batch to every [`Self::batch_observers`] entry.
     ///
-    /// Engines call it right after the batch's writes are durable and before
+    /// Engines await it right after the batch's writes are durable and before
     /// any post-commit early return, passing only results whose writes
-    /// committed. An empty batch reports nothing.
-    pub fn notify_batch_committed(
+    /// committed, plus the committed resources when
+    /// [`Self::wants_committed_resources`] asked for them (empty otherwise).
+    /// An empty batch reports nothing.
+    pub async fn notify_batch_committed(
         &self,
         tenant: &TenantContext,
         submission_id: &SubmissionId,
         manifest_id: &str,
         results: &[BulkEntryResult],
+        resources: &[crate::types::StoredResource],
     ) {
         if results.is_empty() {
             return;
         }
-        if let Some(BatchObserverHandle(observer)) = &self.batch_observer {
-            observer.batch_committed(&BatchCommitted {
-                tenant,
-                submission_id,
-                manifest_id,
-                results,
-            });
+        let batch = BatchCommitted {
+            tenant,
+            submission_id,
+            manifest_id,
+            results,
+            resources,
+        };
+        for BatchObserverHandle(observer) in &self.batch_observers {
+            observer.batch_committed(&batch).await;
         }
     }
 
@@ -1361,6 +1445,22 @@ pub trait BulkSubmitProvider: ResourceStorage {
         id: &SubmissionId,
     ) -> StorageResult<Option<SubmissionSummary>>;
 
+    /// Gets only the current status of a submission.
+    ///
+    /// Backends may override this when reading a complete submission summary is
+    /// materially more expensive than reading its status. The default preserves
+    /// the full getter's found, missing, and error semantics.
+    async fn get_submission_status(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+    ) -> StorageResult<Option<SubmissionStatus>> {
+        Ok(self
+            .get_submission(tenant, id)
+            .await?
+            .map(|submission| submission.status))
+    }
+
     /// Lists submissions.
     ///
     /// # Arguments
@@ -1385,14 +1485,19 @@ pub trait BulkSubmitProvider: ResourceStorage {
 
     /// Marks a submission as complete.
     ///
+    /// This is a status transition only. It deliberately returns nothing:
+    /// building a [`SubmissionSummary`] means aggregating every receipt row of
+    /// the submission, which at corpus scale (millions of entries) took tens
+    /// of seconds on every `submissionStatus=completed` kick-off — the same
+    /// kick-off the Import page's *Mark completed* button sends with a 15s
+    /// budget, so the transition timed out and was lost (#998). A caller that
+    /// wants the counts calls [`get_submission`](Self::get_submission)
+    /// afterwards and pays for them knowingly.
+    ///
     /// # Arguments
     ///
     /// * `tenant` - The tenant context
     /// * `id` - The submission identifier
-    ///
-    /// # Returns
-    ///
-    /// The updated submission summary.
     ///
     /// # Errors
     ///
@@ -1402,7 +1507,7 @@ pub trait BulkSubmitProvider: ResourceStorage {
         &self,
         tenant: &TenantContext,
         id: &SubmissionId,
-    ) -> StorageResult<SubmissionSummary>;
+    ) -> StorageResult<()>;
 
     /// Aborts a submission.
     ///
@@ -1771,14 +1876,15 @@ mod tests {
 
     /// #1078: the batch observer is reached through the options, survives a
     /// clone, stays out of serialization, and is not told about empty batches.
-    #[test]
-    fn test_batch_observer_is_notified_through_options() {
+    #[tokio::test]
+    async fn test_batch_observer_is_notified_through_options() {
         use std::sync::{Arc, Mutex};
 
         #[derive(Default)]
         struct Recording(Mutex<Vec<(String, String, usize)>>);
+        #[async_trait]
         impl BatchCommitObserver for Recording {
-            fn batch_committed(&self, batch: &BatchCommitted<'_>) {
+            async fn batch_committed(&self, batch: &BatchCommitted<'_>) {
                 self.0.lock().unwrap().push((
                     batch.tenant.tenant_id().as_str().to_string(),
                     batch.manifest_id.to_string(),
@@ -1792,6 +1898,7 @@ mod tests {
             .with_batch_observer(recording.clone())
             .clone();
         assert!(format!("{options:?}").contains("BatchObserverHandle"));
+        assert!(!options.wants_committed_resources());
 
         let tenant = crate::tenant::TenantContext::new(
             crate::tenant::TenantId::new("t1"),
@@ -1799,9 +1906,15 @@ mod tests {
         );
         let sub_id = SubmissionId::new("sys", "sub");
         let results = vec![BulkEntryResult::success(1, "Patient", "p1", true)];
-        options.notify_batch_committed(&tenant, &sub_id, "m1", &results);
-        options.notify_batch_committed(&tenant, &sub_id, "m1", &[]);
-        BulkProcessingOptions::new().notify_batch_committed(&tenant, &sub_id, "m1", &results);
+        options
+            .notify_batch_committed(&tenant, &sub_id, "m1", &results, &[])
+            .await;
+        options
+            .notify_batch_committed(&tenant, &sub_id, "m1", &[], &[])
+            .await;
+        BulkProcessingOptions::new()
+            .notify_batch_committed(&tenant, &sub_id, "m1", &results, &[])
+            .await;
 
         assert_eq!(
             *recording.0.lock().unwrap(),
@@ -1809,9 +1922,88 @@ mod tests {
         );
 
         let json = serde_json::to_value(&options).unwrap();
-        assert!(json.get("batch_observer").is_none());
+        assert!(json.get("batch_observers").is_none());
         let back: BulkProcessingOptions = serde_json::from_value(json).unwrap();
-        assert!(back.batch_observer.is_none());
+        assert!(back.batch_observers.is_empty());
+    }
+
+    /// #1127: several observers can be attached; every one hears each batch in
+    /// attach order, and resources are wanted as soon as one observer asks.
+    #[tokio::test]
+    async fn test_every_attached_batch_observer_is_notified_in_order() {
+        use std::sync::{Arc, Mutex};
+
+        struct Named {
+            name: &'static str,
+            wants: bool,
+            log: Arc<Mutex<Vec<(&'static str, usize)>>>,
+        }
+        #[async_trait]
+        impl BatchCommitObserver for Named {
+            async fn batch_committed(&self, batch: &BatchCommitted<'_>) {
+                self.log
+                    .lock()
+                    .unwrap()
+                    .push((self.name, batch.resources.len()));
+            }
+            fn wants_resources(&self) -> bool {
+                self.wants
+            }
+        }
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let counts = Arc::new(Named {
+            name: "counts",
+            wants: false,
+            log: log.clone(),
+        });
+        let sink = Arc::new(Named {
+            name: "sink",
+            wants: true,
+            log: log.clone(),
+        });
+        let options = BulkProcessingOptions::new().with_batch_observer(counts.clone());
+        assert!(!options.wants_committed_resources());
+        let options = options.with_batch_observer(sink);
+        assert!(options.wants_committed_resources());
+
+        let tenant = crate::tenant::TenantContext::new(
+            crate::tenant::TenantId::new("t1"),
+            crate::tenant::TenantPermissions::full_access(),
+        );
+        let sub_id = SubmissionId::new("sys", "sub");
+        let results = vec![BulkEntryResult::success(1, "Patient", "p1", true)];
+        let stored = vec![crate::types::StoredResource::new(
+            "Patient",
+            "p1",
+            tenant.tenant_id().clone(),
+            serde_json::json!({"resourceType": "Patient", "id": "p1"}),
+            helios_fhir::FhirVersion::default(),
+        )];
+        options
+            .notify_batch_committed(&tenant, &sub_id, "m1", &results, &stored)
+            .await;
+        assert_eq!(*log.lock().unwrap(), vec![("counts", 1), ("sink", 1)]);
+    }
+
+    /// #1127: `unchanged` is a success that wrote nothing, and stays out of
+    /// the serialized receipt unless set.
+    #[test]
+    fn test_success_unchanged_result() {
+        let unchanged = BulkEntryResult::success_unchanged(3, "Patient", "p1");
+        assert!(unchanged.is_success());
+        assert!(unchanged.unchanged);
+        assert!(!unchanged.created);
+        assert_eq!(serde_json::to_value(&unchanged).unwrap()["unchanged"], true);
+
+        let written = BulkEntryResult::success(3, "Patient", "p1", false);
+        assert!(!written.unchanged);
+        assert!(
+            serde_json::to_value(&written)
+                .unwrap()
+                .get("unchanged")
+                .is_none()
+        );
     }
 
     #[test]

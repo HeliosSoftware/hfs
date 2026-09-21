@@ -48,7 +48,16 @@ pub fn make_sqlite_backend_for(fhir_version: FhirVersion) -> SqliteBackend {
 }
 
 pub mod chained_tests;
+/// Backend-agnostic scenarios, shared with the PostgreSQL, MongoDB and
+/// Elasticsearch test binaries via `#[path]` (#1293, #1295, #1296, #1297).
+/// Backend-agnostic scenarios, shared with the PostgreSQL and MongoDB test
+/// binaries via `#[path]` (#1315).
+pub mod date_minute_index_suite;
+pub mod date_precision_suite;
 pub mod date_tests;
+/// Backend-agnostic scenarios, shared with the PostgreSQL, MongoDB and
+/// Elasticsearch test binaries via `#[path]` (#1380).
+pub mod empty_value_suite;
 /// Backend-agnostic scenarios, shared with the PostgreSQL test binary via
 /// `#[path]` (issue #386).
 pub mod fts_purge_suite;
@@ -62,9 +71,18 @@ pub mod meta_params_suite;
 pub mod meta_params_suite_tests;
 pub mod meta_params_tests;
 pub mod modifier_tests;
+/// Backend-agnostic scenarios, shared with the PostgreSQL, MongoDB and
+/// Elasticsearch test binaries via `#[path]` (#1337).
+pub mod number_exponent_suite;
 pub mod number_tests;
+/// Backend-agnostic scenarios, shared with the PostgreSQL, MongoDB and
+/// Elasticsearch test binaries via `#[path]` (#1340).
+pub mod numeric_validation_suite;
 pub mod pagination_tests;
 pub mod quantity_tests;
 pub mod reference_tests;
 pub mod string_tests;
+/// Backend-agnostic scenarios, shared with the PostgreSQL, MongoDB and
+/// Elasticsearch test binaries via `#[path]` (#1379).
+pub mod token_code_system_suite;
 pub mod token_tests;

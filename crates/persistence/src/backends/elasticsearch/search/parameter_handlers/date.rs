@@ -1,7 +1,9 @@
 //! Date parameter handler for Elasticsearch.
 
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Value, json};
 
+use crate::search::{DatePredicate, DateValuePrecision, FhirDateValue, StorageResolution};
 use crate::types::SearchPrefix;
 
 /// A precision-aware comparison on one ES date field, ready to be wrapped in
@@ -17,48 +19,87 @@ pub(crate) enum DateRange {
     Outside(Value),
 }
 
-/// Builds the `range` comparison for `field` at the value's inherent
-/// precision: `eq` at day precision means `[day, day+1)`, `ne` its
-/// complement, `gt`/`sa` start strictly after the whole period, `lt`/`eb`
-/// end strictly before it, and `le` reaches the end of the period.
+/// The clause for a date value that is not a date: it matches no document.
 ///
-/// A full-precision instant (`2024-01-15T10:00:00Z`) has no period, so it
-/// falls back to scalar comparison rather than an empty half-open range.
-pub(crate) fn field_range(field: &str, value: &str, prefix: SearchPrefix) -> DateRange {
-    let (lower, upper) = date_precision_range(value);
-    let degenerate = lower == upper;
+/// The search gate (`validate_date_values`) turns such a value into an error
+/// before a query is built, so this is only reached by a caller that skipped
+/// it. It must still be a clause and never `None`: the query builder collects
+/// value clauses with `filter_map`, so a `None` would silently drop the
+/// constraint and return every resource of the type — the very widening this
+/// handler used to perform by reading garbage as the year 2000 (#1293).
+pub(crate) fn match_none() -> Value {
+    json!({ "match_none": {} })
+}
+
+/// Builds the `range` comparison for `field` from the range the value names
+/// at its own precision — a year, a month, a day, a minute, a second, or a
+/// fraction of one, as [`FhirDateValue`] defines for every backend: `eq` means
+/// `[start, end)`, `ne` its complement, `gt`/`sa` start at the end of the
+/// range, `lt`/`eb` end before its start, and `le` reaches its end.
+///
+/// Only `gte` and `lt` bounds are ever emitted, and always as complete
+/// server-generated dates. This used to send a value with a time as written,
+/// under `gte`/`lte`, and matched the whole second only because Elasticsearch
+/// happens to round an `lte` bound *up* over the fields it is missing; an
+/// explicit half-open range does not depend on that. The range is taken at
+/// millisecond resolution, which is what an Elasticsearch `date` holds.
+///
+/// `None` when the value is not a date; see [`match_none`].
+pub(crate) fn field_range(field: &str, value: &str, prefix: SearchPrefix) -> Option<DateRange> {
+    let parsed = match FhirDateValue::parse(value) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            tracing::warn!(
+                "unvalidated date search value reached the Elasticsearch handler: {error}"
+            );
+            return None;
+        }
+    };
+    let bound = |instant: DateTime<Utc>| es_bound(instant, parsed.precision);
     let range = |bounds: Value| json!({ "range": { field: bounds } });
 
-    match prefix {
-        // `ap` on a date is the precision range itself: ES has no fuzzy
-        // date matching, and the implied period is the natural tolerance.
-        SearchPrefix::Eq | SearchPrefix::Ap if degenerate => {
-            DateRange::Within(range(json!({ "gte": lower, "lte": lower })))
+    // `ap` on a date is the precision range itself: ES has no fuzzy date
+    // matching, and the implied period is the natural tolerance.
+    let predicate = parsed
+        .predicate(prefix, StorageResolution::Millis)
+        .or_else(|| parsed.predicate(SearchPrefix::Eq, StorageResolution::Millis))?;
+
+    Some(match predicate {
+        DatePredicate::Within { ge, lt } => {
+            DateRange::Within(range(json!({ "gte": bound(ge), "lt": bound(lt) })))
         }
-        SearchPrefix::Eq | SearchPrefix::Ap => {
-            DateRange::Within(range(json!({ "gte": lower, "lt": upper })))
+        DatePredicate::Outside { lt, ge } => {
+            // The complement of `[lt, ge)`, negated by the caller.
+            DateRange::Outside(range(json!({ "gte": bound(lt), "lt": bound(ge) })))
         }
-        SearchPrefix::Ne if degenerate => {
-            DateRange::Outside(range(json!({ "gte": lower, "lte": lower })))
+        DatePredicate::AtOrAfter(at) => DateRange::Within(range(json!({ "gte": bound(at) }))),
+        DatePredicate::Before(at) => DateRange::Within(range(json!({ "lt": bound(at) }))),
+    })
+}
+
+/// Formats a range bound in a form the `date` mapping accepts: a plain
+/// `yyyy-MM-dd` for the date-only precisions, whose bounds are always UTC
+/// midnights, and an RFC 3339 UTC instant with milliseconds otherwise.
+fn es_bound(instant: DateTime<Utc>, precision: DateValuePrecision) -> String {
+    match precision {
+        DateValuePrecision::Year | DateValuePrecision::Month | DateValuePrecision::Day
+            if instant.timestamp_subsec_nanos() == 0 =>
+        {
+            instant.format("%Y-%m-%d").to_string()
         }
-        SearchPrefix::Ne => DateRange::Outside(range(json!({ "gte": lower, "lt": upper }))),
-        SearchPrefix::Gt | SearchPrefix::Sa if degenerate => {
-            DateRange::Within(range(json!({ "gt": lower })))
-        }
-        SearchPrefix::Gt | SearchPrefix::Sa => DateRange::Within(range(json!({ "gte": upper }))),
-        SearchPrefix::Lt | SearchPrefix::Eb => DateRange::Within(range(json!({ "lt": lower }))),
-        SearchPrefix::Ge => DateRange::Within(range(json!({ "gte": lower }))),
-        SearchPrefix::Le if degenerate => DateRange::Within(range(json!({ "lte": lower }))),
-        SearchPrefix::Le => DateRange::Within(range(json!({ "lt": upper }))),
+        _ => instant.to_rfc3339_opts(SecondsFormat::Millis, true),
     }
 }
 
 /// Builds an ES query clause for an indexed date search parameter.
+///
+/// Always `Some`: a value that is not a date yields [`match_none`].
 pub fn build_clause(name: &str, value: &str, prefix: SearchPrefix) -> Option<Value> {
     let name_term = json!({ "term": { "search_params.date.name": name } });
     let bool_body = match field_range("search_params.date.value", value, prefix) {
-        DateRange::Within(range) => json!({ "must": [name_term, range] }),
-        DateRange::Outside(range) => json!({ "must": [name_term], "must_not": [range] }),
+        Some(DateRange::Within(range)) => json!({ "must": [name_term, range] }),
+        Some(DateRange::Outside(range)) => json!({ "must": [name_term], "must_not": [range] }),
+        None => return Some(match_none()),
     };
 
     Some(json!({
@@ -69,79 +110,43 @@ pub fn build_clause(name: &str, value: &str, prefix: SearchPrefix) -> Option<Val
     }))
 }
 
-/// Computes the precision-based range for a date value.
-///
-/// Returns (lower_bound_inclusive, upper_bound_exclusive).
-fn date_precision_range(value: &str) -> (String, String) {
-    // Count characters to determine precision
-    let clean = value.trim();
-
-    if clean.len() == 4 {
-        // Year precision: "2024" -> ["2024-01-01", "2025-01-01")
-        let year: i32 = clean.parse().unwrap_or(2000);
-        (
-            format!("{:04}-01-01", year),
-            format!("{:04}-01-01", year + 1),
-        )
-    } else if clean.len() == 7 {
-        // Month precision: "2024-01" -> ["2024-01-01", "2024-02-01")
-        let parts: Vec<&str> = clean.split('-').collect();
-        let year: i32 = parts.first().and_then(|p| p.parse().ok()).unwrap_or(2000);
-        let month: u32 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(1);
-        let (next_year, next_month) = if month >= 12 {
-            (year + 1, 1)
-        } else {
-            (year, month + 1)
-        };
-        (
-            format!("{:04}-{:02}-01", year, month),
-            format!("{:04}-{:02}-01", next_year, next_month),
-        )
-    } else if clean.len() == 10 {
-        // Day precision: "2024-01-15" -> ["2024-01-15", "2024-01-16")
-        // Simple: parse and add one day
-        let lower = clean.to_string();
-        let parts: Vec<&str> = clean.split('-').collect();
-        let year: i32 = parts.first().and_then(|p| p.parse().ok()).unwrap_or(2000);
-        let month: u32 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(1);
-        let day: u32 = parts.get(2).and_then(|p| p.parse().ok()).unwrap_or(1);
-
-        // Use chrono for correct date arithmetic
-        if let Some(date) = chrono::NaiveDate::from_ymd_opt(year, month, day) {
-            let next = date + chrono::Duration::days(1);
-            (lower, next.format("%Y-%m-%d").to_string())
-        } else {
-            (lower.clone(), lower)
-        }
-    } else {
-        // Full date-time precision: use the value directly
-        (clean.to_string(), clean.to_string())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn within(value: &str, prefix: SearchPrefix) -> Value {
+        match field_range("f", value, prefix) {
+            Some(DateRange::Within(range)) => range["range"]["f"].clone(),
+            other => panic!("{prefix}{value} must be a plain range: {other:?}"),
+        }
+    }
+
     #[test]
     fn test_year_precision() {
-        let (lower, upper) = date_precision_range("2024");
-        assert_eq!(lower, "2024-01-01");
-        assert_eq!(upper, "2025-01-01");
+        assert_eq!(
+            within("2024", SearchPrefix::Eq),
+            json!({ "gte": "2024-01-01", "lt": "2025-01-01" })
+        );
     }
 
     #[test]
     fn test_month_precision() {
-        let (lower, upper) = date_precision_range("2024-01");
-        assert_eq!(lower, "2024-01-01");
-        assert_eq!(upper, "2024-02-01");
+        assert_eq!(
+            within("2024-01", SearchPrefix::Eq),
+            json!({ "gte": "2024-01-01", "lt": "2024-02-01" })
+        );
+        assert_eq!(
+            within("2024-12", SearchPrefix::Eq),
+            json!({ "gte": "2024-12-01", "lt": "2025-01-01" })
+        );
     }
 
     #[test]
     fn test_day_precision() {
-        let (lower, upper) = date_precision_range("2024-01-15");
-        assert_eq!(lower, "2024-01-15");
-        assert_eq!(upper, "2024-01-16");
+        assert_eq!(
+            within("2024-01-15", SearchPrefix::Eq),
+            json!({ "gte": "2024-01-15", "lt": "2024-01-16" })
+        );
     }
 
     #[test]
@@ -176,35 +181,101 @@ mod tests {
 
     #[test]
     fn sa_and_eb_mirror_gt_and_lt_on_the_whole_period() {
-        let sa = field_range("f", "2024-01", SearchPrefix::Sa);
-        let DateRange::Within(sa) = sa else {
-            panic!("sa must be a plain range: {sa:?}")
-        };
-        assert_eq!(sa["range"]["f"], json!({ "gte": "2024-02-01" }));
+        assert_eq!(
+            within("2024-01", SearchPrefix::Sa),
+            json!({ "gte": "2024-02-01" })
+        );
+        assert_eq!(
+            within("2024-01", SearchPrefix::Eb),
+            json!({ "lt": "2024-01-01" })
+        );
+    }
 
-        let eb = field_range("f", "2024-01", SearchPrefix::Eb);
-        let DateRange::Within(eb) = eb else {
-            panic!("eb must be a plain range: {eb:?}")
+    /// A value with a time is the whole second, as an explicit half-open
+    /// range — not `gte X, lte X` relying on Elasticsearch rounding `lte` up.
+    #[test]
+    fn second_precision_is_an_explicit_one_second_range() {
+        let instant = "2024-01-15T10:00:00Z";
+        let (start, end) = ("2024-01-15T10:00:00.000Z", "2024-01-15T10:00:01.000Z");
+        assert_eq!(
+            within(instant, SearchPrefix::Eq),
+            json!({ "gte": start, "lt": end })
+        );
+        assert_eq!(within(instant, SearchPrefix::Gt), json!({ "gte": end }));
+        assert_eq!(within(instant, SearchPrefix::Sa), json!({ "gte": end }));
+        assert_eq!(within(instant, SearchPrefix::Ge), json!({ "gte": start }));
+        assert_eq!(within(instant, SearchPrefix::Lt), json!({ "lt": start }));
+        assert_eq!(within(instant, SearchPrefix::Eb), json!({ "lt": start }));
+        assert_eq!(within(instant, SearchPrefix::Le), json!({ "lt": end }));
+        // `ap` is the precision range itself, as before.
+        assert_eq!(
+            within(instant, SearchPrefix::Ap),
+            json!({ "gte": start, "lt": end })
+        );
+
+        let Some(DateRange::Outside(ne)) = field_range("f", instant, SearchPrefix::Ne) else {
+            panic!("ne must be a negated range")
         };
-        assert_eq!(eb["range"]["f"], json!({ "lt": "2024-01-01" }));
+        assert_eq!(ne["range"]["f"], json!({ "gte": start, "lt": end }));
     }
 
     #[test]
-    fn full_precision_instant_is_scalar_not_an_empty_range() {
-        let instant = "2024-01-15T10:00:00Z";
-        let DateRange::Within(eq) = field_range("f", instant, SearchPrefix::Eq) else {
-            panic!("eq must be a plain range")
-        };
-        assert_eq!(eq["range"]["f"], json!({ "gte": instant, "lte": instant }));
+    fn offsets_minutes_and_fractions_become_utc_millisecond_bounds() {
+        // A negative offset is folded to UTC rather than sent as written.
+        assert_eq!(
+            within("2013-04-05T23:30:00-04:00", SearchPrefix::Eq),
+            json!({ "gte": "2013-04-06T03:30:00.000Z", "lt": "2013-04-06T03:30:01.000Z" })
+        );
+        // Minute precision is valid in FHIR search.
+        assert_eq!(
+            within("2013-04-05T09:20", SearchPrefix::Eq),
+            json!({ "gte": "2013-04-05T09:20:00.000Z", "lt": "2013-04-05T09:21:00.000Z" })
+        );
+        // An ES date holds milliseconds; a finer value is its millisecond.
+        assert_eq!(
+            within("2021-11-10T16:48:57.246958-08:00", SearchPrefix::Eq),
+            json!({ "gte": "2021-11-11T00:48:57.246Z", "lt": "2021-11-11T00:48:57.247Z" })
+        );
+        // #1296: a `+` that form decoding turned into a space.
+        assert_eq!(
+            within("2013-04-05T18:50:00 05:30", SearchPrefix::Eq),
+            within("2013-04-05T18:50:00+05:30", SearchPrefix::Eq)
+        );
+    }
 
-        let DateRange::Within(gt) = field_range("f", instant, SearchPrefix::Gt) else {
-            panic!("gt must be a plain range")
-        };
-        assert_eq!(gt["range"]["f"], json!({ "gt": instant }));
-
-        let DateRange::Within(le) = field_range("f", instant, SearchPrefix::Le) else {
-            panic!("le must be a plain range")
-        };
-        assert_eq!(le["range"]["f"], json!({ "lte": instant }));
+    /// #1293: these were read as the year 2000 (`gtnot-a-date` was "after
+    /// 2000-01-01" and matched everything), or sent to Elasticsearch as
+    /// written. Under every prefix they now match nothing — `ne` included.
+    #[test]
+    fn a_value_that_is_not_a_date_matches_nothing() {
+        for value in [
+            "not-a-date",
+            "abcd",
+            "2024-1x",
+            "2024-13-45",
+            "2024-02-30",
+            "T25:00:00Z",
+            "2013-04-05T10",
+            "",
+        ] {
+            for prefix in [
+                SearchPrefix::Eq,
+                SearchPrefix::Ne,
+                SearchPrefix::Gt,
+                SearchPrefix::Lt,
+                SearchPrefix::Ge,
+                SearchPrefix::Le,
+                SearchPrefix::Sa,
+                SearchPrefix::Eb,
+                SearchPrefix::Ap,
+            ] {
+                assert!(field_range("f", value, prefix).is_none(), "{prefix}{value}");
+                assert_eq!(
+                    build_clause("date", value, prefix),
+                    Some(json!({ "match_none": {} })),
+                    "{prefix}{value}"
+                );
+            }
+        }
     }
 }

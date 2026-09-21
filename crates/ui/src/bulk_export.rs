@@ -38,7 +38,10 @@ use tokio::io::AsyncReadExt;
 
 use crate::conformance::{parameter_integer, parameter_string};
 use crate::i18n::{I18n, RequestLocale};
-use crate::{RequestTenant, RequestVersion, WebState, current_status, render, settings_user_key};
+use crate::{
+    RequestTenant, RequestVersion, WebState, current_status, render, settings_user_key,
+    upstream_failure_detail,
+};
 
 // ---------------------------------------------------------------------------
 // Model
@@ -966,6 +969,21 @@ pub async fn start(
     Redirect::to("/ui/bulk-export").into_response()
 }
 
+/// How long the kick-off self-call waits for HFS to accept the job. Creating
+/// an export job is one small insert, so this stays well under the server's
+/// own 30s SQLite `busy_timeout`: raising it past that would park this POST
+/// handler for half a minute and still not help, because a search-index
+/// rebuild can hold the single write lock for minutes (#1185). The cap is
+/// deliberately the shorter one, and a kick-off that hits it says so.
+const KICKOFF_TIMEOUT_SECS: u64 = 15;
+
+/// Why a kick-off can go unanswered long enough to hit the cap: on SQLite the
+/// insert that creates the job queues behind the single writer lock, which a
+/// post-import search-index rebuild holds for as long as it takes to rebuild
+/// the value indexes (#1185).
+const KICKOFF_TIMEOUT_HINT: &str =
+    "a search-index rebuild may be holding the database, try again shortly";
+
 /// Performs the `$export` kick-off self-call, recording the poll URL or the
 /// failure on the job.
 async fn kickoff(state: &WebState, job: &mut ExportJob, headers: &HeaderMap, tenant: &str) {
@@ -1040,7 +1058,7 @@ async fn kickoff(state: &WebState, job: &mut ExportJob, headers: &HeaderMap, ten
         builder
             .header("Accept", &media)
             .header("Prefer", "respond-async")
-            .timeout(std::time::Duration::from_secs(15)),
+            .timeout(std::time::Duration::from_secs(KICKOFF_TIMEOUT_SECS)),
         headers,
         tenant,
     );
@@ -1078,9 +1096,18 @@ async fn kickoff(state: &WebState, job: &mut ExportJob, headers: &HeaderMap, ten
             job.error = format!("kick-off answered {code}: {}", response_diagnostics(&body));
         }
         Err(e) => {
+            // The provenance stays `Unknown`: a transport failure says
+            // nothing about whether the server created the job, so the card
+            // must keep asking the server before it deletes anything. The
+            // text must therefore not begin with "kick-off answered ", the
+            // legacy marker `remote_job_identity` reads as "the server
+            // refused outright, there is no remote job".
             job.remote_job = RemoteJobProvenance::Unknown;
             job.status = "failed".to_string();
-            job.error = e.to_string();
+            job.error = format!(
+                "kick-off failed: {}",
+                upstream_failure_detail(&e, KICKOFF_TIMEOUT_SECS, KICKOFF_TIMEOUT_HINT)
+            );
         }
     }
 }
@@ -1940,5 +1967,67 @@ mod tests {
         assert_eq!(legacy_job.types_done, None);
         assert_eq!(legacy_job.types_total, None);
         assert!(legacy_job.current_type.is_empty());
+    }
+
+    /// #1185: a kick-off that goes unanswered must say it timed out and why
+    /// waiting is worth a retry. The card used to show `reqwest`'s own
+    /// `Display` — `error sending request for url (...)` — which names no
+    /// cause at all.
+    ///
+    /// The request here is capped at 50ms so the test does not sit for the
+    /// production cap; the rendered message quotes `KICKOFF_TIMEOUT_SECS`
+    /// because that is the number the user's card has to explain.
+    #[tokio::test]
+    async fn a_kickoff_timeout_is_named_and_blamed_on_the_index_rebuild() {
+        // Bound but never accepted: the kernel completes the handshake from
+        // the backlog, so the request connects and then waits for a response
+        // that never comes — a read timeout, not a connect failure.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let error = reqwest::Client::new()
+            .get(format!("http://{addr}/$export"))
+            .timeout(std::time::Duration::from_millis(50))
+            .send()
+            .await
+            .expect_err("a server that never answers must fail the kick-off");
+        assert!(error.is_timeout(), "{error}");
+
+        let detail = upstream_failure_detail(&error, KICKOFF_TIMEOUT_SECS, KICKOFF_TIMEOUT_HINT);
+        assert_eq!(
+            detail,
+            "timed out after 15s — a search-index rebuild may be holding the \
+             database, try again shortly"
+        );
+
+        // The stored text must not be mistaken for an outright refusal by the
+        // server: `remote_job_identity` reads that prefix as "no remote job
+        // exists", which would let the card delete a job the server may well
+        // have created.
+        let stored = format!("kick-off failed: {detail}");
+        assert!(!stored.starts_with("kick-off answered "), "{stored}");
+    }
+
+    /// A non-timeout transport failure keeps `reqwest`'s own text but appends
+    /// the `source()` chain, where the actual reason lives (#957, #1185).
+    #[tokio::test]
+    async fn a_refused_kickoff_surfaces_the_cause_reqwest_hides() {
+        // Port 1 on loopback has no listener, so the connect is refused.
+        let error = reqwest::Client::new()
+            .get("http://127.0.0.1:1/$export")
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .expect_err("a refused connection must fail the kick-off");
+        assert!(!error.is_timeout(), "{error}");
+
+        let raw = error.to_string();
+        let detail = upstream_failure_detail(&error, KICKOFF_TIMEOUT_SECS, KICKOFF_TIMEOUT_HINT);
+        assert!(detail.starts_with(&raw), "{detail}");
+        assert!(
+            detail.len() > raw.len(),
+            "the cause reqwest hides in source() must be appended: {detail}"
+        );
+        assert!(!detail.contains("timed out"), "{detail}");
     }
 }

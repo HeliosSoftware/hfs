@@ -47,6 +47,19 @@
       }
     }
   ],
+  "bodyStructure": [
+    {
+      "concept": {
+        "coding": [
+          {
+            "system": "http://snomed.info/sct",
+            "code": "83030008",
+            "display": "Retropharyngeal area"
+          }
+        ]
+      }
+    }
+  ],
   "outcome": [
     {
       "concept": {

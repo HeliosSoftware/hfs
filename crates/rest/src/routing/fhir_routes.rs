@@ -44,6 +44,9 @@ use crate::state::AppState;
 /// ## Type-level
 /// - `GET /{type}` - Search
 /// - `POST /{type}` - Create
+/// - `PUT /{type}?criteria` - Conditional update
+/// - `PATCH /{type}?criteria` - Conditional patch
+/// - `DELETE /{type}?criteria` - Conditional delete
 /// - `POST /{type}/_search` - Search (POST)
 /// - `GET /{type}/_history` - Type history
 ///
@@ -373,6 +376,11 @@ where
             "/{resource_type}",
             delete(handlers::conditional_delete_handler::<S>),
         )
+        // Conditional patch: PATCH [base]/[type]?[search-params]
+        .route(
+            "/{resource_type}",
+            patch(handlers::conditional_patch_handler::<S>),
+        )
         .route(
             "/{resource_type}/_search",
             post(handlers::search_post_handler::<S>),
@@ -531,7 +539,15 @@ where
 /// of functionality.
 pub fn create_minimal_routes<S>(state: AppState<S>) -> Router
 where
-    S: ResourceStorage + SearchProvider + BundleProvider + Send + Sync + 'static,
+    // `ConditionalStorage`: `/metadata` reads which conditional interactions
+    // the storage serves (#1384).
+    S: ResourceStorage
+        + ConditionalStorage
+        + SearchProvider
+        + BundleProvider
+        + Send
+        + Sync
+        + 'static,
 {
     Router::new()
         .route("/health", get(handlers::health_handler::<S>))

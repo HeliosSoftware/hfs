@@ -698,6 +698,8 @@ mod tests {
 
         assert_eq!(state.storage().backend_name(), "mock");
         assert_eq!(state.default_tenant(), "default");
+        // A backend that does not opt in offers no whole-type scan (#1228).
+        assert!(state.storage().resource_scan().is_none());
     }
 
     #[test]

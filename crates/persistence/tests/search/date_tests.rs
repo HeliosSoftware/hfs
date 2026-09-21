@@ -282,3 +282,26 @@ async fn test_date_search_year_precision() {
         assert!(birth_date.starts_with("1990"));
     }
 }
+
+/// The shared sub-day precision and validation table (#1293, #1295, #1296,
+/// #1297); PostgreSQL, MongoDB and Elasticsearch run the same one.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_date_precision_and_validation_suite() {
+    let backend = super::make_sqlite_backend();
+    super::date_precision_suite::sub_day_precision_and_validation(&backend, "date-precision").await;
+}
+
+/// The shared table for stored dateTimes with minutes but no seconds (#1315);
+/// PostgreSQL and MongoDB run the same one. SQLite never had the gap — it
+/// indexes the text as stored and `strftime` reads `hh:mm` — so this pins it.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_minute_precision_stored_dates_are_indexed() {
+    let backend = super::make_sqlite_backend();
+    super::date_minute_index_suite::minute_precision_stored_values_are_indexed(
+        &backend,
+        "date-minute-index",
+    )
+    .await;
+}

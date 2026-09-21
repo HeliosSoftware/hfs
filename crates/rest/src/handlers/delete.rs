@@ -61,15 +61,8 @@ use crate::state::AppState;
 /// succeeds but the response is lost, the retry sees a bumped version and
 /// answers `412`. That is correct RFC 9110 behavior, not a regression.
 ///
-/// # Deliberately NOT covered
-///
-/// [`conditional_delete_handler`] (`DELETE [base]/[type]?[search]`) does not
-/// honor `If-Match`. That is a scope decision, not an oversight:
-/// [`ConditionalStorage::conditional_delete`] searches and deletes inside the
-/// backend and never surfaces a version to compare against, so honoring the
-/// header there means threading a precondition through all four backends. FHIR
-/// R6 does define it (`delete-conditional-single` lists `O: If-Match`); R4 and
-/// R5 are silent. Tracked as a follow-up, not silently forgotten.
+/// [`conditional_delete_handler`] (`DELETE [base]/[type]?[search]`) honours the
+/// header the same way; see its documentation.
 ///
 /// # Example
 ///
@@ -232,18 +225,52 @@ where
 ///
 /// # Response
 ///
-/// - `204 No Content` - Resource(s) deleted
-/// - `404 Not Found` - No resources matched
-/// - `412 Precondition Failed` - Multiple resources matched
+/// - `204 No Content` - the single match was deleted, **or nothing matched**
+/// - `400 Bad Request` - criteria that cannot be evaluated (unknown parameter,
+///   empty value, …); nothing is deleted
+/// - `405 Method Not Allowed` - `AuditEvent` resources are immutable
+/// - `412 Precondition Failed` - more than one resource matched
+///   (`conditionalDelete` is advertised as `single`), or `If-Match` was
+///   supplied and is not satisfied
+///
+/// # `If-Match`
+///
+/// Honoured (#1381; FHIR R6 lists `O: If-Match` on `delete-conditional-single`,
+/// R4–R5 are silent). [`ConditionalStorage::conditional_delete`] evaluates it
+/// against the one resource the criteria resolve to, immediately before the
+/// delete. With no match a supplied precondition fails — `412`, not the `204`
+/// below — as it does on `DELETE [type]/[id]` for a resource that does not
+/// exist: no current representation satisfies `If-Match` (RFC 9110 §13.1.1).
+///
+/// The check and the delete are not one atomic step. No backend's `delete`
+/// compares-and-swaps on a version (`update` does), so a writer landing between
+/// the two is deleted along with the version the client named — the same
+/// window [`delete_handler`] has, not a wider one.
+///
+/// # No match
+///
+/// FHIR R4, R4B and R5 word it identically
+/// ([conditional delete](https://hl7.org/fhir/R4/http.html#delete)): "No
+/// matches or One Match: The server performs an ordinary delete on the matching
+/// resource", and an ordinary delete says: "Upon successful deletion, or if the
+/// resource does not exist at all, the server should return either a 200 OK if
+/// the response contains a payload, or a 204 No Content with no response
+/// payload". No payload is sent, so no match is `204`, not `404` (#1361) — the
+/// same answer a batch `DELETE [type]?criteria` entry gives. It differs from
+/// conditional *patch*, where the same text says `404`: a delete that finds
+/// nothing has reached its goal, a patch has not.
 pub async fn conditional_delete_handler<S>(
     State(state): State<AppState<S>>,
     Path(resource_type): Path<String>,
     tenant: TenantExtractor,
-    query: axum::extract::Query<std::collections::HashMap<String, String>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+    conditional: ConditionalHeaders,
 ) -> RestResult<Response>
 where
     S: ResourceStorage + ConditionalStorage + Send + Sync,
 {
+    super::conditional_support::require_delete(state.storage())?;
+
     if resource_type == "AuditEvent" {
         return Err(RestError::MethodNotAllowed {
             method: "DELETE".to_string(),
@@ -251,12 +278,12 @@ where
         });
     }
 
-    // Build search params string
-    let search_params: String = query
-        .iter()
-        .map(|(k, v)| format!("{}={}", k, v))
-        .collect::<Vec<_>>()
-        .join("&");
+    // The raw query, handed over as written: a `HashMap` of it keeps only the
+    // last occurrence of a repeated parameter — which, on a delete, widens
+    // what is deleted (#1321) — and re-joining decoded pairs corrupts a value
+    // containing `&` or `=` (#1322). The shared criteria builder splits, then
+    // decodes, once.
+    let search_params = raw_query.unwrap_or_default();
 
     debug!(
         resource_type = %resource_type,
@@ -265,10 +292,13 @@ where
         "Processing conditional delete request"
     );
 
+    let if_match = super::update::conditional_if_match(&conditional)?;
+
     let result = state
         .storage()
-        .conditional_delete(tenant.context(), &resource_type, &search_params)
-        .await?;
+        .conditional_delete(tenant.context(), &resource_type, &search_params, if_match)
+        .await
+        .map_err(|e| super::update::conditional_write_error(e, &resource_type))?;
 
     use helios_persistence::core::ConditionalDeleteResult;
     match result {
@@ -304,7 +334,9 @@ where
             Ok(response)
         }
         ConditionalDeleteResult::NoMatch => {
-            // Per FHIR spec, no match on conditional delete is success
+            // "No matches or One Match: The server performs an ordinary
+            // delete", which answers 204 "if the resource does not exist at
+            // all" — see the handler doc.
             Ok(StatusCode::NO_CONTENT.into_response())
         }
         ConditionalDeleteResult::MultipleMatches(count) => Err(RestError::MultipleMatches {

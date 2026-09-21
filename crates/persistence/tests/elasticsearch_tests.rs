@@ -659,6 +659,36 @@ mod parameter_handler_tests {
 #[path = "search/date_boundary_suite.rs"]
 mod date_boundary_suite;
 
+/// The backend-agnostic sub-day precision and date-validation suite (#1293,
+/// #1295, #1296, #1297). Same `#[path]` arrangement.
+#[path = "search/date_precision_suite.rs"]
+mod date_precision_suite;
+
+/// The backend-agnostic `_contained` suite (#1336, #1362, #1363). Same
+/// `#[path]` arrangement.
+#[path = "search/contained_suite.rs"]
+mod contained_suite;
+
+/// The backend-agnostic suite for exponent-form number and quantity search
+/// values (#1337). Same `#[path]` arrangement.
+#[path = "search/number_exponent_suite.rs"]
+mod number_exponent_suite;
+
+/// The backend-agnostic number / quantity validation suite (#1319, #1340).
+/// Same `#[path]` arrangement.
+#[path = "search/numeric_validation_suite.rs"]
+mod numeric_validation_suite;
+
+/// The backend-agnostic `system|code` on `code` elements suite (#1379). Same
+/// `#[path]` arrangement.
+#[path = "search/token_code_system_suite.rs"]
+mod token_code_system_suite;
+
+/// The backend-agnostic empty search value suite (#1380). Same `#[path]`
+/// arrangement.
+#[path = "search/empty_value_suite.rs"]
+mod empty_value_suite;
+
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
 
@@ -926,6 +956,708 @@ mod es_integration {
     async fn es_day_precision_date_boundaries() {
         let backend = create_backend().await;
         super::date_boundary_suite::day_precision_boundaries(&backend, "date-boundary-519").await;
+    }
+
+    /// #1293: a value that is not a date was read as the year 2000 and could
+    /// match every resource; here it must be an error. Also pins that a
+    /// second-precision value still covers a stored fraction now that the
+    /// range is explicit instead of resting on `lte` round-up (#1297), and
+    /// that a form-decoded `+` offset no longer reaches Elasticsearch as a
+    /// `parse_exception` (#1296).
+    #[tokio::test]
+    async fn es_sub_day_date_precision_and_validation() {
+        let backend = create_backend().await;
+        super::date_precision_suite::sub_day_precision_and_validation(
+            &backend,
+            "date-precision-1293",
+        )
+        .await;
+    }
+
+    /// #1362: every contained resource is a document of its own here, so a
+    /// repeated parameter is two clauses on one document.
+    #[tokio::test]
+    async fn es_contained_repeated_parameters_are_anded() {
+        let backend = create_backend().await;
+        super::contained_suite::repeated_parameters_are_anded(&backend, "contained-repeated-1362")
+            .await;
+    }
+
+    /// #1363: `_`-parameters, composites and modifiers are applied under
+    /// `_contained`, or refused by name — never dropped.
+    #[tokio::test]
+    async fn es_contained_criteria_are_applied_or_rejected() {
+        let backend = create_backend().await;
+        super::contained_suite::criteria_are_applied_or_rejected(
+            &backend,
+            "contained-criteria-1363",
+        )
+        .await;
+    }
+
+    /// #1383: `_contained` alone is every contained resource of the type;
+    /// `_total`, `search_count` and paging agree; compartment membership is
+    /// applied; `_has`, `_list` and chains are refused by name.
+    #[tokio::test]
+    async fn es_contained_unconstrained_and_out_of_band_constraints() {
+        let backend = create_backend().await;
+        super::contained_suite::unconstrained_and_out_of_band_constraints(
+            &backend,
+            "contained-gaps-1383",
+        )
+        .await;
+    }
+
+    /// #1337: `1e2` is one significant figure, `[50, 150)`.
+    #[tokio::test]
+    async fn es_exponent_values_use_significant_figures() {
+        let backend = create_backend().await;
+        super::number_exponent_suite::exponent_values_use_significant_figures(
+            &backend,
+            "number-exponent-1337",
+            true,
+        )
+        .await;
+    }
+
+    /// #1340: a number that did not parse made the handler return `None`,
+    /// which the query builder filters out, so `probability=abc` returned
+    /// every RiskAssessment; and `ltinf` matched every indexed row.
+    #[tokio::test]
+    async fn es_invalid_numbers_are_rejected_on_every_path() {
+        let backend = create_backend().await;
+        super::numeric_validation_suite::invalid_numbers_are_rejected_on_every_path(
+            &backend,
+            "numeric-validation-1340",
+        )
+        .await;
+    }
+
+    /// #1379: `gender=<system>|female` never matched a `code` element.
+    #[tokio::test]
+    async fn es_system_qualified_tokens_match_code_elements() {
+        let backend = create_backend().await;
+        super::token_code_system_suite::system_qualified_tokens_match_code_elements(
+            &backend,
+            "token-code-system-1379",
+            true,
+        )
+        .await;
+    }
+
+    /// #1379: the same predicate as a chain terminal.
+    #[tokio::test]
+    async fn es_system_qualified_tokens_in_chains() {
+        let backend = create_backend().await;
+        super::token_code_system_suite::system_qualified_tokens_in_chains(
+            &backend,
+            "token-code-system-chain-1379",
+        )
+        .await;
+    }
+
+    /// #1380: `family=Zzz,` is a prefix match on `""`, which is every family
+    /// name; an empty value or alternative is an error on every search path.
+    #[tokio::test]
+    async fn es_empty_values_are_rejected_on_every_path() {
+        let backend = create_backend().await;
+        super::empty_value_suite::empty_values_are_rejected_on_every_path(
+            &backend,
+            "empty-value-1380",
+        )
+        .await;
+    }
+
+    // ========================================================================
+    // Index-side date handling (#1314)
+    // ========================================================================
+
+    /// The ids a search returns.
+    async fn found_ids<S>(
+        backend: &S,
+        tenant: &TenantContext,
+        query: &helios_persistence::types::SearchQuery,
+    ) -> std::collections::BTreeSet<String>
+    where
+        S: helios_persistence::core::SearchProvider,
+    {
+        backend
+            .search(tenant, query)
+            .await
+            .unwrap_or_else(|e| panic!("search {query:?} failed: {e}"))
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect()
+    }
+
+    fn param_query(
+        resource_type: &str,
+        params: &[(&str, helios_persistence::types::SearchParamType, &str)],
+    ) -> helios_persistence::types::SearchQuery {
+        use helios_persistence::types::{SearchParameter, SearchQuery, SearchValue};
+        params.iter().fold(
+            SearchQuery::new(resource_type),
+            |query, (name, param_type, value)| {
+                query.with_parameter(SearchParameter {
+                    name: name.to_string(),
+                    param_type: *param_type,
+                    values: vec![SearchValue::parse(value)],
+                    ..Default::default()
+                })
+            },
+        )
+    }
+
+    /// A Patient whose `birthDate` is not a date, beside a valid
+    /// `deceasedDateTime` and a name.
+    fn patient_with_one_bad_date(id: &str, family: &str) -> serde_json::Value {
+        json!({
+            "resourceType": "Patient",
+            "id": id,
+            "name": [{ "family": family }],
+            "birthDate": "2024-02-30",
+            "deceasedDateTime": "2024-03-15T10:30:00Z"
+        })
+    }
+
+    /// #1314: Elasticsearch rejects a whole document for one value its `date`
+    /// mapping cannot parse, so a single bad date failed the write and left
+    /// the resource unfindable by anything. The bad value must be skipped and
+    /// everything else indexed — including the resource's other dates.
+    #[tokio::test]
+    async fn es_integration_unparseable_date_is_skipped_not_the_document() {
+        use helios_persistence::types::SearchParamType::{Date, String as Str, Token};
+
+        let backend = create_backend_with("1ms", WriteRefreshPolicy::WaitFor).await;
+        let tenant = create_tenant("bad-date-1314");
+
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                patient_with_one_bad_date("bad-birthdate", "Baddate"),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("a bad date must not fail the write");
+
+        // A Period with one bad end: the other end still indexes.
+        backend
+            .create(
+                &tenant,
+                "Encounter",
+                json!({
+                    "resourceType": "Encounter",
+                    "id": "bad-period-start",
+                    "status": "finished",
+                    "class": { "system": "http://terminology.hl7.org/CodeSystem/v3-ActCode", "code": "AMB" },
+                    "period": { "start": "not-a-date", "end": "2024-03-15" }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("a bad Period.start must not fail the write");
+
+        // The same through `update` and `create_or_update`.
+        backend
+            .create_or_update(
+                &tenant,
+                "Patient",
+                "bad-upsert",
+                patient_with_one_bad_date("bad-upsert", "Badupsert"),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("a bad date must not fail create_or_update");
+
+        let one = |id: &str| std::collections::BTreeSet::from([id.to_string()]);
+
+        // Positive control and the other parameters.
+        assert_eq!(
+            found_ids(
+                &backend,
+                &tenant,
+                &param_query("Patient", &[("family", Str, "Baddate")])
+            )
+            .await,
+            one("bad-birthdate"),
+            "found by a string parameter"
+        );
+        assert_eq!(
+            found_ids(
+                &backend,
+                &tenant,
+                &param_query("Patient", &[("family", Str, "Badupsert")])
+            )
+            .await,
+            one("bad-upsert"),
+        );
+        // The other, valid date of the same resource.
+        assert_eq!(
+            found_ids(
+                &backend,
+                &tenant,
+                &param_query(
+                    "Patient",
+                    &[
+                        ("family", Str, "Baddate"),
+                        ("death-date", Date, "2024-03-15")
+                    ]
+                )
+            )
+            .await,
+            one("bad-birthdate"),
+            "found by its valid date"
+        );
+        // The bad one indexed nothing: not the year 2000, not now, not March.
+        assert!(
+            found_ids(
+                &backend,
+                &tenant,
+                &param_query("Patient", &[("birthdate", Date, "ge0001")])
+            )
+            .await
+            .is_empty(),
+            "an unparseable birthDate must not be indexed as any date"
+        );
+        assert_eq!(
+            found_ids(
+                &backend,
+                &tenant,
+                &param_query("Encounter", &[("class", Token, "AMB")])
+            )
+            .await,
+            one("bad-period-start"),
+        );
+        assert_eq!(
+            found_ids(
+                &backend,
+                &tenant,
+                &param_query("Encounter", &[("date", Date, "2024-03-15")])
+            )
+            .await,
+            one("bad-period-start"),
+            "the valid end of the Period is indexed"
+        );
+        assert!(
+            found_ids(
+                &backend,
+                &tenant,
+                &param_query("Encounter", &[("date", Date, "lt2024-03-15")])
+            )
+            .await
+            .is_empty(),
+            "the bad start of the Period is not"
+        );
+    }
+
+    /// #1314: every valid FHIR date form indexes, at the instant the shared
+    /// parser gives it, and is found by `eq`/`ge`/`lt` at every precision.
+    /// Before, `:60` and a fraction longer than nine digits failed the write.
+    #[tokio::test]
+    async fn es_integration_every_fhir_date_form_indexes_and_is_searchable() {
+        use helios_persistence::types::SearchParamType::{Date, Token};
+
+        /// stored value → values that must match it, values that must not.
+        const FORMS: &[(&str, &[&str], &[&str])] = &[
+            (
+                "2024",
+                &[
+                    "2024",
+                    "2024-01",
+                    "2024-01-01",
+                    "ge2024",
+                    "le2024",
+                    "lt2025",
+                    "2024-01-01T00:00:00Z",
+                ],
+                &["2023", "2024-02", "lt2024", "gt2024"],
+            ),
+            (
+                "2024-03",
+                &["2024-03", "2024", "2024-03-01", "ge2024-03", "lt2024-04"],
+                &["2024-02", "2024-03-02", "lt2024-03", "gt2024-03"],
+            ),
+            (
+                "2024-03-15",
+                &[
+                    "2024-03-15",
+                    "2024-03",
+                    "ge2024-03-15",
+                    "lt2024-03-16",
+                    "2024-03-15T00:00:00Z",
+                ],
+                &["2024-03-14", "lt2024-03-15", "gt2024-03-15"],
+            ),
+            // Minute precision: not the dateTime datatype, but valid in search.
+            (
+                "2024-03-15T10:30",
+                &[
+                    "2024-03-15T10:30",
+                    "2024-03-15T10:30:00Z",
+                    "2024-03-15",
+                    "ge2024-03-15T10:30Z",
+                ],
+                &["2024-03-15T10:31", "lt2024-03-15T10:30Z"],
+            ),
+            (
+                "2024-03-15T10:30Z",
+                &["2024-03-15T10:30Z", "2024-03-15T10:30:00Z"],
+                &["2024-03-15T10:29Z"],
+            ),
+            // Zone-less is UTC.
+            (
+                "2024-03-15T10:30:45",
+                &[
+                    "2024-03-15T10:30:45Z",
+                    "2024-03-15T10:30",
+                    "ge2024-03-15T10:30:45Z",
+                    "lt2024-03-15T10:30:46Z",
+                ],
+                &[
+                    "2024-03-15T10:30:46Z",
+                    "lt2024-03-15T10:30:45Z",
+                    "gt2024-03-15T10:30:45Z",
+                ],
+            ),
+            (
+                "2024-03-15T10:30:45Z",
+                &["2024-03-15T10:30:45Z", "2024-03-15T16:00:45+05:30"],
+                &["2024-03-15T10:30:44Z"],
+            ),
+            (
+                "2024-03-15T10:30:45+05:30",
+                &[
+                    "2024-03-15T05:00:45Z",
+                    "2024-03-15T10:30:45+05:30",
+                    "2024-03-15",
+                ],
+                &["2024-03-15T10:30:45Z"],
+            ),
+            // 02:30 on the 16th, UTC.
+            (
+                "2024-03-15T22:30:45-04:00",
+                &["2024-03-16T02:30:45Z", "2024-03-16", "ge2024-03-16"],
+                &["2024-03-15", "lt2024-03-16"],
+            ),
+            (
+                "2024-03-15T10:30:45+14:00",
+                &["2024-03-14T20:30:45Z", "2024-03-14"],
+                &["2024-03-15"],
+            ),
+            (
+                "2024-03-15T10:30:45.1Z",
+                &[
+                    "2024-03-15T10:30:45.1Z",
+                    "2024-03-15T10:30:45.100Z",
+                    "2024-03-15T10:30:45Z",
+                ],
+                &["2024-03-15T10:30:45.2Z", "2024-03-15T10:30:45.0Z"],
+            ),
+            (
+                "2024-03-15T10:30:45.123Z",
+                &[
+                    "2024-03-15T10:30:45.123Z",
+                    "2024-03-15T10:30:45Z",
+                    "ge2024-03-15T10:30:45.123Z",
+                    "lt2024-03-15T10:30:45.124Z",
+                ],
+                &["2024-03-15T10:30:45.124Z", "lt2024-03-15T10:30:45.123Z"],
+            ),
+            // Finer than a millisecond: held at the millisecond, and found by
+            // the value it was written as.
+            (
+                "2024-03-15T10:30:45.123456Z",
+                &["2024-03-15T10:30:45.123456Z", "2024-03-15T10:30:45.123Z"],
+                &["2024-03-15T10:30:45.124Z"],
+            ),
+            (
+                "2024-03-15T10:30:45.123456789Z",
+                &["2024-03-15T10:30:45.123456789Z", "2024-03-15T10:30:45.123Z"],
+                &["2024-03-15T10:30:45.122Z"],
+            ),
+            (
+                "2024-03-15T10:30:45.1234567891Z",
+                &[
+                    "2024-03-15T10:30:45.1234567891Z",
+                    "2024-03-15T10:30:45.123Z",
+                ],
+                &["2024-03-15T10:30:45.124Z"],
+            ),
+            // A leap second is the first instant of the next second.
+            (
+                "2016-12-31T23:59:60Z",
+                &[
+                    "2017-01-01T00:00:00Z",
+                    "2017",
+                    "2016-12-31T23:59:60Z",
+                    "ge2017",
+                ],
+                &["2016-12-31", "2016", "lt2017"],
+            ),
+            (
+                "2024-03-15T10:30:60+05:30",
+                &["2024-03-15T05:01:00Z"],
+                &["2024-03-15T05:00:59Z"],
+            ),
+            // Not FHIR, but Elasticsearch took them as written and must go on
+            // indexing them where it did.
+            (
+                "2024-03-15T10Z",
+                &["2024-03-15T10:00:00Z"],
+                &["2024-03-15T11:00:00Z"],
+            ),
+            (
+                "2024-03-15T10:30:45+0530",
+                &["2024-03-15T05:00:45Z"],
+                &["2024-03-15T10:30:45Z"],
+            ),
+            (
+                "2024-03-15T10:30:45,123Z",
+                &["2024-03-15T10:30:45.123Z"],
+                &["2024-03-15T10:30:45.124Z"],
+            ),
+        ];
+
+        let backend = create_backend_with("1ms", WriteRefreshPolicy::WaitFor).await;
+        let tenant = create_tenant("date-forms-1314");
+
+        for (i, (stored, _, _)) in FORMS.iter().enumerate() {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": format!("form-{i}"),
+                        "status": "final",
+                        "code": { "coding": [{ "system": "http://loinc.org", "code": format!("form-{i}") }] },
+                        "effectiveDateTime": stored
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("effectiveDateTime {stored} failed the write: {e}"));
+        }
+
+        for (i, (stored, matching, not_matching)) in FORMS.iter().enumerate() {
+            let id = format!("form-{i}");
+            let search = |date: &'static str| {
+                let query =
+                    param_query("Observation", &[("code", Token, &id), ("date", Date, date)]);
+                let (backend, tenant) = (&backend, &tenant);
+                async move { found_ids(backend, tenant, &query).await }
+            };
+            // Positive control: the resource is there, with a date.
+            assert_eq!(
+                search("ge0001").await.len(),
+                1,
+                "stored {stored}: not indexed with a date"
+            );
+            for date in *matching {
+                assert_eq!(
+                    search(date).await.len(),
+                    1,
+                    "stored {stored}: date={date} must match"
+                );
+            }
+            for date in *not_matching {
+                assert!(
+                    search(date).await.is_empty(),
+                    "stored {stored}: date={date} must not match"
+                );
+            }
+        }
+    }
+
+    /// #1314: a date that is a composite component goes through the same
+    /// normalisation: a leap second indexes, and a value that is not a date
+    /// costs the instance its date component, not the resource its document.
+    #[tokio::test]
+    async fn es_integration_composite_date_component_is_normalised_or_skipped() {
+        use helios_persistence::types::{
+            CompositeSearchComponent, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend_with("1ms", WriteRefreshPolicy::WaitFor).await;
+        let tenant = create_tenant("composite-date-1314");
+
+        for (id, value) in [("leap", "2016-12-31T23:59:60Z"), ("garbage", "not-a-date")] {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": id,
+                        "status": "final",
+                        "code": { "coding": [{ "system": "http://loinc.org", "code": id }] },
+                        "valueDateTime": value
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("valueDateTime {value} failed the write: {e}"));
+        }
+
+        let composite = |value: &str| {
+            SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "code-value-date".to_string(),
+                param_type: SearchParamType::Composite,
+                values: vec![SearchValue::eq(value)],
+                components: vec![
+                    CompositeSearchComponent {
+                        param_type: SearchParamType::Token,
+                        param_name: "code".to_string(),
+                    },
+                    CompositeSearchComponent {
+                        param_type: SearchParamType::Date,
+                        param_name: "value-date".to_string(),
+                    },
+                ],
+                ..Default::default()
+            })
+        };
+        let one = |id: &str| std::collections::BTreeSet::from([id.to_string()]);
+
+        assert_eq!(
+            found_ids(&backend, &tenant, &composite("leap$2017-01-01T00:00:00Z")).await,
+            one("leap")
+        );
+        assert!(
+            found_ids(&backend, &tenant, &composite("leap$2016-12-31"))
+                .await
+                .is_empty()
+        );
+        assert_eq!(
+            found_ids(
+                &backend,
+                &tenant,
+                &param_query(
+                    "Observation",
+                    &[("code", SearchParamType::Token, "garbage")]
+                )
+            )
+            .await,
+            one("garbage"),
+            "a bad date component must not cost the resource its document"
+        );
+        assert!(
+            found_ids(&backend, &tenant, &composite("garbage$ge0001"))
+                .await
+                .is_empty()
+        );
+    }
+
+    /// #1314 in every `HFS_COMPOSITE_SYNC_MODE`. The composite never failed
+    /// the client's write — a secondary's rejection is only logged — so the
+    /// symptom there was a resource stored in the primary and missing from
+    /// every search, in all three modes.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn es_integration_composite_bad_date_stays_searchable_in_every_sync_mode() {
+        use std::collections::HashMap;
+
+        use helios_persistence::backends::sqlite::SqliteBackend;
+        use helios_persistence::composite::{
+            CompositeConfig, CompositeStorage, DynSearchProvider, DynStorage, SyncMode,
+        };
+        use helios_persistence::types::SearchParamType::{Date, String as Str};
+
+        let es = shared_es().await;
+        let modes = [
+            ("sync", SyncMode::Synchronous),
+            ("async", SyncMode::Asynchronous),
+            (
+                "hybrid",
+                SyncMode::Hybrid {
+                    sync_for_search: true,
+                },
+            ),
+        ];
+
+        for (label, mode) in modes {
+            let es_config = ElasticsearchConfig {
+                nodes: vec![format!("http://{}:{}", es.host, es.port)],
+                index_prefix: format!("hfs_{}", uuid::Uuid::new_v4().simple()),
+                number_of_replicas: 0,
+                refresh_interval: "1ms".to_string(),
+                write_refresh: WriteRefreshPolicy::WaitFor,
+                ..Default::default()
+            };
+            let es_backend = Arc::new(
+                ElasticsearchBackend::with_shared_registry(es_config, build_search_registry())
+                    .expect("create ES backend"),
+            );
+            es_backend
+                .initialize()
+                .await
+                .expect("initialize ES backend");
+
+            let sqlite = Arc::new(SqliteBackend::in_memory().expect("create SQLite backend"));
+            sqlite.init_schema().expect("init SQLite schema");
+
+            let composite_config = CompositeConfig::builder()
+                .primary("sqlite", BackendKind::Sqlite)
+                .search_backend("es", BackendKind::Elasticsearch)
+                .sync_mode(mode)
+                .build()
+                .expect("build composite config");
+
+            let mut backends: HashMap<String, DynStorage> = HashMap::new();
+            backends.insert("sqlite".to_string(), sqlite.clone() as DynStorage);
+            backends.insert("es".to_string(), es_backend.clone() as DynStorage);
+
+            let mut search_providers: HashMap<String, DynSearchProvider> = HashMap::new();
+            search_providers.insert("sqlite".to_string(), sqlite.clone() as DynSearchProvider);
+            search_providers.insert("es".to_string(), es_backend.clone() as DynSearchProvider);
+
+            let composite = CompositeStorage::new(composite_config, backends)
+                .expect("create composite storage")
+                .with_search_providers(search_providers)
+                .with_full_primary(sqlite)
+                .start_sync_workers();
+
+            let tenant = create_tenant("bad-date-composite-1314");
+            composite
+                .create(
+                    &tenant,
+                    "Patient",
+                    patient_with_one_bad_date("bad-birthdate", "Baddate"),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("[{label}] create through composite: {e}"));
+
+            // The asynchronous worker indexes behind the write; poll for it.
+            let by_name = param_query("Patient", &[("family", Str, "Baddate")]);
+            let mut found = std::collections::BTreeSet::new();
+            for _ in 0..50 {
+                found = found_ids(&composite, &tenant, &by_name).await;
+                if !found.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            assert_eq!(
+                found,
+                std::collections::BTreeSet::from(["bad-birthdate".to_string()]),
+                "[{label}] a resource with one bad date must stay searchable"
+            );
+            assert_eq!(
+                found_ids(
+                    &composite,
+                    &tenant,
+                    &param_query("Patient", &[("death-date", Date, "2024-03-15T10:30:00Z")])
+                )
+                .await
+                .len(),
+                1,
+                "[{label}] found by its valid date"
+            );
+        }
     }
 
     // ========================================================================
@@ -3451,6 +4183,187 @@ mod es_integration {
         );
     }
 
+    /// #1092: `_id` is dispatched by name into a dedicated builder
+    /// (`build_id_clause`) that bypassed the generic `:not` handling
+    /// entirely, so `_id:not=<id>` returned *only* the resource the caller
+    /// asked to exclude — the precise inverse of the request.
+    #[tokio::test]
+    async fn es_integration_search_id_not_excludes_listed_ids() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue, TotalMode,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        for id in ["a", "b", "c"] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({ "resourceType": "Patient", "id": id }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Wait for index refresh
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        let mut query = SearchQuery::new("Patient")
+            .with_parameter(SearchParameter {
+                name: "_id".to_string(),
+                param_type: SearchParamType::Token,
+                modifier: Some(SearchModifier::Not),
+                values: vec![SearchValue::eq("b")],
+                chain: vec![],
+                components: vec![],
+            })
+            .with_count(100);
+        query.total = Some(TotalMode::Accurate);
+
+        let result = backend.search(&tenant, &query).await.unwrap();
+        let mut ids: Vec<String> = result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a", "c"], "_id:not=b must exclude only b");
+        assert_eq!(result.total, Some(2));
+
+        let mut query_two = SearchQuery::new("Patient")
+            .with_parameter(SearchParameter {
+                name: "_id".to_string(),
+                param_type: SearchParamType::Token,
+                modifier: Some(SearchModifier::Not),
+                values: vec![SearchValue::eq("a"), SearchValue::eq("b")],
+                chain: vec![],
+                components: vec![],
+            })
+            .with_count(100);
+        query_two.total = Some(TotalMode::Accurate);
+
+        let result_two = backend.search(&tenant, &query_two).await.unwrap();
+        let ids_two: Vec<String> = result_two
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        assert_eq!(ids_two, vec!["c"], "_id:not=a,b must exclude both a and b");
+        assert_eq!(result_two.total, Some(1));
+    }
+
+    /// #1092: modifiers the `_id` builder cannot honour must be rejected
+    /// rather than silently degrading to a positive match (mirrors
+    /// #1055/#1091's MongoDB `metadata_param_honoured` gate).
+    #[tokio::test]
+    async fn es_integration_search_id_unsupported_modifier_is_rejected() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::error::{SearchError, StorageError};
+        use helios_persistence::types::{
+            SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({ "resourceType": "Patient", "id": "a" }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        // Wait for index refresh
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::Text),
+            values: vec![SearchValue::eq("a")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let err = backend.search(&tenant, &query).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StorageError::Search(SearchError::UnsupportedModifier { ref modifier, .. })
+                    if modifier == "text"
+            ),
+            "_id:text must be rejected as an unsupported modifier, got: {err:?}"
+        );
+    }
+
+    /// `_lastUpdated` is dispatched by name into a dedicated builder that
+    /// reads only `param.values`, so a modifier other than `:missing` would
+    /// be dropped and the value consumed as a plain positive date match. It
+    /// must be rejected up front instead, the same way unsupported `_id`
+    /// modifiers are (#1092 follow-up).
+    #[tokio::test]
+    async fn es_integration_search_last_updated_unsupported_modifier_is_rejected() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::error::{SearchError, StorageError};
+        use helios_persistence::types::{
+            SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({ "resourceType": "Patient", "id": "a" }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        // Wait for index refresh
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_lastUpdated".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: Some(SearchModifier::Not),
+            values: vec![SearchValue::eq("2020")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let err = backend.search(&tenant, &query).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StorageError::Search(SearchError::UnsupportedModifier { ref modifier, .. })
+                    if modifier == "not"
+            ),
+            "_lastUpdated:not must be rejected as an unsupported modifier, got: {err:?}"
+        );
+
+        let err = backend.search_count(&tenant, &query).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StorageError::Search(SearchError::UnsupportedModifier { ref modifier, .. })
+                    if modifier == "not"
+            ),
+            "search_count must reject _lastUpdated:not as well, got: {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn es_integration_search_date() {
         use helios_persistence::core::SearchProvider;
@@ -5315,6 +6228,242 @@ mod es_integration {
         assert!(!backend.supports(BackendCapability::Transactions));
         assert!(!backend.supports(BackendCapability::InstanceHistory));
         assert!(!backend.supports(BackendCapability::Versioning));
+    }
+
+    // ========================================================================
+    // Client-error classification (#1294)
+    // ========================================================================
+
+    /// An Observation whose code display `:text-advanced` can match.
+    async fn seed_glucose_observation(backend: &ElasticsearchBackend, tenant: &TenantContext) {
+        backend
+            .create(
+                tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "glucose",
+                    "status": "final",
+                    "code": { "coding": [{
+                        "system": "http://loinc.org",
+                        "code": "2339-0",
+                        "display": "Glucose"
+                    }]}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    }
+
+    fn text_advanced_query(value: &str) -> helios_persistence::types::SearchQuery {
+        use helios_persistence::types::{
+            SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+        SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "code".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::TextAdvanced),
+            values: vec![SearchValue::eq(value)],
+            chain: vec![],
+            components: vec![],
+        })
+    }
+
+    /// Lucene syntax Elasticsearch cannot parse. `:text-advanced` hands the
+    /// value to `query_string` verbatim, so this reaches the cluster and is
+    /// answered with HTTP 400 `search_phase_execution_exception` /
+    /// `query_shard_exception` — a bad request, not a cluster fault.
+    const UNPARSEABLE_LUCENE: &str = "Glucose AND (";
+
+    /// #1294: a query Elasticsearch rejects as malformed is the client's
+    /// fault. It must fail once, promptly, as a search-parse error (REST 400)
+    /// — not be retried with backoff and reported as an internal error.
+    #[tokio::test]
+    async fn es_integration_bad_query_is_not_retried_and_is_a_client_error() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::error::SearchError;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+        seed_glucose_observation(&backend, &tenant).await;
+
+        // Positive control: the same parameter and modifier, well-formed.
+        let found = backend
+            .search(&tenant, &text_advanced_query("Glucose"))
+            .await
+            .unwrap();
+        assert_eq!(found.resources.items.len(), 1, "positive control");
+
+        let started = std::time::Instant::now();
+        let err = backend
+            .search(&tenant, &text_advanced_query(UNPARSEABLE_LUCENE))
+            .await
+            .unwrap_err();
+        let elapsed = started.elapsed();
+
+        let StorageError::Search(SearchError::QueryParseError { message }) = &err else {
+            panic!("a malformed query must be a QueryParseError, got: {err:?}");
+        };
+        // The client-facing message is sanitized: no index names, no raw ES
+        // exception payload.
+        assert!(
+            !message.contains("hfs_") && !message.contains("root_cause"),
+            "message leaks Elasticsearch internals: {message}"
+        );
+        // Retrying sleeps 100ms + 200ms before giving up, so a retried query
+        // cannot finish under 300ms; one round trip to a local container
+        // takes a few milliseconds.
+        assert!(
+            elapsed < std::time::Duration::from_millis(250),
+            "a permanent client error must not be retried, took {elapsed:?}"
+        );
+    }
+
+    /// #1294: `search_count` shares the classification, so `_summary=count`
+    /// with the same bad query is a client error too.
+    #[tokio::test]
+    async fn es_integration_bad_query_count_is_a_client_error() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::error::SearchError;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+        seed_glucose_observation(&backend, &tenant).await;
+
+        let count = backend
+            .search_count(&tenant, &text_advanced_query("Glucose"))
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "positive control");
+
+        let err = backend
+            .search_count(&tenant, &text_advanced_query(UNPARSEABLE_LUCENE))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StorageError::Search(SearchError::QueryParseError { .. })
+            ),
+            "a malformed count query must be a QueryParseError, got: {err:?}"
+        );
+    }
+
+    /// The write paths against a real cluster (#1382; the failure paths are in
+    /// `elasticsearch_storage_write_wiremock.rs`): what Elasticsearch really
+    /// answers for an absent document or index is still `NotFound`, `update`
+    /// keeps the contained documents in step, and `delete`/`purge_all` remove
+    /// them and report real counts.
+    #[tokio::test]
+    async fn es_integration_writes_keep_contained_documents_in_step() {
+        use helios_persistence::core::{PurgableStorage, SearchProvider};
+        use helios_persistence::error::ResourceError;
+        use helios_persistence::types::{
+            ContainedMode, ContainedReturn, SearchParamType, SearchParameter, SearchQuery,
+            SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("write-path-tenant");
+        let containers_of = |org_name: &str| {
+            let mut q = SearchQuery::new("Organization");
+            q.contained = ContainedMode::On;
+            q.contained_return = ContainedReturn::Container;
+            q.parameters.push(SearchParameter {
+                name: "name".to_string(),
+                param_type: SearchParamType::String,
+                modifier: None,
+                values: vec![SearchValue::eq(org_name)],
+                chain: vec![],
+                components: vec![],
+            });
+            q
+        };
+        let search_urls = |q: SearchQuery| {
+            let backend = &backend;
+            let tenant = &tenant;
+            async move {
+                backend
+                    .refresh_index("write-path-tenant", "Organization")
+                    .await
+                    .ok();
+                let found = backend.search(tenant, &q).await.unwrap();
+                let mut urls: Vec<String> = found.resources.items.iter().map(|r| r.url()).collect();
+                urls.sort();
+                urls
+            }
+        };
+        let is_not_found = |r: Result<(), StorageError>| {
+            matches!(
+                r,
+                Err(StorageError::Resource(ResourceError::NotFound { .. }))
+            )
+        };
+        let patient = |id: &str, org: &str| {
+            json!({
+                "resourceType": "Patient", "id": id,
+                "contained": [{ "resourceType": "Organization", "id": "org", "name": org }],
+                "managingOrganization": { "reference": "#org" }
+            })
+        };
+
+        // No index yet: Elasticsearch's `index_not_found_exception`.
+        assert!(is_not_found(backend.delete(&tenant, "Patient", "p1").await));
+
+        let created = backend
+            .create(
+                &tenant,
+                "Patient",
+                patient("p1", "Acme"),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                patient("p2", "Acme"),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            search_urls(containers_of("Acme")).await,
+            vec!["Patient/p1", "Patient/p2"],
+            "positive control: contained documents are indexed and found"
+        );
+
+        // The index exists now: Elasticsearch's `"result": "not_found"`.
+        assert!(is_not_found(
+            backend.delete(&tenant, "Patient", "absent").await
+        ));
+        backend
+            .purge(&tenant, "Patient", "absent")
+            .await
+            .expect("purging an absent document is idempotent");
+
+        // `update` replaces the contained documents (it used to leave them).
+        backend
+            .update(&tenant, &created, patient("p1", "Globex"))
+            .await
+            .unwrap();
+        assert_eq!(search_urls(containers_of("Acme")).await, vec!["Patient/p2"]);
+        assert_eq!(
+            search_urls(containers_of("Globex")).await,
+            vec!["Patient/p1"]
+        );
+
+        // `delete` sweeps them.
+        backend.delete(&tenant, "Patient", "p1").await.unwrap();
+        assert!(search_urls(containers_of("Globex")).await.is_empty());
+
+        // `purge_all` reports what it removed and sweeps the rest.
+        assert_eq!(backend.purge_all(&tenant, "Patient").await.unwrap(), 1);
+        assert!(search_urls(containers_of("Acme")).await.is_empty());
+        assert_eq!(backend.purge_all(&tenant, "Patient").await.unwrap(), 0);
     }
 }
 

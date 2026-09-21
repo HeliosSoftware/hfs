@@ -248,6 +248,43 @@ async fn the_list_page_renders_and_offers_creation() {
     // from the manifest URL.
     assert!(!html.contains(r#"name="submission_id""#));
     assert!(!html.contains(r#"name="fhir_base_url""#));
+    assert_auth_fieldset(&html);
+}
+
+/// The shared Authentication fieldset (#761, #1108): the legend sits
+/// directly above the radios — no legend-level hint — each radio is a
+/// `field--choice` whose hint indents under its label text, and the
+/// credential fields, JWKS pointer, and Test authentication button follow
+/// in order.
+fn assert_auth_fieldset(html: &str) {
+    assert!(!html.contains("How to authenticate to the recipient server."));
+    let legend = html.find("<legend").expect("auth legend");
+    let none = html[legend..]
+        .find(r#"<label class="field field--choice">"#)
+        .map(|i| legend + i)
+        .expect("None radio");
+    assert!(
+        !html[legend..none].contains("field__hint"),
+        "no hint between the legend and the first radio"
+    );
+    let order = [
+        r#"value="none""#,
+        r#"<span class="field__choice-label">None</span>"#,
+        "No authorization header will be sent.",
+        r#"value="backend-services""#,
+        r#"name="client_id""#,
+        r#"name="token_url""#,
+        "/.well-known/bulk-submit-jwks.json",
+        r#"formaction="/ui/bulk-import/test-auth""#,
+    ];
+    let mut cursor = legend;
+    for needle in order {
+        let at = html[cursor..]
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} after offset {cursor}"));
+        cursor += at;
+    }
+    assert_eq!(html.matches(r#"class="field field--choice""#).count(), 2);
 }
 
 #[tokio::test]
@@ -345,6 +382,7 @@ async fn the_detail_page_uses_the_shared_full_width_components() {
     assert!(html.contains(r#"<span>Created</span><code>"#));
     assert!(html.contains(r#"<span>Status</span><div id="submission-status">"#));
     assert!(html.contains(r#"<span>Authentication</span><div>"#));
+    assert_auth_fieldset(&html);
 
     let assert_back_link =
         |localized_html: &str, label: &str| {
@@ -2179,6 +2217,193 @@ async fn a_completion_manifest_with_errors_fails_the_submission() {
     assert!(detail.contains("marked failed"), "{detail}");
 }
 
+/// #1127: HFS's own status handler serialises `countSeverity` as the STU4
+/// array of `{"code":…,"count":…}` objects, not as a severity-keyed object.
+/// The UI used to read only the object shape, so every manifest produced by
+/// a real HFS recipient scored zero errors and a failed ingest was shown as
+/// Completed with "Error files 0".
+#[tokio::test]
+async fn a_server_shaped_count_severity_array_fails_the_submission() {
+    let recipient = mock_recipient_finishing_with(Some(serde_json::json!({
+        "output": [{"type": "Patient", "url": "http://x/1.ndjson"}],
+        "outcome": [{
+            "type": "OperationOutcome",
+            "url": "http://x/e.ndjson",
+            "countSeverity": [{"code": "error", "count": 1}]
+        }]
+    })))
+    .await;
+    let (ctx, detail_path, detail) = run_one_manifest_to_poll(&recipient).await;
+    assert!(
+        detail.contains(r#"<div id="submission-status">Failed</div>"#),
+        "{detail}"
+    );
+    assert!(
+        detail.contains(
+            "Status: got 200 OK — processing finished with 1 error file(s) \
+             (1 outputs); submission marked failed."
+        ),
+        "{detail}"
+    );
+    // The result card counts the one output and the one error file.
+    let (_, fragment) = get(&ctx, &format!("{detail_path}/status")).await;
+    assert!(fragment.contains("<div>1</div>"), "{fragment}");
+    assert!(!fragment.contains("<div>0</div>"), "{fragment}");
+}
+
+/// The array shape's counterpart to the clean-completion case: an `outcome`
+/// entry reporting only warnings carries no error or fatal count, so the
+/// submission still completes.
+#[tokio::test]
+async fn a_warning_only_count_severity_array_completes_the_submission() {
+    let recipient = mock_recipient_finishing_with(Some(serde_json::json!({
+        "output": [{"type": "Patient", "url": "http://x/1.ndjson"}],
+        "outcome": [{
+            "type": "OperationOutcome",
+            "url": "http://x/oo.ndjson",
+            "countSeverity": [{"code": "warning", "count": 2}]
+        }],
+        "error": []
+    })))
+    .await;
+    let (_ctx, _path, detail) = run_one_manifest_to_poll(&recipient).await;
+    assert!(
+        detail.contains(r#"<div id="submission-status">Completed</div>"#),
+        "{detail}"
+    );
+    assert!(detail.contains("submission completed"), "{detail}");
+    assert!(!detail.contains("marked failed"), "{detail}");
+}
+/// A recipient that hands out a fresh poll URL per `$bulk-submit-status`
+/// kick-off, so one test can drive several submissions to different terminal
+/// manifests: the nth submission created polls `manifests[n]`.
+async fn mock_recipient_finishing_with_each(manifests: Vec<serde_json::Value>) -> String {
+    use axum::extract::{Path as AxPath, State as AxState};
+    #[derive(Clone)]
+    struct S {
+        base: Arc<std::sync::Mutex<String>>,
+        manifests: Arc<Vec<serde_json::Value>>,
+        handed: Arc<std::sync::Mutex<usize>>,
+    }
+    let state = S {
+        base: Arc::new(std::sync::Mutex::new(String::new())),
+        manifests: Arc::new(manifests),
+        handed: Arc::new(std::sync::Mutex::new(0)),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    *state.base.lock().unwrap() = format!("http://{addr}");
+    let app = Router::new()
+        .route(
+            "/$bulk-submit",
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({"resourceType": "OperationOutcome"}))
+            }),
+        )
+        .route(
+            "/$bulk-submit-status",
+            axum::routing::post(|AxState(s): AxState<S>| async move {
+                let base = s.base.lock().unwrap().clone();
+                let n = {
+                    let mut handed = s.handed.lock().unwrap();
+                    let n = *handed;
+                    *handed += 1;
+                    n
+                };
+                (
+                    StatusCode::ACCEPTED,
+                    [("content-location", format!("{base}/poll/{n}"))],
+                    "",
+                )
+            }),
+        )
+        .route(
+            "/poll/{n}",
+            axum::routing::get(
+                |AxPath(n): AxPath<usize>, AxState(s): AxState<S>| async move {
+                    match s.manifests.get(n) {
+                        Some(manifest) => axum::Json(manifest.clone()).into_response(),
+                        None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                    }
+                },
+            ),
+        )
+        .with_state(state);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+/// The `/ui/bulk-import` row linking to `detail_path`, so a test can assert
+/// on one submission's Status cell instead of on the whole page.
+fn list_row<'a>(page: &'a str, detail_path: &str) -> &'a str {
+    let anchor = format!("href=\"{detail_path}\"");
+    let start = page
+        .find(&anchor)
+        .unwrap_or_else(|| panic!("no list row for {detail_path}: {page}"));
+    let end = start
+        + page[start..]
+            .find("</tr>")
+            .unwrap_or_else(|| panic!("unterminated list row for {detail_path}: {page}"));
+    &page[start..end]
+}
+
+/// #1127 (browser QA): the failure has to reach the LIST page's Status
+/// column, where a failed submission still read "Completed". The detail
+/// page's own assertions live above; this one drives two submissions — the
+/// first failing on a server-shaped `countSeverity` array, the second
+/// completing cleanly — and reads both rows off `/ui/bulk-import`, so a
+/// blanket "everything is Failed" regression fails it too.
+#[tokio::test]
+async fn the_list_page_status_column_shows_failed_and_completed() {
+    let recipient = mock_recipient_finishing_with_each(vec![
+        serde_json::json!({
+            "output": [{"type": "Patient", "url": "http://x/1.ndjson"}],
+            "outcome": [{
+                "type": "OperationOutcome",
+                "url": "http://x/e.ndjson",
+                "countSeverity": [{"code": "error", "count": 1}]
+            }]
+        }),
+        serde_json::json!({
+            "output": [{"type": "Patient", "url": "http://x/2.ndjson"}],
+            "outcome": [{
+                "type": "OperationOutcome",
+                "url": "http://x/oo.ndjson",
+                "countSeverity": [{"code": "warning", "count": 2}]
+            }],
+            "error": []
+        }),
+    ])
+    .await;
+    let ctx = ctx(&recipient);
+    // Created in the order the recipient hands out poll URLs: the first
+    // submission draws the error manifest, the second the clean one.
+    let (_, failing_path, _) = post_form(
+        &ctx,
+        "/ui/bulk-import",
+        "name=ListFailing&manifest_url=http%3A%2F%2Fone.example%2Ff.json&auth=none",
+    )
+    .await;
+    let (_, clean_path, _) = post_form(
+        &ctx,
+        "/ui/bulk-import",
+        "name=ListClean&manifest_url=http%3A%2F%2Fone.example%2Fc.json&auth=none",
+    )
+    .await;
+    let _ = get(&ctx, &format!("{failing_path}/status")).await;
+    let _ = get(&ctx, &format!("{clean_path}/status")).await;
+
+    let (status, page) = get(&ctx, "/ui/bulk-import").await;
+    assert_eq!(status, StatusCode::OK);
+    let failing_row = list_row(&page, &failing_path);
+    assert!(failing_row.contains("ListFailing"), "{failing_row}");
+    assert!(failing_row.contains("<td>Failed</td>"), "{failing_row}");
+    assert!(!failing_row.contains("<td>Completed</td>"), "{failing_row}");
+    let clean_row = list_row(&page, &clean_path);
+    assert!(clean_row.contains("ListClean"), "{clean_row}");
+    assert!(clean_row.contains("<td>Completed</td>"), "{clean_row}");
+}
+
 /// The export-manifest vocabulary (`error[]`) still counts for recipients
 /// that answer with it.
 #[tokio::test]
@@ -2279,15 +2504,15 @@ async fn mock_recipient_reporting(reports: &'static [&'static str]) -> String {
 async fn pre_ingest_phases_show_their_text_on_an_indeterminate_bar() {
     const PHASES: [&str; 4] = [
         "Queued - starting shortly",
-        "reading manifest",
-        "sizing 37 of 412 files",
-        "downloading file 1 of 412",
+        "Reading manifest",
+        "Sizing 37 of 412 files",
+        "Downloading file 1 of 412",
     ];
     let recipient = mock_recipient_reporting(&[
         "Queued - starting shortly",
-        "reading manifest",
-        "sizing 37 of 412 files",
-        "downloading file 1 of 412",
+        "Reading manifest",
+        "Sizing 37 of 412 files",
+        "Downloading file 1 of 412",
         "processing 35% complete",
     ])
     .await;
@@ -2335,7 +2560,7 @@ async fn pre_ingest_phases_show_their_text_on_an_indeterminate_bar() {
 /// those bytes `obs-text` and leaves their meaning undefined, but nothing
 /// forbids sending them, and HFS itself shipped an em dash there for a while.
 /// Reading the header with `HeaderValue::to_str` rejected the *whole* value on
-/// the first such byte, so the card showed a hardcoded "in progress" instead of
+/// the first such byte, so the card showed a hardcoded "In progress" instead of
 /// the recipient's real report: the uninformative status #953 exists to remove,
 /// reintroduced by an encoding detail. Decoding lossily keeps the report.
 #[tokio::test]
@@ -2351,9 +2576,297 @@ async fn a_non_ascii_progress_report_still_reaches_the_operator() {
         "the report must survive its non-ASCII byte: {html}"
     );
     assert!(
-        !html.contains("in progress"),
+        !html.contains("In progress"),
         "the placeholder must not stand in for a report we received: {html}"
     );
     // And the percentage still parses, so the bar stays determinate.
     assert!(html.contains(r#"aria-valuenow="35""#), "{html}");
+}
+
+// ---------------------------------------------------------------------------
+// #998 — a status change must land, be queued, or be refused; never dropped.
+// ---------------------------------------------------------------------------
+
+/// A provider store that answers the first versioned put with the optimistic
+/// lock failure a status poll landing in between causes, then behaves — the
+/// shape of a *Mark completed* pressed during a live ingest (#998).
+struct ConflictNextPutStore {
+    inner: Arc<dyn BulkProviderStore>,
+    conflict: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl BulkProviderStore for ConflictNextPutStore {
+    async fn list_provider_submissions(
+        &self,
+        tenant: &helios_persistence::tenant::TenantContext,
+    ) -> StorageResult<Vec<helios_persistence::core::StoredProviderSubmission>> {
+        self.inner.list_provider_submissions(tenant).await
+    }
+
+    async fn get_provider_submission(
+        &self,
+        tenant: &helios_persistence::tenant::TenantContext,
+        id: &str,
+    ) -> StorageResult<Option<helios_persistence::core::StoredProviderSubmission>> {
+        self.inner.get_provider_submission(tenant, id).await
+    }
+
+    async fn put_provider_submission(
+        &self,
+        tenant: &helios_persistence::tenant::TenantContext,
+        id: &str,
+        document: serde_json::Value,
+        if_match_version: Option<i64>,
+    ) -> StorageResult<helios_persistence::core::StoredProviderSubmission> {
+        if self
+            .conflict
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(helios_persistence::error::StorageError::Concurrency(
+                helios_persistence::error::ConcurrencyError::OptimisticLockFailure {
+                    resource_type: "BulkProviderSubmission".to_string(),
+                    id: id.to_string(),
+                    expected_etag: format!("W/\"{}\"", if_match_version.unwrap_or(0)),
+                    actual_etag: Some(format!("W/\"{}\"", if_match_version.unwrap_or(0) + 1)),
+                },
+            ));
+        }
+        self.inner
+            .put_provider_submission(tenant, id, document, if_match_version)
+            .await
+    }
+
+    async fn delete_provider_submission(
+        &self,
+        tenant: &helios_persistence::tenant::TenantContext,
+        id: &str,
+    ) -> StorageResult<bool> {
+        self.inner.delete_provider_submission(tenant, id).await
+    }
+}
+
+fn default_tenant() -> helios_persistence::tenant::TenantContext {
+    helios_persistence::tenant::TenantContext::new(
+        helios_persistence::tenant::TenantId::new("default"),
+        helios_persistence::tenant::TenantPermissions::full_access(),
+    )
+}
+
+/// The stored submission document behind a detail path.
+async fn read_document(ctx: &Ctx, detail_path: &str) -> serde_json::Value {
+    let id = detail_path.rsplit('/').next().expect("submission id");
+    ctx.bulk_provider
+        .get_provider_submission(&default_tenant(), id)
+        .await
+        .expect("read submission")
+        .expect("submission exists")
+        .document
+}
+
+/// Rewrites the stored submission document in place, the way
+/// [`set_submission_status`] does for one field.
+async fn rewrite_document(
+    ctx: &Ctx,
+    detail_path: &str,
+    rewrite: impl FnOnce(&mut serde_json::Value),
+) {
+    let id = detail_path.rsplit('/').next().expect("submission id");
+    let stored = ctx
+        .bulk_provider
+        .get_provider_submission(&default_tenant(), id)
+        .await
+        .expect("read submission")
+        .expect("submission exists");
+    let mut document = stored.document;
+    rewrite(&mut document);
+    ctx.bulk_provider
+        .put_provider_submission(&default_tenant(), id, document, Some(stored.version))
+        .await
+        .expect("rewrite submission state");
+}
+
+/// #998 (3): the status fragment rewrites the submission every 5s, so the
+/// operator's own write lost the compare-and-swap more often than not during
+/// a live ingest — `optimistic lock failure ... BulkProviderSubmission/...`
+/// and the press gone. The write is now re-derived on a fresh copy; the
+/// kick-off itself is not repeated.
+#[tokio::test]
+async fn a_status_change_that_loses_the_write_race_is_re_applied() {
+    let (recipient_url, received) = mock_recipient(StatusCode::OK).await;
+    let (settings, backing) = backing_stores();
+    let setup = Ctx {
+        settings: Arc::clone(&settings),
+        bulk_provider: Arc::clone(&backing),
+        recipient: recipient_url.clone(),
+    };
+    let detail_path = create_submission(&setup).await;
+    set_submission_status(&setup, &detail_path, "in-progress").await;
+    let ctx = Ctx {
+        settings,
+        bulk_provider: Arc::new(ConflictNextPutStore {
+            inner: backing,
+            conflict: std::sync::atomic::AtomicBool::new(true),
+        }),
+        recipient: recipient_url,
+    };
+
+    let before = received.lock().unwrap().len();
+    let (status, location, _) = post_form(&ctx, &format!("{detail_path}/complete"), "").await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location, detail_path);
+    assert_eq!(
+        received.lock().unwrap().len(),
+        before + 1,
+        "the kick-off goes out once; only the write is retried"
+    );
+
+    let (_, html) = get(&ctx, &detail_path).await;
+    assert!(
+        html.contains(r#"<div id="submission-status">Completed</div>"#),
+        "{html}"
+    );
+    assert!(html.contains("Recipient acknowledged (200)"), "{html}");
+    assert!(!html.contains(BANNER), "{html}");
+    let stored = read_document(&ctx, &detail_path).await;
+    assert_eq!(stored["status"], "completed");
+}
+
+/// #998 (2): a kick-off the recipient never answers — a timeout, a refused
+/// connection — used to leave the status untouched and the press as one log
+/// line. The change is now queued on the submission, shown as such, and
+/// re-sent by the status card once its hold has passed; the re-send is what
+/// lands it.
+#[tokio::test]
+async fn an_unanswered_status_change_is_queued_and_re_sent_from_the_status_card() {
+    let ctx = ctx("http://localhost:9/");
+    let detail_path = create_submission(&ctx).await;
+    set_submission_status(&ctx, &detail_path, "in-progress").await;
+    post_form(&ctx, &format!("{detail_path}/complete"), "").await;
+
+    let (_, html) = get(&ctx, &detail_path).await;
+    assert!(html.contains("In Progress"), "{html}");
+    assert!(html.contains(BANNER), "{html}");
+    assert!(html.contains("re-sent automatically"), "{html}");
+    assert!(
+        html.contains("attempt 1 of"),
+        "the log counts the attempt: {html}"
+    );
+    let stored = read_document(&ctx, &detail_path).await;
+    assert_eq!(stored["pendingStatus"], "completed", "{stored}");
+    assert_eq!(stored["pendingStatusAttempts"], 1, "{stored}");
+    assert!(
+        stored["pendingStatusRetryAt"]
+            .as_str()
+            .is_some_and(|t| !t.is_empty()),
+        "{stored}"
+    );
+
+    // The hold has not passed: the status card leaves the queue alone (and
+    // does not spend another kick-off budget on a recipient that just went
+    // quiet).
+    let (status, fragment) = get(&ctx, &format!("{detail_path}/status")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(fragment.contains(BANNER), "{fragment}");
+    let stored = read_document(&ctx, &detail_path).await;
+    assert_eq!(
+        stored["pendingStatusAttempts"], 1,
+        "no early re-send: {stored}"
+    );
+
+    // The recipient comes back and the hold passes.
+    let (recipient_url, received) = mock_recipient(StatusCode::OK).await;
+    rewrite_document(&ctx, &detail_path, |doc| {
+        doc["recipientBaseUrl"] = serde_json::json!(recipient_url);
+        doc["pendingStatusRetryAt"] = serde_json::json!("2000-01-01T00:00:00.000Z");
+    })
+    .await;
+    let (status, fragment) = get(&ctx, &format!("{detail_path}/status")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        fragment.contains(r#"<div id="submission-status" hx-swap-oob="true">Completed</div>"#),
+        "{fragment}"
+    );
+    assert!(
+        fragment.contains(r#"<div id="submission-error" hx-swap-oob="true"></div>"#),
+        "the banner clears once the change lands: {fragment}"
+    );
+    assert!(
+        fragment.contains("Re-sending: marking submission completed"),
+        "{fragment}"
+    );
+    assert!(
+        fragment.contains("Recipient acknowledged (200)"),
+        "{fragment}"
+    );
+    let sent = received.lock().unwrap().clone();
+    assert_eq!(sent.len(), 1, "exactly one re-send: {sent:?}");
+    let code = sent[0]["parameter"]
+        .as_array()
+        .and_then(|params| {
+            params
+                .iter()
+                .find(|p| p["name"] == "submissionStatus")
+                .map(|p| p["valueCoding"]["code"].clone())
+        })
+        .unwrap_or_default();
+    assert_eq!(code, "completed");
+    let stored = read_document(&ctx, &detail_path).await;
+    assert_eq!(stored["status"], "completed", "{stored}");
+    assert!(stored.get("pendingStatus").is_none(), "{stored}");
+    assert!(stored.get("statusError").is_none(), "{stored}");
+}
+
+/// A refusal is an answer: the recipient said no, and only another press can
+/// change that. Nothing is queued and the banner is the "try again" one.
+#[tokio::test]
+async fn a_refused_status_change_is_not_queued() {
+    let (recipient_url, _) = mock_recipient(StatusCode::INTERNAL_SERVER_ERROR).await;
+    let ctx = ctx(&recipient_url);
+    let detail_path = create_submission(&ctx).await;
+    set_submission_status(&ctx, &detail_path, "in-progress").await;
+    post_form(&ctx, &format!("{detail_path}/abort"), "").await;
+
+    let stored = read_document(&ctx, &detail_path).await;
+    assert!(stored.get("pendingStatus").is_none(), "{stored}");
+    assert_eq!(stored["status"], "in-progress");
+    let (_, html) = get(&ctx, &detail_path).await;
+    assert!(html.contains(BANNER), "{html}");
+    assert!(html.contains("try again"), "{html}");
+    assert!(!html.contains("re-sent automatically"), "{html}");
+}
+
+/// A queued change is moot once the submission is closed out by other means
+/// — a poll that answered a clean `200`, say — and no kick-off can be sent
+/// for it any more: the status card drops the queue and clears the banner.
+#[tokio::test]
+async fn a_queued_status_change_is_dropped_once_the_submission_is_closed_out() {
+    let ctx = ctx("http://localhost:9/");
+    let detail_path = create_submission(&ctx).await;
+    set_submission_status(&ctx, &detail_path, "in-progress").await;
+    post_form(&ctx, &format!("{detail_path}/abort"), "").await;
+    assert_eq!(
+        read_document(&ctx, &detail_path).await["pendingStatus"],
+        "stopped"
+    );
+
+    rewrite_document(&ctx, &detail_path, |doc| {
+        doc["status"] = serde_json::json!("completed");
+        doc["pendingStatusRetryAt"] = serde_json::json!("2000-01-01T00:00:00.000Z");
+    })
+    .await;
+    let (_, fragment) = get(&ctx, &format!("{detail_path}/status")).await;
+    assert!(
+        fragment.contains(
+            "Queued status change (stopped) dropped: the submission is already completed."
+        ),
+        "{fragment}"
+    );
+    assert!(
+        fragment.contains(r#"<div id="submission-error" hx-swap-oob="true"></div>"#),
+        "{fragment}"
+    );
+    let stored = read_document(&ctx, &detail_path).await;
+    assert!(stored.get("pendingStatus").is_none(), "{stored}");
+    assert_eq!(stored["status"], "completed");
 }

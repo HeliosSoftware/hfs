@@ -114,6 +114,7 @@ where
 
     // Check for conditional create
     if let Some(search_params) = conditional.if_none_exist() {
+        super::conditional_support::require_create(state.storage())?;
         debug!(search_params = %search_params, "Processing conditional create");
 
         let result = state

@@ -28,6 +28,9 @@ on:
         default: "main"
 
 env:
+  # Rustup ranks this above a directory override left on a self-hosted runner
+  # (see ci.yml).
+  RUSTUP_TOOLCHAIN: stable
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: 1
   CARGO_PROFILE_DEV_DEBUG: 0
@@ -177,7 +180,7 @@ jobs:
           exit 1
 
   inferno-bulk-data-test:
-    name: Inferno Bulk Data v2.0.0 Tests
+    name: Inferno Bulk Data v4.0.0-ballot Tests
     needs: [build, inferno-stack-up]
     runs-on: [self-hosted, Linux]
     timeout-minutes: 90

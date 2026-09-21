@@ -293,6 +293,12 @@ pub struct BulkExportConfig {
     pub disable_local_worker: bool,
     /// Cap on simultaneous in-flight jobs per tenant.
     pub max_concurrent_per_tenant: u32,
+    /// Cap on how many times one job may be claimed by a worker.
+    ///
+    /// A job whose lease expires mid-run is reclaimable; once its claims would
+    /// exceed this cap the claim path retires it with an error instead of
+    /// handing it to yet another worker (#1041).
+    pub max_attempts: u32,
     /// Resources per `fetch_export_batch` call.
     pub batch_size: u32,
     /// Initial lease length issued at claim, in seconds.
@@ -323,6 +329,7 @@ impl Default for BulkExportConfig {
             worker_concurrency: 2,
             disable_local_worker: false,
             max_concurrent_per_tenant: 4,
+            max_attempts: 3,
             batch_size: 1000,
             lease_duration_secs: 60,
             heartbeat_interval_secs: 20,
@@ -375,6 +382,7 @@ impl BulkExportConfig {
                 "HFS_BULK_EXPORT_MAX_CONCURRENT_PER_TENANT",
                 d.max_concurrent_per_tenant,
             ),
+            max_attempts: env_u32("HFS_BULK_EXPORT_MAX_ATTEMPTS", d.max_attempts),
             batch_size: env_u32("HFS_BULK_EXPORT_BATCH_SIZE", d.batch_size),
             lease_duration_secs: env_u64("HFS_BULK_EXPORT_LEASE_DURATION", d.lease_duration_secs),
             heartbeat_interval_secs: env_u64(
@@ -429,6 +437,9 @@ impl BulkExportConfig {
         }
         if self.max_concurrent_per_tenant == 0 {
             errors.push("HFS_BULK_EXPORT_MAX_CONCURRENT_PER_TENANT must be >= 1".to_string());
+        }
+        if self.max_attempts == 0 {
+            errors.push("HFS_BULK_EXPORT_MAX_ATTEMPTS must be >= 1".to_string());
         }
         if self.batch_size == 0 {
             errors.push("HFS_BULK_EXPORT_BATCH_SIZE must be >= 1".to_string());
@@ -653,6 +664,15 @@ pub struct BulkSubmitConfig {
     ///
     /// Set `HFS_BULK_SUBMIT_DEFER_INDEXING=false` to give up the speed and
     /// close that window.
+    ///
+    /// This is the single switch for *when* indexing happens; HFS picks the
+    /// *mechanism* from the deployment (#1242). When the primary owns search,
+    /// `false` writes the index in the batch's own transaction. When search is
+    /// offloaded to an Elasticsearch secondary, `false` selects the
+    /// `IngestIndexSink` that indexes batch by batch (#1127), and the four
+    /// `HFS_BULK_SUBMIT_INDEX_*` knobs apply. The former
+    /// `HFS_BULK_SUBMIT_INDEX_DURING_INGEST` flag, which named that mechanism
+    /// explicitly and produced a dead flag combination, is gone.
     pub defer_indexing: bool,
     /// Bulk index rebuild for the deferred reindex (SQLite): drop the
     /// `search_index` value indexes for the duration of each rebuild and
@@ -670,8 +690,37 @@ pub struct BulkSubmitConfig {
     pub disable_local_worker: bool,
     /// Cap on simultaneous in-flight submissions per tenant.
     pub max_concurrent_per_tenant: u32,
-    /// Resources per ingestion batch.
+    /// Resources per ingestion batch — one database transaction per batch.
+    /// Defaults to `100`, the size the engine has always used; a larger batch
+    /// measured slower with index-during-ingest on (382 s at 1000 against
+    /// 252 s at 100, #1127). Set with `HFS_BULK_SUBMIT_BATCH_SIZE`.
     pub batch_size: u32,
+    /// How long the input-file fetcher waits for the next bytes of a
+    /// response before treating the body as broken and resuming it with a
+    /// `Range` request, in seconds (#1127). Set with
+    /// `HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT`.
+    pub fetch_read_timeout_secs: u64,
+    /// Leave an existing resource untouched when a submitted resource is
+    /// identical to it (ignoring `meta.versionId`/`meta.lastUpdated`), so
+    /// replaying a manifest writes no new versions (#1127). Off by default.
+    /// Set with `HFS_BULK_SUBMIT_SKIP_UNCHANGED`.
+    pub skip_unchanged: bool,
+    /// Batches each index-during-ingest writer may hold queued before the
+    /// ingest waits for it. Set with `HFS_BULK_SUBMIT_INDEX_QUEUE`.
+    pub index_queue: u32,
+    /// Index-during-ingest writer tasks; a resource always goes to the same
+    /// writer so its versions are indexed in order. Set with
+    /// `HFS_BULK_SUBMIT_INDEX_CONCURRENCY`.
+    pub index_concurrency: u32,
+    /// Queued batches an index-during-ingest writer merges into one write to
+    /// the secondary. Measured: raising it from 4 to 16 made ingest 34 %
+    /// slower. Set with `HFS_BULK_SUBMIT_INDEX_COALESCE`.
+    pub index_coalesce: u32,
+    /// Longest the ingest waits for room in an index-during-ingest queue, in
+    /// seconds; past it the batch is marked unindexed and repaired by the
+    /// deferred reindex instead of stalling the writer and the lease. Set with
+    /// `HFS_BULK_SUBMIT_INDEX_MAX_WAIT`.
+    pub index_max_wait_secs: u64,
     /// Initial lease length issued at manifest claim, in seconds.
     pub lease_duration_secs: u64,
     /// Worker heartbeat cadence, in seconds.
@@ -733,7 +782,13 @@ impl Default for BulkSubmitConfig {
             defer_indexing: true,
             bulk_index_rebuild: false,
             max_concurrent_per_tenant: 4,
-            batch_size: 1000,
+            batch_size: 100,
+            fetch_read_timeout_secs: 60,
+            skip_unchanged: false,
+            index_queue: 16,
+            index_concurrency: 4,
+            index_coalesce: 4,
+            index_max_wait_secs: 30,
             lease_duration_secs: 60,
             heartbeat_interval_secs: 20,
             cleanup_interval_secs: 300,
@@ -753,6 +808,25 @@ impl Default for BulkSubmitConfig {
             poll_rate_window_secs: 60,
         }
     }
+}
+
+/// The startup error for a set-but-removed `HFS_BULK_SUBMIT_INDEX_DURING_INGEST`,
+/// or `None` when it is unset. `true`/`1` mapped to indexing during ingest, now
+/// `HFS_BULK_SUBMIT_DEFER_INDEXING=false`; anything else mapped to the deferred
+/// rebuild, now `=true` (the default). Split from `validate` so it is testable
+/// without mutating the process environment (#1242).
+fn removed_index_during_ingest_error(raw: Option<&str>) -> Option<String> {
+    let raw = raw?;
+    let equivalent = if matches!(raw.trim().to_ascii_lowercase().as_str(), "true" | "1") {
+        "false"
+    } else {
+        "true"
+    };
+    Some(format!(
+        "HFS_BULK_SUBMIT_INDEX_DURING_INGEST has been removed; set \
+         HFS_BULK_SUBMIT_DEFER_INDEXING={equivalent} instead (it now selects the \
+         index-during-ingest mechanism from the deployment)"
+    ))
 }
 
 impl BulkSubmitConfig {
@@ -842,6 +916,15 @@ impl BulkSubmitConfig {
                 d.max_concurrent_per_tenant,
             ),
             batch_size: env_u32("HFS_BULK_SUBMIT_BATCH_SIZE", d.batch_size),
+            fetch_read_timeout_secs: env_u64(
+                "HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT",
+                d.fetch_read_timeout_secs,
+            ),
+            skip_unchanged: env_bool("HFS_BULK_SUBMIT_SKIP_UNCHANGED", d.skip_unchanged),
+            index_queue: env_u32("HFS_BULK_SUBMIT_INDEX_QUEUE", d.index_queue),
+            index_concurrency: env_u32("HFS_BULK_SUBMIT_INDEX_CONCURRENCY", d.index_concurrency),
+            index_coalesce: env_u32("HFS_BULK_SUBMIT_INDEX_COALESCE", d.index_coalesce),
+            index_max_wait_secs: env_u64("HFS_BULK_SUBMIT_INDEX_MAX_WAIT", d.index_max_wait_secs),
             lease_duration_secs: env_u64("HFS_BULK_SUBMIT_LEASE_DURATION", d.lease_duration_secs),
             heartbeat_interval_secs: env_u64(
                 "HFS_BULK_SUBMIT_HEARTBEAT_INTERVAL",
@@ -880,6 +963,16 @@ impl BulkSubmitConfig {
     /// Validates the bulk-submit configuration.
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
+        // `HFS_BULK_SUBMIT_INDEX_DURING_INGEST` was folded into
+        // `HFS_BULK_SUBMIT_DEFER_INDEXING` (#1242). Fail loudly rather than
+        // ignore a value the operator set expecting an effect.
+        if let Some(e) = removed_index_during_ingest_error(
+            std::env::var("HFS_BULK_SUBMIT_INDEX_DURING_INGEST")
+                .ok()
+                .as_deref(),
+        ) {
+            errors.push(e);
+        }
         if !matches!(self.output_backend.as_str(), "local-fs" | "s3") {
             errors.push(format!(
                 "HFS_BULK_SUBMIT_OUTPUT_BACKEND '{}' invalid (expected local-fs|s3)",
@@ -918,6 +1011,21 @@ impl BulkSubmitConfig {
         }
         if self.batch_size == 0 {
             errors.push("HFS_BULK_SUBMIT_BATCH_SIZE must be >= 1".to_string());
+        }
+        if self.fetch_read_timeout_secs == 0 {
+            errors.push("HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT must be > 0".to_string());
+        }
+        if self.index_queue == 0 {
+            errors.push("HFS_BULK_SUBMIT_INDEX_QUEUE must be >= 1".to_string());
+        }
+        if self.index_concurrency == 0 {
+            errors.push("HFS_BULK_SUBMIT_INDEX_CONCURRENCY must be >= 1".to_string());
+        }
+        if self.index_coalesce == 0 {
+            errors.push("HFS_BULK_SUBMIT_INDEX_COALESCE must be >= 1".to_string());
+        }
+        if self.index_max_wait_secs == 0 {
+            errors.push("HFS_BULK_SUBMIT_INDEX_MAX_WAIT must be > 0".to_string());
         }
         if self.heartbeat_interval_secs == 0 {
             errors.push("HFS_BULK_SUBMIT_HEARTBEAT_INTERVAL must be > 0".to_string());
@@ -2706,6 +2814,16 @@ mod tests {
     }
 
     #[test]
+    fn test_bulk_export_config_zero_heartbeat_interval() {
+        let cfg = BulkExportConfig {
+            heartbeat_interval_secs: 0,
+            ..BulkExportConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("HEARTBEAT_INTERVAL")));
+    }
+
+    #[test]
     fn test_bulk_export_config_lease_must_exceed_heartbeat() {
         let cfg = BulkExportConfig {
             lease_duration_secs: 10,
@@ -2822,6 +2940,67 @@ mod tests {
         };
         let errs = cfg.validate().unwrap_err();
         assert!(errs.iter().any(|e| e.contains("MAX_CONCURRENT_PER_TENANT")));
+    }
+
+    /// #1127: the batch size the engine has always used stays the default
+    /// now that the knob reaches it, and the ingest-tuning knobs keep the
+    /// measured defaults with index-during-ingest and skip-unchanged off.
+    #[test]
+    fn removed_index_during_ingest_maps_to_the_defer_flag() {
+        // Unset: no error.
+        assert!(removed_index_during_ingest_error(None).is_none());
+        // `true`/`1` meant index during ingest → DEFER_INDEXING=false.
+        for raw in ["true", "1", " TRUE "] {
+            let e = removed_index_during_ingest_error(Some(raw)).expect("removed var errors");
+            assert!(
+                e.contains("HFS_BULK_SUBMIT_DEFER_INDEXING=false"),
+                "{raw}: {e}"
+            );
+        }
+        // anything else meant the deferred rebuild → DEFER_INDEXING=true (default).
+        for raw in ["false", "0", "no"] {
+            let e = removed_index_during_ingest_error(Some(raw)).expect("removed var errors");
+            assert!(
+                e.contains("HFS_BULK_SUBMIT_DEFER_INDEXING=true"),
+                "{raw}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bulk_submit_config_ingest_tuning_defaults() {
+        let cfg = BulkSubmitConfig::default();
+        assert_eq!(cfg.batch_size, 100);
+        assert_eq!(cfg.fetch_read_timeout_secs, 60);
+        assert!(!cfg.skip_unchanged);
+        assert_eq!(
+            (cfg.index_queue, cfg.index_concurrency, cfg.index_coalesce),
+            (16, 4, 4)
+        );
+        assert_eq!(cfg.index_max_wait_secs, 30);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_bulk_submit_config_zero_ingest_tuning_knobs_rejected() {
+        let cfg = BulkSubmitConfig {
+            fetch_read_timeout_secs: 0,
+            index_queue: 0,
+            index_concurrency: 0,
+            index_coalesce: 0,
+            index_max_wait_secs: 0,
+            ..BulkSubmitConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        for knob in [
+            "FETCH_READ_TIMEOUT",
+            "INDEX_QUEUE",
+            "INDEX_CONCURRENCY",
+            "INDEX_COALESCE",
+            "INDEX_MAX_WAIT",
+        ] {
+            assert!(errs.iter().any(|e| e.contains(knob)), "{knob}: {errs:?}");
+        }
     }
 
     #[test]

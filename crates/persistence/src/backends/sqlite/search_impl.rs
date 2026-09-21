@@ -36,18 +36,42 @@ fn internal_error(message: String) -> StorageError {
     })
 }
 
+/// Rejects `_id` / `_lastUpdated` modifiers their dedicated query builders
+/// cannot honour (#1092). Both are dispatched by name in
+/// `build_special_parameter_condition`, bypassing the generic per-type
+/// modifier handling, so this must run before
+/// every path that can reach it: the top-level `search`/`search_count` below,
+/// and `search_with_connection` (also reached directly by the in-transaction
+/// `ifNoneExist` resolution path, `find_matching_resources_in_tx` in
+/// `storage.rs`, which never goes through `search`).
+///
+/// Every one of those paths must also refuse a date value that is not a date
+/// (#1293, #1295), so the shared date gate runs here too: an invalid value is
+/// an error, never a query the builder has to make something of.
+fn reject_unsupported_metadata_modifier(query: &SearchQuery) -> StorageResult<()> {
+    crate::search::reject_unsupported_metadata_modifier(query)?;
+    crate::search::validate_date_values(query)?;
+    // And a number or quantity value that is not a number (#1319, #1340).
+    crate::search::validate_numeric_values(query)?;
+    // And a value that is empty, or has an empty alternative: `family=Zzz,`
+    // is a prefix match on `""`, which is every family name (#1380).
+    crate::search::validate_value_presence(query)
+}
+
+/// Refuses what `_contained` matching cannot apply. `:missing` was once the
+/// only such criterion, hence the name; the full rule lives with the builder
+/// it describes (#1363).
 fn reject_contained_missing(query: &SearchQuery) -> StorageResult<()> {
-    if query.contained != crate::types::ContainedMode::Off
-        && query
-            .parameters
-            .iter()
-            .any(|param| matches!(param.modifier, Some(crate::types::SearchModifier::Missing)))
-    {
-        return Err(StorageError::Search(SearchError::QueryParseError {
-            message: "SQLite does not support :missing with _contained=true or both".to_string(),
-        }));
-    }
-    Ok(())
+    QueryBuilder::reject_unsupported_contained(query).map_err(StorageError::Search)
+}
+
+/// A `_cursor` that decoded but carries a sort value of the wrong type for its
+/// sort key. Cursors are unkeyed base64 JSON, so any client can craft one; this
+/// is a bad request (400), not a server fault (#1120).
+fn invalid_cursor(cursor: &PageCursor) -> StorageError {
+    StorageError::Search(SearchError::InvalidCursor {
+        cursor: cursor.encode(),
+    })
 }
 
 /// Binds the cursor's boundary sort value as `?3`, typed per the sort key kind.
@@ -64,20 +88,14 @@ fn bind_cursor_value(
                 Some(CursorValue::Decimal(f)) => *f,
                 Some(CursorValue::Number(i)) => *i as f64,
                 Some(CursorValue::String(s)) => s.parse().unwrap_or(0.0),
-                _ => {
-                    return Err(internal_error(
-                        "Invalid cursor: expected number".to_string(),
-                    ));
-                }
+                _ => return Err(invalid_cursor(cursor)),
             };
             params.push(Box::new(n));
         }
         SortValueKind::Timestamp | SortValueKind::Text => match value {
             Some(CursorValue::String(s)) => params.push(Box::new(s.clone())),
             Some(CursorValue::Null) | None => params.push(Box::new(Option::<String>::None)),
-            _ => {
-                return Err(internal_error("Invalid cursor: expected text".to_string()));
-            }
+            _ => return Err(invalid_cursor(cursor)),
         },
     }
     Ok(())
@@ -101,6 +119,8 @@ impl SqliteBackend {
         query: &SearchQuery,
         total: Option<u64>,
     ) -> StorageResult<SearchResult> {
+        reject_unsupported_metadata_modifier(query)?;
+
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
 
@@ -366,9 +386,12 @@ impl SearchProvider for SqliteBackend {
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
         reject_contained_missing(query)?;
+        reject_unsupported_metadata_modifier(query)?;
 
         // `_contained` search uses a dedicated path (different index columns and
         // heterogeneous result types); standard search handles `_contained=false`.
+        // This is the only entry point into that path, so the gate above is not
+        // repeated inside `search_contained` itself.
         if query.contained != crate::types::ContainedMode::Off {
             return self.search_contained(tenant, query).await;
         }
@@ -392,6 +415,14 @@ impl SearchProvider for SqliteBackend {
         query: &SearchQuery,
     ) -> StorageResult<u64> {
         reject_contained_missing(query)?;
+        reject_unsupported_metadata_modifier(query)?;
+
+        // Under `_contained` the count is of what `search` returns (#1383),
+        // not of the top-level resources matching the same criteria.
+        if query.contained != crate::types::ContainedMode::Off {
+            let plan = self.contained_plan(tenant, query).await?;
+            return Ok(plan.top_total + plan.keys.len() as u64);
+        }
 
         let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
@@ -751,16 +782,11 @@ impl ChainedSearchProvider for SqliteBackend {
 
         // Build the SQL fragment. The chained value still carries its
         // comparator prefix (`patient.birthdate=le1956-07-14`); strip it only
-        // when the terminal parameter's type admits one, so a string value
-        // like `family=Levine` is never misread as le + "vine" (#258).
-        let candidate = crate::types::SearchValue::parse(value);
-        let search_value = if candidate.prefix != crate::types::SearchPrefix::Eq
-            && candidate.prefix.is_valid_for(parsed.terminal_type)
-        {
-            candidate
-        } else {
-            SearchValue::eq(value)
-        };
+        // when the terminal parameter's type admits one — date, number and
+        // quantity, explicit `eq` included — so a string or token value is
+        // never misread: not `family=Levine` as le + "vine" (#258), nor
+        // `family=nelson` as ne + "lson" (#1307).
+        let search_value = SearchValue::parse_for_type(value, parsed.terminal_type);
         let fragment = match builder.build_forward_chain_sql(&parsed, &search_value) {
             Ok(f) => f,
             Err(e) => {
@@ -922,19 +948,144 @@ impl SqliteBackend {
     /// themselves (`_containedType=contained`). For `_contained=both`, top-level
     /// matches (run through the standard path) are merged in first.
     ///
-    /// Paginated by `_offset`/`_count` as a single window (no keyset cursor);
-    /// contained result sets are expected to be small.
+    /// Paginated by `_offset`/`_count` (no keyset cursor) over the result list
+    /// [`Self::contained_plan`] describes — top-level matches, then contained
+    /// ones — so `_total`, `search_count` and every page agree (#1383). Only
+    /// the requested window is materialized.
     async fn search_contained(
         &self,
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
-        use crate::types::{ContainedMode, ContainedReturn};
+        use crate::types::ContainedReturn;
 
-        let tenant_id = tenant.tenant_id().as_str();
         let contained_type = query.resource_type.as_str();
+        let count = query.count.unwrap_or(100) as usize;
+        let offset = query.offset.unwrap_or(0) as u64;
+        let plan = self.contained_plan(tenant, query).await?;
 
-        // 1. Resolve contained matches → (container_type, container_id, local_id).
+        // Top-level matches (`_contained=both`) come first.
+        let mut items: Vec<StoredResource> = Vec::new();
+        if let Some(top_query) = &plan.top_query {
+            if offset < plan.top_total {
+                let mut page_query = top_query.clone();
+                page_query.offset = Some(offset as u32);
+                page_query.count = Some(count as u32);
+                items = self.search(tenant, &page_query).await?.resources.items;
+                items.truncate(count);
+            }
+        }
+
+        let skip = offset.saturating_sub(plan.top_total) as usize;
+        let room = count.saturating_sub(items.len());
+        for (ctype, cid, local) in plan.keys.iter().skip(skip).take(room) {
+            let Some(container) = self.read(tenant, ctype, cid).await? else {
+                continue;
+            };
+            match (query.contained_return, local) {
+                (ContainedReturn::Contained, Some(local_id)) => {
+                    if let Some(c) = extract_contained_resource(container.content(), local_id) {
+                        items.push(build_contained_stored(
+                            &container,
+                            contained_type,
+                            local_id,
+                            c,
+                        ));
+                    }
+                }
+                _ => items.push(container),
+            }
+        }
+
+        let mut result = SearchResult::new(Page::new(items, PageInfo::end()));
+        if query.wants_total() {
+            result = result.with_total(plan.top_total + plan.keys.len() as u64);
+        }
+        Ok(result)
+    }
+
+    /// The result list of a `_contained=true|both` search, unmaterialized:
+    /// `top_total` top-level matches (`both` only, served by `top_query`)
+    /// followed by `keys`, one per contained match — a container
+    /// (`_containedType=container`, local id `None`) or a contained resource —
+    /// in a stable order. A container that is itself a top-level match is
+    /// listed once, in the top-level part. A contained resource never is one:
+    /// its local id may equal a top-level resource's id without being it.
+    async fn contained_plan(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<ContainedPlan> {
+        use crate::types::{ContainedMode, ContainedReturn, SearchParamType, SearchParameter};
+
+        let mut keys = self.contained_matches(tenant.tenant_id().as_str(), query)?;
+        if query.contained_return == ContainedReturn::Container {
+            for key in &mut keys {
+                key.2 = None;
+            }
+        } else {
+            keys.retain(|key| key.2.is_some());
+        }
+        // A stable order to page over, one key per result.
+        keys.sort();
+        keys.dedup();
+
+        if query.contained != ContainedMode::Both {
+            return Ok(ContainedPlan {
+                top_query: None,
+                top_total: 0,
+                keys,
+            });
+        }
+
+        let mut top_query = query.clone();
+        top_query.contained = ContainedMode::Off;
+        top_query.contained_return = ContainedReturn::Container;
+        let top_total = self.search_count(tenant, &top_query).await?;
+
+        if query.contained_return == ContainedReturn::Container {
+            let same_type: Vec<&str> = keys
+                .iter()
+                .filter(|key| key.0 == query.resource_type)
+                .map(|key| key.1.as_str())
+                .collect();
+            let mut also_top_level: HashSet<String> = HashSet::new();
+            for chunk in same_type.chunks(500) {
+                let mut among = top_query.clone();
+                among.parameters.push(SearchParameter {
+                    name: "_id".to_string(),
+                    param_type: SearchParamType::Token,
+                    values: chunk.iter().map(|id| SearchValue::eq(*id)).collect(),
+                    ..Default::default()
+                });
+                among.count = Some(chunk.len() as u32);
+                among.offset = None;
+                among.cursor = None;
+                among.total = None;
+                among.includes.clear();
+                let found = self.search(tenant, &among).await?;
+                also_top_level.extend(found.resources.items.iter().map(|r| r.id().to_string()));
+            }
+            keys.retain(|key| !(key.0 == query.resource_type && also_top_level.contains(&key.1)));
+        }
+
+        Ok(ContainedPlan {
+            top_query: Some(top_query),
+            top_total,
+            keys,
+        })
+    }
+
+    /// Resolves the contained matches of `query` →
+    /// `(container_type, container_id, local_id)`, unordered.
+    /// Synchronous: the connection is not `Send` and must not live across an
+    /// await.
+    fn contained_matches(
+        &self,
+        tenant_id: &str,
+        query: &SearchQuery,
+    ) -> StorageResult<Vec<(String, String, Option<String>)>> {
+        let contained_type = query.resource_type.as_str();
         let builder = QueryBuilder::new(tenant_id, contained_type);
         let matches: Vec<(String, String, Option<String>)> = match builder.build_contained(query) {
             Some(fragment) => {
@@ -969,75 +1120,15 @@ impl SqliteBackend {
             }
             None => Vec::new(),
         };
-
-        // 2. Materialize result items (container or contained), de-duplicated.
-        let mut items: Vec<StoredResource> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
-        match query.contained_return {
-            ContainedReturn::Container => {
-                for (ctype, cid, _) in &matches {
-                    if !seen.insert(format!("{ctype}/{cid}")) {
-                        continue;
-                    }
-                    if let Some(container) = self.read(tenant, ctype, cid).await? {
-                        items.push(container);
-                    }
-                }
-            }
-            ContainedReturn::Contained => {
-                for (ctype, cid, local) in &matches {
-                    let Some(local_id) = local else { continue };
-                    if !seen.insert(format!("{ctype}/{cid}#{local_id}")) {
-                        continue;
-                    }
-                    if let Some(container) = self.read(tenant, ctype, cid).await? {
-                        if let Some(c) = extract_contained_resource(container.content(), local_id) {
-                            items.push(build_contained_stored(
-                                &container,
-                                contained_type,
-                                local_id,
-                                c,
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-
-        // 3. For `both`, merge top-level matches ahead of contained ones.
-        if query.contained == ContainedMode::Both {
-            let mut top_query = query.clone();
-            top_query.contained = ContainedMode::Off;
-            top_query.contained_return = ContainedReturn::Container;
-            let top = self.search(tenant, &top_query).await?;
-            let mut merged = top.resources.items;
-            let top_urls: HashSet<String> = merged.iter().map(|r| r.url()).collect();
-            for item in items {
-                if !top_urls.contains(&item.url()) {
-                    merged.push(item);
-                }
-            }
-            items = merged;
-        }
-
-        // 4. Apply the offset/count window.
-        let count = query.count.unwrap_or(100) as usize;
-        let offset = query.offset.unwrap_or(0) as usize;
-        let total_matches = items.len() as u64;
-        let windowed: Vec<StoredResource> = items.into_iter().skip(offset).take(count).collect();
-
-        let total = if query.wants_total() {
-            Some(total_matches)
-        } else {
-            None
-        };
-        let page = Page::new(windowed, PageInfo::end());
-        let mut result = SearchResult::new(page);
-        if let Some(t) = total {
-            result = result.with_total(t);
-        }
-        Ok(result)
+        Ok(matches)
     }
+}
+
+/// See [`SqliteBackend::contained_plan`].
+struct ContainedPlan {
+    top_query: Option<SearchQuery>,
+    top_total: u64,
+    keys: Vec<(String, String, Option<String>)>,
 }
 
 // Helper methods for search implementations
@@ -1264,6 +1355,30 @@ mod tests {
     use crate::tenant::{TenantId, TenantPermissions};
     use crate::types::SearchParameter;
     use serde_json::json;
+
+    #[test]
+    fn a_type_mismatched_cursor_sort_value_is_a_client_error() {
+        // Crafted: a boolean where the Timestamp sort key expects an RFC3339
+        // string. Must surface as a 400 InvalidCursor, not a 500 (#1120).
+        let cursor = PageCursor::new(vec![CursorValue::Boolean(true)], "p1");
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        let err = bind_cursor_value(&mut params, SortValueKind::Timestamp, &cursor)
+            .expect_err("a boolean is not a timestamp");
+        match err {
+            StorageError::Search(SearchError::InvalidCursor { cursor: c }) => {
+                assert_eq!(c, cursor.encode())
+            }
+            other => panic!("expected InvalidCursor, got {other:?}"),
+        }
+
+        // A well-typed cursor still binds.
+        let ok = PageCursor::new(
+            vec![CursorValue::String("2024-01-01T00:00:00Z".to_string())],
+            "p1",
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        assert!(bind_cursor_value(&mut params, SortValueKind::Timestamp, &ok).is_ok());
+    }
 
     fn create_test_backend() -> SqliteBackend {
         // Point at the workspace's data directory so the search-parameter
@@ -2277,6 +2392,200 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ids, vec!["o1".to_string()], "Levine matches, unclipped");
+    }
+
+    /// Seeds the #1307 fixture through the real write path. Every terminal
+    /// value that begins with a comparator pair (`ne…`, `eq…`) has a decoy
+    /// whose value is what is left once the pair is wrongly stripped, so a
+    /// misparse shows up as the decoy being returned.
+    async fn seed_chain_prefix_fixture(backend: &SqliteBackend, tenant: &TenantContext) {
+        let resources = [
+            (
+                "Patient",
+                json!({"id": "nelson-1", "birthDate": "1950-04-12", "name": [{"family": "Nelson"}]}),
+            ),
+            (
+                "Patient",
+                json!({"id": "wilson-1", "birthDate": "1960-01-01", "name": [{"family": "Wilson"}]}),
+            ),
+            (
+                "Patient",
+                json!({"id": "equus-1", "birthDate": "1970-01-01", "name": [{"family": "Equus"}]}),
+            ),
+            ("Device", json!({"id": "dev-news", "url": "news:example/1"})),
+            ("Device", json!({"id": "dev-ws", "url": "ws:example/1"})),
+            (
+                "MolecularSequence",
+                json!({"id": "ms-10", "coordinateSystem": 0, "referenceSeq": {"windowStart": 10}}),
+            ),
+            (
+                "MolecularSequence",
+                json!({"id": "ms-0", "coordinateSystem": 0, "referenceSeq": {"windowStart": 0}}),
+            ),
+            (
+                "Observation",
+                json!({
+                    "id": "o-nelson", "status": "final",
+                    "code": {"coding": [{"system": "http://example.org/c", "code": "ne123"}]},
+                    "subject": {"reference": "Patient/nelson-1"},
+                    "device": {"reference": "Device/dev-news"},
+                    "derivedFrom": [{"reference": "MolecularSequence/ms-10"}],
+                    "valueQuantity": {"value": 5.4, "unit": "mg"},
+                }),
+            ),
+            (
+                "Observation",
+                json!({
+                    "id": "o-wilson", "status": "final",
+                    "code": {"coding": [{"system": "http://example.org/c", "code": "123"}]},
+                    "subject": {"reference": "Patient/wilson-1"},
+                    "device": {"reference": "Device/dev-ws"},
+                    "derivedFrom": [{"reference": "MolecularSequence/ms-0"}],
+                    "valueQuantity": {"value": 0, "unit": "mg"},
+                }),
+            ),
+            (
+                "Observation",
+                json!({
+                    "id": "o-equus", "status": "final",
+                    "code": {"coding": [{"system": "http://example.org/c", "code": "eq77"}]},
+                    "subject": {"reference": "Patient/equus-1"},
+                    "valueQuantity": {"value": 7.0, "unit": "mg"},
+                }),
+            ),
+            (
+                "Observation",
+                json!({
+                    "id": "o-77", "status": "final",
+                    "code": {"coding": [{"system": "http://example.org/c", "code": "77"}]},
+                    "valueQuantity": {"value": 9.0, "unit": "mg"},
+                }),
+            ),
+        ];
+        for (resource_type, body) in resources {
+            backend
+                .create(tenant, resource_type, body, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+        for obs in ["o-nelson", "o-wilson", "o-equus", "o-77"] {
+            backend
+                .create(
+                    tenant,
+                    "DiagnosticReport",
+                    json!({
+                        "id": obs.replacen("o-", "dr-", 1), "status": "final",
+                        "code": {"text": "panel"},
+                        "result": [{"reference": format!("Observation/{obs}")}],
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    /// #1307: through the `ChainedSearchProvider` trait API a comparator
+    /// prefix is recognised only on date / number / quantity terminals —
+    /// including an explicit `eq` — and never on string / token / reference /
+    /// uri terminals, whatever the value starts with.
+    #[tokio::test]
+    async fn test_resolve_chain_prefix_only_on_ordered_terminals() {
+        const WINDOW_START: &str = "derived-from:MolecularSequence.window-start";
+        const VALUE_QUANTITY: &str = "result.value-quantity";
+
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        seed_chain_prefix_fixture(&backend, &tenant).await;
+
+        let cases: &[(&str, &str, &str, &[&str])] = &[
+            // Positive controls: unprefixed values prove each terminal is
+            // indexed, so the cases below cannot pass or fail vacuously.
+            ("Observation", "subject.family", "Wilson", &["o-wilson"]),
+            ("DiagnosticReport", "result.code", "123", &["dr-wilson"]),
+            (
+                "DiagnosticReport",
+                "result.subject",
+                "wilson-1",
+                &["dr-wilson"],
+            ),
+            (
+                "Observation",
+                "device:Device.url",
+                "ws:example/1",
+                &["o-wilson"],
+            ),
+            ("DiagnosticReport", VALUE_QUANTITY, "5.4", &["dr-nelson"]),
+            ("Observation", WINDOW_START, "10", &["o-nelson"]),
+            (
+                "Observation",
+                "subject.birthdate",
+                "1950-04-12",
+                &["o-nelson"],
+            ),
+            // String terminal: `ne` + "lson" would also match Wilson.
+            ("Observation", "subject.family", "nelson", &["o-nelson"]),
+            ("Observation", "subject.family", "Nelson", &["o-nelson"]),
+            ("Observation", "subject.family", "Equus", &["o-equus"]),
+            // Token terminal: `ne` + "123" / `eq` + "77" are the decoys' codes.
+            ("DiagnosticReport", "result.code", "ne123", &["dr-nelson"]),
+            ("DiagnosticReport", "result.code", "eq77", &["dr-equus"]),
+            // Reference terminal: `ne` + "lson-1" would also match wilson-1.
+            (
+                "DiagnosticReport",
+                "result.subject",
+                "nelson-1",
+                &["dr-nelson"],
+            ),
+            // Uri terminal: `ne` + "ws:example/1" is the decoy's url.
+            (
+                "Observation",
+                "device:Device.url",
+                "news:example/1",
+                &["o-nelson"],
+            ),
+            // Quantity terminal: explicit `eq` is a prefix, as are the rest.
+            ("DiagnosticReport", VALUE_QUANTITY, "eq5.4", &["dr-nelson"]),
+            (
+                "DiagnosticReport",
+                VALUE_QUANTITY,
+                "ne5.4",
+                &["dr-77", "dr-equus", "dr-wilson"],
+            ),
+            (
+                "DiagnosticReport",
+                VALUE_QUANTITY,
+                "gt6",
+                &["dr-77", "dr-equus"],
+            ),
+            // Number terminal, likewise.
+            ("Observation", WINDOW_START, "eq10", &["o-nelson"]),
+            ("Observation", WINDOW_START, "ne10", &["o-wilson"]),
+            ("Observation", WINDOW_START, "gt5", &["o-nelson"]),
+            // Date terminal with an explicit `eq`.
+            (
+                "Observation",
+                "subject.birthdate",
+                "eq1950-04-12",
+                &["o-nelson"],
+            ),
+        ];
+
+        let mut failures = Vec::new();
+        for (base, chain, value, expected) in cases {
+            let mut ids = backend
+                .resolve_chain(&tenant, base, chain, value)
+                .await
+                .unwrap_or_else(|e| panic!("{base}?{chain}={value}: {e}"));
+            ids.sort();
+            let expected: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
+            if ids != expected {
+                failures.push(format!(
+                    "{base}?{chain}={value}: got {ids:?}, want {expected:?}"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
     }
 
     #[tokio::test]

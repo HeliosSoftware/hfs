@@ -58,5 +58,11 @@
         <code value="correct"/>
       </coding>
     </action>
+    <code>
+      <coding>
+        <system value="http://terminology.hl7.org/CodeSystem/observation-category"/>
+        <code value="laboratory"/>
+      </coding>
+    </code>
   </provision>
 </Consent>

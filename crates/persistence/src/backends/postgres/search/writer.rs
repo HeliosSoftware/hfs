@@ -187,7 +187,36 @@ fn postgres_error_message(error: &tokio_postgres::Error) -> String {
 /// A missing index row makes the parameter behave as absent for that resource —
 /// still a gap, but a silent under-match is recoverable and a silent *wrong*
 /// match is not.
+///
+/// The value is read with the search side's own [`FhirDateValue`] first, so
+/// whatever that grammar accepts is indexed at exactly the first instant of the
+/// range a search for the same text covers. That is what indexes a stored
+/// `…T09:20` — minutes without seconds, which RFC 3339 does not allow and which
+/// used to be skipped here although `date=…T09:20` is a valid search (#1315) —
+/// and what puts a `:60` leap second on the next second, where the search side
+/// looks for it.
+///
+/// Only the text as stored counts: the search-side repairs (trimming, and a
+/// space read as a form-decoded `+`, #1296) do not apply to a resource, where
+/// a space is simply not part of a date. Anything the strict grammar does not
+/// take verbatim falls through to the lenient reading below, which is
+/// unchanged.
+///
+/// [`FhirDateValue`]: crate::search::FhirDateValue
 fn parse_index_date(value: &str) -> Option<DateTime<Utc>> {
+    if let Ok(parsed) = crate::search::FhirDateValue::parse(value) {
+        if parsed.canonical() == value {
+            return Some(parsed.start);
+        }
+    }
+    parse_index_date_lenient(value)
+}
+
+/// The reading [`parse_index_date`] falls back to: complete the value with
+/// [`normalize_date_for_pg`] and take whatever chrono makes of it. Wider than
+/// the FHIR grammar on purpose — it is what keeps an out-of-grammar value
+/// (`+14:30`, an instant past the year 9999) indexed rather than dropped.
+fn parse_index_date_lenient(value: &str) -> Option<DateTime<Utc>> {
     let normalized = normalize_date_for_pg(value);
     DateTime::parse_from_rfc3339(&normalized)
         .map(|dt| dt.with_timezone(&Utc))
@@ -540,8 +569,9 @@ const MULTI_BATCH_ROWS: usize = 4096;
 /// value column; `sort_expression` maps both to the bare columns rather than
 /// the correlated `search_index` subquery it uses for indexed parameters;
 /// `build_missing_condition` selects from `resources`; `primary_keyset_key`
-/// pages on `last_updated`; and `build_contained_condition` excludes
-/// `_`-prefixed parameters outright. `ChainQueryBuilder` was the one path that
+/// pages on `last_updated`; and `build_contained` answers `_id` from the
+/// `contained_local_id` column and refuses `_lastUpdated` (#1373).
+/// `ChainQueryBuilder` was the one path that
 /// still read the rows, for a chained or reverse-chained terminal such as
 /// `Observation?subject:Patient._id=p1`, and it now reads `resources` too.
 ///
@@ -1055,10 +1085,15 @@ impl PostgresSearchIndexWriter {
     /// Flattens the values extracted from one `contained[]` entry into rows.
     ///
     /// [`Self::drop_resources_backed`] applies here too, and did not before.
-    /// `build_contained` (`search/query_builder.rs`) skips every parameter whose
-    /// name `starts_with('_')` outright, so a contained `_id` or `_lastUpdated`
-    /// row has no reader at all — not "answered from `resources`" as on the
-    /// plain path, but genuinely unreachable.
+    /// `build_contained` (`search/query_builder.rs`) reads neither row: since
+    /// #1373 it answers `_id` from the `contained_local_id` column every
+    /// contained row carries and refuses `_lastUpdated` (a contained resource
+    /// has none of its own), so a contained `_id` or `_lastUpdated` row has no
+    /// reader at all — not "answered from `resources`" as on the plain path,
+    /// but genuinely unreachable. (The other `_`-parameters — `_tag`,
+    /// `_profile`, `_security`, `_source`, `_language` — are read, and kept.)
+    /// One consequence: a contained resource that yields no other indexed
+    /// value has no row here, and `_contained` search cannot see it (#1383).
     ///
     /// The `_id` row is worse than merely unread: it is a byte-for-byte
     /// restatement of a column the same row already carries. On the benchmark's
@@ -1317,7 +1352,7 @@ impl PostgresSearchIndexWriter {
 /// - "2024-01-15" -> "2024-01-15T00:00:00+00:00"
 /// - "2024-01-15T10:30:00" -> "2024-01-15T10:30:00+00:00"
 /// - "2024-01-15T10:30:00-07:00" -> unchanged (already zoned)
-fn normalize_date_for_pg(value: &str) -> String {
+pub(super) fn normalize_date_for_pg(value: &str) -> String {
     if let Some((_, time_part)) = value.split_once('T') {
         // Already has a time component — append UTC only if it carries no zone.
         //
@@ -1355,6 +1390,143 @@ fn normalize_date_for_pg(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A search value and the stored value it should match must never be zoned
+    /// differently (#1288). The query side used to guarantee that by calling
+    /// [`normalize_date_for_pg`] itself; it now reads search values with the
+    /// shared `FhirDateValue`, and so does [`parse_index_date`] (#1315): for
+    /// every value the search grammar accepts, the instant indexed is the
+    /// start of the range searched.
+    ///
+    /// That includes what a resource cannot validly carry but real data does —
+    /// `hh:mm` without seconds — and a `:60` leap second, which the search
+    /// side reads as the next second.
+    #[test]
+    fn search_and_index_agree_on_every_valid_value() {
+        for value in [
+            "2013",
+            "2013-04",
+            "2013-12",
+            "2013-04-05",
+            "2024-02-29",
+            "2013-04-05T09:20:00",
+            "2013-04-05T09:20:00Z",
+            "2013-04-05T09:20:00-04:00",
+            "2013-04-05T18:50:00+05:30",
+            "2013-04-05T09:20:00-00:00",
+            "2013-04-05T23:20:00+14:00",
+            "2013-04-05T09:20:00.5Z",
+            "2013-04-05T23:30:00.123-04:00",
+            "2021-11-10T16:48:57.246958-08:00",
+            // Minutes without seconds (#1315).
+            "2013-04-05T09:20",
+            "2013-04-05T09:20Z",
+            "2013-04-05T09:20-04:00",
+            "2013-04-05T18:50+05:30",
+            "2013-04-05T09:20-00:00",
+            "2013-04-05T23:59-14:00",
+            // A leap second is the first instant of the next second.
+            "2016-12-31T23:59:60Z",
+            "2013-04-05T09:20:60",
+            "2016-12-31T18:59:60-05:00",
+            "2016-12-31T23:59:60.5Z",
+            // Nine fraction digits, and digits past the ninth.
+            "2013-04-05T09:20:00.123456789Z",
+            "2013-04-05T09:20:00.1234567891Z",
+            "2013-04-05T09:20:00.12345678912345-04:00",
+            // The edges of the supported years.
+            "0001",
+            "0001-01-01T00:00:00Z",
+            "0001-01-01T14:00:00+14:00",
+            "9999",
+            "9999-12-31",
+            "9999-12-31T23:59",
+            "9999-12-31T23:59:59Z",
+            "9999-12-31T09:59:59-14:00",
+        ] {
+            let searched = crate::search::FhirDateValue::parse(value)
+                .unwrap_or_else(|e| panic!("{value} is a valid search value: {e}"));
+            assert_eq!(parse_index_date(value), Some(searched.start), "{value}");
+        }
+    }
+
+    /// #1315 itself: minutes without seconds are not RFC 3339, so the lenient
+    /// reading — all there was — dropped the value and the row was skipped.
+    #[test]
+    fn minute_precision_values_are_indexed() {
+        for (value, expected) in [
+            ("2013-04-05T09:20", "2013-04-05T09:20:00+00:00"),
+            ("2013-04-05T09:20Z", "2013-04-05T09:20:00+00:00"),
+            ("2013-04-05T09:20-04:00", "2013-04-05T13:20:00+00:00"),
+            ("2013-04-05T18:50+05:30", "2013-04-05T13:20:00+00:00"),
+        ] {
+            assert_eq!(parse_index_date_lenient(value), None, "{value} before");
+            assert_eq!(
+                parse_index_date(value).map(|t| t.to_rfc3339()),
+                Some(expected.to_string()),
+                "{value}"
+            );
+        }
+    }
+
+    /// The only value both readings accept and disagree on. Chrono keeps a
+    /// leap second as `:59` plus a second of nanoseconds, which sorts *before*
+    /// the next second; the search side looks for it *at* the next second.
+    #[test]
+    fn leap_second_is_indexed_where_the_search_side_looks_for_it() {
+        let lenient = parse_index_date_lenient("2016-12-31T23:59:60Z").expect("chrono reads it");
+        assert_eq!(lenient.timestamp(), 1_483_228_799, "lenient: still :59");
+        let indexed = parse_index_date("2016-12-31T23:59:60Z").expect("indexed");
+        assert_eq!(indexed.to_rfc3339(), "2017-01-01T00:00:00+00:00");
+    }
+
+    /// The search side trims a value and reads a space in the zone-sign
+    /// position as a form-decoded `+` (#1296). Neither applies to a stored
+    /// value: there a space is not part of a date, and the value is skipped as
+    /// it always was rather than indexed at a zone nobody wrote.
+    #[test]
+    fn search_side_repairs_do_not_apply_to_stored_values() {
+        for value in [
+            "2013-04-05T18:50:00 05:30",
+            "2013-04-05T18:50 05:30",
+            " 2013-04-05T09:20",
+            "2013-04-05T09:20 ",
+            " 2013-04-05 ",
+        ] {
+            assert!(
+                crate::search::FhirDateValue::parse(value).is_ok(),
+                "{value:?} is accepted as a search value"
+            );
+            assert_eq!(parse_index_date(value), None, "{value:?}");
+        }
+    }
+
+    /// What the strict grammar rejects still goes through the lenient reading,
+    /// exactly as before: the strict pass only ever adds index rows.
+    #[test]
+    fn values_outside_the_grammar_keep_the_lenient_reading() {
+        for value in [
+            // Offset beyond ±14:00.
+            "2013-04-05T09:20:00+14:30",
+            // Valid text whose UTC instant is past the year 9999.
+            "9999-12-31T23:59:59-01:00",
+            // Its range would have no width left inside the supported years.
+            "9999-12-31T23:59:59.999999999Z",
+            // Lower-case designators.
+            "2013-04-05t09:20:00z",
+        ] {
+            assert!(
+                crate::search::FhirDateValue::parse(value).is_err(),
+                "{value} is outside the search grammar"
+            );
+            assert!(parse_index_date_lenient(value).is_some(), "{value}");
+            assert_eq!(
+                parse_index_date(value),
+                parse_index_date_lenient(value),
+                "{value}"
+            );
+        }
+    }
 
     /// The two statements are built from one [`insert_plan`], and
     /// [`PostgresSearchIndexWriter::insert_rows`] and

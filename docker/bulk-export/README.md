@@ -78,8 +78,9 @@ The response includes a `Content-Location` header for polling the export job.
 | `HFS_BULK_EXPORT_WORKER_CONCURRENCY` | `2` | In-process worker pool size. |
 | `HFS_BULK_EXPORT_DISABLE_LOCAL_WORKER` | `false` | Disable in-process workers for separate exporter deployment. |
 | `HFS_BULK_EXPORT_MAX_CONCURRENT_PER_TENANT` | `4` | Per-tenant active-job cap. |
+| `HFS_BULK_EXPORT_MAX_ATTEMPTS` | `3` | Claims allowed per job before it is failed as abandoned. |
 | `HFS_BULK_EXPORT_BATCH_SIZE` | `1000` | Resources per export batch. |
 | `HFS_BULK_EXPORT_LEASE_DURATION` | `60` | Initial lease length in seconds. Must be greater than the heartbeat interval. |
-| `HFS_BULK_EXPORT_HEARTBEAT_INTERVAL` | `20` | Worker heartbeat cadence in seconds. |
+| `HFS_BULK_EXPORT_HEARTBEAT_INTERVAL` | `20` | Lease-keeper renewal cadence in seconds. A background task renews the lease at this cadence while a job runs. Must be less than the lease duration. |
 | `HFS_BULK_EXPORT_CLEANUP_INTERVAL` | `300` | Cleanup task scan interval in seconds. |
 | `HFS_BULK_EXPORT_SINCE_NEWLY_ADDED` | `include` | Group-export `_since` toggle: `include` or `exclude`. |

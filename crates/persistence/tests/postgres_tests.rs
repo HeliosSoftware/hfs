@@ -63,6 +63,54 @@ mod meta_params_suite;
 #[path = "search/date_boundary_suite.rs"]
 mod date_boundary_suite;
 
+/// The backend-agnostic sub-day precision and date-validation suite (#1293,
+/// #1295, #1296, #1297). Same `#[path]` arrangement.
+#[path = "search/date_precision_suite.rs"]
+mod date_precision_suite;
+
+/// The backend-agnostic suite for stored dateTimes with minutes but no
+/// seconds (#1315). Same `#[path]` arrangement.
+#[path = "search/date_minute_index_suite.rs"]
+mod date_minute_index_suite;
+
+/// The backend-agnostic suite for exponent-form number and quantity search
+/// values (#1337). Same `#[path]` arrangement.
+#[path = "search/number_exponent_suite.rs"]
+mod number_exponent_suite;
+
+/// The backend-agnostic conditional-criteria suite (#1312): criteria whose
+/// values begin with comparator letters. Same `#[path]` arrangement.
+#[path = "search/conditional_criteria_suite.rs"]
+mod conditional_criteria_suite;
+
+/// The backend-agnostic `_contained` suite (#1336, #1362, #1363). Same
+/// `#[path]` arrangement.
+#[path = "search/contained_suite.rs"]
+mod contained_suite;
+
+/// The backend-agnostic number / quantity validation suite (#1319, #1340).
+/// Same `#[path]` arrangement.
+#[path = "search/numeric_validation_suite.rs"]
+mod numeric_validation_suite;
+
+/// The backend-agnostic `system|code` on `code` elements suite (#1379). Same
+/// `#[path]` arrangement.
+#[path = "search/token_code_system_suite.rs"]
+mod token_code_system_suite;
+
+/// The backend-agnostic conditional `If-Match` suite (#1381). Same `#[path]`
+/// arrangement.
+#[path = "search/conditional_if_match_suite.rs"]
+mod conditional_if_match_suite;
+
+/// The backend-agnostic empty search value suite (#1380). Same `#[path]`
+/// arrangement.
+#[path = "search/empty_value_suite.rs"]
+mod empty_value_suite;
+
+#[path = "common/container_cleanup.rs"]
+mod container_cleanup;
+
 // ============================================================================
 // Backend Configuration Tests (no PostgreSQL instance required)
 // ============================================================================
@@ -762,8 +810,9 @@ mod query_builder_tests {
             );
         }
 
-        // A full-precision instant is a degenerate range and falls back to
-        // scalar comparison.
+        // A value with a time is a range too — the whole second (#1297). `gt`
+        // is strictly after it, so it starts at the *end* of that second; this
+        // used to be a scalar `>` on its first instant.
         let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
             name: "_lastUpdated".to_string(),
             param_type: SearchParamType::Date,
@@ -775,10 +824,16 @@ mod query_builder_tests {
         let fragment = PostgresQueryBuilder::build_search_query(&query, 0)
             .expect("full-precision instant must build");
         assert!(
-            fragment.sql.contains("last_updated > $1"),
-            "full-precision gt must stay scalar, got SQL: {}",
+            fragment.sql.contains("last_updated >= $1"),
+            "second-precision gt starts at the end of the second, got SQL: {}",
             fragment.sql
         );
+        match &fragment.params[..] {
+            [SqlParam::Timestamp(bound)] => {
+                assert_eq!(bound.to_rfc3339(), "2024-01-01T10:00:01+00:00");
+            }
+            other => panic!("expected one timestamp bind, got {other:?}"),
+        }
     }
 }
 
@@ -806,7 +861,10 @@ mod postgres_integration {
     use helios_persistence::backends::postgres::{PostgresBackend, PostgresConfig};
     use helios_persistence::core::SettingsStore;
     use helios_persistence::core::history::{HistoryParams, InstanceHistoryProvider};
-    use helios_persistence::core::{Backend, BackendCapability, BackendKind, ResourceStorage};
+    use helios_persistence::core::{
+        Backend, BackendCapability, BackendKind, ResourceStorage, Transaction, TransactionOptions,
+        TransactionProvider,
+    };
     use helios_persistence::error::{
         BackendError, BulkExportError, ConcurrencyError, ResourceError, StorageError,
     };
@@ -1897,14 +1955,458 @@ mod postgres_integration {
         .await;
     }
 
+    /// #1144: `list_manifests` returns every manifest of the requested scope,
+    /// with the same fields and conversions as `get_manifest`, from one query
+    /// and one connection checkout. The previous shape held the id query's
+    /// client while calling `get_manifest` per row, so on a one-connection
+    /// pool the list stalled until the pool wait timed out.
+    #[tokio::test]
+    async fn postgres_list_manifests_uses_one_connection_and_preserves_scope_order_and_values() {
+        use chrono::SubsecRound;
+        use helios_persistence::core::{
+            BulkSubmitProvider, ManifestPhase, ManifestStatus, SubmissionId,
+        };
+
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        // A pool of one: the list must fit in a single checkout. The shared
+        // container already ran `init_schema`; this backend must not.
+        let backend = create_backend_with_max_connections(1).await;
+        let tenant = create_tenant("list-manifests-one-query");
+        let submission = SubmissionId::new("list-manifests-submitter", "list-manifests-submission");
+        let tenant_id = tenant.tenant_id().as_str();
+
+        // Scope neighbours sharing one identifier each with the target scope:
+        // the same submitter and submission under another tenant, another
+        // submitter under this tenant, and another submission of this
+        // submitter.
+        let other_tenant = create_tenant("list-manifests-one-query-neighbour");
+        let other_submitter = SubmissionId::new(
+            "list-manifests-other-submitter",
+            "list-manifests-submission",
+        );
+        let other_submission = SubmissionId::new(
+            "list-manifests-submitter",
+            "list-manifests-other-submission",
+        );
+        for (neighbour_tenant, neighbour_submission) in [
+            (&other_tenant, &submission),
+            (&tenant, &other_submitter),
+            (&tenant, &other_submission),
+        ] {
+            backend
+                .create_submission(neighbour_tenant, neighbour_submission, None)
+                .await
+                .unwrap();
+            backend
+                .add_manifest(
+                    neighbour_tenant,
+                    neighbour_submission,
+                    Some("https://provider/neighbour.json"),
+                    None,
+                )
+                .await
+                .unwrap();
+            // The neighbour rows only have to prove the scope filters, so
+            // finish them right away: a `pending` manifest left in a scope
+            // that can be claimed again would contaminate later claim tests
+            // once this test releases the lock.
+            assert_eq!(
+                backend
+                    .abort_submission(neighbour_tenant, neighbour_submission, "test cleanup")
+                    .await
+                    .unwrap(),
+                1,
+                "the neighbour manifest must end terminal"
+            );
+        }
+
+        // Empty scope.
+        let listed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            backend.list_manifests(&tenant, &submission),
+        )
+        .await
+        .expect("an empty scope must not stall a one-connection pool")
+        .unwrap();
+        assert!(listed.is_empty());
+
+        backend
+            .create_submission(&tenant, &submission, None)
+            .await
+            .unwrap();
+
+        // One manifest with every field set.
+        let one = backend
+            .add_manifest(
+                &tenant,
+                &submission,
+                Some("https://provider/one.json"),
+                None,
+            )
+            .await
+            .unwrap();
+        // Postgres `TIMESTAMPTZ` keeps microseconds, so pin every expectation
+        // at that precision instead of comparing against the nanosecond clock.
+        let base = chrono::Utc::now().trunc_subsecs(6);
+        let one_added_at = base + chrono::Duration::seconds(30);
+        let one_lease_expiry = base + chrono::Duration::seconds(120);
+        {
+            let client = backend.get_client().await.unwrap();
+            client
+                .execute(
+                    "UPDATE bulk_manifests
+                     SET manifest_url = $5, replaces_manifest_url = $6, status = $7, added_at = $8,
+                         total_entries = $9, processed_entries = $10, failed_entries = $11,
+                         lease_expiry = $12, bytes_processed = $13, bytes_total = $14,
+                         phase = $15, files_done = $16, files_total = $17
+                     WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4",
+                    &[
+                        &tenant_id,
+                        &submission.submitter,
+                        &submission.submission_id,
+                        &one.manifest_id,
+                        &Some("https://provider/one.json"),
+                        &Some("https://provider/replaced.json"),
+                        &"processing",
+                        &one_added_at,
+                        &7_i32,
+                        &5_i32,
+                        &2_i32,
+                        &Some(one_lease_expiry),
+                        &512_i64,
+                        &4096_i64,
+                        &Some("downloading"),
+                        &1_i64,
+                        &3_i64,
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+
+        let listed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            backend.list_manifests(&tenant, &submission),
+        )
+        .await
+        .expect("one manifest must not stall a one-connection pool")
+        .unwrap();
+        assert_eq!(
+            listed.len(),
+            1,
+            "only the target scope's manifests are listed"
+        );
+        let manifest = &listed[0];
+        assert_eq!(manifest.manifest_id, one.manifest_id);
+        assert_eq!(
+            manifest.manifest_url.as_deref(),
+            Some("https://provider/one.json")
+        );
+        assert_eq!(
+            manifest.replaces_manifest_url.as_deref(),
+            Some("https://provider/replaced.json")
+        );
+        assert_eq!(manifest.status, ManifestStatus::Processing);
+        assert_eq!(manifest.added_at, one_added_at);
+        assert_eq!(manifest.total_entries, 7);
+        assert_eq!(manifest.processed_entries, 5);
+        assert_eq!(manifest.failed_entries, 2);
+        assert_eq!(manifest.lease_expiry, Some(one_lease_expiry));
+        assert_eq!(manifest.bytes_processed, 512);
+        assert_eq!(manifest.bytes_total, 4096);
+        assert_eq!(manifest.phase, Some(ManifestPhase::Downloading));
+        assert_eq!(manifest.files_done, 1);
+        assert_eq!(manifest.files_total, 3);
+
+        // Several manifests, with timestamps whose order is not insertion
+        // order, plus the conversion edges: i32 totals sign-extend, byte and
+        // file counts clamp at zero.
+        let middle = backend
+            .add_manifest(
+                &tenant,
+                &submission,
+                None,
+                Some("https://provider/old.json"),
+            )
+            .await
+            .unwrap();
+        let negative = backend
+            .add_manifest(
+                &tenant,
+                &submission,
+                Some("https://provider/negative.json"),
+                None,
+            )
+            .await
+            .unwrap();
+        let middle_added_at = base + chrono::Duration::seconds(20);
+        let negative_added_at = base + chrono::Duration::seconds(10);
+        let middle_lease_expiry = base + chrono::Duration::seconds(60);
+        {
+            let client = backend.get_client().await.unwrap();
+            client
+                .execute(
+                    "UPDATE bulk_manifests
+                     SET manifest_url = NULL, status = $5, added_at = $6, total_entries = $7,
+                         processed_entries = $8, failed_entries = $9, lease_expiry = $10,
+                         bytes_total = $11, phase = $12, files_total = $13
+                     WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4",
+                    &[
+                        &tenant_id,
+                        &submission.submitter,
+                        &submission.submission_id,
+                        &middle.manifest_id,
+                        &"failed",
+                        &middle_added_at,
+                        &0_i32,
+                        &0_i32,
+                        &1_i32,
+                        &Some(middle_lease_expiry),
+                        &-1_i64,
+                        &Some("sizing"),
+                        &2_i64,
+                    ],
+                )
+                .await
+                .unwrap();
+            client
+                .execute(
+                    "UPDATE bulk_manifests
+                     SET replaces_manifest_url = NULL, status = $5, added_at = $6,
+                         total_entries = $7, processed_entries = $8, failed_entries = $9,
+                         lease_expiry = NULL, bytes_processed = $10, bytes_total = $11,
+                         phase = $12, files_done = $13, files_total = $14
+                     WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4",
+                    &[
+                        &tenant_id,
+                        &submission.submitter,
+                        &submission.submission_id,
+                        &negative.manifest_id,
+                        &"replaced",
+                        &negative_added_at,
+                        &-1_i32,
+                        &-2_i32,
+                        &0_i32,
+                        &-5_i64,
+                        &0_i64,
+                        &None::<String>,
+                        &-3_i64,
+                        &-4_i64,
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+
+        let listed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            backend.list_manifests(&tenant, &submission),
+        )
+        .await
+        .expect("several manifests must not stall a one-connection pool")
+        .unwrap();
+        let ids: Vec<&str> = listed.iter().map(|m| m.manifest_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                negative.manifest_id.as_str(),
+                middle.manifest_id.as_str(),
+                one.manifest_id.as_str(),
+            ],
+            "ORDER BY added_at, not insertion order"
+        );
+
+        let negative_row = &listed[0];
+        assert_eq!(
+            negative_row.manifest_url.as_deref(),
+            Some("https://provider/negative.json")
+        );
+        assert_eq!(negative_row.replaces_manifest_url, None);
+        assert_eq!(negative_row.status, ManifestStatus::Replaced);
+        assert_eq!(negative_row.added_at, negative_added_at);
+        assert_eq!(
+            negative_row.total_entries,
+            u64::MAX,
+            "-1i32 as u64 sign-extends, exactly as get_manifest converts it"
+        );
+        assert_eq!(negative_row.processed_entries, u64::MAX - 1);
+        assert_eq!(negative_row.failed_entries, 0);
+        assert_eq!(negative_row.lease_expiry, None);
+        assert_eq!(
+            negative_row.bytes_processed, 0,
+            "negative byte counts clamp to zero"
+        );
+        assert_eq!(negative_row.bytes_total, 0);
+        assert_eq!(negative_row.phase, None);
+        assert_eq!(negative_row.files_done, 0);
+        assert_eq!(negative_row.files_total, 0);
+
+        let middle_row = &listed[1];
+        assert_eq!(middle_row.manifest_url, None);
+        assert_eq!(
+            middle_row.replaces_manifest_url.as_deref(),
+            Some("https://provider/old.json")
+        );
+        assert_eq!(middle_row.status, ManifestStatus::Failed);
+        assert_eq!(middle_row.added_at, middle_added_at);
+        assert_eq!(middle_row.failed_entries, 1);
+        assert_eq!(middle_row.lease_expiry, Some(middle_lease_expiry));
+        assert_eq!(middle_row.bytes_total, 0, "a -1 byte total clamps to zero");
+        assert_eq!(middle_row.phase, Some(ManifestPhase::Sizing));
+        assert_eq!(middle_row.files_total, 2);
+
+        // Every listed row must decode exactly like a sequential read taken
+        // after the list has finished.
+        for listed_manifest in &listed {
+            let sequential = backend
+                .get_manifest(&tenant, &submission, &listed_manifest.manifest_id)
+                .await
+                .unwrap()
+                .expect("every listed manifest is individually readable");
+            assert_eq!(
+                serde_json::to_value(listed_manifest).unwrap(),
+                serde_json::to_value(&sequential).unwrap(),
+                "list_manifests decoded {} differently from get_manifest",
+                listed_manifest.manifest_id
+            );
+        }
+
+        // Leave no unleased `processing` row for a later claim test to pick up.
+        assert_eq!(
+            backend
+                .abort_submission(&tenant, &submission, "test cleanup")
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    /// #1144: the row decoder keeps the per-field semantics `get_manifest`
+    /// always had — an unknown `phase` degrades to `None` because it is a
+    /// cosmetic hint (#953), while an unknown `status` stays an error.
+    #[tokio::test]
+    async fn postgres_list_manifests_preserves_unknown_status_and_phase_semantics() {
+        use helios_persistence::core::{BulkSubmitProvider, ManifestStatus, SubmissionId};
+
+        fn internal_message(error: &StorageError) -> &str {
+            match error {
+                StorageError::Backend(BackendError::Internal { message, .. }) => message,
+                other => panic!("expected an internal backend error, got {other:?}"),
+            }
+        }
+
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        let backend = create_backend_with_max_connections(1).await;
+        let tenant = create_tenant("list-manifests-unknown-values");
+        let submission = SubmissionId::new(
+            "list-manifests-unknown",
+            "list-manifests-unknown-submission",
+        );
+        let tenant_id = tenant.tenant_id().as_str();
+
+        backend
+            .create_submission(&tenant, &submission, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(
+                &tenant,
+                &submission,
+                Some("https://provider/unknown-phase.json"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // A hand-edited phase from a newer HFS must not fail the read.
+        {
+            let client = backend.get_client().await.unwrap();
+            client
+                .execute(
+                    "UPDATE bulk_manifests SET status = 'processing', phase = 'hand-edited-phase'
+                     WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4",
+                    &[
+                        &tenant_id,
+                        &submission.submitter,
+                        &submission.submission_id,
+                        &manifest.manifest_id,
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+
+        let listed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            backend.list_manifests(&tenant, &submission),
+        )
+        .await
+        .expect("an unknown phase must not stall the list")
+        .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status, ManifestStatus::Processing);
+        assert_eq!(
+            listed[0].phase, None,
+            "an unknown phase degrades to no phase"
+        );
+        assert_eq!(
+            backend
+                .get_manifest(&tenant, &submission, &manifest.manifest_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .phase,
+            None,
+            "list_manifests and get_manifest agree on an unknown phase"
+        );
+
+        // An unreadable status stays an error: a corrupt row must not turn
+        // into a listed manifest.
+        {
+            let client = backend.get_client().await.unwrap();
+            client
+                .execute(
+                    "UPDATE bulk_manifests SET status = 'frozen'
+                     WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4",
+                    &[
+                        &tenant_id,
+                        &submission.submitter,
+                        &submission.submission_id,
+                        &manifest.manifest_id,
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+
+        let list_error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            backend.list_manifests(&tenant, &submission),
+        )
+        .await
+        .expect("an unknown status must fail the list, not stall it")
+        .unwrap_err();
+        let get_error = backend
+            .get_manifest(&tenant, &submission, &manifest.manifest_id)
+            .await
+            .unwrap_err();
+        for error in [&list_error, &get_error] {
+            assert_eq!(
+                internal_message(error),
+                "Invalid manifest status: frozen",
+                "the status error must be reported verbatim by both reads"
+            );
+        }
+    }
+
     /// Shared PostgreSQL container reused across all tests in this module.
     struct SharedPg {
         host: String,
         port: u16,
         /// Kept alive for the duration of the test binary. NOTE: a `static` is
         /// never dropped, so `Drop for ContainerAsync` — testcontainers' only
-        /// container-removal path — never runs. The container outlives the test
-        /// process and is reaped in CI by its `github.run_id` label.
+        /// container-removal path — never runs. The `container_cleanup` exit
+        /// hook removes it at process exit.
         _container: testcontainers::ContainerAsync<Postgres>,
     }
 
@@ -1920,12 +2422,16 @@ mod postgres_integration {
                 // postgres:11, which is EOL and predates `plan_cache_mode` — a GUC
                 // the backend sends as a startup option, so PG 11 rejects every
                 // connection FATAL. The rest of the repo runs 16.
-                let container = Postgres::default()
-                    .with_tag("16-alpine")
-                    .with_label("github.run_id", &run_id)
-                    .start()
-                    .await
-                    .expect("Failed to start PostgreSQL container");
+                // `SHARED_PG` is a static and never dropped; the cleanup label
+                // lets the exit hook remove the container.
+                let container = super::container_cleanup::with_cleanup_label(
+                    Postgres::default()
+                        .with_tag("16-alpine")
+                        .with_label("github.run_id", &run_id),
+                )
+                .start()
+                .await
+                .expect("Failed to start PostgreSQL container");
 
                 let port = container
                     .get_host_port_ipv4(5432)
@@ -2011,6 +2517,402 @@ mod postgres_integration {
     fn create_tenant(id: &str) -> TenantContext {
         let unique_id = format!("{}_{}", id, uuid::Uuid::new_v4().simple());
         TenantContext::new(TenantId::new(&unique_id), TenantPermissions::full_access())
+    }
+
+    #[tokio::test]
+    async fn postgres_bulk_submit_status_uses_the_complete_identity_and_preserves_summary() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use helios_persistence::composite::{
+            CompositeConfig, CompositeStorage, CompositeSubmitJobs, DynStorage,
+        };
+        use helios_persistence::core::{
+            BulkSubmitJobStore, BulkSubmitProvider, SubmissionId, SubmissionStatus,
+        };
+
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        let backend = Arc::new(create_backend().await);
+        let tenant = create_tenant("bulk-submit-status");
+        let other_tenant = create_tenant("bulk-submit-status-other-tenant");
+        let submission = SubmissionId::new("status-submitter", "status-id");
+        let other_submitter = SubmissionId::new("other-submitter", "status-id");
+        let other_submission = SubmissionId::new("status-submitter", "other-status-id");
+        let metadata = json!({"source": "status-test"});
+
+        backend
+            .create_submission(&tenant, &submission, Some(metadata.clone()))
+            .await
+            .unwrap();
+        backend
+            .create_submission(&other_tenant, &submission, None)
+            .await
+            .unwrap();
+        backend
+            .create_submission(&tenant, &other_submitter, None)
+            .await
+            .unwrap();
+        backend
+            .create_submission(&tenant, &other_submission, None)
+            .await
+            .unwrap();
+
+        let client = backend.get_client().await.unwrap();
+        for (row_tenant, id, status) in [
+            (&other_tenant, &submission, "complete"),
+            (&tenant, &other_submitter, "aborted"),
+            (&tenant, &other_submission, "complete"),
+        ] {
+            let tenant_id = row_tenant.tenant_id().as_str();
+            client
+                .execute(
+                    "UPDATE bulk_submissions SET status = $4
+                     WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3",
+                    &[
+                        &tenant_id,
+                        &id.submitter.as_str(),
+                        &id.submission_id.as_str(),
+                        &status,
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            backend
+                .get_submission_status(&tenant, &submission)
+                .await
+                .unwrap(),
+            Some(SubmissionStatus::InProgress)
+        );
+        assert_eq!(
+            backend
+                .get_submission_status(&other_tenant, &submission)
+                .await
+                .unwrap(),
+            Some(SubmissionStatus::Complete)
+        );
+        assert_eq!(
+            backend
+                .get_submission_status(&tenant, &other_submitter)
+                .await
+                .unwrap(),
+            Some(SubmissionStatus::Aborted)
+        );
+        assert_eq!(
+            backend
+                .get_submission_status(&tenant, &other_submission)
+                .await
+                .unwrap(),
+            Some(SubmissionStatus::Complete)
+        );
+        assert_eq!(
+            backend
+                .get_submission_status(&tenant, &SubmissionId::new("status-submitter", "missing"),)
+                .await
+                .unwrap(),
+            None
+        );
+
+        let manifest = backend
+            .add_manifest(
+                &tenant,
+                &submission,
+                Some("https://provider/status.json"),
+                None,
+            )
+            .await
+            .unwrap();
+        let tenant_id = tenant.tenant_id().as_str();
+        for (line, outcome) in [
+            (1_i32, "success"),
+            (2, "validation-error"),
+            (3, "processing-error"),
+            (4, "skipped"),
+        ] {
+            let file_url = format!("https://provider/status-{line}.ndjson");
+            let resource_id = format!("status-{line}");
+            client
+                .execute(
+                    "INSERT INTO bulk_entry_results
+                     (tenant_id, submitter, submission_id, manifest_id, file_url,
+                      line_number, resource_type, resource_id, outcome)
+                     VALUES ($1, $2, $3, $4, $5, $6, 'Patient', $7, $8)",
+                    &[
+                        &tenant_id,
+                        &submission.submitter.as_str(),
+                        &submission.submission_id.as_str(),
+                        &manifest.manifest_id.as_str(),
+                        &file_url,
+                        &line,
+                        &resource_id,
+                        &outcome,
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+        // #1127: the summary is served from the manifest counters, not from an
+        // aggregate over `bulk_entry_results` on every poll. The receipts above
+        // stay: they are the pagination surface, and leaving them proves the
+        // summary no longer reads them. These counters are what the batch that
+        // committed those receipts would have charged.
+        client
+            .execute(
+                "UPDATE bulk_manifests SET
+                    total_entries = 4, processed_entries = 1,
+                    failed_entries = 2, skipped_entries = 1
+                 WHERE tenant_id = $1 AND submitter = $2
+                   AND submission_id = $3 AND manifest_id = $4",
+                &[
+                    &tenant_id,
+                    &submission.submitter.as_str(),
+                    &submission.submission_id.as_str(),
+                    &manifest.manifest_id.as_str(),
+                ],
+            )
+            .await
+            .unwrap();
+        let summary = backend
+            .get_submission(&tenant, &submission)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.metadata, Some(metadata));
+        assert_eq!(summary.manifest_count, 1);
+        assert_eq!(summary.total_entries, 4);
+        assert_eq!(summary.success_count, 1);
+        assert_eq!(summary.error_count, 2);
+        assert_eq!(summary.skipped_count, 1);
+
+        let config = CompositeConfig::builder()
+            .primary("postgres", BackendKind::Postgres)
+            .build()
+            .unwrap();
+        let mut backends = HashMap::new();
+        backends.insert("postgres".to_string(), backend.clone() as DynStorage);
+        let composite = Arc::new(CompositeStorage::new(config, backends).unwrap());
+        let jobs =
+            CompositeSubmitJobs::new(backend.clone() as Arc<dyn BulkSubmitJobStore>, composite);
+        assert_eq!(
+            jobs.get_submission_status(&tenant, &submission)
+                .await
+                .unwrap(),
+            Some(SubmissionStatus::InProgress)
+        );
+
+        let corrupt = SubmissionId::generate("corrupt-status");
+        backend
+            .create_submission(&tenant, &corrupt, None)
+            .await
+            .unwrap();
+        client
+            .execute(
+                "UPDATE bulk_submissions SET status = 'invalid-status'
+                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3",
+                &[
+                    &tenant_id,
+                    &corrupt.submitter.as_str(),
+                    &corrupt.submission_id.as_str(),
+                ],
+            )
+            .await
+            .unwrap();
+        let error = backend
+            .get_submission_status(&tenant, &corrupt)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Invalid status: invalid-status"));
+    }
+
+    /// #1151: completing a submission must release its only pooled connection
+    /// before a caller performs the separate summary read. The production
+    /// contract returns `()`; this regression exercises that transition with a
+    /// one-connection pool and then verifies the persisted summary in a second
+    /// checkout.
+    #[tokio::test]
+    async fn postgres_complete_submission_uses_one_connection_and_preserves_scope_and_summary() {
+        use std::time::Duration;
+
+        use helios_persistence::core::{
+            BulkSubmitProvider, ManifestStatus, SubmissionId, SubmissionStatus,
+        };
+        use helios_persistence::error::{BulkSubmitError, StorageError};
+
+        fn assert_already_complete(error: StorageError, expected: &SubmissionId) {
+            match error {
+                StorageError::BulkSubmit(BulkSubmitError::AlreadyComplete { submission_id }) => {
+                    assert_eq!(submission_id, expected.submission_id)
+                }
+                other => panic!("expected AlreadyComplete, got {other:?}"),
+            }
+        }
+
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        let backend = create_backend_with_max_connections(1).await;
+        let tenant = create_tenant("complete-submission-one-connection");
+        let other_tenant = create_tenant("complete-submission-other-tenant");
+        let submission = SubmissionId::new("completion-submitter", "shared-submission-id");
+        let other_submitter =
+            SubmissionId::new("completion-other-submitter", "shared-submission-id");
+        let aborted = SubmissionId::new("completion-submitter", "aborted-submission-id");
+        let missing = SubmissionId::new("completion-submitter", "missing-submission-id");
+        let metadata = json!({
+            "source": "issue-1151",
+            "nested": { "preserved": true }
+        });
+
+        backend
+            .create_submission(&tenant, &submission, Some(metadata.clone()))
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(
+                &tenant,
+                &submission,
+                Some("https://provider.example/issue-1151-manifest.json"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // These neighbours overlap the target's submission identifier. A
+        // completion scoped by fewer than tenant + submitter + submission id
+        // would incorrectly transition at least one of them.
+        backend
+            .create_submission(&other_tenant, &submission, None)
+            .await
+            .unwrap();
+        backend
+            .create_submission(&tenant, &other_submitter, None)
+            .await
+            .unwrap();
+        backend
+            .create_submission(&tenant, &aborted, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .abort_submission(&tenant, &aborted, "terminal-state regression")
+                .await
+                .unwrap(),
+            0
+        );
+
+        // `get_submission` reads these persisted manifest counters directly.
+        // Keep the raw client inside this narrow scope so the one pooled
+        // connection is available to `complete_submission` below.
+        {
+            let client = backend.get_client().await.unwrap();
+            let tenant_id = tenant.tenant_id().as_str();
+            let updated = client
+                .execute(
+                    "UPDATE bulk_manifests SET
+                        status = 'completed', total_entries = 12,
+                        processed_entries = 7, failed_entries = 3,
+                        skipped_entries = 2
+                     WHERE tenant_id = $1 AND submitter = $2
+                       AND submission_id = $3 AND manifest_id = $4",
+                    &[
+                        &tenant_id,
+                        &submission.submitter.as_str(),
+                        &submission.submission_id.as_str(),
+                        &manifest.manifest_id.as_str(),
+                    ],
+                )
+                .await
+                .unwrap();
+            assert_eq!(updated, 1);
+        }
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            backend.complete_submission(&tenant, &submission),
+        )
+        .await
+        .expect("complete_submission must not wait for a second pool connection")
+        .unwrap();
+
+        let summary = backend
+            .get_submission(&tenant, &submission)
+            .await
+            .unwrap()
+            .expect("completed submission must remain readable");
+        assert_eq!(summary.id, submission);
+        assert_eq!(summary.status, SubmissionStatus::Complete);
+        assert_eq!(summary.metadata, Some(metadata));
+        assert_eq!(summary.manifest_count, 1);
+        assert_eq!(summary.total_entries, 12);
+        assert_eq!(summary.success_count, 7);
+        assert_eq!(summary.error_count, 3);
+        assert_eq!(summary.skipped_count, 2);
+        let completed_at = summary
+            .completed_at
+            .as_ref()
+            .expect("completion timestamp must be persisted");
+        assert_eq!(completed_at, &summary.updated_at);
+        assert!(completed_at >= &summary.created_at);
+
+        let repeated_summary = backend
+            .get_submission(&tenant, &submission)
+            .await
+            .unwrap()
+            .expect("completed submission must remain readable repeatedly");
+        assert_eq!(
+            serde_json::to_value(&repeated_summary).unwrap(),
+            serde_json::to_value(&summary).unwrap(),
+            "a repeated full summary read must be stable"
+        );
+
+        let stored_manifest = backend
+            .get_manifest(&tenant, &submission, &manifest.manifest_id)
+            .await
+            .unwrap()
+            .expect("the target manifest must remain readable");
+        assert_eq!(stored_manifest.status, ManifestStatus::Completed);
+
+        for (neighbour_tenant, neighbour_submission) in
+            [(&other_tenant, &submission), (&tenant, &other_submitter)]
+        {
+            let neighbour = backend
+                .get_submission(neighbour_tenant, neighbour_submission)
+                .await
+                .unwrap()
+                .expect("identity neighbour must remain readable");
+            assert_eq!(neighbour.status, SubmissionStatus::InProgress);
+            assert_eq!(neighbour.completed_at, None);
+        }
+
+        let missing_error = backend
+            .complete_submission(&tenant, &missing)
+            .await
+            .unwrap_err();
+        match missing_error {
+            StorageError::BulkSubmit(BulkSubmitError::SubmissionNotFound {
+                submitter,
+                submission_id,
+            }) => {
+                assert_eq!(submitter, missing.submitter);
+                assert_eq!(submission_id, missing.submission_id);
+            }
+            other => panic!("expected SubmissionNotFound, got {other:?}"),
+        }
+
+        assert_already_complete(
+            backend
+                .complete_submission(&tenant, &submission)
+                .await
+                .unwrap_err(),
+            &submission,
+        );
+        assert_already_complete(
+            backend
+                .complete_submission(&tenant, &aborted)
+                .await
+                .unwrap_err(),
+            &aborted,
+        );
     }
 
     #[tokio::test]
@@ -2702,6 +3604,544 @@ mod postgres_integration {
                 "duplicate history versions for {id2}: {versions:?}"
             );
         }
+    }
+
+    /// A writer that verified a stale version before waiting on the row lock
+    /// must fail with a version conflict after the winner commits. The
+    /// observer confirms that the wait really occurred, rather than allowing
+    /// this test to pass because the two updates happened sequentially.
+    #[tokio::test]
+    async fn postgres_transactional_update_conflict_after_verified_row_lock_wait() {
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(5).await;
+        let tenant = create_tenant("transactional-update-lock-wait");
+        let created = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "verified-row-lock-wait",
+                    "name": [{"family": "v1"}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.version_id(), "1");
+
+        let mut tx1 = backend
+            .begin_transaction(&tenant, TransactionOptions::new())
+            .await
+            .unwrap();
+        let mut tx2 = backend
+            .begin_transaction(&tenant, TransactionOptions::new())
+            .await
+            .unwrap();
+
+        let tx1_v1 = tx1
+            .read("Patient", created.id())
+            .await
+            .unwrap()
+            .expect("tx1 should read v1");
+        let tx2_v1 = tx2
+            .read("Patient", created.id())
+            .await
+            .unwrap()
+            .expect("tx2 should read v1");
+        assert_eq!(tx1_v1.version_id(), "1");
+        assert_eq!(tx2_v1.version_id(), "1");
+
+        let tx1_v2 = tx1
+            .update(
+                &tx1_v1,
+                json!({
+                    "resourceType": "Patient",
+                    "id": created.id(),
+                    "name": [{"family": "tx1-winner"}]
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tx1_v2.version_id(), "2");
+
+        let observer = reindex_test_client_for(&dbname).await;
+        let waiter = tokio::spawn(async move {
+            let result = tx2
+                .update(
+                    &tx2_v1,
+                    json!({
+                        "resourceType": "Patient",
+                        "id": "verified-row-lock-wait",
+                        "name": [{"family": "tx2-loser"}]
+                    }),
+                )
+                .await;
+            let rollback = Box::new(tx2).rollback().await;
+            (result, rollback)
+        });
+
+        let blocked = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let waiting: i64 = observer
+                    .query_one(
+                        "SELECT COUNT(*)
+                         FROM pg_stat_activity AS waiting
+                         WHERE waiting.datname = current_database()
+                           AND waiting.state = 'active'
+                           AND position('UPDATE resources SET version_id' IN waiting.query) > 0
+                           AND cardinality(pg_blocking_pids(waiting.pid)) > 0
+                           AND EXISTS (
+                               SELECT 1
+                               FROM pg_stat_activity AS blocker
+                               WHERE blocker.pid = ANY(pg_blocking_pids(waiting.pid))
+                                 AND blocker.datname = current_database()
+                                 AND blocker.state = 'idle in transaction'
+                           )",
+                        &[],
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .get(0);
+                if waiting > 0 {
+                    return Ok::<(), String>(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+
+        match blocked {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                let rollback = Box::new(tx1).rollback().await;
+                let waiter_result = waiter.await;
+                panic!(
+                    "observer failed while waiting for tx2's lock: {error}; tx1 rollback: {rollback:?}; tx2 result: {waiter_result:?}"
+                );
+            }
+            Err(error) => {
+                let rollback = Box::new(tx1).rollback().await;
+                let waiter_result = waiter.await;
+                panic!(
+                    "tx2 did not become blocked before timeout ({error:?}); tx1 rollback: {rollback:?}; tx2 result: {waiter_result:?}"
+                );
+            }
+        }
+
+        if let Err(error) = Box::new(tx1).commit().await {
+            let waiter_result = waiter.await;
+            panic!("tx1 commit failed: {error}; tx2 result: {waiter_result:?}");
+        }
+        let (tx2_result, tx2_rollback) = waiter.await.unwrap();
+        tx2_rollback.expect("tx2 rollback should release its connection");
+        assert!(
+            matches!(
+                &tx2_result,
+                Err(StorageError::Concurrency(ConcurrencyError::VersionConflict {
+                    expected_version,
+                    actual_version,
+                    ..
+                })) if expected_version == "1" && actual_version == "2"
+            ),
+            "tx2 should report the committed winner as a version conflict, got {tx2_result:?}"
+        );
+
+        let live = backend
+            .read(&tenant, "Patient", created.id())
+            .await
+            .unwrap()
+            .expect("the winning live resource should remain");
+        assert_eq!(live.version_id(), "2");
+        assert_eq!(live.content()["name"][0]["family"], "tx1-winner");
+
+        let history = backend
+            .history_instance(&tenant, "Patient", created.id(), &HistoryParams::default())
+            .await
+            .unwrap();
+        assert_eq!(history.items.len(), 2);
+        assert_eq!(history.items[0].resource.version_id(), "2");
+        assert_eq!(
+            history.items[0].resource.content()["name"][0]["family"],
+            "tx1-winner"
+        );
+        assert_eq!(history.items[1].resource.version_id(), "1");
+        assert_eq!(
+            history.items[1].resource.content()["name"][0]["family"],
+            "v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_transactional_update_succeeds_after_verified_blocker_rollback() {
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(5).await;
+        let tenant = create_tenant("transactional-update-blocker-rollback");
+        let created = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "verified-blocker-rollback",
+                    "name": [{"family": "v1"}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let mut tx1 = backend
+            .begin_transaction(&tenant, TransactionOptions::new())
+            .await
+            .unwrap();
+        let mut tx2 = backend
+            .begin_transaction(&tenant, TransactionOptions::new())
+            .await
+            .unwrap();
+        let tx1_v1 = tx1
+            .read("Patient", created.id())
+            .await
+            .unwrap()
+            .expect("tx1 should read v1");
+        let tx2_v1 = tx2
+            .read("Patient", created.id())
+            .await
+            .unwrap()
+            .expect("tx2 should read v1");
+
+        let tx1_v2 = tx1
+            .update(
+                &tx1_v1,
+                json!({
+                    "resourceType": "Patient",
+                    "id": created.id(),
+                    "name": [{"family": "tx1-rolled-back"}]
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tx1_v2.version_id(), "2");
+
+        let waiter = tokio::spawn(async move {
+            let updated = tx2
+                .update(
+                    &tx2_v1,
+                    json!({
+                        "resourceType": "Patient",
+                        "id": "verified-blocker-rollback",
+                        "name": [{"family": "tx2-winner"}]
+                    }),
+                )
+                .await;
+            let committed = if updated.is_ok() {
+                Box::new(tx2).commit().await
+            } else {
+                Box::new(tx2).rollback().await
+            };
+            (updated, committed)
+        });
+        let observer = reindex_test_client_for(&dbname).await;
+        let blocked = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let waiting: i64 = observer
+                    .query_one(
+                        "SELECT COUNT(*)
+                         FROM pg_stat_activity AS waiting
+                         WHERE waiting.datname = current_database()
+                           AND waiting.state = 'active'
+                           AND position('UPDATE resources SET version_id' IN waiting.query) > 0
+                           AND cardinality(pg_blocking_pids(waiting.pid)) > 0
+                           AND EXISTS (
+                               SELECT 1
+                               FROM pg_stat_activity AS blocker
+                               WHERE blocker.pid = ANY(pg_blocking_pids(waiting.pid))
+                                 AND blocker.datname = current_database()
+                                 AND blocker.state = 'idle in transaction'
+                           )",
+                        &[],
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .get(0);
+                if waiting > 0 {
+                    return Ok::<(), String>(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        if let Err(error) = blocked {
+            let _ = Box::new(tx1).rollback().await;
+            waiter.abort();
+            let _ = waiter.await;
+            panic!("tx2 did not become blocked before timeout: {error:?}");
+        }
+        if let Ok(Err(error)) = blocked {
+            let _ = Box::new(tx1).rollback().await;
+            waiter.abort();
+            let _ = waiter.await;
+            panic!("observer failed while waiting for tx2: {error}");
+        }
+
+        Box::new(tx1)
+            .rollback()
+            .await
+            .expect("tx1 rollback should release the row lock");
+        let (updated, committed) = tokio::time::timeout(std::time::Duration::from_secs(10), waiter)
+            .await
+            .expect("tx2 remained blocked after tx1 rollback")
+            .expect("tx2 task panicked");
+        let updated = updated.expect("tx2 update should win after rollback");
+        committed.expect("tx2 commit should succeed");
+        assert_eq!(updated.version_id(), "2");
+        assert_eq!(updated.content()["name"][0]["family"], "tx2-winner");
+
+        let live = backend
+            .read(&tenant, "Patient", created.id())
+            .await
+            .unwrap()
+            .expect("the tx2 resource should remain live");
+        assert_eq!(live.version_id(), "2");
+        assert_eq!(live.content()["name"][0]["family"], "tx2-winner");
+        let history = backend
+            .history_instance(&tenant, "Patient", created.id(), &HistoryParams::default())
+            .await
+            .unwrap();
+        assert_eq!(history.items.len(), 2);
+        assert_eq!(history.items[0].resource.version_id(), "2");
+        assert_eq!(
+            history.items[0].resource.content()["name"][0]["family"],
+            "tx2-winner"
+        );
+        assert_eq!(history.items[1].resource.version_id(), "1");
+        assert_eq!(
+            history.items[1].resource.content()["name"][0]["family"],
+            "v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_transactional_update_classifies_stale_missing_and_deleted() {
+        let backend = create_backend().await;
+        let tenant = create_tenant("transactional-update-classification");
+
+        let stale = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"tx-stale","active":true}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let winner = backend
+            .update(
+                &tenant,
+                &stale,
+                json!({"resourceType":"Patient","id":"tx-stale","active":false}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(winner.version_id(), "2");
+        let mut stale_tx = backend
+            .begin_transaction(&tenant, TransactionOptions::new())
+            .await
+            .unwrap();
+        let stale_error = stale_tx
+            .update(
+                &stale,
+                json!({"resourceType":"Patient","id":"tx-stale","active":true}),
+            )
+            .await
+            .expect_err("stale live resource must conflict");
+        assert!(matches!(
+            stale_error,
+            StorageError::Concurrency(ConcurrencyError::VersionConflict {
+                expected_version,
+                actual_version,
+                ..
+            }) if expected_version == "1" && actual_version == "2"
+        ));
+        Box::new(stale_tx).rollback().await.unwrap();
+
+        let missing = helios_persistence::types::StoredResource::new(
+            "Patient",
+            "tx-missing",
+            tenant.tenant_id().clone(),
+            json!({"resourceType":"Patient","id":"tx-missing"}),
+            FhirVersion::default(),
+        );
+        let mut missing_tx = backend
+            .begin_transaction(&tenant, TransactionOptions::new())
+            .await
+            .unwrap();
+        let missing_error = missing_tx
+            .update(&missing, missing.content().clone())
+            .await
+            .expect_err("missing resource must be not found");
+        assert!(matches!(
+            missing_error,
+            StorageError::Resource(ResourceError::NotFound { ref id, .. }) if id == "tx-missing"
+        ));
+        Box::new(missing_tx).rollback().await.unwrap();
+
+        let deleted = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"tx-deleted","active":true}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .delete(&tenant, "Patient", deleted.id())
+            .await
+            .unwrap();
+        let mut deleted_tx = backend
+            .begin_transaction(&tenant, TransactionOptions::new())
+            .await
+            .unwrap();
+        let deleted_error = deleted_tx
+            .update(
+                &deleted,
+                json!({"resourceType":"Patient","id":"tx-deleted","active":false}),
+            )
+            .await
+            .expect_err("soft-deleted resource must be not found");
+        assert!(matches!(
+            deleted_error,
+            StorageError::Resource(ResourceError::NotFound { ref id, .. }) if id == "tx-deleted"
+        ));
+        Box::new(deleted_tx).rollback().await.unwrap();
+
+        assert_eq!(
+            backend
+                .history_instance(&tenant, "Patient", "tx-stale", &HistoryParams::default())
+                .await
+                .unwrap()
+                .items
+                .len(),
+            2,
+            "stale update must not add history"
+        );
+        assert!(
+            backend
+                .history_instance(&tenant, "Patient", "tx-missing", &HistoryParams::default())
+                .await
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        assert_eq!(
+            backend
+                .history_instance(
+                    &tenant,
+                    "Patient",
+                    "tx-deleted",
+                    &HistoryParams::default().include_deleted(true),
+                )
+                .await
+                .unwrap()
+                .items
+                .len(),
+            2,
+            "deleted update must not add history beyond the tombstone"
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_transactional_update_preserves_sequential_versions_and_metadata() {
+        let backend = create_backend().await;
+        let tenant = create_tenant("transactional-update-sequential");
+        let started = chrono::Utc::now();
+        let v1 = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"tx-sequential","name":[{"family":"one"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (v1.resource_type(), v1.id(), v1.version_id()),
+            ("Patient", "tx-sequential", "1")
+        );
+        assert_eq!(v1.fhir_version(), FhirVersion::R4);
+
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::new())
+            .await
+            .unwrap();
+        let read_v1 = tx.read("Patient", v1.id()).await.unwrap().unwrap();
+        let v2 = tx
+            .update(
+                &read_v1,
+                json!({"resourceType":"Observation","id":"wrong","name":[{"family":"two"}]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (v2.resource_type(), v2.id(), v2.version_id()),
+            ("Patient", "tx-sequential", "2")
+        );
+        assert_eq!(v2.fhir_version(), FhirVersion::R4);
+        Box::new(tx).commit().await.unwrap();
+
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::new())
+            .await
+            .unwrap();
+        let read_v2 = tx.read("Patient", v1.id()).await.unwrap().unwrap();
+        let v3 = tx
+            .update(
+                &read_v2,
+                json!({"resourceType":"Patient","id":"other","name":[{"family":"three"}]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (v3.resource_type(), v3.id(), v3.version_id()),
+            ("Patient", "tx-sequential", "3")
+        );
+        assert_eq!(v3.fhir_version(), FhirVersion::R4);
+        Box::new(tx).commit().await.unwrap();
+
+        let live = backend
+            .read(&tenant, "Patient", v1.id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.version_id(), "3");
+        assert_eq!(live.content()["name"][0]["family"], "three");
+        assert_eq!(live.content()["resourceType"], "Patient");
+        assert_eq!(live.content()["id"], "tx-sequential");
+        assert_eq!(live.fhir_version(), FhirVersion::R4);
+        assert!(live.last_modified() >= v2.last_modified());
+        assert!(live.last_modified() >= v1.last_modified());
+        assert!(v1.last_modified() >= started);
+        let body = live.content_with_meta();
+        assert_eq!(body["meta"]["versionId"], "3");
+        assert!(body["meta"]["lastUpdated"].as_str().is_some());
+
+        let history = backend
+            .history_instance(&tenant, "Patient", v1.id(), &HistoryParams::default())
+            .await
+            .unwrap();
+        assert_eq!(history.items.len(), 3);
+        let expected = [("3", "three"), ("2", "two"), ("1", "one")];
+        for (entry, (version, family)) in history.items.iter().zip(expected) {
+            assert_eq!(entry.resource.version_id(), version);
+            assert_eq!(entry.resource.resource_type(), "Patient");
+            assert_eq!(entry.resource.id(), "tx-sequential");
+            assert_eq!(entry.resource.fhir_version(), FhirVersion::R4);
+            assert_eq!(entry.resource.content()["resourceType"], "Patient");
+            assert_eq!(entry.resource.content()["id"], "tx-sequential");
+            assert_eq!(entry.resource.content()["name"][0]["family"], family);
+            assert!(entry.timestamp >= started);
+        }
+        assert!(history.items[2].timestamp <= history.items[1].timestamp);
+        assert!(history.items[1].timestamp <= history.items[0].timestamp);
     }
 
     #[tokio::test]
@@ -4403,6 +5843,174 @@ mod postgres_integration {
             ids,
             vec!["female1", "none1"],
             "gender:not=male → non-male incl. resources with no gender"
+        );
+    }
+
+    /// #1092: `_id` is dispatched by name into a dedicated builder
+    /// (`build_id_condition`) that bypassed the generic `:not` handling
+    /// entirely, so `_id:not=<id>` returned *only* the resource the caller
+    /// asked to exclude — the precise inverse of the request.
+    #[tokio::test]
+    async fn postgres_integration_search_id_not_excludes_listed_ids() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue, TotalMode,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        for id in ["a", "b", "c"] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({ "resourceType": "Patient", "id": id }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::Not),
+            values: vec![SearchValue::eq("b")],
+            chain: vec![],
+            components: vec![],
+        });
+        query.total = Some(TotalMode::Accurate);
+
+        let result = backend.search(&tenant, &query).await.unwrap();
+        let mut ids: Vec<String> = result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a", "c"], "_id:not=b must exclude only b");
+        assert_eq!(result.total, Some(2));
+
+        let mut query_two = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::Not),
+            values: vec![SearchValue::eq("a"), SearchValue::eq("b")],
+            chain: vec![],
+            components: vec![],
+        });
+        query_two.total = Some(TotalMode::Accurate);
+
+        let result_two = backend.search(&tenant, &query_two).await.unwrap();
+        let ids_two: Vec<String> = result_two
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        assert_eq!(ids_two, vec!["c"], "_id:not=a,b must exclude both a and b");
+        assert_eq!(result_two.total, Some(1));
+    }
+
+    /// #1092: modifiers the `_id` builder cannot honour must be rejected
+    /// rather than silently degrading to a positive match (mirrors
+    /// #1055/#1091's MongoDB `metadata_param_honoured` gate).
+    #[tokio::test]
+    async fn postgres_integration_search_id_unsupported_modifier_is_rejected() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::error::{SearchError, StorageError};
+        use helios_persistence::types::{
+            SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({ "resourceType": "Patient", "id": "a" }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::Text),
+            values: vec![SearchValue::eq("a")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let err = backend.search(&tenant, &query).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StorageError::Search(SearchError::UnsupportedModifier { ref modifier, .. })
+                    if modifier == "text"
+            ),
+            "_id:text must be rejected as an unsupported modifier, got: {err:?}"
+        );
+    }
+
+    /// `_lastUpdated` is dispatched by name into a dedicated builder that
+    /// reads only `param.values`, so a modifier other than `:missing` would
+    /// be dropped and the value consumed as a plain positive date match. It
+    /// must be rejected up front instead, the same way unsupported `_id`
+    /// modifiers are (#1092 follow-up).
+    #[tokio::test]
+    async fn postgres_integration_search_last_updated_unsupported_modifier_is_rejected() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::error::{SearchError, StorageError};
+        use helios_persistence::types::{
+            SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({ "resourceType": "Patient", "id": "a" }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_lastUpdated".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: Some(SearchModifier::Not),
+            values: vec![SearchValue::eq("2020")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let err = backend.search(&tenant, &query).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StorageError::Search(SearchError::UnsupportedModifier { ref modifier, .. })
+                    if modifier == "not"
+            ),
+            "_lastUpdated:not must be rejected as an unsupported modifier, got: {err:?}"
+        );
+
+        let err = backend.search_count(&tenant, &query).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StorageError::Search(SearchError::UnsupportedModifier { ref modifier, .. })
+                    if modifier == "not"
+            ),
+            "search_count must reject _lastUpdated:not as well, got: {err:?}"
         );
     }
 
@@ -6242,6 +7850,7 @@ mod postgres_integration {
                 "identifier=http://hospital.org/mrn|MRN-UPDATE-1",
                 false,
                 FhirVersion::default(),
+                &helios_persistence::core::EntityTagPrecondition::Absent,
             )
             .await
             .unwrap();
@@ -6469,6 +8078,7 @@ mod postgres_integration {
                 &tenant,
                 "Patient",
                 "identifier=http://hospital.org/mrn|MRN-DELETE-1",
+                &helios_persistence::core::EntityTagPrecondition::Absent,
             )
             .await
             .unwrap();
@@ -6729,9 +8339,137 @@ mod postgres_integration {
         assert_eq!(fts_rows, 1, "the follow-up generation duplicated FTS rows");
     }
 
-    #[tokio::test]
+    /// The narrative token a page fixture carries: one indexable word, unique
+    /// per resource, so a full-text hit can only be that resource.
+    fn page_batch_term(index: usize) -> String {
+        format!("Pagebatch{index:02}marker")
+    }
+
+    /// Every `search_index` row a tenant owns, as JSON text, ordered — a
+    /// fingerprint the page path and the per-resource path must agree on.
+    async fn index_snapshot(client: &tokio_postgres::Client, tenant_id: &str) -> Vec<String> {
+        client
+            .query(
+                "SELECT to_jsonb(t)::text FROM search_index t
+                 WHERE tenant_id = $1 ORDER BY 1",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect()
+    }
+
+    /// Every `resource_fts` row a tenant owns, ordered, the same way.
+    async fn fts_snapshot(client: &tokio_postgres::Client, tenant_id: &str) -> Vec<String> {
+        client
+            .query(
+                "SELECT resource_id || '|' || narrative_tsvector::text
+                        || '|' || content_tsvector::text
+                 FROM resource_fts WHERE tenant_id = $1 ORDER BY 1",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect()
+    }
+
+    /// The ids a search parameter answers for in this tenant, sorted.
+    async fn search_hits(
+        backend: &PostgresBackend,
+        tenant: &TenantContext,
+        param_name: &str,
+        param_type: helios_persistence::types::SearchParamType,
+        value: &str,
+    ) -> Vec<String> {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{SearchParameter, SearchQuery, SearchValue};
+
+        let mut hits: Vec<String> = backend
+            .search(
+                tenant,
+                &SearchQuery::new("Patient").with_parameter(SearchParameter {
+                    name: param_name.to_string(),
+                    param_type,
+                    modifier: None,
+                    values: vec![SearchValue::eq(value)],
+                    chain: vec![],
+                    components: vec![],
+                }),
+            )
+            .await
+            .expect("search should succeed")
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        hits.sort();
+        hits
+    }
+
+    async fn text_hits(
+        backend: &PostgresBackend,
+        tenant: &TenantContext,
+        term: &str,
+    ) -> Vec<String> {
+        search_hits(
+            backend,
+            tenant,
+            "_text",
+            helios_persistence::types::SearchParamType::Special,
+            term,
+        )
+        .await
+    }
+
+    async fn content_hits(
+        backend: &PostgresBackend,
+        tenant: &TenantContext,
+        term: &str,
+    ) -> Vec<String> {
+        search_hits(
+            backend,
+            tenant,
+            "_content",
+            helios_persistence::types::SearchParamType::Special,
+            term,
+        )
+        .await
+    }
+
+    /// The exact error a page item produces when its document's `resourceType`
+    /// disagrees with the type it is declared as: the extractor's own message,
+    /// wrapped the way `write_search_entries` has always wrapped it. Asserting
+    /// the whole string is what keeps the prepared page reporting the same
+    /// error the sequential path reported before pages were pooled.
+    fn extraction_failure_text() -> String {
+        concat!(
+            "internal error in postgres: Search parameter extraction failed: ",
+            "Invalid resource: Resource type mismatch: expected Patient, got Observation"
+        )
+        .to_string()
+    }
+
+    /// Multi-threaded on purpose: the page path only spreads its preparation
+    /// across the pool inside a multi-thread runtime, so this is the run that
+    /// exercises the parallel branch wherever the host has the cores, while
+    /// the per-resource pass below is the sequential preparation of the same
+    /// resources.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn postgres_integration_reindex_page_batches_and_scopes_writes() {
         use helios_persistence::search::{ReindexSource, ReindexTarget};
+        use helios_persistence::types::StoredResource;
+
+        /// One item of the page — neither first nor last — whose extraction
+        /// fails outright: its document is an `Observation` while the page
+        /// declares it a `Patient`, which the extractor rejects before any
+        /// statement runs. A page that lost or reordered its per-item
+        /// outcomes cannot place the error here.
+        const FAILING_INDEX: usize = 9;
 
         let backend = create_backend().await;
         let tenant = create_tenant("reindex-page-batch");
@@ -6739,11 +8477,13 @@ mod postgres_integration {
         let tenant_id = tenant.tenant_id().as_str();
         let other_tenant_id = other_tenant.tenant_id().as_str();
 
-        for (id, family) in [
-            ("page-a", "Able"),
-            ("page-b", "Baker"),
-            ("outside", "Clark"),
-        ] {
+        // One full page: 18 resources, past the 16-item preparation threshold,
+        // so a host with cores prepares this page on the prepare pool and a
+        // host without falls back to the calling thread. Every assertion below
+        // holds either way, which is the parity requirement of #1142.
+        let ids: Vec<String> = (0..18).map(|i| format!("page-{i:02}")).collect();
+        let page_ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+        for (index, id) in ids.iter().enumerate() {
             backend
                 .create(
                     &tenant,
@@ -6751,11 +8491,28 @@ mod postgres_integration {
                     json!({
                         "resourceType": "Patient",
                         "id": id,
-                        "name": [{"family": family}],
+                        // A varying number of identifiers per resource, so
+                        // each produces a different number of index rows: a
+                        // page that loses its input order cannot pass the
+                        // per-resource row-count comparison below.
+                        "identifier": (0..=(index % 3))
+                            .map(|n| json!({
+                                "system": "http://hospital.example.org/mrn",
+                                "value": format!("MRN-{index}-{n}")
+                            }))
+                            .collect::<Vec<_>>(),
+                        "name": [{"family": format!("Family{index}")}],
+                        "text": {
+                            "status": "generated",
+                            "div": format!(
+                                "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p>{}.</p></div>",
+                                page_batch_term(index)
+                            )
+                        },
                         "contained": [{
                             "resourceType": "Practitioner",
                             "id": format!("contained-{id}"),
-                            "name": [{"family": format!("Contained {family}")}]
+                            "name": [{"family": format!("Contained {index}")}]
                         }]
                     }),
                     FhirVersion::default(),
@@ -6763,13 +8520,30 @@ mod postgres_integration {
                 .await
                 .unwrap();
         }
+
+        // One resource outside the page, so "the page did not touch it" is
+        // observable, and the same id under another tenant, so "the page did
+        // not touch another tenant" is too.
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "outside",
+                    "name": [{"family": "Clark"}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
         backend
             .create(
                 &other_tenant,
                 "Patient",
                 json!({
                     "resourceType": "Patient",
-                    "id": "page-a",
+                    "id": "page-00",
                     "name": [{"family": "Bystander"}]
                 }),
                 FhirVersion::default(),
@@ -6778,30 +8552,74 @@ mod postgres_integration {
             .unwrap();
 
         let client = reindex_test_client().await;
-        for (scoped_tenant, id) in [
-            (tenant_id, "page-a"),
-            (tenant_id, "page-b"),
-            (tenant_id, "outside"),
-            (other_tenant_id, "page-a"),
-        ] {
+        for id in page_ids.iter().copied().chain(["outside"]) {
             client
                 .execute(
                     "INSERT INTO search_index
                      (tenant_id, resource_type, resource_id, param_name, value_string)
                      VALUES ($1, 'Patient', $2, 'obsolete-batch-probe', 'stale')",
-                    &[&scoped_tenant, &id],
+                    &[&tenant_id, &id],
                 )
                 .await
                 .unwrap();
         }
+        client
+            .execute(
+                "INSERT INTO search_index
+                 (tenant_id, resource_type, resource_id, param_name, value_string)
+                 VALUES ($1, 'Patient', 'page-00', 'obsolete-batch-probe', 'stale')",
+                &[&other_tenant_id],
+            )
+            .await
+            .unwrap();
+
+        // The bystander tenant's rows must survive both paths byte for byte,
+        // and so must this tenant's resource outside the page (#1146): the
+        // page's full-text statements name their resources, so a row the page
+        // does not name is never deleted, re-inserted, or rewritten.
+        let bystander_before = index_snapshot(&client, other_tenant_id).await;
+        let bystander_fts_before = fts_snapshot(&client, other_tenant_id).await;
+        let outside_fts_before: Vec<String> = fts_snapshot(&client, tenant_id)
+            .await
+            .into_iter()
+            .filter(|row| row.starts_with("outside|"))
+            .collect();
+        assert_eq!(
+            outside_fts_before.len(),
+            1,
+            "POSITIVE CONTROL: the resource outside the page must have exactly one \
+             full-text row before the write"
+        );
 
         let page = backend
-            .fetch_resources_page(&tenant, "Patient", None, 2)
+            .fetch_resources_page(&tenant, "Patient", None, ids.len() as u32)
             .await
             .unwrap();
         assert_eq!(
-            page.resources.iter().map(|r| r.id()).collect::<Vec<_>>(),
-            vec!["page-a", "page-b"]
+            page.resources
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect::<Vec<_>>(),
+            ids,
+            "the page is the tenant's resources in (last_updated, id) order"
+        );
+
+        // Substituting the item keeps the page's ids and input order and adds
+        // the one page item the extractor rejects. The stored resource is left
+        // alone — this is a page whose *content* fails, not a store that was
+        // touched.
+        let mut page_resources = page.resources.clone();
+        page_resources[FAILING_INDEX] = StoredResource::new(
+            "Patient",
+            ids[FAILING_INDEX].clone(),
+            tenant.tenant_id().clone(),
+            json!({
+                "resourceType": "Observation",
+                "id": ids[FAILING_INDEX],
+                "status": "final",
+                "code": {"text": "not a patient"}
+            }),
+            FhirVersion::default(),
         );
 
         let before: Vec<(String, serde_json::Value)> = client
@@ -6809,7 +8627,7 @@ mod postgres_integration {
                 "SELECT version_id, data FROM resources
                  WHERE tenant_id = $1 AND resource_type = 'Patient'
                    AND id = ANY($2::text[]) ORDER BY id",
-                &[&tenant_id, &vec!["page-a", "page-b"]],
+                &[&tenant_id, &page_ids],
             )
             .await
             .unwrap()
@@ -6821,29 +8639,62 @@ mod postgres_integration {
                 "SELECT COUNT(*) FROM resource_history
                  WHERE tenant_id = $1 AND resource_type = 'Patient'
                    AND id = ANY($2::text[])",
-                &[&tenant_id, &vec!["page-a", "page-b"]],
+                &[&tenant_id, &page_ids],
             )
             .await
             .unwrap()
             .get(0);
 
         let results = backend
-            .write_search_entries_page(&tenant, &page.resources)
+            .write_search_entries_page(&tenant, &page_resources)
             .await;
-        assert_eq!(results.len(), 2);
-        assert!(results.iter().all(Result::is_ok));
-        assert!(results.iter().all(|result| *result.as_ref().unwrap() > 0));
+        assert_eq!(results.len(), page_resources.len());
+        let page_outcomes: Vec<Result<usize, String>> = results
+            .into_iter()
+            .map(|result| result.map_err(|error| error.to_string()))
+            .collect();
+        for (index, outcome) in page_outcomes.iter().enumerate() {
+            if index == FAILING_INDEX {
+                assert_eq!(
+                    outcome,
+                    &Err(extraction_failure_text()),
+                    "the page must report the extraction failure of {} verbatim, in place",
+                    ids[index]
+                );
+            } else {
+                assert!(
+                    matches!(outcome, Ok(rows) if *rows > 0),
+                    "{} should have been reindexed, got {outcome:?}",
+                    ids[index]
+                );
+            }
+        }
+
+        let outside_fts_after: Vec<String> = fts_snapshot(&client, tenant_id)
+            .await
+            .into_iter()
+            .filter(|row| row.starts_with("outside|"))
+            .collect();
+        assert_eq!(
+            outside_fts_after, outside_fts_before,
+            "the full-text row of the resource outside the page must come out of \
+             the page write byte-identical"
+        );
 
         let remaining_stale: Vec<(String, String)> = client
             .query(
                 "SELECT tenant_id, resource_id FROM search_index
                  WHERE param_name = 'obsolete-batch-probe'
                    AND ((tenant_id = $1 AND resource_id = ANY($2::text[]))
-                     OR (tenant_id = $3 AND resource_id = 'page-a'))
+                     OR (tenant_id = $3 AND resource_id = 'page-00'))
                  ORDER BY tenant_id, resource_id",
                 &[
                     &tenant_id,
-                    &vec!["page-a", "page-b", "outside"],
+                    &page_ids
+                        .iter()
+                        .copied()
+                        .chain(["outside"])
+                        .collect::<Vec<_>>(),
                     &other_tenant_id,
                 ],
             )
@@ -6852,11 +8703,19 @@ mod postgres_integration {
             .into_iter()
             .map(|row| (row.get(0), row.get(1)))
             .collect();
-        assert_eq!(remaining_stale.len(), 2);
-        assert!(remaining_stale.contains(&(tenant_id.to_string(), "outside".to_string())));
-        assert!(remaining_stale.contains(&(other_tenant_id.to_string(), "page-a".to_string())));
+        assert_eq!(
+            remaining_stale,
+            vec![
+                (tenant_id.to_string(), "outside".to_string()),
+                (other_tenant_id.to_string(), "page-00".to_string()),
+            ],
+            "only the resource outside the page and the other tenant's row keep their stale row"
+        );
 
-        for resource in &page.resources {
+        for (index, resource) in page_resources.iter().enumerate() {
+            if index == FAILING_INDEX {
+                continue;
+            }
             let contained_count: i64 = client
                 .query_one(
                     "SELECT COUNT(*) FROM search_index
@@ -6870,12 +8729,118 @@ mod postgres_integration {
             assert!(contained_count > 0);
         }
 
+        // Full-text coverage: every resource of the page has a rebuilt
+        // `resource_fts` row, and both `_text` and `_content` reach a page
+        // resource through the narrative the batched path indexed.
+        let fts_rows: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM resource_fts
+                 WHERE tenant_id = $1 AND resource_id = ANY($2::text[])",
+                &[&tenant_id, &page_ids],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            fts_rows,
+            (ids.len() - 1) as i64,
+            "every resource of the page but the extraction failure must have a full-text row"
+        );
+        let failed_fts: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM resource_fts
+                 WHERE tenant_id = $1 AND resource_id = $2",
+                &[&tenant_id, &ids[FAILING_INDEX]],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            failed_fts, 0,
+            "the page must leave no full-text row behind for the failed item"
+        );
+        for index in [0usize, 7, ids.len() - 1] {
+            let term = page_batch_term(index);
+            assert_eq!(
+                text_hits(&backend, &tenant, &term).await,
+                vec![ids[index].clone()],
+                "`_text` must find the page's narrative for {}",
+                ids[index]
+            );
+            assert_eq!(
+                content_hits(&backend, &tenant, &term).await,
+                vec![ids[index].clone()],
+                "`_content` must find the page's narrative for {}",
+                ids[index]
+            );
+        }
+        // The rebuilt `search_index` rows answer an ordinary search too.
+        let token_hits = search_hits(
+            &backend,
+            &tenant,
+            "identifier",
+            helios_persistence::types::SearchParamType::Token,
+            "http://hospital.example.org/mrn|MRN-7-0",
+        )
+        .await;
+        assert_eq!(token_hits, vec!["page-07".to_string()]);
+
+        // Parity: the per-resource path prepares and writes one resource at a
+        // time, the page path prepared all of them (on the pool where the host
+        // has the cores) and wrote them in one transaction. The persisted rows
+        // must be identical, and the per-resource outcomes must line up with
+        // the page's in input order — success with its row count, failure with
+        // the same error text — so a page that lost its order, its error, or
+        // its count could not match. Each successful resource here produces a
+        // different number of rows, which pins the order further.
+        let page_index = index_snapshot(&client, tenant_id).await;
+        let page_fts = fts_snapshot(&client, tenant_id).await;
+        assert!(!page_index.is_empty());
+
+        let mut individual_outcomes = Vec::with_capacity(page_outcomes.len());
+        for resource in &page_resources {
+            backend
+                .delete_search_entries(&tenant, resource.resource_type(), resource.id())
+                .await
+                .unwrap();
+            individual_outcomes.push(
+                backend
+                    .write_search_entries(&tenant, resource)
+                    .await
+                    .map_err(|error| error.to_string()),
+            );
+        }
+        assert_eq!(
+            individual_outcomes, page_outcomes,
+            "the per-resource path must report the page's ordered outcomes, error text included"
+        );
+        assert_eq!(
+            individual_outcomes[FAILING_INDEX],
+            Err(extraction_failure_text()),
+            "the per-resource path must report the same extraction failure as the page path"
+        );
+        assert_eq!(
+            index_snapshot(&client, tenant_id).await,
+            page_index,
+            "the per-resource path must persist exactly what the page path did"
+        );
+        assert_eq!(fts_snapshot(&client, tenant_id).await, page_fts);
+        assert_eq!(
+            index_snapshot(&client, other_tenant_id).await,
+            bystander_before,
+            "the page and per-resource paths must not touch another tenant"
+        );
+        assert_eq!(
+            fts_snapshot(&client, other_tenant_id).await,
+            bystander_fts_before
+        );
+
         let after: Vec<(String, serde_json::Value)> = client
             .query(
                 "SELECT version_id, data FROM resources
                  WHERE tenant_id = $1 AND resource_type = 'Patient'
                    AND id = ANY($2::text[]) ORDER BY id",
-                &[&tenant_id, &vec!["page-a", "page-b"]],
+                &[&tenant_id, &page_ids],
             )
             .await
             .unwrap()
@@ -6887,7 +8852,7 @@ mod postgres_integration {
                 "SELECT COUNT(*) FROM resource_history
                  WHERE tenant_id = $1 AND resource_type = 'Patient'
                    AND id = ANY($2::text[])",
-                &[&tenant_id, &vec!["page-a", "page-b"]],
+                &[&tenant_id, &page_ids],
             )
             .await
             .unwrap()
@@ -6896,111 +8861,941 @@ mod postgres_integration {
         assert_eq!(history_after, history_before);
     }
 
+    /// One `write_search_entries_page` call must stay one PostgreSQL
+    /// transaction, and (#1146) it must keep each valid `resource_fts` row
+    /// until that resource's upsert: no effective full-text write when the
+    /// stored bytes did not change, one `UPDATE` when they did.
+    ///
+    /// The probe records one row per trigger firing, with the resource and the
+    /// transaction that fired it. It deliberately does **not** project with
+    /// `SELECT DISTINCT`: a page write fires several identical `search_index`
+    /// triggers per resource, and the distinct projection this test used to do
+    /// collapsed exactly the multiplicity the assertions are about.
     #[tokio::test]
     async fn postgres_integration_reindex_page_uses_one_transaction_for_all_index_writes() {
+        use helios_persistence::core::SearchProvider;
         use helios_persistence::search::{ReindexSource, ReindexTarget};
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue, StoredResource,
+        };
+
+        /// One trigger firing: the operation, the resource it belongs to,
+        /// whether the full-text row already existed (BEFORE INSERT only), and
+        /// the transaction that fired it.
+        #[derive(Debug)]
+        struct ProbeRow {
+            operation: String,
+            resource_id: String,
+            row_existed: Option<bool>,
+            transaction_id: i64,
+        }
+
+        async fn probe_rows(client: &tokio_postgres::Client, table_name: &str) -> Vec<ProbeRow> {
+            client
+                .query(
+                    &format!(
+                        "SELECT operation, resource_id, row_existed, transaction_id
+                         FROM {table_name}"
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| ProbeRow {
+                    operation: row.get(0),
+                    resource_id: row.get(1),
+                    row_existed: row.get(2),
+                    transaction_id: row.get(3),
+                })
+                .collect()
+        }
+
+        fn fired(rows: &[ProbeRow], operation: &str, resource_id: &str) -> usize {
+            rows.iter()
+                .filter(|row| row.operation == operation && row.resource_id == resource_id)
+                .count()
+        }
+
+        /// One entry per attempted upsert of this resource's full-text row,
+        /// carrying whether the row was already there when the attempt was made.
+        fn upsert_attempts(rows: &[ProbeRow], resource_id: &str) -> Vec<Option<bool>> {
+            rows.iter()
+                .filter(|row| {
+                    row.operation == "resource_fts_before_insert" && row.resource_id == resource_id
+                })
+                .map(|row| row.row_existed)
+                .collect()
+        }
+
+        fn assert_one_transaction(rows: &[ProbeRow], context: &str) {
+            let transactions: std::collections::BTreeSet<i64> =
+                rows.iter().map(|row| row.transaction_id).collect();
+            assert_eq!(
+                transactions.len(),
+                1,
+                "{context}: every index write of a page must share one PostgreSQL \
+                 transaction: {rows:?}"
+            );
+        }
+
+        fn narrative(term: &str) -> serde_json::Value {
+            json!({
+                "status": "generated",
+                "div": format!(
+                    "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p>{term}</p></div>"
+                )
+            })
+        }
+
+        async fn fts_hits(
+            backend: &PostgresBackend,
+            tenant: &TenantContext,
+            parameter: &str,
+            term: &str,
+        ) -> Vec<String> {
+            let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+                name: parameter.to_string(),
+                param_type: SearchParamType::Special,
+                modifier: None,
+                values: vec![SearchValue::eq(term)],
+                chain: vec![],
+                components: vec![],
+            });
+            backend
+                .search(tenant, &query)
+                .await
+                .expect("full-text search should succeed")
+                .resources
+                .items
+                .iter()
+                .map(|resource| resource.id().to_string())
+                .collect()
+        }
+
+        async fn fts_vectors(
+            client: &tokio_postgres::Client,
+            tenant_id: &str,
+        ) -> Vec<(String, Option<String>, Option<String>)> {
+            client
+                .query(
+                    "SELECT resource_id, narrative_tsvector::text, content_tsvector::text
+                     FROM resource_fts
+                     WHERE tenant_id = $1 AND resource_type = 'Patient'
+                     ORDER BY resource_id",
+                    &[&tenant_id],
+                )
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.get(0), row.get(1), row.get(2)))
+                .collect()
+        }
+
+        const PAGE_IDS: [&str; 2] = ["tx-a", "tx-b"];
 
         let (backend, dbname) = isolated_reindex_backend().await;
         let tenant = create_tenant("reindex-page-single-transaction");
         let tenant_id = tenant.tenant_id().as_str();
-        for id in ["tx-a", "tx-b"] {
-            backend
-                .create(
-                    &tenant,
-                    "Patient",
-                    json!({
-                        "resourceType": "Patient",
-                        "id": id,
-                        "name": [{"family": id}]
-                    }),
-                    FhirVersion::default(),
-                )
-                .await
-                .unwrap();
-        }
+        let unchanged_term = format!("Preservedtoken{}", uuid::Uuid::new_v4().simple());
+        let replaced_term = format!("Replacedtoken{}", uuid::Uuid::new_v4().simple());
+        let refreshed_term = format!("Refreshedtoken{}", uuid::Uuid::new_v4().simple());
+
+        // Fixtures through the CRUD write paths — `create` for one resource and
+        // `create` then `update` for the other — so the page finds full-text
+        // rows written the way a live tenant's rows are, not by a raw seed.
+        // The triggers go in after this, so the probe sees reindex writes only.
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "tx-a",
+                    "name": [{"family": "TxAlpha"}],
+                    "text": narrative(&unchanged_term)
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let created = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "tx-b",
+                    "name": [{"family": "TxBravo"}],
+                    "text": narrative(&replaced_term)
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .update(
+                &tenant,
+                &created,
+                json!({
+                    "resourceType": "Patient",
+                    "id": "tx-b",
+                    "name": [{"family": "TxBravoRevised"}],
+                    "text": narrative(&replaced_term)
+                }),
+            )
+            .await
+            .unwrap();
+
         let page = backend
             .fetch_resources_page(&tenant, "Patient", None, 10)
             .await
             .unwrap();
+        assert_eq!(
+            page.resources
+                .iter()
+                .map(|resource| resource.id())
+                .collect::<Vec<_>>(),
+            PAGE_IDS.to_vec()
+        );
+
+        // Settle the page's full-text rows on the stored-bytes serialization
+        // before the probe starts, still part of the fixture. A CRUD write
+        // tokenises the resource it holds in memory; a reindex tokenises the
+        // jsonb round trip, and the two orders differ in an object's keys, so
+        // the first reindex after a CRUD write may legitimately replace the
+        // stored vectors once. Runs 1 and 2 below must be reindexes of a page
+        // whose rows already hold what a reindex would write, which is the
+        // state a repeated reindex finds.
+        let settled = backend
+            .write_search_entries_page(&tenant, &page.resources)
+            .await;
+        assert!(
+            settled.iter().all(Result::is_ok),
+            "the fixture's settling page write must succeed: {settled:?}"
+        );
 
         let client = reindex_test_client_for(&dbname).await;
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let table_name = format!("reindex_tx_probe_{suffix}");
         let function_name = format!("record_reindex_tx_{suffix}");
+        let upsert_trigger = format!("record_fts_upsert_{suffix}");
         let search_trigger = format!("record_search_tx_{suffix}");
         let fts_trigger = format!("record_fts_tx_{suffix}");
         client
             .batch_execute(&format!(
-                "CREATE TABLE {table_name} (operation text NOT NULL, transaction_id bigint NOT NULL);
+                "CREATE TABLE {table_name} (
+                     operation text NOT NULL,
+                     resource_id text NOT NULL,
+                     row_existed boolean,
+                     transaction_id bigint NOT NULL
+                 );
                  CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
                  BEGIN
+                   IF TG_WHEN = 'BEFORE' THEN
+                     IF NEW.tenant_id = '{tenant_id}' THEN
+                       INSERT INTO {table_name}
+                         (operation, resource_id, row_existed, transaction_id)
+                       VALUES (
+                         'resource_fts_before_insert',
+                         NEW.resource_id,
+                         EXISTS (
+                           SELECT 1 FROM resource_fts existing
+                           WHERE existing.tenant_id = NEW.tenant_id
+                             AND existing.resource_type = NEW.resource_type
+                             AND existing.resource_id = NEW.resource_id
+                         ),
+                         txid_current()
+                       );
+                     END IF;
+                     RETURN NEW;
+                   END IF;
                    IF TG_OP = 'DELETE' THEN
                      IF OLD.tenant_id = '{tenant_id}' THEN
-                       INSERT INTO {table_name} VALUES (TG_TABLE_NAME || '_delete', txid_current());
+                       INSERT INTO {table_name} (operation, resource_id, transaction_id)
+                       VALUES (TG_TABLE_NAME || '_delete', OLD.resource_id, txid_current());
                      END IF;
                      RETURN OLD;
+                   ELSIF TG_OP = 'UPDATE' THEN
+                     IF NEW.tenant_id = '{tenant_id}' THEN
+                       INSERT INTO {table_name} (operation, resource_id, transaction_id)
+                       VALUES (TG_TABLE_NAME || '_update', NEW.resource_id, txid_current());
+                     END IF;
+                     RETURN NEW;
+                   ELSE
+                     IF NEW.tenant_id = '{tenant_id}' THEN
+                       INSERT INTO {table_name} (operation, resource_id, transaction_id)
+                       VALUES (TG_TABLE_NAME || '_insert', NEW.resource_id, txid_current());
+                     END IF;
+                     RETURN NEW;
                    END IF;
-                   IF NEW.tenant_id = '{tenant_id}' THEN
-                     INSERT INTO {table_name} VALUES (TG_TABLE_NAME || '_insert', txid_current());
-                   END IF;
-                   RETURN NEW;
                  END $$;
-                 CREATE TRIGGER {search_trigger} AFTER INSERT OR DELETE ON search_index
+                 CREATE TRIGGER {upsert_trigger} BEFORE INSERT ON resource_fts
                  FOR EACH ROW EXECUTE FUNCTION {function_name}();
-                 CREATE TRIGGER {fts_trigger} AFTER INSERT OR DELETE ON resource_fts
+                 CREATE TRIGGER {fts_trigger} AFTER INSERT OR UPDATE OR DELETE ON resource_fts
+                 FOR EACH ROW EXECUTE FUNCTION {function_name}();
+                 CREATE TRIGGER {search_trigger} AFTER INSERT OR DELETE ON search_index
                  FOR EACH ROW EXECUTE FUNCTION {function_name}();"
             ))
             .await
             .unwrap();
 
-        let results = backend
-            .write_search_entries_page(&tenant, &page.resources)
-            .await;
-        let probe_rows: Vec<(String, i64)> = client
-            .query(
-                &format!(
-                    "SELECT DISTINCT operation, transaction_id FROM {table_name} ORDER BY operation"
-                ),
-                &[],
+        // Two reindexes of the unchanged page. Both must attempt the full-text
+        // upsert over the row the CRUD path already wrote, and neither may
+        // produce an effective full-text write while still replacing
+        // `search_index` in the page's one transaction.
+        let mut unchanged_page_transactions = Vec::new();
+        for run in 1..=2 {
+            client
+                .execute(&format!("DELETE FROM {table_name}"), &[])
+                .await
+                .unwrap();
+
+            let results = backend
+                .write_search_entries_page(&tenant, &page.resources)
+                .await;
+            assert_eq!(results.len(), PAGE_IDS.len());
+            assert!(
+                results.iter().all(Result::is_ok),
+                "run {run}: an unchanged page must take the batched path, not the \
+                 per-resource fallback: {results:?}"
+            );
+
+            let rows = probe_rows(&client, &table_name).await;
+            let context = format!("unchanged page, run {run}");
+            assert_one_transaction(&rows, &context);
+            unchanged_page_transactions.push(rows[0].transaction_id);
+
+            for id in PAGE_IDS {
+                assert_eq!(
+                    upsert_attempts(&rows, id),
+                    vec![Some(true)],
+                    "{context}: {id} must attempt exactly one full-text upsert, over \
+                     the row that is already there: {rows:?}"
+                );
+                for operation in [
+                    "resource_fts_insert",
+                    "resource_fts_update",
+                    "resource_fts_delete",
+                ] {
+                    assert_eq!(
+                        fired(&rows, operation, id),
+                        0,
+                        "{context}: an unchanged {id} must produce no effective \
+                         full-text write: {rows:?}"
+                    );
+                }
+                assert!(
+                    fired(&rows, "search_index_delete", id) > 0
+                        && fired(&rows, "search_index_insert", id) > 0,
+                    "{context}: {id}'s search_index rows must still be replaced: {rows:?}"
+                );
+            }
+        }
+        assert_ne!(
+            unchanged_page_transactions[0], unchanged_page_transactions[1],
+            "each page write must be its own transaction"
+        );
+
+        // Mixed page, still under the triggers: the same settled valid
+        // resources plus one resource the extractor rejects. The page's one
+        // full-text DELETE must cover that failed pair alone — were it to use
+        // the page's arrays, the valid resources would report a delete here,
+        // their upsert would find no row to land on, and the stale row below
+        // would not be the only one that went.
+        let failed = StoredResource::new(
+            "Patient",
+            "tx-fail",
+            tenant.tenant_id().clone(),
+            json!({"resourceType": "Observation", "id": "tx-fail"}),
+            FhirVersion::default(),
+        );
+        client
+            .execute(
+                "INSERT INTO resource_fts
+                 (tenant_id, resource_type, resource_id, narrative_tsvector, content_tsvector)
+                 VALUES ($1, 'Patient', 'tx-fail', to_tsvector('english', 'stale'), to_tsvector('english', 'stale'))",
+                &[&tenant_id],
             )
             .await
-            .unwrap()
-            .into_iter()
-            .map(|row| (row.get(0), row.get(1)))
-            .collect();
+            .unwrap();
+        let mut mixed_page = page.resources.clone();
+        mixed_page.push(failed);
+
+        // Seeding the stale row went through the triggers; clear what setup
+        // recorded so the probe holds the page write's events only.
+        client
+            .execute(&format!("DELETE FROM {table_name}"), &[])
+            .await
+            .unwrap();
+
+        let results = backend
+            .write_search_entries_page(&tenant, &mixed_page)
+            .await;
+        assert_eq!(results.len(), 3);
+        assert!(
+            results[..2].iter().all(Result::is_ok),
+            "mixed page: the valid resources must still be reindexed: {results:?}"
+        );
+        assert!(
+            results[2].is_err(),
+            "mixed page: the synthetic resource's extraction failure must be \
+             reported: {results:?}"
+        );
+
+        let rows = probe_rows(&client, &table_name).await;
+        assert_one_transaction(&rows, "mixed page");
+        for id in PAGE_IDS {
+            assert_eq!(
+                upsert_attempts(&rows, id),
+                vec![Some(true)],
+                "mixed page: {id} must upsert over the row that is already there: {rows:?}"
+            );
+            for operation in [
+                "resource_fts_insert",
+                "resource_fts_update",
+                "resource_fts_delete",
+            ] {
+                assert_eq!(
+                    fired(&rows, operation, id),
+                    0,
+                    "mixed page: a valid {id} whose row is kept must produce no \
+                     full-text write: {rows:?}"
+                );
+            }
+            assert!(
+                fired(&rows, "search_index_delete", id) > 0
+                    && fired(&rows, "search_index_insert", id) > 0,
+                "mixed page: {id}'s search_index rows must still be replaced: {rows:?}"
+            );
+        }
+        assert_eq!(
+            fired(&rows, "resource_fts_delete", "tx-fail"),
+            1,
+            "mixed page: the failed resource's stale full-text row must be deleted \
+             exactly once: {rows:?}"
+        );
+        assert!(
+            upsert_attempts(&rows, "tx-fail").is_empty(),
+            "mixed page: the failed resource has no full-text row to upsert: {rows:?}"
+        );
+        for operation in ["resource_fts_insert", "resource_fts_update"] {
+            assert_eq!(
+                fired(&rows, operation, "tx-fail"),
+                0,
+                "mixed page: the failed resource must not be written: {rows:?}"
+            );
+        }
+
+        // Change the stored bytes of one resource behind the backend's back
+        // and re-run the page: the upsert must replace its vectors in place —
+        // one `UPDATE`, no delete and no insert.
+        let refreshed = json!({
+            "resourceType": "Patient",
+            "id": "tx-b",
+            "name": [{"family": "TxBravoRevised"}],
+            "text": narrative(&refreshed_term)
+        });
+        let updated = client
+            .execute(
+                "UPDATE resources SET data = $3
+                 WHERE tenant_id = $1 AND resource_type = 'Patient' AND id = $2",
+                &[&tenant_id, &"tx-b", &refreshed],
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated, 1, "the raw data change must land on one row");
+
+        let changed_page = backend
+            .fetch_resources_page(&tenant, "Patient", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            changed_page
+                .resources
+                .iter()
+                .map(|resource| resource.id())
+                .collect::<Vec<_>>(),
+            PAGE_IDS.to_vec()
+        );
+
+        client
+            .execute(&format!("DELETE FROM {table_name}"), &[])
+            .await
+            .unwrap();
+        let results = backend
+            .write_search_entries_page(&tenant, &changed_page.resources)
+            .await;
+        assert_eq!(results.len(), PAGE_IDS.len());
+        assert!(
+            results.iter().all(Result::is_ok),
+            "the changed page must take the batched path, not the per-resource \
+             fallback: {results:?}"
+        );
+
+        let rows = probe_rows(&client, &table_name).await;
+        assert_one_transaction(&rows, "changed page");
+        assert_eq!(
+            fired(&rows, "resource_fts_update", "tx-b"),
+            1,
+            "the changed resource's stored vectors must be replaced by exactly one \
+             UPDATE: {rows:?}"
+        );
+        for id in PAGE_IDS {
+            assert_eq!(
+                upsert_attempts(&rows, id),
+                vec![Some(true)],
+                "changed page: {id}'s upsert must still land on the existing row: {rows:?}"
+            );
+            assert_eq!(
+                fired(&rows, "resource_fts_delete", id),
+                0,
+                "changed page: keeping the row means no delete: {rows:?}"
+            );
+            assert_eq!(
+                fired(&rows, "resource_fts_insert", id),
+                0,
+                "changed page: the row is replaced in place, not re-inserted: {rows:?}"
+            );
+            if id != "tx-b" {
+                assert_eq!(
+                    fired(&rows, "resource_fts_update", id),
+                    0,
+                    "the untouched resource must not be rewritten: {rows:?}"
+                );
+            }
+            assert!(
+                fired(&rows, "search_index_delete", id) > 0
+                    && fired(&rows, "search_index_insert", id) > 0,
+                "changed page: {id}'s search_index rows must still be replaced: {rows:?}"
+            );
+        }
+
+        // The refreshed term must be searchable and the replaced one must be
+        // gone, through both full-text parameters.
+        for parameter in ["_text", "_content"] {
+            assert_eq!(
+                fts_hits(&backend, &tenant, parameter, &refreshed_term).await,
+                vec!["tx-b".to_string()],
+                "{parameter} must find the refreshed term"
+            );
+            assert!(
+                fts_hits(&backend, &tenant, parameter, &replaced_term)
+                    .await
+                    .is_empty(),
+                "{parameter} must not still match the replaced term"
+            );
+            assert_eq!(
+                fts_hits(&backend, &tenant, parameter, &unchanged_term).await,
+                vec!["tx-a".to_string()],
+                "{parameter} must still find the untouched resource's term"
+            );
+        }
 
         client
             .batch_execute(&format!(
-                "DROP TRIGGER {search_trigger} ON search_index;
+                "DROP TRIGGER {upsert_trigger} ON resource_fts;
                  DROP TRIGGER {fts_trigger} ON resource_fts;
+                 DROP TRIGGER {search_trigger} ON search_index;
                  DROP FUNCTION {function_name}();
                  DROP TABLE {table_name};"
             ))
             .await
             .unwrap();
 
-        assert!(results.iter().all(Result::is_ok));
+        // Equivalence check: a per-resource delete-and-write rebuild (what the
+        // fallback path does) must leave exactly the vectors the in-place page
+        // write left. The triggers are gone, so the rebuild is not probed.
+        let vectors_after_page_write = fts_vectors(&client, tenant_id).await;
+        for resource in &changed_page.resources {
+            backend
+                .delete_search_entries(&tenant, resource.resource_type(), resource.id())
+                .await
+                .unwrap();
+            backend
+                .write_search_entries(&tenant, resource)
+                .await
+                .unwrap();
+        }
         assert_eq!(
-            probe_rows
-                .iter()
-                .map(|(operation, _)| operation.as_str())
-                .collect::<Vec<_>>(),
-            vec![
-                "resource_fts_delete",
-                "resource_fts_insert",
-                "search_index_delete",
-                "search_index_insert",
-            ]
+            fts_vectors(&client, tenant_id).await,
+            vectors_after_page_write,
+            "in-place upserts must leave the same vectors a delete-and-write rebuild \
+             produces"
         );
+    }
+
+    /// #1140: one page must reach `resource_fts` in `ceil(n / 100)` statements,
+    /// not one statement per resource.
+    ///
+    /// The page's `search_index` writes are already batched; the full-text
+    /// upsert was still one statement — and so one extra round trip — per
+    /// resource, inside the same page transaction. Counting the writes needs a
+    /// trigger, and a trigger is DDL, so this runs on a database of its own: a
+    /// `BEFORE INSERT … FOR EACH STATEMENT` trigger on `resource_fts` counts
+    /// each `INSERT` statement the page writer issues — 100 for a hundred
+    /// resources before this change, 1 after it, and 2 for a hundred and one.
+    ///
+    /// The probe is installed after seeding, so the `create` calls that build
+    /// each corpus contribute nothing to it and every delta measured below is
+    /// the page writer's own statements. The bystander tenant holds the same
+    /// first three resource ids as the hundred-resource tenant with different
+    /// narratives, so losing the tenant predicate in the batched delete or the
+    /// batched upsert changes its row count or its vectors.
+    #[tokio::test]
+    async fn postgres_integration_reindex_page_batches_fts_writes_by_hundreds() {
+        use helios_persistence::search::{ReindexSource, ReindexTarget};
+
+        let (backend, dbname) = isolated_reindex_backend().await;
+        let client = reindex_test_client_for(&dbname).await;
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let table_name = format!("fts_statement_probe_{suffix}");
+        let function_name = format!("count_fts_statements_{suffix}");
+        let trigger_name = format!("count_fts_statements_{suffix}");
+
+        let hundred = create_tenant("reindex-page-fts-hundred");
+        let hundred_one = create_tenant("reindex-page-fts-hundred-one");
+        let bystander = create_tenant("reindex-page-fts-bystander");
+        // Every resource carries a term of its own, so a row's two vectors can
+        // be tied to that resource's content rather than to the page's.
+        let marker_for = |id: &str| {
+            format!(
+                "marker{}",
+                id.strip_prefix("fts-batch-")
+                    .expect("test ids are fts-batch-NNN")
+            )
+        };
+        let patient = |id: &str, family: &str| {
+            json!({
+                "resourceType": "Patient",
+                "id": id,
+                "name": [{"family": family}],
+                "text": {
+                    "status": "generated",
+                    "div": format!(
+                        "<div>narrative for {family} {id} {}</div>",
+                        marker_for(id)
+                    )
+                }
+            })
+        };
+
+        for index in 0..101 {
+            let id = format!("fts-batch-{index:03}");
+            if index < 100 {
+                backend
+                    .create(
+                        &hundred,
+                        "Patient",
+                        patient(&id, "Able"),
+                        FhirVersion::default(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            backend
+                .create(
+                    &hundred_one,
+                    "Patient",
+                    patient(&id, "Baker"),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        for index in 0..3 {
+            let id = format!("fts-batch-{index:03}");
+            backend
+                .create(
+                    &bystander,
+                    "Patient",
+                    patient(&id, "Bystander"),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        async fn fts_snapshot(
+            client: &tokio_postgres::Client,
+            tenant_id: &str,
+        ) -> Vec<(String, String, String)> {
+            client
+                .query(
+                    "SELECT resource_id, narrative_tsvector::text, content_tsvector::text
+                     FROM resource_fts WHERE tenant_id = $1 ORDER BY resource_id",
+                    &[&tenant_id],
+                )
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.get(0), row.get(1), row.get(2)))
+                .collect()
+        }
+        let bystander_before = fts_snapshot(&client, bystander.tenant_id().as_str()).await;
+        assert_eq!(bystander_before.len(), 3);
+
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE {table_name} (id bigserial PRIMARY KEY);
+                 CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   INSERT INTO {table_name} DEFAULT VALUES;
+                   RETURN NULL;
+                 END $$;
+                 CREATE TRIGGER {trigger_name} BEFORE INSERT ON resource_fts
+                 FOR EACH STATEMENT EXECUTE FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        for (tenant, expected_statements) in [(&hundred, 1i64), (&hundred_one, 2i64)] {
+            let tenant_id = tenant.tenant_id().as_str();
+            let page = backend
+                .fetch_resources_page(tenant, "Patient", None, 200)
+                .await
+                .unwrap();
+            let page_size = page.resources.len() as i64;
+            assert!(
+                page_size == 100 || page_size == 101,
+                "unexpected page size {page_size}"
+            );
+
+            let before: i64 = client
+                .query_one(&format!("SELECT COUNT(*) FROM {table_name}"), &[])
+                .await
+                .unwrap()
+                .get(0);
+            let results = backend
+                .write_search_entries_page(tenant, &page.resources)
+                .await;
+            let after: i64 = client
+                .query_one(&format!("SELECT COUNT(*) FROM {table_name}"), &[])
+                .await
+                .unwrap()
+                .get(0);
+
+            assert_eq!(results.len(), page.resources.len());
+            assert!(
+                results.iter().all(Result::is_ok),
+                "page write must succeed for every resource"
+            );
+            assert_eq!(
+                after - before,
+                expected_statements,
+                "a page of {page_size} resources must write resource_fts in \
+                 {expected_statements} statement(s)"
+            );
+
+            // One row per id, rather than a shorter or duplicated page.
+            let rows: i64 = client
+                .query_one(
+                    "SELECT COUNT(*) FROM resource_fts
+                     WHERE tenant_id = $1 AND resource_type = 'Patient'",
+                    &[&tenant_id],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            let distinct_ids: i64 = client
+                .query_one(
+                    "SELECT COUNT(DISTINCT resource_id) FROM resource_fts
+                     WHERE tenant_id = $1 AND resource_type = 'Patient'",
+                    &[&tenant_id],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(rows, page_size, "one FTS row per page resource");
+            assert_eq!(distinct_ids, page_size, "one FTS row per resource id");
+
+            // And every row's vectors must be that row's own. `own_marker` is
+            // planted in exactly one resource's narrative — which its full
+            // content also carries, since the narrative is appended to it —
+            // while `other_marker` belongs to the next resource on the page, so
+            // a row that took its content from a neighbour fails one leg or the
+            // other. The count is the number of page ids for which both
+            // columns answer their own marker and neither answers the other's.
+            let ids: Vec<String> = page
+                .resources
+                .iter()
+                .map(|resource| resource.id().to_string())
+                .collect();
+            let own_markers: Vec<String> = ids.iter().map(|id| marker_for(id)).collect();
+            let other_markers: Vec<String> = (0..ids.len())
+                .map(|index| own_markers[(index + 1) % own_markers.len()].clone())
+                .collect();
+            let verified: i64 = client
+                .query_one(
+                    "SELECT COUNT(*)
+                     FROM unnest($1::text[], $2::text[], $3::text[])
+                          AS expected(resource_id, own_marker, other_marker)
+                     JOIN resource_fts fts
+                       ON fts.tenant_id = $4 AND fts.resource_type = 'Patient'
+                      AND fts.resource_id = expected.resource_id
+                     WHERE fts.narrative_tsvector @@ plainto_tsquery('english', expected.own_marker)
+                       AND fts.content_tsvector @@ plainto_tsquery('english', expected.own_marker)
+                       AND NOT (fts.narrative_tsvector @@ plainto_tsquery('english', expected.other_marker))
+                       AND NOT (fts.content_tsvector @@ plainto_tsquery('english', expected.other_marker))",
+                    &[&ids, &own_markers, &other_markers, &tenant_id],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(
+                verified, page_size,
+                "every row must carry its own content in both vectors, and no \
+                 other page resource's content in either"
+            );
+        }
+
         assert_eq!(
-            probe_rows
-                .iter()
-                .map(|(_, transaction_id)| *transaction_id)
-                .collect::<std::collections::HashSet<_>>()
-                .len(),
-            1,
-            "all page index writes must share one PostgreSQL transaction"
+            fts_snapshot(&client, bystander.tenant_id().as_str()).await,
+            bystander_before,
+            "a page write must not touch another tenant's full-text rows"
         );
+
+        client
+            .batch_execute(&format!(
+                "DROP TRIGGER {trigger_name} ON resource_fts;
+                 DROP FUNCTION {function_name}();
+                 DROP TABLE {table_name};"
+            ))
+            .await
+            .unwrap();
+    }
+
+    /// The batched writer must leave the *same* full-text row as the
+    /// per-resource writer, and both must be reachable through the public
+    /// `_text` / `_content` searches.
+    ///
+    /// Comparing the two `tsvector` columns as text is the strong form of
+    /// "equivalent": a row can exist with the right shape — right tenant, right
+    /// resource — and still carry a different vector (a different text search
+    /// configuration, the content in the narrative column, no tokenisation at
+    /// all). The searches then pin that the vectors mean what they are supposed
+    /// to mean: the narrative term answers `_text`, the term that exists only
+    /// outside the narrative answers `_content`, and it does not answer `_text`.
+    #[tokio::test]
+    async fn postgres_integration_reindex_page_fts_batch_matches_individual_writer() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::search::{ReindexSource, ReindexTarget};
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("reindex-page-fts-equivalence");
+        let tenant_id = tenant.tenant_id().as_str();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "fts-equivalence",
+                    "text": {
+                        "status": "generated",
+                        "div": "<div>Narrative mentions xanthochromia.</div>"
+                    },
+                    "name": [{"family": "Marshmallow"}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let page = backend
+            .fetch_resources_page(&tenant, "Patient", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(page.resources.len(), 1);
+        let stored = &page.resources[0];
+
+        let client = reindex_test_client().await;
+        async fn vectors(client: &tokio_postgres::Client, tenant_id: &str) -> (String, String) {
+            let row = client
+                .query_one(
+                    "SELECT narrative_tsvector::text, content_tsvector::text FROM resource_fts
+                     WHERE tenant_id = $1 AND resource_type = 'Patient'
+                       AND resource_id = 'fts-equivalence'",
+                    &[&tenant_id],
+                )
+                .await
+                .expect("exactly one FTS row for the resource");
+            (row.get(0), row.get(1))
+        }
+        async fn hits(
+            backend: &PostgresBackend,
+            tenant: &TenantContext,
+            param_name: &str,
+            term: &str,
+        ) -> Vec<String> {
+            let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+                name: param_name.to_string(),
+                param_type: SearchParamType::Special,
+                modifier: None,
+                values: vec![SearchValue::eq(term)],
+                chain: vec![],
+                components: vec![],
+            });
+            backend
+                .search(tenant, &query)
+                .await
+                .expect("full-text search should succeed")
+                .resources
+                .items
+                .iter()
+                .map(|resource| resource.id().to_string())
+                .collect()
+        }
+        async fn assert_searchable(backend: &PostgresBackend, tenant: &TenantContext) {
+            assert_eq!(
+                hits(backend, tenant, "_text", "xanthochromia").await,
+                vec!["fts-equivalence".to_string()],
+                "_text must find the narrative term"
+            );
+            assert_eq!(
+                hits(backend, tenant, "_content", "marshmallow").await,
+                vec!["fts-equivalence".to_string()],
+                "_content must find the term that only exists outside the narrative"
+            );
+            assert!(
+                hits(backend, tenant, "_text", "marshmallow")
+                    .await
+                    .is_empty(),
+                "the narrative column must not carry the rest of the resource"
+            );
+        }
+
+        // `create` wrote a row too, but from the in-memory `Value`; the writers
+        // below re-derive their input from the `jsonb` round-tripped row, whose
+        // object keys come back in a different order, and `to_tsvector`
+        // positions follow that order. So `create`'s row is a positive control
+        // that the resource is findable, not a byte-comparable reference.
+        assert_searchable(&backend, &tenant).await;
+
+        // The per-resource writer is the reference, because it is what the
+        // fallback runs when the page transaction fails.
+        backend
+            .write_search_entries(&tenant, stored)
+            .await
+            .expect("per-resource reindex write");
+        let individual = vectors(&client, tenant_id).await;
+        assert_searchable(&backend, &tenant).await;
+
+        // The page writer must land on the same row, byte for byte.
+        let results = backend
+            .write_search_entries_page(&tenant, std::slice::from_ref(stored))
+            .await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_ok(), "page write must succeed");
+        let batched = vectors(&client, tenant_id).await;
+        assert_eq!(
+            batched, individual,
+            "the batched writer must leave the row the per-resource writer leaves"
+        );
+        assert_searchable(&backend, &tenant).await;
     }
 
     #[tokio::test]
@@ -7196,6 +9991,116 @@ mod postgres_integration {
         assert_eq!(error_count["valueInteger"], json!(1));
     }
 
+    /// The batched full-text phase of a reindex page deletes the stale row of a
+    /// resource whose content became empty (`index_fts_content_batch`, whose
+    /// error mapping #1230 restored). If that delete fails, the page must not
+    /// skip it — the stale row would keep matching `_text` and `_content` — but
+    /// fail and be replayed per resource. The trigger rejects only the first
+    /// delete of the row and counts attempts in a sequence (sequences survive a
+    /// rollback): the page must still end `Ok` with the row gone, after exactly
+    /// one rejected batched attempt and one successful per-resource delete.
+    #[tokio::test]
+    async fn postgres_integration_reindex_page_replays_a_failed_empty_fts_delete() {
+        use helios_persistence::search::ReindexTarget;
+        use helios_persistence::types::StoredResource;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("reindex-page-empty-fts-delete-failure");
+        let tenant_id = tenant.tenant_id().as_str();
+        let emptied = StoredResource::new(
+            "Patient",
+            "emptied",
+            tenant.tenant_id().clone(),
+            json!({}),
+            FhirVersion::default(),
+        );
+
+        let client = reindex_test_client().await;
+        client
+            .execute(
+                "INSERT INTO resource_fts
+                 (tenant_id, resource_type, resource_id, narrative_tsvector, content_tsvector)
+                 VALUES ($1, 'Patient', 'emptied', to_tsvector('english', 'stale'), to_tsvector('english', 'stale'))",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap();
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let attempts = format!("fts_delete_attempts_{suffix}");
+        let function_name = format!("reject_first_fts_delete_{suffix}");
+        let trigger_name = format!("reject_first_fts_delete_{suffix}");
+        client
+            .batch_execute(&format!(
+                "CREATE SEQUENCE {attempts};
+                 CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   IF OLD.tenant_id = '{tenant_id}' AND nextval('{attempts}') = 1 THEN
+                     RAISE EXCEPTION 'injected resource_fts delete failure';
+                   END IF;
+                   RETURN OLD;
+                 END $$;
+                 CREATE TRIGGER {trigger_name} BEFORE DELETE ON resource_fts
+                 FOR EACH ROW EXECUTE FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        let outcomes = backend
+            .write_search_entries_page(&tenant, std::slice::from_ref(&emptied))
+            .await;
+
+        let attempted: i64 = client
+            .query_one(&format!("SELECT last_value FROM {attempts}"), &[])
+            .await
+            .unwrap()
+            .get(0);
+        client
+            .batch_execute(&format!(
+                "DROP TRIGGER {trigger_name} ON resource_fts;
+                 DROP FUNCTION {function_name}();
+                 DROP SEQUENCE {attempts};"
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            outcomes[0].is_ok(),
+            "the per-resource replay must recover the page: {:?}",
+            outcomes[0]
+        );
+        assert_eq!(
+            attempted, 2,
+            "one rejected batched delete, then one successful per-resource delete"
+        );
+        let remaining: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM resource_fts
+                 WHERE tenant_id = $1 AND resource_type = 'Patient' AND resource_id = 'emptied'",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(remaining, 0, "the replay must delete the stale row");
+    }
+
+    /// A page whose middle resource fails search-parameter extraction still
+    /// reports the failure in its original slot, and the page commits the rest.
+    ///
+    /// An extraction failure is a per-resource verdict, not a page failure: the
+    /// caller filters that resource out of the `search_index` and full-text
+    /// inserts before either statement is built, so nothing aborts, nothing
+    /// falls back, and the resources on either side of it are written by the
+    /// batched path as usual. The page's `DELETE FROM resource_fts` names only
+    /// the failed resources (#1146), so the failed resource's stale row is gone
+    /// rather than left behind — which is what an extraction failure has to
+    /// mean for full-text search — while every valid resource keeps its row
+    /// until its own upsert. A resource whose extracted content is empty is
+    /// handed to that batched path, which deletes its stale row rather than
+    /// rebuilding it. Two rows the page does not name must survive untouched:
+    /// the same pair under another tenant, and another resource of this tenant
+    /// outside the page.
     #[tokio::test]
     async fn postgres_integration_reindex_page_handles_empty_and_extraction_failure() {
         use helios_persistence::search::ReindexTarget;
@@ -7203,7 +10108,9 @@ mod postgres_integration {
 
         let backend = create_backend().await;
         let tenant = create_tenant("reindex-page-extraction");
+        let bystander_tenant = create_tenant("reindex-page-extraction-bystander");
         let tenant_id = tenant.tenant_id().as_str();
+        let bystander_tenant_id = bystander_tenant.tenant_id().as_str();
         assert!(
             backend
                 .write_search_entries_page(&tenant, &[])
@@ -7211,6 +10118,17 @@ mod postgres_integration {
                 .is_empty()
         );
 
+        let before_error = StoredResource::new(
+            "Patient",
+            "before-error",
+            tenant.tenant_id().clone(),
+            json!({
+                "resourceType": "Patient",
+                "id": "before-error",
+                "name": [{"family": "BeforeError"}]
+            }),
+            FhirVersion::default(),
+        );
         let invalid = StoredResource::new(
             "Patient",
             "invalid-extraction",
@@ -7225,6 +10143,17 @@ mod postgres_integration {
             json!({}),
             FhirVersion::default(),
         );
+        let after_error = StoredResource::new(
+            "Patient",
+            "after-error",
+            tenant.tenant_id().clone(),
+            json!({
+                "resourceType": "Patient",
+                "id": "after-error",
+                "name": [{"family": "AfterError"}]
+            }),
+            FhirVersion::default(),
+        );
         let client = reindex_test_client().await;
         client
             .execute(
@@ -7235,22 +10164,47 @@ mod postgres_integration {
             )
             .await
             .unwrap();
-        client
-            .execute(
-                "INSERT INTO resource_fts
-                 (tenant_id, resource_type, resource_id, narrative_tsvector, content_tsvector)
-                 VALUES ($1, 'Patient', 'empty-fts', to_tsvector('english', 'stale'), to_tsvector('english', 'stale'))",
-                &[&tenant_id],
-            )
-            .await
-            .unwrap();
+        // Stale full-text rows for two page resources: an extraction failure
+        // and an emptied resource are the two ways a resource in the page ends
+        // up with no replacement to write, so both stale rows must go. Two
+        // bystanders must not: the same pair under another tenant, and another
+        // resource of this tenant outside the page.
+        for (scoped_tenant, resource_id) in [
+            (tenant_id, "invalid-extraction"),
+            (tenant_id, "empty-fts"),
+            (bystander_tenant_id, "invalid-extraction"),
+            (tenant_id, "outside-extraction"),
+        ] {
+            client
+                .execute(
+                    "INSERT INTO resource_fts
+                     (tenant_id, resource_type, resource_id, narrative_tsvector, content_tsvector)
+                     VALUES ($1, 'Patient', $2, to_tsvector('english', 'stale'), to_tsvector('english', 'stale'))",
+                    &[&scoped_tenant, &resource_id],
+                )
+                .await
+                .unwrap();
+        }
 
         let results = backend
-            .write_search_entries_page(&tenant, &[invalid, empty_fts])
+            .write_search_entries_page(&tenant, &[before_error, invalid, empty_fts, after_error])
             .await;
-        assert_eq!(results.len(), 2);
-        assert!(results[0].is_err());
-        assert!(results[1].is_ok());
+        assert_eq!(results.len(), 4);
+        assert!(results[0].is_ok(), "the resource before the failure");
+        let error = results[1]
+            .as_ref()
+            .expect_err("the mismatched resource type must fail extraction");
+        assert!(
+            error
+                .to_string()
+                .contains("Search parameter extraction failed"),
+            "the extraction failure must be reported as itself: {error}"
+        );
+        assert!(
+            results[2].is_ok(),
+            "the resource with no searchable content"
+        );
+        assert!(results[3].is_ok(), "the resource after the failure");
 
         let stale_count: i64 = client
             .query_one(
@@ -7261,17 +10215,58 @@ mod postgres_integration {
             .await
             .unwrap()
             .get(0);
-        let empty_fts_count: i64 = client
-            .query_one(
-                "SELECT COUNT(*) FROM resource_fts
-                 WHERE tenant_id = $1 AND resource_id = 'empty-fts'",
-                &[&tenant_id],
-            )
-            .await
-            .unwrap()
-            .get(0);
-        assert_eq!(stale_count, 0);
-        assert_eq!(empty_fts_count, 0);
+        assert_eq!(
+            stale_count, 0,
+            "the failed resource must not keep stale search_index rows"
+        );
+        for (resource_id, expected_fts_rows) in [
+            ("invalid-extraction", 0),
+            ("empty-fts", 0),
+            ("before-error", 1),
+            ("after-error", 1),
+        ] {
+            let fts_rows: i64 = client
+                .query_one(
+                    "SELECT COUNT(*) FROM resource_fts
+                     WHERE tenant_id = $1 AND resource_type = 'Patient'
+                       AND resource_id = $2",
+                    &[&tenant_id, &resource_id],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(
+                fts_rows, expected_fts_rows,
+                "unexpected full-text rows for {resource_id}"
+            );
+        }
+
+        for (scoped_tenant, resource_id, label) in [
+            (
+                bystander_tenant_id,
+                "invalid-extraction",
+                "another tenant's row",
+            ),
+            (tenant_id, "outside-extraction", "a row outside the page"),
+        ] {
+            let survivors: Vec<String> = client
+                .query(
+                    "SELECT narrative_tsvector::text FROM resource_fts
+                     WHERE tenant_id = $1 AND resource_type = 'Patient'
+                       AND resource_id = $2",
+                    &[&scoped_tenant, &resource_id],
+                )
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.get::<_, Option<String>>(0).unwrap_or_default())
+                .collect();
+            assert_eq!(survivors.len(), 1, "{label} must survive the page write");
+            assert!(
+                survivors[0].contains("stale"),
+                "{label} must be left untouched: {survivors:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -7333,6 +10328,31 @@ mod postgres_integration {
 
         assert_eq!(results.len(), 3);
         for (resource, result) in page.resources.iter().zip(results) {
+            // The page's writes all rolled back, so both tables start clean for
+            // every resource on it: the two the fallback reindexed end with one
+            // full-text row, and the one it could not write ends with none.
+            let expected_fts_rows: i64 = if resource.id() == "fallback-fail" {
+                0
+            } else {
+                1
+            };
+            let fts_rows: i64 = client
+                .query_one(
+                    "SELECT COUNT(*) FROM resource_fts
+                     WHERE tenant_id = $1 AND resource_type = 'Patient'
+                       AND resource_id = $2",
+                    &[&tenant_id, &resource.id()],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(
+                fts_rows,
+                expected_fts_rows,
+                "unexpected full-text rows for {}",
+                resource.id()
+            );
+
             if resource.id() == "fallback-fail" {
                 assert!(result.is_err());
             } else {
@@ -7352,18 +10372,30 @@ mod postgres_integration {
         }
     }
 
+    /// A resource too large for one `tsvector` aborts the batched statement —
+    /// `to_tsvector` refuses it and Postgres has already killed the page
+    /// transaction — so the page must fall back to the per-resource writer,
+    /// which truncates the input, and the truncated row must be the *first*
+    /// `FTS_MAX_INPUT_BYTES` of the text.
+    ///
+    /// The pool holds one connection on purpose: the fallback can only run if
+    /// the page released the client before abandoning it, and a pool this size
+    /// turns that obligation into either a timeout or a pass rather than a
+    /// second connection quietly covering for it.
     #[tokio::test]
     async fn postgres_integration_reindex_page_retries_oversized_fts_individually() {
         use helios_persistence::search::ReindexTarget;
         use helios_persistence::types::StoredResource;
 
-        let backend = create_backend().await;
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
         let tenant = create_tenant("reindex-page-oversized-fts");
         let tenant_id = tenant.tenant_id().as_str();
-        let text = (0..100_000)
+        let lexemes: Vec<String> = (0..100_000)
             .map(|index| format!("lexeme{index:08x}"))
-            .collect::<Vec<_>>()
-            .join(" ");
+            .collect();
+        let early = lexemes[0].clone();
+        let late = lexemes[99_999].clone();
+        let text = lexemes.join(" ");
         let resource = StoredResource::new(
             "Patient",
             "oversized-fts",
@@ -7376,24 +10408,628 @@ mod postgres_integration {
             FhirVersion::default(),
         );
 
-        let results = backend
-            .write_search_entries_page(&tenant, &[resource])
-            .await;
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            backend.write_search_entries_page(&tenant, &[resource]),
+        )
+        .await
+        .expect("the oversized fallback must not deadlock a one-connection pool");
         assert_eq!(results.len(), 1);
-        assert!(results[0].is_ok());
+        assert!(
+            results[0].is_ok(),
+            "the per-resource retry must index a truncated row: {:?}",
+            results[0].as_ref().err().map(ToString::to_string)
+        );
 
-        let client = reindex_test_client().await;
-        let fts_rows: i64 = client
-            .query_one(
-                "SELECT COUNT(*) FROM resource_fts
+        let client = reindex_test_client_for(&dbname).await;
+        let rows: Vec<(bool, bool, bool, bool)> = client
+            .query(
+                "SELECT narrative_tsvector @@ plainto_tsquery('english', $2),
+                        content_tsvector @@ plainto_tsquery('english', $2),
+                        narrative_tsvector @@ plainto_tsquery('english', $3),
+                        content_tsvector @@ plainto_tsquery('english', $3)
+                 FROM resource_fts
                  WHERE tenant_id = $1 AND resource_type = 'Patient'
                    AND resource_id = 'oversized-fts'",
-                &[&tenant_id],
+                &[&tenant_id, &early, &late],
             )
             .await
             .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+            .collect();
+        assert_eq!(rows.len(), 1, "the retry must leave exactly one FTS row");
+        let (early_narrative, early_content, late_narrative, late_content) = rows[0];
+        assert!(
+            early_narrative && early_content,
+            "both vectors must carry the start of the input"
+        );
+        assert!(
+            !late_narrative && !late_content,
+            "neither vector may carry text past the truncation point"
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_reindex_page_recovers_oversized_fts_without_replaying_search_parameters()
+     {
+        use helios_persistence::search::{ReindexSource, ReindexTarget};
+
+        // Keep the page well below MULTI_BATCH_ROWS: each Observation contributes
+        // one ordinary `status` SearchParameter row, so this probes recovery from
+        // an FTS failure without also splitting the multi-row search insert.
+        let (backend, dbname) = isolated_reindex_backend().await;
+        let first_tenant = create_tenant("reindex-page-fts-recovery-first");
+        let second_tenant = create_tenant("reindex-page-fts-recovery-second");
+        let first_tenant_id = first_tenant.tenant_id().as_str().to_string();
+        let second_tenant_id = second_tenant.tenant_id().as_str().to_string();
+
+        let text = (0..100_000)
+            .map(|index| format!("lexeme{index:08x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        for (tenant, entries) in [
+            (
+                &first_tenant,
+                [
+                    ("a-normal", false),
+                    ("b-oversized", true),
+                    ("c-normal", false),
+                ],
+            ),
+            (
+                &second_tenant,
+                [
+                    ("a-oversized", true),
+                    ("b-normal", false),
+                    ("c-oversized", true),
+                ],
+            ),
+        ] {
+            for (id, oversized) in entries {
+                let resource = if oversized {
+                    json!({
+                        "resourceType": "Observation",
+                        "id": id,
+                        "status": id,
+                        "text": {"status": "generated", "div": format!("<div>{text}</div>")}
+                    })
+                } else {
+                    json!({
+                        "resourceType": "Observation",
+                        "id": id,
+                        "status": id
+                    })
+                };
+                // Seed through create so the ordinary writer establishes the
+                // approved truncated FTS result for every oversized resource.
+                backend
+                    .create(tenant, "Observation", resource, FhirVersion::default())
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let first_page = backend
+            .fetch_resources_page(&first_tenant, "Observation", None, 3)
+            .await
+            .unwrap();
+        let second_page = backend
+            .fetch_resources_page(&second_tenant, "Observation", None, 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            first_page
+                .resources
+                .iter()
+                .map(|resource| resource.id())
+                .collect::<Vec<_>>(),
+            vec!["a-normal", "b-oversized", "c-normal"]
+        );
+        assert_eq!(
+            second_page
+                .resources
+                .iter()
+                .map(|resource| resource.id())
+                .collect::<Vec<_>>(),
+            vec!["a-oversized", "b-normal", "c-oversized"]
+        );
+
+        let client = reindex_test_client_for(&dbname).await;
+        let first_ids = vec!["a-normal", "b-oversized", "c-normal"];
+        let second_ids = vec!["a-oversized", "b-normal", "c-oversized"];
+        let first_search_before: Vec<(String, String, Option<String>, Option<String>)> = client
+            .query(
+                "SELECT resource_id, param_name, value_string, value_string_folded
+                 FROM search_index
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = ANY($2::text[])
+                 ORDER BY array_position($2::text[], resource_id), param_name, value_string",
+                &[&first_tenant_id, &first_ids],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+            .collect();
+        let second_search_before: Vec<(String, String, Option<String>, Option<String>)> = client
+            .query(
+                "SELECT resource_id, param_name, value_string, value_string_folded
+                 FROM search_index
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = ANY($2::text[])
+                 ORDER BY array_position($2::text[], resource_id), param_name, value_string",
+                &[&second_tenant_id, &second_ids],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+            .collect();
+        let first_fts_before: Vec<(String, Vec<String>, Vec<String>)> = client
+            .query(
+                "SELECT resource_id, tsvector_to_array(narrative_tsvector),
+                        tsvector_to_array(content_tsvector)
+                 FROM resource_fts
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = ANY($2::text[])
+                 ORDER BY array_position($2::text[], resource_id)",
+                &[&first_tenant_id, &first_ids],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect();
+        let second_fts_before: Vec<(String, Vec<String>, Vec<String>)> = client
+            .query(
+                "SELECT resource_id, tsvector_to_array(narrative_tsvector),
+                        tsvector_to_array(content_tsvector)
+                 FROM resource_fts
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = ANY($2::text[])
+                 ORDER BY array_position($2::text[], resource_id)",
+                &[&second_tenant_id, &second_ids],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect();
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let sequence_name = format!("reindex_fts_search_attempts_{suffix}");
+        let function_name = format!("count_reindex_fts_search_attempts_{suffix}");
+        let trigger_name = format!("count_reindex_fts_search_attempts_{suffix}");
+        client
+            .batch_execute(&format!(
+                "CREATE SEQUENCE {sequence_name};
+                 CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   PERFORM nextval('{sequence_name}');
+                   RETURN NEW;
+                 END $$;
+                 CREATE TRIGGER {trigger_name} AFTER INSERT ON search_index
+                 FOR EACH ROW EXECUTE FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        let first_results = backend
+            .write_search_entries_page(&first_tenant, &first_page.resources)
+            .await;
+        let second_results = backend
+            .write_search_entries_page(&second_tenant, &second_page.resources)
+            .await;
+
+        let first_search_after: Vec<(String, String, Option<String>, Option<String>)> = client
+            .query(
+                "SELECT resource_id, param_name, value_string, value_string_folded
+                 FROM search_index
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = ANY($2::text[])
+                 ORDER BY array_position($2::text[], resource_id), param_name, value_string",
+                &[&first_tenant_id, &first_ids],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+            .collect();
+        let second_search_after: Vec<(String, String, Option<String>, Option<String>)> = client
+            .query(
+                "SELECT resource_id, param_name, value_string, value_string_folded
+                 FROM search_index
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = ANY($2::text[])
+                 ORDER BY array_position($2::text[], resource_id), param_name, value_string",
+                &[&second_tenant_id, &second_ids],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+            .collect();
+        let first_fts_after: Vec<(String, Vec<String>, Vec<String>)> = client
+            .query(
+                "SELECT resource_id, tsvector_to_array(narrative_tsvector),
+                        tsvector_to_array(content_tsvector)
+                 FROM resource_fts
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = ANY($2::text[])
+                 ORDER BY array_position($2::text[], resource_id)",
+                &[&first_tenant_id, &first_ids],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect();
+        let second_fts_after: Vec<(String, Vec<String>, Vec<String>)> = client
+            .query(
+                "SELECT resource_id, tsvector_to_array(narrative_tsvector),
+                        tsvector_to_array(content_tsvector)
+                 FROM resource_fts
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = ANY($2::text[])
+                 ORDER BY array_position($2::text[], resource_id)",
+                &[&second_tenant_id, &second_ids],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect();
+
+        let first_fts_terms: Vec<(String, bool, bool)> = client
+            .query(
+                "SELECT resource_id,
+                        content_tsvector @@ plainto_tsquery('english', $2),
+                        content_tsvector @@ plainto_tsquery('english', $3)
+                 FROM resource_fts
+                 WHERE tenant_id = $1 AND resource_id = ANY($4::text[])
+                 ORDER BY array_position($4::text[], resource_id)",
+                &[
+                    &first_tenant_id,
+                    &"lexeme00000000",
+                    &"lexeme000186a0",
+                    &first_ids,
+                ],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect();
+        let second_fts_terms: Vec<(String, bool, bool)> = client
+            .query(
+                "SELECT resource_id,
+                        content_tsvector @@ plainto_tsquery('english', $2),
+                        content_tsvector @@ plainto_tsquery('english', $3)
+                 FROM resource_fts
+                 WHERE tenant_id = $1 AND resource_id = ANY($4::text[])
+                 ORDER BY array_position($4::text[], resource_id)",
+                &[
+                    &second_tenant_id,
+                    &"lexeme00000000",
+                    &"lexeme000186a0",
+                    &second_ids,
+                ],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect();
+        let search_attempts: i64 = client
+            .query_one(&format!("SELECT last_value FROM {sequence_name}"), &[])
+            .await
+            .unwrap()
             .get(0);
-        assert_eq!(fts_rows, 1);
+
+        client
+            .batch_execute(&format!(
+                "DROP TRIGGER {trigger_name} ON search_index;
+                 DROP FUNCTION {function_name}();
+                 DROP SEQUENCE {sequence_name};"
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(first_results.len(), 3);
+        for (resource, result) in first_page.resources.iter().zip(&first_results) {
+            assert!(
+                result.is_ok(),
+                "reindex failed for first-page resource {}: {:?}",
+                resource.id(),
+                result.as_ref().err()
+            );
+        }
+        assert_eq!(second_results.len(), 3);
+        for (resource, result) in second_page.resources.iter().zip(&second_results) {
+            assert!(
+                result.is_ok(),
+                "reindex failed for second-page resource {}: {:?}",
+                resource.id(),
+                result.as_ref().err()
+            );
+        }
+        assert_eq!(first_search_after, first_search_before);
+        assert_eq!(second_search_after, second_search_before);
+        assert_eq!(first_fts_after, first_fts_before);
+        assert_eq!(second_fts_after, second_fts_before);
+        assert_eq!(
+            first_fts_terms,
+            vec![
+                ("a-normal".to_string(), false, false),
+                ("b-oversized".to_string(), true, false),
+                ("c-normal".to_string(), false, false),
+            ]
+        );
+        assert_eq!(
+            second_fts_terms,
+            vec![
+                ("a-oversized".to_string(), true, false),
+                ("b-normal".to_string(), false, false),
+                ("c-oversized".to_string(), true, false),
+            ]
+        );
+        // One search-index insert per resource is the single-pass contract.
+        // The current implementation reaches 12: three rows per page in the
+        // aborted batch plus three rows per page in the full-page fallback.
+        assert_eq!(search_attempts, 6);
+    }
+
+    async fn reindex_page_fts_trigger_case(
+        target_id: &str,
+        target_is_oversized: bool,
+        leading_is_oversized: bool,
+        trigger_message: &str,
+    ) -> (
+        Vec<helios_persistence::types::StoredResource>,
+        Vec<Result<usize, StorageError>>,
+        Vec<(String, i64)>,
+        Vec<(String, i64)>,
+    ) {
+        use helios_persistence::search::{ReindexSource, ReindexTarget};
+
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenant = create_tenant("reindex-page-fts-error");
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        let text = (0..100_000)
+            .map(|index| format!("lexeme{index:08x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let leading_id = if leading_is_oversized {
+            "a-oversized"
+        } else {
+            "a-normal"
+        };
+        let entries = [
+            (leading_id, leading_is_oversized),
+            (target_id, target_is_oversized),
+            ("c-normal", false),
+        ];
+        for (id, oversized) in entries {
+            let resource = if oversized {
+                json!({
+                    "resourceType": "Observation",
+                    "id": id,
+                    "status": id,
+                    "text": {"status": "generated", "div": format!("<div>{text}</div>")}
+                })
+            } else {
+                json!({"resourceType": "Observation", "id": id, "status": id})
+            };
+            backend
+                .create(&tenant, "Observation", resource, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+
+        let page = backend
+            .fetch_resources_page(&tenant, "Observation", None, 3)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = page
+            .resources
+            .iter()
+            .map(|resource| resource.id())
+            .collect();
+        let client = reindex_test_client_for(&dbname).await;
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let function_name = format!("reject_reindex_fts_{suffix}");
+        let trigger_name = format!("reject_reindex_fts_{suffix}");
+        client
+            .batch_execute(&format!(
+                "CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   IF NEW.tenant_id = '{tenant_id}' AND NEW.resource_id = '{target_id}' THEN
+                     RAISE EXCEPTION '{trigger_message}';
+                   END IF;
+                   RETURN NEW;
+                 END $$;
+                 CREATE TRIGGER {trigger_name} BEFORE INSERT ON resource_fts
+                 FOR EACH ROW EXECUTE FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            backend.write_search_entries_page(&tenant, &page.resources),
+        )
+        .await
+        .expect("FTS page fallback must not deadlock a one-connection pool");
+
+        client
+            .batch_execute(&format!(
+                "DROP TRIGGER {trigger_name} ON resource_fts;
+                 DROP FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        let search_rows: Vec<(String, i64)> = client
+            .query(
+                "SELECT resource_id, COUNT(*)::bigint
+                 FROM search_index
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = ANY($2::text[])
+                 GROUP BY resource_id
+                 ORDER BY array_position($2::text[], resource_id)",
+                &[&tenant_id, &ids],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        let fts_rows: Vec<(String, i64)> = client
+            .query(
+                "SELECT resource_id, COUNT(*)::bigint
+                 FROM resource_fts
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = ANY($2::text[])
+                 GROUP BY resource_id
+                 ORDER BY array_position($2::text[], resource_id)",
+                &[&tenant_id, &ids],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+
+        (page.resources, results, search_rows, fts_rows)
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_reindex_page_unexpected_fts_error_falls_back_per_resource() {
+        let (resources, results, search_rows, fts_rows) =
+            reindex_page_fts_trigger_case("b-normal", false, false, "unexpected FTS page failure")
+                .await;
+
+        assert_eq!(
+            resources
+                .iter()
+                .map(|resource| resource.id())
+                .collect::<Vec<_>>(),
+            vec!["a-normal", "b-normal", "c-normal"]
+        );
+        for (resource, result) in resources.iter().zip(&results) {
+            if resource.id() == "b-normal" {
+                let error = result.as_ref().expect_err("trigger target must fail");
+                assert_eq!(
+                    error.to_string(),
+                    "internal error in postgres: Failed to insert FTS content: db error"
+                );
+            } else {
+                assert!(result.is_ok(), "{} should be reindexed", resource.id());
+            }
+        }
+        // The ordinary fallback writes search_index before the target FTS
+        // failure, so the failed resource's search rows are not assumed absent.
+        assert_eq!(
+            search_rows,
+            vec![
+                ("a-normal".to_string(), 1),
+                ("b-normal".to_string(), 1),
+                ("c-normal".to_string(), 1),
+            ]
+        );
+        assert_eq!(
+            fts_rows,
+            vec![("a-normal".to_string(), 1), ("c-normal".to_string(), 1)]
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_reindex_page_unexpected_fts_error_during_oversized_recovery_falls_back_per_resource()
+     {
+        let (resources, results, search_rows, fts_rows) = reindex_page_fts_trigger_case(
+            "b-normal",
+            false,
+            true,
+            "unexpected FTS recovery failure",
+        )
+        .await;
+
+        assert_eq!(
+            resources
+                .iter()
+                .map(|resource| resource.id())
+                .collect::<Vec<_>>(),
+            vec!["a-oversized", "b-normal", "c-normal"]
+        );
+        assert_eq!(results.len(), 3);
+        for (resource, result) in resources.iter().zip(&results) {
+            if resource.id() == "b-normal" {
+                let error = result
+                    .as_ref()
+                    .expect_err("recovery trigger target must fail");
+                assert_eq!(
+                    error.to_string(),
+                    "internal error in postgres: Failed to insert FTS content: db error"
+                );
+            } else {
+                assert!(result.is_ok(), "{} should be reindexed", resource.id());
+            }
+        }
+        assert_eq!(
+            search_rows,
+            vec![
+                ("a-oversized".to_string(), 1),
+                ("b-normal".to_string(), 1),
+                ("c-normal".to_string(), 1),
+            ]
+        );
+        assert_eq!(
+            fts_rows,
+            vec![("a-oversized".to_string(), 1), ("c-normal".to_string(), 1),]
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_reindex_page_truncated_fts_retry_error_falls_back_per_resource() {
+        let (resources, results, search_rows, fts_rows) = reindex_page_fts_trigger_case(
+            "b-oversized",
+            true,
+            false,
+            "truncated FTS retry failure",
+        )
+        .await;
+
+        assert_eq!(
+            resources
+                .iter()
+                .map(|resource| resource.id())
+                .collect::<Vec<_>>(),
+            vec!["a-normal", "b-oversized", "c-normal"]
+        );
+        for (resource, result) in resources.iter().zip(&results) {
+            if resource.id() == "b-oversized" {
+                let error = result.as_ref().expect_err("retry trigger target must fail");
+                assert_eq!(
+                    error.to_string(),
+                    "internal error in postgres: Failed to insert FTS content: db error"
+                );
+            } else {
+                assert!(result.is_ok(), "{} should be reindexed", resource.id());
+            }
+        }
+        assert_eq!(
+            search_rows,
+            vec![
+                ("a-normal".to_string(), 1),
+                ("b-oversized".to_string(), 1),
+                ("c-normal".to_string(), 1),
+            ]
+        );
+        assert_eq!(
+            fts_rows,
+            vec![("a-normal".to_string(), 1), ("c-normal".to_string(), 1)]
+        );
     }
 
     #[tokio::test]
@@ -7853,6 +11489,1317 @@ mod postgres_integration {
         assert_eq!(ids, vec!["p1".to_string()]);
     }
 
+    /// Seeds two patients and one observation each for the chained-date tests
+    /// (#1290), through the real write path so `birthdate` / `date` /
+    /// `subject` are indexed by the backend rather than hand-inserted.
+    ///
+    /// - `p-old` born 1975-03-02, observation `o-old` effective
+    ///   `2019-05-04T23:30:00-07:00` (= `2019-05-05T06:30:00Z`)
+    /// - `p-new` born 1990-01-15, observation `o-new` effective `2021-08-09`
+    ///
+    /// Asserts that an *unchained* date search finds the seeded rows, so a
+    /// chained assertion below can never pass vacuously against an empty index.
+    async fn seed_chain_date_fixture(backend: &PostgresBackend, tenant: &TenantContext) {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        for (id, birth) in [("p-old", "1975-03-02"), ("p-new", "1990-01-15")] {
+            backend
+                .create(
+                    tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": id, "birthDate": birth}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        for (id, subject, effective) in [
+            ("o-old", "Patient/p-old", "2019-05-04T23:30:00-07:00"),
+            ("o-new", "Patient/p-new", "2021-08-09"),
+        ] {
+            backend
+                .create(
+                    tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": id,
+                        "status": "final",
+                        "code": {"text": "x"},
+                        "subject": {"reference": subject},
+                        "effectiveDateTime": effective,
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let date_query = |rt: &str, name: &str, v: &str| {
+            SearchQuery::new(rt).with_parameter(SearchParameter {
+                name: name.to_string(),
+                param_type: SearchParamType::Date,
+                modifier: None,
+                values: vec![SearchValue::eq(v)],
+                chain: vec![],
+                components: vec![],
+            })
+        };
+        let found = backend
+            .search(tenant, &date_query("Patient", "birthdate", "1990-01-15"))
+            .await
+            .unwrap();
+        assert_eq!(
+            found.resources.items.len(),
+            1,
+            "fixture: birthdate must be indexed or the chained tests are vacuous"
+        );
+        let found = backend
+            .search(tenant, &date_query("Observation", "date", "2021-08-09"))
+            .await
+            .unwrap();
+        assert_eq!(
+            found.resources.items.len(),
+            1,
+            "fixture: Observation.date must be indexed or the chained tests are vacuous"
+        );
+    }
+
+    fn sorted_ids(mut ids: Vec<String>) -> Vec<String> {
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    fn expect_ids(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `Observation?subject:Patient.birthdate=<value>` through the
+    /// `ChainedSearchProvider` trait API (#1290). The chain builder bound the
+    /// raw string against `value_date TIMESTAMPTZ`.
+    #[tokio::test]
+    async fn postgres_integration_resolve_chain_date_terminal() {
+        use helios_persistence::core::ChainedSearchProvider;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("chain-date");
+        seed_chain_date_fixture(&backend, &tenant).await;
+
+        let cases: &[(&str, &[&str])] = &[
+            // Unprefixed day precision means the whole day.
+            ("1990-01-15", &["o-new"]),
+            ("1990-01", &["o-new"]),
+            ("1990", &["o-new"]),
+            ("eq1990-01-15", &["o-new"]),
+            ("ne1990-01-15", &["o-old"]),
+            ("ge1980-01-01", &["o-new"]),
+            ("ge1990-01-15", &["o-new"]),
+            ("gt1990-01-15", &[]),
+            ("gt1975-03-02", &["o-new"]),
+            ("lt1980-01-01", &["o-old"]),
+            ("lt1975-03-02", &[]),
+            ("le1975-03-02", &["o-old"]),
+            ("le1990-01-15", &["o-new", "o-old"]),
+            ("sa1975-03-02", &["o-new"]),
+            ("eb1990-01-15", &["o-old"]),
+            // Not a date: must match nothing, never widen.
+            ("not-a-date", &[]),
+            ("nenot-a-date", &[]),
+        ];
+        for (value, expected) in cases {
+            let ids = backend
+                .resolve_chain(&tenant, "Observation", "subject:Patient.birthdate", value)
+                .await
+                .unwrap_or_else(|e| panic!("birthdate={value}: {e}"));
+            assert_eq!(sorted_ids(ids), expect_ids(expected), "birthdate={value}");
+        }
+    }
+
+    /// A forward chain whose terminal is a full instant carrying a negative
+    /// offset: `DiagnosticReport?result:Observation.date=<value>`.
+    #[tokio::test]
+    async fn postgres_integration_resolve_chain_date_terminal_instant_with_offset() {
+        use helios_persistence::core::ChainedSearchProvider;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("chain-date-instant");
+        seed_chain_date_fixture(&backend, &tenant).await;
+        for (id, result) in [
+            ("dr-old", "Observation/o-old"),
+            ("dr-new", "Observation/o-new"),
+        ] {
+            backend
+                .create(
+                    &tenant,
+                    "DiagnosticReport",
+                    json!({
+                        "resourceType": "DiagnosticReport",
+                        "id": id,
+                        "status": "final",
+                        "code": {"text": "x"},
+                        "result": [{"reference": result}],
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let cases: &[(&str, &[&str])] = &[
+            // The stored instant, written in its own zone and in UTC.
+            ("2019-05-04T23:30:00-07:00", &["dr-old"]),
+            ("2019-05-05T06:30:00Z", &["dr-old"]),
+            // One second either side, in the negative-offset zone.
+            ("gt2019-05-04T23:29:59-07:00", &["dr-new", "dr-old"]),
+            ("gt2019-05-04T23:30:00-07:00", &["dr-new"]),
+            ("ge2019-05-04T23:30:00-07:00", &["dr-new", "dr-old"]),
+            ("lt2019-05-04T23:30:01-07:00", &["dr-old"]),
+            ("lt2019-05-04T23:30:00-07:00", &[]),
+            ("le2019-05-04T23:30:00-07:00", &["dr-old"]),
+            // Day precision is read in UTC: the instant falls on 05-05 there.
+            ("2019-05-05", &["dr-old"]),
+            ("2019-05-04", &[]),
+        ];
+        for (value, expected) in cases {
+            let ids = backend
+                .resolve_chain(
+                    &tenant,
+                    "DiagnosticReport",
+                    "result:Observation.date",
+                    value,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("date={value}: {e}"));
+            assert_eq!(sorted_ids(ids), expect_ids(expected), "date={value}");
+        }
+    }
+
+    /// `Patient?_has:Observation:subject:date=<value>` through the trait API.
+    #[tokio::test]
+    async fn postgres_integration_resolve_reverse_chain_date_terminal() {
+        use helios_persistence::core::ChainedSearchProvider;
+        use helios_persistence::types::{ReverseChainedParameter, SearchValue};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("reverse-chain-date");
+        seed_chain_date_fixture(&backend, &tenant).await;
+
+        let cases: &[(&str, &[&str])] = &[
+            ("2021-08-09", &["p-new"]),
+            ("2021-08", &["p-new"]),
+            ("ge2020-01-01", &["p-new"]),
+            ("lt2020-01-01", &["p-old"]),
+            ("gt2021-08-09", &[]),
+            ("le2021-08-09", &["p-new", "p-old"]),
+            ("ne2021-08-09", &["p-old"]),
+            ("2019-05-04T23:30:00-07:00", &["p-old"]),
+            ("ge2019-05-04T23:30:00-07:00", &["p-new", "p-old"]),
+            ("gt2019-05-04T23:30:00-07:00", &["p-new"]),
+            ("not-a-date", &[]),
+        ];
+        for (value, expected) in cases {
+            let rc = ReverseChainedParameter::terminal(
+                "Observation",
+                "subject",
+                "date",
+                SearchValue::parse(value),
+            );
+            let ids = backend
+                .resolve_reverse_chain(&tenant, "Patient", &rc)
+                .await
+                .unwrap_or_else(|e| panic!("_has date={value}: {e}"));
+            assert_eq!(sorted_ids(ids), expect_ids(expected), "_has date={value}");
+        }
+    }
+
+    /// Chained and reverse-chained `_lastUpdated`, which the chain builder
+    /// reads from `resources.last_updated` (also `TIMESTAMPTZ`).
+    #[tokio::test]
+    async fn postgres_integration_resolve_chain_last_updated_terminal() {
+        use helios_persistence::core::ChainedSearchProvider;
+        use helios_persistence::types::{ReverseChainedParameter, SearchValue};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("chain-last-updated");
+        seed_chain_date_fixture(&backend, &tenant).await;
+
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let cases: &[(&str, &[&str])] = &[
+            ("gt2000-01-01", &["o-new", "o-old"]),
+            ("ge2000", &["o-new", "o-old"]),
+            ("lt2000-01-01", &[]),
+            ("gt2999-01-01", &[]),
+            ("le2999-01-01T00:00:00-05:00", &["o-new", "o-old"]),
+            ("not-a-date", &[]),
+        ];
+        for (value, expected) in cases {
+            let ids = backend
+                .resolve_chain(
+                    &tenant,
+                    "Observation",
+                    "subject:Patient._lastUpdated",
+                    value,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("_lastUpdated={value}: {e}"));
+            assert_eq!(
+                sorted_ids(ids),
+                expect_ids(expected),
+                "_lastUpdated={value}"
+            );
+        }
+
+        // Day-precision eq must cover the whole (UTC) day. Skipped in the rare
+        // run that straddles midnight UTC between the writes and this line.
+        if today == chrono::Utc::now().format("%Y-%m-%d").to_string() {
+            let ids = backend
+                .resolve_chain(
+                    &tenant,
+                    "Observation",
+                    "subject:Patient._lastUpdated",
+                    &today,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("_lastUpdated={today}: {e}"));
+            assert_eq!(
+                sorted_ids(ids),
+                expect_ids(&["o-new", "o-old"]),
+                "_lastUpdated={today}"
+            );
+        }
+
+        let reverse_cases: &[(&str, &[&str])] =
+            &[("gt2000-01-01", &["p-new", "p-old"]), ("lt2000-01-01", &[])];
+        for (value, expected) in reverse_cases {
+            let rc = ReverseChainedParameter::terminal(
+                "Observation",
+                "subject",
+                "_lastUpdated",
+                SearchValue::parse(value),
+            );
+            let ids = backend
+                .resolve_reverse_chain(&tenant, "Patient", &rc)
+                .await
+                .unwrap_or_else(|e| panic!("_has _lastUpdated={value}: {e}"));
+            assert_eq!(
+                sorted_ids(ids),
+                expect_ids(expected),
+                "_has _lastUpdated={value}"
+            );
+        }
+    }
+
+    /// Seeds the #1307 fixture through the real write path. Every terminal
+    /// value that begins with a comparator pair (`ne…`, `eq…`) has a decoy
+    /// whose value is what is left once the pair is wrongly stripped, so a
+    /// misparse shows up as the decoy being returned.
+    async fn seed_chain_prefix_fixture(backend: &PostgresBackend, tenant: &TenantContext) {
+        let patient = |id: &str, birth: &str, family: &str| {
+            json!({"resourceType": "Patient", "id": id, "birthDate": birth,
+                   "name": [{"family": family}]})
+        };
+        let sequence = |id: &str, start: i64| {
+            json!({"resourceType": "MolecularSequence", "id": id, "coordinateSystem": 0,
+                   "referenceSeq": {"windowStart": start}})
+        };
+        let observation = |id: &str, code: &str, value: f64| {
+            json!({"resourceType": "Observation", "id": id, "status": "final",
+                   "code": {"coding": [{"system": "http://example.org/c", "code": code}]},
+                   "valueQuantity": {"value": value, "unit": "mg"}})
+        };
+        let mut o_nelson = observation("o-nelson", "ne123", 5.4);
+        o_nelson["subject"] = json!({"reference": "Patient/nelson-1"});
+        o_nelson["device"] = json!({"reference": "Device/dev-news"});
+        o_nelson["derivedFrom"] = json!([{"reference": "MolecularSequence/ms-10"}]);
+        let mut o_wilson = observation("o-wilson", "123", 0.0);
+        o_wilson["subject"] = json!({"reference": "Patient/wilson-1"});
+        o_wilson["device"] = json!({"reference": "Device/dev-ws"});
+        o_wilson["derivedFrom"] = json!([{"reference": "MolecularSequence/ms-0"}]);
+        let mut o_equus = observation("o-equus", "eq77", 7.0);
+        o_equus["subject"] = json!({"reference": "Patient/equus-1"});
+
+        let resources = [
+            ("Patient", patient("nelson-1", "1950-04-12", "Nelson")),
+            ("Patient", patient("wilson-1", "1960-01-01", "Wilson")),
+            ("Patient", patient("equus-1", "1970-01-01", "Equus")),
+            (
+                "Device",
+                json!({"resourceType": "Device", "id": "dev-news", "url": "news:example/1"}),
+            ),
+            (
+                "Device",
+                json!({"resourceType": "Device", "id": "dev-ws", "url": "ws:example/1"}),
+            ),
+            ("MolecularSequence", sequence("ms-10", 10)),
+            ("MolecularSequence", sequence("ms-0", 0)),
+            ("Observation", o_nelson),
+            ("Observation", o_wilson),
+            ("Observation", o_equus),
+            ("Observation", observation("o-77", "77", 9.0)),
+        ];
+        for (resource_type, body) in resources {
+            backend
+                .create(tenant, resource_type, body, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+        for obs in ["o-nelson", "o-wilson", "o-equus", "o-77"] {
+            backend
+                .create(
+                    tenant,
+                    "DiagnosticReport",
+                    json!({
+                        "resourceType": "DiagnosticReport",
+                        "id": obs.replacen("o-", "dr-", 1),
+                        "status": "final",
+                        "code": {"text": "panel"},
+                        "result": [{"reference": format!("Observation/{obs}")}],
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    /// #1307: through the `ChainedSearchProvider` trait API a comparator
+    /// prefix is recognised only on date / number / quantity terminals —
+    /// including an explicit `eq` — and never on string / token / reference /
+    /// uri terminals, whatever the value starts with.
+    #[tokio::test]
+    async fn postgres_integration_resolve_chain_prefix_only_on_ordered_terminals() {
+        use helios_persistence::core::ChainedSearchProvider;
+
+        const WINDOW_START: &str = "derived-from:MolecularSequence.window-start";
+        const VALUE_QUANTITY: &str = "result.value-quantity";
+        const FAMILY: &str = "subject:Patient.family";
+        const BIRTHDATE: &str = "subject:Patient.birthdate";
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("chain-prefix");
+        seed_chain_prefix_fixture(&backend, &tenant).await;
+
+        let cases: &[(&str, &str, &str, &[&str])] = &[
+            // Positive controls: unprefixed values prove each terminal is
+            // indexed, so the cases below cannot pass or fail vacuously.
+            ("Observation", FAMILY, "Wilson", &["o-wilson"]),
+            ("DiagnosticReport", "result.code", "123", &["dr-wilson"]),
+            (
+                "DiagnosticReport",
+                "result.subject",
+                "wilson-1",
+                &["dr-wilson"],
+            ),
+            (
+                "Observation",
+                "device:Device.url",
+                "ws:example/1",
+                &["o-wilson"],
+            ),
+            ("DiagnosticReport", VALUE_QUANTITY, "5.4", &["dr-nelson"]),
+            ("Observation", WINDOW_START, "10", &["o-nelson"]),
+            ("Observation", BIRTHDATE, "1950-04-12", &["o-nelson"]),
+            // String terminal: `ne` + "lson" would also match Wilson.
+            ("Observation", FAMILY, "nelson", &["o-nelson"]),
+            ("Observation", FAMILY, "Nelson", &["o-nelson"]),
+            ("Observation", FAMILY, "Equus", &["o-equus"]),
+            // Token terminal: `ne` + "123" / `eq` + "77" are the decoys' codes.
+            ("DiagnosticReport", "result.code", "ne123", &["dr-nelson"]),
+            ("DiagnosticReport", "result.code", "eq77", &["dr-equus"]),
+            // Reference terminal: `ne` + "lson-1" would also match wilson-1.
+            (
+                "DiagnosticReport",
+                "result.subject",
+                "nelson-1",
+                &["dr-nelson"],
+            ),
+            // Uri terminal: `ne` + "ws:example/1" is the decoy's url.
+            (
+                "Observation",
+                "device:Device.url",
+                "news:example/1",
+                &["o-nelson"],
+            ),
+            // Quantity terminal: explicit `eq` is a prefix, as are the rest.
+            ("DiagnosticReport", VALUE_QUANTITY, "eq5.4", &["dr-nelson"]),
+            (
+                "DiagnosticReport",
+                VALUE_QUANTITY,
+                "ne5.4",
+                &["dr-77", "dr-equus", "dr-wilson"],
+            ),
+            (
+                "DiagnosticReport",
+                VALUE_QUANTITY,
+                "gt6",
+                &["dr-77", "dr-equus"],
+            ),
+            // Number terminal, likewise.
+            ("Observation", WINDOW_START, "eq10", &["o-nelson"]),
+            ("Observation", WINDOW_START, "ne10", &["o-wilson"]),
+            ("Observation", WINDOW_START, "gt5", &["o-nelson"]),
+            // Date terminal with an explicit `eq` (#1290 regression guard).
+            ("Observation", BIRTHDATE, "eq1950-04-12", &["o-nelson"]),
+        ];
+
+        let mut failures = Vec::new();
+        for (base, chain, value, expected) in cases {
+            let ids = backend
+                .resolve_chain(&tenant, base, chain, value)
+                .await
+                .unwrap_or_else(|e| panic!("{base}?{chain}={value}: {e}"));
+            let ids = sorted_ids(ids);
+            if ids != expect_ids(expected) {
+                failures.push(format!(
+                    "{base}?{chain}={value}: got {ids:?}, want {expected:?}"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    /// Seeds the chained-numeric fixture (#1306) through the real write path.
+    ///
+    /// Number terminal, `MolecularSequence.referenceSeq.windowStart`, reached
+    /// by `Observation?has-member:MolecularSequence.window-start`:
+    /// `on-neg` → -100, `on-zero` → 0, `on-100` → 100, `on-105` → 105,
+    /// `on-200` → 200. The zero row is what an unparseable number used to
+    /// match, because it was read as `0`.
+    ///
+    /// Quantity terminal, `Observation.valueQuantity`, reached by
+    /// `DiagnosticReport?result:Observation.value-quantity` and by
+    /// `Patient?_has:Observation:subject:value-quantity`:
+    /// `dr-neg`/`pq-neg` → -5.4 mg, `dr-a`/`pq-a` → 5.4 mg,
+    /// `dr-b`/`pq-b` → 5.9 mg, `dr-c`/`pq-c` → 6.5 mg,
+    /// `dr-g`/`pq-g` → 0.0054 g (the same amount as 5.4 mg).
+    ///
+    /// Asserts that the *unchained* number and quantity searches find the
+    /// seeded rows, so a chained assertion can never pass vacuously against an
+    /// index that holds no numeric rows.
+    async fn seed_chain_numeric_fixture(backend: &PostgresBackend, tenant: &TenantContext) {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        for (suffix, window_start) in [
+            ("neg", -100),
+            ("zero", 0),
+            ("100", 100),
+            ("105", 105),
+            ("200", 200),
+        ] {
+            backend
+                .create(
+                    tenant,
+                    "MolecularSequence",
+                    json!({
+                        "resourceType": "MolecularSequence",
+                        "id": format!("ms-{suffix}"),
+                        "coordinateSystem": 0,
+                        "referenceSeq": {"windowStart": window_start, "windowEnd": 1000},
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            backend
+                .create(
+                    tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": format!("on-{suffix}"),
+                        "status": "final",
+                        "code": {"text": "x"},
+                        "hasMember": [{"reference": format!("MolecularSequence/ms-{suffix}")}],
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        for (suffix, amount, unit) in [
+            ("neg", -5.4, "mg"),
+            ("a", 5.4, "mg"),
+            ("b", 5.9, "mg"),
+            ("c", 6.5, "mg"),
+            ("g", 0.0054, "g"),
+        ] {
+            backend
+                .create(
+                    tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": format!("pq-{suffix}")}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            backend
+                .create(
+                    tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": format!("oq-{suffix}"),
+                        "status": "final",
+                        "code": {"text": "x"},
+                        "subject": {"reference": format!("Patient/pq-{suffix}")},
+                        "valueQuantity": {
+                            "value": amount,
+                            "unit": unit,
+                            "system": "http://unitsofmeasure.org",
+                            "code": unit,
+                        },
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            backend
+                .create(
+                    tenant,
+                    "DiagnosticReport",
+                    json!({
+                        "resourceType": "DiagnosticReport",
+                        "id": format!("dr-{suffix}"),
+                        "status": "final",
+                        "code": {"text": "x"},
+                        "result": [{"reference": format!("Observation/oq-{suffix}")}],
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let query = |rt: &str, name: &str, ty: SearchParamType, v: &str| {
+            SearchQuery::new(rt).with_parameter(SearchParameter {
+                name: name.to_string(),
+                param_type: ty,
+                modifier: None,
+                values: vec![SearchValue::parse(v)],
+                chain: vec![],
+                components: vec![],
+            })
+        };
+        let found = backend
+            .search(
+                tenant,
+                &query(
+                    "MolecularSequence",
+                    "window-start",
+                    SearchParamType::Number,
+                    "ap100",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            found.resources.items.len(),
+            2,
+            "fixture: window-start must be indexed or the chained tests are vacuous"
+        );
+        let found = backend
+            .search(
+                tenant,
+                &query(
+                    "Observation",
+                    "value-quantity",
+                    SearchParamType::Quantity,
+                    "ap5.4",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            found.resources.items.len(),
+            2,
+            "fixture: value-quantity must be indexed or the chained tests are vacuous"
+        );
+    }
+
+    /// Compares one chained-numeric case, recording rather than panicking so a
+    /// run reports every failing prefix at once.
+    fn check_chain_case(
+        failures: &mut Vec<String>,
+        label: &str,
+        value: &str,
+        result: Result<Vec<String>, impl std::fmt::Display>,
+        expected: &[&str],
+    ) {
+        match result {
+            Err(e) => failures.push(format!("{label}={value}: {e}")),
+            Ok(ids) => {
+                let ids = sorted_ids(ids);
+                if ids != expect_ids(expected) {
+                    failures.push(format!("{label}={value}: got {ids:?}, want {expected:?}"));
+                }
+            }
+        }
+    }
+
+    /// `Observation?has-member:MolecularSequence.window-start=<value>` through
+    /// the `ChainedSearchProvider` trait API (#1306). `ap` inlined its bounds
+    /// into the SQL text yet still returned a bind, so the statement was handed
+    /// one more parameter than it had placeholders.
+    #[tokio::test]
+    async fn postgres_integration_resolve_chain_number_terminal() {
+        use helios_persistence::core::ChainedSearchProvider;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("chain-number");
+        seed_chain_numeric_fixture(&backend, &tenant).await;
+
+        let cases: &[(&str, &[&str])] = &[
+            ("ap100", &["on-100", "on-105"]),
+            // A negative value: the window is [-110, -90], not [-90, -110].
+            ("ap-100", &["on-neg"]),
+            ("ap0", &["on-zero"]),
+            ("100", &["on-100"]),
+            ("100.0", &["on-100"]),
+            ("ne100", &["on-105", "on-200", "on-neg", "on-zero"]),
+            ("gt100", &["on-105", "on-200"]),
+            ("ge100", &["on-100", "on-105", "on-200"]),
+            ("lt100", &["on-neg", "on-zero"]),
+            ("le100", &["on-100", "on-neg", "on-zero"]),
+            ("lt0", &["on-neg"]),
+            // Not a number: must match nothing. It used to be read as 0.
+            ("abc", &[]),
+            ("apabc", &[]),
+            ("neabc", &[]),
+            ("gtabc", &[]),
+        ];
+        let mut failures = Vec::new();
+        for (value, expected) in cases {
+            let result = backend
+                .resolve_chain(
+                    &tenant,
+                    "Observation",
+                    "has-member:MolecularSequence.window-start",
+                    value,
+                )
+                .await;
+            check_chain_case(&mut failures, "window-start", value, result, expected);
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    /// `DiagnosticReport?result:Observation.value-quantity=<value>` through the
+    /// trait API (#1306), including the `number|system|code` forms.
+    #[tokio::test]
+    async fn postgres_integration_resolve_chain_quantity_terminal() {
+        use helios_persistence::core::ChainedSearchProvider;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("chain-quantity");
+        seed_chain_numeric_fixture(&backend, &tenant).await;
+
+        let cases: &[(&str, &[&str])] = &[
+            // No unit: the stored number alone is compared.
+            ("ap5.4", &["dr-a", "dr-b"]),
+            ("ap-5.4", &["dr-neg"]),
+            ("5.4", &["dr-a"]),
+            ("ne5.4", &["dr-b", "dr-c", "dr-g", "dr-neg"]),
+            ("gt5.4", &["dr-b", "dr-c"]),
+            ("ge5.4", &["dr-a", "dr-b", "dr-c"]),
+            ("lt0", &["dr-neg"]),
+            ("sa5.4", &["dr-b", "dr-c"]),
+            ("eb5.4", &["dr-g", "dr-neg"]),
+            ("le5.4", &["dr-a", "dr-g", "dr-neg"]),
+            // With a unit, as the unchained search reads it: the stored unit,
+            // or a UCUM equivalent (0.0054 g is 5.4 mg).
+            ("5.4|http://unitsofmeasure.org|mg", &["dr-a", "dr-g"]),
+            ("5.4||mg", &["dr-a", "dr-g"]),
+            (
+                "ap5.4|http://unitsofmeasure.org|mg",
+                &["dr-a", "dr-b", "dr-g"],
+            ),
+            ("ap-5.4||mg", &["dr-neg"]),
+            ("gt5.4||mg", &["dr-b", "dr-c"]),
+            ("5.4||kg", &[]),
+            // Not a number: must match nothing. It used to be read as 0.
+            ("abc", &[]),
+            ("apabc", &[]),
+            ("neabc", &[]),
+            ("abc||mg", &[]),
+        ];
+        let mut failures = Vec::new();
+        for (value, expected) in cases {
+            let result = backend
+                .resolve_chain(
+                    &tenant,
+                    "DiagnosticReport",
+                    "result:Observation.value-quantity",
+                    value,
+                )
+                .await;
+            check_chain_case(&mut failures, "value-quantity", value, result, expected);
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    /// Reverse chains onto numeric terminals (#1306):
+    /// `Patient?_has:Observation:subject:value-quantity=<value>` for quantity
+    /// and `Patient?_has:ChargeItem:subject:factor-override=<value>` for number.
+    #[tokio::test]
+    async fn postgres_integration_resolve_reverse_chain_numeric_terminal() {
+        use helios_persistence::core::ChainedSearchProvider;
+        use helios_persistence::types::{ReverseChainedParameter, SearchValue};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("reverse-chain-numeric");
+        seed_chain_numeric_fixture(&backend, &tenant).await;
+        for (patient, factor) in [("pq-a", 2.0), ("pq-neg", -2.0), ("pq-c", 0.0)] {
+            backend
+                .create(
+                    &tenant,
+                    "ChargeItem",
+                    json!({
+                        "resourceType": "ChargeItem",
+                        "id": format!("ci-{patient}"),
+                        "status": "billable",
+                        "code": {"text": "x"},
+                        "subject": {"reference": format!("Patient/{patient}")},
+                        "factorOverride": factor,
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let cases: &[(&str, &str, &str, &[&str])] = &[
+            ("Observation", "value-quantity", "ap5.4", &["pq-a", "pq-b"]),
+            ("Observation", "value-quantity", "ap-5.4", &["pq-neg"]),
+            (
+                "Observation",
+                "value-quantity",
+                "5.4||mg",
+                &["pq-a", "pq-g"],
+            ),
+            ("Observation", "value-quantity", "lt0", &["pq-neg"]),
+            ("Observation", "value-quantity", "apabc", &[]),
+            ("ChargeItem", "factor-override", "ap2", &["pq-a"]),
+            ("ChargeItem", "factor-override", "ap-2", &["pq-neg"]),
+            ("ChargeItem", "factor-override", "2", &["pq-a"]),
+            ("ChargeItem", "factor-override", "ne2", &["pq-c", "pq-neg"]),
+            ("ChargeItem", "factor-override", "lt0", &["pq-neg"]),
+            ("ChargeItem", "factor-override", "abc", &[]),
+            ("ChargeItem", "factor-override", "apabc", &[]),
+        ];
+        let mut failures = Vec::new();
+        for (source, param, value, expected) in cases {
+            let rc = ReverseChainedParameter::terminal(
+                *source,
+                "subject",
+                *param,
+                SearchValue::parse(value),
+            );
+            let result = backend.resolve_reverse_chain(&tenant, "Patient", &rc).await;
+            check_chain_case(
+                &mut failures,
+                &format!("_has {param}"),
+                value,
+                result,
+                expected,
+            );
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    // ========================================================================
+    // Unparseable number / quantity values never widen a search (#1319).
+    //
+    // #1319 made the query builder emit `FALSE` for them; since #1340 the
+    // shared gate (`validate_numeric_values`) rejects them before a query is
+    // built, so through `search` they are an `InvalidNumberValue`. The `FALSE`
+    // stays as defence in depth and is pinned by the builder's unit tests.
+    // ========================================================================
+
+    /// Three RiskAssessments (`ra-low` 0.2, `ra-high` 0.8, `ra-none` without a
+    /// probability) and four Observations coded 8480-6 (`uq-a` 5.4 mg, `uq-b`
+    /// 6.5 mg, `uq-pipe` 5.4 in the unit `a|b`, `uq-none` without a value).
+    /// The valueless resources are the decoys a dropped constraint returns.
+    async fn seed_unparseable_numeric_fixture(backend: &PostgresBackend, tenant: &TenantContext) {
+        for (id, probability) in [
+            ("ra-low", Some(0.2)),
+            ("ra-high", Some(0.8)),
+            ("ra-none", None),
+        ] {
+            let mut prediction = json!({"outcome": {"text": "x"}});
+            if let Some(p) = probability {
+                prediction["probabilityDecimal"] = json!(p);
+            }
+            backend
+                .create(
+                    tenant,
+                    "RiskAssessment",
+                    json!({
+                        "resourceType": "RiskAssessment",
+                        "id": id,
+                        "status": "final",
+                        "subject": {"reference": "Patient/p"},
+                        "prediction": [prediction],
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        for (id, quantity) in [
+            ("uq-a", Some((5.4, "mg"))),
+            ("uq-b", Some((6.5, "mg"))),
+            ("uq-pipe", Some((5.4, "a|b"))),
+            ("uq-none", None),
+        ] {
+            let mut observation = json!({
+                "resourceType": "Observation",
+                "id": id,
+                "status": "final",
+                "code": {"coding": [{"system": "http://loinc.org", "code": "8480-6"}]},
+            });
+            if let Some((value, unit)) = quantity {
+                observation["valueQuantity"] = json!({
+                    "value": value,
+                    "unit": unit,
+                    "system": "http://unitsofmeasure.org",
+                    "code": unit,
+                });
+            }
+            backend
+                .create(tenant, "Observation", observation, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+    }
+
+    fn result_ids(found: &helios_persistence::core::SearchResult) -> Vec<String> {
+        sorted_ids(
+            found
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect(),
+        )
+    }
+
+    /// What [`ids_or_refused`] reports for a search the shared numeric gate
+    /// refused (#1340).
+    const REFUSED: &[&str] = &["<InvalidNumberValue>"];
+
+    /// The ids a search found, or [`REFUSED`].
+    fn ids_or_refused(
+        result: helios_persistence::error::StorageResult<helios_persistence::core::SearchResult>,
+    ) -> Result<Vec<String>, StorageError> {
+        if is_invalid_number(&result) {
+            return Ok(expect_ids(REFUSED));
+        }
+        result.map(|found| result_ids(&found))
+    }
+
+    /// Whether a search was refused by the shared numeric gate (#1340).
+    fn is_invalid_number<T>(result: &helios_persistence::error::StorageResult<T>) -> bool {
+        matches!(
+            result,
+            Err(StorageError::Search(
+                helios_persistence::error::SearchError::InvalidNumberValue { .. }
+            ))
+        )
+    }
+
+    /// Runs `cases` as `<resource_type>?<name>=<value>`, expects every value of
+    /// `invalid` to be refused, and reports every mismatch at once.
+    async fn check_numeric_cases(
+        backend: &PostgresBackend,
+        tenant: &TenantContext,
+        resource_type: &str,
+        name: &str,
+        param_type: helios_persistence::types::SearchParamType,
+        cases: &[(&str, &[&str])],
+        invalid: &[&str],
+    ) {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{SearchParameter, SearchQuery, SearchValue};
+
+        let query = |value: &str| {
+            SearchQuery::new(resource_type).with_parameter(SearchParameter {
+                name: name.to_string(),
+                param_type,
+                modifier: None,
+                values: vec![SearchValue::parse(value)],
+                chain: vec![],
+                components: vec![],
+            })
+        };
+        let mut failures = Vec::new();
+        for (value, expected) in cases {
+            match backend.search(tenant, &query(value)).await {
+                Ok(found) => {
+                    let ids = result_ids(&found);
+                    if ids != expect_ids(expected) {
+                        failures.push(format!(
+                            "{name}={value}: got {ids:?}, expected {expected:?}"
+                        ));
+                    }
+                }
+                Err(e) => failures.push(format!("{name}={value}: error {e}")),
+            }
+        }
+        for value in invalid {
+            let result = backend.search(tenant, &query(value)).await;
+            if !is_invalid_number(&result) {
+                failures.push(format!(
+                    "{name}={value}: expected InvalidNumberValue, got {:?}",
+                    result.map(|found| result_ids(&found))
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    /// `RiskAssessment?probability=abc` used to be `RiskAssessment?` (#1319).
+    #[tokio::test]
+    async fn postgres_integration_unparseable_number_matches_nothing() {
+        use helios_persistence::types::SearchParamType;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("unparseable-number");
+        seed_unparseable_numeric_fixture(&backend, &tenant).await;
+
+        let cases: &[(&str, &[&str])] = &[
+            // Positive controls: the index holds the rows, in every accepted form.
+            ("0.2", &["ra-low"]),
+            ("gt0.5", &["ra-high"]),
+            ("ne0.2", &["ra-high"]),
+            ("lt1e3", &["ra-high", "ra-low"]),
+            ("gt2.5E-1", &["ra-high"]),
+            ("gt-1", &["ra-high", "ra-low"]),
+            ("+0.2", &["ra-low"]),
+            ("gt.5", &["ra-high"]),
+        ];
+        let invalid: &[&str] = &[
+            // Not a number: refused, under every prefix.
+            "abc",
+            "eqabc",
+            "neabc",
+            "gtabc",
+            "ltabc",
+            "geabc",
+            "leabc",
+            "saabc",
+            "ebabc",
+            "apabc",
+            "1e",
+            "gt",
+            "",
+            "0.2abc",
+            // `f64::from_str` takes these; as bounds they match every row.
+            "ltinf",
+            "ltinfinity",
+            "gt-inf",
+            "ltnan",
+            "neNaN",
+            "lt1e999",
+        ];
+        check_numeric_cases(
+            &backend,
+            &tenant,
+            "RiskAssessment",
+            "probability",
+            SearchParamType::Number,
+            cases,
+            invalid,
+        )
+        .await;
+    }
+
+    /// `Observation?value-quantity=abc` and friends (#1319). "Unparseable"
+    /// means the number part; the system and code forms must keep working.
+    #[tokio::test]
+    async fn postgres_integration_unparseable_quantity_matches_nothing() {
+        use helios_persistence::types::SearchParamType;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("unparseable-quantity");
+        seed_unparseable_numeric_fixture(&backend, &tenant).await;
+
+        let cases: &[(&str, &[&str])] = &[
+            // Positive controls.
+            ("5.4", &["uq-a", "uq-pipe"]),
+            ("5.4|http://unitsofmeasure.org|mg", &["uq-a"]),
+            ("5.4||mg", &["uq-a"]),
+            ("5.4|mg", &["uq-a"]),
+            ("gt6", &["uq-b"]),
+            ("gt6|http://unitsofmeasure.org|mg", &["uq-b"]),
+            ("lt1e3||mg", &["uq-a", "uq-b"]),
+            ("gt5.5E0||mg", &["uq-b"]),
+            ("gt-1||mg", &["uq-a", "uq-b"]),
+            ("+5.4||mg", &["uq-a"]),
+            // An escaped `|` is part of the code, not a separator.
+            ("5.4|http://unitsofmeasure.org|a\\|b", &["uq-pipe"]),
+            ("5.4||a\\|b", &["uq-pipe"]),
+            ("5.4|a\\|b", &["uq-pipe"]),
+        ];
+        // Number part is not a number.
+        let invalid: &[&str] = &[
+            "abc",
+            "neabc",
+            "apabc",
+            "abc|http://unitsofmeasure.org|mg",
+            "neabc|http://unitsofmeasure.org|mg",
+            "gt|http://unitsofmeasure.org|mg",
+            "|http://unitsofmeasure.org|mg",
+            "||mg",
+            "",
+            "1e||mg",
+            "ltinf||mg",
+            "nenan||mg",
+        ];
+        check_numeric_cases(
+            &backend,
+            &tenant,
+            "Observation",
+            "value-quantity",
+            SearchParamType::Quantity,
+            cases,
+            invalid,
+        )
+        .await;
+    }
+
+    /// An unparseable value beside valid parameters: the bad one must still
+    /// constrain, and the placeholders around it must stay bindable.
+    #[tokio::test]
+    async fn postgres_integration_unparseable_number_beside_valid_params() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("unparseable-number-mixed");
+        seed_unparseable_numeric_fixture(&backend, &tenant).await;
+
+        let code = SearchParameter {
+            name: "code".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("8480-6")],
+            chain: vec![],
+            components: vec![],
+        };
+        let quantity = |value: &str| SearchParameter {
+            name: "value-quantity".to_string(),
+            param_type: SearchParamType::Quantity,
+            modifier: None,
+            values: vec![SearchValue::parse(value)],
+            chain: vec![],
+            components: vec![],
+        };
+        let cases: Vec<(&str, Vec<SearchParameter>, &[&str])> = vec![
+            (
+                "code=8480-6 (positive control)",
+                vec![code.clone()],
+                &["uq-a", "uq-b", "uq-none", "uq-pipe"],
+            ),
+            (
+                "value-quantity=gt6&code=8480-6 (positive control)",
+                vec![quantity("gt6"), code.clone()],
+                &["uq-b"],
+            ),
+            (
+                "value-quantity=abc&code=8480-6",
+                vec![quantity("abc"), code.clone()],
+                REFUSED,
+            ),
+            (
+                "code=8480-6&value-quantity=gtabc&value-quantity=gt6",
+                vec![code.clone(), quantity("gtabc"), quantity("gt6")],
+                REFUSED,
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (label, params, expected) in cases {
+            let mut query = SearchQuery::new("Observation");
+            query.parameters = params;
+            match ids_or_refused(backend.search(&tenant, &query).await) {
+                Ok(ids) => {
+                    if ids != expect_ids(expected) {
+                        failures.push(format!("{label}: got {ids:?}, expected {expected:?}"));
+                    }
+                }
+                Err(e) => failures.push(format!("{label}: error {e}")),
+            }
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    /// `code-value-quantity=8480-6$abc`: a composite whose numeric component
+    /// does not parse.
+    #[tokio::test]
+    async fn postgres_integration_unparseable_composite_quantity_matches_nothing() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            CompositeSearchComponent, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("unparseable-composite");
+        seed_unparseable_numeric_fixture(&backend, &tenant).await;
+
+        let cases: &[(&str, &[&str])] = &[
+            ("8480-6$5.4", &["uq-a", "uq-pipe"]),
+            ("8480-6$gt6", &["uq-b"]),
+            ("8480-6$abc", REFUSED),
+            ("8480-6$neabc", REFUSED),
+            ("8480-6$gt", REFUSED),
+            ("8480-6$ltinf", REFUSED),
+            ("8480-6$nenan", REFUSED),
+            ("8480-6$abc|http://unitsofmeasure.org|mg", REFUSED),
+        ];
+        let mut failures = Vec::new();
+        for (value, expected) in cases {
+            let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "code-value-quantity".to_string(),
+                param_type: SearchParamType::Composite,
+                modifier: None,
+                values: vec![SearchValue::eq(*value)],
+                chain: vec![],
+                components: vec![
+                    CompositeSearchComponent {
+                        param_type: SearchParamType::Token,
+                        param_name: "code".to_string(),
+                    },
+                    CompositeSearchComponent {
+                        param_type: SearchParamType::Quantity,
+                        param_name: "value-quantity".to_string(),
+                    },
+                ],
+            });
+            match ids_or_refused(backend.search(&tenant, &query).await) {
+                Ok(ids) => {
+                    if ids != expect_ids(expected) {
+                        failures.push(format!(
+                            "code-value-quantity={value}: got {ids:?}, expected {expected:?}"
+                        ));
+                    }
+                }
+                Err(e) => failures.push(format!("code-value-quantity={value}: error {e}")),
+            }
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    /// `_contained=true` reuses the composite component builder, and skips a
+    /// component that comes back `None` — so an unparseable number or quantity
+    /// beside a valid parameter used to be dropped there too.
+    #[tokio::test]
+    async fn postgres_integration_unparseable_contained_number_is_not_dropped() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            ContainedMode, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("unparseable-contained");
+        backend
+            .create(
+                &tenant,
+                "DiagnosticReport",
+                json!({
+                    "resourceType": "DiagnosticReport",
+                    "id": "dr-container",
+                    "status": "final",
+                    "code": {"text": "x"},
+                    "result": [{"reference": "#o1"}],
+                    "contained": [
+                        {
+                            "resourceType": "Observation",
+                            "id": "o1",
+                            "status": "final",
+                            "code": {"coding": [{"system": "http://loinc.org", "code": "8480-6"}]},
+                            "valueQuantity": {
+                                "value": 5.4,
+                                "unit": "mg",
+                                "system": "http://unitsofmeasure.org",
+                                "code": "mg",
+                            },
+                        },
+                        {
+                            "resourceType": "RiskAssessment",
+                            "id": "r1",
+                            "status": "final",
+                            "subject": {"reference": "Patient/p"},
+                            "prediction": [{"probabilityDecimal": 0.2}],
+                        },
+                    ],
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let param = |name: &str, ty: SearchParamType, value: &str| SearchParameter {
+            name: name.to_string(),
+            param_type: ty,
+            modifier: None,
+            values: vec![SearchValue::parse(value)],
+            chain: vec![],
+            components: vec![],
+        };
+        let observation = ("Observation", "code", SearchParamType::Token, "8480-6");
+        let risk = (
+            "RiskAssessment",
+            "subject",
+            SearchParamType::Reference,
+            "Patient/p",
+        );
+        // (contained type, companion param, its type, its value)
+        type Target = (&'static str, &'static str, SearchParamType, &'static str);
+        let cases: &[(Target, &str, &[&str])] = &[
+            // Positive and negative controls, then the unparseable values.
+            (observation, "ge5", &["dr-container"]),
+            (observation, "ge6", &[]),
+            (observation, "abc", REFUSED),
+            (observation, "neabc||mg", REFUSED),
+            (observation, "ltinf", REFUSED),
+            (risk, "lt0.5", &["dr-container"]),
+            (risk, "gt0.5", &[]),
+            (risk, "abc", REFUSED),
+            (risk, "neabc", REFUSED),
+            (risk, "ltinf", REFUSED),
+        ];
+        let mut failures = Vec::new();
+        for ((resource_type, other, other_type, other_value), numeric, expected) in cases {
+            let (name, ty) = if *resource_type == "Observation" {
+                ("value-quantity", SearchParamType::Quantity)
+            } else {
+                ("probability", SearchParamType::Number)
+            };
+            let mut query = SearchQuery::new(*resource_type);
+            query.contained = ContainedMode::On;
+            query.parameters = vec![
+                param(other, *other_type, other_value),
+                param(name, ty, numeric),
+            ];
+            let ids = ids_or_refused(backend.search(&tenant, &query).await).unwrap();
+            if ids != expect_ids(expected) {
+                failures.push(format!(
+                    "{resource_type}?_contained=true&{other}={other_value}&{name}={numeric}: \
+                     got {ids:?}, expected {expected:?}"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
     // ========================================================================
     // Bulk Export — Phase 2 multi-instance job state on Postgres.
     // ========================================================================
@@ -7863,9 +12810,12 @@ mod postgres_integration {
         PatientExportProvider, StartExportInput, TypeExportProgress,
     };
     use helios_persistence::core::bulk_export_worker::{
-        ExportClaimStrategy, ExportWorkerStorage, LeaseError, WorkerId,
+        ExportClaimStrategy, ExportWorkerStorage, LeaseError, WorkerId, abandoned_export_message,
     };
     use std::time::Duration as StdDuration;
+
+    /// Claim cap for tests that are not exercising the cap itself.
+    const TEST_MAX_ATTEMPTS: u32 = 3;
 
     fn export_input(request: ExportRequest) -> StartExportInput {
         StartExportInput {
@@ -7886,8 +12836,31 @@ mod postgres_integration {
         target: &helios_persistence::core::bulk_export::ExportJobId,
         lease_duration: StdDuration,
     ) -> helios_persistence::core::bulk_export_worker::ExportJobLease {
+        claim_specific_with_cap(
+            backend,
+            worker_id,
+            target,
+            lease_duration,
+            TEST_MAX_ATTEMPTS,
+        )
+        .await
+    }
+
+    /// [`claim_specific`] with an explicit claim cap, for the tests that drive
+    /// one job past it (#1041).
+    async fn claim_specific_with_cap(
+        backend: &helios_persistence::backends::postgres::PostgresBackend,
+        worker_id: &WorkerId,
+        target: &helios_persistence::core::bulk_export::ExportJobId,
+        lease_duration: StdDuration,
+        max_attempts: u32,
+    ) -> helios_persistence::core::bulk_export_worker::ExportJobLease {
         for _ in 0..100 {
-            match backend.claim_next(worker_id, lease_duration).await.unwrap() {
+            match backend
+                .claim_next(worker_id, lease_duration, max_attempts)
+                .await
+                .unwrap()
+            {
                 Some(lease) if &lease.job_id == target => return lease,
                 Some(other) => {
                     // Drain other tests' jobs out of the queue by completing
@@ -8236,6 +13209,810 @@ mod postgres_integration {
         ));
 
         // Worker B can still finish.
+        backend
+            .finish_export_job(&tenant, &job_id, &worker_b, lease_b.fencing_token)
+            .await
+            .unwrap();
+    }
+
+    /// Reads a job's raw claim counter, which no trait surfaces.
+    async fn export_attempts(
+        backend: &PostgresBackend,
+        job_id: &helios_persistence::core::bulk_export::ExportJobId,
+    ) -> i32 {
+        let client = backend.get_client().await.unwrap();
+        client
+            .query_one(
+                "SELECT attempts FROM bulk_export_jobs WHERE id = $1",
+                &[&job_id.as_str()],
+            )
+            .await
+            .unwrap()
+            .get(0)
+    }
+
+    /// Completes every currently-claimable job, so a scan-order assertion sees
+    /// only the jobs the test itself created on the shared instance.
+    async fn drain_claim_queue(backend: &PostgresBackend) {
+        let worker = WorkerId::new(format!("pg-drain-{}", uuid::Uuid::new_v4()));
+        for _ in 0..100 {
+            match backend
+                .claim_next(&worker, StdDuration::from_secs(60), TEST_MAX_ATTEMPTS)
+                .await
+                .unwrap()
+            {
+                Some(lease) => {
+                    let _ = backend
+                        .finish_export_job(
+                            &lease.tenant,
+                            &lease.job_id,
+                            &lease.worker_id,
+                            lease.fencing_token,
+                        )
+                        .await;
+                }
+                None => return,
+            }
+        }
+    }
+
+    /// A job whose lease expires mid-run is reclaimable, so one that keeps
+    /// dying the same way used to be handed to worker after worker forever:
+    /// never terminal, `error_message` never set, the status poll answering
+    /// `202` indefinitely, and one of the tenant's export slots held the whole
+    /// time (#1041). The claim cap retires it instead.
+    #[tokio::test]
+    async fn postgres_integration_export_claim_cap_retires_a_job_that_never_finishes() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-attempt-cap");
+
+        let job_id = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        // Two claims, each losing its lease before finishing.
+        for attempt in 1..=2 {
+            let worker = WorkerId::new(format!("pg-cap-{attempt}-{}", uuid::Uuid::new_v4()));
+            let lease =
+                claim_specific_with_cap(&backend, &worker, &job_id, StdDuration::from_millis(1), 2)
+                    .await;
+            assert!(lease.fencing_token >= attempt as u64, "fencing still bumps");
+            assert_eq!(
+                export_attempts(&backend, &job_id).await,
+                attempt,
+                "attempts counted"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        // The third claim would exceed the cap, so the job is retired rather
+        // than handed out again.
+        let worker = WorkerId::new(format!("pg-cap-3-{}", uuid::Uuid::new_v4()));
+        for _ in 0..20 {
+            match backend
+                .claim_next(&worker, StdDuration::from_secs(60), 2)
+                .await
+                .unwrap()
+            {
+                Some(lease) => {
+                    assert_ne!(
+                        lease.job_id, job_id,
+                        "a job past its attempt cap must not be claimable"
+                    );
+                    // Another test's job: complete it and keep scanning.
+                    let _ = backend
+                        .finish_export_job(
+                            &lease.tenant,
+                            &lease.job_id,
+                            &lease.worker_id,
+                            lease.fencing_token,
+                        )
+                        .await;
+                }
+                None => break,
+            }
+        }
+
+        let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
+        assert_eq!(progress.status, ExportStatus::Error);
+        assert_eq!(progress.error_message, Some(abandoned_export_message(2)));
+        assert!(
+            progress.completed_at.is_some(),
+            "a retired job is terminal, so it has a completion time"
+        );
+    }
+
+    /// Retiring a job is not the end of the scan — the claim that spends the
+    /// last attempt still hands back the next eligible job, so one stuck job
+    /// cannot stall a worker that has other work waiting.
+    #[tokio::test]
+    async fn postgres_integration_export_claim_cap_still_returns_the_next_job() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-attempt-cap-scan");
+
+        // The assertion below is about scan order, so start from an empty
+        // queue rather than behind another test's leftovers.
+        drain_claim_queue(&backend).await;
+
+        let stuck = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let fresh = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        let worker = WorkerId::new(format!("pg-cap-scan-{}", uuid::Uuid::new_v4()));
+        let lease =
+            claim_specific_with_cap(&backend, &worker, &stuck, StdDuration::from_millis(1), 1)
+                .await;
+        assert_eq!(lease.job_id, stuck);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let lease = backend
+            .claim_next(&worker, StdDuration::from_secs(60), 1)
+            .await
+            .unwrap()
+            .expect("the scan must go past the retired job, not stop at it");
+        assert_eq!(lease.job_id, fresh);
+
+        assert_eq!(
+            backend
+                .get_export_status(&tenant, &stuck)
+                .await
+                .unwrap()
+                .status,
+            ExportStatus::Error
+        );
+        backend
+            .finish_export_job(&tenant, &fresh, &worker, lease.fencing_token)
+            .await
+            .unwrap();
+    }
+
+    /// The cap only ever sees jobs that come back for another claim: a job that
+    /// runs to completion on its first attempt is untouched by it.
+    #[tokio::test]
+    async fn postgres_integration_export_claim_cap_leaves_a_completed_job_alone() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-attempt-cap-complete");
+
+        let job_id = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        let worker = WorkerId::new(format!("pg-cap-done-{}", uuid::Uuid::new_v4()));
+        let lease =
+            claim_specific_with_cap(&backend, &worker, &job_id, StdDuration::from_secs(60), 1)
+                .await;
+        backend
+            .finish_export_job(&tenant, &job_id, &worker, lease.fencing_token)
+            .await
+            .unwrap();
+
+        let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
+        assert_eq!(progress.status, ExportStatus::Complete);
+        assert_eq!(progress.error_message, None);
+        assert_eq!(export_attempts(&backend, &job_id).await, 1);
+    }
+
+    use helios_persistence::core::bulk_export_output::{ExportPartKey, FinalizedPart};
+
+    /// Counts a job's rows in the two tables a re-claim wipes; no trait
+    /// surfaces them as raw counts.
+    async fn export_row_counts(
+        backend: &PostgresBackend,
+        job_id: &helios_persistence::core::bulk_export::ExportJobId,
+    ) -> (i64, i64) {
+        let client = backend.get_client().await.unwrap();
+        let progress: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM bulk_export_progress WHERE job_id = $1",
+                &[&job_id.as_str()],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let files: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM bulk_export_files WHERE job_id = $1",
+                &[&job_id.as_str()],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        (progress, files)
+    }
+
+    /// Records one finalized output part the way the worker does after a flush.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_output_part(
+        backend: &PostgresBackend,
+        tenant: &TenantContext,
+        job_id: &helios_persistence::core::bulk_export::ExportJobId,
+        worker: &WorkerId,
+        fencing_token: u64,
+        resource_type: &str,
+        part_index: u32,
+        line_count: u64,
+    ) {
+        let part = FinalizedPart {
+            key: ExportPartKey::output(
+                tenant.tenant_id().as_str(),
+                job_id.clone(),
+                resource_type,
+                part_index,
+                fencing_token,
+            ),
+            resource_type: resource_type.to_string(),
+            line_count,
+            size_bytes: line_count * 120,
+        };
+        backend
+            .record_export_file(tenant, job_id, worker, fencing_token, &part, "output")
+            .await
+            .unwrap();
+    }
+
+    /// Persists per-type progress the way the worker does between batches.
+    async fn record_type_progress(
+        backend: &PostgresBackend,
+        tenant: &TenantContext,
+        job_id: &helios_persistence::core::bulk_export::ExportJobId,
+        worker: &WorkerId,
+        fencing_token: u64,
+        progress: TypeExportProgress,
+    ) {
+        backend
+            .update_export_type_progress(tenant, job_id, worker, fencing_token, &progress)
+            .await
+            .unwrap();
+    }
+
+    /// Re-claiming a job whose lease expired mid-run drops everything the dead
+    /// worker wrote, in the same transaction that bumps the fencing token, so
+    /// the new lease starts from a clean slate (#1041).
+    #[tokio::test]
+    async fn postgres_integration_export_reclaim_discards_the_previous_attempts_rows() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-reclaim-wipe");
+
+        let job_id = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        let worker_a = WorkerId::new(format!("pg-wipe-a-{}", uuid::Uuid::new_v4()));
+        let lease_a =
+            claim_specific(&backend, &worker_a, &job_id, StdDuration::from_millis(1)).await;
+        backend
+            .mark_export_in_progress(&tenant, &job_id, &worker_a, lease_a.fencing_token)
+            .await
+            .unwrap();
+        let mut patient = TypeExportProgress::new("Patient");
+        patient.exported_count = 200;
+        patient.cursor_state = Some("page-3".to_string());
+        record_type_progress(
+            &backend,
+            &tenant,
+            &job_id,
+            &worker_a,
+            lease_a.fencing_token,
+            patient,
+        )
+        .await;
+        for part_index in 0..2 {
+            record_output_part(
+                &backend,
+                &tenant,
+                &job_id,
+                &worker_a,
+                lease_a.fencing_token,
+                "Patient",
+                part_index,
+                100,
+            )
+            .await;
+        }
+        assert_eq!(
+            export_row_counts(&backend, &job_id).await,
+            (1, 2),
+            "the first attempt wrote progress and file rows"
+        );
+
+        // The lease lapses and worker B takes over.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let worker_b = WorkerId::new(format!("pg-wipe-b-{}", uuid::Uuid::new_v4()));
+        let lease_b =
+            claim_specific(&backend, &worker_b, &job_id, StdDuration::from_secs(60)).await;
+        assert!(
+            lease_b.fencing_token > lease_a.fencing_token,
+            "the re-claim still bumps the fencing token"
+        );
+
+        assert_eq!(
+            export_row_counts(&backend, &job_id).await,
+            (0, 0),
+            "the re-claim wipes the previous attempt's progress and file rows"
+        );
+        let view = backend
+            .get_export_job_for_worker(&tenant, &job_id, &worker_b, lease_b.fencing_token)
+            .await
+            .unwrap();
+        assert!(
+            view.type_progress.is_empty(),
+            "the new attempt resumes from nothing, not from a cursor whose parts are gone"
+        );
+        assert!(
+            backend
+                .get_export_manifest(&tenant, &job_id)
+                .await
+                .unwrap()
+                .output
+                .is_empty(),
+            "no part of the abandoned attempt survives into the manifest"
+        );
+
+        backend
+            .finish_export_job(&tenant, &job_id, &worker_b, lease_b.fencing_token)
+            .await
+            .unwrap();
+    }
+
+    /// The wipe is only for re-claims: an `accepted` job never wrote anything,
+    /// and its first claim goes through the same code path untouched.
+    #[tokio::test]
+    async fn postgres_integration_export_first_claim_has_nothing_to_discard() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-first-claim");
+
+        let job_id = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+        assert_eq!(export_row_counts(&backend, &job_id).await, (0, 0));
+
+        let worker = WorkerId::new(format!("pg-first-claim-{}", uuid::Uuid::new_v4()));
+        let lease = claim_specific(&backend, &worker, &job_id, StdDuration::from_secs(60)).await;
+        assert!(lease.fencing_token >= 1);
+        assert_eq!(export_attempts(&backend, &job_id).await, 1);
+
+        // Rows written under the fresh lease stay put — the wipe runs before
+        // them, not after.
+        record_type_progress(
+            &backend,
+            &tenant,
+            &job_id,
+            &worker,
+            lease.fencing_token,
+            TypeExportProgress::new("Patient"),
+        )
+        .await;
+        record_output_part(
+            &backend,
+            &tenant,
+            &job_id,
+            &worker,
+            lease.fencing_token,
+            "Patient",
+            0,
+            10,
+        )
+        .await;
+        assert_eq!(export_row_counts(&backend, &job_id).await, (1, 1));
+
+        backend
+            .finish_export_job(&tenant, &job_id, &worker, lease.fencing_token)
+            .await
+            .unwrap();
+        let manifest = backend.get_export_manifest(&tenant, &job_id).await.unwrap();
+        assert_eq!(manifest.output.len(), 1);
+    }
+
+    /// The reason the wipe exists. The worker resumes *within* a type from
+    /// `cursor_state` but always restarts `part_index` at 0, and
+    /// `record_export_file` upserts on `(job, file_type, resource_type,
+    /// part_index)`. Keeping the first attempt's rows would therefore let the
+    /// second attempt's parts overwrite them row by row: the manifest would
+    /// list attempt 2's post-cursor parts under attempt 1's indexes, the
+    /// pre-cursor resources would vanish, and the job would still end
+    /// `complete` — silent data loss (#1041). After the wipe a manifest can
+    /// only ever describe one attempt.
+    #[tokio::test]
+    async fn postgres_integration_export_reclaim_cannot_mix_parts_from_two_attempts() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-reclaim-manifest");
+
+        let job_id = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        // Attempt 1: Observation runs to the end, Patient stops mid-type with
+        // two parts written and a cursor pointing past them.
+        let worker_a = WorkerId::new(format!("pg-mix-a-{}", uuid::Uuid::new_v4()));
+        let lease_a =
+            claim_specific(&backend, &worker_a, &job_id, StdDuration::from_millis(1)).await;
+        backend
+            .mark_export_in_progress(&tenant, &job_id, &worker_a, lease_a.fencing_token)
+            .await
+            .unwrap();
+        let mut observation = TypeExportProgress::new("Observation");
+        observation.exported_count = 50;
+        record_type_progress(
+            &backend,
+            &tenant,
+            &job_id,
+            &worker_a,
+            lease_a.fencing_token,
+            observation,
+        )
+        .await;
+        record_output_part(
+            &backend,
+            &tenant,
+            &job_id,
+            &worker_a,
+            lease_a.fencing_token,
+            "Observation",
+            0,
+            50,
+        )
+        .await;
+        let mut patient = TypeExportProgress::new("Patient");
+        patient.exported_count = 200;
+        patient.cursor_state = Some("after-patient-200".to_string());
+        record_type_progress(
+            &backend,
+            &tenant,
+            &job_id,
+            &worker_a,
+            lease_a.fencing_token,
+            patient,
+        )
+        .await;
+        for part_index in 0..2 {
+            record_output_part(
+                &backend,
+                &tenant,
+                &job_id,
+                &worker_a,
+                lease_a.fencing_token,
+                "Patient",
+                part_index,
+                100,
+            )
+            .await;
+        }
+
+        // Worker A dies; worker B re-claims the job.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let worker_b = WorkerId::new(format!("pg-mix-b-{}", uuid::Uuid::new_v4()));
+        let lease_b =
+            claim_specific(&backend, &worker_b, &job_id, StdDuration::from_secs(60)).await;
+
+        // Nothing of attempt 1 is left for attempt 2's part 0 to overwrite.
+        assert_eq!(
+            export_row_counts(&backend, &job_id).await,
+            (0, 0),
+            "attempt 2 must not inherit attempt 1's rows"
+        );
+        let view = backend
+            .get_export_job_for_worker(&tenant, &job_id, &worker_b, lease_b.fencing_token)
+            .await
+            .unwrap();
+        assert!(
+            view.type_progress.is_empty(),
+            "no surviving cursor, so attempt 2 re-exports Patient from the start"
+        );
+
+        // Attempt 2 re-exports both types from scratch and finishes.
+        record_output_part(
+            &backend,
+            &tenant,
+            &job_id,
+            &worker_b,
+            lease_b.fencing_token,
+            "Patient",
+            0,
+            300,
+        )
+        .await;
+        record_output_part(
+            &backend,
+            &tenant,
+            &job_id,
+            &worker_b,
+            lease_b.fencing_token,
+            "Observation",
+            0,
+            50,
+        )
+        .await;
+        backend
+            .finish_export_job(&tenant, &job_id, &worker_b, lease_b.fencing_token)
+            .await
+            .unwrap();
+
+        let manifest = backend.get_export_manifest(&tenant, &job_id).await.unwrap();
+        assert_eq!(manifest.status, ExportStatus::Complete);
+        assert_eq!(
+            manifest.output.len(),
+            2,
+            "one part per type, all from attempt 2"
+        );
+        assert!(
+            manifest
+                .output
+                .iter()
+                .all(|entry| entry.key.fencing_token == lease_b.fencing_token),
+            "every manifest entry belongs to the attempt that finished the job"
+        );
+        let patient_entry = manifest
+            .output
+            .iter()
+            .find(|entry| entry.resource_type == "Patient")
+            .expect("Patient part present");
+        assert_eq!(
+            patient_entry.count, 300,
+            "the manifest reports attempt 2's whole Patient export, not a post-cursor remainder \
+             sitting on top of attempt 1's rows"
+        );
+    }
+
+    /// The wipe is scoped to the job being re-claimed: another job of the same
+    /// tenant keeps its progress and file rows, however the DELETEs are
+    /// written.
+    #[tokio::test]
+    async fn postgres_integration_export_reclaim_leaves_other_jobs_rows_alone() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-reclaim-neighbour");
+
+        let bystander = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+        let reclaimed = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        // The bystander holds a long lease, so it is never eligible for the
+        // re-claim below; only its rows can prove the DELETEs are job-scoped.
+        let worker_a = WorkerId::new(format!("pg-bystander-{}", uuid::Uuid::new_v4()));
+        let lease_bystander =
+            claim_specific(&backend, &worker_a, &bystander, StdDuration::from_secs(60)).await;
+        record_type_progress(
+            &backend,
+            &tenant,
+            &bystander,
+            &worker_a,
+            lease_bystander.fencing_token,
+            TypeExportProgress::new("Patient"),
+        )
+        .await;
+        record_output_part(
+            &backend,
+            &tenant,
+            &bystander,
+            &worker_a,
+            lease_bystander.fencing_token,
+            "Patient",
+            0,
+            7,
+        )
+        .await;
+
+        let worker_b = WorkerId::new(format!("pg-neighbour-b-{}", uuid::Uuid::new_v4()));
+        let lease_b =
+            claim_specific(&backend, &worker_b, &reclaimed, StdDuration::from_millis(1)).await;
+        record_type_progress(
+            &backend,
+            &tenant,
+            &reclaimed,
+            &worker_b,
+            lease_b.fencing_token,
+            TypeExportProgress::new("Patient"),
+        )
+        .await;
+        record_output_part(
+            &backend,
+            &tenant,
+            &reclaimed,
+            &worker_b,
+            lease_b.fencing_token,
+            "Patient",
+            0,
+            9,
+        )
+        .await;
+
+        // Only `reclaimed` has an expired lease, so only its rows go.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let worker_c = WorkerId::new(format!("pg-neighbour-c-{}", uuid::Uuid::new_v4()));
+        let lease_c =
+            claim_specific(&backend, &worker_c, &reclaimed, StdDuration::from_secs(60)).await;
+        assert!(lease_c.fencing_token > lease_b.fencing_token);
+
+        assert_eq!(export_row_counts(&backend, &reclaimed).await, (0, 0));
+        assert_eq!(
+            export_row_counts(&backend, &bystander).await,
+            (1, 1),
+            "a concurrent job's rows are not collateral damage"
+        );
+        let bystander_manifest = backend
+            .get_export_manifest(&tenant, &bystander)
+            .await
+            .unwrap();
+        assert_eq!(bystander_manifest.output.len(), 1);
+        assert_eq!(bystander_manifest.output[0].count, 7);
+
+        backend
+            .finish_export_job(&tenant, &reclaimed, &worker_c, lease_c.fencing_token)
+            .await
+            .unwrap();
+        backend
+            .finish_export_job(
+                &tenant,
+                &bystander,
+                &worker_a,
+                lease_bystander.fencing_token,
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Reads a job's persisted lease columns, which no trait surfaces.
+    async fn export_lease_row(
+        backend: &PostgresBackend,
+        job_id: &helios_persistence::core::bulk_export::ExportJobId,
+    ) -> (DateTime<Utc>, DateTime<Utc>) {
+        let client = backend.get_client().await.unwrap();
+        let row = client
+            .query_one(
+                "SELECT lease_expiry, heartbeat_at FROM bulk_export_jobs WHERE id = $1",
+                &[&job_id.as_str()],
+            )
+            .await
+            .unwrap();
+        let expiry: Option<DateTime<Utc>> = row.get(0);
+        let heartbeat_at: Option<DateTime<Utc>> = row.get(1);
+        (
+            expiry.expect("a claimed job has a lease expiry"),
+            heartbeat_at.expect("a claimed job has a heartbeat timestamp"),
+        )
+    }
+
+    /// Claims and repeated heartbeats preserve short, default, and long lease
+    /// durations in both stored timestamps (#1152).
+    #[tokio::test]
+    async fn postgres_integration_export_claim_lease_duration_round_trips_into_heartbeats() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-heartbeat-roundtrip");
+
+        for seconds in [30, 60, 180] {
+            let job_id = backend
+                .start_export(&tenant, export_input(ExportRequest::system()))
+                .await
+                .unwrap();
+            let worker = WorkerId::new(format!("pg-hb-{seconds}-{}", uuid::Uuid::new_v4()));
+            let configured = StdDuration::from_secs(seconds);
+            let lease = claim_specific(&backend, &worker, &job_id, configured).await;
+            let expected = chrono::Duration::seconds(seconds as i64);
+
+            assert_eq!(lease.lease_duration, configured);
+            let (claimed_expiry, claimed_heartbeat) = export_lease_row(&backend, &job_id).await;
+            let claim_precision_loss = (lease.lease_expiry - claimed_expiry)
+                .num_nanoseconds()
+                .unwrap()
+                .abs();
+            assert!(
+                claim_precision_loss < 1_000,
+                "PostgreSQL may discard sub-microsecond precision, lost {claim_precision_loss}ns"
+            );
+            assert_eq!(claimed_expiry - claimed_heartbeat, expected);
+
+            for renewal in 1..=2 {
+                let returned = backend.heartbeat(&lease).await.unwrap();
+                let (persisted_expiry, heartbeat_at) = export_lease_row(&backend, &job_id).await;
+                let precision_loss = (returned - persisted_expiry)
+                    .num_nanoseconds()
+                    .unwrap()
+                    .abs();
+                assert!(
+                    precision_loss < 1_000,
+                    "renewal {renewal} for {seconds}s lost {precision_loss}ns to PostgreSQL precision"
+                );
+                assert_eq!(
+                    persisted_expiry - heartbeat_at,
+                    expected,
+                    "renewal {renewal} must preserve the {seconds}s claim duration"
+                );
+            }
+
+            backend
+                .finish_export_job(&tenant, &job_id, &worker, lease.fencing_token)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Renewing by the lease's own duration must not weaken the fence: a
+    /// worker whose job was re-claimed still learns it lost the lease, and
+    /// writes nothing to the row now owned by someone else.
+    #[tokio::test]
+    async fn postgres_integration_export_heartbeat_on_a_stolen_lease_is_lost() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-heartbeat-stolen");
+
+        let job_id = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+        let worker_a = WorkerId::new(format!("pg-hb-stolen-a-{}", uuid::Uuid::new_v4()));
+        let lease_a =
+            claim_specific(&backend, &worker_a, &job_id, StdDuration::from_secs(30)).await;
+
+        // Expire only the row still owned by worker A. This avoids a timing
+        // dependency while proving the update itself is fenced.
+        let past = Utc::now() - chrono::Duration::seconds(1);
+        let stale_token = lease_a.fencing_token as i64;
+        let client = backend.get_client().await.unwrap();
+        let affected = client
+            .execute(
+                "UPDATE bulk_export_jobs SET lease_expiry = $1
+                 WHERE id = $2 AND worker_id = $3 AND fencing_token = $4",
+                &[&past, &job_id.as_str(), &worker_a.as_str(), &stale_token],
+            )
+            .await
+            .unwrap();
+        assert_eq!(affected, 1, "the test must expire exactly worker A's row");
+        drop(client);
+
+        let worker_b = WorkerId::new(format!("pg-hb-stolen-b-{}", uuid::Uuid::new_v4()));
+        let lease_b =
+            claim_specific(&backend, &worker_b, &job_id, StdDuration::from_secs(180)).await;
+        assert!(lease_b.fencing_token > lease_a.fencing_token);
+        assert_eq!(lease_b.lease_duration, StdDuration::from_secs(180));
+        let row_after_steal = export_lease_row(&backend, &job_id).await;
+
+        assert!(matches!(
+            backend.heartbeat(&lease_a).await,
+            Err(LeaseError::LeaseLost { job_id: lost }) if lost == job_id
+        ));
+        assert_eq!(
+            export_lease_row(&backend, &job_id).await,
+            row_after_steal,
+            "the stale heartbeat must change neither lease timestamp"
+        );
+
+        let returned = backend.heartbeat(&lease_b).await.unwrap();
+        let (persisted_expiry, heartbeat_at) = export_lease_row(&backend, &job_id).await;
+        assert!(
+            (returned - persisted_expiry)
+                .num_nanoseconds()
+                .unwrap()
+                .abs()
+                < 1_000
+        );
+        assert_eq!(
+            persisted_expiry - heartbeat_at,
+            chrono::Duration::seconds(180),
+            "the new owner's duration controls its renewal"
+        );
         backend
             .finish_export_job(&tenant, &job_id, &worker_b, lease_b.fencing_token)
             .await
@@ -9061,6 +14838,8 @@ mod postgres_integration {
         let view = backend.get_manifest_for_worker(&lease).await.unwrap();
         assert_eq!(view.import_directives, directives);
         assert_eq!(view.metadata, metadata);
+        assert_eq!(view.fhir_base_url.as_deref(), Some("https://provider/fhir"));
+        assert_eq!(view.fhir_version, FhirVersion::R4);
         assert_eq!(
             ImportMode::from_directives(&view.import_directives),
             ImportMode::Merge
@@ -9109,6 +14888,354 @@ mod postgres_integration {
             json!("female"),
             "merge must retain elements the submission omitted"
         );
+        assert_eq!(stored.resource_type(), "Patient");
+        assert_eq!(stored.id(), "pg-merge-1");
+        assert_eq!(stored.version_id(), "2");
+        assert_eq!(stored.fhir_version(), FhirVersion::R4);
+        assert_eq!(stored.content()["resourceType"], "Patient");
+        assert_eq!(stored.content()["id"], "pg-merge-1");
+        assert_eq!(stored.content_with_meta()["meta"]["versionId"], "2");
+    }
+
+    #[tokio::test]
+    async fn postgres_bulk_submit_update_uses_one_core_mutation_statement() {
+        use helios_persistence::core::{BulkProcessingOptions, BulkSubmitProvider, NdjsonEntry};
+
+        let (backend, _dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenant = create_tenant("bulk-submit-core-update-statement");
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"core-update","name":[{"family":"before"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let (submission, manifest) =
+            new_bulk_submit_manifest(&backend, &tenant, "core-update-statement").await;
+        let results = backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest.manifest_id,
+                vec![NdjsonEntry::new(
+                    1,
+                    "Patient",
+                    json!({"resourceType":"Patient","id":"core-update","name":[{"family":"after"}]}),
+                )],
+                &BulkProcessingOptions::new()
+                    .with_skip_unchanged(false)
+                    .with_file_url("core-update.ndjson"),
+            )
+            .await
+            .unwrap();
+        assert!(results[0].is_success() && !results[0].created);
+
+        // max_connections=1 makes this the same physical session that ran the
+        // ingest. The caller query is deliberately not part of the filtered
+        // mutation families below.
+        let client = backend.get_client().await.unwrap();
+        let statements: Vec<String> = client
+            .query(
+                "SELECT statement FROM pg_prepared_statements
+                 WHERE statement ILIKE '%resources%' OR statement ILIKE '%resource_history%'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        let normalized: Vec<String> = statements
+            .iter()
+            .map(|statement| {
+                statement
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_ascii_lowercase()
+            })
+            .collect();
+        let guarded: Vec<_> = normalized
+            .iter()
+            .filter(|statement| {
+                statement.contains("with upd as (")
+                    && statement.contains("update resources set version_id")
+                    && statement.contains("insert into resource_history")
+                    && statement.contains("and version_id = $7")
+            })
+            .collect();
+        assert_eq!(
+            guarded.len(),
+            1,
+            "the bulk update must prepare exactly one guarded update+history family: {normalized:?}"
+        );
+        let standalone_resource_updates = normalized
+            .iter()
+            .filter(|statement| statement.starts_with("update resources set version_id"));
+        assert_eq!(
+            standalone_resource_updates.count(),
+            0,
+            "the old standalone resources UPDATE must not be prepared: {normalized:?}"
+        );
+        let standalone_history_inserts = normalized
+            .iter()
+            .filter(|statement| statement.starts_with("insert into resource_history"));
+        assert_eq!(
+            standalone_history_inserts.count(),
+            0,
+            "the old standalone history INSERT must not be prepared: {normalized:?}"
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordingCommittedResources {
+        batches: std::sync::Mutex<Vec<(Vec<String>, Vec<String>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl helios_persistence::core::BatchCommitObserver for RecordingCommittedResources {
+        async fn batch_committed(&self, batch: &helios_persistence::core::BatchCommitted<'_>) {
+            self.batches.lock().unwrap().push((
+                batch
+                    .results
+                    .iter()
+                    .map(|result| result.resource_id.clone().unwrap_or_default())
+                    .collect(),
+                batch
+                    .resources
+                    .iter()
+                    .map(|resource| resource.id().to_string())
+                    .collect(),
+            ));
+        }
+
+        fn wants_resources(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_bulk_submit_update_savepoint_rolls_back_resource_and_history() {
+        use helios_persistence::core::{
+            BulkEntryOutcome, BulkProcessingOptions, BulkSubmitProvider,
+            BulkSubmitRollbackProvider, ChangeType, NdjsonEntry,
+        };
+        use std::sync::Arc;
+
+        let (backend, dbname) = isolated_reindex_backend().await;
+        let tenant = create_tenant("bulk-submit-update-savepoint");
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"savepoint-original","name":[{"family":"original"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let client = reindex_test_client_for(&dbname).await;
+        let original_index_before: String = client
+            .query_one(
+                "SELECT md5(COALESCE(string_agg(to_jsonb(search_index)::text, '|' ORDER BY to_jsonb(search_index)::text), ''))
+                 FROM search_index WHERE tenant_id = $1 AND resource_type = 'Patient' AND resource_id = 'savepoint-original'",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let probe = format!("savepoint_update_probe_{suffix}");
+        let function = format!("fail_savepoint_update_{suffix}");
+        let trigger = format!("fail_savepoint_update_trigger_{suffix}");
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE {probe} (calls bigint NOT NULL);
+                 INSERT INTO {probe} VALUES (0);
+                 CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 DECLARE call_number bigint;
+                 BEGIN
+                   IF NEW.tenant_id = '{tenant_id}' AND NEW.resource_id = 'savepoint-original' THEN
+                     UPDATE {probe} SET calls = calls + 1 RETURNING calls INTO call_number;
+                     IF call_number = 1 THEN
+                       RAISE EXCEPTION 'forced first resource update index failure';
+                     END IF;
+                   END IF;
+                   RETURN NEW;
+                 END $$;
+                 CREATE TRIGGER {trigger} BEFORE INSERT ON search_index
+                   FOR EACH ROW EXECUTE FUNCTION {function}();"
+            ))
+            .await
+            .unwrap();
+
+        let (submission, manifest) =
+            new_bulk_submit_manifest(&backend, &tenant, "update-savepoint").await;
+        let observer = Arc::new(RecordingCommittedResources::default());
+        let processed = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            backend.process_entries(
+                &tenant,
+                &submission,
+                &manifest.manifest_id,
+                vec![
+                    NdjsonEntry::new(
+                        1,
+                        "Patient",
+                        json!({"resourceType":"Patient","id":"savepoint-original","name":[{"family":"failed"}]}),
+                    ),
+                    NdjsonEntry::new(
+                        2,
+                        "Patient",
+                        json!({"resourceType":"Patient","id":"savepoint-companion","name":[{"family":"companion"}]}),
+                    ),
+                ],
+                &BulkProcessingOptions::new()
+                    .with_defer_indexing(false)
+                    .with_batch_observer(observer.clone()),
+            ),
+        )
+        .await;
+        client
+            .batch_execute(&format!(
+                "DROP TRIGGER IF EXISTS {trigger} ON search_index;
+                 DROP FUNCTION IF EXISTS {function}();
+                 DROP TABLE IF EXISTS {probe};"
+            ))
+            .await
+            .unwrap();
+        let results = processed
+            .expect("bulk submit processing should finish before timeout")
+            .expect("the failed entry should be isolated by its savepoint");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].outcome, BulkEntryOutcome::ProcessingError);
+        assert!(results[0].resource_id.is_none());
+        assert!(!results[0].created);
+        let first_outcome = results[0].operation_outcome.as_ref().unwrap();
+        assert_eq!(first_outcome["resourceType"], "OperationOutcome");
+        assert_eq!(first_outcome["issue"][0]["severity"], "error");
+        assert_eq!(first_outcome["issue"][0]["code"], "exception");
+        assert!(
+            first_outcome["issue"][0]["diagnostics"]
+                .as_str()
+                .unwrap()
+                .contains("forced first resource update index failure")
+        );
+        assert!(results[1].is_success() && results[1].created);
+        assert_eq!(
+            results[1].resource_id.as_deref(),
+            Some("savepoint-companion")
+        );
+
+        let original = backend
+            .read(&tenant, "Patient", "savepoint-original")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(original.version_id(), "1");
+        assert_eq!(original.content()["name"][0]["family"], "original");
+        let original_history = backend
+            .history_instance(
+                &tenant,
+                "Patient",
+                "savepoint-original",
+                &HistoryParams::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(original_history.items.len(), 1);
+        assert_eq!(original_history.items[0].resource.version_id(), "1");
+        let original_index_after: String = client
+            .query_one(
+                "SELECT md5(COALESCE(string_agg(to_jsonb(search_index)::text, '|' ORDER BY to_jsonb(search_index)::text), ''))
+                 FROM search_index WHERE tenant_id = $1 AND resource_type = 'Patient' AND resource_id = 'savepoint-original'",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(original_index_after, original_index_before);
+
+        let companion = backend
+            .read(&tenant, "Patient", "savepoint-companion")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(companion.version_id(), "1");
+        assert_eq!(companion.content()["name"][0]["family"], "companion");
+        assert_eq!(
+            backend
+                .history_instance(
+                    &tenant,
+                    "Patient",
+                    "savepoint-companion",
+                    &HistoryParams::default()
+                )
+                .await
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+
+        let receipts = backend
+            .get_entry_results_page(&tenant, &submission, &manifest.manifest_id, None, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(receipts.entries.len(), 2);
+        assert_eq!(
+            receipts.entries[0].result.outcome,
+            BulkEntryOutcome::ProcessingError
+        );
+        assert_eq!(
+            receipts.entries[0].result.operation_outcome,
+            results[0].operation_outcome
+        );
+        assert_eq!(
+            receipts.entries[1].result.outcome,
+            BulkEntryOutcome::Success
+        );
+        assert_eq!(
+            receipts.entries[1].result.resource_id.as_deref(),
+            Some("savepoint-companion")
+        );
+        let counts = backend
+            .get_entry_counts(&tenant, &submission, &manifest.manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            (counts.total, counts.success, counts.processing_error),
+            (2, 1, 1)
+        );
+        let manifest_after = backend
+            .get_manifest(&tenant, &submission, &manifest.manifest_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                manifest_after.total_entries,
+                manifest_after.processed_entries,
+                manifest_after.failed_entries
+            ),
+            (2, 1, 1)
+        );
+        let changes = backend
+            .list_changes(&tenant, &submission, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].change_type, ChangeType::Create);
+        assert_eq!(changes[0].resource_id, "savepoint-companion");
+        let observed = observer.batches.lock().unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(
+            observed[0].0,
+            vec!["".to_string(), "savepoint-companion".to_string()]
+        );
+        assert_eq!(observed[0].1, vec!["savepoint-companion".to_string()]);
     }
 
     #[derive(Clone)]
@@ -9123,8 +15250,11 @@ mod postgres_integration {
     #[derive(Default)]
     struct RecordingBulkSubmitBatches(std::sync::Mutex<Vec<Vec<RecordedBulkEntry>>>);
 
+    // #1127 made the observer async, so it can bound its own wait instead of
+    // blocking the ingest task; this recorder only takes a lock.
+    #[async_trait::async_trait]
     impl helios_persistence::core::BatchCommitObserver for RecordingBulkSubmitBatches {
-        fn batch_committed(&self, batch: &helios_persistence::core::BatchCommitted<'_>) {
+        async fn batch_committed(&self, batch: &helios_persistence::core::BatchCommitted<'_>) {
             self.0.lock().unwrap().push(
                 batch
                     .results
@@ -10174,10 +16304,14 @@ mod postgres_integration {
         );
     }
 
-    /// The counter update runs after the resource transaction commits. Its
-    /// failure must preserve the durable batch and its single observer event.
+    /// #1127 moved the manifest counters into the batch transaction, so they
+    /// commit — or vanish — with the rows they describe. A counter failure
+    /// therefore takes the whole batch down with it: nothing durable, nothing
+    /// reported to the observer, and the error surfaced to the caller, which
+    /// re-walks the file. The per-file watermark keeps that re-walk from
+    /// charging the same lines twice.
     #[tokio::test]
-    async fn postgres_bulk_submit_tail_counter_failure_preserves_committed_batch() {
+    async fn postgres_bulk_submit_counter_failure_rolls_back_the_whole_batch() {
         use helios_persistence::core::{BulkSubmitProvider, NdjsonEntry};
 
         let (backend, dbname) = isolated_reindex_backend().await;
@@ -10227,7 +16361,11 @@ mod postgres_integration {
                 .await
                 .is_err()
         );
-        assert_eq!(observer.0.lock().unwrap().len(), 1);
+        // Nothing committed, so the observer is told about nothing: it must
+        // never see work the transaction rolled back.
+        assert_eq!(observer.0.lock().unwrap().len(), 0);
+        // The attempt counter is a sequence, so it survives the rollback and
+        // still proves both creates were flushed as one grouped statement.
         assert_eq!(grouped_resource_attempts(&client).await, 2);
         for table in [
             "resources",
@@ -10235,7 +16373,7 @@ mod postgres_integration {
             "bulk_entry_results",
             "bulk_submission_changes",
         ] {
-            assert_bulk_submit_table_count(&client, table, &tenant_id, 2).await;
+            assert_bulk_submit_table_count(&client, table, &tenant_id, 0).await;
         }
         let current = backend
             .get_manifest(&tenant, &submission, &manifest.manifest_id)
@@ -10619,7 +16757,7 @@ mod postgres_integration {
             .query_one(
                 "SELECT COUNT(*) FROM pg_prepared_statements
                  WHERE statement LIKE 'INSERT INTO bulk_submission_changes%'
-                    OR statement LIKE 'INSERT INTO bulk_entry_results%'",
+                    OR statement LIKE 'WITH receipt_rows AS%'",
                 &[],
             )
             .await
@@ -10752,28 +16890,933 @@ mod postgres_integration {
             2,
             "one rollback record per successful write, none for the failed entry"
         );
-        let create_change = changes
+        let create = changes
             .iter()
             .find(|change| change.resource_id == "pg-batch-new")
-            .unwrap();
-        assert_eq!(create_change.manifest_id, manifest.manifest_id);
-        assert_eq!(create_change.change_type, ChangeType::Create);
-        assert_eq!(create_change.resource_type, "Patient");
-        assert_eq!(create_change.previous_version, None);
-        assert_eq!(create_change.new_version, "1");
-        assert_eq!(create_change.previous_content, None);
-        let update_change = changes
+            .expect("create change");
+        assert_eq!(create.manifest_id, manifest.manifest_id);
+        assert_eq!(create.change_type, ChangeType::Create);
+        assert_eq!(create.resource_type, "Patient");
+        assert_eq!(create.new_version, "1");
+        assert!(create.previous_version.is_none());
+        assert!(create.previous_content.is_none());
+        let update = changes
             .iter()
             .find(|change| change.resource_id == "pg-batch-upd")
-            .unwrap();
-        assert_eq!(update_change.manifest_id, manifest.manifest_id);
-        assert_eq!(update_change.change_type, ChangeType::Update);
-        assert_eq!(update_change.resource_type, "Patient");
-        assert_eq!(update_change.previous_version.as_deref(), Some("1"));
-        assert_eq!(update_change.new_version, "2");
+            .expect("update change");
+        assert_eq!(update.manifest_id, manifest.manifest_id);
+        assert_eq!(update.change_type, ChangeType::Update);
+        assert_eq!(update.resource_type, "Patient");
+        assert_eq!(update.previous_version.as_deref(), Some("1"));
+        assert_eq!(update.new_version, "2");
         assert_eq!(
-            update_change.previous_content.as_ref().unwrap()["name"],
+            update
+                .previous_content
+                .as_ref()
+                .expect("update previous content")["name"],
             json!([{"family":"Old"}])
+        );
+
+        let page = backend
+            .get_entry_results_page(
+                &tenant,
+                &sub_id,
+                &manifest.manifest_id,
+                Some(BulkEntryOutcome::ProcessingError),
+                1,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert!(page.entries[0].result.resource_id.is_none());
+        assert!(page.entries[0].result.operation_outcome.is_some());
+    }
+
+    async fn seed_isolated_bulk_submit(
+        backend: &PostgresBackend,
+        label: &str,
+    ) -> (
+        TenantContext,
+        helios_persistence::core::SubmissionId,
+        String,
+    ) {
+        use helios_persistence::core::{BulkSubmitProvider, SubmissionId};
+
+        let tenant = create_tenant(label);
+        let submission = SubmissionId::generate(label);
+        backend
+            .create_submission(&tenant, &submission, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(
+                &tenant,
+                &submission,
+                Some(&format!("https://provider/{label}.json")),
+                None,
+            )
+            .await
+            .unwrap();
+        (tenant, submission, manifest.manifest_id)
+    }
+
+    async fn install_bookkeeping_statement_probe(dbname: &str) -> (tokio_postgres::Client, String) {
+        let client = reindex_test_client_for(dbname).await;
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let probe = format!("bulk_bookkeeping_probe_{suffix}");
+        let function = format!("record_bulk_bookkeeping_{suffix}");
+        let receipt_trigger = format!("record_bulk_receipt_{suffix}");
+        let change_trigger = format!("record_bulk_change_{suffix}");
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE {probe} (target text PRIMARY KEY, statements bigint NOT NULL);
+                 INSERT INTO {probe} VALUES ('bulk_entry_results', 0), ('bulk_submission_changes', 0);
+                 CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   UPDATE {probe} SET statements = statements + 1 WHERE target = TG_TABLE_NAME;
+                   RETURN NULL;
+                 END $$;
+                 CREATE TRIGGER {receipt_trigger} BEFORE INSERT ON bulk_entry_results
+                   FOR EACH STATEMENT EXECUTE FUNCTION {function}();
+                 CREATE TRIGGER {change_trigger} BEFORE INSERT ON bulk_submission_changes
+                   FOR EACH STATEMENT EXECUTE FUNCTION {function}();"
+            ))
+            .await
+            .expect("install bookkeeping statement probe");
+        (client, probe)
+    }
+
+    async fn bookkeeping_statement_counts(
+        client: &tokio_postgres::Client,
+        probe: &str,
+    ) -> (i64, i64) {
+        let receipt = client
+            .query_one(
+                &format!("SELECT statements FROM {probe} WHERE target = 'bulk_entry_results'"),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let change = client
+            .query_one(
+                &format!("SELECT statements FROM {probe} WHERE target = 'bulk_submission_changes'"),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        (receipt, change)
+    }
+
+    async fn reset_bookkeeping_statement_counts(client: &tokio_postgres::Client, probe: &str) {
+        client
+            .execute(&format!("UPDATE {probe} SET statements = 0"), &[])
+            .await
+            .unwrap();
+    }
+
+    fn mutation_entries(prefix: &str, count: usize) -> Vec<helios_persistence::core::NdjsonEntry> {
+        use helios_persistence::core::NdjsonEntry;
+
+        (0..count)
+            .map(|index| {
+                NdjsonEntry::new(
+                    index as u64 + 1,
+                    "Patient",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": format!("{prefix}-{index}")
+                    }),
+                )
+            })
+            .collect()
+    }
+
+    /// #1137: bookkeeping statement count is bounded by processed entries,
+    /// including batches where every entry is skipped and creates no rollback row.
+    #[tokio::test]
+    async fn postgres_bulk_submit_bookkeeping_flushes_in_processed_entry_batches() {
+        use helios_persistence::core::{
+            BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider, NdjsonEntry,
+            ResourceStorage,
+        };
+
+        let (backend, dbname) = isolated_reindex_backend().await;
+        let (client, probe) = install_bookkeeping_statement_probe(&dbname).await;
+
+        let (tenant, submission, manifest) =
+            seed_isolated_bulk_submit(&backend, "bulk-bookkeeping-100").await;
+        let results = backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest,
+                mutation_entries("bookkeeping-100", 100),
+                &BulkProcessingOptions::new().with_defer_indexing(true),
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 100);
+        assert_eq!(bookkeeping_statement_counts(&client, &probe).await, (1, 1));
+
+        reset_bookkeeping_statement_counts(&client, &probe).await;
+        let (tenant, submission, manifest) =
+            seed_isolated_bulk_submit(&backend, "bulk-bookkeeping-1002").await;
+        let results = backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest,
+                mutation_entries("bookkeeping-1002", 1002),
+                &BulkProcessingOptions::new().with_defer_indexing(true),
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1002);
+        assert_eq!(bookkeeping_statement_counts(&client, &probe).await, (2, 2));
+        assert_eq!(
+            backend
+                .get_entry_counts(&tenant, &submission, &manifest)
+                .await
+                .unwrap()
+                .total,
+            1002
+        );
+        assert_eq!(
+            backend
+                .list_changes(&tenant, &submission, 2000, 0)
+                .await
+                .unwrap()
+                .len(),
+            1002
+        );
+
+        reset_bookkeeping_statement_counts(&client, &probe).await;
+        let (tenant, submission, manifest) =
+            seed_isolated_bulk_submit(&backend, "bulk-bookkeeping-skips").await;
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"bookkeeping-existing"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let skips: Vec<_> = (0..1002)
+            .map(|index| {
+                NdjsonEntry::new(
+                    index + 1,
+                    "Patient",
+                    json!({"resourceType":"Patient","id":"bookkeeping-existing"}),
+                )
+            })
+            .collect();
+        let results = backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest,
+                skips,
+                &BulkProcessingOptions::create_only().with_defer_indexing(true),
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1002);
+        assert!(results.iter().all(|result| !result.is_success()));
+        assert_eq!(bookkeeping_statement_counts(&client, &probe).await, (2, 0));
+        assert_eq!(
+            backend
+                .get_entry_counts(&tenant, &submission, &manifest)
+                .await
+                .unwrap()
+                .skipped,
+            1002
+        );
+    }
+
+    /// #1137: a receipt upsert remains last-write-wins within one array batch,
+    /// across array batches, and on replay. File URL remains part of its identity.
+    #[tokio::test]
+    async fn postgres_bulk_submit_batched_receipts_keep_identity_and_change_fidelity() {
+        use helios_persistence::core::{
+            BulkEntryOutcome, BulkProcessingOptions, BulkSubmitProvider,
+            BulkSubmitRollbackProvider, ChangeType, NdjsonEntry, ResourceStorage,
+        };
+        use std::collections::HashSet;
+
+        let (backend, _dbname) = isolated_reindex_backend().await;
+        let (tenant, submission, manifest) =
+            seed_isolated_bulk_submit(&backend, "bulk-bookkeeping-identity").await;
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"identity-skip"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let mut across = vec![NdjsonEntry::new(
+            77,
+            "Patient",
+            json!({"resourceType":"Patient","id":"identity-across-first"}),
+        )];
+        across.extend((0..999).map(|index| {
+            NdjsonEntry::new(
+                index + 1000,
+                "Patient",
+                json!({"resourceType":"Patient","id":"identity-skip"}),
+            )
+        }));
+        across.push(NdjsonEntry::new(
+            77,
+            "Patient",
+            json!({"resourceType":"Patient","id":"identity-across-last"}),
+        ));
+        backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest,
+                across,
+                &BulkProcessingOptions::create_only()
+                    .with_file_url("across.ndjson")
+                    .with_defer_indexing(true),
+            )
+            .await
+            .unwrap();
+        let cross_flush_receipt = backend
+            .get_entry_results_page(
+                &tenant,
+                &submission,
+                &manifest,
+                Some(BulkEntryOutcome::Success),
+                1,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(cross_flush_receipt.entries.len(), 1);
+        assert_eq!(
+            cross_flush_receipt.entries[0].result.resource_id.as_deref(),
+            Some("identity-across-last")
+        );
+
+        backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest,
+                vec![
+                    NdjsonEntry::new(
+                        88,
+                        "Patient",
+                        json!({"resourceType":"Patient","id":"identity-within-first"}),
+                    ),
+                    NdjsonEntry::new(
+                        88,
+                        "Patient",
+                        json!({"resourceType":"Patient","id":"identity-within-last"}),
+                    ),
+                ],
+                &BulkProcessingOptions::new()
+                    .with_file_url("within.ndjson")
+                    .with_defer_indexing(true),
+            )
+            .await
+            .unwrap();
+
+        backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest,
+                vec![NdjsonEntry::new(
+                    77,
+                    "Patient",
+                    json!({"resourceType":"Patient","id":"identity-replay"}),
+                )],
+                &BulkProcessingOptions::new()
+                    .with_file_url("across.ndjson")
+                    .with_defer_indexing(true),
+            )
+            .await
+            .unwrap();
+        let replay_receipt = backend
+            .get_entry_results_page(
+                &tenant,
+                &submission,
+                &manifest,
+                Some(BulkEntryOutcome::Success),
+                1,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            replay_receipt.entries[0].result.resource_id.as_deref(),
+            Some("identity-replay")
+        );
+        backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest,
+                vec![NdjsonEntry::new(
+                    77,
+                    "Patient",
+                    json!({"resourceType":"Patient","id":"identity-other-file"}),
+                )],
+                &BulkProcessingOptions::new()
+                    .with_file_url("other.ndjson")
+                    .with_defer_indexing(true),
+            )
+            .await
+            .unwrap();
+        backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest,
+                vec![NdjsonEntry::new(
+                    79,
+                    "Patient",
+                    json!({
+                        "resourceType":"Patient",
+                        "id":"identity-replay",
+                        "active":true
+                    }),
+                )],
+                &BulkProcessingOptions::new()
+                    .with_file_url("across.ndjson")
+                    .with_defer_indexing(true),
+            )
+            .await
+            .unwrap();
+
+        let mut cursor = None;
+        let mut successes = Vec::new();
+        loop {
+            let page = backend
+                .get_entry_results_page(
+                    &tenant,
+                    &submission,
+                    &manifest,
+                    Some(BulkEntryOutcome::Success),
+                    1,
+                    cursor.as_ref(),
+                )
+                .await
+                .unwrap();
+            successes.extend(page.entries);
+            let Some(next) = page.next else {
+                break;
+            };
+            cursor = Some(next);
+        }
+        let success_identities: Vec<_> = successes
+            .iter()
+            .map(|entry| {
+                (
+                    entry.stored_identity.as_ref().unwrap().file_url.as_str(),
+                    entry.result.line_number,
+                    entry.result.resource_id.as_deref().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            success_identities,
+            vec![
+                ("across.ndjson", 77, "identity-replay"),
+                ("across.ndjson", 79, "identity-replay"),
+                ("other.ndjson", 77, "identity-other-file"),
+                ("within.ndjson", 88, "identity-within-last"),
+            ]
+        );
+        let skipped = backend
+            .get_entry_results_page(
+                &tenant,
+                &submission,
+                &manifest,
+                Some(BulkEntryOutcome::Skipped),
+                1,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(skipped.entries.len(), 1);
+        assert!(skipped.entries[0].result.resource_id.is_none());
+        assert!(skipped.entries[0].result.operation_outcome.is_some());
+
+        let changes = backend
+            .list_changes(&tenant, &submission, 20, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            changes.len(),
+            7,
+            "every successful mutation keeps its change"
+        );
+        assert_eq!(
+            changes
+                .iter()
+                .map(|change| change.change_id.as_str())
+                .collect::<HashSet<_>>()
+                .len(),
+            changes.len()
+        );
+        assert!(changes.iter().all(|change| {
+            change.manifest_id == manifest
+                && change.resource_type == "Patient"
+                && !change.change_id.is_empty()
+                && change.changed_at <= chrono::Utc::now()
+        }));
+        let update = changes
+            .iter()
+            .find(|change| change.change_type == ChangeType::Update)
+            .expect("replay update change");
+        assert_eq!(update.resource_id, "identity-replay");
+        assert_eq!(update.previous_version.as_deref(), Some("1"));
+        assert_eq!(update.new_version, "2");
+        assert_eq!(
+            update.previous_content.as_ref().unwrap()["id"],
+            json!("identity-replay")
+        );
+        assert!(
+            changes
+                .iter()
+                .filter(|change| change.change_type == ChangeType::Create)
+                .all(|change| change.previous_version.is_none()
+                    && change.previous_content.is_none()
+                    && change.new_version == "1")
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordingBatchCommitObserver {
+        batches: std::sync::Mutex<Vec<Vec<helios_persistence::core::BulkEntryResult>>>,
+    }
+
+    // #1127 made the observer async so it can bound its own wait; this one
+    // only takes a lock.
+    #[async_trait::async_trait]
+    impl helios_persistence::core::BatchCommitObserver for RecordingBatchCommitObserver {
+        async fn batch_committed(&self, batch: &helios_persistence::core::BatchCommitted<'_>) {
+            self.batches.lock().unwrap().push(batch.results.to_vec());
+        }
+    }
+
+    async fn install_second_bookkeeping_statement_failure(dbname: &str, target: &str) {
+        assert!(matches!(
+            target,
+            "bulk_entry_results" | "bulk_submission_changes"
+        ));
+        let client = reindex_test_client_for(dbname).await;
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let probe = format!("bulk_failure_probe_{suffix}");
+        let function = format!("fail_second_bulk_statement_{suffix}");
+        let trigger = format!("fail_second_bulk_statement_trigger_{suffix}");
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE {probe} (calls bigint NOT NULL);
+                 INSERT INTO {probe} VALUES (0);
+                 CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 DECLARE call_number bigint;
+                 BEGIN
+                   UPDATE {probe} SET calls = calls + 1 RETURNING calls INTO call_number;
+                   IF call_number = 2 THEN
+                     RAISE EXCEPTION 'forced second bookkeeping statement failure';
+                   END IF;
+                   RETURN NULL;
+                 END $$;
+                 CREATE TRIGGER {trigger} BEFORE INSERT ON {target}
+                   FOR EACH STATEMENT EXECUTE FUNCTION {function}();"
+            ))
+            .await
+            .expect("install second-statement failure trigger");
+    }
+
+    /// #1137: every flush remains inside the resource transaction. Failure of
+    /// either bookkeeping table on flush two rolls flush one and all resources back.
+    #[tokio::test]
+    async fn postgres_bulk_submit_second_bookkeeping_flush_failure_rolls_back_everything() {
+        use helios_persistence::core::{BulkProcessingOptions, BulkSubmitProvider};
+        use std::sync::Arc;
+
+        for target in ["bulk_entry_results", "bulk_submission_changes"] {
+            let (backend, dbname) = isolated_reindex_backend().await;
+            let (tenant, submission, manifest) =
+                seed_isolated_bulk_submit(&backend, &format!("bulk-failure-{target}")).await;
+            install_second_bookkeeping_statement_failure(&dbname, target).await;
+            let observer = Arc::new(RecordingBatchCommitObserver::default());
+            let outcome = backend
+                .process_entries(
+                    &tenant,
+                    &submission,
+                    &manifest,
+                    mutation_entries(&format!("failure-{target}"), 1001),
+                    &BulkProcessingOptions::new()
+                        .with_defer_indexing(true)
+                        .with_batch_observer(observer.clone()),
+                )
+                .await;
+            assert!(outcome.is_err(), "{target} failure must abort the batch");
+            assert!(
+                observer.batches.lock().unwrap().is_empty(),
+                "an uncommitted batch must not notify the observer"
+            );
+
+            let client = reindex_test_client_for(&dbname).await;
+            let tenant_id = tenant.tenant_id().as_str();
+            for table in [
+                "resources",
+                "resource_history",
+                "bulk_entry_results",
+                "bulk_submission_changes",
+            ] {
+                let count: i64 = client
+                    .query_one(
+                        &format!("SELECT COUNT(*) FROM {table} WHERE tenant_id = $1"),
+                        &[&tenant_id],
+                    )
+                    .await
+                    .unwrap()
+                    .get(0);
+                assert_eq!(count, 0, "{target} failure left rows in {table}");
+            }
+            let stored_manifest = backend
+                .get_manifest(&tenant, &submission, &manifest)
+                .await
+                .unwrap()
+                .expect("manifest remains after ingest rollback");
+            assert_eq!(stored_manifest.total_entries, 0);
+            assert_eq!(stored_manifest.processed_entries, 0);
+            assert_eq!(stored_manifest.failed_entries, 0);
+        }
+    }
+
+    /// #1137: the max-error paths flush and commit exactly the processed prefix
+    /// and notify only after commit. #1127 then moved the manifest counters into
+    /// the batch transaction, so the aborting entry is charged along with the
+    /// receipt it committed — the same result SQLite and MongoDB give.
+    #[tokio::test]
+    async fn postgres_bulk_submit_batched_bookkeeping_preserves_max_error_semantics() {
+        use helios_persistence::core::{
+            BulkEntryOutcome, BulkProcessingOptions, BulkSubmitProvider, NdjsonEntry,
+            ResourceStorage,
+        };
+        use helios_persistence::error::{BulkSubmitError, StorageError};
+        use std::sync::Arc;
+
+        let (backend, _dbname) = isolated_reindex_backend().await;
+        let (tenant, submission, manifest) =
+            seed_isolated_bulk_submit(&backend, "bulk-max-errors-stop").await;
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"max-stop-tombstone"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .delete(&tenant, "Patient", "max-stop-tombstone")
+            .await
+            .unwrap();
+        let stop_observer = Arc::new(RecordingBatchCommitObserver::default());
+        let outcome = backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest,
+                vec![
+                    NdjsonEntry::new(
+                        1,
+                        "Patient",
+                        json!({"resourceType":"Patient","id":"max-stop-tombstone"}),
+                    ),
+                    NdjsonEntry::new(
+                        2,
+                        "Patient",
+                        json!({"resourceType":"Patient","id":"max-stop-unreached"}),
+                    ),
+                ],
+                &BulkProcessingOptions::strict()
+                    .with_defer_indexing(true)
+                    .with_batch_observer(stop_observer.clone()),
+            )
+            .await;
+        assert!(
+            matches!(
+                &outcome,
+                Err(StorageError::BulkSubmit(
+                    BulkSubmitError::MaxErrorsExceeded { .. }
+                ))
+            ),
+            "expected MaxErrorsExceeded, got {outcome:?}"
+        );
+        {
+            let stopped_batches = stop_observer.batches.lock().unwrap();
+            assert_eq!(stopped_batches.len(), 1);
+            assert_eq!(stopped_batches[0].len(), 1);
+            assert!(stopped_batches[0][0].is_error());
+        }
+        let receipt_counts = backend
+            .get_entry_counts(&tenant, &submission, &manifest)
+            .await
+            .unwrap();
+        assert_eq!(receipt_counts.total, 1);
+        assert_eq!(receipt_counts.processing_error, 1);
+        assert!(
+            backend
+                .read(&tenant, "Patient", "max-stop-unreached")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let stopped_manifest = backend
+            .get_manifest(&tenant, &submission, &manifest)
+            .await
+            .unwrap()
+            .unwrap();
+        // #1127: the aborting entry's receipt committed with the batch, so the
+        // manifest charges it too. Counters that disagreed with their own
+        // receipts is what the status endpoint used to paper over by
+        // aggregating them on every poll.
+        assert_eq!(stopped_manifest.total_entries, 1);
+        assert_eq!(stopped_manifest.processed_entries, 0);
+        assert_eq!(stopped_manifest.failed_entries, 1);
+        assert_eq!(
+            stopped_manifest.total_entries, receipt_counts.total,
+            "the manifest counts exactly the receipts it committed"
+        );
+
+        let (tenant, submission, manifest) =
+            seed_isolated_bulk_submit(&backend, "bulk-max-errors-continue").await;
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"max-continue-tombstone"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .delete(&tenant, "Patient", "max-continue-tombstone")
+            .await
+            .unwrap();
+        let continue_observer = Arc::new(RecordingBatchCommitObserver::default());
+        let results = backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest,
+                vec![
+                    NdjsonEntry::new(
+                        1,
+                        "Patient",
+                        json!({"resourceType":"Patient","id":"max-continue-tombstone"}),
+                    ),
+                    NdjsonEntry::new(
+                        2,
+                        "Patient",
+                        json!({"resourceType":"Patient","id":"max-continue-a"}),
+                    ),
+                    NdjsonEntry::new(
+                        3,
+                        "Patient",
+                        json!({"resourceType":"Patient","id":"max-continue-b"}),
+                    ),
+                ],
+                &BulkProcessingOptions::new()
+                    .with_max_errors(1)
+                    .with_continue_on_error(true)
+                    .with_defer_indexing(true)
+                    .with_batch_observer(continue_observer.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_error());
+        assert!(
+            results[1..]
+                .iter()
+                .all(|result| result.outcome == BulkEntryOutcome::Skipped)
+        );
+        {
+            let continued_batches = continue_observer.batches.lock().unwrap();
+            assert_eq!(continued_batches.len(), 1);
+            assert_eq!(continued_batches[0].len(), 3);
+        }
+        let receipt_counts = backend
+            .get_entry_counts(&tenant, &submission, &manifest)
+            .await
+            .unwrap();
+        assert_eq!(receipt_counts.total, 3);
+        assert_eq!(receipt_counts.processing_error, 1);
+        assert_eq!(receipt_counts.skipped, 2);
+        let continued_manifest = backend
+            .get_manifest(&tenant, &submission, &manifest)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(continued_manifest.total_entries, 3);
+        assert_eq!(continued_manifest.processed_entries, 0);
+        assert_eq!(continued_manifest.failed_entries, 1);
+    }
+
+    /// Isolated probe counting row-level writes of `bulk_manifests.status`, so
+    /// "promote once" is observable at the SQL level rather than through a
+    /// value that reads `processing` either way.
+    ///
+    /// `FOR EACH ROW` plus `UPDATE OF status` keeps the batch's counter update
+    /// (which names the counter columns and never `status`) out of the count.
+    async fn install_bulk_status_write_probe(dbname: &str) -> (tokio_postgres::Client, String) {
+        let client = reindex_test_client_for(dbname).await;
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let probe = format!("bulk_status_probe_{suffix}");
+        let function = format!("record_bulk_status_write_{suffix}");
+        let trigger = format!("record_bulk_status_write_{suffix}_trigger");
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE {probe} (target text PRIMARY KEY, writes bigint NOT NULL);
+                 INSERT INTO {probe} VALUES ('bulk_manifests.status', 0);
+                 CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   UPDATE {probe} SET writes = writes + 1
+                     WHERE target = 'bulk_manifests.status';
+                   RETURN NULL;
+                 END $$;
+                 CREATE TRIGGER {trigger} AFTER UPDATE OF status ON bulk_manifests
+                   FOR EACH ROW EXECUTE FUNCTION {function}();"
+            ))
+            .await
+            .expect("install bulk manifest status write probe");
+        (client, probe)
+    }
+
+    async fn bulk_status_write_count(client: &tokio_postgres::Client, probe: &str) -> i64 {
+        client
+            .query_one(
+                &format!("SELECT writes FROM {probe} WHERE target = 'bulk_manifests.status'"),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0)
+    }
+
+    /// #1141: the first batch of a pending manifest promotes it to
+    /// `processing`; later batches leave `status` alone while their counters
+    /// keep accumulating. A batch that promotes nothing is still successful,
+    /// and a missing manifest is still the lookup's `ManifestNotFound`; an
+    /// empty promotion never becomes an error.
+    #[tokio::test]
+    async fn postgres_bulk_submit_promotes_manifest_status_once() {
+        use helios_persistence::core::{BulkProcessingOptions, BulkSubmitProvider, ManifestStatus};
+        use helios_persistence::error::{BulkSubmitError, StorageError};
+
+        let (backend, dbname) = isolated_reindex_backend().await;
+        let (client, probe) = install_bulk_status_write_probe(&dbname).await;
+        let (tenant, submission, manifest) =
+            seed_isolated_bulk_submit(&backend, "bulk-status-promote").await;
+
+        let first = backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest,
+                mutation_entries("status-promote-a", 2),
+                &BulkProcessingOptions::new()
+                    .with_file_url("status-promote-a.ndjson")
+                    .with_defer_indexing(true),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 2);
+        assert!(first.iter().all(|result| result.is_success()));
+
+        let promoted = backend
+            .get_manifest(&tenant, &submission, &manifest)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(promoted.status, ManifestStatus::Processing);
+        assert_eq!(
+            bulk_status_write_count(&client, &probe).await,
+            1,
+            "the first batch promotes the pending manifest with one status write"
+        );
+
+        let second = backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest,
+                mutation_entries("status-promote-b", 2),
+                &BulkProcessingOptions::new()
+                    .with_file_url("status-promote-b.ndjson")
+                    .with_defer_indexing(true),
+            )
+            .await
+            .expect("a batch on an already-promoted manifest is still a successful batch");
+        assert_eq!(second.len(), 2);
+        assert!(second.iter().all(|result| result.is_success()));
+
+        assert_eq!(
+            bulk_status_write_count(&client, &probe).await,
+            1,
+            "a later batch must not rewrite the already-promoted manifest status"
+        );
+        let after_second = backend
+            .get_manifest(&tenant, &submission, &manifest)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_second.status, ManifestStatus::Processing);
+        assert_eq!(after_second.total_entries, 4);
+        assert_eq!(after_second.processed_entries, 4);
+        assert_eq!(after_second.failed_entries, 0);
+        let receipts = backend
+            .get_entry_counts(&tenant, &submission, &manifest)
+            .await
+            .unwrap();
+        assert_eq!(receipts.total, 4);
+        assert_eq!(receipts.success, 4);
+        assert_eq!(receipts.processing_error, 0);
+
+        // A manifest that does not exist is still reported by the manifest
+        // lookup, and its zero matching status rows are never reached.
+        let missing = backend
+            .process_entries(
+                &tenant,
+                &submission,
+                "status-promote-missing",
+                mutation_entries("status-promote-missing", 1),
+                &BulkProcessingOptions::new()
+                    .with_file_url("status-promote-missing.ndjson")
+                    .with_defer_indexing(true),
+            )
+            .await;
+        assert!(
+            matches!(
+                &missing,
+                Err(StorageError::BulkSubmit(
+                    BulkSubmitError::ManifestNotFound { .. }
+                ))
+            ),
+            "expected ManifestNotFound, got {missing:?}"
+        );
+        assert_eq!(
+            bulk_status_write_count(&client, &probe).await,
+            1,
+            "a missing manifest never reaches a status write"
         );
     }
 
@@ -10984,6 +18027,179 @@ mod postgres_integration {
                 .unwrap()
                 .is_none(),
             "nothing after the cancellation point was ingested"
+        );
+    }
+
+    /// #1127, PostgreSQL: re-walking a file — what a reclaimed manifest or a
+    /// whole-file retry does — must not add the file to the manifest's
+    /// counters a second time. The submission summary reads those counters, so
+    /// it must equal the manifest, not a multiple of it.
+    #[tokio::test]
+    async fn postgres_bulk_submit_rewalk_does_not_multiply_manifest_counters() {
+        use helios_persistence::core::{
+            BulkProcessingOptions, BulkSubmitProvider, StreamingBulkSubmitProvider, SubmissionId,
+        };
+
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("bulk_submit_rewalk");
+        let sub_id = SubmissionId::generate("pg-rewalk-test");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &sub_id, Some("https://provider/rewalk.json"), None)
+            .await
+            .unwrap();
+
+        let patients = |n: u32| -> Vec<u8> {
+            (1..=n)
+                .map(|i| format!("{{\"resourceType\":\"Patient\",\"id\":\"pg-rewalk-{i}\"}}\n"))
+                .collect::<String>()
+                .into_bytes()
+        };
+        let options = BulkProcessingOptions::new()
+            .with_batch_size(2)
+            .with_file_url("https://provider/patient.ndjson");
+        // Two full passes over five lines, then a pass over a longer copy of
+        // the same file: only its two new lines are new work.
+        for lines in [patients(5), patients(5), patients(7)] {
+            let reader = Box::new(tokio::io::BufReader::new(std::io::Cursor::new(lines)));
+            backend
+                .process_ndjson_stream(
+                    &tenant,
+                    &sub_id,
+                    &manifest.manifest_id,
+                    "Patient",
+                    reader,
+                    &options,
+                )
+                .await
+                .unwrap();
+        }
+
+        let current = backend
+            .get_manifest(&tenant, &sub_id, &manifest.manifest_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let summary = backend
+            .get_submission(&tenant, &sub_id)
+            .await
+            .unwrap()
+            .unwrap();
+        backend
+            .abort_submission(&tenant, &sub_id, "test cleanup")
+            .await
+            .unwrap();
+
+        assert_eq!(current.total_entries, 7, "each line is charged once");
+        assert_eq!(current.processed_entries, 7);
+        assert_eq!(current.failed_entries, 0);
+        assert_eq!(summary.manifest_count, 1);
+        assert_eq!(
+            summary.total_entries, 7,
+            "the summary reads the manifest counters"
+        );
+        assert_eq!(summary.success_count, 7);
+        assert_eq!(summary.error_count, 0);
+        assert_eq!(summary.skipped_count, 0);
+    }
+
+    /// #1127, PostgreSQL: with `skip_unchanged`, replaying a resource whose
+    /// content is identical writes nothing — no new version, no history row,
+    /// no rollback record — while a changed resource is still updated. Without
+    /// the option the replay keeps today's behaviour.
+    #[tokio::test]
+    async fn postgres_bulk_submit_skip_unchanged_leaves_identical_resources_alone() {
+        use helios_persistence::core::{
+            BulkProcessingOptions, BulkSubmitProvider, NdjsonEntry, SubmissionId,
+        };
+
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("bulk_submit_skip_unchanged");
+        let sub_id = SubmissionId::generate("pg-skip-unchanged-test");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &sub_id, Some("https://provider/skip.json"), None)
+            .await
+            .unwrap();
+
+        let entries = |second_family: &str| {
+            vec![
+                NdjsonEntry::new(
+                    1,
+                    "Patient",
+                    json!({"resourceType":"Patient","id":"pg-same","name":[{"family":"Same"}]}),
+                ),
+                NdjsonEntry::new(
+                    2,
+                    "Patient",
+                    json!({"resourceType":"Patient","id":"pg-edit","name":[{"family":second_family}]}),
+                ),
+            ]
+        };
+        let skipping = BulkProcessingOptions::new().with_skip_unchanged(true);
+        let ingest = |batch, options| {
+            let backend = &backend;
+            let tenant = &tenant;
+            let sub_id = &sub_id;
+            let manifest_id = manifest.manifest_id.clone();
+            async move {
+                backend
+                    .process_entries(tenant, sub_id, &manifest_id, batch, &options)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let first = ingest(entries("Before"), skipping.clone()).await;
+        assert!(first.iter().all(|r| r.is_success() && r.created));
+
+        let replay = ingest(entries("After"), skipping.clone()).await;
+        let version = |id: &'static str| {
+            let backend = &backend;
+            let tenant = &tenant;
+            async move {
+                backend
+                    .read(tenant, "Patient", id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .version_id()
+                    .to_string()
+            }
+        };
+        let same_version = version("pg-same").await;
+        let edit_version = version("pg-edit").await;
+        let same_history = backend
+            .history_instance(&tenant, "Patient", "pg-same", &HistoryParams::default())
+            .await
+            .unwrap()
+            .items
+            .len();
+
+        let plain = ingest(entries("After"), BulkProcessingOptions::new()).await;
+        let same_after_plain = version("pg-same").await;
+        backend
+            .abort_submission(&tenant, &sub_id, "test cleanup")
+            .await
+            .unwrap();
+
+        assert!(replay[0].is_success() && replay[0].unchanged && !replay[0].created);
+        assert!(replay[1].is_success() && !replay[1].unchanged);
+        assert_eq!(same_version, "1", "an identical replay adds no version");
+        assert_eq!(same_history, 1, "an identical replay adds no history row");
+        assert_eq!(edit_version, "2", "a changed resource is still updated");
+        assert!(!plain[0].unchanged, "the option is opt-in");
+        assert_eq!(
+            same_after_plain, "2",
+            "without it the replay writes as before"
         );
     }
 
@@ -11277,12 +18493,610 @@ mod postgres_integration {
         format!("{}_{}", label, uuid::Uuid::new_v4().simple())
     }
 
+    /// #1312: `family=Neal` / `identifier=ne123` name the right resource on
+    /// every conditional interaction, and never the decoy the old
+    /// comparator-stripping parse would have found.
+    #[tokio::test]
+    async fn postgres_integration_conditional_criteria_with_prefix_like_values() {
+        let backend = create_backend().await;
+        super::conditional_criteria_suite::prefix_like_criteria_name_the_right_resource(
+            &backend,
+            &unique_base("cond_criteria_1312"),
+            true,
+        )
+        .await;
+    }
+
+    /// #1340: a number or quantity value that is not a number is an error on
+    /// every path (#1332 made it `FALSE`; before that the constraint was
+    /// dropped).
+    #[tokio::test]
+    async fn postgres_integration_invalid_numbers_are_rejected_on_every_path() {
+        let backend = create_backend().await;
+        super::numeric_validation_suite::invalid_numbers_are_rejected_on_every_path(
+            &backend,
+            &unique_base("numeric_validation"),
+        )
+        .await;
+    }
+
+    /// #1340: the same values as conditional criteria.
+    #[tokio::test]
+    async fn postgres_integration_invalid_numbers_are_rejected_in_conditional_criteria() {
+        let backend = create_backend().await;
+        super::numeric_validation_suite::invalid_numbers_are_rejected_in_conditional_criteria(
+            &backend,
+            &unique_base("numeric_validation_cond"),
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn postgres_integration_day_precision_date_boundaries() {
         let backend = create_backend().await;
         super::date_boundary_suite::day_precision_boundaries(
             &backend,
             &unique_base("date_boundary"),
+        )
+        .await;
+    }
+
+    /// #1297: a value with a time was a scalar comparison, so a
+    /// second-precision `eq` missed a stored `…:00.123` and a millisecond
+    /// `_lastUpdated` missed the microsecond timestamp stored for it. Also
+    /// holds PostgreSQL to the shared grammar: a value that is not a date is
+    /// an error (#1289 made it `FALSE`; before that it was "now").
+    #[tokio::test]
+    async fn postgres_integration_sub_day_date_precision_and_validation() {
+        let backend = create_backend().await;
+        super::date_precision_suite::sub_day_precision_and_validation(
+            &backend,
+            &unique_base("date_precision"),
+        )
+        .await;
+    }
+
+    /// #1300: the values of ONE parameter (`date=a,b`) are alternatives. The
+    /// date, `_lastUpdated`, number and quantity builders ANDed them, so a list
+    /// naming two different days asked for a resource on both and found none.
+    /// Repeating the parameter (`date=ge…&date=le…`) is the conjunction, and it
+    /// is folded one level up (`build_search_query_for`), so it must stay one.
+    #[tokio::test]
+    async fn postgres_integration_comma_list_is_or_and_repeated_param_is_and() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant(&unique_base("or_list"));
+
+        let mut procedure_ids = Vec::new();
+        for performed in ["2013-04-05", "2020-06-01"] {
+            let stored = backend
+                .create(
+                    &tenant,
+                    "Procedure",
+                    json!({
+                        "resourceType": "Procedure",
+                        "status": "completed",
+                        "subject": {"reference": "Patient/or-list"},
+                        "performedDateTime": performed
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            procedure_ids.push(stored.id().to_string());
+        }
+        let (old, new) = (procedure_ids[0].clone(), procedure_ids[1].clone());
+        pin_last_updated(&backend, &old, instant("2013-04-05T10:00:00Z")).await;
+        pin_last_updated(&backend, &new, instant("2020-06-01T10:00:00Z")).await;
+
+        let mut observation_ids = Vec::new();
+        for value in [5.0, 50.0] {
+            let stored = backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "status": "final",
+                        "code": {"text": "or-list"},
+                        "valueQuantity": {
+                            "value": value,
+                            "unit": "mg",
+                            "system": "http://unitsofmeasure.org",
+                            "code": "mg"
+                        }
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            observation_ids.push(stored.id().to_string());
+        }
+        let mut risk_ids = Vec::new();
+        for probability in [0.2, 0.8] {
+            let stored = backend
+                .create(
+                    &tenant,
+                    "RiskAssessment",
+                    json!({
+                        "resourceType": "RiskAssessment",
+                        "status": "final",
+                        "subject": {"reference": "Patient/or-list"},
+                        "prediction": [{"probabilityDecimal": probability}]
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            risk_ids.push(stored.id().to_string());
+        }
+
+        let param =
+            |name: &str, param_type: SearchParamType, values: Vec<SearchValue>| SearchParameter {
+                name: name.to_string(),
+                param_type,
+                modifier: None,
+                values,
+                chain: vec![],
+                components: vec![],
+            };
+        let search = |resource_type: &'static str, params: Vec<SearchParameter>| {
+            let backend = &backend;
+            let tenant = &tenant;
+            async move {
+                let mut query = SearchQuery::new(resource_type);
+                for p in params {
+                    query = query.with_parameter(p);
+                }
+                let mut ids: Vec<String> = backend
+                    .search(tenant, &query)
+                    .await
+                    .unwrap()
+                    .resources
+                    .items
+                    .iter()
+                    .map(|r| r.id().to_string())
+                    .collect();
+                ids.sort();
+                ids
+            }
+        };
+        let sorted = |ids: &[String]| {
+            let mut ids = ids.to_vec();
+            ids.sort();
+            ids
+        };
+        let date = SearchParamType::Date;
+
+        // Positive controls: each value alone finds exactly its own resource, so
+        // the parameters below are indexed and an empty list result is the fold.
+        for (name, value, expected) in [
+            ("date", "2013-04-05", &old),
+            ("date", "2020-06-01", &new),
+            ("_lastUpdated", "2013-04-05", &old),
+            ("_lastUpdated", "2020-06-01", &new),
+        ] {
+            assert_eq!(
+                search(
+                    "Procedure",
+                    vec![param(name, date, vec![SearchValue::eq(value)])]
+                )
+                .await,
+                vec![expected.clone()],
+                "control: {name}={value}"
+            );
+        }
+
+        // `date=2013-04-05,2020-06-01` — either day.
+        assert_eq!(
+            search(
+                "Procedure",
+                vec![param(
+                    "date",
+                    date,
+                    vec![SearchValue::eq("2013-04-05"), SearchValue::eq("2020-06-01")]
+                )]
+            )
+            .await,
+            sorted(&procedure_ids),
+            "date=2013-04-05,2020-06-01"
+        );
+        // `_lastUpdated=2013-04-05,2020-06-01`
+        assert_eq!(
+            search(
+                "Procedure",
+                vec![param(
+                    "_lastUpdated",
+                    date,
+                    vec![SearchValue::eq("2013-04-05"), SearchValue::eq("2020-06-01")]
+                )]
+            )
+            .await,
+            sorted(&procedure_ids),
+            "_lastUpdated=2013-04-05,2020-06-01"
+        );
+        // A prefixed list: `date=lt2014-01-01,gt2020-01-01` — no single day can
+        // satisfy both, so under AND this is empty by construction.
+        for name in ["date", "_lastUpdated"] {
+            assert_eq!(
+                search(
+                    "Procedure",
+                    vec![param(
+                        name,
+                        date,
+                        vec![
+                            SearchValue::new(SearchPrefix::Lt, "2014-01-01"),
+                            SearchValue::new(SearchPrefix::Gt, "2020-01-01"),
+                        ]
+                    )]
+                )
+                .await,
+                sorted(&procedure_ids),
+                "{name}=lt2014-01-01,gt2020-01-01"
+            );
+        }
+        // An alternative nothing matches adds nothing.
+        assert_eq!(
+            search(
+                "Procedure",
+                vec![param(
+                    "date",
+                    date,
+                    vec![SearchValue::eq("2013-04-05"), SearchValue::eq("1999-01-01")]
+                )]
+            )
+            .await,
+            vec![old.clone()],
+            "date=2013-04-05,1999-01-01"
+        );
+
+        // Repeated parameters stay a conjunction: `date=ge2013-01-01&date=le2013-12-31`
+        // is the year 2013, not "everything".
+        for name in ["date", "_lastUpdated"] {
+            assert_eq!(
+                search(
+                    "Procedure",
+                    vec![
+                        param(
+                            name,
+                            date,
+                            vec![SearchValue::new(SearchPrefix::Ge, "2013-01-01")]
+                        ),
+                        param(
+                            name,
+                            date,
+                            vec![SearchValue::new(SearchPrefix::Le, "2013-12-31")]
+                        ),
+                    ]
+                )
+                .await,
+                vec![old.clone()],
+                "{name}=ge2013-01-01&{name}=le2013-12-31"
+            );
+        }
+        // …and an OR list inside a conjunction keeps its parentheses:
+        // `date=2013-04-05,2020-06-01&date=gt2019-01-01`.
+        assert_eq!(
+            search(
+                "Procedure",
+                vec![
+                    param(
+                        "date",
+                        date,
+                        vec![SearchValue::eq("2013-04-05"), SearchValue::eq("2020-06-01")]
+                    ),
+                    param(
+                        "date",
+                        date,
+                        vec![SearchValue::new(SearchPrefix::Gt, "2019-01-01")]
+                    ),
+                ]
+            )
+            .await,
+            vec![new.clone()],
+            "date=2013-04-05,2020-06-01&date=gt2019-01-01"
+        );
+
+        // The sibling builders had the same fold. Quantity: `value-quantity=5|…|mg,50|…|mg`.
+        let quantity = SearchParamType::Quantity;
+        let mg = |n: &str| SearchValue::eq(format!("{n}|http://unitsofmeasure.org|mg"));
+        assert_eq!(
+            search(
+                "Observation",
+                vec![param("value-quantity", quantity, vec![mg("5")])]
+            )
+            .await,
+            vec![observation_ids[0].clone()],
+            "control: value-quantity=5|…|mg"
+        );
+        assert_eq!(
+            search(
+                "Observation",
+                vec![param("value-quantity", quantity, vec![mg("5"), mg("50")])]
+            )
+            .await,
+            sorted(&observation_ids),
+            "value-quantity=5|…|mg,50|…|mg"
+        );
+        assert_eq!(
+            search(
+                "Observation",
+                vec![
+                    param(
+                        "value-quantity",
+                        quantity,
+                        vec![SearchValue::new(
+                            SearchPrefix::Gt,
+                            "1|http://unitsofmeasure.org|mg"
+                        )]
+                    ),
+                    param(
+                        "value-quantity",
+                        quantity,
+                        vec![SearchValue::new(
+                            SearchPrefix::Lt,
+                            "10|http://unitsofmeasure.org|mg"
+                        )]
+                    ),
+                ]
+            )
+            .await,
+            vec![observation_ids[0].clone()],
+            "value-quantity=gt1|…|mg&value-quantity=lt10|…|mg"
+        );
+
+        // Number: `probability=0.2,0.8`.
+        let number = SearchParamType::Number;
+        assert_eq!(
+            search(
+                "RiskAssessment",
+                vec![param("probability", number, vec![SearchValue::eq("0.2")])]
+            )
+            .await,
+            vec![risk_ids[0].clone()],
+            "control: probability=0.2"
+        );
+        assert_eq!(
+            search(
+                "RiskAssessment",
+                vec![param(
+                    "probability",
+                    number,
+                    vec![SearchValue::eq("0.2"), SearchValue::eq("0.8")]
+                )]
+            )
+            .await,
+            sorted(&risk_ids),
+            "probability=0.2,0.8"
+        );
+    }
+
+    /// What makes the OR fold (#1300) safe: under OR a value that is not a date
+    /// is `FALSE OR x`, so it no longer empties the parameter the way it did
+    /// under AND. It never gets that far — the shared gate rejects the whole
+    /// request, in either order and under `ne`, for `search` and `search_count`
+    /// alike, so a list with a bad value is an error and never a widened (or
+    /// silently narrowed) result.
+    #[tokio::test]
+    async fn postgres_integration_invalid_date_in_or_list_is_rejected() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::error::SearchError;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant(&unique_base("or_list_gate"));
+        backend
+            .create(
+                &tenant,
+                "Procedure",
+                json!({
+                    "resourceType": "Procedure",
+                    "status": "completed",
+                    "subject": {"reference": "Patient/or-list"},
+                    "performedDateTime": "2013-04-05"
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let query = |name: &str, values: Vec<SearchValue>| {
+            SearchQuery::new("Procedure").with_parameter(SearchParameter {
+                name: name.to_string(),
+                param_type: SearchParamType::Date,
+                modifier: None,
+                values,
+                chain: vec![],
+                components: vec![],
+            })
+        };
+
+        // Positive control: the valid value alone finds the resource.
+        let found = backend
+            .search(&tenant, &query("date", vec![SearchValue::eq("2013-04-05")]))
+            .await
+            .unwrap();
+        assert_eq!(found.resources.items.len(), 1);
+
+        for name in ["date", "_lastUpdated"] {
+            for values in [
+                vec![SearchValue::eq("2013-04-05"), SearchValue::eq("not-a-date")],
+                vec![
+                    SearchValue::new(SearchPrefix::Lt, "not-a-date"),
+                    SearchValue::eq("2013-04-05"),
+                ],
+                vec![
+                    SearchValue::new(SearchPrefix::Ne, "2013-13-45"),
+                    SearchValue::eq("2013-04-05"),
+                ],
+            ] {
+                let q = query(name, values);
+                let context = format!("{name}: {:?}", q.parameters[0].values);
+                match backend.search(&tenant, &q).await {
+                    Err(StorageError::Search(SearchError::InvalidDateValue { .. })) => {}
+                    Err(other) => panic!("{context}: expected InvalidDateValue, got {other}"),
+                    Ok(result) => panic!(
+                        "{context}: must be rejected, returned {} resource(s)",
+                        result.resources.items.len()
+                    ),
+                }
+                assert!(
+                    backend.search_count(&tenant, &q).await.is_err(),
+                    "{context}: search_count must be rejected too"
+                );
+            }
+        }
+    }
+
+    /// #1315: a stored `…T09:20` is not RFC 3339, so `parse_index_date`
+    /// returned `None`, the `search_index` row was skipped, and the resource
+    /// could not be found by that date parameter at all.
+    #[tokio::test]
+    async fn postgres_integration_minute_precision_stored_dates_are_indexed() {
+        let backend = create_backend().await;
+        super::date_minute_index_suite::minute_precision_stored_values_are_indexed(
+            &backend,
+            &unique_base("date_minute_index"),
+        )
+        .await;
+    }
+
+    /// #1336: a repeated parameter under `_contained` is a conjunction on one
+    /// contained resource.
+    #[tokio::test]
+    async fn postgres_integration_contained_repeated_parameters_are_anded() {
+        let backend = create_backend().await;
+        super::contained_suite::repeated_parameters_are_anded(
+            &backend,
+            &unique_base("contained_repeated"),
+        )
+        .await;
+    }
+
+    /// #1363: `_`-parameters, composites and modifiers are applied under
+    /// `_contained`, or refused by name — never dropped.
+    #[tokio::test]
+    async fn postgres_integration_contained_criteria_are_applied_or_rejected() {
+        let backend = create_backend().await;
+        super::contained_suite::criteria_are_applied_or_rejected(
+            &backend,
+            &unique_base("contained_criteria"),
+        )
+        .await;
+    }
+
+    /// #1383: `_contained` alone is every contained resource of the type;
+    /// `_total`, `search_count` and paging agree; compartment membership is
+    /// applied; `_has`, `_list` and chains are refused by name.
+    #[tokio::test]
+    async fn postgres_integration_contained_unconstrained_and_out_of_band_constraints() {
+        let backend = create_backend().await;
+        super::contained_suite::unconstrained_and_out_of_band_constraints(
+            &backend,
+            &unique_base("contained_gaps"),
+        )
+        .await;
+    }
+
+    /// #1337: `1e2` is one significant figure, `[50, 150)`.
+    #[tokio::test]
+    async fn postgres_integration_exponent_values_use_significant_figures() {
+        let backend = create_backend().await;
+        super::number_exponent_suite::exponent_values_use_significant_figures(
+            &backend,
+            &unique_base("number_exponent"),
+            true,
+        )
+        .await;
+    }
+
+    /// #1379: `gender=<system>|female` never matched a `code` element.
+    #[tokio::test]
+    async fn postgres_integration_system_qualified_tokens_match_code_elements() {
+        let backend = create_backend().await;
+        super::token_code_system_suite::system_qualified_tokens_match_code_elements(
+            &backend,
+            &unique_base("token_code_system"),
+            false,
+        )
+        .await;
+    }
+
+    /// #1379: a row indexed before the marker existed has no system at all and
+    /// keeps its old behaviour until the resource is reindexed.
+    #[tokio::test]
+    async fn postgres_integration_unmarked_code_rows_keep_their_old_behaviour() {
+        let backend = create_backend().await;
+        let tenant = super::token_code_system_suite::seed_for_unmarked_rows(
+            &backend,
+            &unique_base("token_code_system_old"),
+        )
+        .await;
+        let client = backend.get_client().await.unwrap();
+        let stripped = client
+            .execute(
+                "UPDATE search_index SET value_token_system = NULL \
+                 WHERE tenant_id = $1 AND param_name = 'gender'",
+                &[&tenant.tenant_id().as_str()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(stripped, 1);
+        super::token_code_system_suite::unmarked_rows_keep_their_old_behaviour(&backend, &tenant)
+            .await;
+    }
+
+    /// #1379: the same predicate as a chain terminal.
+    #[tokio::test]
+    async fn postgres_integration_system_qualified_tokens_in_chains() {
+        let backend = create_backend().await;
+        super::token_code_system_suite::system_qualified_tokens_in_chains(
+            &backend,
+            &unique_base("token_code_system_chain"),
+        )
+        .await;
+    }
+
+    /// #1381: `If-Match` is evaluated against the resource the criteria
+    /// resolve to, on conditional update, delete and patch.
+    #[tokio::test]
+    async fn postgres_integration_conditional_writes_honour_if_match() {
+        let backend = create_backend().await;
+        super::conditional_if_match_suite::if_match_is_evaluated_against_the_resolved_match(
+            &backend,
+            &unique_base("cond_if_match_1381"),
+            true,
+        )
+        .await;
+    }
+
+    /// #1381: of several writers holding the same `If-Match`, one writes —
+    /// the precondition and the write share `update`'s compare-and-swap.
+    #[tokio::test]
+    async fn postgres_integration_conditional_writers_with_the_same_if_match_admit_one() {
+        let backend = create_backend().await;
+        super::conditional_if_match_suite::concurrent_writers_with_the_same_if_match_admit_one(
+            &backend,
+            &unique_base("cond_if_match_race_1381"),
+            true,
+        )
+        .await;
+    }
+
+    /// #1380: `family=Zzz,` is a prefix match on `""`, which is every family
+    /// name; an empty value or alternative is an error on every search path.
+    #[tokio::test]
+    async fn postgres_integration_empty_values_are_rejected_on_every_path() {
+        let backend = create_backend().await;
+        super::empty_value_suite::empty_values_are_rejected_on_every_path(
+            &backend,
+            &unique_base("empty_value"),
         )
         .await;
     }

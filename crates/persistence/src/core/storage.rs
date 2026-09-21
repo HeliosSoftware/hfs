@@ -11,6 +11,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use helios_fhir::FhirVersion;
 use serde_json::Value;
 
+use crate::core::preconditions::EntityTagPrecondition;
 use crate::core::sof_runner::SofRunner;
 use crate::error::{BackendError, ResourceError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
@@ -592,7 +593,12 @@ pub trait ResourceStorage: Send + Sync {
     ///
     /// # Returns
     ///
-    /// A vector of found resources (missing/deleted resources are omitted).
+    /// A vector of found resources. A missing id (`Ok(None)`) and a
+    /// soft-deleted id (`Err(Gone)`) are both omitted rather than failing the
+    /// batch — one deleted target must not sink the reads of every other id, so
+    /// callers resolving a set of references (`$everything` supporting resources,
+    /// SOF reference resolution, the ingest index sink) get the resources that
+    /// do exist. Any other error still propagates.
     async fn read_batch(
         &self,
         tenant: &TenantContext,
@@ -601,8 +607,11 @@ pub trait ResourceStorage: Send + Sync {
     ) -> StorageResult<Vec<StoredResource>> {
         let mut results = Vec::with_capacity(ids.len());
         for id in ids {
-            if let Some(resource) = self.read(tenant, resource_type, id).await? {
-                results.push(resource);
+            match self.read(tenant, resource_type, id).await {
+                Ok(Some(resource)) => results.push(resource),
+                Ok(None) => {}
+                Err(StorageError::Resource(ResourceError::Gone { .. })) => {}
+                Err(e) => return Err(e),
             }
         }
         Ok(results)
@@ -632,6 +641,20 @@ pub trait ResourceStorage: Send + Sync {
     ///
     /// The default implementation returns `None`.
     fn sof_runner(&self) -> Option<Arc<dyn SofRunner>> {
+        None
+    }
+
+    /// Returns a whole-type scan for backends that have no search index.
+    ///
+    /// A backend without search cannot answer `url=` lookups, yet the
+    /// SQL-on-FHIR operations must still resolve a canonical — a
+    /// `subjectCanonical`, or the `relatedArtifact.depends-on` of every SQL
+    /// View / SQL Query Library. Such a backend returns `Some`, and callers
+    /// that get `UnsupportedCapability` from `search` fall back to scanning
+    /// the (small, operator-authored) definition type and matching in process
+    /// (#1228). Backends with a search index keep the default `None`: their
+    /// index answers the lookup and a scan would only be slower.
+    fn resource_scan(&self) -> Option<Arc<dyn crate::sof::in_process::ResourceScan>> {
         None
     }
 
@@ -1123,9 +1146,99 @@ pub enum PatchFormat {
     MergePatch(Value),
 }
 
+/// One of the four conditional interactions a [`ConditionalStorage`] may or
+/// may not really implement.
+///
+/// What the CapabilityStatement advertises in `rest.resource.conditional*`
+/// and what the REST layer answers `501` for are both read from
+/// [`ConditionalStorage::supports_conditional`], so the two cannot disagree
+/// (#1384).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConditionalInteraction {
+    /// `POST [type]` with `If-None-Exist`.
+    Create,
+    /// `PUT [type]?criteria`.
+    Update,
+    /// `DELETE [type]?criteria`.
+    Delete,
+    /// `PATCH [type]?criteria`.
+    Patch,
+}
+
+impl ConditionalInteraction {
+    /// Every conditional interaction, in CapabilityStatement element order.
+    pub const ALL: [ConditionalInteraction; 4] = [
+        ConditionalInteraction::Create,
+        ConditionalInteraction::Update,
+        ConditionalInteraction::Delete,
+        ConditionalInteraction::Patch,
+    ];
+
+    /// The [`BackendCapability`](crate::core::BackendCapability) a backend
+    /// declares when it implements this interaction.
+    pub fn capability(self) -> crate::core::BackendCapability {
+        use crate::core::BackendCapability;
+        match self {
+            ConditionalInteraction::Create => BackendCapability::ConditionalCreate,
+            ConditionalInteraction::Update => BackendCapability::ConditionalUpdate,
+            ConditionalInteraction::Delete => BackendCapability::ConditionalDelete,
+            ConditionalInteraction::Patch => BackendCapability::ConditionalPatch,
+        }
+    }
+}
+
+impl std::fmt::Display for ConditionalInteraction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ConditionalInteraction::Create => "conditional create",
+            ConditionalInteraction::Update => "conditional update",
+            ConditionalInteraction::Delete => "conditional delete",
+            ConditionalInteraction::Patch => "conditional patch",
+        })
+    }
+}
+
 /// Extension trait for conditional operations based on search criteria.
+///
+/// Every `search_params` argument is the query portion of a search URL as it
+/// appears on the wire — form-urlencoded, exactly what `If-None-Exist` and a
+/// conditional URL carry. Callers pass it through undecoded; it is decoded
+/// once, by [`crate::search::parse_conditional_criteria`] (#1322).
+///
+/// # `If-Match`
+///
+/// The update, delete and patch methods take the request's `If-Match`
+/// precondition ([`EntityTagPrecondition::Absent`] when none was sent). The
+/// criteria are resolved *inside* these methods, so only they ever hold the
+/// resource the precondition is about; a caller comparing versions itself
+/// would be checking a row the write never sees (#1381). Implementations call
+/// [`conditional_if_match_gate`](super::conditional_if_match_gate) on the
+/// resolved match before writing and fail with
+/// `StorageError::Concurrency(OptimisticLockFailure)` — `412` — when it is not
+/// satisfied.
+///
+/// When nothing matched, each method answers what its instance twin answers
+/// for a resource that does not exist. Update and delete fail the precondition
+/// (RFC 9110 §13.1.1: no current representation satisfies `If-Match`, `*`
+/// included), so a conditional update does **not** fall through to its create.
+/// Patch reports `NoMatch` — `404`, as `PATCH [type]/[id]` does — and writes
+/// nothing either way.
 #[async_trait]
 pub trait ConditionalStorage: ResourceStorage {
+    /// Whether this storage really implements `interaction`, as opposed to
+    /// answering `UnsupportedCapability` for it.
+    ///
+    /// The default mirrors the trait itself: `conditional_create`,
+    /// `conditional_update` and `conditional_delete` are required methods,
+    /// `conditional_patch` defaults to `UnsupportedCapability`. A backend whose
+    /// methods differ from that — S3 refuses all four, SQLite and PostgreSQL
+    /// implement patch — overrides it from its declared
+    /// [`BackendCapability`](crate::core::BackendCapability) list, the same
+    /// list `tests/backend_capability_contract.rs` pins.
+    fn supports_conditional(&self, interaction: ConditionalInteraction) -> bool {
+        !matches!(interaction, ConditionalInteraction::Patch)
+    }
+
     /// Creates a resource only if no matching resource exists.
     ///
     /// # Arguments
@@ -1160,6 +1273,7 @@ pub trait ConditionalStorage: ResourceStorage {
     /// * `search_params` - Search parameters to find the resource
     /// * `upsert` - If true, create if no match found
     /// * `fhir_version` - The FHIR specification version for this resource (used if creating)
+    /// * `if_match` - The `If-Match` version precondition; see the trait docs
     ///
     /// # Returns
     ///
@@ -1167,6 +1281,7 @@ pub trait ConditionalStorage: ResourceStorage {
     /// * `Created` - If no match was found and upsert is true
     /// * `NoMatch` - If no match was found and upsert is false
     /// * `MultipleMatches` - If multiple matches were found (error)
+    #[allow(clippy::too_many_arguments)]
     async fn conditional_update(
         &self,
         tenant: &TenantContext,
@@ -1175,6 +1290,7 @@ pub trait ConditionalStorage: ResourceStorage {
         search_params: &str,
         upsert: bool,
         fhir_version: FhirVersion,
+        if_match: &EntityTagPrecondition,
     ) -> StorageResult<ConditionalUpdateResult>;
 
     /// Deletes a resource based on search criteria.
@@ -1184,6 +1300,7 @@ pub trait ConditionalStorage: ResourceStorage {
     /// * `tenant` - The tenant context
     /// * `resource_type` - The FHIR resource type
     /// * `search_params` - Search parameters to find the resource
+    /// * `if_match` - The `If-Match` version precondition; see the trait docs
     ///
     /// # Returns
     ///
@@ -1195,6 +1312,7 @@ pub trait ConditionalStorage: ResourceStorage {
         tenant: &TenantContext,
         resource_type: &str,
         search_params: &str,
+        if_match: &EntityTagPrecondition,
     ) -> StorageResult<ConditionalDeleteResult>;
 
     /// Patches a resource based on search criteria.
@@ -1208,6 +1326,7 @@ pub trait ConditionalStorage: ResourceStorage {
     /// * `resource_type` - The FHIR resource type
     /// * `search_params` - Search parameters to find the resource
     /// * `patch` - The patch to apply (JSON Patch, FHIRPath Patch, or Merge Patch)
+    /// * `if_match` - The `If-Match` version precondition; see the trait docs
     ///
     /// # Returns
     ///
@@ -1225,9 +1344,10 @@ pub trait ConditionalStorage: ResourceStorage {
         resource_type: &str,
         search_params: &str,
         patch: &PatchFormat,
+        if_match: &EntityTagPrecondition,
     ) -> StorageResult<ConditionalPatchResult> {
         // Default implementation returns NotSupported
-        let _ = (tenant, resource_type, search_params, patch);
+        let _ = (tenant, resource_type, search_params, patch, if_match);
         Err(StorageError::Backend(
             crate::error::BackendError::UnsupportedCapability {
                 backend_name: "unknown".to_string(),

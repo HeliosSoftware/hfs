@@ -14,6 +14,10 @@
     "display": "Peter Chalmers"
   },
   "dateTime": "2014-09-17",
+  "requester": {
+    "reference": "Practitioner/example",
+    "display": "Dr Adam Careful"
+  },
   "oralDiet": {
     "type": [
       {
@@ -54,6 +58,16 @@
               "system": "http://snomed.info/sct",
               "code": "228049004",
               "display": "Chopped food"
+            }
+          ],
+          "text": "Regular, Chopped Meat"
+        },
+        "type": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "28647000",
+              "display": "Meat"
             }
           ],
           "text": "Regular, Chopped Meat"

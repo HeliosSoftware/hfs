@@ -127,6 +127,7 @@ pub use bulk_export_output::{
 pub use bulk_export_worker::{
     BulkExportJobStore, DefaultExportWorker, ExportClaimStrategy, ExportJobLease,
     ExportResourceProvider, ExportWorkerStorage, LeaseError, WorkerId, WorkerJobView,
+    abandoned_export_message,
 };
 pub use bulk_provider::{BulkProviderStore, StoredProviderSubmission};
 pub use bulk_submit::{
@@ -159,8 +160,8 @@ pub use history::{
 };
 pub use preconditions::{
     EntityTag, EntityTagPrecondition, MalformedPrecondition, bundle_if_match_gate,
-    bundle_if_none_exist_gate, if_match_field_satisfied, multiple_matches_entry,
-    not_supported_entry, precondition_failed_entry,
+    bundle_if_none_exist_gate, conditional_if_match_gate, if_match_field_satisfied,
+    multiple_matches_entry, not_supported_entry, precondition_failed_entry,
 };
 pub use search::{
     ChainedSearchProvider, FullSearchProvider, INCLUDE_TRUNCATION_OUTCOME_ID, IncludeProvider,
@@ -171,9 +172,10 @@ pub use search::{
 };
 pub use sof_runner::{RowStream, SofError, SofRunner, ViewFilters, ViewRow};
 pub use storage::{
-    ActivityCell, ConditionalCreateResult, ConditionalDeleteResult, ConditionalPatchResult,
-    ConditionalStorage, ConditionalUpdateResult, DailyResourceCount, PatchFormat, PurgableStorage,
-    ResourceCountDelta, ResourceStorage, TenantRecord, WriteMarker, bucket_floor,
+    ActivityCell, ConditionalCreateResult, ConditionalDeleteResult, ConditionalInteraction,
+    ConditionalPatchResult, ConditionalStorage, ConditionalUpdateResult, DailyResourceCount,
+    PatchFormat, PurgableStorage, ResourceCountDelta, ResourceStorage, TenantRecord, WriteMarker,
+    bucket_floor,
 };
 pub use transaction::{
     BundleEntry, BundleEntryEffect, BundleEntryResult, BundleMethod, BundleProvider, BundleResult,

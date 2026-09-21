@@ -13,6 +13,7 @@ use tokio::sync::OnceCell;
 
 use helios_fhir::FhirVersion;
 
+use super::search_index_builder::{BuildOutcome, IndexBuildMode, SearchIndexBuilder};
 use crate::core::{Backend, BackendCapability, BackendKind};
 use crate::error::{BackendError, StorageError, StorageResult};
 use crate::search::{
@@ -75,7 +76,9 @@ const MAX_CONNECTION_IDLE_TIME: Duration = Duration::from_secs(60);
 /// [`crate::core::VersionedStorage`] support, and history providers.
 ///
 /// Basic search and conditional create/update/delete are available.
-/// Advanced search/composite behavior remains in later phases.
+/// Composite search parameters are served via a grouped
+/// `(resource_id, composite_group)` pair check (#1206); forward/reverse
+/// chains remain unsupported.
 pub struct MongoBackend {
     config: MongoBackendConfig,
     /// Lazily initialized MongoDB client. MongoDB clients own their connection
@@ -87,6 +90,15 @@ pub struct MongoBackend {
     registries: Arc<TenantSearchRegistries>,
     /// Sync cache of each tenant's stored params, read by the registry loader.
     stored_by_tenant: StoredByTenant,
+    /// Publishes the post-boot `search_index` build's outcome once, from the
+    /// task `init_schema` spawns. `None` until that task finishes.
+    search_index_rx: tokio::sync::watch::Receiver<Option<BuildOutcome>>,
+    /// The sending half, taken (leaving `None`) by `init_schema` the one time
+    /// it runs; `wait_for_search_index_build` reads "already taken" as
+    /// "`init_schema` has run". A `Mutex` only to make `take()` safe from
+    /// `&self`; never held across an `.await`.
+    search_index_tx:
+        Arc<tokio::sync::Mutex<Option<tokio::sync::watch::Sender<Option<BuildOutcome>>>>>,
 }
 
 impl Debug for MongoBackend {
@@ -163,6 +175,13 @@ pub struct MongoBackendConfig {
     /// client in tests.
     #[serde(default = "default_app_name")]
     pub app_name: String,
+
+    /// When the generation-2 `search_index` indexes are built relative to
+    /// boot: `background` (default) spawns the builder and serves at once,
+    /// `inline` awaits it, `off` only warns about missing indexes so an
+    /// operator can build them out of band (`HFS_MONGODB_INDEX_BUILD`).
+    #[serde(default)]
+    pub index_build: IndexBuildMode,
 }
 
 fn default_connection_string() -> String {
@@ -206,6 +225,7 @@ impl Default for MongoBackendConfig {
             search_offloaded: false,
             max_included_resources: default_max_included_resources(),
             app_name: default_app_name(),
+            index_build: IndexBuildMode::default(),
         }
     }
 }
@@ -214,6 +234,8 @@ impl MongoBackend {
     pub(crate) const RESOURCES_COLLECTION: &'static str = "resources";
     pub(crate) const RESOURCE_HISTORY_COLLECTION: &'static str = "resource_history";
     pub(crate) const SEARCH_INDEX_COLLECTION: &'static str = "search_index";
+    pub(crate) const SEARCH_INDEX_CONTAINED_COLLECTION: &'static str =
+        super::search_index_catalog::SEARCH_INDEX_CONTAINED_COLLECTION;
     pub(crate) const TENANTS_COLLECTION: &'static str = "tenants";
 
     /// The capabilities this backend declares.
@@ -253,6 +275,11 @@ impl MongoBackend {
             BackendCapability::BulkSubmitIngest,
             BackendCapability::BulkSubmitRestWorker,
             BackendCapability::InDbSofRunner,
+            BackendCapability::ConditionalCreate,
+            BackendCapability::ConditionalUpdate,
+            BackendCapability::ConditionalDelete,
+            // No `ConditionalPatch`: `conditional_patch` answers
+            // `UnsupportedCapability` on this backend.
             BackendCapability::SharedSchema,
         ]
     }
@@ -280,11 +307,15 @@ impl MongoBackend {
         )));
         Self::initialize_search_registry(registries.base(), &config);
 
+        let (search_index_tx, search_index_rx) = tokio::sync::watch::channel(None::<BuildOutcome>);
+
         Ok(Self {
             config,
             client: Arc::new(OnceCell::new()),
             registries,
             stored_by_tenant,
+            search_index_rx,
+            search_index_tx: Arc::new(tokio::sync::Mutex::new(Some(search_index_tx))),
         })
     }
 
@@ -307,6 +338,7 @@ impl MongoBackend {
     /// - `HFS_MONGODB_MAX_CONNECTIONS` (default: `10`)
     /// - `HFS_MONGODB_CONNECT_TIMEOUT_MS` (default: `5000`)
     /// - `HFS_MONGODB_MAX_INCLUDED_RESOURCES` (default: `1000`)
+    /// - `HFS_MONGODB_INDEX_BUILD` (default: `background`; `inline` | `off`)
     pub fn from_env() -> StorageResult<Self> {
         let connection_string = std::env::var("HFS_MONGODB_URL")
             .or_else(|_| std::env::var("HFS_MONGODB_URI"))
@@ -332,12 +364,21 @@ impl MongoBackend {
             .unwrap_or_else(default_max_included_resources)
             .max(1);
 
+        let index_build = IndexBuildMode::from_env().map_err(|message| {
+            StorageError::Backend(BackendError::Internal {
+                backend_name: "mongodb".to_string(),
+                message,
+                source: None,
+            })
+        })?;
+
         let config = MongoBackendConfig {
             connection_string,
             database_name,
             max_connections,
             connect_timeout_ms,
             max_included_resources,
+            index_build,
             ..Default::default()
         };
 
@@ -464,13 +505,78 @@ impl MongoBackend {
     }
 
     /// Initializes the MongoDB schema/index bootstrap for this backend.
+    ///
+    /// Inline-class indexes are created before this returns. The
+    /// generation-3 `search_index` indexes are built by `SearchIndexBuilder`,
+    /// which moves any contained rows out of `search_index` first, in every
+    /// mode (#1160): spawned and left running in `background` mode, awaited
+    /// in `inline` mode, and only inspected in `off` mode (see
+    /// `IndexBuildMode`).
     pub async fn init_schema(&self) -> StorageResult<()> {
         let db = self.get_database().await?;
         schema::initialize_schema_async(&db).await?;
+
+        // Taken once: `init_schema` runs once per backend instance (boot). A
+        // second call finds `None` here and skips spawning another build —
+        // `search_index_rx` still carries the first build's outcome.
+        let tx = self.search_index_tx.lock().await.take();
+        if let Some(tx) = tx {
+            let builder = SearchIndexBuilder::new(db.clone(), self.config.index_build);
+            let handle = tokio::spawn(async move {
+                let outcome = builder.run().await;
+                let _ = tx.send(Some(outcome));
+            });
+            if self.config.index_build == IndexBuildMode::Inline {
+                handle.await.map_err(|e| {
+                    StorageError::Backend(BackendError::Internal {
+                        backend_name: "mongodb".to_string(),
+                        message: format!("search_index build task panicked: {e}"),
+                        source: None,
+                    })
+                })?;
+                if let Some(BuildOutcome::Failed { message }) =
+                    self.search_index_rx.borrow().clone()
+                {
+                    return Err(StorageError::Backend(BackendError::Internal {
+                        backend_name: "mongodb".to_string(),
+                        message,
+                        source: None,
+                    }));
+                }
+            }
+        }
+
         // Populate the per-tenant stored-param cache so the registries can build
         // each tenant's overlay lazily.
         self.reload_stored_cache().await?;
         Ok(())
+    }
+
+    /// Waits for the post-boot `search_index` build started by `init_schema`
+    /// and returns its outcome; `None` if `init_schema` has not run. Safe to
+    /// call repeatedly: the outcome is kept. Holds no lock across an `.await`,
+    /// so it is safe to cancel (e.g. the caller's future is dropped mid-wait).
+    pub async fn wait_for_search_index_build(&self) -> Option<BuildOutcome> {
+        {
+            let sender = self.search_index_tx.lock().await;
+            if sender.is_some() {
+                // init_schema hasn't taken the sender yet, so it hasn't run.
+                return None;
+            }
+        }
+        let mut rx = self.search_index_rx.clone();
+        loop {
+            if let Some(outcome) = rx.borrow().clone() {
+                return Some(outcome);
+            }
+            // `Err` means the sender was dropped without ever sending: the
+            // spawned task ended (e.g. panicked) before publishing an outcome.
+            if rx.changed().await.is_err() {
+                return Some(BuildOutcome::Failed {
+                    message: "search_index build task ended without reporting".to_string(),
+                });
+            }
+        }
     }
 
     /// Reloads every tenant's stored active SearchParameters into the sync
@@ -744,10 +850,15 @@ impl MongoBackend {
     /// `SearchModifier::is_valid_for` permits (the same gate
     /// `search_query_builder` uses to reject a modifier before it reaches any
     /// backend): `:missing` on every index-backed type (string, token, date,
-    /// number, quantity, reference, uri), `:not` on token only. Composite and
-    /// special params stay unadvertised for both — they are never indexed by
-    /// value, so `:missing` there would answer from an empty index rather
-    /// than a real absence check.
+    /// number, quantity, reference, uri), `:not` on token only. Composite
+    /// search itself is served (#1206) by the grouped `(resource_id,
+    /// composite_group)` pair check in `matching_resource_ids`;
+    /// `missing_presence_filter` would serve `:missing` on a composite for a
+    /// direct `SearchProvider` caller, but over REST every modifier on a
+    /// composite is rejected upstream by `SearchModifier::is_valid_for`; the
+    /// backend itself rejects every composite modifier other than
+    /// `:missing` in `validate_query_support`. Special params stay
+    /// unadvertised for both because they are never indexed by value.
     ///
     /// `_id` and `_lastUpdated` take a different route and are no longer
     /// imprecise here (#1055). `matching_resource_ids` skips them by name and
@@ -766,17 +877,22 @@ impl MongoBackend {
     /// rejected is a visible 400 rather than the old silent wrong answer;
     /// narrowing it would need a name-aware capability path.
     ///
-    /// Still unimplemented and therefore still unadvertised: `:above`/
-    /// `:below`/`:in`/`:not-in` (rejected outright by `validate_query_support`
-    /// for every type), token `:of-type`/`:text-advanced`, and reference
-    /// `:identifier`/`:above`/`:below`/`:text-advanced` — each still hits an
-    /// `UnsupportedModifier` catch-all in its type-specific builder.
+    /// `:above`/`:below` are now implemented for `uri` (#1002):
+    /// `build_uri_filter` resolves them segment-aware, mirroring SQLite and
+    /// Elasticsearch, so they are advertised there. `:in`/`:not-in` stay
+    /// unimplemented and unadvertised for every type (rejected outright by
+    /// `validate_query_support`), as do token `:above`/`:below`/`:of-type`/
+    /// `:text-advanced` and reference `:identifier`/`:above`/`:below`/
+    /// `:text-advanced` — token/reference `:above`/`:below` need terminology
+    /// subsumption and hierarchy resolution respectively, neither of which is
+    /// implemented — each still hits an `UnsupportedModifier` catch-all in
+    /// its type-specific builder.
     pub(super) fn modifiers_for_type(param_type: SearchParamType) -> Vec<&'static str> {
         match param_type {
             SearchParamType::String => vec!["exact", "contains", "text", "missing"],
             SearchParamType::Token => vec!["text", "code-text", "not", "missing"],
             SearchParamType::Reference => vec!["contains", "text", "code-text", "missing"],
-            SearchParamType::Uri => vec!["exact", "contains", "missing"],
+            SearchParamType::Uri => vec!["exact", "contains", "below", "above", "missing"],
             SearchParamType::Date | SearchParamType::Number | SearchParamType::Quantity => {
                 vec!["missing"]
             }
@@ -875,12 +991,13 @@ mod capability_tests {
         assert!(r.contains(&"missing"));
         assert!(!r.contains(&"identifier"));
 
-        // Uri honors exact/contains/missing but not :above/:below.
+        // Uri honors exact/contains/missing and :above/:below (#1002,
+        // segment-aware in build_uri_filter).
         let u = MongoBackend::modifiers_for_type(SearchParamType::Uri);
         assert!(u.contains(&"contains"));
         assert!(u.contains(&"missing"));
-        assert!(!u.contains(&"above"));
-        assert!(!u.contains(&"below"));
+        assert!(u.contains(&"above"));
+        assert!(u.contains(&"below"));
     }
 
     /// Every `SearchParamType` variant paired with a value `matching_resource_ids`
@@ -974,13 +1091,22 @@ mod capability_tests {
 
         for param_type in all_param_types() {
             for &modifier_str in &MongoBackend::modifiers_for_type(param_type) {
-                // `validate_query_support` (search_impl.rs) rejects these four
-                // outright for every parameter type; advertising any of them
-                // would be a straightforward regression back to over-promising.
+                // `validate_query_support` (search_impl.rs) rejects `:in`/
+                // `:not-in` outright for every parameter type; advertising
+                // either would be a straightforward regression back to
+                // over-promising. `:above`/`:below` are rejected for every
+                // type EXCEPT uri (#1002: build_uri_filter resolves them
+                // there, segment-aware).
                 assert!(
-                    !matches!(modifier_str, "above" | "below" | "in" | "not-in"),
+                    !matches!(modifier_str, "in" | "not-in"),
                     "{param_type} advertises `{modifier_str}`, which \
                      validate_query_support rejects unconditionally"
+                );
+                assert!(
+                    !matches!(modifier_str, "above" | "below")
+                        || param_type == SearchParamType::Uri,
+                    "{param_type} advertises `{modifier_str}`, which \
+                     validate_query_support rejects for every type except uri"
                 );
 
                 // The advertised string must be a real, round-trippable
@@ -1037,5 +1163,26 @@ mod tests {
     #[test]
     fn app_name_defaults_to_the_historical_constant() {
         assert_eq!(MongoBackendConfig::default().app_name, "helios-persistence");
+    }
+
+    #[test]
+    fn config_index_build_defaults_to_background_and_reads_env() {
+        assert_eq!(
+            MongoBackendConfig::default().index_build,
+            IndexBuildMode::Background
+        );
+        // from_env is process-global; guard the variable.
+        //
+        // SAFETY: this is the only test in this module that touches the
+        // environment; it runs single-threaded relative to itself and
+        // restores the variable before returning, so there is no
+        // cross-test data race on the process environment.
+        unsafe { std::env::set_var("HFS_MONGODB_INDEX_BUILD", "inline") };
+        let backend = MongoBackend::from_env().expect("from_env");
+        assert_eq!(backend.config().index_build, IndexBuildMode::Inline);
+        unsafe { std::env::set_var("HFS_MONGODB_INDEX_BUILD", "nonsense") };
+        let err = MongoBackend::from_env().expect_err("invalid mode must be rejected");
+        assert!(format!("{err}").contains("HFS_MONGODB_INDEX_BUILD"));
+        unsafe { std::env::remove_var("HFS_MONGODB_INDEX_BUILD") };
     }
 }

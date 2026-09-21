@@ -82,7 +82,7 @@ use helios_persistence::search::ReindexOperation;
 use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
 
 #[cfg(feature = "mongodb")]
-use helios_persistence::backends::mongodb::{MongoBackend, MongoBackendConfig};
+use helios_persistence::backends::mongodb::{IndexBuildMode, MongoBackend, MongoBackendConfig};
 fn is_database_audit_dedicated(config: &AuditConfig, backend_kind: BackendKind) -> bool {
     match backend_kind {
         BackendKind::Sqlite | BackendKind::Postgres => config.database_url.is_some(),
@@ -204,7 +204,10 @@ fn sqlite_es_reindex_targets(
 }
 
 #[cfg(feature = "mongodb")]
-fn build_mongodb_config(config: &ServerConfig, search_offloaded: bool) -> MongoBackendConfig {
+fn build_mongodb_config(
+    config: &ServerConfig,
+    search_offloaded: bool,
+) -> anyhow::Result<MongoBackendConfig> {
     build_mongodb_config_with_env(config, search_offloaded, |name| std::env::var(name).ok())
 }
 
@@ -213,7 +216,7 @@ fn build_mongodb_config_with_env<F>(
     config: &ServerConfig,
     search_offloaded: bool,
     env: F,
-) -> MongoBackendConfig
+) -> anyhow::Result<MongoBackendConfig>
 where
     F: Fn(&str) -> Option<String>,
 {
@@ -245,8 +248,18 @@ where
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(1000)
         .max(1);
+    // The only way to reach `off` (the escape hatch that stops the builder
+    // touching the collection at all) or `inline`, so an invalid value must
+    // fail startup rather than silently fall back to `background` — same
+    // "bail with the invalid value" shape as HFS_BULK_EXPORT_OUTPUT_BACKEND.
+    let index_build = match env("HFS_MONGODB_INDEX_BUILD") {
+        Some(raw) => raw
+            .parse::<IndexBuildMode>()
+            .map_err(|message| anyhow::anyhow!(message))?,
+        None => IndexBuildMode::default(),
+    };
 
-    MongoBackendConfig {
+    Ok(MongoBackendConfig {
         connection_string,
         database_name,
         max_connections,
@@ -256,8 +269,9 @@ where
         data_dir: config.data_dir.clone(),
         search_offloaded,
         max_included_resources,
+        index_build,
         app_name: MongoBackendConfig::default().app_name,
-    }
+    })
 }
 
 #[cfg(feature = "sqlite")]
@@ -466,6 +480,12 @@ async fn create_audit_mongodb_storage(
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(15_000);
+        let index_build = match std::env::var("HFS_MONGODB_INDEX_BUILD") {
+            Ok(raw) => raw
+                .parse::<IndexBuildMode>()
+                .map_err(|message| anyhow::anyhow!(message))?,
+            Err(_) => IndexBuildMode::default(),
+        };
 
         let config = MongoBackendConfig {
             connection_string,
@@ -476,13 +496,14 @@ async fn create_audit_mongodb_storage(
             fhir_version: server_config.default_fhir_version,
             data_dir: server_config.data_dir.clone(),
             search_offloaded: false,
+            index_build,
             // Audit storage doesn't resolve _include/_revinclude; the default
             // (and any future new field) is fine here.
             ..Default::default()
         };
         MongoBackend::new(config)?
     } else {
-        MongoBackend::new(build_mongodb_config(server_config, false))?
+        MongoBackend::new(build_mongodb_config(server_config, false)?)?
     };
 
     backend.init_schema().await?;
@@ -635,7 +656,7 @@ async fn start_mongodb(
     auth_state: Option<Arc<AuthMiddlewareState>>,
     audit_state: Option<Arc<AuditMiddlewareState>>,
 ) -> anyhow::Result<()> {
-    let backend_config = build_mongodb_config(&config, false);
+    let backend_config = build_mongodb_config(&config, false)?;
     info!(
         url = %backend_config.connection_string,
         database = %backend_config.database_name,
@@ -681,7 +702,7 @@ async fn start_mongodb(
     let reindex_hook = ops
         .reindex
         .clone()
-        .map(|op| automatic_reindex_hook(op, &config));
+        .map(|op| automatic_reindex_hook_with_ledger(op, &config, None));
     let submit_bundle = build_bulk_submit(
         &config,
         backend.clone(),
@@ -1649,7 +1670,19 @@ where
                         .map(|d| format!("{}/exports", d.display()))
                 })
                 .unwrap_or_else(|| "./data/exports".to_string());
-            Arc::new(LocalFsOutputStore::new(output_dir, config.base_url.clone()))
+            // The served file endpoint enforces a token only when auth is on, so
+            // the manifest's requiresAccessToken must follow the auth state under
+            // `auto`; an explicit true/false override still wins (#1269). `false`
+            // is rejected for local-fs by config validation (no pre-signing).
+            let requires_token = match cfg.requires_access_token.as_str() {
+                "true" => true,
+                "false" => false,
+                _ => AuthConfig::from_env().enabled,
+            };
+            Arc::new(
+                LocalFsOutputStore::new(output_dir, config.base_url.clone())
+                    .with_access_token_required(requires_token),
+            )
         }
         "s3" => {
             #[cfg(feature = "s3")]
@@ -1726,23 +1759,21 @@ fn wire_reindex(
 }
 
 /// Builds the deferred bulk-submit hook using the existing submit-worker
-/// concurrency as the per-process automatic reindex limit.
+/// concurrency as the per-process automatic reindex limit, plus where to clear
+/// the persisted "this manifest still owes a rebuild" marker when a generation
+/// finishes (#1125). Without a ledger (`None`) nothing is recorded and a restart
+/// cannot resume, as before.
+///
+/// Gated exactly like [`wire_reindex`], which produces the `op` every caller
+/// passes in: any build with a reindex target. Keep the two in step rather than
+/// naming individual backends here — a narrower gate breaks the builds that
+/// leave that backend out (#1291).
 #[cfg(any(
     feature = "sqlite",
     feature = "postgres",
     feature = "mongodb",
     feature = "elasticsearch"
 ))]
-fn automatic_reindex_hook(
-    op: Arc<ReindexOperation>,
-    config: &ServerConfig,
-) -> Arc<dyn helios_persistence::core::DeferredReindexHook> {
-    automatic_reindex_hook_with_ledger(op, config, None)
-}
-
-/// The deferred-rebuild hook, plus where to clear the persisted "this manifest
-/// still owes a rebuild" marker when a generation finishes (#1125). Without a
-/// ledger nothing is recorded and a restart cannot resume, as before.
 fn automatic_reindex_hook_with_ledger(
     op: Arc<ReindexOperation>,
     config: &ServerConfig,
@@ -1830,6 +1861,8 @@ fn spawn_export_workers<Dp>(
         return;
     }
     let lease = std::time::Duration::from_secs(cfg.lease_duration_secs);
+    let heartbeat = std::time::Duration::from_secs(cfg.heartbeat_interval_secs);
+    let max_attempts = cfg.max_attempts;
     for i in 0..cfg.worker_concurrency {
         let jobs = jobs.clone();
         let data = data.clone();
@@ -1838,9 +1871,10 @@ fn spawn_export_workers<Dp>(
         let exclude_newly_added = cfg.since_newly_added.eq_ignore_ascii_case("exclude");
         tokio::spawn(async move {
             let worker = DefaultExportWorker::new(jobs.clone(), data, output, worker_id.clone())
-                .with_exclude_since_newly_added(exclude_newly_added);
+                .with_exclude_since_newly_added(exclude_newly_added)
+                .with_heartbeat_interval(heartbeat);
             loop {
-                match jobs.claim_next(&worker_id, lease).await {
+                match jobs.claim_next(&worker_id, lease, max_attempts).await {
                     Ok(Some(claimed)) => {
                         if let Err(e) = worker.run_job(claimed).await {
                             tracing::error!("export worker job failed: {e}");
@@ -1898,7 +1932,19 @@ fn spawn_export_workers<Dp>(
 /// raw primary is used instead. Fast-load without a reindex hook still needs
 /// the wrapper, otherwise the data never reaches Elasticsearch.
 ///
+/// With `HFS_BULK_SUBMIT_DEFER_INDEXING=false` (#1127, #1242) the wrapper is
+/// itself wrapped in [`IndexingSubmitJobs`]: every committed batch is handed to
+/// an [`IngestIndexSink`] writing into `search_targets` (the Elasticsearch
+/// secondary, not the primary's own offloaded index), and the manifest's sync
+/// drains that sink instead of re-reading the manifest. The deferred reindex
+/// then rebuilds only the types the sink rejected. `source` is the primary the
+/// sink reads resources back from for engines that do not hand them over. On
+/// this ES-composite path `false` always means the sink; the operator no longer
+/// names the mechanism (the old `HFS_BULK_SUBMIT_INDEX_DURING_INGEST` is gone).
+///
 /// [`CompositeSubmitJobs`]: helios_persistence::composite::CompositeSubmitJobs
+/// [`IndexingSubmitJobs`]: helios_persistence::composite::IndexingSubmitJobs
+/// [`IngestIndexSink`]: helios_persistence::composite::IngestIndexSink
 #[cfg(all(
     feature = "elasticsearch",
     any(
@@ -1910,16 +1956,50 @@ fn spawn_export_workers<Dp>(
 ))]
 fn composite_submit_jobs(
     primary: Arc<dyn BulkSubmitJobStore>,
+    source: Arc<dyn ResourceStorage>,
     composite: Arc<helios_persistence::composite::CompositeStorage>,
-    defer_indexing: bool,
+    search_targets: Vec<Arc<dyn helios_persistence::search::ReindexTarget>>,
+    cfg: &helios_rest::config::BulkSubmitConfig,
     has_reindex_hook: bool,
 ) -> Arc<dyn BulkSubmitJobStore> {
-    if defer_indexing && has_reindex_hook {
+    use helios_persistence::composite::{
+        CompositeSubmitJobs, IndexingSubmitJobs, IngestIndexSink, IngestIndexSinkConfig,
+    };
+
+    if !cfg.defer_indexing {
+        // Search is offloaded to Elasticsearch here (this fn is the ES-composite
+        // path), so "index as the manifest ingests" means the batch-by-batch
+        // sink (#1127, #1242).
+        let sink_config = IngestIndexSinkConfig {
+            queue: cfg.index_queue as usize,
+            concurrency: cfg.index_concurrency as usize,
+            coalesce: cfg.index_coalesce as usize,
+            max_wait: std::time::Duration::from_secs(cfg.index_max_wait_secs),
+        };
+        info!(
+            queue = sink_config.queue,
+            concurrency = sink_config.concurrency,
+            coalesce = sink_config.coalesce,
+            max_wait_secs = cfg.index_max_wait_secs,
+            "Bulk submit indexes into Elasticsearch during ingest (DEFER_INDEXING=false); \
+             the deferred reindex runs only for types the search index rejected"
+        );
+        let sink = Arc::new(IngestIndexSink::new(source, search_targets, sink_config));
+        let inner: Arc<dyn BulkSubmitJobStore> =
+            Arc::new(CompositeSubmitJobs::new(primary, composite));
+        Arc::new(IndexingSubmitJobs::new(inner, sink))
+    } else if has_reindex_hook {
+        info!(
+            "Bulk submit defers indexing (DEFER_INDEXING=true); Elasticsearch is rebuilt \
+             per type after each manifest"
+        );
         primary
     } else {
-        Arc::new(helios_persistence::composite::CompositeSubmitJobs::new(
-            primary, composite,
-        ))
+        info!(
+            "Bulk submit syncs each finished manifest into Elasticsearch (no reindex hook); \
+             set DEFER_INDEXING=false to index batch by batch instead"
+        );
+        Arc::new(CompositeSubmitJobs::new(primary, composite))
     }
 }
 
@@ -2043,6 +2123,7 @@ async fn build_bulk_submit(
             token_provider,
             cfg.outbound_scope.clone(),
         )
+        .with_read_timeout(std::time::Duration::from_secs(cfg.fetch_read_timeout_secs))
         .with_decryption_keys(decryption_keys),
     );
 
@@ -2109,6 +2190,11 @@ fn spawn_submit_workers(
     if defer_indexing {
         info!("Bulk submit fast-load: search indexing deferred to post-manifest reindex");
     }
+    let batch_size = cfg.batch_size;
+    let skip_unchanged = cfg.skip_unchanged;
+    if skip_unchanged {
+        info!("Bulk submit skips resources whose content is identical to the stored version");
+    }
     // #1125: manifests whose rebuild was still outstanding when the server
     // stopped. The marker is on the manifest row, so it survived; re-firing
     // the same hook the live path uses keeps one code path.
@@ -2162,7 +2248,9 @@ fn spawn_submit_workers(
             let worker = DefaultSubmitWorker::new(jobs.clone(), fetcher, output, worker_id.clone())
                 .with_deferred_indexing(defer_indexing, reindex_hook.clone())
                 .with_write_observer(Some(write_observer))
-                .with_file_concurrency(file_concurrency);
+                .with_file_concurrency(file_concurrency)
+                .with_batch_size(batch_size)
+                .with_skip_unchanged(skip_unchanged);
             loop {
                 match jobs.claim_next_manifest(&worker_id, lease).await {
                     Ok(Some(claimed)) => {
@@ -2311,6 +2399,7 @@ async fn start_sqlite_elasticsearch(
         .primary("sqlite", BackendKind::Sqlite)
         .search_backend("es", BackendKind::Elasticsearch)
         .sync_mode(composite_sync_mode_from_env())
+        .fhir_version(config.default_fhir_version)
         .build()?;
 
     // Build backends map for CompositeStorage
@@ -2394,8 +2483,10 @@ async fn start_sqlite_elasticsearch(
     // so the per-resource sync is skipped rather than done twice (#903).
     let submit_jobs = composite_submit_jobs(
         sqlite.clone(),
+        sqlite.clone(),
         composite.clone(),
-        config.bulk_submit.defer_indexing,
+        vec![es.clone()],
+        &config.bulk_submit,
         reindex_hook.is_some(),
     );
     let submit_bundle = build_bulk_submit(
@@ -2476,7 +2567,7 @@ async fn start_postgres(
     let reindex_hook = ops
         .reindex
         .clone()
-        .map(|op| automatic_reindex_hook(op, &config));
+        .map(|op| automatic_reindex_hook_with_ledger(op, &config, None));
     let submit_bundle = build_bulk_submit(
         &config,
         backend.clone(),
@@ -2611,6 +2702,7 @@ async fn start_postgres_elasticsearch(
         .primary("postgres", BackendKind::Postgres)
         .search_backend("es", BackendKind::Elasticsearch)
         .sync_mode(composite_sync_mode_from_env())
+        .fhir_version(config.default_fhir_version)
         .build()?;
 
     // Build backends map for CompositeStorage
@@ -2679,14 +2771,16 @@ async fn start_postgres_elasticsearch(
     let reindex_hook = ops
         .reindex
         .clone()
-        .map(|op| automatic_reindex_hook(op, &config));
+        .map(|op| automatic_reindex_hook_with_ledger(op, &config, None));
     // Wrapped like sqlite-es: finished manifests sync their ingested
     // resources into Elasticsearch, which the raw primary never does (#882),
     // unless fast-load's post-manifest reindex covers it (#903).
     let submit_jobs = composite_submit_jobs(
         pg.clone(),
+        pg.clone(),
         composite.clone(),
-        config.bulk_submit.defer_indexing,
+        vec![es.clone()],
+        &config.bulk_submit,
         reindex_hook.is_some(),
     );
     let submit_bundle = build_bulk_submit(
@@ -2753,7 +2847,7 @@ async fn start_mongodb_elasticsearch(
     use helios_persistence::core::BackendKind;
 
     // Create MongoDB backend
-    let backend_config = build_mongodb_config(&config, true);
+    let backend_config = build_mongodb_config(&config, true)?;
     info!(
         url = %backend_config.connection_string,
         database = %backend_config.database_name,
@@ -2827,6 +2921,7 @@ async fn start_mongodb_elasticsearch(
         .primary("mongodb", BackendKind::MongoDB)
         .search_backend("es", BackendKind::Elasticsearch)
         .sync_mode(composite_sync_mode_from_env())
+        .fhir_version(config.default_fhir_version)
         .build()?;
 
     // Build backends map for CompositeStorage
@@ -2906,7 +3001,7 @@ async fn start_mongodb_elasticsearch(
     let reindex_hook = ops
         .reindex
         .clone()
-        .map(|op| automatic_reindex_hook(op, &config));
+        .map(|op| automatic_reindex_hook_with_ledger(op, &config, None));
     // Bulk submit runs against the MongoDB primary, which hosts its own job
     // state, but wrapped like sqlite-es and pg-es so finished manifests sync
     // their resources into Elasticsearch (#882). The comment this replaces said
@@ -2917,8 +3012,10 @@ async fn start_mongodb_elasticsearch(
     // was readable by id and invisible to every search (#1021).
     let submit_jobs = composite_submit_jobs(
         mongo.clone(),
+        mongo.clone(),
         composite.clone(),
-        config.bulk_submit.defer_indexing,
+        vec![es.clone()],
+        &config.bulk_submit,
         reindex_hook.is_some(),
     );
     let submit_bundle = build_bulk_submit(
@@ -3267,6 +3364,7 @@ async fn start_s3_elasticsearch(
         .primary("s3", BackendKind::S3)
         .search_backend("es", BackendKind::Elasticsearch)
         .sync_mode(composite_sync_mode_from_env())
+        .fhir_version(config.default_fhir_version)
         .build()?;
 
     let mut backends = HashMap::new();
@@ -3365,12 +3463,14 @@ async fn start_s3_elasticsearch(
     let reindex_hook = ops
         .reindex
         .clone()
-        .map(|op| automatic_reindex_hook(op, &config));
+        .map(|op| automatic_reindex_hook_with_ledger(op, &config, None));
     let bulk_submit = if s3.supports_bulk_submit_worker() {
         let submit_jobs = composite_submit_jobs(
             s3.clone(),
+            s3.clone(),
             composite.clone(),
-            config.bulk_submit.defer_indexing,
+            vec![es.clone()],
+            &config.bulk_submit,
             reindex_hook.is_some(),
         );
         build_bulk_submit(
@@ -3589,7 +3689,8 @@ mod tests {
             "HFS_MONGODB_CONNECT_TIMEOUT_MS" => Some("7500".to_string()),
             "HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS" => Some("2500".to_string()),
             _ => None,
-        });
+        })
+        .expect("valid config");
 
         assert_eq!(
             mongo_config.connection_string,
@@ -3602,6 +3703,7 @@ mod tests {
         assert_eq!(mongo_config.fhir_version, FhirVersion::R4);
         assert_eq!(mongo_config.data_dir, Some(data_dir));
         assert!(!mongo_config.search_offloaded);
+        assert_eq!(mongo_config.index_build, IndexBuildMode::Background);
     }
 
     #[cfg(feature = "mongodb")]
@@ -3616,11 +3718,39 @@ mod tests {
             "HFS_DATABASE_URL" => Some("postgres://localhost/hfs".to_string()),
             "HFS_MONGODB_DATABASE" => Some("mongo_db".to_string()),
             _ => None,
-        });
+        })
+        .expect("valid config");
 
         assert_eq!(mongo_config.connection_string, "mongodb://localhost:27017");
         assert_eq!(mongo_config.database_name, "mongo_db");
         assert!(mongo_config.search_offloaded);
+    }
+
+    #[cfg(feature = "mongodb")]
+    #[test]
+    fn test_build_mongodb_config_reads_index_build_and_rejects_invalid_values() {
+        let config = ServerConfig::default();
+
+        let mongo_config = build_mongodb_config_with_env(&config, false, |name| match name {
+            "HFS_MONGODB_INDEX_BUILD" => Some("off".to_string()),
+            _ => None,
+        })
+        .expect("valid config");
+        assert_eq!(mongo_config.index_build, IndexBuildMode::Off);
+
+        let mongo_config = build_mongodb_config_with_env(&config, false, |name| match name {
+            "HFS_MONGODB_INDEX_BUILD" => Some("inline".to_string()),
+            _ => None,
+        })
+        .expect("valid config");
+        assert_eq!(mongo_config.index_build, IndexBuildMode::Inline);
+
+        let err = build_mongodb_config_with_env(&config, false, |name| match name {
+            "HFS_MONGODB_INDEX_BUILD" => Some("nonsense".to_string()),
+            _ => None,
+        })
+        .expect_err("invalid mode must fail startup");
+        assert!(format!("{err}").contains("HFS_MONGODB_INDEX_BUILD"));
     }
 
     #[cfg(feature = "mongodb")]
@@ -3632,7 +3762,8 @@ mod tests {
             "HFS_MONGODB_URI" => Some("mongodb://mongo-specific:27017".to_string()),
             "HFS_DATABASE_URL" => Some("mongodb://database-url:27017".to_string()),
             _ => None,
-        });
+        })
+        .expect("valid config");
 
         assert_eq!(
             mongo_config.connection_string,

@@ -458,6 +458,7 @@ queries-param-placeholder = parameter
 queries-value-placeholder = value
 queries-results = Results
 queries-results-total = { $count } results
+queries-results-total-partial = { $count }+ results
 queries-results-included = { $count } included
 queries-results-empty = No results.
 queries-searching = Searching…
@@ -631,7 +632,6 @@ bulk-import-new = New Submission
 bulk-import-create-title = Create Bulk Submission
 bulk-import-field-name = Submission name
 bulk-import-auth = Authentication
-bulk-import-auth-hint = How to authenticate to the recipient server.
 bulk-import-auth-none = None
 bulk-import-auth-none-hint = No authorization header will be sent.
 bulk-import-auth-backend = Backend services authentication
@@ -664,6 +664,10 @@ bulk-import-status-failed = Failed
 # button can simply be pressed again. { $detail } is the recipient's own
 # untranslated diagnosis — an HTTP status and reason, or a transport error.
 bulk-import-status-error = The last status change did not reach the Data Recipient, so this submission is unchanged — try again. ({ $detail })
+# The same banner while the change is still queued (#998): the recipient
+# never answered (as opposed to refusing), so the request is kept and re-sent
+# from the status card's own refresh for as long as this page stays open.
+bulk-import-status-pending = The last status change did not reach the Data Recipient; it is kept and will be re-sent automatically while this page is open. ({ $detail })
 bulk-import-detail-recipient = Data Recipient
 bulk-import-detail-id = Submission ID
 bulk-import-detail-submitter = Submitter

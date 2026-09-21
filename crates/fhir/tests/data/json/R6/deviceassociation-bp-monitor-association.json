@@ -82,7 +82,7 @@
   "relationship": {
     "coding": [
       {
-        "system": "http://hl7.org/fhir/deviceassociation-relationship",
+        "system": "http://terminology.hl7.org/CodeSystem/deviceassociation-relationship",
         "code": "used-by",
         "display": "Used By"
       }
@@ -92,7 +92,7 @@
   "relationshipStatus": {
     "coding": [
       {
-        "system": "http://hl7.org/fhir/deviceassociation-relationship-status",
+        "system": "http://terminology.hl7.org/CodeSystem/deviceassociation-relationship-status",
         "code": "ended",
         "display": "Ended"
       }

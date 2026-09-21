@@ -28,7 +28,9 @@ use crate::search::converters::IndexValue;
 use crate::search::extractor::ExtractedValue;
 use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
 use crate::tenant::{Operation, TenantContext};
-use crate::types::{CursorValue, Page, PageCursor, PageInfo, SearchQuery, StoredResource};
+use crate::types::{
+    CursorValue, Page, PageCursor, PageInfo, SearchParamType, SearchQuery, StoredResource,
+};
 
 use super::MongoBackend;
 
@@ -93,7 +95,35 @@ pub(super) fn chrono_to_bson(dt: DateTime<Utc>) -> BsonDateTime {
     BsonDateTime::from_millis(dt.timestamp_millis())
 }
 
+/// The instant a stored date is indexed at, or `None` when it cannot be read
+/// and the caller should skip the index entry.
+///
+/// The value is read with the search side's own `FhirDateValue` first, so
+/// whatever that grammar accepts is indexed at exactly the first instant of the
+/// range a search for the same text covers. That is what indexes a stored
+/// `…T09:20` — minutes without seconds, which RFC 3339 does not allow and which
+/// used to be skipped here although `date=…T09:20` is a valid search (#1315) —
+/// and what puts a `:60` leap second on the next second, where the search side
+/// looks for it.
+///
+/// Only the text as stored counts: the search-side repairs (trimming, and a
+/// space read as a form-decoded `+`) do not apply to a resource, where a space
+/// is simply not part of a date. Anything the strict grammar does not take
+/// verbatim falls through to the lenient reading below, which is unchanged.
 fn normalize_date_for_mongo(value: &str) -> Option<DateTime<Utc>> {
+    if let Ok(parsed) = crate::search::FhirDateValue::parse(value) {
+        if parsed.canonical() == value {
+            return Some(parsed.start);
+        }
+    }
+    normalize_date_for_mongo_lenient(value)
+}
+
+/// The reading [`normalize_date_for_mongo`] falls back to: complete the value
+/// and take whatever chrono's RFC 3339 parser makes of it. Wider than the FHIR
+/// grammar on purpose — it is what keeps an out-of-grammar value (`+14:30`, an
+/// instant past the year 9999) indexed rather than dropped.
+fn normalize_date_for_mongo_lenient(value: &str) -> Option<DateTime<Utc>> {
     let normalized = if value.contains('T') {
         if value.contains('Z') || value.contains('+') || value.matches('-').count() > 2 {
             value.to_string()
@@ -195,7 +225,7 @@ async fn collect_documents(mut cursor: Cursor<Document>) -> StorageResult<Vec<Do
     Ok(docs)
 }
 
-async fn collect_session_documents(
+pub(super) async fn collect_session_documents(
     mut cursor: SessionCursor<Document>,
     session: &mut ClientSession,
 ) -> StorageResult<Vec<Document>> {
@@ -415,24 +445,7 @@ fn parse_history_row(
     })
 }
 
-fn parse_simple_bundle_search_params(params: &str) -> Vec<(String, String)> {
-    params
-        .split('&')
-        .filter_map(|pair| {
-            let mut iter = pair.splitn(2, '=');
-            let key = iter.next()?.trim();
-            let value = iter.next()?.trim();
-
-            if key.is_empty() || value.is_empty() {
-                return None;
-            }
-
-            Some((key.to_string(), value.to_string()))
-        })
-        .collect()
-}
-
-fn document_to_stored_resource(
+pub(super) fn document_to_stored_resource(
     doc: &Document,
     tenant: &TenantContext,
     fallback_resource_type: &str,
@@ -814,11 +827,15 @@ impl ResourceStorage for MongoBackend {
         self.index_resource(&db, tenant_id, resource_type, &id, &resource, &mut session)
             .await?;
 
+        commit_best_effort_multi_write_session(&mut session, transaction_active, "create").await?;
+
         // An overlay-affecting SearchParameter write: refresh the stored-param
         // cache (which the per-tenant loader reads) and drop the cached
-        // registries. Seeded spec copies never affect the overlay (see
-        // `create_affects_overlay`), which keeps bulk seeding from triggering
-        // an O(n²) reload storm.
+        // registries. This must run after the commit above: `reload_stored_cache`
+        // reads the `resources` collection without the session, so while the
+        // transaction is still open the write above is invisible to it. Seeded
+        // spec copies never affect the overlay (see `create_affects_overlay`),
+        // which keeps bulk seeding from triggering an O(n²) reload storm.
         if resource_type == "SearchParameter"
             && self.tenant_registries().create_affects_overlay(&resource)
         {
@@ -826,8 +843,6 @@ impl ResourceStorage for MongoBackend {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
             }
         }
-
-        commit_best_effort_multi_write_session(&mut session, transaction_active, "create").await?;
 
         Ok(StoredResource::from_storage(
             resource_type,
@@ -1109,15 +1124,18 @@ impl ResourceStorage for MongoBackend {
         self.index_resource(&db, tenant_id, resource_type, id, &resource, &mut session)
             .await?;
 
+        commit_best_effort_multi_write_session(&mut session, transaction_active, "update").await?;
+
         // A SearchParameter update may change a tenant's overlay (status flips,
         // expression edits): refresh the stored-param cache and drop registries.
+        // This must run after the commit above: `reload_stored_cache` reads the
+        // `resources` collection without the session, so it cannot observe the
+        // update while the transaction is still open.
         if resource_type == "SearchParameter" {
             if let Err(e) = self.reload_stored_cache().await {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
             }
         }
-
-        commit_best_effort_multi_write_session(&mut session, transaction_active, "update").await?;
 
         Ok(StoredResource::from_storage(
             resource_type,
@@ -1270,15 +1288,18 @@ impl ResourceStorage for MongoBackend {
         self.delete_search_index(&db, tenant_id, resource_type, id, &mut session)
             .await?;
 
+        commit_best_effort_multi_write_session(&mut session, transaction_active, "delete").await?;
+
         // A SearchParameter delete may remove a tenant's overlay entry: refresh
-        // the stored-param cache and drop registries.
+        // the stored-param cache and drop registries. This must run after the
+        // commit above: `reload_stored_cache` reads the `resources` collection
+        // without the session, so it cannot observe the delete while the
+        // transaction is still open.
         if resource_type == "SearchParameter" {
             if let Err(e) = self.reload_stored_cache().await {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
             }
         }
-
-        commit_best_effort_multi_write_session(&mut session, transaction_active, "delete").await?;
 
         Ok(())
     }
@@ -1315,8 +1336,14 @@ impl ResourceStorage for MongoBackend {
         let mut resources = Vec::with_capacity(ids.len());
 
         for id in ids {
-            if let Some(resource) = self.read(tenant, resource_type, id).await? {
-                resources.push(resource);
+            // A missing or soft-deleted (Gone) id is omitted, not fatal — one
+            // deleted target must not fail the whole batch (matches the default
+            // impl / #1119).
+            match self.read(tenant, resource_type, id).await {
+                Ok(Some(resource)) => resources.push(resource),
+                Ok(None) => {}
+                Err(StorageError::Resource(ResourceError::Gone { .. })) => {}
+                Err(e) => return Err(e),
             }
         }
 
@@ -1843,6 +1870,7 @@ impl ResourceStorage for MongoBackend {
             .or_query_error("purge count")?;
         for collection in [
             MongoBackend::SEARCH_INDEX_COLLECTION,
+            MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION,
             MongoBackend::RESOURCE_HISTORY_COLLECTION,
             MongoBackend::RESOURCES_COLLECTION,
         ] {
@@ -1922,6 +1950,23 @@ async fn grouped_string_counts(
         out.push((key, n.max(0) as u64));
     }
     Ok(out)
+}
+
+/// One resource's `search_index` contribution, split by destination
+/// collection: its own rows go to `search_index`, and rows extracted from its
+/// `contained` entries go to `search_index_contained`.
+#[derive(Debug, Default)]
+pub(super) struct SearchIndexDocuments {
+    /// The resource's own rows, for `search_index`.
+    pub own: Vec<Document>,
+    /// Rows extracted from `contained` entries, for `search_index_contained`.
+    pub contained: Vec<Document>,
+}
+
+impl SearchIndexDocuments {
+    pub fn is_empty(&self) -> bool {
+        self.own.is_empty() && self.contained.is_empty()
+    }
 }
 
 impl MongoBackend {
@@ -2077,15 +2122,18 @@ impl MongoBackend {
         self.index_resource(&db, tenant_id, resource_type, id, &resource, &mut session)
             .await?;
 
+        commit_best_effort_multi_write_session(&mut session, transaction_active, "restore").await?;
+
         // A restored SearchParameter re-enters a tenant's overlay: refresh the
-        // stored-param cache and drop registries.
+        // stored-param cache and drop registries. This must run after the
+        // commit above: `reload_stored_cache` reads the `resources` collection
+        // without the session, so it cannot observe the restore while the
+        // transaction is still open.
         if resource_type == "SearchParameter" {
             if let Err(e) = self.reload_stored_cache().await {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
             }
         }
-
-        commit_best_effort_multi_write_session(&mut session, transaction_active, "restore").await?;
 
         Ok(StoredResource::from_storage(
             resource_type,
@@ -2100,8 +2148,9 @@ impl MongoBackend {
         ))
     }
 
-    /// The `search_index` documents one resource contributes — every value the
-    /// extractor yields, plus the `_contained` rows, with no I/O of its own.
+    /// The `search_index`/`search_index_contained` documents one resource
+    /// contributes — every value the extractor yields, split by destination
+    /// collection, with no I/O of its own.
     ///
     /// Split out of [`Self::index_resource`] so the batched bulk-submit ingest
     /// (#1000) can build a whole batch's index documents and write them in one
@@ -2113,7 +2162,7 @@ impl MongoBackend {
         resource_type: &str,
         resource_id: &str,
         resource: &Value,
-    ) -> Vec<Document> {
+    ) -> SearchIndexDocuments {
         self.search_index_documents_checked(tenant_id, resource_type, resource_id, resource)
             .0
     }
@@ -2133,8 +2182,8 @@ impl MongoBackend {
         resource_type: &str,
         resource_id: &str,
         resource: &Value,
-    ) -> (Vec<Document>, Option<String>) {
-        let (mut index_docs, failure) = match self
+    ) -> (SearchIndexDocuments, Option<String>) {
+        let (own, failure) = match self
             .tenant_extractor(tenant_id)
             .extract(resource, resource_type)
         {
@@ -2171,27 +2220,29 @@ impl MongoBackend {
             }
         };
 
-        // Also index any contained resources for `_contained` search. These rows
-        // share the container's (resource_type, resource_id) — so the
-        // delete-by-(type,id) that precedes a re-index cleans them too — but are
-        // flagged `is_contained` and carry the contained resource's type and
-        // local id.
-        for contained in self.tenant_extractor(tenant_id).extract_contained(resource) {
-            for value in &contained.values {
+        // Also index any contained resources for `_contained` search, into
+        // their own collection (`search_index_contained`) rather than mixed
+        // into `own`. These rows share the container's
+        // (resource_type, resource_id) — so the delete-by-(type,id) that
+        // precedes a re-index cleans them too — and carry the contained
+        // resource's type and local id.
+        let mut contained = Vec::new();
+        for c in self.tenant_extractor(tenant_id).extract_contained(resource) {
+            for value in &c.values {
                 if let Some(d) = self.build_contained_index_document(
                     tenant_id,
                     resource_type,
                     resource_id,
-                    &contained.contained_type,
-                    &contained.local_id,
+                    &c.contained_type,
+                    &c.local_id,
                     value,
                 ) {
-                    index_docs.push(d);
+                    contained.push(d);
                 }
             }
         }
 
-        (index_docs, failure)
+        (SearchIndexDocuments { own, contained }, failure)
     }
 
     pub(crate) async fn index_resource(
@@ -2210,28 +2261,146 @@ impl MongoBackend {
         self.delete_search_index(db, tenant_id, resource_type, resource_id, session)
             .await?;
 
-        let index_docs =
-            self.search_index_documents(tenant_id, resource_type, resource_id, resource);
+        let docs = self.search_index_documents(tenant_id, resource_type, resource_id, resource);
 
-        if index_docs.is_empty() {
+        if docs.is_empty() {
             return Ok(());
         }
 
-        let collection = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+        self.insert_search_index_documents(db, docs, session.as_mut())
+            .await
+    }
+
+    /// Runs `insert_many(docs)` on `collection` through `session` when given,
+    /// skipping the call entirely when `docs` is empty. Shared by
+    /// [`Self::insert_search_index_documents`]'s two collection inserts so
+    /// they read alike.
+    async fn insert_indexed_docs(
+        collection: &Collection<Document>,
+        docs: Vec<Document>,
+        session: &mut Option<&mut ClientSession>,
+        error_prefix: &str,
+    ) -> StorageResult<()> {
+        if docs.is_empty() {
+            return Ok(());
+        }
 
         if let Some(active_session) = session.as_mut() {
             collection
-                .insert_many(index_docs)
-                .session(active_session)
+                .insert_many(docs)
+                .session(&mut **active_session)
                 .await
-                .map_err(|e| {
-                    internal_error(format!("Failed to insert search index entries: {}", e))
-                })?;
+                .map_err(|e| internal_error(format!("{error_prefix}: {}", e)))?;
         } else {
-            collection.insert_many(index_docs).await.map_err(|e| {
-                internal_error(format!("Failed to insert search index entries: {}", e))
-            })?;
+            collection
+                .insert_many(docs)
+                .await
+                .map_err(|e| internal_error(format!("{error_prefix}: {}", e)))?;
         }
+
+        Ok(())
+    }
+
+    /// Inserts one resource's [`SearchIndexDocuments`]: `own` rows into
+    /// `search_index`, `contained` rows into `search_index_contained`, each
+    /// only when non-empty, through `session` when given. Used by every
+    /// insert path so a resource's own rows and its contained rows land in
+    /// the right collection by construction.
+    async fn insert_search_index_documents(
+        &self,
+        db: &mongodb::Database,
+        docs: SearchIndexDocuments,
+        session: Option<&mut ClientSession>,
+    ) -> StorageResult<()> {
+        let mut session = session;
+
+        let own_collection = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+        Self::insert_indexed_docs(
+            &own_collection,
+            docs.own,
+            &mut session,
+            "Failed to insert search index entries",
+        )
+        .await?;
+
+        let contained_collection =
+            db.collection::<Document>(MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION);
+        Self::insert_indexed_docs(
+            &contained_collection,
+            docs.contained,
+            &mut session,
+            "Failed to insert search_index_contained entries",
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Runs `delete_many(filter)` on `collection` through `session` when
+    /// given. Shared by [`Self::delete_search_index_rows_for`]'s two
+    /// collection deletes so they read alike (and alongside
+    /// [`Self::insert_indexed_docs`]).
+    async fn delete_indexed_docs(
+        collection: &Collection<Document>,
+        filter: Document,
+        session: &mut Option<&mut ClientSession>,
+        error_prefix: &str,
+    ) -> StorageResult<()> {
+        if let Some(active_session) = session.as_mut() {
+            collection
+                .delete_many(filter)
+                .session(&mut **active_session)
+                .await
+                .map_err(|e| internal_error(format!("{error_prefix}: {}", e)))?;
+        } else {
+            collection
+                .delete_many(filter)
+                .await
+                .map_err(|e| internal_error(format!("{error_prefix}: {}", e)))?;
+        }
+
+        Ok(())
+    }
+
+    /// Deletes rows matching `{tenant_id, resource_type, resource_id:
+    /// id_filter}` from `search_index` and then `search_index_contained`,
+    /// through `session` when given. `id_filter` is either a single id
+    /// (`Bson::String`) or an `$in` filter over multiple ids. Used by every
+    /// delete path so a resource's own rows and its contained rows are
+    /// removed together by construction.
+    async fn delete_search_index_rows_for(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        resource_type: &str,
+        id_filter: Bson,
+        session: Option<&mut ClientSession>,
+    ) -> StorageResult<()> {
+        let mut session = session;
+        let filter = doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "resource_id": id_filter,
+        };
+
+        let own_collection = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+        Self::delete_indexed_docs(
+            &own_collection,
+            filter.clone(),
+            &mut session,
+            "Failed to delete search index entries",
+        )
+        .await?;
+
+        let contained_collection =
+            db.collection::<Document>(MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION);
+        Self::delete_indexed_docs(
+            &contained_collection,
+            filter,
+            &mut session,
+            "Failed to delete search_index_contained entries",
+        )
+        .await?;
 
         Ok(())
     }
@@ -2248,28 +2417,14 @@ impl MongoBackend {
             return Ok(());
         }
 
-        let collection = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
-        let filter = doc! {
-            "tenant_id": tenant_id,
-            "resource_type": resource_type,
-            "resource_id": resource_id,
-        };
-
-        if let Some(active_session) = session.as_mut() {
-            collection
-                .delete_many(filter)
-                .session(active_session)
-                .await
-                .map_err(|e| {
-                    internal_error(format!("Failed to delete search index entries: {}", e))
-                })?;
-        } else {
-            collection.delete_many(filter).await.map_err(|e| {
-                internal_error(format!("Failed to delete search index entries: {}", e))
-            })?;
-        }
-
-        Ok(())
+        self.delete_search_index_rows_for(
+            db,
+            tenant_id,
+            resource_type,
+            Bson::String(resource_id.to_string()),
+            session.as_mut(),
+        )
+        .await
     }
 
     fn build_search_index_document(
@@ -2372,8 +2527,8 @@ impl MongoBackend {
 
     /// Builds a contained-resource search-index document (`_contained` search):
     /// the same value columns as [`Self::build_search_index_document`], with the
-    /// container's `(resource_type, resource_id)`, flagged `is_contained` and
-    /// carrying the contained resource's type and local id.
+    /// container's `(resource_type, resource_id)`, carrying the contained
+    /// resource's type and local id; written to `search_index_contained`.
     fn build_contained_index_document(
         &self,
         tenant_id: &str,
@@ -2385,7 +2540,6 @@ impl MongoBackend {
     ) -> Option<Document> {
         let mut doc =
             self.build_search_index_document(tenant_id, container_type, container_id, value)?;
-        doc.insert("is_contained", true);
         doc.insert("contained_type", contained_type);
         doc.insert("contained_local_id", contained_local_id);
         Some(doc)
@@ -3684,18 +3838,26 @@ impl MongoBackend {
         resource_type: &str,
         search_params: &str,
     ) -> StorageResult<Vec<StoredResource>> {
-        let parsed_params = parse_simple_bundle_search_params(search_params);
+        let parsed_params = crate::search::parse_conditional_criteria(search_params);
         if parsed_params.is_empty() {
             return Ok(Vec::new());
         }
 
         if self.is_search_offloaded() {
+            // This path reads the pairs itself; an empty `identifier=` would
+            // add no condition and match the whole type (#1360).
+            crate::search::conditional::reject_empty_criterion_values(&parsed_params)?;
             return self
                 .if_none_exist_offloaded_scan(db, session, tenant, resource_type, &parsed_params)
                 .await;
         }
 
-        let typed_params = self.build_search_parameters(tenant, resource_type, &parsed_params);
+        let typed_params = self.build_search_parameters(tenant, resource_type, &parsed_params)?;
+        // Result-shaping names (`_format`, …) are not criteria; with nothing
+        // left, an empty filter would match the whole type.
+        if typed_params.is_empty() {
+            return Ok(Vec::new());
+        }
         let index_params: Vec<_> = typed_params
             .iter()
             .filter(|p| !matches!(p.name.as_str(), "_id" | "_lastUpdated"))
@@ -3733,32 +3895,60 @@ impl MongoBackend {
         const PROBE_LIMIT: i64 = 2;
         const BATCH_SIZE: i64 = 128;
 
+        // #1206: cache each composite's driver-arm probe (component filters +
+        // counts already resolved) so the winning index, if composite,
+        // doesn't re-probe below — mirrors `matching_resource_ids` in
+        // `search_impl.rs`.
+        let mut composite_probes: HashMap<usize, (Document, i64)> = HashMap::new();
+
         let driver_idx = {
             let mut best: Option<(usize, i64)> = None;
             for (i, param) in index_params.iter().enumerate() {
-                let filter = self.build_search_index_filter(tenant_id, resource_type, param)?;
-                let pipeline = vec![
-                    doc! { "$match": filter },
-                    doc! { "$limit": PROBE_LIMIT },
-                    doc! { "$group": { "_id": "$resource_id" } },
-                    doc! { "$count": "n" },
-                ];
-                let cursor = search_index
-                    .aggregate(pipeline)
-                    .session(&mut *session)
-                    .await
-                    .map_err(|e| {
-                        internal_error(format!("Failed probe for ifNoneExist driver: {}", e))
-                    })?;
-                let probe_docs = collect_session_documents(cursor, session).await?;
-                let count = probe_docs
-                    .first()
-                    .and_then(|d| d.get_i32("n").ok())
-                    .map(|n| n as i64)
-                    .unwrap_or(0);
-                if count == 0 {
-                    return Ok(Vec::new());
-                }
+                let count = if param.param_type == SearchParamType::Composite {
+                    match self
+                        .composite_driver_probe(
+                            &search_index,
+                            tenant_id,
+                            resource_type,
+                            param,
+                            PROBE_LIMIT as u64,
+                            Some(&mut *session),
+                        )
+                        .await?
+                    {
+                        None => return Ok(Vec::new()),
+                        Some((filter, count)) => {
+                            let count = count as i64;
+                            composite_probes.insert(i, (filter, count));
+                            count
+                        }
+                    }
+                } else {
+                    let filter = self.build_search_index_filter(tenant_id, resource_type, param)?;
+                    let pipeline = vec![
+                        doc! { "$match": filter },
+                        doc! { "$limit": PROBE_LIMIT },
+                        doc! { "$group": { "_id": "$resource_id" } },
+                        doc! { "$count": "n" },
+                    ];
+                    let cursor = search_index
+                        .aggregate(pipeline)
+                        .session(&mut *session)
+                        .await
+                        .map_err(|e| {
+                            internal_error(format!("Failed probe for ifNoneExist driver: {}", e))
+                        })?;
+                    let probe_docs = collect_session_documents(cursor, session).await?;
+                    let count = probe_docs
+                        .first()
+                        .and_then(|d| d.get_i32("n").ok())
+                        .map(|n| n as i64)
+                        .unwrap_or(0);
+                    if count == 0 {
+                        return Ok(Vec::new());
+                    }
+                    count
+                };
                 if best.is_none_or(|(_, prev)| count < prev) {
                     best = Some((i, count));
                 }
@@ -3766,8 +3956,14 @@ impl MongoBackend {
             best.map(|(i, _)| i).unwrap_or(0)
         };
 
-        let driver_filter =
-            self.build_search_index_filter(tenant_id, resource_type, index_params[driver_idx])?;
+        // Every composite index visited above has its probe result cached,
+        // so `driver_idx` pointing at a composite always finds an entry
+        // here; a plain param never has one and falls through as before.
+        let driver_filter = if let Some((filter, _)) = composite_probes.remove(&driver_idx) {
+            filter
+        } else {
+            self.build_search_index_filter(tenant_id, resource_type, index_params[driver_idx])?
+        };
 
         let mut last_index_id: Option<Bson> = None;
         let mut matches: Vec<StoredResource> = Vec::with_capacity(2);
@@ -3817,7 +4013,28 @@ impl MongoBackend {
             }
 
             for (i, param) in index_params.iter().enumerate() {
-                if i == driver_idx || candidate_ids.is_empty() {
+                if candidate_ids.is_empty() {
+                    continue;
+                }
+                // Same reasoning as `matching_resource_ids`: a composite's
+                // driver arm only proves its most selective component
+                // matched, so every composite here — including the driver —
+                // still needs the grouped pair check (#1206).
+                if param.param_type == SearchParamType::Composite {
+                    let passing = self
+                        .composite_pair_check(
+                            &search_index,
+                            tenant_id,
+                            resource_type,
+                            param,
+                            &candidate_ids,
+                            Some(&mut *session),
+                        )
+                        .await?;
+                    candidate_ids.retain(|id| passing.contains(id));
+                    continue;
+                }
+                if i == driver_idx {
                     continue;
                 }
                 let param_filter =
@@ -4001,48 +4218,11 @@ impl MongoBackend {
         )
         .await?;
 
-        let index_docs = match self
-            .tenant_extractor(tenant_id)
-            .extract(resource, resource_type)
-        {
-            Ok(values) => values
-                .iter()
-                .filter_map(|value| {
-                    self.build_search_index_document(tenant_id, resource_type, resource_id, value)
-                })
-                .collect::<Vec<_>>(),
-            Err(e) => {
-                tracing::warn!(
-                    "Search extraction failed for {}/{} in transaction: {}. Using minimal fallback index values.",
-                    resource_type,
-                    resource_id,
-                    e
-                );
-                self.index_minimal_fallback_documents(
-                    tenant_id,
-                    resource_type,
-                    resource_id,
-                    resource,
-                )
-            }
-        };
+        let (docs, _failure) =
+            self.search_index_documents_checked(tenant_id, resource_type, resource_id, resource);
 
-        if index_docs.is_empty() {
-            return Ok(());
-        }
-
-        db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION)
-            .insert_many(index_docs)
-            .session(&mut *session)
+        self.insert_search_index_documents(db, docs, Some(session))
             .await
-            .map_err(|e| {
-                internal_error(format!(
-                    "Failed to insert search_index entries in transaction: {}",
-                    e
-                ))
-            })?;
-
-        Ok(())
     }
 
     async fn delete_search_index_in_bundle_transaction(
@@ -4057,22 +4237,14 @@ impl MongoBackend {
             return Ok(());
         }
 
-        db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION)
-            .delete_many(doc! {
-                "tenant_id": tenant_id,
-                "resource_type": resource_type,
-                "resource_id": resource_id,
-            })
-            .session(&mut *session)
-            .await
-            .map_err(|e| {
-                internal_error(format!(
-                    "Failed to delete search_index entries in transaction: {}",
-                    e
-                ))
-            })?;
-
-        Ok(())
+        self.delete_search_index_rows_for(
+            db,
+            tenant_id,
+            resource_type,
+            Bson::String(resource_id.to_string()),
+            Some(session),
+        )
+        .await
     }
 
     fn parse_url(&self, url: &str) -> StorageResult<(String, String)> {
@@ -4105,10 +4277,11 @@ impl MongoBackend {
 // ============================================================================
 // PurgableStorage
 //
-// MongoDB stores resources across three collections — `resources`,
-// `resource_history`, and `search_index` — the same shape SQLite uses, so purge
-// is the same three deletes keyed by (tenant_id, resource_type, id). Note that
-// the ordinary `delete` is a *soft* delete: it flips `is_deleted` and writes a
+// MongoDB stores resources across four collections — `resources`,
+// `resource_history`, `search_index`, and `search_index_contained` — the same
+// shape SQLite uses (plus the #1160 contained-rows split), so purge is the
+// same four deletes keyed by (tenant_id, resource_type, id). Note that the
+// ordinary `delete` is a *soft* delete: it flips `is_deleted` and writes a
 // tombstone. Purge is the only path that removes the bytes.
 // ============================================================================
 
@@ -4166,6 +4339,19 @@ impl PurgableStorage for MongoBackend {
             .await
             .or_query_error("Failed to purge search index")?;
 
+        // Contained rows share the container's (tenant_id, resource_type,
+        // resource_id), so they key the same way.
+        let search_index_contained =
+            db.collection::<Document>(MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION);
+        search_index_contained
+            .delete_many(doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "resource_id": id,
+            })
+            .await
+            .or_query_error("Failed to purge contained search index")?;
+
         Ok(())
     }
 
@@ -4176,6 +4362,8 @@ impl PurgableStorage for MongoBackend {
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
         let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+        let search_index_contained =
+            db.collection::<Document>(MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION);
 
         let key = doc! { "tenant_id": tenant_id, "resource_type": resource_type };
 
@@ -4199,6 +4387,12 @@ impl PurgableStorage for MongoBackend {
             .delete_many(doc! { "tenant_id": tenant_id, "resource_type": resource_type })
             .await
             .or_query_error("Failed to purge search index")?;
+        // Contained rows share the container's (tenant_id, resource_type),
+        // so a type-level purge keys the same way (#1160 Task 4).
+        search_index_contained
+            .delete_many(doc! { "tenant_id": tenant_id, "resource_type": resource_type })
+            .await
+            .or_query_error("Failed to purge contained search index")?;
 
         Ok(count)
     }
@@ -4340,17 +4534,34 @@ impl ReindexTarget for MongoBackend {
         }
 
         let db = self.get_database().await?;
+        let filter = doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": resource_type,
+            "resource_id": resource_id,
+        };
+
         let result = db
             .collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION)
-            .delete_many(doc! {
-                "tenant_id": tenant.tenant_id().as_str(),
-                "resource_type": resource_type,
-                "resource_id": resource_id,
-            })
+            .delete_many(filter.clone())
             .await
             .map_err(|e| internal_error(format!("Failed to delete search entries: {e}")))?;
 
-        Ok(result.deleted_count)
+        // Contained rows key the same way (#1160 Task 4), so this default
+        // `ReindexTarget` per-resource delete clears both collections too —
+        // keeping the invariant intact even though `write_search_entries_page`
+        // below overrides the page-level caller, making this single-resource
+        // path unreachable on MongoDB today.
+        let contained_result = db
+            .collection::<Document>(MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION)
+            .delete_many(filter)
+            .await
+            .map_err(|e| {
+                internal_error(format!(
+                    "Failed to delete search_index_contained entries: {e}"
+                ))
+            })?;
+
+        Ok(result.deleted_count + contained_result.deleted_count)
     }
 
     async fn write_search_entries(
@@ -4375,13 +4586,24 @@ impl ReindexTarget for MongoBackend {
         }
 
         let db = self.get_database().await?;
+        let tenant_id = tenant.tenant_id().as_str();
         let result = db
             .collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION)
-            .delete_many(doc! { "tenant_id": tenant.tenant_id().as_str() })
+            .delete_many(doc! { "tenant_id": tenant_id })
             .await
             .or_query_error("Failed to clear search index")?;
 
-        Ok(result.deleted_count)
+        // A reindex scoped by `resource_types`/`resource_ids` never rewrites
+        // out-of-scope containers, so a `clear_existing` run that skipped
+        // this would leave their contained rows behind as orphans (#1160
+        // Task 4) — same tenant-wide scope as the `search_index` clear above.
+        let contained_result = db
+            .collection::<Document>(MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION)
+            .delete_many(doc! { "tenant_id": tenant_id })
+            .await
+            .or_query_error("Failed to clear contained search index")?;
+
+        Ok(result.deleted_count + contained_result.deleted_count)
     }
 
     /// Rebuilds a whole page in one `delete_many` plus one (possibly chunked)
@@ -4457,7 +4679,7 @@ impl ReindexTarget for MongoBackend {
         let tenant_id = tenant.tenant_id().as_str();
 
         struct Prepared {
-            docs: Vec<Document>,
+            docs: SearchIndexDocuments,
             failure: Option<String>,
         }
         let prepared: Vec<Prepared> = resources
@@ -4474,12 +4696,16 @@ impl ReindexTarget for MongoBackend {
             .collect();
 
         let collection = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+        let contained_collection =
+            db.collection::<Document>(MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION);
 
         // ONE delete per distinct resource_type in the page (a production
         // page is single-type — `fetch_resources_page` filters on one type —
         // so this is one command; grouping keeps a hypothetical
-        // heterogeneous slice correct too). A failure here means stale rows
-        // may remain for the whole page, so it fans out to every resource.
+        // heterogeneous slice correct too), run against both collections so
+        // stale contained rows don't outlive the page they belonged to
+        // (#1160 Task 4). A failure on either delete means stale rows may
+        // remain for the whole page, so it fans out to every resource.
         let mut ids_by_type: HashMap<&str, Vec<Bson>> = HashMap::new();
         for resource in resources {
             ids_by_type
@@ -4488,15 +4714,20 @@ impl ReindexTarget for MongoBackend {
                 .push(Bson::from(resource.id()));
         }
         for (resource_type, ids) in ids_by_type {
-            if let Err(e) = collection
-                .delete_many(doc! {
-                    "tenant_id": tenant_id,
-                    "resource_type": resource_type,
-                    "resource_id": { "$in": ids },
-                })
-                .await
-            {
+            let filter = doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "resource_id": { "$in": ids },
+            };
+            if let Err(e) = collection.delete_many(filter.clone()).await {
                 let msg = format!("Failed to delete search entries: {e}");
+                return resources
+                    .iter()
+                    .map(|_| Err(internal_error(msg.clone())))
+                    .collect();
+            }
+            if let Err(e) = contained_collection.delete_many(filter).await {
+                let msg = format!("Failed to delete search_index_contained entries: {e}");
                 return resources
                     .iter()
                     .map(|_| Err(internal_error(msg.clone())))
@@ -4504,51 +4735,74 @@ impl ReindexTarget for MongoBackend {
             }
         }
 
-        // Flatten every resource's documents into one insert, chunked at
+        // Flatten every resource's own documents into one insert, chunked at
         // SEARCH_INDEX_INSERT_CHUNK, tracking which resource each document
         // belongs to so an unordered write error attributes back to just
         // that resource instead of failing the whole page.
-        let mut owners: Vec<usize> =
-            Vec::with_capacity(prepared.iter().map(|p| p.docs.len()).sum());
-        let mut all_docs: Vec<Document> = Vec::with_capacity(owners.capacity());
+        let mut own_owners: Vec<usize> =
+            Vec::with_capacity(prepared.iter().map(|p| p.docs.own.len()).sum());
+        let mut own_docs: Vec<Document> = Vec::with_capacity(own_owners.capacity());
         for (i, p) in prepared.iter().enumerate() {
-            for d in &p.docs {
-                owners.push(i);
-                all_docs.push(d.clone());
+            for d in &p.docs.own {
+                own_owners.push(i);
+                own_docs.push(d.clone());
             }
         }
 
-        let mut insert_failures: HashMap<usize, String> = HashMap::new();
-        let mut offset = 0usize;
-        for chunk in all_docs.chunks(SEARCH_INDEX_INSERT_CHUNK) {
-            match collection.insert_many(chunk).ordered(false).await {
-                Ok(_) => {}
-                Err(e) => match e.kind.as_ref() {
-                    MongoErrorKind::InsertMany(insert_many) => {
-                        let Some(write_errors) = insert_many.write_errors.as_ref() else {
-                            let msg = format!("Failed to insert search index entries: {e}");
-                            return resources
-                                .iter()
-                                .map(|_| Err(internal_error(msg.clone())))
-                                .collect();
-                        };
-                        for write_error in write_errors {
-                            let owner = owners[offset + write_error.index];
-                            insert_failures
-                                .entry(owner)
-                                .or_insert_with(|| write_error.message.clone());
-                        }
-                    }
-                    _ => {
-                        let msg = format!("Failed to insert search index entries: {e}");
-                        return resources
-                            .iter()
-                            .map(|_| Err(internal_error(msg.clone())))
-                            .collect();
-                    }
-                },
+        let mut insert_failures = match insert_search_entries_chunk(
+            &collection,
+            &own_owners,
+            &own_docs,
+            "Failed to insert search index entries",
+        )
+        .await
+        {
+            Ok(failures) => failures,
+            Err(msg) => {
+                return resources
+                    .iter()
+                    .map(|_| Err(internal_error(msg.clone())))
+                    .collect();
             }
-            offset += chunk.len();
+        };
+
+        // Same flatten-and-chunked-insert for contained rows, into their own
+        // collection. A failed contained insert attributes back to its
+        // resource exactly like a failed own insert; if a resource already
+        // has an own-row failure recorded, that one wins (matching the
+        // "first write error found" semantics `insert_search_entries_chunk`
+        // already uses within one collection).
+        let mut contained_owners: Vec<usize> =
+            Vec::with_capacity(prepared.iter().map(|p| p.docs.contained.len()).sum());
+        let mut contained_docs: Vec<Document> = Vec::with_capacity(contained_owners.capacity());
+        for (i, p) in prepared.iter().enumerate() {
+            for d in &p.docs.contained {
+                contained_owners.push(i);
+                contained_docs.push(d.clone());
+            }
+        }
+
+        if !contained_docs.is_empty() {
+            match insert_search_entries_chunk(
+                &contained_collection,
+                &contained_owners,
+                &contained_docs,
+                "Failed to insert search_index_contained entries",
+            )
+            .await
+            {
+                Ok(failures) => {
+                    for (owner, msg) in failures {
+                        insert_failures.entry(owner).or_insert(msg);
+                    }
+                }
+                Err(msg) => {
+                    return resources
+                        .iter()
+                        .map(|_| Err(internal_error(msg.clone())))
+                        .collect();
+                }
+            }
         }
 
         prepared
@@ -4557,10 +4811,8 @@ impl ReindexTarget for MongoBackend {
             .map(|(i, p)| match p.failure {
                 Some(msg) => Err(internal_error(msg)),
                 None => match insert_failures.remove(&i) {
-                    Some(msg) => Err(internal_error(format!(
-                        "Failed to insert search index entries: {msg}"
-                    ))),
-                    None => Ok(p.docs.len()),
+                    Some(msg) => Err(internal_error(msg)),
+                    None => Ok(p.docs.own.len() + p.docs.contained.len()),
                 },
             })
             .collect()
@@ -4574,6 +4826,51 @@ impl ReindexTarget for MongoBackend {
 /// driver serializes per command) without depending on that module, since a
 /// page's `search_index` documents are built the same way a batch's are.
 const SEARCH_INDEX_INSERT_CHUNK: usize = 5_000;
+
+/// Chunked, unordered `insert_many` of `docs` into `collection`, attributing
+/// each document to the resource index at the same position in `owners`.
+///
+/// Used by [`MongoBackend::write_search_entries_page`] once per destination
+/// collection (`search_index` for a page's own rows, `search_index_contained`
+/// for its contained rows) so a failed contained insert attributes back to
+/// its resource exactly like a failed own insert.
+///
+/// Returns the per-resource write failures found, each message already
+/// carrying `error_context` (so a `search_index_contained` failure reads as
+/// that, not as "Failed to insert search index entries" regardless of which
+/// collection actually failed). A page-level error — one the driver did not
+/// attribute to specific documents — is returned as `Err`, for the caller to
+/// fan out to every resource in the page.
+async fn insert_search_entries_chunk(
+    collection: &mongodb::Collection<Document>,
+    owners: &[usize],
+    docs: &[Document],
+    error_context: &str,
+) -> Result<HashMap<usize, String>, String> {
+    let mut insert_failures: HashMap<usize, String> = HashMap::new();
+    let mut offset = 0usize;
+    for chunk in docs.chunks(SEARCH_INDEX_INSERT_CHUNK) {
+        match collection.insert_many(chunk).ordered(false).await {
+            Ok(_) => {}
+            Err(e) => match e.kind.as_ref() {
+                MongoErrorKind::InsertMany(insert_many) => {
+                    let Some(write_errors) = insert_many.write_errors.as_ref() else {
+                        return Err(format!("{error_context}: {e}"));
+                    };
+                    for write_error in write_errors {
+                        let owner = owners[offset + write_error.index];
+                        insert_failures
+                            .entry(owner)
+                            .or_insert_with(|| format!("{error_context}: {}", write_error.message));
+                    }
+                }
+                _ => return Err(format!("{error_context}: {e}")),
+            },
+        }
+        offset += chunk.len();
+    }
+    Ok(insert_failures)
+}
 
 /// Parses a `{rfc3339}|{id}` keyset-pagination cursor for the reindex source.
 fn parse_reindex_cursor(cursor: &str) -> Option<(DateTime<Utc>, String)> {
@@ -4603,6 +4900,170 @@ fn resolve_bundle_references(value: &mut Value, reference_map: &HashMap<String, 
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod index_date_tests {
+    use super::*;
+
+    /// A search value and the stored value it should match must never be zoned
+    /// differently. Both are read by the shared `FhirDateValue` (the writer
+    /// since #1315): for every value the search grammar accepts, the instant
+    /// indexed must be the start of the range searched (both are then cut to
+    /// the millisecond a BSON date holds).
+    ///
+    /// That includes what a resource cannot validly carry but real data does —
+    /// `hh:mm` without seconds — and a `:60` leap second, which the search
+    /// side reads as the next second.
+    #[test]
+    fn search_and_index_agree_on_every_valid_value() {
+        for value in [
+            "2013",
+            "2013-04",
+            "2013-12",
+            "2013-04-05",
+            "2024-02-29",
+            "2013-04-05T09:20:00",
+            "2013-04-05T09:20:00Z",
+            "2013-04-05T09:20:00-04:00",
+            "2013-04-05T18:50:00+05:30",
+            "2013-04-05T09:20:00-00:00",
+            "2013-04-05T23:20:00+14:00",
+            "2013-04-05T09:20:00.5Z",
+            "2013-04-05T23:30:00.123-04:00",
+            "2021-11-10T16:48:57.246958-08:00",
+            // Minutes without seconds (#1315).
+            "2013-04-05T09:20",
+            "2013-04-05T09:20Z",
+            "2013-04-05T09:20-04:00",
+            "2013-04-05T18:50+05:30",
+            "2013-04-05T09:20-00:00",
+            "2013-04-05T23:59-14:00",
+            // A leap second is the first instant of the next second.
+            "2016-12-31T23:59:60Z",
+            "2013-04-05T09:20:60",
+            "2016-12-31T18:59:60-05:00",
+            "2016-12-31T23:59:60.5Z",
+            // Nine fraction digits, and digits past the ninth.
+            "2013-04-05T09:20:00.123456789Z",
+            "2013-04-05T09:20:00.1234567891Z",
+            "2013-04-05T09:20:00.12345678912345-04:00",
+            // The edges of the supported years.
+            "0001",
+            "0001-01-01T00:00:00Z",
+            "0001-01-01T14:00:00+14:00",
+            "9999",
+            "9999-12-31",
+            "9999-12-31T23:59",
+            "9999-12-31T23:59:59Z",
+            "9999-12-31T09:59:59-14:00",
+        ] {
+            let searched = crate::search::FhirDateValue::parse(value)
+                .unwrap_or_else(|e| panic!("{value} is a valid search value: {e}"));
+            assert_eq!(
+                normalize_date_for_mongo(value),
+                Some(searched.start),
+                "{value}"
+            );
+            let (start, _) = searched.range_at(crate::search::StorageResolution::Millis);
+            assert_eq!(
+                normalize_date_for_mongo(value).map(chrono_to_bson),
+                Some(chrono_to_bson(start)),
+                "{value} at BSON resolution"
+            );
+        }
+    }
+
+    /// #1315 itself: minutes without seconds are not RFC 3339, so the lenient
+    /// reading — all there was — dropped the value and the index document was
+    /// skipped.
+    #[test]
+    fn minute_precision_values_are_indexed() {
+        for (value, expected) in [
+            ("2013-04-05T09:20", "2013-04-05T09:20:00+00:00"),
+            ("2013-04-05T09:20Z", "2013-04-05T09:20:00+00:00"),
+            ("2013-04-05T09:20-04:00", "2013-04-05T13:20:00+00:00"),
+            ("2013-04-05T18:50+05:30", "2013-04-05T13:20:00+00:00"),
+        ] {
+            assert_eq!(
+                normalize_date_for_mongo_lenient(value),
+                None,
+                "{value} before"
+            );
+            assert_eq!(
+                normalize_date_for_mongo(value).map(|t| t.to_rfc3339()),
+                Some(expected.to_string()),
+                "{value}"
+            );
+        }
+    }
+
+    /// The only value both readings accept and disagree on. Chrono keeps a
+    /// leap second as `:59` plus a second of nanoseconds, which a BSON date
+    /// holds as `:59.999`-and-a-bit at best; the search side looks for it *at*
+    /// the next second.
+    #[test]
+    fn leap_second_is_indexed_where_the_search_side_looks_for_it() {
+        let lenient =
+            normalize_date_for_mongo_lenient("2016-12-31T23:59:60Z").expect("chrono reads it");
+        assert_eq!(lenient.timestamp(), 1_483_228_799, "lenient: still :59");
+        let indexed = normalize_date_for_mongo("2016-12-31T23:59:60Z").expect("indexed");
+        assert_eq!(indexed.to_rfc3339(), "2017-01-01T00:00:00+00:00");
+    }
+
+    /// The search side trims a value and reads a space in the zone-sign
+    /// position as a form-decoded `+` (#1296). Neither applies to a stored
+    /// value: there a space is not part of a date, and the value is skipped as
+    /// it always was rather than indexed at a zone nobody wrote.
+    #[test]
+    fn search_side_repairs_do_not_apply_to_stored_values() {
+        for value in [
+            "2013-04-05T18:50:00 05:30",
+            "2013-04-05T18:50 05:30",
+            " 2013-04-05T09:20",
+            "2013-04-05T09:20 ",
+            " 2013-04-05 ",
+        ] {
+            assert!(
+                crate::search::FhirDateValue::parse(value).is_ok(),
+                "{value:?} is accepted as a search value"
+            );
+            assert_eq!(normalize_date_for_mongo(value), None, "{value:?}");
+        }
+    }
+
+    /// What the strict grammar rejects still goes through the lenient reading,
+    /// exactly as before: the strict pass only ever adds index documents.
+    #[test]
+    fn values_outside_the_grammar_keep_the_lenient_reading() {
+        for value in [
+            // Offset beyond ±14:00.
+            "2013-04-05T09:20:00+14:30",
+            // Valid text whose UTC instant is past the year 9999.
+            "9999-12-31T23:59:59-01:00",
+            // Its range would have no width left inside the supported years.
+            "9999-12-31T23:59:59.999999999Z",
+        ] {
+            assert!(
+                crate::search::FhirDateValue::parse(value).is_err(),
+                "{value} is outside the search grammar"
+            );
+            assert!(normalize_date_for_mongo_lenient(value).is_some(), "{value}");
+            assert_eq!(
+                normalize_date_for_mongo(value),
+                normalize_date_for_mongo_lenient(value),
+                "{value}"
+            );
+        }
+    }
+
+    /// Never a timestamp for something that is not a date.
+    #[test]
+    fn unparseable_values_are_dropped_not_substituted() {
+        for value in ["", "not-a-date", "2024-13-45T99:99:99", "T00:00:00"] {
+            assert_eq!(normalize_date_for_mongo(value), None, "{value:?}");
+        }
     }
 }
 

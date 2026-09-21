@@ -2,7 +2,7 @@
   "resourceType": "StructureDefinition",
   "id": "CareTeam",
   "meta": {
-    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
+    "lastUpdated": "2026-09-14T16:43:45.341+00:00"
   },
   "text": {
     "status": "generated",
@@ -14,12 +14,12 @@
       "valueCode": "normative"
     },
     {
-      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
-      "valueCode": "pc"
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-normative-version",
+      "valueCode": "6.0.0-snapshot1"
     },
     {
-      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
-      "valueInteger": 2
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "pc"
     },
     {
       "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-security-category",
@@ -27,11 +27,11 @@
     }
   ],
   "url": "http://hl7.org/fhir/StructureDefinition/CareTeam",
-  "version": "6.0.0-ballot4",
+  "version": "6.0.0-snapshot1",
   "name": "CareTeam",
   "status": "active",
   "experimental": false,
-  "date": "2026-07-17T03:44:13+00:00",
+  "date": "2026-09-14T16:43:45+00:00",
   "publisher": "HL7 International / Patient Care",
   "contact": [
     {
@@ -63,7 +63,7 @@
       ]
     }
   ],
-  "fhirVersion": "6.0.0-ballot4",
+  "fhirVersion": "6.0.0-snapshot1",
   "mapping": [
     {
       "identity": "w5",
@@ -142,7 +142,7 @@
               },
               {
                 "url": "http://hl7.org/fhir/StructureDefinition/elementdefinition-bestpractice-explanation",
-                "valueMarkdown": "When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust eco-system and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such eco-systems often open up to new participants over time."
+                "valueMarkdown": "When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust ecosystem and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such ecosystems often open up to new participants over time."
               }
             ],
             "key": "dom-6",
@@ -303,7 +303,7 @@
           ],
           "strength": "required",
           "description": "IETF language tag for a human language",
-          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
+          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1",
           "additional": [
             {
               "purpose": "starter",
@@ -583,7 +583,7 @@
           ],
           "strength": "required",
           "description": "Indicates the status of the care team.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/care-team-status|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/care-team-status|6.0.0-snapshot1"
         },
         "mapping": [
           {
@@ -1403,7 +1403,7 @@
           ],
           "strength": "required",
           "description": "Indicates the status of the care team.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/care-team-status|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/care-team-status|6.0.0-snapshot1"
         },
         "mapping": [
           {

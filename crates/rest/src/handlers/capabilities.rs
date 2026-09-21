@@ -20,7 +20,9 @@ use axum::{
     response::Response,
 };
 use helios_fhir::FhirVersion;
-use helios_persistence::core::{BundleProvider, ResourceStorage, SearchProvider};
+use helios_persistence::core::{
+    BundleProvider, ConditionalStorage, ResourceStorage, SearchProvider,
+};
 use helios_persistence::search::SearchParameterRegistry;
 use helios_persistence::types::SearchParamType;
 use tracing::debug;
@@ -75,7 +77,13 @@ pub async fn capabilities_handler<S>(
     req_headers: HeaderMap,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + SearchProvider + BundleProvider + Send + Sync + 'static,
+    S: ResourceStorage
+        + SearchProvider
+        + BundleProvider
+        + ConditionalStorage
+        + Send
+        + Sync
+        + 'static,
 {
     // Determine which version to describe (from Accept header or default)
     let fhir_version = version.accept_version_or(state.config().default_fhir_version);
@@ -122,7 +130,13 @@ fn build_capability_statement<S>(
     base_url: &str,
 ) -> serde_json::Value
 where
-    S: ResourceStorage + SearchProvider + BundleProvider + Send + Sync + 'static,
+    S: ResourceStorage
+        + SearchProvider
+        + BundleProvider
+        + ConditionalStorage
+        + Send
+        + Sync
+        + 'static,
 {
     // Get resource types for the requested FHIR version
     let resource_types = get_resource_type_names_for_version(version);
@@ -159,11 +173,18 @@ where
     // each resource's real `searchRevInclude` targets.
     let revinclude_by_target = build_revinclude_index(&registry);
 
+    // The conditional interactions are the storage's to declare, not literals:
+    // MongoDB has no conditional patch, S3 none at all, and a composite's
+    // answer depends on how it is composed (#1384). The conditional handlers
+    // refuse with `501` from this same source.
+    let conditionals = super::conditional_support::advertised(state.storage(), version);
+
     let resources: Vec<serde_json::Value> = resource_types
         .iter()
         .map(|rt| {
             build_resource_capability(
                 rt,
+                &conditionals,
                 &registry,
                 supports_contained,
                 &modifier_map,
@@ -330,6 +351,7 @@ fn build_rest_operations<S: ResourceStorage + Send + Sync + 'static>(
 /// Builds the capability entry for a resource type.
 fn build_resource_capability(
     resource_type: &str,
+    conditionals: &serde_json::Map<String, serde_json::Value>,
     registry: &SearchParameterRegistry,
     supports_contained: bool,
     modifier_map: &std::collections::HashMap<SearchParamType, Vec<&'static str>>,
@@ -369,9 +391,9 @@ fn build_resource_capability(
 
     if resource_type != "AuditEvent" {
         entry["updateCreate"] = serde_json::Value::Bool(true);
-        entry["conditionalCreate"] = serde_json::Value::Bool(true);
-        entry["conditionalUpdate"] = serde_json::Value::Bool(true);
-        entry["conditionalDelete"] = serde_json::Value::String("single".to_string());
+        for (element, value) in conditionals {
+            entry[element.as_str()] = value.clone();
+        }
     }
 
     // Advertise real `_include` targets: one "Type:code" per reference param on

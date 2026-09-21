@@ -37,6 +37,25 @@
     ]
   },
   "description": "Polyethylene Glycol 3350 (PEG 3350, Macrogol 3350) — a synthetic polyether of ethylene oxide with number-average molecular weight approximately 3350 Da. Linear homopolymer used as an osmotic laxative and a pharmaceutical excipient.",
+  "molecularWeight": [
+    {
+      "type": {
+        "coding": [
+          {
+            "system": "http://example.europa.eu/fhir/WeightType",
+            "code": "number-average",
+            "display": "Number average (Mn)"
+          }
+        ]
+      },
+      "amount": {
+        "value": 3350,
+        "unit": "g/mol",
+        "system": "http://unitsofmeasure.org",
+        "code": "g/mol"
+      }
+    }
+  ],
   "code": [
     {
       "code": {
@@ -90,25 +109,6 @@
     {
       "name": "Macrogol 3350",
       "preferred": false
-    }
-  ],
-  "molecularWeight": [
-    {
-      "type": {
-        "coding": [
-          {
-            "system": "http://example.europa.eu/fhir/WeightType",
-            "code": "number-average",
-            "display": "Number average (Mn)"
-          }
-        ]
-      },
-      "amount": {
-        "value": 3350,
-        "unit": "g/mol",
-        "system": "http://unitsofmeasure.org",
-        "code": "g/mol"
-      }
     }
   ],
   "polymer": {

@@ -16,7 +16,7 @@
       </p>
       <br/>
       <p>Mapping from 
-        <a href="http://terminology.hl7.org/7.2.0/CodeSystem-goal-achievement.html">Goal achievement status</a> to 
+        <a href="http://terminology.hl7.org/7.3.0/CodeSystem-goal-achievement.html">Goal achievement status</a> to 
         <a href="codesystem-resource-status.html">Canonical Status Codes for FHIR Resources</a>
       </p>
       <table class="grid">
@@ -34,63 +34,63 @@
         <tr>
           <td>in-progress</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>active</td>
         </tr>
         <tr>
           <td>sustaining</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>active</td>
         </tr>
         <tr>
           <td>improving</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>active</td>
         </tr>
         <tr>
           <td>worsening</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>active</td>
         </tr>
         <tr>
           <td>no-change</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>active</td>
         </tr>
         <tr>
           <td>achieved</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>complete</td>
         </tr>
         <tr>
           <td>not-attainable</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>abandoned</td>
         </tr>
         <tr>
           <td>no-progress</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>not-done</td>
         </tr>
         <tr>
           <td>not-achieved</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>not-done</td>
         </tr>
@@ -98,7 +98,7 @@
     </div>
   </text>
   <url value="http://hl7.org/fhir/ConceptMap/sc-goal-achievement"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-snapshot1"/>
   <name value="GoalAchievementStatusCanonicalMap"/>
   <title value="Canonical Mapping for &quot;Goal Achievement Status&quot;"/>
   <status value="draft"/>

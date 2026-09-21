@@ -36,15 +36,16 @@ All kick-offs require `Prefer: respond-async`. The default response is `202 Acce
 | `HFS_BULK_EXPORT_WORKER_CONCURRENCY` | `2` | In-process worker pool size |
 | `HFS_BULK_EXPORT_DISABLE_LOCAL_WORKER` | `false` | Disable in-pod workers for separate exporter deployments |
 | `HFS_BULK_EXPORT_MAX_CONCURRENT_PER_TENANT` | `4` | Per-tenant active job cap; kick-off returns `429` if exceeded |
+| `HFS_BULK_EXPORT_MAX_ATTEMPTS` | `3` | Claims allowed per job; a job reclaimed past this is failed as abandoned |
 | `HFS_BULK_EXPORT_BATCH_SIZE` | `1000` | Resources per `fetch_export_batch` |
 | `HFS_BULK_EXPORT_LEASE_DURATION` | `60` | Initial lease length in seconds; must exceed heartbeat interval |
-| `HFS_BULK_EXPORT_HEARTBEAT_INTERVAL` | `20` | Worker heartbeat cadence in seconds |
+| `HFS_BULK_EXPORT_HEARTBEAT_INTERVAL` | `20` | Lease-keeper renewal cadence in seconds; a background task renews the lease at this cadence while a job runs; must be below the lease duration |
 | `HFS_BULK_EXPORT_CLEANUP_INTERVAL` | `300` | Cleanup scan interval in seconds |
 | `HFS_BULK_EXPORT_SINCE_NEWLY_ADDED` | `include` | Group export `_since` toggle: include or exclude |
 
 Job-state storage reuses the same backend and connection pool that holds FHIR resources. SQLite deployments share `./data/hfs.db`. PostgreSQL deployments share `HFS_DATABASE_URL`. There is no separate job-store configuration.
 
-Bulk export is currently available on `sqlite`, `postgres`, `sqlite-elasticsearch`, and `postgres-elasticsearch`. Other backends return `501` until job-state implementations exist.
+Bulk export is currently available on `sqlite`, `postgres`, `sqlite-elasticsearch`, `postgres-elasticsearch`, `mongodb`, and `s3-elasticsearch` — the last two through a SQLite sidecar job store. The composite `mongo-elasticsearch` and standalone `s3` return `501` until job-state implementations exist there.
 
 ## Single-instance Recipe
 
@@ -85,3 +86,4 @@ The full local stack is in `docker/bulk-export/docker-compose.yml`: HFS, Postgre
 - `exclude` is reserved for a follow-up that requires group-membership-history tracking.
 - Group export flattens nested `Group/` members iteratively with a visited-set cycle guard.
 - Status poll `202`: `X-Progress` is the percentage of resource types fully written; the body is a `Parameters` with `typesTotal`, `typesDone` and `currentType` (the type in flight), like `$sql-export`.
+- Transient storage failures on any export route answer `503` with `Retry-After: 5` and an `OperationOutcome` whose issue code is `transient`, not `500`. The usual cause on SQLite is a foreground write losing the race with a background search-index rebuild: the single writer lock is held elsewhere, the connection exhausts its `busy_timeout` (default 30 s) and the driver reports `database is locked`. Kick-off is the visible case because it is the first write of a job. A `503` here means retry shortly, not that the export is broken.

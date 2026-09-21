@@ -51,6 +51,19 @@
       }
     }
   ],
+  "bodyStructure": [
+    {
+      "concept": {
+        "coding": [
+          {
+            "system": "http://snomed.info/sct",
+            "code": "39607008",
+            "display": "Lung structure"
+          }
+        ]
+      }
+    }
+  ],
   "outcome": [
     {
       "concept": {

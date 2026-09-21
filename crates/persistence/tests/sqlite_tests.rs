@@ -18,6 +18,86 @@ use helios_persistence::core::{
 use helios_persistence::error::{ResourceError, StorageError};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 
+/// The backend-agnostic conditional-criteria suite (#1312). `#[path]` resolves
+/// relative to this file, the same arrangement the other backends' binaries
+/// use for their shared suites.
+#[path = "search/conditional_criteria_suite.rs"]
+mod conditional_criteria_suite;
+
+/// #1312: criteria whose values begin with comparator letters (`family=Neal`,
+/// `identifier=ne123`) name the right resource, and never an unrelated one.
+#[tokio::test]
+async fn sqlite_conditional_criteria_with_prefix_like_values() {
+    let backend = create_backend();
+    conditional_criteria_suite::prefix_like_criteria_name_the_right_resource(
+        &backend,
+        "cond-criteria-1312",
+        true,
+    )
+    .await;
+}
+
+/// The backend-agnostic `_contained` suite (#1336, #1362, #1363). Same
+/// `#[path]` arrangement.
+#[path = "search/contained_suite.rs"]
+mod contained_suite;
+
+/// #1362: a repeated parameter under `_contained` is a conjunction on one
+/// contained resource.
+#[tokio::test]
+async fn sqlite_contained_repeated_parameters_are_anded() {
+    let backend = create_backend();
+    contained_suite::repeated_parameters_are_anded(&backend, "contained-repeated-1362").await;
+}
+
+/// #1363: `_`-parameters, composites and modifiers are applied under
+/// `_contained`, or refused by name — never dropped.
+#[tokio::test]
+async fn sqlite_contained_criteria_are_applied_or_rejected() {
+    let backend = create_backend();
+    contained_suite::criteria_are_applied_or_rejected(&backend, "contained-criteria-1363").await;
+}
+
+/// #1383: `_contained` alone is every contained resource of the type;
+/// `_total`, `search_count` and paging agree; compartment membership is
+/// applied; `_has`, `_list` and chains are refused by name.
+#[tokio::test]
+async fn sqlite_contained_unconstrained_and_out_of_band_constraints() {
+    let backend = create_backend();
+    contained_suite::unconstrained_and_out_of_band_constraints(&backend, "contained-gaps-1383")
+        .await;
+}
+
+/// The backend-agnostic conditional `If-Match` suite (#1381). Same `#[path]`
+/// arrangement.
+#[path = "search/conditional_if_match_suite.rs"]
+mod conditional_if_match_suite;
+
+/// #1381: `If-Match` is evaluated against the resource the criteria resolve
+/// to, on conditional update, delete and patch.
+#[tokio::test]
+async fn sqlite_conditional_writes_honour_if_match() {
+    let backend = create_backend();
+    conditional_if_match_suite::if_match_is_evaluated_against_the_resolved_match(
+        &backend,
+        "cond-if-match-1381",
+        true,
+    )
+    .await;
+}
+
+/// #1381: of several writers holding the same `If-Match`, one writes.
+#[tokio::test]
+async fn sqlite_conditional_writers_with_the_same_if_match_admit_one() {
+    let backend = create_backend();
+    conditional_if_match_suite::concurrent_writers_with_the_same_if_match_admit_one(
+        &backend,
+        "cond-if-match-race-1381",
+        true,
+    )
+    .await;
+}
+
 fn create_backend() -> SqliteBackend {
     // Configure with data directory to load spec SearchParameters
     // CARGO_MANIFEST_DIR for tests is crates/persistence
@@ -3040,6 +3120,7 @@ async fn test_conditional_update_with_identifier() {
             "identifier=http://hospital.org/mrn|MRN-UPDATE-1",
             false,
             FhirVersion::default(),
+            &helios_persistence::core::EntityTagPrecondition::Absent,
         )
         .await
         .unwrap();
@@ -3077,6 +3158,7 @@ async fn test_conditional_update_with_upsert() {
             "identifier=http://hospital.org/mrn|MRN-UPSERT-1",
             true, // upsert=true
             FhirVersion::default(),
+            &helios_persistence::core::EntityTagPrecondition::Absent,
         )
         .await
         .unwrap();
@@ -3109,6 +3191,7 @@ async fn test_conditional_delete_with_identifier() {
             &tenant,
             "Patient",
             "identifier=http://hospital.org/mrn|MRN-DELETE-1",
+            &helios_persistence::core::EntityTagPrecondition::Absent,
         )
         .await
         .unwrap();

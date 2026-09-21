@@ -348,6 +348,49 @@ pub enum SearchError {
         message: String,
     },
 
+    /// A date search value that is not a FHIR date, dateTime or instant.
+    ///
+    /// Raised by [`crate::search::validate_date_values`] before any backend
+    /// builds a query, so every backend answers an invalid date the same way.
+    #[error("invalid value for date parameter '{param}': {reason}")]
+    InvalidDateValue {
+        /// Name of the search parameter carrying the value.
+        param: String,
+        /// The rejected value, as received.
+        value: String,
+        /// What is wrong with it, and the forms that are accepted.
+        reason: String,
+    },
+
+    /// A number or quantity search value whose number is not a finite decimal.
+    ///
+    /// Raised by [`crate::search::validate_numeric_values`] before any backend
+    /// builds a query, so every backend answers an invalid number the same way.
+    #[error("invalid value for number or quantity parameter '{param}': {reason}")]
+    InvalidNumberValue {
+        /// Name of the search parameter carrying the value.
+        param: String,
+        /// The rejected value, as received.
+        value: String,
+        /// What is wrong with it, and the forms that are accepted.
+        reason: String,
+    },
+
+    /// A search value that is empty, or has an empty alternative in its
+    /// comma-separated list (`family=Zzz,`).
+    ///
+    /// Raised by [`crate::search::validate_value_presence`] before any backend
+    /// builds a query: the empty string is a prefix of every string, so such a
+    /// value used to match everything (#1380).
+    #[error(
+        "invalid value for parameter '{param}': {}",
+        crate::search::EMPTY_VALUE_REASON
+    )]
+    EmptyValue {
+        /// The search parameter carrying the value, as nearly as written.
+        param: String,
+    },
+
     /// Composite search parameter error.
     #[error("invalid composite search parameter: {message}")]
     InvalidComposite {
@@ -358,6 +401,22 @@ pub enum SearchError {
     /// Text search not available.
     #[error("full-text search not available")]
     TextSearchNotAvailable,
+
+    /// The modifier needs a terminology server (value-set membership, or code
+    /// subsumption on a token) and none is configured. Raised for a direct
+    /// parameter and for the terminal parameter of a chained / `_has` search
+    /// alike, so both forms report it identically.
+    #[error(
+        "search modifier ':{modifier}' on token parameter '{param}' requires a \
+         configured terminology server (set HFS_TERMINOLOGY_SERVER)"
+    )]
+    TerminologyRequired {
+        /// Modifier name (e.g., `in`, `below`).
+        modifier: String,
+        /// The parameter as the client wrote it (`code`, `subject.gender`,
+        /// `_has:Observation:subject:code`).
+        param: String,
+    },
 }
 
 /// Errors related to transactions.
@@ -703,6 +762,19 @@ pub enum BulkSubmitError {
         manifest_url: String,
         /// Human-readable reason for the failure.
         reason: String,
+    },
+
+    /// A submitted file's body could not be read to the end (#1127) — a broken
+    /// connection, a timeout, or a resume that could not be completed. The
+    /// message is the reader's own, so the cause reaches the manifest's error
+    /// artifact unprefixed; the reader's error is kept as `source`.
+    #[error("{message}")]
+    InputStream {
+        /// The reader's own failure message, reproduced verbatim.
+        message: String,
+        /// The underlying reader error, when one is available.
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
     },
 
     /// Rollback failed.
@@ -1099,6 +1171,39 @@ mod tests {
             message: "invalid JSON".to_string(),
         };
         assert!(err.to_string().contains("line 42"));
+    }
+
+    /// A file body that breaks mid-stream must reach the manifest's error
+    /// artifact as the reader wrote it — no `internal error in sqlite: ` and
+    /// no `parse error at line N: ` in front of it (#1127) — and the io error
+    /// must stay reachable through the standard `source()` chain.
+    #[test]
+    fn test_bulk_submit_input_stream_display_is_unprefixed() {
+        let reader_message = "reading file http://host/patients.ndjson?[redacted]: \
+                              connection reset by peer (gave up after 512 bytes and 3 retries)";
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, reader_message);
+
+        let storage_err: StorageError = BulkSubmitError::InputStream {
+            message: io_err.to_string(),
+            source: Some(Box::new(io_err)),
+        }
+        .into();
+
+        // `StorageError::BulkSubmit` is `#[error(transparent)]` and the
+        // variant's Display is just `{message}`, so the two hops add nothing.
+        assert_eq!(storage_err.to_string(), reader_message);
+
+        // The io error is still walkable: StorageError → BulkSubmitError → io.
+        let mut source = std::error::Error::source(&storage_err);
+        let mut found_io = false;
+        while let Some(err) = source {
+            if err.downcast_ref::<std::io::Error>().is_some() {
+                found_io = true;
+                break;
+            }
+            source = err.source();
+        }
+        assert!(found_io, "the io error should be reachable via source()");
     }
 
     // ── Driver-error classification (issue #353) ────────────────────────────

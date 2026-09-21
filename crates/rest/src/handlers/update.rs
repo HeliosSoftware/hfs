@@ -324,13 +324,25 @@ where
 /// # HTTP Request
 ///
 /// `PUT [base]/[type]?[search-params]`
+///
+/// # `If-Match`
+///
+/// Honoured (#1381): once the criteria resolve to exactly one resource, the
+/// update proceeds only if a supplied entity-tag matches that resource's
+/// current version, and answers `412 Precondition Failed` otherwise — a
+/// malformed value included. With **no match** the request would fall through
+/// to a create; a precondition naming a version cannot hold for a resource that
+/// does not exist (RFC 9110 §13.1.1), so that is `412` too and nothing is
+/// created, exactly as `PUT [type]/[id]` with `If-Match` refuses to create.
+/// `If-None-Match` and `If-Modified-Since` are not consulted.
 #[allow(clippy::too_many_arguments)]
 pub async fn conditional_update_handler<S>(
     State(state): State<AppState<S>>,
     Path(resource_type): Path<String>,
     tenant: TenantExtractor,
     version: FhirVersionExtractor,
-    query: axum::extract::Query<std::collections::HashMap<String, String>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+    conditional: ConditionalHeaders,
     prefer: PreferHeader,
     req_headers: HeaderMap,
     FhirResource(resource): FhirResource,
@@ -338,6 +350,8 @@ pub async fn conditional_update_handler<S>(
 where
     S: ResourceStorage + ConditionalStorage + Send + Sync,
 {
+    super::conditional_support::require_update(state.storage())?;
+
     // Determine FHIR version from header or use server default
     let fhir_version = version.storage_version_or(state.config().default_fhir_version);
 
@@ -353,12 +367,13 @@ where
     // Negotiate response format from Accept header
     let negotiated = negotiate_format(&req_headers, None);
 
-    // Build search params string
-    let search_params: String = query
-        .iter()
-        .map(|(k, v)| format!("{}={}", k, v))
-        .collect::<Vec<_>>()
-        .join("&");
+    // The raw query, handed over as written. A `HashMap` of it keeps only the
+    // last occurrence of a repeated parameter, which FHIR ANDs
+    // (`date=ge…&date=le…`), so the write matched more than it named (#1321);
+    // and re-joining decoded pairs turns a decoded `&` or `=` inside a value
+    // into a pair boundary (#1322). The shared criteria builder splits, then
+    // decodes, once.
+    let search_params = raw_query.unwrap_or_default();
 
     debug!(
         resource_type = %resource_type,
@@ -377,6 +392,11 @@ where
     // #1014: an unknown ViewDefinition.resource is rejected on every write.
     super::sof::reject_unknown_view_definition_resource(&resource_type, &resource)?;
 
+    // `If-Match` is honoured, not ignored (#1381). It is evaluated by the
+    // backend, against the one resource the criteria resolve to and ahead of
+    // the compare-and-swap that writes it — this handler never holds that row.
+    let if_match = conditional_if_match(&conditional)?;
+
     let result = state
         .storage()
         .conditional_update(
@@ -386,8 +406,10 @@ where
             &search_params,
             true, // upsert
             fhir_version,
+            if_match,
         )
-        .await?;
+        .await
+        .map_err(|e| conditional_write_error(e, &resource_type))?;
 
     use helios_persistence::core::ConditionalUpdateResult;
     match result {
@@ -471,6 +493,50 @@ where
             operation: "update".to_string(),
             count,
         }),
+    }
+}
+
+/// The `If-Match` precondition of a conditional interaction (`PUT`, `PATCH`,
+/// `DELETE [type]?[criteria]`), parsed before storage is touched.
+///
+/// A malformed value is a *failed* precondition — `412`, as on the instance
+/// endpoints — never an absent one: degrading it would turn a guarded write
+/// into an unconditional one.
+pub(super) fn conditional_if_match(
+    conditional: &ConditionalHeaders,
+) -> RestResult<&helios_persistence::core::EntityTagPrecondition> {
+    conditional
+        .if_match_tags()
+        .map_err(|e| RestError::PreconditionFailed {
+            message: format!("Malformed If-Match header: {e}"),
+        })
+}
+
+/// Renders a conditional write's storage error, wording the failed `If-Match`
+/// for a resource the client named by criteria rather than by id.
+///
+/// The generic mapping says "Resource [type]/[id] was modified", which is
+/// wrong when nothing matched (there is no id) and discloses the resolved id
+/// and nothing else useful when something did. The current version is left out
+/// for the reason `delete_handler` gives: a delete-only principal reaches this.
+pub(super) fn conditional_write_error(err: StorageError, resource_type: &str) -> RestError {
+    use helios_persistence::error::ConcurrencyError;
+    match err {
+        StorageError::Concurrency(ConcurrencyError::OptimisticLockFailure { id, .. }) => {
+            let message = if id.is_empty() {
+                format!(
+                    "If-Match precondition failed: the criteria matched no {resource_type}, so \
+                     there is no current version to match. Nothing was written"
+                )
+            } else {
+                format!(
+                    "If-Match precondition failed: no supplied entity-tag matches the current \
+                     version of the {resource_type} the criteria selected. Nothing was written"
+                )
+            };
+            RestError::PreconditionFailed { message }
+        }
+        other => other.into(),
     }
 }
 

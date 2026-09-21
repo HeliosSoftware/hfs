@@ -1744,6 +1744,10 @@ pub fn mount_with_conformance_source_and_runtime(
             get(bulk_import::empty_manifest),
         )
         .route("/ui/bulk-import/keys", get(bulk_import::keys))
+        .route(
+            "/ui/bulk-import/rebuild",
+            get(bulk_import::rebuild_fragment),
+        )
         .route("/ui/bulk-import/{id}", get(bulk_import::detail))
         .route(
             "/ui/bulk-import/{id}/status",
@@ -2058,6 +2062,7 @@ async fn index(
     HxTarget(hx_target): HxTarget,
     HxHistoryRestoreRequest(history_restore): HxHistoryRestoreRequest,
     RawQuery(query): RawQuery,
+    settings: rail_state::RequestSettings,
 ) -> Response {
     if is_htmx
         && let Some(sent) = query.as_deref().and_then(|q| {
@@ -2081,6 +2086,19 @@ async fn index(
         Some("dash-chart") => DashRegion::Chart,
         _ => DashRegion::Page,
     };
+    // Does this request carry an explicit chart selection, or is it a bare
+    // navigation to Home? Any of `types`/`type`/`window`/`all` being present
+    // marks an explicit selection (a picker click's `dash_href` always carries
+    // `types` and `window`). When none are present — the sidebar/brand `/ui`
+    // links, or a session's first visit — restore the last stored selection
+    // instead of the provider default (#1358). An explicit selection is
+    // persisted below; a restore is not, so returning to Home is idempotent.
+    let has_selection_param = query_value(query.as_deref(), "types").is_some()
+        || query_value(query.as_deref(), "type").is_some()
+        || query_value(query.as_deref(), "window").is_some()
+        || query_value(query.as_deref(), "all").is_some();
+    let stored = (!has_selection_param).then(|| settings.dashboard(&rt.id));
+
     let types: Vec<String> = query_value(query.as_deref(), "types")
         .or_else(|| query_value(query.as_deref(), "type"))
         .map(|csv| {
@@ -2090,10 +2108,19 @@ async fn index(
                 .map(str::to_string)
                 .collect()
         })
+        .or_else(|| stored.as_ref().map(|s| s.types.clone()))
         .unwrap_or_default();
     let window = query_value(query.as_deref(), "window")
         .and_then(|slug| DashboardWindow::from_slug(&slug))
+        .or_else(|| {
+            stored
+                .as_ref()
+                .and_then(|s| s.window.as_deref())
+                .and_then(DashboardWindow::from_slug)
+        })
         .unwrap_or_default();
+    // "View all resources" is not restored from storage (see DashboardSelection):
+    // it is a transient exploration mode, off unless this request asks for it.
     let all_types = query_value(query.as_deref(), "all").as_deref() == Some("1");
     // The full type list is only fetched when offered â€” the common,
     // flag-off case pays nothing extra for it.
@@ -2132,6 +2159,20 @@ async fn index(
     // is not a plausible digest is ignored rather than compared.
     let sent_state = query_value(query.as_deref(), "state")
         .filter(|s| !s.is_empty() && s.len() <= 32 && s.chars().all(|c| c.is_ascii_hexdigit()));
+    // Persist an explicit selection so it survives navigation back to Home
+    // (#1358). Only for an explicit pick — the chart-card picker request and a
+    // no-JS full-page selection — never the `dash-live` polling refresh (which
+    // would write on every tick) nor a bare `/ui` visit (`has_selection_param`
+    // is false there, so the restore path ran instead). Best-effort, so it
+    // never delays or fails the render.
+    if has_selection_param && !matches!(region, DashRegion::Live) {
+        let selection = rail_state::DashboardSelection {
+            types: types.clone(),
+            window: Some(window.as_str().to_string()),
+        };
+        rail_state::persist_dashboard(&state.settings, &settings.user_key, &rt.id, &selection)
+            .await;
+    }
     // The selection's own link, pushed by a picker request.
     let canonical_href = dash_href(&types, window, all_types, focus.as_deref());
     let mut page = build_index_page(
@@ -2790,10 +2831,14 @@ async fn query_params_catalog(
     })
 }
 
-/// Default result-table columns for a resource type (#958): its summary
-/// elements minus resource infrastructure, capped so the table stays
-/// scannable. Replaces the six-type hardcoded map in the browser — every
-/// type the spec defines summary elements for now gets real columns.
+/// Default result-table columns for a resource type (#958): every summary
+/// element minus resource infrastructure. Replaces the six-type hardcoded map
+/// in the browser — every type the spec defines summary elements for now
+/// gets real columns.
+///
+/// The list is the type's full summary set; the browser derives the table's
+/// actual columns from the resources a page returns and only falls back to
+/// this hint when the page is empty (#1105).
 ///
 /// The names are JSON element names straight from
 /// [`helios_fhir::summary_elements`] — the browser uses each one as both the
@@ -2816,7 +2861,6 @@ fn default_result_columns(version: helios_fhir::FhirVersion, resource_type: &str
     helios_fhir::summary_elements(version, resource_type)
         .into_iter()
         .filter(|f| !INFRASTRUCTURE.contains(&f.as_str()))
-        .take(5)
         .collect()
 }
 
@@ -8915,6 +8959,34 @@ pub(crate) fn render_not_found(
     (StatusCode::NOT_FOUND, render(page)).into_response()
 }
 
+/// Renders a failed self-call to HFS with its cause. `reqwest::Error`'s
+/// `Display` stops at the URL — `error sending request for url (...)` — and
+/// hides the reason in `source()`, which made a timeout, a refused
+/// connection, and a reset read byte-identically (#957).
+///
+/// A timeout is the one cause worth naming outright, because it is the only
+/// one the user can act on by waiting: `timeout_secs` is the cap this
+/// particular call gave the server, and `timeout_hint` says why that call can
+/// legitimately run long. Every other cause is the `Display` text with its
+/// `source()` chain appended, colon-separated (#1185).
+pub(crate) fn upstream_failure_detail(
+    e: &reqwest::Error,
+    timeout_secs: u64,
+    timeout_hint: &str,
+) -> String {
+    if e.is_timeout() {
+        return format!("timed out after {timeout_secs}s — {timeout_hint}");
+    }
+    let mut detail = e.to_string();
+    let mut src = std::error::Error::source(e);
+    while let Some(cause) = src {
+        detail.push_str(": ");
+        detail.push_str(&cause.to_string());
+        src = cause.source();
+    }
+    detail
+}
+
 fn unix_timestamp_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -9455,11 +9527,33 @@ mod tests {
     fn default_result_columns_use_json_element_names() {
         assert_eq!(
             default_result_columns(helios_fhir::FhirVersion::R4, "Claim"),
-            ["status", "type", "use", "patient", "billablePeriod"]
+            [
+                "status",
+                "type",
+                "use",
+                "patient",
+                "billablePeriod",
+                "created",
+                "insurer",
+                "provider",
+                "priority",
+                "insurance"
+            ]
         );
         assert_eq!(
             default_result_columns(helios_fhir::FhirVersion::R4, "Patient"),
-            ["identifier", "active", "name", "telecom", "gender"]
+            [
+                "identifier",
+                "active",
+                "name",
+                "telecom",
+                "gender",
+                "birthDate",
+                "deceased",
+                "address",
+                "managingOrganization",
+                "link"
+            ]
         );
         assert!(default_result_columns(helios_fhir::FhirVersion::R4, "Nope").is_empty());
     }

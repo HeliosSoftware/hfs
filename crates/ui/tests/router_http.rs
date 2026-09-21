@@ -1218,7 +1218,7 @@ async fn queries_param_catalog_column_hint_uses_json_element_names() {
     let html = body_text(response).await;
     assert!(
         html.contains(
-            r#"<datalist id="param-options" data-columns="status,type,use,patient,billablePeriod">"#
+            r#"<datalist id="param-options" data-columns="status,type,use,patient,billablePeriod,created,insurer,provider,priority,insurance">"#
         ),
         "{html}"
     );

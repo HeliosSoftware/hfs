@@ -3330,7 +3330,7 @@ mod tests {
 
         let worker = WorkerId::new("worker-1");
         let lease = backend
-            .claim_next(&worker, std::time::Duration::from_secs(60))
+            .claim_next(&worker, std::time::Duration::from_secs(60), 3)
             .await
             .expect("claim_next succeeds")
             .expect("a job should be claimable");

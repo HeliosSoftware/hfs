@@ -138,7 +138,7 @@ impl BulkSubmitProvider for S3Backend {
         &self,
         tenant: &TenantContext,
         id: &SubmissionId,
-    ) -> StorageResult<SubmissionSummary> {
+    ) -> StorageResult<()> {
         let location = self.tenant_location(tenant)?;
         let mut state = self.load_submission_state(&location, id).await?;
 
@@ -156,7 +156,7 @@ impl BulkSubmitProvider for S3Backend {
         self.save_submission_state(&location, id, &state).await?;
         self.touch_submit_registry(tenant, id, state.summary.status)
             .await?;
-        Ok(state.summary)
+        Ok(())
     }
 
     async fn abort_submission(
@@ -328,19 +328,12 @@ impl BulkSubmitProvider for S3Backend {
             }
         }
 
-        let mut manifest_state = self
-            .load_manifest_state_optional(&location, submission_id, manifest_id)
-            .await?
-            .ok_or_else(|| {
-                StorageError::BulkSubmit(BulkSubmitError::ManifestNotFound {
-                    submission_id: submission_id.submission_id.clone(),
-                    manifest_id: manifest_id.to_string(),
-                })
-            })?;
-
-        manifest_state.manifest.status = ManifestStatus::Processing;
-        self.save_manifest_state(&location, submission_id, &manifest_state)
-            .await?;
+        // Both manifest writes in this function go through compare-and-swap
+        // and touch only what a batch owns — never the lease fields (#1229).
+        self.mutate_manifest_state(&location, submission_id, manifest_id, |state| {
+            state.manifest.status = ManifestStatus::Processing;
+        })
+        .await?;
 
         let mut results = Vec::new();
         let mut error_count = 0u32;
@@ -351,62 +344,118 @@ impl BulkSubmitProvider for S3Backend {
         // exhausted, max errors reached, or a storage error part-way — the
         // entries it already wrote are reported before that outcome
         // propagates (#1078).
-        let walked: StorageResult<()> = async {
-            for entry in entries {
-                if options.max_errors > 0 && error_count >= options.max_errors {
-                    if !options.continue_on_error {
-                        return Err(StorageError::BulkSubmit(
-                            BulkSubmitError::MaxErrorsExceeded {
-                                submission_id: submission_id.submission_id.clone(),
-                                max_errors: options.max_errors,
-                            },
-                        ));
+        //
+        // With no per-entry error cap (the default, and the bulk fast-load
+        // path) there is no early-stop, so the entries are independent and run
+        // with bounded concurrency to overlap their PUT latencies (#945).
+        // `buffered` keeps receipts in input order. A hard store failure on any
+        // entry is captured and propagated after the successful receipts are
+        // reported, matching the serial block's #1078 contract. A cap keeps the
+        // serial early-stop semantics.
+        let concurrency = Self::s3_ingest_concurrency();
+        let walked: StorageResult<()> = if options.max_errors == 0 && concurrency > 1 {
+            use futures::stream::{self, StreamExt};
+            let outcomes: Vec<StorageResult<BulkEntryResult>> = stream::iter(entries)
+                .map(|entry| {
+                    self.process_one_entry(
+                        &location,
+                        tenant,
+                        submission_id,
+                        manifest_id,
+                        file_url,
+                        entry,
+                        options,
+                    )
+                })
+                .buffered(concurrency)
+                .collect()
+                .await;
+            // `error_count` is only the serial path's early-stop counter; with
+            // no cap the final tallies come from `results` below, so it is not
+            // touched here.
+            let mut first_err = None;
+            for outcome in outcomes {
+                match outcome {
+                    Ok(result) => results.push(result),
+                    Err(err) => {
+                        if first_err.is_none() {
+                            first_err = Some(err);
+                        }
+                    }
+                }
+            }
+            match first_err {
+                Some(err) => Err(err),
+                None => Ok(()),
+            }
+        } else {
+            async {
+                for entry in entries {
+                    if options.max_errors > 0 && error_count >= options.max_errors {
+                        if !options.continue_on_error {
+                            return Err(StorageError::BulkSubmit(
+                                BulkSubmitError::MaxErrorsExceeded {
+                                    submission_id: submission_id.submission_id.clone(),
+                                    max_errors: options.max_errors,
+                                },
+                            ));
+                        }
+
+                        let skipped = BulkEntryResult::skipped(
+                            entry.line_number,
+                            &entry.resource_type,
+                            "max errors exceeded",
+                        );
+                        self.persist_entry_result(
+                            &location,
+                            submission_id,
+                            manifest_id,
+                            file_url,
+                            &skipped,
+                        )
+                        .await?;
+                        results.push(skipped);
+                        continue;
                     }
 
-                    let skipped = BulkEntryResult::skipped(
-                        entry.line_number,
-                        &entry.resource_type,
-                        "max errors exceeded",
-                    );
+                    self.persist_raw_entry(&location, submission_id, manifest_id, file_url, &entry)
+                        .await?;
+
+                    let result = match self
+                        .process_single_entry(tenant, submission_id, manifest_id, &entry, options)
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(err) => BulkEntryResult::processing_error(
+                            entry.line_number,
+                            &entry.resource_type,
+                            Self::bulk_submit_operation_outcome(&err),
+                        ),
+                    };
+
+                    if result.is_error() {
+                        error_count += 1;
+                    }
+
                     self.persist_entry_result(
                         &location,
                         submission_id,
                         manifest_id,
                         file_url,
-                        &skipped,
+                        &result,
                     )
                     .await?;
-                    results.push(skipped);
-                    continue;
+                    results.push(result);
                 }
-
-                self.persist_raw_entry(&location, submission_id, manifest_id, file_url, &entry)
-                    .await?;
-
-                let result = match self
-                    .process_single_entry(tenant, submission_id, manifest_id, &entry, options)
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(err) => BulkEntryResult::processing_error(
-                        entry.line_number,
-                        &entry.resource_type,
-                        Self::bulk_submit_operation_outcome(&err),
-                    ),
-                };
-
-                if result.is_error() {
-                    error_count += 1;
-                }
-
-                self.persist_entry_result(&location, submission_id, manifest_id, file_url, &result)
-                    .await?;
-                results.push(result);
+                Ok(())
             }
-            Ok(())
-        }
-        .await;
-        options.notify_batch_committed(tenant, submission_id, manifest_id, &results);
+            .await
+        };
+        // Entries are written one by one and not kept, so observers that need
+        // the resources re-read the ids from the primary (#1127).
+        options
+            .notify_batch_committed(tenant, submission_id, manifest_id, &results, &[])
+            .await;
         walked?;
 
         let success_count = results.iter().filter(|r| r.is_success()).count() as u64;
@@ -421,24 +470,40 @@ impl BulkSubmitProvider for S3Backend {
         // semantics (#969). `processed_entries` means resources written to the
         // store, so skips are excluded and surface through their receipts
         // (#954); `last_processed_line` is a line cursor and counts them.
-        manifest_state.manifest.total_entries += results.len() as u64;
-        manifest_state.manifest.processed_entries += success_count;
-        manifest_state.manifest.failed_entries += failed_count;
-        manifest_state.last_processed_line += results.len() as u64;
-        // A leased manifest's terminal status belongs to the worker, which calls
-        // this once per manifest output file and only then decides. Settling it
-        // here would take the manifest out of `processing` mid-run, so a worker
-        // that died on the next file would never be reclaimed.
-        if manifest_state.worker_id.is_none() {
-            manifest_state.manifest.status = if failed_count > 0 {
-                ManifestStatus::Failed
-            } else {
-                ManifestStatus::Completed
-            };
-        }
-
-        self.save_manifest_state(&location, submission_id, &manifest_state)
-            .await?;
+        //
+        // Applied as deltas onto the state as it is stored *now*, not onto a
+        // copy read before the batch. The lease keeper renews `lease_expiry`
+        // on this same object while batches run, and writing the pre-batch
+        // copy back undid it: the batch in flight when a renewal landed wrote
+        // the pre-renewal expiry back a moment later, the next batch read
+        // that, and so the stored expiry never moved past the one the claim
+        // had set. During a long file — batches back to back, no gap for a
+        // renewal to survive in — the other worker therefore reclaimed the
+        // manifest exactly one lease duration after every claim, from a holder
+        // that was alive and heartbeating (#1229: 96 reclaims in 90 minutes,
+        // each one abandoning the download in progress). The same write also
+        // put a fenced-out holder's `worker_id` and `fencing_token` back over
+        // the new holder's.
+        let walked_entries = results.len() as u64;
+        self.mutate_manifest_state(&location, submission_id, manifest_id, |state| {
+            state.manifest.total_entries += walked_entries;
+            state.manifest.processed_entries += success_count;
+            state.manifest.failed_entries += failed_count;
+            state.last_processed_line += walked_entries;
+            // A leased manifest's terminal status belongs to the worker, which
+            // calls this once per manifest output file and only then decides.
+            // Settling it here would take the manifest out of `processing`
+            // mid-run, so a worker that died on the next file would never be
+            // reclaimed.
+            if state.worker_id.is_none() {
+                state.manifest.status = if failed_count > 0 {
+                    ManifestStatus::Failed
+                } else {
+                    ManifestStatus::Completed
+                };
+            }
+        })
+        .await?;
 
         submission.summary.total_entries += results.len() as u64;
         submission.summary.success_count += success_count;
@@ -570,9 +635,12 @@ impl StreamingBulkSubmitProvider for S3Backend {
         loop {
             let mut line = String::new();
             let bytes_read = reader.read_line(&mut line).await.map_err(|e| {
-                StorageError::BulkSubmit(BulkSubmitError::ParseError {
-                    line: line_number,
-                    message: format!("failed to read line: {e}"),
+                // #1127: surface the reader's own message (e.g. the fetcher's
+                // give-up text) unprefixed so it reaches the manifest's error
+                // artifact intact.
+                StorageError::BulkSubmit(BulkSubmitError::InputStream {
+                    message: e.to_string(),
+                    source: Some(Box::new(e)),
                 })
             })?;
 
@@ -749,6 +817,53 @@ impl BulkSubmitRollbackProvider for S3Backend {
 }
 
 impl S3Backend {
+    /// Processes one ingest entry end to end — writes its raw line, runs it,
+    /// and writes its receipt — returning the receipt. This is the unit the
+    /// batch runs, serially or concurrently. A per-entry *processing* failure
+    /// becomes a `processing-error` receipt (not an error); only a hard store
+    /// failure writing the raw line or the receipt propagates.
+    #[allow(clippy::too_many_arguments)]
+    async fn process_one_entry(
+        &self,
+        location: &TenantLocation,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        file_url: Option<&str>,
+        entry: NdjsonEntry,
+        options: &BulkProcessingOptions,
+    ) -> StorageResult<BulkEntryResult> {
+        self.persist_raw_entry(location, submission_id, manifest_id, file_url, &entry)
+            .await?;
+        let result = match self
+            .process_single_entry(tenant, submission_id, manifest_id, &entry, options)
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => BulkEntryResult::processing_error(
+                entry.line_number,
+                &entry.resource_type,
+                Self::bulk_submit_operation_outcome(&err),
+            ),
+        };
+        self.persist_entry_result(location, submission_id, manifest_id, file_url, &result)
+            .await?;
+        Ok(result)
+    }
+
+    /// How many ingest entries run at once on S3 when no per-entry error cap is
+    /// set. Each entry is several sequential PUTs and the bottleneck is PUT
+    /// round-trip latency, not CPU, so overlapping entries multiplies write
+    /// throughput (#945). Tunable with `HFS_BULK_SUBMIT_S3_INGEST_CONCURRENCY`
+    /// (default 8, min 1) — raise it against higher-latency (real AWS) S3.
+    fn s3_ingest_concurrency() -> usize {
+        std::env::var("HFS_BULK_SUBMIT_S3_INGEST_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(8)
+    }
+
     /// Processes a single NDJSON entry: validates it, upserts the resource,
     /// and records a change log entry for rollback.
     ///
@@ -1120,6 +1235,52 @@ impl S3Backend {
             .get_json_object::<SubmissionManifestState>(&location.bucket, &key)
             .await?
             .map(|(state, _)| state))
+    }
+
+    /// Applies `mutate` to a manifest state under compare-and-swap, re-reading
+    /// and re-applying it when another writer got in between.
+    ///
+    /// A manifest state carries its lease (`worker_id`, `lease_expiry`,
+    /// `fencing_token`) alongside its counters, and the lease keeper and the
+    /// claim path compare-and-swap that same object. A writer that is not
+    /// holding the lease handle — `process_entries` — must therefore never
+    /// write back a copy it read earlier: it goes through here, and `mutate`
+    /// states its change relative to whatever is stored (#1229).
+    async fn mutate_manifest_state<F>(
+        &self,
+        location: &TenantLocation,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        mutate: F,
+    ) -> StorageResult<()>
+    where
+        F: Fn(&mut SubmissionManifestState),
+    {
+        for _ in 0..super::submit_worker::CAS_ATTEMPTS {
+            let Some((mut state, etag)) = self
+                .load_manifest_for_cas(location, submission_id, manifest_id)
+                .await?
+            else {
+                return Err(StorageError::BulkSubmit(
+                    BulkSubmitError::ManifestNotFound {
+                        submission_id: submission_id.submission_id.clone(),
+                        manifest_id: manifest_id.to_string(),
+                    },
+                ));
+            };
+            mutate(&mut state);
+            if self
+                .save_manifest_if_unchanged(location, submission_id, &state, etag.as_deref())
+                .await?
+            {
+                return Ok(());
+            }
+        }
+        Err(super::submit_worker::internal_error(format!(
+            "manifest {manifest_id} of submission {submission_id} could not be updated after \
+             {} compare-and-swap attempts",
+            super::submit_worker::CAS_ATTEMPTS
+        )))
     }
 
     /// Serialises and writes a manifest state to S3.

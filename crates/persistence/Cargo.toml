@@ -39,12 +39,12 @@ R6 = ["helios-fhir/R6", "helios-fhirpath/R6", "helios-sof/R6", "helios-audit/R6"
 
 [dependencies]
 # Core dependencies (always included)
-helios-fhir = { path = "../fhir", version = "0.2.1", default-features = false }
-helios-fhirpath = { path = "../fhirpath", version = "0.2.1", default-features = false }
-helios-fhirpath-support = { path = "../fhirpath-support", version = "0.2.1" }
+helios-fhir = { path = "../fhir", version = "0.2.3", default-features = false }
+helios-fhirpath = { path = "../fhirpath", version = "0.2.3", default-features = false }
+helios-fhirpath-support = { path = "../fhirpath-support", version = "0.2.3" }
 # Shared SoF v2 spec parsing (ConstantValue, run-params extractor). Kept
 # default-features = false so persistence can pick its own FHIR-version set.
-helios-sof = { path = "../sof", version = "0.2.1", default-features = false }
+helios-sof = { path = "../sof", version = "0.2.3", default-features = false }
 rust_decimal = "1"
 serde.workspace = true
 serde_json.workspace = true
@@ -70,6 +70,9 @@ rayon = "1.8"
 # Bulk-submit result receipts spool to a per-run temp directory (#982) instead
 # of accumulating in memory. Uses the platform temp dir, so `TMPDIR` isolates it.
 tempfile = "3"
+# Decodes conditional-interaction criteria (`If-None-Exist`, `ifNoneExist`,
+# conditional URLs) with the parser helios-rest uses for a search query (#1322).
+form_urlencoded = "1"
 
 # SQLite backend
 rusqlite = { version = "0.33", features = ["bundled", "serde_json", "functions"], optional = true }
@@ -112,7 +115,7 @@ sha2 = { version = "0.10" }
 # `helios-rest` — which does not enable the feature — could not call the shared
 # emit helpers at all, so it grew a hand-rolled duplicate that silently drifted.
 # helios-audit only depends on helios-fhir, so this introduces no cycle.
-helios-audit = { path = "../audit", version = "0.2.1", default-features = false }
+helios-audit = { path = "../audit", version = "0.2.3", default-features = false }
 
 # Configuration advisor HTTP server
 axum = { version = "0.8", optional = true }
@@ -139,6 +142,9 @@ paste = "1.0"
 # `#[ctor::dtor]` exit hook that removes testcontainers held in `static`s
 # (tests/common/container_cleanup.rs).
 ctor = "0.2"
+# Asserts that lease loss, heartbeat timeouts, and broken input streams are
+# logged at `warn` (#1127).
+tracing-test = "0.2"
 # In-process HTTP stub for Elasticsearch `_bulk` failure paths (413, 429,
 # timeouts) that a real cluster cannot be made to produce on demand (#1125).
 wiremock = "0.6"

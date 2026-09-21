@@ -1,9 +1,14 @@
 //! ResourceStorage and VersionedStorage implementations for PostgreSQL.
 
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use deadpool_postgres::GenericClient;
 use helios_fhir::FhirVersion;
 use serde_json::Value;
+use tokio::sync::Semaphore;
 
 use crate::core::history::{
     DifferentialHistoryProvider, HistoryEntry, HistoryMethod, HistoryPage, HistoryParams,
@@ -24,8 +29,8 @@ use crate::error::{
 use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
 use crate::tenant::{Operation, TenantContext};
 use crate::types::Pagination;
+use crate::types::SearchQuery;
 use crate::types::{CursorValue, Page, PageCursor, PageInfo, StoredResource};
-use crate::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
 
 use super::PostgresBackend;
 use super::cached::{execute_cached, query_opt_cached};
@@ -106,6 +111,77 @@ ON CONFLICT (tenant_id, resource_type, resource_id) DO UPDATE \
 SET narrative_tsvector = EXCLUDED.narrative_tsvector, content_tsvector = EXCLUDED.content_tsvector \
 WHERE resource_fts.content_tsvector IS DISTINCT FROM EXCLUDED.content_tsvector \
    OR resource_fts.narrative_tsvector IS DISTINCT FROM EXCLUDED.narrative_tsvector";
+
+/// The page writer's version of [`FTS_UPSERT_SQL`]: the same row for up to
+/// [`FTS_BATCH_SIZE`] resources per statement.
+///
+/// Same target table, same five columns, same conflict target, same
+/// `IS DISTINCT FROM` guard, same two `to_tsvector('english', …)` calls — the
+/// only difference is where the rows come from. Instead of five scalars, four
+/// parallel `text[]` arrays are expanded by `unnest`, which walks them in
+/// lockstep; the caller pushes one element into each array per resource, so
+/// they are equal length by construction. `tenant_id` stays a scalar (`$1`),
+/// which is the only shape a page can have: `$reindex` pages one tenant at a
+/// time. Both of those are what let the statement be fixed text — a single
+/// prepared statement per connection under `execute_cached`, rather than one
+/// prepare per resource.
+///
+/// # Duplicates are not coalesced
+///
+/// Postgres refuses an `ON CONFLICT DO UPDATE` that proposes the same key
+/// twice in one statement: `ON CONFLICT DO UPDATE command cannot affect row a
+/// second time`. That is left to happen rather than pre-empted with a `WHERE`.
+/// The page comes from `fetch_resources_page`, which reads `resources` by
+/// primary key, so a resource id cannot legitimately appear twice, and a
+/// statement that quietly dropped one copy of a duplicated id would hide the
+/// caller defect that produced it. A duplicate aborts the page, and the
+/// per-resource fallback (`write_reindex_page_individually` →
+/// `index_fts_content`) writes the page one row at a time instead.
+///
+/// # No truncating retry here
+///
+/// `index_fts_content` retries an oversized input against
+/// `FTS_MAX_INPUT_BYTES`, which assumes the session is still usable: true for
+/// an ordinary write, which runs without an explicit transaction. This
+/// statement runs inside the page's managed transaction, where a
+/// `program_limit_exceeded` has aborted it back to the `reindex_fts_phase`
+/// savepoint, and a grouped statement cannot say which row was too large. So
+/// nothing here truncates or retries — the page writer rolls back to that
+/// savepoint, keeping the `search_index` work already done, and replays the
+/// FTS phase one resource at a time under per-resource savepoints, truncating
+/// only the oversized ones (see
+/// `postgres_integration_reindex_page_recovers_oversized_fts_without_replaying_search_parameters`).
+const FTS_BATCH_UPSERT_SQL: &str = "\
+INSERT INTO resource_fts (tenant_id, resource_type, resource_id, narrative_tsvector, content_tsvector) \
+SELECT $1::text, batch.resource_type, batch.resource_id, \
+to_tsvector('english', batch.narrative), to_tsvector('english', batch.full_content) \
+FROM unnest($2::text[], $3::text[], $4::text[], $5::text[]) \
+AS batch(resource_type, resource_id, narrative, full_content) \
+ON CONFLICT (tenant_id, resource_type, resource_id) DO UPDATE \
+SET narrative_tsvector = EXCLUDED.narrative_tsvector, content_tsvector = EXCLUDED.content_tsvector \
+WHERE resource_fts.content_tsvector IS DISTINCT FROM EXCLUDED.content_tsvector \
+   OR resource_fts.narrative_tsvector IS DISTINCT FROM EXCLUDED.narrative_tsvector";
+
+/// Resources per statement in [`FTS_BATCH_UPSERT_SQL`].
+///
+/// A cap on one statement's bind payload and workset — not a page size, and
+/// not a byte ceiling. The page is whatever the caller asked for, and this
+/// splits it: an operator's `POST $reindex` defaults to `batchSize` 100, so
+/// that page is one statement, while the automatic deferred rebuild after a
+/// bulk import defaults to `HFS_REINDEX_BATCH_SIZE`, whose 1,000 makes it ten
+/// statements over this same code. Nothing here bounds the bytes a group
+/// carries — the four `text[]` parameters are as large as the resources in
+/// them — and a group whose input is too large for one `to_tsvector` fails the
+/// FTS phase, which is replayed per resource and truncated there (see
+/// [`FTS_BATCH_UPSERT_SQL`]).
+///
+/// The three things this number trades off: the parameters one statement binds
+/// (four `text[]` arrays of up to this many elements), the text a reindex page
+/// holds twice at once (the staged `SearchableContent`, on top of the `data`
+/// the page's resources already carry — ~70 KB for a group at the corpus's
+/// measured mean 688-byte content), and the work one aborted transaction
+/// throws away before the per-resource fallback repeats it.
+const FTS_BATCH_SIZE: usize = 100;
 
 /// How much text a single retry hands `to_tsvector` after it has refused the
 /// whole thing.
@@ -1554,6 +1630,110 @@ impl PostgresBackend {
     /// deliberately: the fix adds a `to_tsvector` per bundle entry, which is
     /// cost on the import path, and it belongs with a decision about the
     /// paragraph above rather than inside a performance change.
+    async fn execute_fts_statement<C>(
+        client: &C,
+        tenant_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+        content: &SearchableContent,
+    ) -> Result<(), tokio_postgres::Error>
+    where
+        C: deadpool_postgres::GenericClient + ?Sized,
+    {
+        if content.is_empty() {
+            execute_cached(
+                client,
+                "DELETE FROM resource_fts WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
+                &[&tenant_id, &resource_type, &resource_id],
+            )
+            .await?;
+            return Ok(());
+        }
+
+        execute_cached(
+            client,
+            FTS_UPSERT_SQL,
+            &[
+                &resource_id,
+                &resource_type,
+                &tenant_id,
+                &content.narrative,
+                &content.full_content,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn retry_truncated_fts<C>(
+        client: &C,
+        tenant_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+        content: &SearchableContent,
+    ) -> StorageResult<()>
+    where
+        C: deadpool_postgres::GenericClient + ?Sized,
+    {
+        let narrative = truncate_on_char_boundary(&content.narrative, FTS_MAX_INPUT_BYTES);
+        let full_content = truncate_on_char_boundary(&content.full_content, FTS_MAX_INPUT_BYTES);
+        tracing::warn!(
+            "FTS content for {}/{} exceeds PostgreSQL's 1 MB tsvector limit; \
+             indexing the first {} bytes of narrative and content only",
+            resource_type,
+            resource_id,
+            FTS_MAX_INPUT_BYTES,
+        );
+        let truncated = SearchableContent {
+            narrative: narrative.to_string(),
+            full_content: full_content.to_string(),
+        };
+        Self::execute_fts_statement(client, tenant_id, resource_type, resource_id, &truncated)
+            .await
+            .map_err(|e| internal_error(format!("Failed to insert FTS content: {}", e)))
+    }
+
+    async fn index_fts_content_page<C>(
+        &self,
+        client: &C,
+        tenant_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+        resource: &Value,
+    ) -> Result<(), PageFtsError>
+    where
+        C: deadpool_postgres::GenericClient + ?Sized,
+    {
+        if !self
+            .fts_table_exists(client)
+            .await
+            .map_err(PageFtsError::Other)?
+        {
+            return Ok(());
+        }
+
+        let content = extract_searchable_content(resource);
+        match Self::execute_fts_statement(client, tenant_id, resource_type, resource_id, &content)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(error)
+                if error.code()
+                    == Some(&tokio_postgres::error::SqlState::PROGRAM_LIMIT_EXCEEDED) =>
+            {
+                Err(PageFtsError::ProgramLimitExceeded { error, content })
+            }
+            Err(error) if content.is_empty() => Err(PageFtsError::Other(internal_error(format!(
+                "Failed to delete empty FTS index: {}",
+                error
+            )))),
+            Err(error) => Err(PageFtsError::Other(internal_error(format!(
+                "Failed to insert FTS content: {}",
+                error
+            )))),
+        }
+    }
+
     async fn index_fts_content<C>(
         &self,
         client: &C,
@@ -1572,21 +1752,6 @@ impl PostgresBackend {
         // Extract searchable content
         let content = extract_searchable_content(resource);
 
-        if content.is_empty() {
-            // Nothing to index. A stored resource always carries at least its
-            // `resourceType`, so this is unreachable in practice, but if a
-            // rewrite ever did empty a resource out, the previous row has to go
-            // rather than survive as a stale match.
-            execute_cached(
-                client,
-                "DELETE FROM resource_fts WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
-                &[&tenant_id, &resource_type, &resource_id],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to delete empty FTS index: {}", e)))?;
-            return Ok(());
-        }
-
         // Store the vectors, not their input. `narrative_text` and
         // `full_content` are write-only columns — `_text` and `_content` query
         // `narrative_tsvector` / `content_tsvector` and nothing reads the raw
@@ -1595,18 +1760,15 @@ impl PostgresBackend {
         // instead of in a `BEFORE INSERT` trigger; the trigger is dropped in
         // schema v26 because it would otherwise overwrite these vectors with
         // the tsvector of an empty string.
-        let result = execute_cached(
-            client,
-            FTS_UPSERT_SQL,
-            &[
-                &resource_id,
-                &resource_type,
-                &tenant_id,
-                &content.narrative,
-                &content.full_content,
-            ],
-        )
-        .await;
+        let result =
+            Self::execute_fts_statement(client, tenant_id, resource_type, resource_id, &content)
+                .await;
+
+        if content.is_empty() {
+            result
+                .map_err(|e| internal_error(format!("Failed to delete empty FTS index: {}", e)))?;
+            return Ok(());
+        }
 
         let err = match result {
             Ok(_) => return Ok(()),
@@ -1624,11 +1786,13 @@ impl PostgresBackend {
         //
         // Retry once against a truncated input instead. Ordinary resource
         // writes run without an explicit transaction, so their session remains
-        // usable. A batched reindex calls this inside its managed page
-        // transaction; PostgreSQL aborts that transaction after this error, so
-        // the retry fails and the page writer rolls back and repeats each
-        // resource through the ordinary path. The bundle path
-        // (`PostgresTransaction`) does not write `resource_fts` at all.
+        // usable. A page reindex does not call this inside its managed
+        // transaction at all: the batched statement fails in its own statement,
+        // PostgreSQL aborts that transaction there, the page writer rolls it
+        // back and repeats the page per resource, and this function is reached
+        // from that fallback — outside any transaction, where the truncated
+        // retry can succeed. The bundle path (`PostgresTransaction`) does not
+        // write `resource_fts` at all.
         if err.code() != Some(&tokio_postgres::error::SqlState::PROGRAM_LIMIT_EXCEEDED) {
             return Err(internal_error(format!(
                 "Failed to insert FTS content: {}",
@@ -1636,28 +1800,128 @@ impl PostgresBackend {
             )));
         }
 
-        let narrative = truncate_on_char_boundary(&content.narrative, FTS_MAX_INPUT_BYTES);
-        let full_content = truncate_on_char_boundary(&content.full_content, FTS_MAX_INPUT_BYTES);
-        tracing::warn!(
-            "FTS content for {}/{} exceeds PostgreSQL's 1 MB tsvector limit; \
-             indexing the first {} bytes of narrative and content only",
-            resource_type,
-            resource_id,
-            FTS_MAX_INPUT_BYTES,
-        );
-        execute_cached(
-            client,
-            FTS_UPSERT_SQL,
-            &[
-                &resource_id,
-                &resource_type,
-                &tenant_id,
-                &narrative,
-                &full_content,
-            ],
-        )
-        .await
-        .map_err(|e| internal_error(format!("Failed to insert FTS content: {}", e)))?;
+        Self::retry_truncated_fts(client, tenant_id, resource_type, resource_id, &content).await?;
+
+        Ok(())
+    }
+
+    /// Writes a page's full-text rows in consecutive groups of
+    /// [`FTS_BATCH_SIZE`], one statement per group.
+    ///
+    /// `resources` is the page *minus* the resources whose search-parameter
+    /// extraction failed. Those are reported per resource by the caller and
+    /// have no full-text row to rebuild, so this function never has to make an
+    /// error decision: everything it is handed is expected to be written.
+    /// Ordering, the `search_index` row counts, and the error slots all stay
+    /// with the caller too — this writes FTS rows and nothing else.
+    ///
+    /// Groups are consecutive slices of the page rather than a regathering of
+    /// it, so the statement boundaries are a function of the page alone.
+    ///
+    /// The `SearchableContent` for one group is built inside the iteration and
+    /// dropped at the end of it, so the text this holds twice (the resource
+    /// `data` the page already carries, plus the extracted narrative and
+    /// content) is bounded by [`FTS_BATCH_SIZE`] resources rather than by the
+    /// page's length.
+    ///
+    /// A resource whose content is empty is left out of the group's arrays and
+    /// its row is deleted instead, in one statement per group that has any:
+    /// the page's own `DELETE FROM resource_fts` names only the resources whose
+    /// extraction failed (#1146), so the row of an emptied resource is this
+    /// function's to remove, exactly as `index_fts_content` removes it on the
+    /// per-resource path. A group left holding only such resources issues the
+    /// delete and no upsert; a group with none issues the upsert alone.
+    ///
+    /// Every error is returned as it arrives — never truncated, never retried,
+    /// never re-split into smaller groups. A `program_limit_exceeded` is
+    /// reported as [`BatchFtsError::ProgramLimitExceeded`] so the caller can
+    /// roll back to its FTS-phase savepoint and replay the phase per resource,
+    /// truncating the oversized input there; every other error is page-fatal
+    /// and the caller re-runs the page through the per-resource path.
+    async fn index_fts_content_batch<C>(
+        &self,
+        client: &C,
+        tenant_id: &str,
+        resources: &[&StoredResource],
+    ) -> Result<(), BatchFtsError>
+    where
+        C: deadpool_postgres::GenericClient + ?Sized,
+    {
+        if !self
+            .fts_table_exists(client)
+            .await
+            .map_err(BatchFtsError::Other)?
+        {
+            return Ok(());
+        }
+
+        for group in resources.chunks(FTS_BATCH_SIZE) {
+            let mut resource_types = Vec::with_capacity(group.len());
+            let mut resource_ids = Vec::with_capacity(group.len());
+            let mut narratives = Vec::with_capacity(group.len());
+            let mut full_contents = Vec::with_capacity(group.len());
+            let mut empty_types: Vec<&str> = Vec::new();
+            let mut empty_ids: Vec<&str> = Vec::new();
+
+            for resource in group {
+                let content = extract_searchable_content(resource.content());
+                if content.is_empty() {
+                    empty_types.push(resource.resource_type());
+                    empty_ids.push(resource.id());
+                    continue;
+                }
+                resource_types.push(resource.resource_type().to_string());
+                resource_ids.push(resource.id().to_string());
+                narratives.push(content.narrative);
+                full_contents.push(content.full_content);
+            }
+
+            if !empty_ids.is_empty() {
+                execute_cached(
+                    client,
+                    "DELETE FROM resource_fts
+                     WHERE tenant_id = $1
+                       AND (resource_type, resource_id) IN (
+                           SELECT * FROM unnest($2::text[], $3::text[])
+                       )",
+                    &[&tenant_id, &empty_types, &empty_ids],
+                )
+                .await
+                .map_err(|e| {
+                    BatchFtsError::Other(internal_error(format!(
+                        "Failed to delete empty FTS index: {}",
+                        e
+                    )))
+                })?;
+            }
+
+            if resource_types.is_empty() {
+                continue;
+            }
+
+            execute_cached(
+                client,
+                FTS_BATCH_UPSERT_SQL,
+                &[
+                    &tenant_id,
+                    &resource_types,
+                    &resource_ids,
+                    &narratives,
+                    &full_contents,
+                ],
+            )
+            .await
+            .map_err(|error| {
+                if error.code() == Some(&tokio_postgres::error::SqlState::PROGRAM_LIMIT_EXCEEDED) {
+                    BatchFtsError::ProgramLimitExceeded(error)
+                } else {
+                    BatchFtsError::Other(internal_error(format!(
+                        "Failed to insert FTS content: {}",
+                        error
+                    )))
+                }
+            })?;
+        }
 
         Ok(())
     }
@@ -2792,24 +3056,13 @@ impl PurgableStorage for PostgresBackend {
 // ConditionalStorage Implementation
 // ============================================================================
 
-// Helper function to parse simple search parameters
-// Supports basic formats like: identifier=X, _id=Y, name=Z
-fn parse_simple_search_params(params: &str) -> Vec<(String, String)> {
-    params
-        .split('&')
-        .filter_map(|pair| {
-            let parts: Vec<&str> = pair.splitn(2, '=').collect();
-            if parts.len() == 2 {
-                Some((parts[0].to_string(), parts[1].to_string()))
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
 #[async_trait]
 impl ConditionalStorage for PostgresBackend {
+    fn supports_conditional(&self, interaction: crate::core::ConditionalInteraction) -> bool {
+        // One declaration: the capability list the contract test pins (#1384).
+        crate::core::Backend::supports(self, interaction.capability())
+    }
+
     async fn conditional_create(
         &self,
         tenant: &TenantContext,
@@ -2844,6 +3097,7 @@ impl ConditionalStorage for PostgresBackend {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn conditional_update(
         &self,
         tenant: &TenantContext,
@@ -2852,6 +3106,7 @@ impl ConditionalStorage for PostgresBackend {
         search_params: &str,
         upsert: bool,
         fhir_version: FhirVersion,
+        if_match: &crate::core::EntityTagPrecondition,
     ) -> StorageResult<ConditionalUpdateResult> {
         // Find matching resources based on search parameters
         let matches = self
@@ -2860,6 +3115,9 @@ impl ConditionalStorage for PostgresBackend {
 
         match matches.len() {
             0 => {
+                // `If-Match` names a version; nothing matched, so nothing
+                // can carry it and the create below must not run (#1381).
+                crate::core::conditional_if_match_gate(if_match, resource_type, None)?;
                 if upsert {
                     // No match, but upsert is true - create new resource
                     let created = self
@@ -2872,8 +3130,11 @@ impl ConditionalStorage for PostgresBackend {
                 }
             }
             1 => {
-                // Exactly one match - update it (preserves existing FHIR version)
+                // Exactly one match - update it (preserves existing FHIR version).
+                // `update` compares-and-swaps on `existing`'s version, the one
+                // `If-Match` is evaluated against here.
                 let existing = matches.into_iter().next().unwrap();
+                crate::core::conditional_if_match_gate(if_match, resource_type, Some(&existing))?;
                 let updated = self.update(tenant, &existing, resource).await?;
                 Ok(ConditionalUpdateResult::Updated(updated))
             }
@@ -2889,6 +3150,7 @@ impl ConditionalStorage for PostgresBackend {
         tenant: &TenantContext,
         resource_type: &str,
         search_params: &str,
+        if_match: &crate::core::EntityTagPrecondition,
     ) -> StorageResult<ConditionalDeleteResult> {
         // Find matching resources based on search parameters
         let matches = self
@@ -2897,12 +3159,15 @@ impl ConditionalStorage for PostgresBackend {
 
         match matches.len() {
             0 => {
-                // No match
+                // No match. A supplied `If-Match` fails against it, as it
+                // does on `DELETE [type]/[id]` for a missing resource.
+                crate::core::conditional_if_match_gate(if_match, resource_type, None)?;
                 Ok(ConditionalDeleteResult::NoMatch)
             }
             1 => {
                 // Exactly one match - delete it
                 let existing = matches.into_iter().next().unwrap();
+                crate::core::conditional_if_match_gate(if_match, resource_type, Some(&existing))?;
                 self.delete(tenant, resource_type, existing.id()).await?;
                 Ok(ConditionalDeleteResult::Deleted(existing))
             }
@@ -2919,6 +3184,7 @@ impl ConditionalStorage for PostgresBackend {
         resource_type: &str,
         search_params: &str,
         patch: &crate::core::PatchFormat,
+        if_match: &crate::core::EntityTagPrecondition,
     ) -> StorageResult<crate::core::ConditionalPatchResult> {
         use crate::core::{ConditionalPatchResult, PatchFormat};
 
@@ -2932,6 +3198,7 @@ impl ConditionalStorage for PostgresBackend {
             1 => {
                 // Exactly one match - apply the patch
                 let existing = matches.into_iter().next().unwrap();
+                crate::core::conditional_if_match_gate(if_match, resource_type, Some(&existing))?;
                 let current_content = existing.content().clone();
 
                 // Apply the patch based on format
@@ -3004,73 +3271,24 @@ impl PostgresBackend {
     /// Builds the search a conditional interaction's criteria describe, or
     /// `None` when the criteria are empty — matching everything would be the
     /// literal reading, but no conditional interaction means that.
+    ///
+    /// The parsing is [`crate::search::build_conditional_query`], shared by
+    /// every backend so criteria mean what they mean as a direct search
+    /// (#1312).
     fn conditional_query(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         search_params_str: &str,
     ) -> StorageResult<Option<SearchQuery>> {
-        // Parse search parameters into (name, value) pairs
-        let parsed_params = parse_simple_search_params(search_params_str);
-
-        if parsed_params.is_empty() {
-            return Ok(None);
-        }
-
-        // Build SearchParameter objects by looking up types from the registry
-        let search_params = self.build_search_parameters(tenant, resource_type, &parsed_params)?;
-
-        Ok(Some(SearchQuery {
-            resource_type: resource_type.to_string(),
-            parameters: search_params,
-            count: Some(1000),
-            ..Default::default()
-        }))
-    }
-
-    /// Builds SearchParameter objects from parsed (name, value) pairs.
-    fn build_search_parameters(
-        &self,
-        tenant: &TenantContext,
-        resource_type: &str,
-        params: &[(String, String)],
-    ) -> StorageResult<Vec<SearchParameter>> {
         let registry_arc = self.tenant_registry(tenant.tenant_id().as_str());
         let registry = registry_arc.read();
-        let mut search_params = Vec::with_capacity(params.len());
-
-        for (name, value) in params {
-            let param_type = self
-                .lookup_param_type(&registry, resource_type, name)
-                .unwrap_or_else(|| crate::search::fallback_param_type(name));
-
-            search_params.push(SearchParameter {
-                name: name.clone(),
-                param_type,
-                modifier: None,
-                values: vec![SearchValue::parse(value)],
-                chain: vec![],
-                components: vec![],
-            });
-        }
-
-        Ok(search_params)
-    }
-
-    /// Looks up a search parameter type from the registry.
-    fn lookup_param_type(
-        &self,
-        registry: &crate::search::SearchParameterRegistry,
-        resource_type: &str,
-        param_name: &str,
-    ) -> Option<SearchParamType> {
-        if let Some(def) = registry.get_param(resource_type, param_name) {
-            return Some(def.param_type);
-        }
-        if let Some(def) = registry.get_param("Resource", param_name) {
-            return Some(def.param_type);
-        }
-        None
+        crate::search::build_conditional_query(
+            &registry,
+            resource_type,
+            search_params_str,
+            crate::search::ResourceTypeScope::version(self.config().fhir_version),
+        )
     }
 
     // ========================================================================
@@ -3760,6 +3978,387 @@ impl ReindexSource for PostgresBackend {
 }
 
 // ============================================================================
+// Reindex page preparation — the database-free half of a page write, spread
+// across a process-wide pool when a page is worth it (#1142).
+//
+// `write_search_entries_page` used to extract, marshal and shape every
+// resource of a page on the thread that was about to run the page's SQL. That
+// preparation is pure CPU — FHIRPath evaluation over whole documents,
+// contained-resource flattening, row building — and it is independent per
+// resource, so it is the one part of a page write that can leave the writer's
+// critical path without moving a statement, a transaction boundary or an
+// error.
+//
+// Nothing here touches the database. The connection is acquired, and the
+// transaction opened, only after preparation has returned and its admission
+// permit has been dropped; the pool never holds a `deadpool` client, and a
+// page never waits for the pool — an unusable pool only means the page is
+// prepared on the calling thread, exactly as it was before.
+// ============================================================================
+
+/// Pages shorter than this are prepared on the calling thread.
+///
+/// Preparation is per-resource FHIRPath extraction, which is microseconds of
+/// work for a resource, so below this size the pool's hand-off costs more than
+/// it saves. The reindex driver's default page is 100 resources, and the
+/// deferred ingest path reindexes in pages of 1000, so every ordinary page is
+/// well past this threshold.
+const REINDEX_PREPARE_MIN_PAGE: usize = 16;
+
+/// Width of the static prepare pool: one core is left to the thread that runs
+/// the page's SQL and to everything else the process is serving, clamped to
+/// four because a reindex competes with live traffic for the same machine.
+/// A one-core machine ends at `1`, which [`ReindexPrepareEnv::plan`] reads as
+/// "no parallelism to win" and prepares inline.
+fn reindex_prepare_width() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(1).clamp(1, 4))
+        .unwrap_or(1)
+}
+
+/// The pool a page's preparation runs on, built once per process.
+///
+/// A failure to build is remembered exactly like a success: the page path
+/// falls back to the calling thread, and the one warning
+/// [`init_reindex_prepare_pool`] emits is the only trace it leaves — however
+/// many pages take that fallback afterwards.
+fn reindex_prepare_pool() -> &'static Result<rayon::ThreadPool, String> {
+    static POOL: OnceLock<Result<rayon::ThreadPool, String>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        init_reindex_prepare_pool(
+            || {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(reindex_prepare_width())
+                    .thread_name(|index| format!("hfs-pg-reindex-{index}"))
+                    .build()
+            },
+            |message| tracing::warn!("{message}"),
+        )
+    })
+}
+
+/// Turns a pool construction result into what [`reindex_prepare_pool`]'s
+/// `OnceLock` remembers.
+///
+/// `notify_failure` runs only for a failure, and only the `OnceLock`'s one
+/// initializer call can reach it, so a failed build warns exactly once per
+/// process. Split from the build itself so a test can inject a failing build
+/// without touching — or exhausting — the process-global pool.
+fn init_reindex_prepare_pool<E: std::fmt::Display>(
+    build: impl FnOnce() -> Result<rayon::ThreadPool, E>,
+    notify_failure: impl FnOnce(&str),
+) -> Result<rayon::ThreadPool, String> {
+    match build() {
+        Ok(pool) => Ok(pool),
+        Err(error) => {
+            let message = format!(
+                "Failed to build the PostgreSQL reindex prepare pool; reindex pages will be \
+                 prepared on the calling thread: {error}"
+            );
+            notify_failure(&message);
+            Err(message)
+        }
+    }
+}
+
+/// The one permit that admits a page to the static pool, process-global.
+///
+/// The pool is shared by every reindex page in the process, and an admitted
+/// page occupies it for its whole preparation. Without this, a second page —
+/// another job, or this backend used from somewhere else — would queue its
+/// work behind the first and pay that page's latency. Admission is
+/// deliberately nonblocking: preparing on the calling thread is always
+/// correct, so a busy pool is a reason to fall back, never a reason to wait.
+fn reindex_prepare_gate() -> &'static Semaphore {
+    static GATE: OnceLock<Semaphore> = OnceLock::new();
+    GATE.get_or_init(|| Semaphore::new(1))
+}
+
+/// Whether this thread may block on the pool: `block_in_place` is legal only
+/// inside a multi-thread Tokio runtime. It panics on a current-thread runtime
+/// (there is no other worker to hand the reactor to) and outside a runtime
+/// altogether, so both take the sequential path.
+fn tokio_multi_thread_runtime() -> bool {
+    tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+        matches!(
+            handle.runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        )
+    })
+}
+
+/// Why a page's preparation stayed on the calling thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReindexPrepareFallback {
+    /// Fewer than [`REINDEX_PREPARE_MIN_PAGE`] resources.
+    SmallPage,
+    /// The caller is not inside a multi-thread Tokio runtime, so
+    /// `block_in_place` is not legal.
+    NotMultiThreadRuntime,
+    /// The static pool failed to build (see [`reindex_prepare_pool`]).
+    PoolUnavailable,
+    /// The pool has a single worker: handing the work over cannot overlap it
+    /// with anything.
+    SingleWorker,
+    /// Another page holds the process-global admission permit.
+    GateBusy,
+}
+
+impl ReindexPrepareFallback {
+    /// Stable name for the `hfs_perf` marker.
+    fn label(self) -> &'static str {
+        match self {
+            ReindexPrepareFallback::SmallPage => "small_page",
+            ReindexPrepareFallback::NotMultiThreadRuntime => "not_multi_thread_runtime",
+            ReindexPrepareFallback::PoolUnavailable => "pool_unavailable",
+            ReindexPrepareFallback::SingleWorker => "single_worker",
+            ReindexPrepareFallback::GateBusy => "gate_busy",
+        }
+    }
+}
+
+/// What a page's preparation will do, decided before any permit is claimed.
+enum ReindexPreparePlan<'a> {
+    /// The pool is usable for this page.
+    Parallel {
+        pool: &'a rayon::ThreadPool,
+        workers: usize,
+    },
+    /// Prepare on the calling thread.
+    Sequential(ReindexPrepareFallback),
+}
+
+/// How one page's database-free preparation actually ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReindexPrepareMode {
+    /// Spread across `workers` pool threads.
+    Parallel { workers: usize },
+    /// On the calling thread, for the stated reason.
+    Sequential(ReindexPrepareFallback),
+}
+
+impl ReindexPrepareMode {
+    /// Stable name for the `hfs_perf` marker.
+    fn label(self) -> &'static str {
+        match self {
+            ReindexPrepareMode::Parallel { .. } => "parallel",
+            ReindexPrepareMode::Sequential(_) => "sequential",
+        }
+    }
+
+    /// The fallback reason, for the marker; `None` when the pool ran.
+    fn fallback(self) -> Option<ReindexPrepareFallback> {
+        match self {
+            ReindexPrepareMode::Parallel { .. } => None,
+            ReindexPrepareMode::Sequential(reason) => Some(reason),
+        }
+    }
+
+    /// Pool threads the page was spread across (`1` when it was not).
+    fn workers(self) -> usize {
+        match self {
+            ReindexPrepareMode::Parallel { workers } => workers,
+            ReindexPrepareMode::Sequential(_) => 1,
+        }
+    }
+}
+
+/// The pool, admission gate and runtime facts one page's preparation is
+/// decided from.
+///
+/// Production fills this from the process statics
+/// ([`ReindexPrepareEnv::process`]); a test constructs it with a private pool
+/// and a private gate, which is what makes admission, fallback and worker
+/// counts deterministic on any machine.
+struct ReindexPrepareEnv<'a> {
+    /// The pool to use, or the remembered reason it could not be built.
+    pool: &'a Result<rayon::ThreadPool, String>,
+    /// The admission permit's semaphore.
+    gate: &'a Semaphore,
+    /// Whether the calling thread is inside a multi-thread Tokio runtime.
+    multi_thread_runtime: bool,
+}
+
+impl<'a> ReindexPrepareEnv<'a> {
+    /// The process-wide environment: the static pool, the static gate, and the
+    /// runtime flavor of the thread that is asking.
+    fn process() -> Self {
+        Self {
+            pool: reindex_prepare_pool(),
+            gate: reindex_prepare_gate(),
+            multi_thread_runtime: tokio_multi_thread_runtime(),
+        }
+    }
+
+    /// Decides how a page of `len` items will be prepared, without claiming
+    /// anything.
+    ///
+    /// Everything that can rule the pool out — page size, runtime flavor, pool
+    /// existence and width — is checked before [`Self::admit`], so an
+    /// ineligible page never touches the process-global permit.
+    fn plan(&self, len: usize) -> ReindexPreparePlan<'_> {
+        if len < REINDEX_PREPARE_MIN_PAGE {
+            return ReindexPreparePlan::Sequential(ReindexPrepareFallback::SmallPage);
+        }
+        if !self.multi_thread_runtime {
+            return ReindexPreparePlan::Sequential(ReindexPrepareFallback::NotMultiThreadRuntime);
+        }
+        let pool = match self.pool {
+            Ok(pool) => pool,
+            Err(_) => {
+                return ReindexPreparePlan::Sequential(ReindexPrepareFallback::PoolUnavailable);
+            }
+        };
+        let workers = pool.current_num_threads();
+        if workers < 2 {
+            return ReindexPreparePlan::Sequential(ReindexPrepareFallback::SingleWorker);
+        }
+        ReindexPreparePlan::Parallel { pool, workers }
+    }
+
+    /// Nonblocking admission: claims the process-global permit, or reports
+    /// `GateBusy` immediately.
+    fn admit(&self) -> Result<tokio::sync::SemaphorePermit<'a>, ReindexPrepareFallback> {
+        self.gate
+            .try_acquire()
+            .map_err(|_| ReindexPrepareFallback::GateBusy)
+    }
+}
+
+/// Prepares `len` items with `prepare`, spreading them across `env`'s pool
+/// when the page is eligible and the admission permit is free, and returns the
+/// results in input order together with the mode that ran.
+///
+/// Order is part of the contract: every downstream vector of a page write is
+/// zipped against the caller's `resources` slice, so a pooled and an inline
+/// preparation must produce the same sequence. Rayon's indexed `collect`
+/// preserves it.
+///
+/// The permit lives exactly as long as this call: it is claimed after the
+/// decision, held across the parallel preparation, and released before the
+/// caller runs a single statement.
+fn prepare_reindex_items<T, F>(
+    env: &ReindexPrepareEnv<'_>,
+    len: usize,
+    prepare: F,
+) -> (ReindexPrepareMode, Vec<T>)
+where
+    F: Fn(usize) -> T + Sync,
+    T: Send,
+{
+    use rayon::prelude::*;
+
+    let sequential = |reason: ReindexPrepareFallback| {
+        let results: Vec<T> = (0..len).map(&prepare).collect();
+        (ReindexPrepareMode::Sequential(reason), results)
+    };
+
+    match env.plan(len) {
+        ReindexPreparePlan::Sequential(reason) => sequential(reason),
+        ReindexPreparePlan::Parallel { pool, workers } => {
+            debug_assert!(workers >= 2, "a one-worker pool is a sequential plan");
+            match env.admit() {
+                Err(reason) => sequential(reason),
+                Ok(permit) => {
+                    // `plan` established that the runtime is multi-thread, so
+                    // `block_in_place` is legal here: it hands this worker's
+                    // other work to the runtime for the duration instead of
+                    // stalling the worker inside the pool wait below.
+                    let results = tokio::task::block_in_place(|| {
+                        pool.install(|| (0..len).into_par_iter().map(&prepare).collect::<Vec<T>>())
+                    });
+                    drop(permit);
+                    (ReindexPrepareMode::Parallel { workers }, results)
+                }
+            }
+        }
+    }
+}
+
+/// Records which preparation path this process took.
+///
+/// At most one marker per process, and only for a page at or above the
+/// parallelism threshold — the first page whose decision says anything about
+/// the pool — so a profiling run learns whether the parallel path engaged (and
+/// if not, why) without a line per page. [`crate::perf::enabled`] is a
+/// compile-time `false` without `--cfg perf_phases`, so an ordinary build
+/// folds this away, and a profiling build without `HFS_PERF_PHASES` emits
+/// nothing either.
+fn note_reindex_prepare_mode(page_len: usize, mode: ReindexPrepareMode) {
+    if page_len < REINDEX_PREPARE_MIN_PAGE || !crate::perf::enabled() {
+        return;
+    }
+    static NOTED: AtomicBool = AtomicBool::new(false);
+    if NOTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    tracing::info!(
+        target: "hfs_perf",
+        process_global = true,
+        prepare_mode = mode.label(),
+        fallback = mode.fallback().map(ReindexPrepareFallback::label),
+        workers = mode.workers(),
+        "postgres reindex page preparation mode"
+    );
+}
+
+impl PostgresBackend {
+    /// The database-free half of one reindex page item: the resource's own
+    /// `search_index` rows followed by its contained resources' rows, or the
+    /// extraction error that sends the resource down the written fallback.
+    ///
+    /// A fresh extractor per item, from the tenant's registry — the extractor
+    /// is cheap and tenant-scoped, and building one per item is what keeps a
+    /// page from pinning a registry across the resources it holds.
+    fn prepare_reindex_item(
+        &self,
+        tenant_id: &str,
+        resource: &StoredResource,
+    ) -> Result<Vec<IndexRow>, StorageError> {
+        let resource_type = resource.resource_type();
+        let resource_id = resource.id();
+        let content = resource.content();
+        let values = self
+            .tenant_extractor(tenant_id)
+            .extract(content, resource_type)
+            .map_err(|error| {
+                internal_error(format!("Search parameter extraction failed: {}", error))
+            })?;
+        let mut rows = PostgresSearchIndexWriter::build_rows(
+            resource_type,
+            resource_id,
+            resource.last_modified(),
+            self.index_layout(),
+            values,
+        );
+        rows.extend(self.contained_index_rows(tenant_id, resource_type, resource_id, content));
+        Ok(rows)
+    }
+
+    /// Prepares a whole page without touching the database, in the page's
+    /// input order.
+    ///
+    /// The single `ReindexExtract` span covers the decision, the admission and
+    /// every item — the same stage the inline loop measured before. Full-text
+    /// preparation is *not* part of this: `index_fts_content` runs inside the
+    /// page's transaction, where its oversize retry can still roll the page
+    /// back and repeat it per resource.
+    fn prepare_reindex_page(
+        &self,
+        tenant_id: &str,
+        resources: &[StoredResource],
+    ) -> Vec<Result<Vec<IndexRow>, StorageError>> {
+        let _span = crate::perf::span(crate::perf::Phase::ReindexExtract);
+        let (mode, prepared) =
+            prepare_reindex_items(&ReindexPrepareEnv::process(), resources.len(), |index| {
+                self.prepare_reindex_item(tenant_id, &resources[index])
+            });
+        note_reindex_prepare_mode(resources.len(), mode);
+        prepared
+    }
+}
+
+// ============================================================================
 // ReindexTarget Implementation — PostgreSQL keeps search entries in its own
 // `search_index` table, so it is also a writer and can reindex itself.
 // ============================================================================
@@ -3862,42 +4461,21 @@ impl ReindexTarget for PostgresBackend {
         let mut rows_by_resource = Vec::with_capacity(resources.len());
         let mut extraction_errors = Vec::with_capacity(resources.len());
 
-        let extraction_span = crate::perf::span(crate::perf::Phase::ReindexExtract);
-        for resource in resources {
-            let resource_type = resource.resource_type();
-            let resource_id = resource.id();
-            let content = resource.content();
-            match self
-                .tenant_extractor(tenant_id)
-                .extract(content, resource_type)
-            {
-                Ok(values) => {
-                    let mut rows = PostgresSearchIndexWriter::build_rows(
-                        resource_type,
-                        resource_id,
-                        resource.last_modified(),
-                        self.index_layout(),
-                        values,
-                    );
-                    rows.extend(self.contained_index_rows(
-                        tenant_id,
-                        resource_type,
-                        resource_id,
-                        content,
-                    ));
+        // The database-free preparation stage: one `ReindexExtract` span,
+        // covering the pool decision, admission and every item, and no
+        // statement or connection inside it.
+        for prepared in self.prepare_reindex_page(tenant_id, resources) {
+            match prepared {
+                Ok(rows) => {
                     rows_by_resource.push(rows);
                     extraction_errors.push(None);
                 }
                 Err(error) => {
                     rows_by_resource.push(Vec::new());
-                    extraction_errors.push(Some(internal_error(format!(
-                        "Search parameter extraction failed: {}",
-                        error
-                    ))));
+                    extraction_errors.push(Some(error));
                 }
             }
         }
-        drop(extraction_span);
 
         let resource_types: Vec<&str> = resources
             .iter()
@@ -3951,20 +4529,49 @@ impl ReindexTarget for PostgresBackend {
                 internal_error(format!("Failed to delete search index page: {}", e))
             })?;
 
-            let fts_delete_span = crate::perf::span(crate::perf::Phase::ReindexFtsDelete);
-            let deleted = execute_cached(
-                &transaction,
-                "DELETE FROM resource_fts
-                 WHERE tenant_id = $1
-                   AND (resource_type, resource_id) IN (
-                       SELECT * FROM unnest($2::text[], $3::text[])
-                   )",
-                &[&tenant_id, &resource_types, &resource_ids],
-            )
-            .await;
-            drop(fts_delete_span);
-            deleted
-                .map_err(|e| internal_error(format!("Failed to delete FTS index page: {}", e)))?;
+            // Every resource whose extraction succeeded reaches
+            // `index_fts_content_batch` later in this same transaction, and
+            // that call decides each row's fate from the content: non-empty
+            // content keeps the row and replaces its stored vectors in place
+            // through the `idx_fts_lookup` upsert, which withholds the write
+            // when they are already equal; empty content deletes the row. Neither
+            // branch needs the row gone first, so those pairs are left alone
+            // until their own write lands. A resource whose extraction failed
+            // gets no later call at all, and nothing else would remove its row,
+            // so those pairs are the only ones that have to be deleted here.
+            // Derive them together, and skip the statement entirely when the
+            // page has no failures.
+            let failed_pairs: Vec<(&str, &str)> = resources
+                .iter()
+                .zip(&extraction_errors)
+                .filter(|(_, error)| error.is_some())
+                .map(|(resource, _)| (resource.resource_type(), resource.id()))
+                .collect();
+            if !failed_pairs.is_empty() {
+                let failed_types: Vec<&str> = failed_pairs
+                    .iter()
+                    .map(|(resource_type, _)| *resource_type)
+                    .collect();
+                let failed_ids: Vec<&str> = failed_pairs
+                    .iter()
+                    .map(|(_, resource_id)| *resource_id)
+                    .collect();
+                let fts_delete_span = crate::perf::span(crate::perf::Phase::ReindexFtsDelete);
+                let deleted = execute_cached(
+                    &transaction,
+                    "DELETE FROM resource_fts
+                     WHERE tenant_id = $1
+                       AND (resource_type, resource_id) IN (
+                           SELECT * FROM unnest($2::text[], $3::text[])
+                       )",
+                    &[&tenant_id, &failed_types, &failed_ids],
+                )
+                .await;
+                drop(fts_delete_span);
+                deleted.map_err(|e| {
+                    internal_error(format!("Failed to delete FTS index page: {}", e))
+                })?;
+            }
 
             let valid_batches: Vec<(&str, &str, &[IndexRow])> = resources
                 .iter()
@@ -3995,19 +4602,128 @@ impl ReindexTarget for PostgresBackend {
                     .sum(),
             );
 
+            transaction
+                .batch_execute("SAVEPOINT reindex_fts_phase")
+                .await
+                .map_err(|e| {
+                    internal_error(format!("Failed to create FTS phase savepoint: {}", e))
+                })?;
             let fts_span = crate::perf::span(crate::perf::Phase::ReindexFts);
-            for (resource, error) in resources.iter().zip(&extraction_errors) {
-                if error.is_none() {
-                    self.index_fts_content(
-                        &transaction,
-                        tenant_id,
-                        resource.resource_type(),
-                        resource.id(),
-                        resource.content(),
-                    )
-                    .await?;
+            // One statement per group of `FTS_BATCH_SIZE` resources, instead of
+            // one per resource: the whole point of this path. The resource ids
+            // are already flattened for the page's `search_index` writes, and
+            // they are unique per page, which is what the statement's
+            // `ON CONFLICT` needs (see `FTS_BATCH_UPSERT_SQL`).
+            //
+            // The batch runs under `reindex_fts_phase`. A `to_tsvector` input
+            // over PostgreSQL's 1 MB limit aborts the transaction, but only
+            // back to that savepoint: the page's `search_index` work above it
+            // survives, and the FTS phase is replayed one resource at a time,
+            // truncating just the oversized ones (`retry_truncated_fts`).
+            // Any other failure still fails the page, which
+            // `write_reindex_page_individually` repeats per resource.
+            let fts_batch: Vec<&StoredResource> = resources
+                .iter()
+                .zip(&extraction_errors)
+                .filter(|(_, error)| error.is_none())
+                .map(|(resource, _)| resource)
+                .collect();
+            let oversized = match self
+                .index_fts_content_batch(&transaction, tenant_id, &fts_batch)
+                .await
+            {
+                Ok(()) => None,
+                Err(BatchFtsError::ProgramLimitExceeded(error)) => Some(error),
+                Err(BatchFtsError::Other(error)) => return Err(error),
+            };
+
+            if let Some(error) = oversized {
+                transaction
+                    .batch_execute("ROLLBACK TO SAVEPOINT reindex_fts_phase")
+                    .await
+                    .map_err(|e| {
+                        internal_error(format!(
+                            "Failed to rollback FTS phase after PROGRAM_LIMIT_EXCEEDED: {}",
+                            e
+                        ))
+                    })?;
+                tracing::debug!(
+                    "Recovering PostgreSQL reindex FTS page after PROGRAM_LIMIT_EXCEEDED: {}",
+                    error
+                );
+
+                for resource in &fts_batch {
+                    transaction
+                        .batch_execute("SAVEPOINT reindex_fts_resource")
+                        .await
+                        .map_err(|e| {
+                            internal_error(format!("Failed to create FTS resource savepoint: {}", e))
+                        })?;
+
+                    let attempt = self
+                        .index_fts_content_page(
+                            &transaction,
+                            tenant_id,
+                            resource.resource_type(),
+                            resource.id(),
+                            resource.content(),
+                        )
+                        .await;
+                    match attempt {
+                        Ok(()) => {
+                            transaction
+                                .batch_execute("RELEASE SAVEPOINT reindex_fts_resource")
+                                .await
+                                .map_err(|e| {
+                                    internal_error(format!(
+                                        "Failed to release FTS resource savepoint: {}",
+                                        e
+                                    ))
+                                })?;
+                        }
+                        Err(PageFtsError::ProgramLimitExceeded { content, error }) => {
+                            transaction
+                                .batch_execute("ROLLBACK TO SAVEPOINT reindex_fts_resource")
+                                .await
+                                .map_err(|e| {
+                                    internal_error(format!(
+                                        "Failed to rollback FTS resource after PROGRAM_LIMIT_EXCEEDED: {}",
+                                        e
+                                    ))
+                                })?;
+                            tracing::debug!(
+                                "Retrying PostgreSQL reindex FTS resource after PROGRAM_LIMIT_EXCEEDED: {}",
+                                error
+                            );
+                            Self::retry_truncated_fts(
+                                &transaction,
+                                tenant_id,
+                                resource.resource_type(),
+                                resource.id(),
+                                &content,
+                            )
+                            .await?;
+                            transaction
+                                .batch_execute("RELEASE SAVEPOINT reindex_fts_resource")
+                                .await
+                                .map_err(|e| {
+                                    internal_error(format!(
+                                        "Failed to release FTS resource savepoint: {}",
+                                        e
+                                    ))
+                                })?;
+                        }
+                        Err(PageFtsError::Other(error)) => return Err(error),
+                    }
                 }
             }
+
+            transaction
+                .batch_execute("RELEASE SAVEPOINT reindex_fts_phase")
+                .await
+                .map_err(|e| {
+                    internal_error(format!("Failed to release FTS phase savepoint: {}", e))
+                })?;
             drop(fts_span);
             Ok(())
         }
@@ -4090,6 +4806,31 @@ impl ReindexTarget for PostgresBackend {
 // ============================================================================
 // FTS Content Extraction (local copy to avoid cross-feature dependency on sqlite)
 // ============================================================================
+
+/// Outcome of one resource's FTS statement inside a reindex page transaction.
+///
+/// A `program_limit_exceeded` (the 1 MB `tsvector` cap) is surfaced with the
+/// content that tripped it so the caller can roll back to its savepoint and
+/// retry that one resource truncated; anything else is page-fatal.
+enum PageFtsError {
+    ProgramLimitExceeded {
+        error: tokio_postgres::Error,
+        content: SearchableContent,
+    },
+    Other(StorageError),
+}
+
+/// Outcome of a grouped FTS statement (`FTS_BATCH_UPSERT_SQL`) inside a
+/// reindex page transaction.
+///
+/// A grouped statement cannot say which of its rows exceeded the `tsvector`
+/// limit, so `ProgramLimitExceeded` carries only the error: the caller rolls
+/// back to the FTS-phase savepoint and replays the page per resource, where
+/// [`PageFtsError`] identifies the oversized one.
+enum BatchFtsError {
+    ProgramLimitExceeded(tokio_postgres::Error),
+    Other(StorageError),
+}
 
 /// Content extracted from a resource for full-text search.
 struct SearchableContent {
@@ -4627,5 +5368,545 @@ mod fts_extraction_tests {
             assert!(s.starts_with(cut));
         }
         assert_eq!(truncate_on_char_boundary("abc", 10), "abc");
+    }
+}
+
+/// The reindex page preparer's scheduler: threshold, runtime eligibility,
+/// ordering, admission and pool-build failure.
+///
+/// Every test injects its own pool and its own gate, so none of them depends
+/// on the host's core count, and none of them resets or exhausts the
+/// process-global `OnceLock` the production path initializes.
+#[cfg(test)]
+mod reindex_prepare_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
+    /// A private pool for a test: `workers` threads nothing else shares, so
+    /// "how wide did this run" is a property of the test, not of the machine.
+    fn test_pool(workers: usize) -> rayon::ThreadPool {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .thread_name(|index| format!("hfs-pg-reindex-test-{index}"))
+            .build()
+            .expect("build the test prepare pool")
+    }
+
+    /// Watches item closures: how many ran at once, and whether they ran on a
+    /// pool thread or on the calling thread.
+    #[derive(Default)]
+    struct Probe {
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+        pool_items: AtomicUsize,
+        caller_items: AtomicUsize,
+    }
+
+    impl Probe {
+        fn enter(&self) {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+        }
+
+        fn leave(&self) {
+            self.active.fetch_sub(1, Ordering::SeqCst);
+        }
+
+        /// Records the thread this item runs on. `current_thread_index` is
+        /// `Some` only inside a rayon pool.
+        fn thread(&self) {
+            if rayon::current_thread_index().is_some() {
+                self.pool_items.fetch_add(1, Ordering::SeqCst);
+            } else {
+                self.caller_items.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// A one-shot gate a pool closure can block on and the test can open.
+    #[derive(Default)]
+    struct BlockGate {
+        open: std::sync::Mutex<bool>,
+        cond: std::sync::Condvar,
+    }
+
+    impl BlockGate {
+        fn wait(&self) {
+            let mut open = self.open.lock().expect("block gate lock");
+            while !*open {
+                open = self.cond.wait(open).expect("block gate wait");
+            }
+        }
+
+        fn open(&self) {
+            *self.open.lock().expect("block gate lock") = true;
+            self.cond.notify_all();
+        }
+    }
+
+    /// A two-party rendezvous with a bounded wait.
+    ///
+    /// The first item closure to arrive parks until a second one arrives, so a
+    /// successful meet *proves* two pool threads were inside their closures at
+    /// the same time — a fact a `sleep` only made probable and a loaded
+    /// machine could miss. Once the first pair has met, later arrivals pass
+    /// straight through, so only the overlap this test is about ever parks.
+    ///
+    /// The wait is timed: a pool that never runs a second closure cannot hang
+    /// the suite, it fails the assertions below instead.
+    struct Rendezvous {
+        state: std::sync::Mutex<RendezvousState>,
+        cond: std::sync::Condvar,
+        timeout: Duration,
+    }
+
+    /// A rendezvous' shared state: how many closures have arrived, and whether
+    /// the pair has met.
+    #[derive(Default)]
+    struct RendezvousState {
+        arrived: usize,
+        met: bool,
+    }
+
+    impl Rendezvous {
+        fn new(timeout: Duration) -> Self {
+            Self {
+                state: std::sync::Mutex::new(RendezvousState::default()),
+                cond: std::sync::Condvar::new(),
+                timeout,
+            }
+        }
+
+        /// Arrives: `true` once two closures have arrived, `false` if the wait
+        /// expired before a second one did.
+        fn meet(&self) -> bool {
+            let mut state = self.state.lock().expect("rendezvous lock");
+            if state.met {
+                return true;
+            }
+            state.arrived += 1;
+            if state.arrived >= 2 {
+                state.met = true;
+                self.cond.notify_all();
+                return true;
+            }
+            let (state, _) = self
+                .cond
+                .wait_timeout_while(state, self.timeout, |state| !state.met)
+                .expect("rendezvous wait");
+            state.met
+        }
+    }
+
+    /// An environment that would use the injected pool for an eligible page:
+    /// the same shape production builds, minus the process statics.
+    fn eligible_env<'a>(
+        pool: &'a Result<rayon::ThreadPool, String>,
+        gate: &'a Semaphore,
+    ) -> ReindexPrepareEnv<'a> {
+        ReindexPrepareEnv {
+            pool,
+            gate,
+            multi_thread_runtime: true,
+        }
+    }
+
+    #[test]
+    fn a_page_below_the_threshold_is_prepared_on_the_calling_thread() {
+        let pool = Ok(test_pool(2));
+        let gate = Semaphore::new(1);
+        let env = eligible_env(&pool, &gate);
+        let probe = Probe::default();
+        let len = REINDEX_PREPARE_MIN_PAGE - 1;
+
+        let (mode, results) = prepare_reindex_items(&env, len, |index| {
+            probe.thread();
+            index
+        });
+
+        assert_eq!(
+            mode,
+            ReindexPrepareMode::Sequential(ReindexPrepareFallback::SmallPage)
+        );
+        assert_eq!(results, (0..len).collect::<Vec<_>>());
+        assert_eq!(probe.caller_items.load(Ordering::SeqCst), len);
+        assert_eq!(
+            gate.available_permits(),
+            1,
+            "an ineligible page must not touch the process-global permit"
+        );
+    }
+
+    #[test]
+    fn the_threshold_is_the_eligibility_boundary() {
+        let pool = Ok(test_pool(2));
+        let gate = Semaphore::new(1);
+        let env = eligible_env(&pool, &gate);
+
+        assert!(
+            matches!(
+                env.plan(REINDEX_PREPARE_MIN_PAGE),
+                ReindexPreparePlan::Parallel { workers: 2, .. }
+            ),
+            "a page of exactly {REINDEX_PREPARE_MIN_PAGE} is eligible"
+        );
+        assert!(matches!(
+            env.plan(REINDEX_PREPARE_MIN_PAGE + 1),
+            ReindexPreparePlan::Parallel { .. }
+        ));
+        assert!(matches!(
+            env.plan(REINDEX_PREPARE_MIN_PAGE - 1),
+            ReindexPreparePlan::Sequential(ReindexPrepareFallback::SmallPage)
+        ));
+    }
+
+    #[test]
+    fn without_a_multi_thread_runtime_the_page_is_prepared_inline() {
+        let pool = Ok(test_pool(2));
+        let gate = Semaphore::new(1);
+        let env = ReindexPrepareEnv {
+            pool: &pool,
+            gate: &gate,
+            multi_thread_runtime: false,
+        };
+        let probe = Probe::default();
+
+        let (mode, results) = prepare_reindex_items(&env, 32, |index| {
+            probe.thread();
+            index
+        });
+
+        assert_eq!(
+            mode,
+            ReindexPrepareMode::Sequential(ReindexPrepareFallback::NotMultiThreadRuntime)
+        );
+        assert_eq!(results, (0..32).collect::<Vec<_>>());
+        assert_eq!(probe.caller_items.load(Ordering::SeqCst), 32);
+        assert_eq!(gate.available_permits(), 1);
+    }
+
+    #[test]
+    fn a_single_worker_pool_is_not_worth_handing_work_to() {
+        let pool = Ok(test_pool(1));
+        let gate = Semaphore::new(1);
+        let env = eligible_env(&pool, &gate);
+
+        let (mode, results) = prepare_reindex_items(&env, 32, |index| index);
+
+        assert_eq!(
+            mode,
+            ReindexPrepareMode::Sequential(ReindexPrepareFallback::SingleWorker)
+        );
+        assert_eq!(results, (0..32).collect::<Vec<_>>());
+        assert_eq!(gate.available_permits(), 1);
+    }
+
+    #[test]
+    fn a_pool_that_failed_to_build_falls_back_to_the_calling_thread() {
+        let pool: Result<rayon::ThreadPool, String> = Err("injected pool build failure".into());
+        let gate = Semaphore::new(1);
+        let env = eligible_env(&pool, &gate);
+        let probe = Probe::default();
+
+        let (mode, results) = prepare_reindex_items(&env, 32, |index| {
+            probe.thread();
+            index
+        });
+
+        assert_eq!(
+            mode,
+            ReindexPrepareMode::Sequential(ReindexPrepareFallback::PoolUnavailable)
+        );
+        assert_eq!(results, (0..32).collect::<Vec<_>>());
+        assert_eq!(probe.caller_items.load(Ordering::SeqCst), 32);
+        assert_eq!(gate.available_permits(), 1);
+    }
+
+    #[test]
+    fn a_held_permit_sends_the_next_page_inline_without_waiting() {
+        let pool = Ok(test_pool(2));
+        let gate = Semaphore::new(1);
+        let held = gate.try_acquire().expect("the test takes the only permit");
+        let env = eligible_env(&pool, &gate);
+        let probe = Probe::default();
+
+        // Synchronous, and it cannot wait: the only permit is held, and
+        // `prepare_reindex_items` returns instead of parking on it.
+        let (mode, results) = prepare_reindex_items(&env, REINDEX_PREPARE_MIN_PAGE, |index| {
+            probe.thread();
+            index
+        });
+
+        assert_eq!(
+            mode,
+            ReindexPrepareMode::Sequential(ReindexPrepareFallback::GateBusy)
+        );
+        assert_eq!(results, (0..REINDEX_PREPARE_MIN_PAGE).collect::<Vec<_>>());
+        assert_eq!(
+            probe.caller_items.load(Ordering::SeqCst),
+            REINDEX_PREPARE_MIN_PAGE
+        );
+        assert_eq!(
+            gate.available_permits(),
+            0,
+            "the busy page neither took nor released the permit it could not get"
+        );
+        drop(held);
+        assert_eq!(gate.available_permits(), 1);
+    }
+
+    #[test]
+    fn no_runtime_is_not_a_multi_thread_runtime() {
+        assert!(!tokio_multi_thread_runtime());
+    }
+
+    /// Under a current-thread runtime the decision itself must fall back: the
+    /// eligibility here comes from the real runtime flavor, not from a flag the
+    /// test chose, so this is the path a current-thread deployment takes.
+    #[tokio::test]
+    async fn a_current_thread_runtime_prepares_the_page_inline() {
+        assert!(
+            !tokio_multi_thread_runtime(),
+            "a current-thread runtime must not be eligible"
+        );
+
+        let pool = Ok(test_pool(2));
+        let gate = Semaphore::new(1);
+        let env = ReindexPrepareEnv {
+            pool: &pool,
+            gate: &gate,
+            multi_thread_runtime: tokio_multi_thread_runtime(),
+        };
+        let probe = Probe::default();
+        let len = REINDEX_PREPARE_MIN_PAGE + 16;
+
+        let (mode, results) = prepare_reindex_items(&env, len, |index| {
+            probe.enter();
+            probe.thread();
+            probe.leave();
+            index
+        });
+
+        assert_eq!(
+            mode,
+            ReindexPrepareMode::Sequential(ReindexPrepareFallback::NotMultiThreadRuntime)
+        );
+        assert_eq!(results, (0..len).collect::<Vec<_>>());
+        assert_eq!(probe.caller_items.load(Ordering::SeqCst), len);
+        assert_eq!(probe.active.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            gate.available_permits(),
+            1,
+            "the fallback never claims the permit"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_multi_thread_runtime_is_eligible() {
+        assert!(tokio_multi_thread_runtime());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_eligible_page_is_prepared_on_the_injected_pool_in_input_order() {
+        let pool = Ok(test_pool(2));
+        let gate = Semaphore::new(1);
+        let env = eligible_env(&pool, &gate);
+        let probe = Probe::default();
+        // Two workers must be inside an item closure at the same time before
+        // either of them returns; the rendezvous, not a sleep, is what makes
+        // that overlap a fact rather than a hope.
+        let meet = Rendezvous::new(Duration::from_secs(5));
+        let missed = AtomicBool::new(false);
+
+        let (mode, results) = prepare_reindex_items(&env, REINDEX_PREPARE_MIN_PAGE, |index| {
+            probe.enter();
+            probe.thread();
+            if !meet.meet() {
+                missed.store(true, Ordering::SeqCst);
+            }
+            probe.leave();
+            index
+        });
+
+        assert_eq!(mode, ReindexPrepareMode::Parallel { workers: 2 });
+        assert_eq!(
+            results,
+            (0..REINDEX_PREPARE_MIN_PAGE).collect::<Vec<_>>(),
+            "pooled preparation preserves the page's input order"
+        );
+        assert_eq!(
+            probe.pool_items.load(Ordering::SeqCst),
+            REINDEX_PREPARE_MIN_PAGE
+        );
+        assert_eq!(
+            probe.active.load(Ordering::SeqCst),
+            0,
+            "no item outlived the call"
+        );
+        assert!(
+            !missed.load(Ordering::SeqCst),
+            "both workers must have been inside an item closure at the same time"
+        );
+        assert_eq!(
+            probe.max_active.load(Ordering::SeqCst),
+            2,
+            "the injected pool's two workers overlapped, and nothing wider did"
+        );
+        assert_eq!(
+            gate.available_permits(),
+            1,
+            "the permit is back before the caller can touch the database"
+        );
+    }
+
+    /// The single-permit contract, with a page that is still preparing when the
+    /// second one asks: only one page is admitted to the pool, the next one
+    /// falls back inline instead of waiting, and the admitted page releases its
+    /// permit when — and only when — its preparation returns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_page_is_admitted_and_the_next_falls_back_without_waiting() {
+        use std::sync::Arc;
+
+        let pool = Arc::new(Ok(test_pool(2)));
+        let gate = Arc::new(Semaphore::new(1));
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(BlockGate::default());
+
+        let first = tokio::spawn({
+            let (pool, gate, entered, release) = (
+                Arc::clone(&pool),
+                Arc::clone(&gate),
+                Arc::clone(&entered),
+                Arc::clone(&release),
+            );
+            async move {
+                let env = eligible_env(&pool, &gate);
+                prepare_reindex_items(&env, REINDEX_PREPARE_MIN_PAGE, |index| {
+                    if index == 0 {
+                        entered.add_permits(1);
+                        release.wait();
+                    }
+                    index
+                })
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), entered.acquire())
+            .await
+            .expect("the admitted page entered its preparation within the watchdog window")
+            .expect("first page entered")
+            .forget();
+        assert_eq!(
+            gate.available_permits(),
+            0,
+            "the admitted page holds the permit for its whole preparation"
+        );
+
+        let probe = Probe::default();
+        let env = eligible_env(&pool, &gate);
+        let (mode, results) = prepare_reindex_items(&env, REINDEX_PREPARE_MIN_PAGE, |index| {
+            probe.enter();
+            probe.thread();
+            probe.leave();
+            index
+        });
+
+        assert_eq!(
+            mode,
+            ReindexPrepareMode::Sequential(ReindexPrepareFallback::GateBusy)
+        );
+        assert_eq!(results, (0..REINDEX_PREPARE_MIN_PAGE).collect::<Vec<_>>());
+        assert_eq!(
+            probe.caller_items.load(Ordering::SeqCst),
+            REINDEX_PREPARE_MIN_PAGE,
+            "the second page did not queue behind the first"
+        );
+        assert_eq!(probe.max_active.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            gate.available_permits(),
+            0,
+            "the busy page neither took nor released the admitted page's permit"
+        );
+
+        release.open();
+        let (first_mode, first_results) = tokio::time::timeout(Duration::from_secs(5), first)
+            .await
+            .expect("the admitted page finished once the block gate opened")
+            .expect("first page task");
+        assert_eq!(first_mode, ReindexPrepareMode::Parallel { workers: 2 });
+        assert_eq!(
+            first_results,
+            (0..REINDEX_PREPARE_MIN_PAGE).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            gate.available_permits(),
+            1,
+            "admission is released when preparation returns, before any SQL"
+        );
+    }
+
+    #[test]
+    fn a_failed_pool_build_is_remembered_and_reported_once() {
+        let slot: OnceLock<Result<rayon::ThreadPool, String>> = OnceLock::new();
+        let builds = AtomicUsize::new(0);
+        let warnings = AtomicUsize::new(0);
+
+        // Three `get_or_init` calls model three pages reaching the pool getter:
+        // the initializer runs once, so the failure is built — and warned
+        // about — once, and every later page sees the remembered error.
+        for _ in 0..3 {
+            let result = slot.get_or_init(|| {
+                builds.fetch_add(1, Ordering::SeqCst);
+                init_reindex_prepare_pool(
+                    || Err("injected pool build failure"),
+                    |message| {
+                        warnings.fetch_add(1, Ordering::SeqCst);
+                        assert!(message.contains("injected pool build failure"), "{message}");
+                    },
+                )
+            });
+            match result {
+                Ok(_) => panic!("the injected failure must be remembered"),
+                Err(error) => assert!(error.contains("injected pool build failure"), "{error}"),
+            }
+        }
+
+        assert_eq!(builds.load(Ordering::SeqCst), 1, "one build per process");
+        assert_eq!(
+            warnings.load(Ordering::SeqCst),
+            1,
+            "one warning per process, however many pages fall back"
+        );
+    }
+
+    #[test]
+    fn a_pool_build_that_succeeds_does_not_warn() {
+        let warnings = AtomicUsize::new(0);
+        let built = init_reindex_prepare_pool(
+            || Ok::<_, String>(test_pool(2)),
+            |_| {
+                warnings.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+
+        assert_eq!(built.expect("pool").current_num_threads(), 2);
+        assert_eq!(warnings.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn the_static_pool_is_created_once_at_the_documented_width() {
+        let expected = std::thread::available_parallelism()
+            .map(|n| n.get().saturating_sub(1).clamp(1, 4))
+            .unwrap_or(1);
+        assert_eq!(reindex_prepare_width(), expected);
+        assert!((1..=4).contains(&expected));
+
+        // The getter is a `OnceLock`: one slot for the process, so a build
+        // failure can never be retried page by page.
+        assert!(std::ptr::eq(reindex_prepare_pool(), reindex_prepare_pool()));
+        if let Ok(pool) = reindex_prepare_pool() {
+            assert_eq!(pool.current_num_threads(), expected);
+        }
     }
 }

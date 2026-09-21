@@ -45,9 +45,21 @@ LIMIT 1";
 
 struct ProcessedEntryBatch {
     results: Vec<BulkEntryResult>,
-    error_count: u32,
     aborted_on_max_errors: bool,
+    /// The resources as committed, for observers that index them (#1127);
+    /// collected only when one asked, so counting-only runs hold nothing.
+    committed_resources: Vec<crate::types::StoredResource>,
 }
+
+/// One ingested entry: its receipt, the rollback record its write warrants,
+/// and the resource as committed (absent when nothing was written).
+type IngestedEntry = (
+    BulkEntryResult,
+    Option<SubmissionChange>,
+    Option<crate::types::StoredResource>,
+);
+
+const BOOKKEEPING_FLUSH_SIZE: usize = 1000;
 
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -65,6 +77,12 @@ fn is_grouped_fresh_create_eligible(
     if entries.is_empty()
         || entries.len() > MAX_GROUPED_FRESH_CREATES
         || search_offloaded
+        // Grouped creates yield receipts and rollback records, not the
+        // resources as committed, so an observer that indexes them (#1127)
+        // would silently miss this batch. Today `search_offloaded` already
+        // excludes every wiring that attaches one; this keeps the invariant
+        // true if that ever changes.
+        || options.wants_committed_resources()
         || !options.defer_indexing
         || options.import_mode != ImportMode::Replace
         || !options.continue_on_error
@@ -121,6 +139,59 @@ fn fhir_version_from_output_format(output_format: Option<&str>) -> FhirVersion {
             })
         })
         .unwrap_or_else(FhirVersion::default_enabled)
+}
+
+/// Projection of a full `SubmissionManifest` row, shared by `get_manifest`
+/// and `list_manifests` so both select every field. The columns are decoded
+/// by name in [`decode_submission_manifest_row`], so their order here is
+/// only cosmetic.
+const SUBMISSION_MANIFEST_COLUMNS: &str = "\
+manifest_id, manifest_url, replaces_manifest_url, status, added_at, total_entries, \
+processed_entries, failed_entries, lease_expiry, bytes_processed, bytes_total, phase, \
+files_done, files_total";
+
+/// Decodes one `bulk_manifests` row selected with
+/// [`SUBMISSION_MANIFEST_COLUMNS`], reading every field by column name.
+///
+/// An unreadable `status` is an error, but an unreadable `phase` is not: it is
+/// a cosmetic hint, and a row written by a newer HFS must still be readable
+/// here (#953).
+fn decode_submission_manifest_row(row: &tokio_postgres::Row) -> StorageResult<SubmissionManifest> {
+    let manifest_id: String = row.get("manifest_id");
+    let manifest_url: Option<String> = row.get("manifest_url");
+    let replaces_manifest_url: Option<String> = row.get("replaces_manifest_url");
+    let status_str: String = row.get("status");
+    let added_at: DateTime<Utc> = row.get("added_at");
+    let total: i32 = row.get("total_entries");
+    let processed: i32 = row.get("processed_entries");
+    let failed: i32 = row.get("failed_entries");
+    let lease_expiry: Option<DateTime<Utc>> = row.get("lease_expiry");
+    let bytes_processed: i64 = row.get("bytes_processed");
+    let bytes_total: i64 = row.get("bytes_total");
+    let phase: Option<String> = row.get("phase");
+    let files_done: i64 = row.get("files_done");
+    let files_total: i64 = row.get("files_total");
+
+    let status: ManifestStatus = status_str
+        .parse()
+        .map_err(|_| internal_error(format!("Invalid manifest status: {}", status_str)))?;
+
+    Ok(SubmissionManifest {
+        manifest_id,
+        manifest_url,
+        replaces_manifest_url,
+        status,
+        added_at,
+        total_entries: total as u64,
+        processed_entries: processed as u64,
+        failed_entries: failed as u64,
+        lease_expiry,
+        bytes_processed: bytes_processed.max(0) as u64,
+        bytes_total: bytes_total.max(0) as u64,
+        phase: phase.and_then(|p| p.parse::<ManifestPhase>().ok()),
+        files_done: files_done.max(0) as u64,
+        files_total: files_total.max(0) as u64,
+    })
 }
 
 #[async_trait]
@@ -200,11 +271,28 @@ impl BulkSubmitProvider for PostgresBackend {
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
 
+        // The summary comes from the manifests' own counters, which every
+        // committed batch maintains in its transaction. It used to aggregate
+        // `bulk_entry_results`, one row per ingested resource, on every status
+        // poll — a cost that grew with the import and competed with the ingest
+        // for the same tables (#1127, #998).
         let rows = client
             .query(
-                "SELECT status, created_at, updated_at, completed_at, metadata
-                 FROM bulk_submissions
-                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3",
+                "SELECT s.status, s.created_at, s.updated_at, s.completed_at, s.metadata,
+                        m.manifest_count, m.total_entries, m.processed_entries,
+                        m.failed_entries, m.skipped_entries
+                 FROM bulk_submissions s
+                 CROSS JOIN LATERAL (
+                     SELECT COUNT(*) AS manifest_count,
+                            COALESCE(SUM(total_entries), 0)::BIGINT AS total_entries,
+                            COALESCE(SUM(processed_entries), 0)::BIGINT AS processed_entries,
+                            COALESCE(SUM(failed_entries), 0)::BIGINT AS failed_entries,
+                            COALESCE(SUM(skipped_entries), 0)::BIGINT AS skipped_entries
+                     FROM bulk_manifests
+                     WHERE tenant_id = s.tenant_id AND submitter = s.submitter
+                       AND submission_id = s.submission_id
+                 ) m
+                 WHERE s.tenant_id = $1 AND s.submitter = $2 AND s.submission_id = $3",
                 &[
                     &tenant_id,
                     &id.submitter.as_str(),
@@ -214,56 +302,23 @@ impl BulkSubmitProvider for PostgresBackend {
             .await
             .map_err(|e| internal_error(format!("Failed to get submission: {}", e)))?;
 
-        if rows.is_empty() {
+        let Some(row) = rows.first() else {
             return Ok(None);
-        }
-
-        let row = &rows[0];
+        };
         let status_str: String = row.get(0);
         let created_at: chrono::DateTime<Utc> = row.get(1);
         let updated_at: chrono::DateTime<Utc> = row.get(2);
         let completed_at: Option<chrono::DateTime<Utc>> = row.get(3);
         let metadata: Option<Value> = row.get(4);
+        let manifest_count: i64 = row.get(5);
+        let total: i64 = row.get(6);
+        let processed: i64 = row.get(7);
+        let failed: i64 = row.get(8);
+        let skipped: i64 = row.get(9);
 
         let status: SubmissionStatus = status_str
             .parse()
             .map_err(|_| internal_error(format!("Invalid status: {}", status_str)))?;
-
-        // Get manifest count
-        let manifest_row = client
-            .query_one(
-                "SELECT COUNT(*) FROM bulk_manifests
-                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3",
-                &[
-                    &tenant_id,
-                    &id.submitter.as_str(),
-                    &id.submission_id.as_str(),
-                ],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to count manifests: {}", e)))?;
-
-        let manifest_count: i64 = manifest_row.get(0);
-
-        // Get aggregated counts from entry results
-        let counts_row = client
-            .query_one(
-                "SELECT
-                    COUNT(*),
-                    SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN outcome IN ('validation-error', 'processing-error') THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN outcome = 'skipped' THEN 1 ELSE 0 END)
-                 FROM bulk_entry_results
-                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3",
-                &[&tenant_id, &id.submitter.as_str(), &id.submission_id.as_str()],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to count entries: {}", e)))?;
-
-        let total: i64 = counts_row.get(0);
-        let success: Option<i64> = counts_row.get(1);
-        let errors: Option<i64> = counts_row.get(2);
-        let skipped: Option<i64> = counts_row.get(3);
 
         Ok(Some(SubmissionSummary {
             id: id.clone(),
@@ -271,13 +326,46 @@ impl BulkSubmitProvider for PostgresBackend {
             created_at,
             updated_at,
             completed_at,
-            manifest_count: manifest_count as u32,
-            total_entries: total as u64,
-            success_count: success.unwrap_or(0) as u64,
-            error_count: errors.unwrap_or(0) as u64,
-            skipped_count: skipped.unwrap_or(0) as u64,
+            manifest_count: manifest_count.max(0) as u32,
+            total_entries: total.max(0) as u64,
+            // `processed_entries` counts successes only; skips have their own
+            // counter and errors include what the worker charged per file.
+            success_count: processed.max(0) as u64,
+            error_count: failed.max(0) as u64,
+            skipped_count: skipped.max(0) as u64,
             metadata,
         }))
+    }
+
+    async fn get_submission_status(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+    ) -> StorageResult<Option<SubmissionStatus>> {
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+
+        let row = query_opt_cached(
+            &client,
+            "SELECT status
+             FROM bulk_submissions
+             WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3",
+            &[
+                &tenant_id,
+                &id.submitter.as_str(),
+                &id.submission_id.as_str(),
+            ],
+        )
+        .await
+        .map_err(|e| internal_error(format!("Failed to get submission status: {}", e)))?;
+
+        row.map(|row| {
+            let status: String = row.get(0);
+            status
+                .parse()
+                .map_err(|_| internal_error(format!("Invalid status: {}", status)))
+        })
+        .transpose()
     }
 
     async fn list_submissions(
@@ -340,7 +428,7 @@ impl BulkSubmitProvider for PostgresBackend {
         &self,
         tenant: &TenantContext,
         id: &SubmissionId,
-    ) -> StorageResult<SubmissionSummary> {
+    ) -> StorageResult<()> {
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
 
@@ -389,10 +477,7 @@ impl BulkSubmitProvider for PostgresBackend {
             )
             .await
             .map_err(|e| internal_error(format!("Failed to complete submission: {}", e)))?;
-
-        self.get_submission(tenant, id)
-            .await?
-            .ok_or_else(|| internal_error("Submission disappeared".to_string()))
+        Ok(())
     }
 
     async fn abort_submission(
@@ -593,9 +678,11 @@ impl BulkSubmitProvider for PostgresBackend {
 
         let rows = client
             .query(
-                "SELECT manifest_url, replaces_manifest_url, status, added_at, total_entries, processed_entries, failed_entries, lease_expiry, bytes_processed, bytes_total, phase, files_done, files_total
-                 FROM bulk_manifests
-                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4",
+                &format!(
+                    "SELECT {SUBMISSION_MANIFEST_COLUMNS}
+                     FROM bulk_manifests
+                     WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4"
+                ),
                 &[
                     &tenant_id,
                     &submission_id.submitter.as_str(),
@@ -610,44 +697,7 @@ impl BulkSubmitProvider for PostgresBackend {
             return Ok(None);
         }
 
-        let row = &rows[0];
-        let manifest_url: Option<String> = row.get(0);
-        let replaces_manifest_url: Option<String> = row.get(1);
-        let status_str: String = row.get(2);
-        let added_at: chrono::DateTime<Utc> = row.get(3);
-        let total: i32 = row.get(4);
-        let processed: i32 = row.get(5);
-        let failed: i32 = row.get(6);
-        let lease_expiry: Option<chrono::DateTime<Utc>> = row.get(7);
-        let bytes_processed: i64 = row.get(8);
-        let bytes_total: i64 = row.get(9);
-        // Unlike `status`, an unreadable phase is not an error: it is a
-        // cosmetic hint, and a row written by a newer HFS must still be
-        // readable here (#953).
-        let phase: Option<String> = row.get(10);
-        let files_done: i64 = row.get(11);
-        let files_total: i64 = row.get(12);
-
-        let status: ManifestStatus = status_str
-            .parse()
-            .map_err(|_| internal_error(format!("Invalid manifest status: {}", status_str)))?;
-
-        Ok(Some(SubmissionManifest {
-            manifest_id: manifest_id.to_string(),
-            manifest_url,
-            replaces_manifest_url,
-            status,
-            added_at,
-            total_entries: total as u64,
-            processed_entries: processed as u64,
-            failed_entries: failed as u64,
-            lease_expiry,
-            bytes_processed: bytes_processed.max(0) as u64,
-            bytes_total: bytes_total.max(0) as u64,
-            phase: phase.and_then(|p| p.parse::<ManifestPhase>().ok()),
-            files_done: files_done.max(0) as u64,
-            files_total: files_total.max(0) as u64,
-        }))
+        Ok(Some(decode_submission_manifest_row(&rows[0])?))
     }
 
     async fn list_manifests(
@@ -658,11 +708,18 @@ impl BulkSubmitProvider for PostgresBackend {
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
 
+        // One query, one connection checkout: the previous shape selected the
+        // ids first and then called `get_manifest` per row while still holding
+        // this client, so on a pool of one connection the list waited for a
+        // connection it was itself holding until the pool timed out (#1144).
         let rows = client
             .query(
-                "SELECT manifest_id FROM bulk_manifests
-                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
-                 ORDER BY added_at",
+                &format!(
+                    "SELECT {SUBMISSION_MANIFEST_COLUMNS}
+                     FROM bulk_manifests
+                     WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
+                     ORDER BY added_at"
+                ),
                 &[
                     &tenant_id,
                     &submission_id.submitter.as_str(),
@@ -672,15 +729,9 @@ impl BulkSubmitProvider for PostgresBackend {
             .await
             .map_err(|e| internal_error(format!("Failed to query manifests: {}", e)))?;
 
-        let mut results = Vec::new();
+        let mut results = Vec::with_capacity(rows.len());
         for row in &rows {
-            let manifest_id: String = row.get(0);
-            if let Some(manifest) = self
-                .get_manifest(tenant, submission_id, &manifest_id)
-                .await?
-            {
-                results.push(manifest);
-            }
+            results.push(decode_submission_manifest_row(row)?);
         }
 
         Ok(results)
@@ -710,21 +761,25 @@ impl BulkSubmitProvider for PostgresBackend {
             ));
         }
 
-        // Update manifest status to processing, on a client scoped to this one
-        // statement.
+        // Promote a pending manifest to processing, on a client scoped to this
+        // one statement.
         //
-        // `status IN ('pending', 'processing')` keeps it a promotion rather
-        // than a reset: the statement runs on *every* batch, so without the
-        // guard the batch that lands right after `abort_submission` moved the
-        // manifest to `'failed'` would quietly put it back to `'processing'`
-        // and the abort would read as if it had never happened (#968).
+        // `status = 'pending'` makes this the promotion of the first batch and
+        // nothing else. The shared engine runs the statement on *every* batch,
+        // both in synchronous `process_entries` calls and in the lease-holding
+        // worker that reaches it through `process_ndjson_stream`, and once the
+        // manifest is `processing` the later batches must leave the column
+        // alone instead of rewriting the value it already has. Every other
+        // state, whether `failed` after `abort_submission` moved the manifest,
+        // `replaced`, or any terminal status, matches nothing, so an abort
+        // cannot read as if it had never happened (#968).
         {
             let client = self.get_client().await?;
             client
                 .execute(
                     "UPDATE bulk_manifests SET status = 'processing'
                      WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4
-                       AND status IN ('pending', 'processing')",
+                       AND status = 'pending'",
                     &[
                         &tenant_id,
                         &submission_id.submitter.as_str(),
@@ -757,7 +812,6 @@ impl BulkSubmitProvider for PostgresBackend {
             transaction_options.clone(),
         )
         .await?;
-
         let processed = if is_grouped_fresh_create_eligible(
             &entries,
             options,
@@ -768,27 +822,28 @@ impl BulkSubmitProvider for PostgresBackend {
                 .await
             {
                 Ok(Some(provisional)) => {
-                    let mut results = Vec::with_capacity(provisional.len());
                     // Resource and history rows are durable within the
                     // transaction now. Only at this point may their receipts
                     // and rollback records be staged: a grouped-write failure
                     // must leave no bookkeeping that could be replayed.
-                    for (entry_result, change) in provisional {
-                        Self::write_entry_rows_tx(
-                            &txn,
-                            submission_id,
-                            manifest_id,
-                            file_url,
-                            &entry_result,
-                            Some(&change),
-                        )
-                        .await?;
-                        results.push(entry_result);
-                    }
+                    let (results, changes): (Vec<BulkEntryResult>, Vec<SubmissionChange>) =
+                        provisional.into_iter().unzip();
+                    Self::flush_entry_rows_tx(
+                        &txn,
+                        submission_id,
+                        manifest_id,
+                        file_url,
+                        &results,
+                        &changes,
+                    )
+                    .await?;
                     ProcessedEntryBatch {
                         results,
-                        error_count: 0,
                         aborted_on_max_errors: false,
+                        // Grouped creates never run while an observer wants
+                        // the committed resources; see
+                        // `is_grouped_fresh_create_eligible`.
+                        committed_resources: Vec::new(),
                     }
                 }
                 Ok(None) => {
@@ -845,14 +900,120 @@ impl BulkSubmitProvider for PostgresBackend {
 
         let ProcessedEntryBatch {
             results,
-            error_count,
             aborted_on_max_errors,
+            committed_resources,
         } = processed;
 
+        // Charge the batch to the manifest's counters inside the batch
+        // transaction, so they commit (or vanish) with the rows they describe.
+        //
+        // Counters accumulate across runs and never move backwards (#969), but
+        // a line of a file is charged only once: `bulk_manifest_file_progress`
+        // remembers the highest line already counted per file, and a re-walk
+        // of that file (lost lease, reclaim, whole-file retry) adds only the
+        // lines beyond it. Without that, every pass added the whole file again
+        // and `total_entries` reported a multiple of the manifest (#1127).
+        // Callers without a file URL have no line identity to key on and keep
+        // plain accumulation.
+        //
+        // Last before the commit on purpose: the manifest row lock taken here is
+        // held only for the commit, not for the batch's entry writes, so the
+        // lease heartbeat never waits behind a batch.
+        {
+            let client = txn.raw_client()?;
+            let submitter = submission_id.submitter.as_str();
+            let sub_id_str = submission_id.submission_id.as_str();
+            let tally = match options.file_url.as_deref() {
+                Some(url) => {
+                    // Creates the file's row or locks the existing one, and
+                    // returns what earlier passes already counted.
+                    let row = client
+                        .query_one(
+                            "INSERT INTO bulk_manifest_file_progress
+                                (tenant_id, submitter, submission_id, manifest_id, file_url)
+                             VALUES ($1, $2, $3, $4, $5)
+                             ON CONFLICT (tenant_id, submitter, submission_id, manifest_id, file_url)
+                             DO UPDATE SET max_line = bulk_manifest_file_progress.max_line
+                             RETURNING max_line",
+                            &[&tenant_id, &submitter, &sub_id_str, &manifest_id, &url],
+                        )
+                        .await
+                        .map_err(|e| {
+                            internal_error(format!("Failed to lock file progress: {}", e))
+                        })?;
+                    let counted: i64 = row.get(0);
+                    let tally = BatchTally::beyond(&results, Some(counted.max(0) as u64));
+                    client
+                        .execute(
+                            "UPDATE bulk_manifest_file_progress SET
+                                max_line = GREATEST(max_line, $1::BIGINT),
+                                total_entries = total_entries + $2::BIGINT,
+                                processed_entries = processed_entries + $3::BIGINT,
+                                failed_entries = failed_entries + $4::BIGINT,
+                                skipped_entries = skipped_entries + $5::BIGINT
+                             WHERE tenant_id = $6 AND submitter = $7 AND submission_id = $8
+                               AND manifest_id = $9 AND file_url = $10",
+                            &[
+                                &tally.last_line,
+                                &tally.entries,
+                                &tally.succeeded,
+                                &tally.failed,
+                                &tally.skipped,
+                                &tenant_id,
+                                &submitter,
+                                &sub_id_str,
+                                &manifest_id,
+                                &url,
+                            ],
+                        )
+                        .await
+                        .map_err(|e| {
+                            internal_error(format!("Failed to update file progress: {}", e))
+                        })?;
+                    tally
+                }
+                None => BatchTally::beyond(&results, None),
+            };
+            // `processed_entries` counts successes, `skipped_entries` the
+            // deliberate skips, and `last_processed_line` advances by the
+            // entries newly charged (#969, #954).
+            client
+                .execute(
+                    "UPDATE bulk_manifests SET
+                        total_entries = total_entries + $1,
+                        processed_entries = processed_entries + $2,
+                        failed_entries = failed_entries + $3,
+                        skipped_entries = skipped_entries + $4,
+                        last_processed_line = last_processed_line + $5
+                     WHERE tenant_id = $6 AND submitter = $7 AND submission_id = $8 AND manifest_id = $9",
+                    &[
+                        &(tally.entries as i32),
+                        &(tally.succeeded as i32),
+                        &(tally.failed as i32),
+                        &(tally.skipped as i32),
+                        &tally.entries,
+                        &tenant_id,
+                        &submitter,
+                        &sub_id_str,
+                        &manifest_id,
+                    ],
+                )
+                .await
+                .map_err(|e| internal_error(format!("Failed to update manifest counts: {}", e)))?;
+        }
+
         crate::core::Transaction::commit(Box::new(txn)).await?;
-        // Durable now: report it before the max-errors return and the separate
-        // counter statement below, so neither can lose committed work (#1078).
-        options.notify_batch_committed(tenant, submission_id, manifest_id, &results);
+        // Durable now: report it before the max-errors return, so it cannot
+        // lose committed work (#1078).
+        options
+            .notify_batch_committed(
+                tenant,
+                submission_id,
+                manifest_id,
+                &results,
+                &committed_resources,
+            )
+            .await;
 
         if aborted_on_max_errors {
             return Err(StorageError::BulkSubmit(
@@ -863,38 +1024,8 @@ impl BulkSubmitProvider for PostgresBackend {
             ));
         }
 
-        // Update manifest counts, on a fresh client for the tail statements.
-        //
-        // Every column here accumulates: these counters are cumulative across
-        // all runs of the manifest (including resumes) and are the ones the
-        // submit status endpoint reports (#969). `processed_entries` counts the
-        // entries that did not fail — successes plus deliberate skips — so that
-        // `processed_entries + failed_entries` equals the entries walked, and
-        // `last_processed_line` advances by the entries this batch consumed.
         let now = Utc::now();
         let client = self.get_client().await?;
-        client
-            .execute(
-                "UPDATE bulk_manifests SET
-                    total_entries = total_entries + $1,
-                    processed_entries = processed_entries + $2,
-                    failed_entries = failed_entries + $3,
-                    last_processed_line = last_processed_line + $4
-                 WHERE tenant_id = $5 AND submitter = $6 AND submission_id = $7 AND manifest_id = $8",
-                &[
-                    &(results.len() as i32),
-                    &(results.iter().filter(|r| r.is_success()).count() as i32),
-                    &(error_count as i32),
-                    &(results.len() as i64),
-                    &tenant_id,
-                    &submission_id.submitter.as_str(),
-                    &submission_id.submission_id.as_str(),
-                    &manifest_id,
-                ],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to update manifest counts: {}", e)))?;
-
         // Update submission updated_at
         client
             .execute(
@@ -1007,6 +1138,7 @@ impl BulkSubmitProvider for PostgresBackend {
                         resource_type,
                         resource_id,
                         created: created.unwrap_or(false),
+                        unchanged: false,
                         outcome,
                         operation_outcome,
                     },
@@ -1195,9 +1327,14 @@ impl PostgresBackend {
         options: &BulkProcessingOptions,
     ) -> StorageResult<ProcessedEntryBatch> {
         let mut results = Vec::with_capacity(entries.len());
+        let mut unflushed_result_start = 0;
+        let mut pending_changes = Vec::with_capacity(BOOKKEEPING_FLUSH_SIZE);
         let mut error_count = 0u32;
         let mut aborted_on_max_errors = false;
         let file_url = options.file_url.as_deref().unwrap_or("");
+        // Collected only when an observer asked for them (#1127).
+        let want_resources = options.wants_committed_resources();
+        let mut committed_resources = Vec::new();
 
         for entry in entries {
             if options.max_errors > 0 && error_count >= options.max_errors {
@@ -1210,16 +1347,20 @@ impl PostgresBackend {
                     &entry.resource_type,
                     "max errors exceeded",
                 );
-                Self::write_entry_rows_tx(
-                    txn,
-                    submission_id,
-                    manifest_id,
-                    file_url,
-                    &skip_result,
-                    None,
-                )
-                .await?;
                 results.push(skip_result);
+                if results.len() - unflushed_result_start == BOOKKEEPING_FLUSH_SIZE {
+                    Self::flush_entry_rows_tx(
+                        txn,
+                        submission_id,
+                        manifest_id,
+                        file_url,
+                        &results[unflushed_result_start..],
+                        &pending_changes,
+                    )
+                    .await?;
+                    unflushed_result_start = results.len();
+                    pending_changes.clear();
+                }
                 continue;
             }
 
@@ -1236,8 +1377,8 @@ impl PostgresBackend {
                 Ok(pair) => txn.release_savepoint("bulk_entry").await.map(|_| pair),
                 Err(error) => Err(error),
             };
-            let (entry_result, change) = match outcome {
-                Ok(pair) => pair,
+            let (entry_result, change, stored) = match outcome {
+                Ok(ingested) => ingested,
                 Err(error) => {
                     txn.rollback_to_savepoint("bulk_entry")
                         .await
@@ -1256,7 +1397,7 @@ impl PostgresBackend {
                             }]
                         }),
                     );
-                    (failed, None)
+                    (failed, None, None)
                 }
             };
 
@@ -1264,22 +1405,42 @@ impl PostgresBackend {
                 error_count += 1;
             }
 
-            Self::write_entry_rows_tx(
-                txn,
-                submission_id,
-                manifest_id,
-                file_url,
-                &entry_result,
-                change.as_ref(),
-            )
-            .await?;
+            if let Some(change) = change {
+                pending_changes.push(change);
+            }
             results.push(entry_result);
+            if want_resources && let Some(stored) = stored {
+                committed_resources.push(stored);
+            }
+            if results.len() - unflushed_result_start == BOOKKEEPING_FLUSH_SIZE {
+                Self::flush_entry_rows_tx(
+                    txn,
+                    submission_id,
+                    manifest_id,
+                    file_url,
+                    &results[unflushed_result_start..],
+                    &pending_changes,
+                )
+                .await?;
+                unflushed_result_start = results.len();
+                pending_changes.clear();
+            }
         }
+
+        Self::flush_entry_rows_tx(
+            txn,
+            submission_id,
+            manifest_id,
+            file_url,
+            &results[unflushed_result_start..],
+            &pending_changes,
+        )
+        .await?;
 
         Ok(ProcessedEntryBatch {
             results,
-            error_count,
             aborted_on_max_errors,
+            committed_resources,
         })
     }
 
@@ -1297,7 +1458,7 @@ impl PostgresBackend {
         manifest_id: &str,
         entry: &NdjsonEntry,
         options: &BulkProcessingOptions,
-    ) -> StorageResult<(BulkEntryResult, Option<SubmissionChange>)> {
+    ) -> StorageResult<IngestedEntry> {
         use crate::core::Transaction;
 
         if let Some(id) = entry.resource_id.as_ref() {
@@ -1311,6 +1472,26 @@ impl PostgresBackend {
                                 "updates not allowed",
                             ),
                             None,
+                            None,
+                        ));
+                    }
+
+                    // Update the resource, honoring the submission's import mode.
+                    let content = options.content_for_update(current.content(), &entry.resource);
+
+                    // Opt-in (#1127): a replayed manifest re-sends byte-identical
+                    // resources; writing them again only adds a history version
+                    // and index churn. Nothing is written, so there is nothing
+                    // to roll back and nothing new to index.
+                    if options.skip_unchanged && content_unchanged(current.content(), &content) {
+                        return Ok((
+                            BulkEntryResult::success_unchanged(
+                                entry.line_number,
+                                &entry.resource_type,
+                                current.id(),
+                            ),
+                            None,
+                            None,
                         ));
                     }
 
@@ -1322,9 +1503,6 @@ impl PostgresBackend {
                         (current.version_id().parse::<i32>().unwrap_or(0) + 1).to_string(),
                         current.content().clone(),
                     );
-
-                    // Update the resource, honoring the submission's import mode.
-                    let content = options.content_for_update(current.content(), &entry.resource);
                     let updated = txn.update(&current, content).await?;
 
                     Ok((
@@ -1335,6 +1513,7 @@ impl PostgresBackend {
                             false,
                         ),
                         Some(change),
+                        Some(updated),
                     ))
                 }
                 None => {
@@ -1356,6 +1535,7 @@ impl PostgresBackend {
                             true,
                         ),
                         Some(change),
+                        Some(created),
                     ))
                 }
             }
@@ -1378,74 +1558,99 @@ impl PostgresBackend {
                     true,
                 ),
                 Some(change),
+                Some(created),
             ))
         }
     }
 
-    /// Writes an entry's rollback record and per-line receipt on the batch
-    /// transaction's client, so both commit (or vanish) with the entry writes.
-    async fn write_entry_rows_tx(
+    /// Flushes rollback records and per-line receipts on the batch transaction's
+    /// client, so they commit (or vanish) with the entry writes.
+    async fn flush_entry_rows_tx(
         txn: &super::transaction::PostgresTransaction,
         submission_id: &SubmissionId,
         manifest_id: &str,
         file_url: &str,
-        result: &BulkEntryResult,
-        change: Option<&SubmissionChange>,
+        results: &[BulkEntryResult],
+        changes: &[SubmissionChange],
     ) -> StorageResult<()> {
         use crate::core::Transaction;
+
+        if results.is_empty() && changes.is_empty() {
+            return Ok(());
+        }
 
         let client = txn.raw_client()?;
         let tenant_id = txn.tenant().tenant_id().as_str().to_string();
 
-        let previous_content_json: Option<Value> = change
-            .map(|c| c.previous_content.clone())
-            .unwrap_or_default();
-        let outcome_json: Option<Value> = result.operation_outcome.clone();
-
         // The two bookkeeping inserts are independent: pipelined on the
         // transaction's connection they cost one round trip, not two.
         let record_change = async {
-            let Some(change) = change else {
+            if changes.is_empty() {
                 return Ok(0);
-            };
+            }
+            let change_ids: Vec<String> = changes.iter().map(|c| c.change_id.clone()).collect();
+            let change_manifest_ids: Vec<String> =
+                changes.iter().map(|c| c.manifest_id.clone()).collect();
+            let change_types: Vec<String> =
+                changes.iter().map(|c| c.change_type.to_string()).collect();
+            let change_resource_types: Vec<String> =
+                changes.iter().map(|c| c.resource_type.clone()).collect();
+            let change_resource_ids: Vec<String> =
+                changes.iter().map(|c| c.resource_id.clone()).collect();
+            let previous_versions: Vec<Option<String>> =
+                changes.iter().map(|c| c.previous_version.clone()).collect();
+            let new_versions: Vec<String> = changes.iter().map(|c| c.new_version.clone()).collect();
+            let previous_contents: Vec<Option<Value>> =
+                changes.iter().map(|c| c.previous_content.clone()).collect();
+            let changed_at: Vec<DateTime<Utc>> = changes.iter().map(|c| c.changed_at).collect();
             super::cached::execute_cached(
                 client,
                     "INSERT INTO bulk_submission_changes
                      (tenant_id, submitter, submission_id, change_id, manifest_id, change_type, resource_type, resource_id, previous_version, new_version, previous_content, changed_at)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                     SELECT $1, $2, $3, *
+                     FROM UNNEST(
+                         $4::text[], $5::text[], $6::text[], $7::text[],
+                         $8::text[], $9::text[], $10::text[], $11::jsonb[],
+                         $12::timestamptz[]
+                     )",
                     &[
                         &tenant_id,
                         &submission_id.submitter.as_str(),
                         &submission_id.submission_id.as_str(),
-                        &change.change_id.as_str(),
-                        &change.manifest_id.as_str(),
-                        &change.change_type.to_string().as_str(),
-                        &change.resource_type.as_str(),
-                        &change.resource_id.as_str(),
-                        &change.previous_version,
-                        &change.new_version.as_str(),
-                        &previous_content_json,
-                        &change.changed_at,
+                        &change_ids,
+                        &change_manifest_ids,
+                        &change_types,
+                        &change_resource_types,
+                        &change_resource_ids,
+                        &previous_versions,
+                        &new_versions,
+                        &previous_contents,
+                        &changed_at,
                     ],
                 )
                 .await
         };
-        let submitter = submission_id.submitter.as_str();
-        let sub_id_str = submission_id.submission_id.as_str();
-        let line_number = result.line_number as i32;
-        let result_type = result.resource_type.as_str();
-        let outcome_code = result.outcome.to_string();
+        let line_numbers: Vec<i32> = results.iter().map(|r| r.line_number as i32).collect();
+        let result_types: Vec<String> = results.iter().map(|r| r.resource_type.clone()).collect();
+        let resource_ids: Vec<Option<String>> =
+            results.iter().map(|r| r.resource_id.clone()).collect();
+        let created: Vec<bool> = results.iter().map(|r| r.created).collect();
+        let outcome_codes: Vec<String> = results.iter().map(|r| r.outcome.to_string()).collect();
+        let outcome_json: Vec<Option<Value>> = results
+            .iter()
+            .map(|r| r.operation_outcome.clone())
+            .collect();
         let receipt_params: [&(dyn tokio_postgres::types::ToSql + Sync); 11] = [
             &tenant_id,
-            &submitter,
-            &sub_id_str,
+            &submission_id.submitter.as_str(),
+            &submission_id.submission_id.as_str(),
             &manifest_id,
             &file_url,
-            &line_number,
-            &result_type,
-            &result.resource_id,
-            &result.created,
-            &outcome_code,
+            &line_numbers,
+            &result_types,
+            &resource_ids,
+            &created,
+            &outcome_codes,
             &outcome_json,
         ];
         let store_receipt = super::cached::execute_cached(
@@ -1453,9 +1658,27 @@ impl PostgresBackend {
             // Upsert: the worker re-fetches a whole file after a transient
             // failure, and the retry must overwrite its own earlier rows
             // instead of colliding with them (#457).
-            "INSERT INTO bulk_entry_results
+            "WITH receipt_rows AS (
+                 SELECT $5::text AS file_url, rows.*
+                 FROM UNNEST(
+                     $6::integer[], $7::text[], $8::text[], $9::boolean[],
+                     $10::text[], $11::jsonb[]
+                 ) WITH ORDINALITY AS rows(
+                     line_number, resource_type, resource_id, created,
+                     outcome, operation_outcome, ordinal
+                 )
+             ), latest_receipts AS (
+                 SELECT DISTINCT ON (file_url, line_number)
+                     file_url, line_number, resource_type, resource_id,
+                     created, outcome, operation_outcome
+                 FROM receipt_rows
+                 ORDER BY file_url, line_number, ordinal DESC
+             )
+             INSERT INTO bulk_entry_results
              (tenant_id, submitter, submission_id, manifest_id, file_url, line_number, resource_type, resource_id, created, outcome, operation_outcome)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             SELECT $1, $2, $3, $4, file_url, line_number, resource_type,
+                    resource_id, created, outcome, operation_outcome
+             FROM latest_receipts
              ON CONFLICT (tenant_id, submitter, submission_id, manifest_id, file_url, line_number)
              DO UPDATE SET resource_type = EXCLUDED.resource_type,
                            resource_id = EXCLUDED.resource_id,
@@ -1494,10 +1717,15 @@ impl StreamingBulkSubmitProvider for PostgresBackend {
 
         loop {
             let mut line = String::new();
-            let bytes_read = reader
-                .read_line(&mut line)
-                .await
-                .map_err(|e| internal_error(format!("Failed to read line: {}", e)))?;
+            let bytes_read = reader.read_line(&mut line).await.map_err(|e| {
+                // #1127: surface the reader's own message (e.g. the
+                // fetcher's give-up text) unprefixed so it reaches the
+                // manifest's error artifact intact.
+                StorageError::BulkSubmit(BulkSubmitError::InputStream {
+                    message: e.to_string(),
+                    source: Some(Box::new(e)),
+                })
+            })?;
 
             if bytes_read == 0 {
                 break;
@@ -3029,10 +3257,165 @@ async fn insert_publication_files(
     Ok(())
 }
 
+/// What one committed batch adds to its manifest's counters.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct BatchTally {
+    entries: i64,
+    succeeded: i64,
+    failed: i64,
+    skipped: i64,
+    /// The highest line charged so far, this batch included.
+    last_line: i64,
+}
+
+impl BatchTally {
+    /// Tallies the entries of `results` whose line lies beyond `counted`, the
+    /// highest line an earlier pass over the same file already charged.
+    /// `None` charges every entry.
+    fn beyond(results: &[BulkEntryResult], counted: Option<u64>) -> Self {
+        let floor = counted.unwrap_or(0);
+        let mut tally = Self {
+            last_line: floor as i64,
+            ..Self::default()
+        };
+        for result in results
+            .iter()
+            .filter(|r| counted.is_none_or(|c| r.line_number > c))
+        {
+            tally.entries += 1;
+            match result.outcome {
+                BulkEntryOutcome::Success => tally.succeeded += 1,
+                BulkEntryOutcome::Skipped => tally.skipped += 1,
+                _ if result.is_error() => tally.failed += 1,
+                _ => {}
+            }
+            tally.last_line = tally.last_line.max(result.line_number as i64);
+        }
+        tally
+    }
+}
+
+/// Resource fields that change on every write without changing the resource.
+const VOLATILE_META: [&str; 2] = ["versionId", "lastUpdated"];
+
+/// True when writing `next` over `stored` would change nothing but the
+/// server-assigned `meta.versionId` / `meta.lastUpdated`.
+///
+/// Compared as parsed JSON, so key order does not matter. A false "changed"
+/// (for instance a number the store re-renders) only costs the write that
+/// would have happened anyway; it never drops a real change.
+fn content_unchanged(stored: &Value, next: &Value) -> bool {
+    let (Some(stored), Some(next)) = (stored.as_object(), next.as_object()) else {
+        return stored == next;
+    };
+    let body = |fields: &serde_json::Map<String, Value>| {
+        fields
+            .iter()
+            .filter(|(key, _)| key.as_str() != "meta")
+            .count()
+    };
+    body(stored) == body(next)
+        && stored
+            .iter()
+            .filter(|(key, _)| key.as_str() != "meta")
+            .all(|(key, value)| next.get(key) == Some(value))
+        && stable_meta(stored.get("meta")) == stable_meta(next.get("meta"))
+}
+
+/// `meta` without its volatile fields; `None` when nothing else is left.
+fn stable_meta(meta: Option<&Value>) -> Option<Value> {
+    match meta? {
+        Value::Object(fields) => {
+            let kept: serde_json::Map<String, Value> = fields
+                .iter()
+                .filter(|(key, _)| !VOLATILE_META.contains(&key.as_str()))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            (!kept.is_empty()).then_some(Value::Object(kept))
+        }
+        other => Some(other.clone()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_rewalked_file_charges_only_lines_beyond_what_was_counted() {
+        let results = vec![
+            BulkEntryResult::success(3, "Patient", "p3", false),
+            BulkEntryResult::success(4, "Patient", "p4", true),
+            BulkEntryResult::skipped(5, "Patient", "updates not allowed"),
+            BulkEntryResult::validation_error(6, "Patient", json!({})),
+        ];
+
+        let first_pass = BatchTally::beyond(&results, Some(2));
+        assert_eq!(
+            first_pass,
+            BatchTally {
+                entries: 4,
+                succeeded: 2,
+                failed: 1,
+                skipped: 1,
+                last_line: 6,
+            }
+        );
+
+        let rewalk = BatchTally::beyond(&results, Some(6));
+        assert_eq!(rewalk.entries, 0, "every line was already charged");
+        assert_eq!(rewalk.last_line, 6, "the high-water mark never moves back");
+
+        let partial = BatchTally::beyond(&results, Some(4));
+        assert_eq!(
+            (partial.entries, partial.skipped, partial.failed),
+            (2, 1, 1)
+        );
+    }
+
+    #[test]
+    fn a_batch_without_a_file_charges_every_entry() {
+        let results = vec![
+            BulkEntryResult::success(1, "Patient", "a", true),
+            BulkEntryResult::success(1, "Patient", "b", true),
+        ];
+        let tally = BatchTally::beyond(&results, None);
+        assert_eq!((tally.entries, tally.succeeded), (2, 2));
+    }
+
+    #[test]
+    fn identical_content_ignores_only_server_assigned_meta() {
+        let stored = json!({
+            "resourceType": "Patient",
+            "id": "p1",
+            "meta": {"versionId": "3", "lastUpdated": "2026-01-01T00:00:00Z"},
+            "name": [{"family": "Doe"}],
+        });
+        let replay = json!({
+            "name": [{"family": "Doe"}],
+            "id": "p1",
+            "resourceType": "Patient",
+        });
+        assert!(content_unchanged(&stored, &replay));
+
+        let renamed = json!({"resourceType": "Patient", "id": "p1", "name": [{"family": "Roe"}]});
+        assert!(!content_unchanged(&stored, &renamed));
+
+        let extra = json!({"resourceType": "Patient", "id": "p1", "name": [{"family": "Doe"}], "gender": "male"});
+        assert!(!content_unchanged(&stored, &extra));
+
+        let tagged = json!({
+            "resourceType": "Patient",
+            "id": "p1",
+            "meta": {"versionId": "9", "tag": [{"code": "x"}]},
+            "name": [{"family": "Doe"}],
+        });
+        assert!(
+            !content_unchanged(&stored, &tagged),
+            "a tag is part of the resource, not server bookkeeping"
+        );
+    }
 
     fn eligible_options() -> BulkProcessingOptions {
         BulkProcessingOptions {

@@ -821,7 +821,12 @@ impl From<StorageError> for RestError {
                     | B::MaxErrorsExceeded { .. } => {
                         RestError::UnprocessableEntity { message: msg }
                     }
-                    B::RollbackFailed { .. } => RestError::InternalError { message: msg },
+                    // #1127: a submitted file's body broke mid-stream. That is
+                    // a server-side ingest failure, not a bad submission, so
+                    // it classifies with the other internal failures.
+                    B::RollbackFailed { .. } | B::InputStream { .. } => {
+                        RestError::InternalError { message: msg }
+                    }
                 }
             }
         }
@@ -956,6 +961,19 @@ impl From<ValidationError> for RestError {
 impl From<SearchError> for RestError {
     fn from(err: SearchError) -> Self {
         match err {
+            // Named after the parameter, like the extractor's own value errors.
+            SearchError::InvalidDateValue { param, reason, .. } => RestError::InvalidParameter {
+                param,
+                message: reason,
+            },
+            SearchError::InvalidNumberValue { param, reason, .. } => RestError::InvalidParameter {
+                param,
+                message: reason,
+            },
+            SearchError::EmptyValue { param } => RestError::InvalidParameter {
+                param,
+                message: helios_persistence::search::EMPTY_VALUE_REASON.to_string(),
+            },
             SearchError::UnsupportedParameterType { .. }
             | SearchError::UnsupportedModifier { .. }
             | SearchError::InvalidComposite { .. }
@@ -966,7 +984,8 @@ impl From<SearchError> for RestError {
             SearchError::ChainedSearchNotSupported { .. }
             | SearchError::ReverseChainNotSupported
             | SearchError::IncludeNotSupported { .. }
-            | SearchError::TextSearchNotAvailable => RestError::NotImplemented {
+            | SearchError::TextSearchNotAvailable
+            | SearchError::TerminologyRequired { .. } => RestError::NotImplemented {
                 feature: err.to_string(),
             },
             SearchError::TooManyResults { count, max } => RestError::UnprocessableEntity {
@@ -1370,6 +1389,28 @@ mod tests {
             message: "db down".to_string(),
         });
         assert_eq!(status_of(err), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn test_bulk_submit_input_stream_maps_to_500() {
+        use helios_persistence::error::BulkSubmitError;
+        let err = StorageError::BulkSubmit(BulkSubmitError::InputStream {
+            message: "reading file http://host/p.ndjson?[redacted]: connection reset by peer \
+                      (gave up after 512 bytes and 3 retries)"
+                .to_string(),
+            source: None,
+        });
+        // #1127: the reader's message reaches the response body unprefixed.
+        let rest = RestError::from(err);
+        assert!(
+            rest.to_string().contains("gave up after 512 bytes"),
+            "unexpected message: {rest}"
+        );
+        assert!(!rest.to_string().contains("parse error at line"));
+        assert_eq!(
+            rest.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     // ── ServiceUnavailable (503) — over-capacity / pool exhaustion ─

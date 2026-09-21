@@ -127,6 +127,9 @@ fn test_tenant() -> TenantContext {
     )
 }
 
+/// Claim cap for tests that are not exercising the cap itself.
+const TEST_MAX_ATTEMPTS: u32 = 3;
+
 /// Drains all currently-claimable export jobs by running a worker synchronously.
 async fn drain_workers(backend: &Arc<SqliteBackend>, output: &Arc<LocalFsOutputStore>) {
     let worker_id = WorkerId::new("test-worker");
@@ -137,7 +140,7 @@ async fn drain_workers(backend: &Arc<SqliteBackend>, output: &Arc<LocalFsOutputS
         worker_id.clone(),
     );
     while let Some(lease) = backend
-        .claim_next(&worker_id, Duration::from_secs(60))
+        .claim_next(&worker_id, Duration::from_secs(60), TEST_MAX_ATTEMPTS)
         .await
         .expect("claim_next")
     {
@@ -407,7 +410,7 @@ async fn test_status_poll_reports_types_progress_while_in_flight() {
     // it in-progress, and record that one of the three types is done.
     let worker_id = WorkerId::new("t");
     let lease = backend
-        .claim_next(&worker_id, Duration::from_secs(60))
+        .claim_next(&worker_id, Duration::from_secs(60), TEST_MAX_ATTEMPTS)
         .await
         .expect("claim_next")
         .expect("a job is claimable right after kick-off");
@@ -529,7 +532,7 @@ async fn test_status_poll_percent_is_capped_at_99_while_running() {
 
     let worker_id = WorkerId::new("t");
     let lease = backend
-        .claim_next(&worker_id, Duration::from_secs(60))
+        .claim_next(&worker_id, Duration::from_secs(60), TEST_MAX_ATTEMPTS)
         .await
         .expect("claim_next")
         .expect("a job is claimable right after kick-off");
@@ -715,7 +718,7 @@ async fn test_failed_job_status_poll_returns_operation_outcome_with_diagnostics(
         worker_id.clone(),
     );
     while let Some(lease) = backend
-        .claim_next(&worker_id, Duration::from_secs(60))
+        .claim_next(&worker_id, Duration::from_secs(60), TEST_MAX_ATTEMPTS)
         .await
         .expect("claim_next")
     {
@@ -860,6 +863,50 @@ async fn test_type_filter_invalid_value_rejected() {
     assert!(text.contains("_typeFilter"), "got: {text}");
 }
 
+/// #1366: a `_typeFilter` is compiled by the version-aware query builder, so a
+/// `:[type]` qualifier must name a resource type of the FHIR version searches
+/// run in. (R4-only test build: a type that is none is what can be observed.)
+#[tokio::test]
+async fn test_type_filter_type_qualifier_is_validated() {
+    let (server, backend, _output, _tmp) = create_bulk_export_server().await;
+    let kickoff = |filter: &'static str| {
+        server
+            .get("/$export")
+            .add_header("x-tenant-id", "test-tenant")
+            .add_header("prefer", "respond-async")
+            .add_query_param("_type", "Observation")
+            .add_query_param("_typeFilter", filter)
+    };
+
+    let resp = kickoff("Observation?subject:Bogus=p1").await;
+    assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST);
+    let body: Value = resp.json();
+    let text = body["issue"][0]["details"]["text"].as_str().unwrap();
+    assert!(text.contains("_typeFilter"), "got: {text}");
+    assert!(
+        text.contains("neither a search modifier nor a resource type of FHIR R4"),
+        "got: {text}"
+    );
+    assert_eq!(
+        backend.count_active_exports(&test_tenant()).await.unwrap(),
+        0,
+        "no job should be created when the type filter is rejected"
+    );
+
+    // Only a multi-version build has a type of another version to offer
+    // (`--features R4,R4B,R5,R6`): R5's ActorDefinition on an R4 server.
+    #[cfg(all(feature = "R4", feature = "R5"))]
+    {
+        let resp = kickoff("Observation?subject:ActorDefinition=a1").await;
+        assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST);
+        assert!(resp.text().contains("nor a resource type of FHIR R4"));
+    }
+
+    // A real resource type is accepted.
+    let resp = kickoff("Observation?subject:Patient=p1").await;
+    assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
+}
+
 #[tokio::test]
 async fn test_type_filter_unknown_param_rejected_even_when_lenient() {
     let (server, _backend, _output, _tmp) = create_bulk_export_server().await;
@@ -999,7 +1046,7 @@ async fn test_valid_type_filter_accepted() {
     // the worker to reinterpret the raw query string.
     let worker_id = WorkerId::new("t");
     let lease = backend
-        .claim_next(&worker_id, Duration::from_secs(60))
+        .claim_next(&worker_id, Duration::from_secs(60), TEST_MAX_ATTEMPTS)
         .await
         .expect("claim_next")
         .expect("a job should be claimable");

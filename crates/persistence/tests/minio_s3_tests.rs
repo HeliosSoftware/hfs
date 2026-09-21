@@ -35,6 +35,9 @@ use testcontainers::{GenericImage, ImageExt};
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
+#[path = "common/container_cleanup.rs"]
+mod container_cleanup;
+
 const DEFAULT_MINIO_IMAGE: &str = "quay.io/minio/minio";
 const DEFAULT_MINIO_TAG: &str = "RELEASE.2025-02-28T09-55-16Z";
 const DEFAULT_MINIO_ROOT_USER: &str = "minioadmin";
@@ -44,6 +47,8 @@ struct SharedMinio {
     endpoint_url: String,
     root_user: String,
     root_password: String,
+    /// Kept alive for the duration of the test binary; the
+    /// `container_cleanup` exit hook removes it at process exit.
     _container: testcontainers::ContainerAsync<GenericImage>,
 }
 
@@ -105,18 +110,22 @@ async fn shared_minio() -> &'static SharedMinio {
                 .unwrap_or_else(|_| DEFAULT_MINIO_ROOT_PASSWORD.to_string());
 
             let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
-            let container = GenericImage::new(image, tag)
-                .with_wait_for(WaitFor::message_on_stderr("API:"))
-                .with_exposed_port(9000.tcp())
-                .with_exposed_port(9001.tcp())
-                .with_env_var("MINIO_ROOT_USER", root_user.clone())
-                .with_env_var("MINIO_ROOT_PASSWORD", root_password.clone())
-                .with_env_var("MINIO_CONSOLE_ADDRESS", ":9001")
-                .with_cmd(["server", "/data", "--console-address", ":9001"])
-                .with_label("github.run_id", &run_id)
-                .start()
-                .await
-                .expect("failed to start MinIO container");
+            // `SHARED_MINIO` is a static and never dropped; the cleanup label
+            // lets the exit hook remove the container.
+            let container = container_cleanup::with_cleanup_label(
+                GenericImage::new(image, tag)
+                    .with_wait_for(WaitFor::message_on_stderr("API:"))
+                    .with_exposed_port(9000.tcp())
+                    .with_exposed_port(9001.tcp())
+                    .with_env_var("MINIO_ROOT_USER", root_user.clone())
+                    .with_env_var("MINIO_ROOT_PASSWORD", root_password.clone())
+                    .with_env_var("MINIO_CONSOLE_ADDRESS", ":9001")
+                    .with_cmd(["server", "/data", "--console-address", ":9001"])
+                    .with_label("github.run_id", &run_id),
+            )
+            .start()
+            .await
+            .expect("failed to start MinIO container");
 
             let host = container
                 .get_host()

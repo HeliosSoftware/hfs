@@ -26,6 +26,19 @@ done
 # list the upstream `tests/` directory and `curl` anything missing locally.
 ```
 
+## Specification examples
+
+`examples/` holds the example ViewDefinitions published with the specification
+itself (not part of the conformance suite above), also copied byte-for-byte:
+
+- **Upstream source:** <https://github.com/HL7/sql-on-fhir/tree/main/input/resources/viewdefinition>
+  (`ViewDefinition-*.json`; CC0). Last synced at `e3e1d3c` (3.0.0-ballot).
+- `examples/test-bundle.json` is ours — a small bundle with one resource per
+  example — and is the only hand-written file in that directory.
+
+`crates/sof/tests/spec_examples.rs` lints and runs every example; it fails if a
+newly synced example has no test.
+
 ## Who runs these
 
 - `crates/sof/tests/test_runner_integration.rs` — runs every fixture against the
