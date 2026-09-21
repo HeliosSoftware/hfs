@@ -153,7 +153,7 @@ fn parse_args() -> Args {
 /// at a chosen selectivity, collected while the corpus is built.
 #[derive(Default)]
 struct Stats {
-    /// Lower-cased name parts (family, given, prefix) per patient.
+    /// Lower-cased name parts (family, given) per patient.
     patient_names: Vec<Vec<String>>,
     patient_ids: Vec<String>,
     birthdates: Vec<String>,
@@ -190,16 +190,16 @@ fn name_parts(resource: &Value) -> Vec<String> {
                 if let Some(f) = name.get("family").and_then(Value::as_str) {
                     parts.push(f.to_lowercase());
                 }
-                for key in ["given", "prefix", "suffix"] {
-                    for g in name
-                        .get(key)
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                    {
-                        if let Some(g) = g.as_str() {
-                            parts.push(g.to_lowercase());
-                        }
+                // Not `prefix` or `suffix`: the `name` parameter does not index them
+                // here ("Mrs." matches no patient), so they are no terminal value.
+                for g in name
+                    .get("given")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(g) = g.as_str() {
+                        parts.push(g.to_lowercase());
                     }
                 }
             }
