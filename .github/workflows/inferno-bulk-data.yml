@@ -101,8 +101,18 @@ jobs:
           FROM nginx
           COPY config/nginx.conf /etc/nginx/nginx.conf
           EOF
+          # The validator JVM sizes its heap off the docker host's RAM (max
+          # ~78 GB there) and the kit sets no limit, so it balloons to tens of
+          # GB while loading IGs and gets OOM-killed; with no restart policy it
+          # stays dead and every validation test errors with "Connection failed
+          # to validator". Cap it, as inferno-us-quality-core.yml does.
           cat > docker-compose.override.yml <<EOF
           services:
+            hl7_validator_service:
+              restart: on-failure
+              mem_limit: 6g
+              environment:
+                JAVA_TOOL_OPTIONS: -Xmx4g
             inferno:
               environment:
                 INFERNO_HOST: "$INFERNO_BASE_URL"
