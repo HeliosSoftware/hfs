@@ -260,6 +260,8 @@ pub async fn conditional_delete_handler<S>(
 where
     S: ResourceStorage + ConditionalStorage + Send + Sync,
 {
+    super::conditional_support::require_delete(state.storage())?;
+
     if resource_type == "AuditEvent" {
         return Err(RestError::MethodNotAllowed {
             method: "DELETE".to_string(),

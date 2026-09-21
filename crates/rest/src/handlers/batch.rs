@@ -1168,6 +1168,9 @@ where
             // query string by definition, which the shared criteria builder
             // decodes (#1322).
             if let Some(criteria) = if_none_exist {
+                if let Err(e) = super::conditional_support::require_create(state.storage()) {
+                    return entry_failure(e);
+                }
                 return match state
                     .storage()
                     .conditional_create(
@@ -1256,6 +1259,9 @@ where
             // Conditional update, mirroring `conditional_update_handler`:
             // upsert, so no match creates (201) and one match updates (200).
             if let Some(criteria) = criteria {
+                if let Err(e) = super::conditional_support::require_update(state.storage()) {
+                    return entry_failure(e);
+                }
                 if let Err(e) = state
                     .validation()
                     .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
@@ -1405,6 +1411,9 @@ where
             // match is a success (R4 §3.1.0.7.1), several matches are 412
             // because `/metadata` elects `conditionalDelete: "single"`.
             if let Some(criteria) = criteria {
+                if let Err(e) = super::conditional_support::require_delete(state.storage()) {
+                    return entry_failure(e);
+                }
                 return match state
                     .storage()
                     .conditional_delete(tenant.context(), &resource_type, criteria)
@@ -3272,6 +3281,10 @@ mod tests {
         Deleted,
         MultipleMatches(usize),
         Unsupported,
+        /// The storage declares no conditional interaction at all
+        /// (`supports_conditional` is `false`), as S3 does. Its methods are
+        /// unscripted: reaching one panics.
+        Undeclared,
     }
 
     impl DelayStorage {
@@ -3492,6 +3505,13 @@ mod tests {
     // to, without a search index.
     #[async_trait]
     impl ConditionalStorage for DelayStorage {
+        fn supports_conditional(
+            &self,
+            _interaction: helios_persistence::core::ConditionalInteraction,
+        ) -> bool {
+            !matches!(self.conditional_reply, ConditionalReply::Undeclared)
+        }
+
         async fn conditional_create(
             &self,
             tenant: &TenantContext,
@@ -4569,6 +4589,54 @@ mod tests {
         assert!(
             !create_text.contains("'search'") && !create_text.contains("'conditional_create'"),
             "must not surface the raw missing capability: {create_text}"
+        );
+    }
+
+    /// A storage that *declares* it serves no conditional interaction is
+    /// refused from that declaration — the source `/metadata` reads — before
+    /// storage is reached, each entry naming the interaction the client asked
+    /// for (#1384).
+    #[tokio::test]
+    async fn undeclared_conditional_interactions_are_501_per_entry_without_reaching_storage() {
+        let state = state_with(DelayStorage::conditional(ConditionalReply::Undeclared));
+        let bundle = serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "batch",
+            "entry": [
+                {
+                    "request": { "method": "PUT", "url": "Patient?identifier=x" },
+                    "resource": { "resourceType": "Patient" }
+                },
+                { "request": { "method": "DELETE", "url": "Patient?identifier=x" } },
+                {
+                    "request": { "method": "POST", "url": "Patient", "ifNoneExist": "identifier=x" },
+                    "resource": { "resourceType": "Patient" }
+                },
+            ]
+        });
+
+        let response = run_batch(&state, &bundle, None).await;
+        for (index, wording) in [
+            "conditional update (PUT [type]?criteria)",
+            "conditional delete (DELETE [type]?criteria)",
+            "conditional create (If-None-Exist)",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let entry = &response["entry"][index];
+            assert_eq!(
+                entry["response"]["status"], "501 Not Implemented",
+                "entry {index}: {entry}"
+            );
+            let issue = &entry["response"]["outcome"]["issue"][0];
+            assert_eq!(issue["code"], "not-supported", "entry {index}: {entry}");
+            let text = issue["details"]["text"].as_str().unwrap_or_default();
+            assert!(text.contains(wording), "entry {index}: {text}");
+        }
+        assert!(
+            state.storage().conditional_calls().is_empty(),
+            "an undeclared interaction must be refused before storage is asked"
         );
     }
 
