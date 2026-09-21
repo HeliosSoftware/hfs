@@ -23,6 +23,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use helios_fhir::FhirVersion;
 use serde::{Deserialize, Serialize};
 
 use crate::core::{BackendCapability, BackendKind};
@@ -522,6 +523,15 @@ pub struct CompositeConfig {
 
     /// Health check settings.
     pub health_config: HealthConfig,
+
+    /// The FHIR version this composite serves — under `hfs`, the server's
+    /// default version, which is the one its search index is built for.
+    ///
+    /// Conditional criteria the composite resolves itself (it has a dedicated
+    /// search backend) judge a `:[type]` qualifier against this version.
+    /// `None` keeps the version-less fallback: a type of any FHIR version
+    /// enabled in the build passes (#1384).
+    pub fhir_version: Option<FhirVersion>,
 }
 
 impl CompositeConfig {
@@ -533,6 +543,7 @@ impl CompositeConfig {
             sync_config: SyncConfig::default(),
             cost_config: CostConfig::default(),
             health_config: HealthConfig::default(),
+            fhir_version: None,
         }
     }
 
@@ -666,6 +677,7 @@ pub struct CompositeConfigBuilder {
     sync_config: SyncConfig,
     cost_config: CostConfig,
     health_config: HealthConfig,
+    fhir_version: Option<FhirVersion>,
 }
 
 impl CompositeConfigBuilder {
@@ -720,6 +732,13 @@ impl CompositeConfigBuilder {
         self
     }
 
+    /// Sets the FHIR version the composite serves (see
+    /// [`CompositeConfig::fhir_version`]).
+    pub fn fhir_version(mut self, fhir_version: FhirVersion) -> Self {
+        self.fhir_version = Some(fhir_version);
+        self
+    }
+
     /// Sets the sync configuration.
     pub fn with_sync_config(mut self, config: SyncConfig) -> Self {
         self.sync_config = config;
@@ -746,6 +765,7 @@ impl CompositeConfigBuilder {
             sync_config: self.sync_config,
             cost_config: self.cost_config,
             health_config: self.health_config,
+            fhir_version: self.fhir_version,
         };
 
         // Validate and ignore warnings for build
@@ -761,6 +781,7 @@ impl CompositeConfigBuilder {
             sync_config: self.sync_config,
             cost_config: self.cost_config,
             health_config: self.health_config,
+            fhir_version: self.fhir_version,
         };
 
         let warnings = config.validate()?;

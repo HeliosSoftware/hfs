@@ -224,6 +224,8 @@ pub async fn conditional_patch_handler<S>(
 where
     S: ResourceStorage + ConditionalStorage + Send + Sync,
 {
+    super::conditional_support::require_patch(state.storage())?;
+
     // AuditEvent resources are immutable — block write operations
     if resource_type == "AuditEvent" {
         return Err(RestError::MethodNotAllowed {
