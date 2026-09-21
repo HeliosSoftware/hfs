@@ -1075,10 +1075,9 @@ impl PostgresQueryBuilder {
         // for is the silent ignore #1363 rules out, so it is refused (#1407).
         if !query.sort.is_empty() {
             return Err(SearchError::QueryParseError {
-                message: format!(
-                    "'_sort' cannot be combined with _contained=true or both: sorting \
-                     contained matches is not supported on PostgreSQL"
-                ),
+                message: "'_sort' cannot be combined with _contained=true or both: sorting \
+                          contained matches is not supported on PostgreSQL"
+                    .to_string(),
             });
         }
         for param in &query.parameters {
