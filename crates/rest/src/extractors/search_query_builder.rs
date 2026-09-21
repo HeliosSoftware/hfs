@@ -184,6 +184,19 @@ fn build_query(
 
     // Process search parameters (non-system params)
     for (name, value) in params.search_params() {
+        // An empty value or OR-alternative (`family=Zzz,`). The gate at the end
+        // of this function refuses it too, for everything that can carry one;
+        // here the parameter can still be named exactly as the client wrote it.
+        if !name.ends_with(":missing")
+            && name != "_filter"
+            && split_unescaped_commas(value).iter().any(String::is_empty)
+        {
+            return Err(RestError::InvalidParameter {
+                param: name.clone(),
+                message: helios_persistence::search::EMPTY_VALUE_REASON.to_string(),
+            });
+        }
+
         // Handle _has (reverse chaining)
         if name == "_has" || name.starts_with("_has:") {
             if let Some(reverse_chain) = parse_has_parameter_in(name, value, types)? {

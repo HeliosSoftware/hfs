@@ -1714,7 +1714,10 @@ mod date_search {
             ("/RiskAssessment", "probability", "neNaN"),
             ("/RiskAssessment", "probability", "lt1e999"),
             ("/RiskAssessment", "probability", "0x10"),
-            ("/RiskAssessment", "probability", ""),
+            // (`probability=`, no value at all, is an empty parameter and
+            // ignored — #1380, `empty_search_values.rs`. A prefix with no
+            // number is not.)
+            ("/RiskAssessment", "probability", "gt"),
             ("/Observation", "value-quantity", "ltinf||mg"),
             ("/Observation", "value-quantity", "||mg"),
             ("/Observation", "value-quantity", "5.4\\|mg"),

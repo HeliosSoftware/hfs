@@ -138,7 +138,9 @@ pub fn validate_value_presence(query: &SearchQuery) -> StorageResult<()> {
 /// The gate reports the error on every ordinary path; this is what stands
 /// behind it should a caller ever skip it.
 pub fn has_empty_value(param: &SearchParameter) -> bool {
-    if matches!(param.modifier, Some(SearchModifier::Missing)) {
+    // A `_filter` value is an expression, whose string literals may hold
+    // anything, doubled commas included; its parser judges it.
+    if matches!(param.modifier, Some(SearchModifier::Missing)) || param.name == "_filter" {
         return false;
     }
     let composite = param.chain.is_empty() && param.param_type == SearchParamType::Composite;
@@ -189,9 +191,14 @@ fn display_name(param: &SearchParameter) -> String {
         out.push('.');
         out.push_str(&hop.target_param);
     }
-    if let Some(modifier) = &param.modifier {
-        out.push(':');
-        out.push_str(&modifier.to_string());
+    match &param.modifier {
+        // `Display` writes the legacy camelCase spelling.
+        Some(SearchModifier::OfType) => out.push_str(":of-type"),
+        Some(modifier) => {
+            out.push(':');
+            out.push_str(&modifier.to_string());
+        }
+        None => {}
     }
     out
 }
@@ -444,6 +451,26 @@ mod tests {
             )))
             .as_deref(),
             Some("gender:not")
+        );
+        assert_eq!(
+            refused(&query(param(
+                "identifier",
+                T::Token,
+                Some(SearchModifier::OfType),
+                &[""]
+            )))
+            .as_deref(),
+            Some("identifier:of-type")
+        );
+        // A `_filter` expression is its parser's business.
+        assert_eq!(
+            refused(&query(param(
+                "_filter",
+                T::Special,
+                None,
+                &["given eq \"a", "", "b\""]
+            ))),
+            None
         );
         let mut chained = param("subject", T::Reference, None, &["Zzz", ""]);
         chained.chain = vec![crate::types::ChainedParameter {

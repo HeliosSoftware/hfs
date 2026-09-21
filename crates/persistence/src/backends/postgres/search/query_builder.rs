@@ -4251,6 +4251,13 @@ mod tests {
                     let frag = PostgresQueryBuilder::build_search_query(&query, 2)
                         .expect("an invalid composite number must still constrain the query");
 
+                    // A component with nothing in it (`8480-6$`) is an empty
+                    // value: the whole parameter matches nothing (#1380).
+                    if prefix.is_empty() && input.trim().is_empty() {
+                        assert_eq!(frag.sql, "FALSE", "{context}");
+                        continue;
+                    }
+
                     assert!(
                         frag.sql.contains("(value_token_code = $3) AND (FALSE)"),
                         "{context}: {}",
@@ -4311,15 +4318,15 @@ mod tests {
         // Two terms OR together, and a blank one must not consume a placeholder
         // number it never binds — the caller binds this fragment's params
         // consecutively.
-        let query = SearchQuery::new("Patient").with_parameter(special_param(
-            "_text",
-            vec![
-                SearchValue::eq("   "),
-                SearchValue::eq("fracture"),
-                SearchValue::eq("sprain"),
-            ],
-        ));
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2)
+        //
+        // Driven at the FTS builder: through `build_search_query` a parameter
+        // with a blank term matches nothing as a whole (#1380).
+        let values = vec![
+            SearchValue::eq("   "),
+            SearchValue::eq("fracture"),
+            SearchValue::eq("sprain"),
+        ];
+        let frag = PostgresQueryBuilder::build_fts_condition(&values, "narrative_tsvector", 2)
             .expect("_text OR-list should produce a condition");
 
         assert_eq!(frag.params.len(), 2, "the blank term binds nothing");
@@ -4715,11 +4722,20 @@ mod tests {
 
     #[test]
     fn empty_string_value_falls_back_to_the_like_form() {
-        // `name=` matches every indexed value; there is no prefix to bound, so
-        // the `LIKE '%'` form is emitted. The strict `~~` proves the index
-        // predicate on its own, so it carries no conjunct either.
-        let query = SearchQuery::new("Patient").with_parameter(string_param("name", None, ""));
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("string condition");
+        // With no prefix to bound, the string builder emits the `LIKE '%'`
+        // form, which matches every indexed value. The strict `~~` proves the
+        // index predicate on its own, so it carries no conjunct either.
+        //
+        // That is the builder on its own. A search never gets here with an
+        // empty value: the gate refuses it, and `build_search_query` answers
+        // such a parameter with `FALSE` (#1380).
+        let param = string_param("name", None, "");
+        let query = SearchQuery::new("Patient").with_parameter(param.clone());
+        let guarded = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+        assert_eq!(guarded.sql, "FALSE");
+
+        let frag =
+            PostgresQueryBuilder::build_string_condition(&param, 2).expect("string condition");
 
         assert!(
             frag.sql
@@ -5566,6 +5582,47 @@ mod tests {
             assert!(fragment.sql.contains("FROM resources"));
             assert!(fragment.sql.contains(&format!("{column} IS NOT NULL")));
             assert!(!fragment.sql.contains("FROM search_index"));
+        }
+    }
+
+    /// #1380: `family=Zzz,` reached the builder as the values `Zzz` and `""`,
+    /// and a prefix match on `""` is every row. The search gate
+    /// (`validate_value_presence`) rejects it before a query is built; if one
+    /// is built anyway, the parameter matches nothing — the whole parameter, or
+    /// `:not` would negate it into everything.
+    #[test]
+    fn a_parameter_with_an_empty_value_matches_nothing() {
+        use SearchModifier as M;
+        use SearchParamType as T;
+        let cases: Vec<(&str, SearchParamType, Option<SearchModifier>, Vec<&str>)> = vec![
+            ("family", T::String, None, vec!["Zzz", ""]),
+            ("family", T::String, None, vec![""]),
+            ("family", T::String, Some(M::Contains), vec!["", "Zzz"]),
+            ("family", T::String, Some(M::Text), vec![" "]),
+            ("gender", T::Token, None, vec![""]),
+            ("gender", T::Token, Some(M::Not), vec!["female", ""]),
+            ("gender", T::Token, Some(M::Text), vec![""]),
+            ("identifier", T::Token, Some(M::OfType), vec![""]),
+            ("_id", T::Token, None, vec!["a", ""]),
+            ("_tag", T::Token, None, vec![""]),
+            ("general-practitioner", T::Reference, None, vec![""]),
+            ("url", T::Uri, Some(M::Below), vec![""]),
+            ("url", T::Uri, Some(M::Contains), vec!["", "x"]),
+        ];
+        for (name, param_type, modifier, values) in cases {
+            let context = format!("{name} {modifier:?} {values:?}");
+            let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+                name: name.to_string(),
+                param_type,
+                modifier,
+                values: values.into_iter().map(SearchValue::eq).collect(),
+                chain: vec![],
+                components: vec![],
+            });
+            let fragment = PostgresQueryBuilder::build_search_query(&query, 2)
+                .unwrap_or_else(|| panic!("{context}: a dropped condition matches everything"));
+            assert_eq!(fragment.sql, "FALSE", "{context}");
+            assert!(fragment.params.is_empty(), "{context}");
         }
     }
 }
