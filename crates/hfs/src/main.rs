@@ -148,6 +148,90 @@ fn composite_sync_mode_from_env() -> helios_persistence::composite::SyncMode {
     }
 }
 
+/// Forwards composite secondary sync failures to the Prometheus exporter
+/// (#1334): `composite_secondary_sync_failures_total{backend,operation}` and
+/// the `composite_secondary_sync_needs_reindex` gauge.
+#[cfg(feature = "elasticsearch")]
+struct CompositeSyncMetrics;
+
+#[cfg(feature = "elasticsearch")]
+impl helios_persistence::composite::SecondarySyncObserver for CompositeSyncMetrics {
+    fn sync_failed(
+        &self,
+        backend_id: &str,
+        operation: helios_persistence::composite::SyncOperation,
+    ) {
+        helios_observability::composite_metrics::record_secondary_sync_failure(
+            backend_id,
+            operation.as_str(),
+        );
+    }
+
+    fn needs_reindex(&self, outstanding: u64) {
+        helios_observability::composite_metrics::set_secondary_sync_needs_reindex(outstanding);
+    }
+}
+
+/// Reads a non-negative integer setting, falling back on anything else.
+#[cfg(feature = "elasticsearch")]
+fn env_u64(var: &str, default_value: u64) -> u64 {
+    match std::env::var(var) {
+        Ok(v) => v.trim().parse().unwrap_or_else(|_| {
+            tracing::warn!(variable = var, value = %v, default_value, "Not a number; using the default");
+            default_value
+        }),
+        Err(_) => default_value,
+    }
+}
+
+/// Periodically drains the composite's "needs reindex" records (#1334): each
+/// pass re-syncs the primary's current state of up to
+/// `HFS_COMPOSITE_SYNC_REPAIR_BATCH` (default 100) recorded resources to the
+/// secondary that missed them. Runs every
+/// `HFS_COMPOSITE_SYNC_REPAIR_INTERVAL` seconds (default 60; `0` disables),
+/// starting right away so records left by an earlier run are picked up.
+///
+/// A primary without a ledger (S3) has nothing to drain, so no task is
+/// spawned for it.
+#[cfg(feature = "elasticsearch")]
+fn spawn_secondary_sync_repair(
+    composite: Arc<helios_persistence::composite::CompositeStorage>,
+    has_ledger: bool,
+) {
+    if !has_ledger {
+        info!(
+            "This primary keeps no needs-reindex ledger: failed secondary syncs are counted and logged only; repair them with $reindex"
+        );
+        return;
+    }
+    let interval = env_u64("HFS_COMPOSITE_SYNC_REPAIR_INTERVAL", 60);
+    if interval == 0 {
+        info!(
+            "HFS_COMPOSITE_SYNC_REPAIR_INTERVAL=0: periodic repair of failed secondary syncs is off"
+        );
+        return;
+    }
+    let batch = env_u64("HFS_COMPOSITE_SYNC_REPAIR_BATCH", 100).max(1) as usize;
+    let interval = std::time::Duration::from_secs(interval);
+    tokio::spawn(async move {
+        loop {
+            match composite.repair_secondary_sync_failures(batch).await {
+                Ok(report) if report.examined > 0 => info!(
+                    examined = report.examined,
+                    repaired = report.repaired,
+                    still_failing = report.still_failing,
+                    dropped = report.dropped,
+                    remaining = report.remaining,
+                    "Repaired failed secondary syncs"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("Repair of failed secondary syncs could not run: {e}"),
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
+}
+
 #[cfg(feature = "elasticsearch")]
 fn es_write_refresh_from_config(
     config: &ServerConfig,
@@ -2428,6 +2512,10 @@ async fn start_sqlite_elasticsearch(
     let composite = CompositeStorage::new(composite_config, backends)?
         .with_search_providers(search_providers)
         .with_full_primary(sqlite.clone())
+        // A failed Elasticsearch sync is counted, logged, and recorded in the
+        // primary as "needs reindex" (#1334).
+        .with_sync_observer(Arc::new(CompositeSyncMetrics))
+        .with_sync_failure_ledger(sqlite.clone())
         // `$purge` must reach the Elasticsearch secondary too — purging only
         // the SQLite primary would leave the resource in the search index,
         // still searchable and still holding its content.
@@ -2441,6 +2529,7 @@ async fn start_sqlite_elasticsearch(
 
     let serve_audit_state = audit_state.clone();
     let composite = Arc::new(composite);
+    spawn_secondary_sync_repair(composite.clone(), true);
 
     // Seed through the composite: the primary's own indexing is offloaded, so
     // seeding it directly would leave the conformance resources unsearchable
@@ -2731,6 +2820,10 @@ async fn start_postgres_elasticsearch(
     let composite = CompositeStorage::new(composite_config, backends)?
         .with_search_providers(search_providers)
         .with_full_primary(pg.clone())
+        // A failed Elasticsearch sync is counted, logged, and recorded in the
+        // primary as "needs reindex" (#1334).
+        .with_sync_observer(Arc::new(CompositeSyncMetrics))
+        .with_sync_failure_ledger(pg.clone())
         // See `start_sqlite_elasticsearch`: `$purge` must reach the search
         // secondary, not just the primary.
         .with_purgable_backends(
@@ -2743,6 +2836,7 @@ async fn start_postgres_elasticsearch(
 
     let serve_audit_state = audit_state.clone();
     let composite = Arc::new(composite);
+    spawn_secondary_sync_repair(composite.clone(), true);
 
     // Seed through the composite: the primary's own indexing is offloaded, so
     // seeding it directly would leave the conformance resources unsearchable.
@@ -2950,6 +3044,10 @@ async fn start_mongodb_elasticsearch(
     let composite = CompositeStorage::new(composite_config, backends)?
         .with_search_providers(search_providers)
         .with_full_primary(mongo.clone())
+        // A failed Elasticsearch sync is counted, logged, and recorded in the
+        // primary as "needs reindex" (#1334).
+        .with_sync_observer(Arc::new(CompositeSyncMetrics))
+        .with_sync_failure_ledger(mongo.clone())
         // See `start_sqlite_elasticsearch`: `$purge` must reach the search
         // secondary, not just the primary.
         .with_purgable_backends(
@@ -2962,6 +3060,7 @@ async fn start_mongodb_elasticsearch(
 
     let serve_audit_state = audit_state.clone();
     let composite = Arc::new(composite);
+    spawn_secondary_sync_repair(composite.clone(), true);
 
     // Seed through the composite: the primary's own indexing is offloaded, so
     // seeding it directly would leave the conformance resources unsearchable.
@@ -3390,6 +3489,9 @@ async fn start_s3_elasticsearch(
     let composite = CompositeStorage::new(composite_config, backends)?
         .with_search_providers(search_providers)
         .with_full_primary(s3.clone())
+        // S3 keeps no needs-reindex ledger: a failed Elasticsearch sync is
+        // counted and logged, and repaired by `$reindex` (#1334).
+        .with_sync_observer(Arc::new(CompositeSyncMetrics))
         // See `start_sqlite_elasticsearch`: `$purge` must reach the search
         // secondary, not just the primary.
         .with_purgable_backends(
@@ -3402,6 +3504,7 @@ async fn start_s3_elasticsearch(
 
     let serve_audit_state = audit_state.clone();
     let composite = Arc::new(composite);
+    spawn_secondary_sync_repair(composite.clone(), false);
 
     // Seed through the composite so the conformance resources land in the S3
     // primary and get indexed into Elasticsearch — the only search index here.

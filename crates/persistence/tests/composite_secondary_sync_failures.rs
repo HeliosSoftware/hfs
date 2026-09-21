@@ -349,6 +349,16 @@ fn by_identifier(identifier: &str) -> SearchQuery {
     })
 }
 
+/// The ledger contract PostgreSQL and MongoDB are held to as well.
+#[path = "common/sync_failure_ledger_suite.rs"]
+mod sync_failure_ledger_suite;
+
+#[tokio::test]
+async fn sqlite_sync_failure_ledger_contract() {
+    let backend = sqlite_at(":memory:");
+    sync_failure_ledger_suite::ledger_folds_orders_clears_and_counts(&backend, "ledger-1334").await;
+}
+
 /// The whole contract, in every sync mode: create, update and delete against
 /// a secondary that is down all succeed, each final failure is counted exactly
 /// once, one record per resource says what is owed, a later successful write
