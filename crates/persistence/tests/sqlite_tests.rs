@@ -58,6 +58,46 @@ async fn sqlite_contained_criteria_are_applied_or_rejected() {
     contained_suite::criteria_are_applied_or_rejected(&backend, "contained-criteria-1363").await;
 }
 
+/// #1383: `_contained` alone is every contained resource of the type;
+/// `_total`, `search_count` and paging agree; compartment membership is
+/// applied; `_has`, `_list` and chains are refused by name.
+#[tokio::test]
+async fn sqlite_contained_unconstrained_and_out_of_band_constraints() {
+    let backend = create_backend();
+    contained_suite::unconstrained_and_out_of_band_constraints(&backend, "contained-gaps-1383")
+        .await;
+}
+
+/// The backend-agnostic conditional `If-Match` suite (#1381). Same `#[path]`
+/// arrangement.
+#[path = "search/conditional_if_match_suite.rs"]
+mod conditional_if_match_suite;
+
+/// #1381: `If-Match` is evaluated against the resource the criteria resolve
+/// to, on conditional update, delete and patch.
+#[tokio::test]
+async fn sqlite_conditional_writes_honour_if_match() {
+    let backend = create_backend();
+    conditional_if_match_suite::if_match_is_evaluated_against_the_resolved_match(
+        &backend,
+        "cond-if-match-1381",
+        true,
+    )
+    .await;
+}
+
+/// #1381: of several writers holding the same `If-Match`, one writes.
+#[tokio::test]
+async fn sqlite_conditional_writers_with_the_same_if_match_admit_one() {
+    let backend = create_backend();
+    conditional_if_match_suite::concurrent_writers_with_the_same_if_match_admit_one(
+        &backend,
+        "cond-if-match-race-1381",
+        true,
+    )
+    .await;
+}
+
 fn create_backend() -> SqliteBackend {
     // Configure with data directory to load spec SearchParameters
     // CARGO_MANIFEST_DIR for tests is crates/persistence
@@ -3080,6 +3120,7 @@ async fn test_conditional_update_with_identifier() {
             "identifier=http://hospital.org/mrn|MRN-UPDATE-1",
             false,
             FhirVersion::default(),
+            &helios_persistence::core::EntityTagPrecondition::Absent,
         )
         .await
         .unwrap();
@@ -3117,6 +3158,7 @@ async fn test_conditional_update_with_upsert() {
             "identifier=http://hospital.org/mrn|MRN-UPSERT-1",
             true, // upsert=true
             FhirVersion::default(),
+            &helios_persistence::core::EntityTagPrecondition::Absent,
         )
         .await
         .unwrap();
@@ -3149,6 +3191,7 @@ async fn test_conditional_delete_with_identifier() {
             &tenant,
             "Patient",
             "identifier=http://hospital.org/mrn|MRN-DELETE-1",
+            &helios_persistence::core::EntityTagPrecondition::Absent,
         )
         .await
         .unwrap();

@@ -242,6 +242,7 @@ pub async fn prefix_like_criteria_name_the_right_resource<S>(
                 criteria,
                 true,
                 version,
+                &helios_persistence::core::EntityTagPrecondition::Absent,
             )
             .await
         {
@@ -305,7 +306,12 @@ pub async fn prefix_like_criteria_name_the_right_resource<S>(
         let tenant = tenant(tenant_base, label);
         seed(backend, &tenant, rows).await;
         let outcome = match backend
-            .conditional_delete(&tenant, "Patient", criteria)
+            .conditional_delete(
+                &tenant,
+                "Patient",
+                criteria,
+                &helios_persistence::core::EntityTagPrecondition::Absent,
+            )
             .await
         {
             Ok(ConditionalDeleteResult::Deleted(stored)) => format!("Deleted({})", stored.id()),

@@ -365,11 +365,11 @@ async fn criteria_that_cannot_be_trusted_are_400() {
     assert_eq!(snapshot(&server).await, untouched());
 }
 
-/// The instance endpoint honours `If-Match`; the conditional one cannot see the
-/// version it is about to replace. Refused, not silently ignored — satisfied
-/// or not.
+/// `If-Match` is honoured, as on the instance endpoint (#1381; it was refused
+/// with `400` before). `tests/conditional_if_match.rs` covers the matrix; this
+/// keeps the one-line contract beside the rest of conditional patch.
 #[tokio::test]
-async fn if_match_is_refused_rather_than_ignored() {
+async fn if_match_is_honoured_rather_than_refused() {
     let server = test_server().await;
     seed(&server).await;
 
@@ -379,7 +379,7 @@ async fn if_match_is_refused_rather_than_ignored() {
         .await
         .assert_status(StatusCode::PRECONDITION_FAILED);
 
-    for if_match in ["W/\"7\"", "W/\"1\"", "*", "garbage"] {
+    for if_match in ["W/\"7\"", "garbage"] {
         let response = patch(
             &server,
             "/Patient?identifier=ne123",
@@ -391,10 +391,21 @@ async fn if_match_is_refused_rather_than_ignored() {
             HeaderValue::from_str(if_match).expect("header"),
         )
         .await;
-        let outcome = assert_outcome(&response, StatusCode::BAD_REQUEST, if_match);
+        let outcome = assert_outcome(&response, StatusCode::PRECONDITION_FAILED, if_match);
         assert!(outcome.to_string().contains("If-Match"), "{outcome}");
     }
     assert_eq!(snapshot(&server).await, untouched());
+
+    patch(
+        &server,
+        "/Patient?identifier=ne123",
+        JSON_PATCH,
+        &activate(),
+    )
+    .add_header(header::IF_MATCH, HeaderValue::from_static("W/\"1\""))
+    .await
+    .assert_status(StatusCode::OK);
+    assert_ne!(snapshot(&server).await, untouched());
 }
 
 /// What the instance endpoint refuses, the conditional one refuses the same

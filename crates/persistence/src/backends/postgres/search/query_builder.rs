@@ -713,7 +713,11 @@ impl PostgresQueryBuilder {
     /// this function skips those parameters.
     ///
     /// Param layout: `$1` = tenant, `$2` = contained type, then value params.
-    /// Returns `None` when no parameter contributes a condition.
+    ///
+    /// `query.compartment` is one more branch, on the contained resource's
+    /// own references. With no criterion at all the result is every contained
+    /// resource of the type (#1383), so this always returns `Some`. The rows
+    /// are unordered; the caller sorts them before paging.
     pub fn build_contained(query: &SearchQuery) -> Option<SqlFragment> {
         // (branch, negated)
         let mut branches: Vec<(String, bool)> = Vec::new();
@@ -789,10 +793,32 @@ impl PostgresQueryBuilder {
             distinct_names.insert(param.name.clone());
         }
 
-        if branches.is_empty() && entity_filters.is_empty() {
-            return None;
+        // Compartment membership is a criterion on the contained resource like
+        // any other: it references the compartment through ANY of the
+        // membership parameters (#1383). That one branch spans several
+        // parameter names, so the names an entity matched no longer prove
+        // every branch did.
+        let mut names_prove_branches = true;
+        if let Some(comp) = &query.compartment {
+            if !comp.params.is_empty() && !comp.reference.is_empty() {
+                let in_list = comp
+                    .params
+                    .iter()
+                    .map(|p| format!("'{}'", p.replace('\'', "''")))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                offset += 1;
+                branches.push((
+                    format!("(param_name IN ({in_list}) AND value_reference = ${offset})"),
+                    false,
+                ));
+                params.push(SqlParam::text(strip_reference_version(&comp.reference)));
+                names_prove_branches = false;
+            }
         }
 
+        // With no criterion at all, every contained resource of the type
+        // matches (#1383): the grouping below lists each of them once.
         let any_negated = branches.iter().any(|(_, negated)| *negated);
         let mut sql = String::from(
             "SELECT resource_type, resource_id, contained_local_id FROM search_index \
@@ -807,24 +833,25 @@ impl PostgresQueryBuilder {
         }
         sql.push_str(" GROUP BY resource_type, resource_id, contained_local_id");
         if !branches.is_empty() {
-            let having = if !any_negated && distinct_names.len() == branches.len() {
-                format!("COUNT(DISTINCT param_name) >= {}", distinct_names.len())
-            } else {
-                // A repeated name or a negation: one row can satisfy only some
-                // of the branches, so state each. The placeholders are reused,
-                // not rebound.
-                branches
-                    .iter()
-                    .map(|(branch, negated)| {
-                        if *negated {
-                            format!("bool_or{branch} IS NOT TRUE")
-                        } else {
-                            format!("bool_or{branch}")
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" AND ")
-            };
+            let having =
+                if !any_negated && names_prove_branches && distinct_names.len() == branches.len() {
+                    format!("COUNT(DISTINCT param_name) >= {}", distinct_names.len())
+                } else {
+                    // A repeated name or a negation: one row can satisfy only some
+                    // of the branches, so state each. The placeholders are reused,
+                    // not rebound.
+                    branches
+                        .iter()
+                        .map(|(branch, negated)| {
+                            if *negated {
+                                format!("bool_or{branch} IS NOT TRUE")
+                            } else {
+                                format!("bool_or{branch}")
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" AND ")
+                };
             sql.push_str(&format!(" HAVING {having}"));
         }
         Some(SqlFragment::with_params(sql, params))
@@ -881,9 +908,26 @@ impl PostgresQueryBuilder {
     /// criteria used to be skipped — or, for a modifier, read as a plain
     /// match — so the search answered a different question than the one
     /// asked. A no-op for `_contained=false`.
+    ///
+    /// `_has` and `_list` live outside `query.parameters` and select
+    /// *top-level* resources, which a contained resource never is: nothing
+    /// outside its container can reference it. They are refused too (#1383).
     pub fn reject_unsupported_contained(query: &SearchQuery) -> Result<(), SearchError> {
         if query.contained == ContainedMode::Off {
             return Ok(());
+        }
+        for (present, name) in [
+            (!query.reverse_chains.is_empty(), "_has"),
+            (!query.list.is_empty(), "_list"),
+        ] {
+            if present {
+                return Err(SearchError::QueryParseError {
+                    message: format!(
+                        "'{name}' cannot be combined with _contained=true or both: it selects \
+                         top-level resources, which a contained resource is not"
+                    ),
+                });
+            }
         }
         for param in &query.parameters {
             if let Some(reason) = Self::contained_unsupported_reason(param) {
@@ -4007,6 +4051,68 @@ mod tests {
             "{}",
             frag.sql
         );
+    }
+
+    /// #1383: no criterion is every contained resource of the type, and
+    /// compartment membership is one explicit branch over several names.
+    #[test]
+    fn contained_without_criteria_and_with_a_compartment() {
+        let frag = PostgresQueryBuilder::build_contained(&contained_query(vec![])).unwrap();
+        assert!(
+            frag.sql.ends_with(
+                "contained_type = $2 GROUP BY resource_type, resource_id, contained_local_id"
+            ),
+            "{}",
+            frag.sql
+        );
+        assert!(frag.params.is_empty());
+
+        let mut query = contained_query(vec![token_param("code", None, "X")]);
+        query.compartment = Some(CompartmentMembership {
+            params: vec!["subject".to_string(), "performer".to_string()],
+            reference: "Patient/p1/_history/2".to_string(),
+        });
+        let frag = PostgresQueryBuilder::build_contained(&query).unwrap();
+        // The `HAVING` reuses the `WHERE` placeholders; none is bound twice.
+        let filter = frag.sql.split(" HAVING ").next().unwrap();
+        assert_eq!(placeholders(filter), vec![1, 2, 3, 4]);
+        assert_eq!(frag.params.len(), 2);
+        let having = frag.sql.split(" HAVING ").nth(1).expect(&frag.sql);
+        // Counting names would let `subject` stand in for `code`.
+        assert_eq!(
+            having,
+            "bool_or(param_name = 'code' AND (value_token_code = $3)) AND \
+             bool_or(param_name IN ('subject', 'performer') AND value_reference = $4)"
+        );
+        assert!(
+            matches!(&frag.params[1], SqlParam::Text(s) if s == "Patient/p1"),
+            "{:?}",
+            frag.params
+        );
+    }
+
+    /// #1383: `_has` and `_list` select top-level resources.
+    #[test]
+    fn contained_refuses_has_and_list_by_name() {
+        let mut has = contained_query(vec![]);
+        has.reverse_chains
+            .push(crate::types::ReverseChainedParameter::terminal(
+                "Provenance",
+                "target",
+                "agent",
+                SearchValue::new(SearchPrefix::Eq, "Practitioner/x"),
+            ));
+        let mut list = contained_query(vec![]);
+        list.list.push("l1".to_string());
+        for (query, name) in [(has, "'_has'"), (list, "'_list'")] {
+            let message = PostgresQueryBuilder::reject_unsupported_contained(&query)
+                .unwrap_err()
+                .to_string();
+            assert!(message.contains(name), "{message}");
+            let mut off = query.clone();
+            off.contained = ContainedMode::Off;
+            assert!(PostgresQueryBuilder::reject_unsupported_contained(&off).is_ok());
+        }
     }
 
     #[test]

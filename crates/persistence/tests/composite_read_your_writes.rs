@@ -413,7 +413,12 @@ async fn conditional_criteria_with_prefix_like_values_name_the_right_resource() 
     }
 
     match composite
-        .conditional_delete(&t, "Organization", "name=Neal")
+        .conditional_delete(
+            &t,
+            "Organization",
+            "name=Neal",
+            &helios_persistence::core::EntityTagPrecondition::Absent,
+        )
         .await
         .expect("conditional delete")
     {
@@ -426,7 +431,12 @@ async fn conditional_criteria_with_prefix_like_values_name_the_right_resource() 
     // all the decoy.
     assert!(matches!(
         composite
-            .conditional_delete(&t, "Organization", "identifier=ne123")
+            .conditional_delete(
+                &t,
+                "Organization",
+                "identifier=ne123",
+                &helios_persistence::core::EntityTagPrecondition::Absent
+            )
             .await
             .expect("conditional delete"),
         ConditionalDeleteResult::NoMatch
