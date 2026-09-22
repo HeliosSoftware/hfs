@@ -16060,7 +16060,7 @@ mod postgres_integration {
             let (backend, dbname, deployment) = fixed_bookkeeping_measurement_backend().await;
             let backend = Arc::new(backend);
             let tenant = create_tenant(&format!("fixed-cache-measurement-{trial}"));
-            let submission = SubmissionId::generate(&format!("fixed-cache-measurement-{trial}"));
+            let submission = SubmissionId::generate(format!("fixed-cache-measurement-{trial}"));
             let manifest_url =
                 format!("https://provider.example/fixed-cache-measurement-{trial}/manifest.json");
             let file_url =
