@@ -481,14 +481,21 @@ pub(crate) async fn patient_options(
         let Ok(url) = internal_api_url(&state, &rt.id, ["Patient", id]) else {
             return lookup_error(&i18n, &target, id_only);
         };
-        let request = forward_identity(
+        let audience = url.to_string();
+        let Ok(request) = forward_identity(
+            &state,
             client
                 .get(url)
                 .header("Accept", &media)
                 .timeout(std::time::Duration::from_secs(10)),
             &headers,
             &rt.id,
-        );
+            &audience,
+        )
+        .await
+        else {
+            return lookup_error(&i18n, &target, id_only);
+        };
         match request.send().await {
             Ok(response)
                 if matches!(response.status(), StatusCode::NOT_FOUND | StatusCode::GONE) => {}
@@ -515,7 +522,9 @@ pub(crate) async fn patient_options(
         let Ok(url) = internal_api_url(&state, &rt.id, ["Patient", "_search"]) else {
             return lookup_error(&i18n, &target, false);
         };
+        let audience = url.to_string();
         let identifier_request = forward_identity(
+            &state,
             client
                 .post(url.clone())
                 .header("Accept", &media)
@@ -528,8 +537,11 @@ pub(crate) async fn patient_options(
                 .timeout(std::time::Duration::from_secs(10)),
             &headers,
             &rt.id,
-        );
+            &audience,
+        )
+        .await;
         let name_request = forward_identity(
+            &state,
             client
                 .post(url)
                 .header("Accept", &media)
@@ -542,7 +554,12 @@ pub(crate) async fn patient_options(
                 .timeout(std::time::Duration::from_secs(10)),
             &headers,
             &rt.id,
-        );
+            &audience,
+        )
+        .await;
+        let (Ok(identifier_request), Ok(name_request)) = (identifier_request, name_request) else {
+            return lookup_error(&i18n, &target, false);
+        };
         let (identifier_result, name_result) =
             zip(identifier_request.send(), name_request.send()).await;
 
@@ -717,14 +734,21 @@ pub(crate) async fn group_options(
         let Ok(url) = internal_api_url(&state, &rt.id, ["Group", id]) else {
             return lookup_error(&i18n, &target, false);
         };
-        let request = forward_identity(
+        let audience = url.to_string();
+        let Ok(request) = forward_identity(
+            &state,
             client
                 .get(url)
                 .header("Accept", &media)
                 .timeout(std::time::Duration::from_secs(10)),
             &headers,
             &rt.id,
-        );
+            &audience,
+        )
+        .await
+        else {
+            return lookup_error(&i18n, &target, false);
+        };
         match request.send().await {
             Ok(response)
                 if matches!(response.status(), StatusCode::NOT_FOUND | StatusCode::GONE) => {}
@@ -750,7 +774,9 @@ pub(crate) async fn group_options(
         let Ok(url) = internal_api_url(&state, &rt.id, ["Group", "_search"]) else {
             return lookup_error(&i18n, &target, false);
         };
-        let identifier_request = forward_identity(
+        let audience = url.to_string();
+        let Ok(identifier_request) = forward_identity(
+            &state,
             client
                 .post(url.clone())
                 .header("Accept", &media)
@@ -763,13 +789,19 @@ pub(crate) async fn group_options(
                 .timeout(std::time::Duration::from_secs(10)),
             &headers,
             &rt.id,
-        );
+            &audience,
+        )
+        .await
+        else {
+            return lookup_error(&i18n, &target, false);
+        };
         let identifier_future = group_search_result(identifier_request);
         // R4/R4B define no `name` search parameter for Group at all
         // (`supports_group_name_search`), so a name request is never even
         // built on those versions — not merely skipped after the fact.
         let searched = if supports_group_name_search(rv.0) {
-            let name_request = forward_identity(
+            let Ok(name_request) = forward_identity(
+                &state,
                 client
                     .post(url)
                     .header("Accept", &media)
@@ -782,7 +814,12 @@ pub(crate) async fn group_options(
                     .timeout(std::time::Duration::from_secs(10)),
                 &headers,
                 &rt.id,
-            );
+                &audience,
+            )
+            .await
+            else {
+                return lookup_error(&i18n, &target, false);
+            };
             let (identifier_result, name_result) =
                 zip(identifier_future, group_search_result(name_request)).await;
             identifier_result.and_then(|ids| name_result.map(|names| (ids, names)))

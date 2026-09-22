@@ -535,17 +535,28 @@ fn public_status_url(
 }
 
 /// Forwards the caller's credentials and tenant onto a self-call, so the
-/// export runs as the user who asked for it.
-pub(crate) fn forward_identity(
+/// export runs as the user who asked for it. When the browser sent no
+/// `Authorization` the process's outbound service credential is used instead
+/// (#1438): every request here targets this server, never a third party.
+pub(crate) async fn forward_identity(
+    state: &WebState,
     mut request: reqwest::RequestBuilder,
     headers: &HeaderMap,
     tenant: &str,
-) -> reqwest::RequestBuilder {
-    if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
-        request = request.header("Authorization", auth);
+    audience: &str,
+) -> Result<reqwest::RequestBuilder, String> {
+    match headers.get("authorization").and_then(|v| v.to_str().ok()) {
+        Some(auth) => request = request.header("Authorization", auth),
+        None => {
+            request = state
+                .outbound_auth
+                .authorize(request, audience)
+                .await
+                .map_err(|e| format!("outbound credential unavailable: {e}"))?;
+        }
     }
     request = request.header("X-Tenant-ID", tenant);
-    request
+    Ok(request)
 }
 
 // ---------------------------------------------------------------------------
@@ -1029,6 +1040,7 @@ async fn kickoff(state: &WebState, job: &mut ExportJob, headers: &HeaderMap, ten
             return;
         }
     };
+    let audience = path.to_string();
     let builder = if job.scope == "patient" && !job.patient_refs.is_empty() {
         let mut parameters = Vec::new();
         for (name, value) in &query {
@@ -1054,14 +1066,25 @@ async fn kickoff(state: &WebState, job: &mut ExportJob, headers: &HeaderMap, ten
     } else {
         client.get(path).query(&query)
     };
-    let request = forward_identity(
+    let request = match forward_identity(
+        state,
         builder
             .header("Accept", &media)
             .header("Prefer", "respond-async")
             .timeout(std::time::Duration::from_secs(KICKOFF_TIMEOUT_SECS)),
         headers,
         tenant,
-    );
+        &audience,
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(e) => {
+            job.status = "failed".to_string();
+            job.error = e;
+            return;
+        }
+    };
     match request.send().await {
         Ok(response) if response.status() == StatusCode::ACCEPTED => {
             match response
@@ -1126,12 +1149,15 @@ async fn cleanup_kickoff_job(
     let mut last_error = String::new();
     for attempt in 0..SETTINGS_CAS_ATTEMPTS {
         let response = forward_identity(
+            state,
             client
                 .delete(url.clone())
                 .timeout(std::time::Duration::from_secs(10)),
             headers,
             tenant,
+            url.as_str(),
         )
+        .await?
         .send()
         .await;
         match response {
@@ -1346,14 +1372,27 @@ async fn poll_job(state: &WebState, job: &mut ExportJob, headers: &HeaderMap, te
         return;
     };
     let media = crate::lookup::fhir_json(job.fhir_version.unwrap_or(state.fhir_version));
-    let request = forward_identity(
+    let audience = url.to_string();
+    let request = match forward_identity(
+        state,
         client
             .get(url)
             .header("Accept", media)
             .timeout(std::time::Duration::from_secs(10)),
         headers,
         tenant,
-    );
+        &audience,
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(e) => {
+            job.status = "failed".to_string();
+            job.error = format!("status poll unavailable: {e}");
+            job.clear_types_progress();
+            return;
+        }
+    };
     let response = match request.send().await {
         Ok(r) => r,
         Err(e) => {
@@ -1419,14 +1458,20 @@ pub async fn cancel(
             && let (Ok(client), Ok(url)) =
                 (no_redirect_client(), status_url(&state, &rt.id, &remote_id))
         {
-            let request = forward_identity(
+            let audience = url.to_string();
+            if let Ok(request) = forward_identity(
+                &state,
                 client
                     .delete(url)
                     .timeout(std::time::Duration::from_secs(10)),
                 &headers,
                 &rt.id,
-            );
-            let _ = request.send().await;
+                &audience,
+            )
+            .await
+            {
+                let _ = request.send().await;
+            }
         }
         job.status = "cancelled".to_string();
         job.finished_at = now_stamp();
@@ -1519,15 +1564,21 @@ pub async fn delete(
             else {
                 return delete_error_redirect("remote");
             };
-            let response = forward_identity(
+            let audience = url.to_string();
+            let Ok(request) = forward_identity(
+                &state,
                 client
                     .delete(url)
                     .timeout(std::time::Duration::from_secs(10)),
                 &headers,
                 &rt.id,
+                &audience,
             )
-            .send()
-            .await;
+            .await
+            else {
+                return delete_error_redirect("remote");
+            };
+            let response = request.send().await;
             match response {
                 Ok(response)
                     if response.status().is_success()
@@ -1576,14 +1627,18 @@ async fn fetch_fresh_manifest(
 ) -> Result<FreshManifest, String> {
     let client = no_redirect_client()?;
     let url = status_url(state, tenant, remote_id)?;
+    let audience = url.to_string();
     let response = forward_identity(
+        state,
         client
             .get(url)
             .header("Accept", "application/fhir+json")
             .timeout(std::time::Duration::from_secs(15)),
         headers,
         tenant,
+        &audience,
     )
+    .await?
     .send()
     .await
     .map_err(|e| e.to_string())?;
@@ -1757,9 +1812,10 @@ async fn stream_zip(
                 (external_output_url(&output.url)?, false)
             }
         };
+        let audience = url.to_string();
         let request = client.get(url).header("Accept", "application/fhir+ndjson");
         let request = if send_identity {
-            forward_identity(request, &headers, &tenant)
+            forward_identity(&state, request, &headers, &tenant, &audience).await?
         } else {
             request
         };

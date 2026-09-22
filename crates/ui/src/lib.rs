@@ -173,6 +173,10 @@ struct WebState {
     /// Trusted loopback base used for UI calls back into this HFS process.
     /// Unlike `public_base_url`, this never carries a reverse-proxy prefix.
     self_base_url: String,
+    /// Credential for the UI's self-calls that carry no caller identity
+    /// (the Import page's own kick-offs and polls, the Export workspace,
+    /// #1436/#1438): the same provider the conformance source uses.
+    outbound_auth: Arc<dyn helios_auth::outbound::OutboundAuthProvider>,
     /// Runtime capability cache. A standards-compliant 501 from Patient name
     /// search downgrades this process to exact-id lookup only.
     patient_name_search: Arc<AtomicBool>,
@@ -1376,7 +1380,7 @@ pub fn mount_with_body_limit_and_tenant_routing(
 ) -> Router {
     let source: Arc<dyn ConformanceSource> = Arc::new(conformance::HttpConformanceSource::new(
         self_base_url.clone(),
-        outbound_auth,
+        outbound_auth.clone(),
         fhir_version,
         data_dir.clone(),
     ));
@@ -1396,6 +1400,7 @@ pub fn mount_with_body_limit_and_tenant_routing(
         tenant_path_routing,
         bulk_provider,
         self_base_url,
+        outbound_auth,
         patient_name_search,
         write_observer,
     )
@@ -1509,6 +1514,7 @@ pub fn mount_with_conformance_source_and_body_limit_and_tenant_routing(
         tenant_path_routing,
         bulk_provider,
         public_base_url,
+        Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
         PatientNameSearchSupport::Enabled,
         None,
     )
@@ -1533,6 +1539,7 @@ pub fn mount_with_conformance_source_and_runtime(
     tenant_path_routing: bool,
     bulk_provider: Option<Arc<dyn BulkProviderStore>>,
     self_base_url: String,
+    outbound_auth: Arc<dyn helios_auth::outbound::OutboundAuthProvider>,
     patient_name_search: PatientNameSearchSupport,
     write_observer: Option<Arc<dyn helios_persistence::core::WriteObserver>>,
 ) -> Router {
@@ -1800,6 +1807,7 @@ pub fn mount_with_conformance_source_and_runtime(
         terminology,
         public_base_url,
         self_base_url,
+        outbound_auth,
         patient_name_search: Arc::new(AtomicBool::new(matches!(
             patient_name_search,
             PatientNameSearchSupport::Enabled

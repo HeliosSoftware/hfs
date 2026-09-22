@@ -733,6 +733,7 @@ async fn serve_with_runtime(
         tenant_path_routing,
         None,
         base.clone(),
+        Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
         patient_name_search,
         None,
     )
