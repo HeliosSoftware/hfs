@@ -3999,4 +3999,147 @@ mod tests {
         assert_eq!(outcome["resourceType"], "OperationOutcome");
         assert_eq!(outcome["issue"][0]["code"], "not-found");
     }
+
+    // ── Deferred bulk-submit job store (#1161) ──────────────────
+
+    #[cfg(all(feature = "elasticsearch", feature = "sqlite"))]
+    mod composite_submit_jobs_1161 {
+        use super::*;
+        use helios_fhir::FhirVersion;
+        use helios_persistence::composite::{
+            CompositeConfig, CompositeStorage, DynStorage, SyncMode,
+        };
+        use helios_persistence::core::{SubmissionChange, SubmissionId};
+        use helios_persistence::{StorageResult, StoredResource, TenantId, TenantPermissions};
+        use parking_lot::Mutex;
+        use serde_json::Value;
+
+        /// A search secondary that only records deletes; nothing else is
+        /// reached by a rollback.
+        struct DeleteSpy {
+            deletes: Arc<Mutex<Vec<String>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl ResourceStorage for DeleteSpy {
+            fn backend_name(&self) -> &'static str {
+                "delete-spy"
+            }
+
+            async fn create(
+                &self,
+                _tenant: &TenantContext,
+                _resource_type: &str,
+                _resource: Value,
+                _fhir_version: FhirVersion,
+            ) -> StorageResult<StoredResource> {
+                unimplemented!("a rollback never creates on the secondary")
+            }
+
+            async fn create_or_update(
+                &self,
+                _tenant: &TenantContext,
+                _resource_type: &str,
+                _id: &str,
+                _resource: Value,
+                _fhir_version: FhirVersion,
+            ) -> StorageResult<(StoredResource, bool)> {
+                unimplemented!("a rollback of a create never upserts")
+            }
+
+            async fn read(
+                &self,
+                _tenant: &TenantContext,
+                _resource_type: &str,
+                _id: &str,
+            ) -> StorageResult<Option<StoredResource>> {
+                Ok(None)
+            }
+
+            async fn update(
+                &self,
+                _tenant: &TenantContext,
+                _current: &StoredResource,
+                _resource: Value,
+            ) -> StorageResult<StoredResource> {
+                unimplemented!("a rollback of a create never updates")
+            }
+
+            async fn delete(
+                &self,
+                _tenant: &TenantContext,
+                resource_type: &str,
+                id: &str,
+            ) -> StorageResult<()> {
+                self.deletes
+                    .lock()
+                    .push(format!("delete {resource_type}/{id}"));
+                Ok(())
+            }
+
+            async fn count(
+                &self,
+                _tenant: &TenantContext,
+                _resource_type: Option<&str>,
+            ) -> StorageResult<u64> {
+                Ok(0)
+            }
+        }
+
+        /// #1161: the job store `composite_submit_jobs` hands the worker under
+        /// deferred indexing must mirror a rolled-back create to the search
+        /// backend. Returning the raw primary there left the document in
+        /// Elasticsearch after the primary had dropped it.
+        #[tokio::test]
+        async fn deferred_submit_jobs_mirror_rollbacks_to_the_search_backend() {
+            let sqlite = Arc::new(SqliteBackend::in_memory().unwrap());
+            sqlite.init_schema().unwrap();
+            let deletes = Arc::new(Mutex::new(Vec::new()));
+
+            let config = CompositeConfig::builder()
+                .primary("sqlite", BackendKind::Sqlite)
+                .search_backend("es", BackendKind::Elasticsearch)
+                // Synchronous, so the delete lands before the assertion.
+                .sync_mode(SyncMode::Synchronous)
+                .build()
+                .unwrap();
+            let mut backends = std::collections::HashMap::new();
+            backends.insert("sqlite".to_string(), sqlite.clone() as DynStorage);
+            backends.insert(
+                "es".to_string(),
+                Arc::new(DeleteSpy {
+                    deletes: deletes.clone(),
+                }) as DynStorage,
+            );
+            let composite = Arc::new(CompositeStorage::new(config, backends).unwrap());
+
+            let cfg = helios_rest::config::BulkSubmitConfig {
+                defer_indexing: true,
+                ..Default::default()
+            };
+            let jobs = composite_submit_jobs(
+                sqlite.clone(),
+                sqlite.clone(),
+                composite,
+                Vec::new(),
+                &cfg,
+                true,
+            );
+
+            // No ingest needed: SQLite treats a create that is already gone
+            // as reverted, which is all the wrapper needs to mirror it.
+            let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+            let change = SubmissionChange::create("m1", "Patient", "p-1161", "1");
+            let sub = SubmissionId::generate("t1161");
+            assert!(jobs.rollback_change(&tenant, &sub, &change).await.unwrap());
+
+            assert_eq!(
+                deletes.lock().clone(),
+                vec!["delete Patient/p-1161".to_string()],
+                "the deferred-path job store must mirror rollbacks to the search backend \
+                 (#1161); nothing recorded means composite_submit_jobs handed the worker \
+                 the raw primary"
+            );
+        }
+    }
 }
