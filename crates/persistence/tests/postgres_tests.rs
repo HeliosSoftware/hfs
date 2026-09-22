@@ -108,6 +108,11 @@ mod conditional_if_match_suite;
 #[path = "search/empty_value_suite.rs"]
 mod empty_value_suite;
 
+/// The backend-agnostic modifier parity suite (#1408). Same `#[path]`
+/// arrangement.
+#[path = "search/modifier_parity_suite.rs"]
+mod modifier_parity_suite;
+
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
 
@@ -19171,6 +19176,55 @@ mod postgres_integration {
         super::empty_value_suite::empty_values_are_rejected_on_every_path(
             &backend,
             &unique_base("empty_value"),
+        )
+        .await;
+    }
+
+    /// #1408: every modifier `SearchModifier::is_valid_for` allows, on every
+    /// parameter type.
+    #[tokio::test]
+    async fn postgres_integration_modifier_parity() {
+        use super::modifier_parity_suite::{Divergence, Expect};
+
+        let backend = create_backend().await;
+        super::modifier_parity_suite::every_valid_modifier_agrees_across_backends(
+            &backend,
+            &unique_base("modifier_parity"),
+            &[
+                // A short `:of-type` value adds no condition at all: every Patient.
+                Divergence {
+                    label: "Patient?identifier:ofType=MR|12345",
+                    expect: Expect::Ids(&["p1", "p2", "p3", "p4"]),
+                },
+                Divergence {
+                    label: "Patient?identifier:ofType=12345",
+                    expect: Expect::Ids(&["p1", "p2", "p3", "p4"]),
+                },
+                // Terminology-backed token modifiers are not refused but degraded:
+                // `:in` / `:not-in` match nothing, `:above` / `:below` match the code
+                // itself. Unreachable over REST, which expands them or answers 501 first.
+                Divergence {
+                    label: "Observation?code:in=http://example.org/fhir/ValueSet/a",
+                    expect: Expect::Ids(&[]),
+                },
+                Divergence {
+                    label: "Observation?code:not-in=http://example.org/fhir/ValueSet/a",
+                    expect: Expect::Ids(&[]),
+                },
+                Divergence {
+                    label: "Observation?code:above=http://loinc.org|1234-5",
+                    expect: Expect::Ids(&["ob-pat"]),
+                },
+                Divergence {
+                    label: "Observation?code:below=http://loinc.org|1234-5",
+                    expect: Expect::Ids(&["ob-pat"]),
+                },
+                // A value naming another type wins over the `:[type]` modifier.
+                Divergence {
+                    label: "Observation?subject:Patient=Group/p1",
+                    expect: Expect::Ids(&["ob-grp"]),
+                },
+            ],
         )
         .await;
     }
