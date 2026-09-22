@@ -108,6 +108,26 @@ mod conditional_if_match_suite;
 #[path = "search/empty_value_suite.rs"]
 mod empty_value_suite;
 
+/// The backend-agnostic modifier parity suite (#1408). Same `#[path]`
+/// arrangement.
+#[path = "search/modifier_parity_suite.rs"]
+mod modifier_parity_suite;
+
+/// The backend-agnostic race suite for version-aware writes (#1404, #1405).
+/// Same `#[path]` arrangement.
+#[path = "search/versioned_write_race_suite.rs"]
+mod versioned_write_race_suite;
+
+/// The backend-agnostic conditional patch suite (#1406). Same `#[path]`
+/// arrangement.
+#[path = "search/conditional_patch_suite.rs"]
+mod conditional_patch_suite;
+
+/// The backend-agnostic contract of the secondary sync failure ledger
+/// (#1334). Same `#[path]` arrangement.
+#[path = "common/sync_failure_ledger_suite.rs"]
+mod sync_failure_ledger_suite;
+
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
 
@@ -213,7 +233,7 @@ mod query_builder_tests {
         let result = PostgresQueryBuilder::build_search_query(&query, 2);
         assert!(result.is_some());
         let fragment = result.unwrap();
-        assert!(fragment.sql.contains("id = $"));
+        assert_eq!(fragment.sql, "id = $3");
         assert_eq!(fragment.params.len(), 1);
         match &fragment.params[0] {
             SqlParam::Text(s) => assert_eq!(s, "123"),
@@ -715,7 +735,7 @@ mod query_builder_tests {
     }
 
     #[test]
-    fn test_multiple_values_or() {
+    fn test_multiple_id_values_use_flat_in() {
         let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
             name: "_id".to_string(),
             param_type: SearchParamType::Token,
@@ -728,9 +748,15 @@ mod query_builder_tests {
         let result = PostgresQueryBuilder::build_search_query(&query, 2);
         assert!(result.is_some());
         let fragment = result.unwrap();
-        // Multiple _id values should be OR'd
-        assert!(fragment.sql.contains("OR"));
-        assert_eq!(fragment.params.len(), 2);
+        assert_eq!(fragment.sql, "id IN ($3, $4)");
+        assert!(!fragment.sql.contains("OR"));
+        match &fragment.params[..] {
+            [SqlParam::Text(first), SqlParam::Text(second)] => {
+                assert_eq!(first, "123");
+                assert_eq!(second, "456");
+            }
+            other => panic!("expected ordered text binds, got {other:?}"),
+        }
     }
 
     #[test]
@@ -5912,6 +5938,74 @@ mod postgres_integration {
             .collect();
         assert_eq!(ids_two, vec!["c"], "_id:not=a,b must exclude both a and b");
         assert_eq!(result_two.total, Some(1));
+    }
+
+    /// #1413: chain resolution can rewrite a broad result set into thousands
+    /// of positive `_id` alternatives. PostgreSQL exhausts memory while
+    /// parsing the former left-deep `id = $n OR ...` tree, even when only a
+    /// handful of those ids exist for the tenant. Both result and count paths
+    /// must accept the same wide, flat predicate.
+    #[tokio::test]
+    async fn postgres_integration_search_wide_id_list_uses_flat_predicate() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        const ID_COUNT: usize = 12_000;
+        const MATCHING_IDS: [&str; 3] = ["wide-id-0", "wide-id-5999", "wide-id-11999"];
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("wide-id-list");
+
+        for id in MATCHING_IDS {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({ "resourceType": "Patient", "id": id }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: (0..ID_COUNT)
+                .map(|i| SearchValue::eq(format!("wide-id-{i}")))
+                .collect(),
+            chain: vec![],
+            components: vec![],
+        });
+        assert_eq!(
+            query.total, None,
+            "the result path must not run an implicit count"
+        );
+
+        let result = backend
+            .search(&tenant, &query)
+            .await
+            .expect("the result query accepts a wide positive _id list");
+        assert_eq!(result.total, None);
+        let mut ids: Vec<String> = result
+            .resources
+            .items
+            .iter()
+            .map(|resource| resource.id().to_string())
+            .collect();
+        ids.sort();
+        let mut expected: Vec<String> = MATCHING_IDS.iter().map(ToString::to_string).collect();
+        expected.sort();
+        assert_eq!(ids, expected);
+
+        let count = backend
+            .search_count(&tenant, &query)
+            .await
+            .expect("the count query accepts a wide positive _id list");
+        assert_eq!(count, MATCHING_IDS.len() as u64);
     }
 
     /// #1092: modifiers the `_id` builder cannot honour must be rejected
@@ -19004,6 +19098,30 @@ mod postgres_integration {
         .await;
     }
 
+    /// #1407: `_sort` under `_contained` is applied or refused by name, and a
+    /// contained resource with nothing indexed but its id is still found.
+    #[tokio::test]
+    async fn postgres_integration_contained_sort_and_id_only_contained() {
+        let backend = create_backend().await;
+        super::contained_suite::sort_and_id_only_contained(
+            &backend,
+            &unique_base("contained_sort"),
+        )
+        .await;
+    }
+
+    /// #1407: `reference:identifier` under `_contained` resolves the
+    /// reference's top-level target.
+    #[tokio::test]
+    async fn postgres_integration_contained_reference_identifier_resolves_the_target() {
+        let backend = create_backend().await;
+        super::contained_suite::reference_identifier_resolves_the_target(
+            &backend,
+            &unique_base("contained_ident"),
+        )
+        .await;
+    }
+
     /// #1337: `1e2` is one significant figure, `[50, 150)`.
     #[tokio::test]
     async fn postgres_integration_exponent_values_use_significant_figures() {
@@ -19084,7 +19202,6 @@ mod postgres_integration {
         super::conditional_if_match_suite::concurrent_writers_with_the_same_if_match_admit_one(
             &backend,
             &unique_base("cond_if_match_race_1381"),
-            true,
         )
         .await;
     }
@@ -19097,6 +19214,67 @@ mod postgres_integration {
         super::empty_value_suite::empty_values_are_rejected_on_every_path(
             &backend,
             &unique_base("empty_value"),
+        )
+        .await;
+    }
+
+    /// #1408: every modifier `SearchModifier::is_valid_for` allows, on every
+    /// parameter type.
+    #[tokio::test]
+    async fn postgres_integration_modifier_parity() {
+        use super::modifier_parity_suite::{Divergence, Expect};
+
+        let backend = create_backend().await;
+        super::modifier_parity_suite::every_valid_modifier_agrees_across_backends(
+            &backend,
+            &unique_base("modifier_parity"),
+            &[
+                // A short `:of-type` value adds no condition at all: every Patient.
+                Divergence {
+                    label: "Patient?identifier:ofType=MR|12345",
+                    expect: Expect::Ids(&["p1", "p2", "p3", "p4"]),
+                },
+                Divergence {
+                    label: "Patient?identifier:ofType=12345",
+                    expect: Expect::Ids(&["p1", "p2", "p3", "p4"]),
+                },
+                // Terminology-backed token modifiers are not refused but degraded:
+                // `:in` / `:not-in` match nothing, `:above` / `:below` match the code
+                // itself. Unreachable over REST, which expands them or answers 501 first.
+                Divergence {
+                    label: "Observation?code:in=http://example.org/fhir/ValueSet/a",
+                    expect: Expect::Ids(&[]),
+                },
+                Divergence {
+                    label: "Observation?code:not-in=http://example.org/fhir/ValueSet/a",
+                    expect: Expect::Ids(&[]),
+                },
+                Divergence {
+                    label: "Observation?code:above=http://loinc.org|1234-5",
+                    expect: Expect::Ids(&["ob-pat"]),
+                },
+                Divergence {
+                    label: "Observation?code:below=http://loinc.org|1234-5",
+                    expect: Expect::Ids(&["ob-pat"]),
+                },
+                // A value naming another type wins over the `:[type]` modifier.
+                Divergence {
+                    label: "Observation?subject:Patient=Group/p1",
+                    expect: Expect::Ids(&["ob-grp"]),
+                },
+            ],
+        )
+        .await;
+    }
+
+    /// #1406: conditional patch is the trait's provided implementation over
+    /// the backend's criteria resolver and the shared patch applier.
+    #[tokio::test]
+    async fn postgres_integration_conditional_patch() {
+        let backend = create_backend().await;
+        super::conditional_patch_suite::conditional_patch_resolves_gates_applies_and_swaps(
+            &backend,
+            &unique_base("cond_patch_1406"),
         )
         .await;
     }
@@ -19189,5 +19367,64 @@ mod postgres_integration {
             .unwrap();
 
         assert!(included.is_empty());
+    }
+
+    /// #1404: of several writers holding the same version, one `update` writes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn postgres_integration_concurrent_updates_from_the_same_version_admit_one() {
+        let backend = create_backend().await;
+        super::versioned_write_race_suite::concurrent_updates_from_the_same_version_admit_one(
+            std::sync::Arc::new(backend),
+            &unique_base("update_race_1404"),
+            10,
+        )
+        .await;
+    }
+
+    /// #1404: an update and a versioned delete of the same version: one wins.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn postgres_integration_concurrent_update_and_versioned_delete_admit_one() {
+        let backend = create_backend().await;
+        super::versioned_write_race_suite::concurrent_update_and_versioned_delete_admit_one(
+            std::sync::Arc::new(backend),
+            &unique_base("delete_race_1404"),
+            10,
+        )
+        .await;
+    }
+
+    /// #1404: an update racing an unconditional delete leaves a contiguous
+    /// history.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn postgres_integration_concurrent_update_and_plain_delete_stay_consistent() {
+        let backend = create_backend().await;
+        super::versioned_write_race_suite::concurrent_update_and_plain_delete_stay_consistent(
+            std::sync::Arc::new(backend),
+            &unique_base("plain_delete_race_1404"),
+            10,
+        )
+        .await;
+    }
+
+    /// #1404: `delete_versioned` compares and deletes in one step.
+    #[tokio::test]
+    async fn postgres_integration_versioned_delete_is_a_compare_and_swap() {
+        let backend = create_backend().await;
+        super::versioned_write_race_suite::versioned_delete_is_a_compare_and_swap(
+            &backend,
+            &unique_base("delete_cas_1404"),
+        )
+        .await;
+    }
+
+    /// #1334: the "needs reindex" ledger a composite keeps in this primary.
+    #[tokio::test]
+    async fn postgres_integration_sync_failure_ledger_contract() {
+        let backend = create_backend().await;
+        super::sync_failure_ledger_suite::ledger_folds_orders_clears_and_counts(
+            &backend,
+            &format!("ledger-1334-{}", uuid::Uuid::new_v4()),
+        )
+        .await;
     }
 }

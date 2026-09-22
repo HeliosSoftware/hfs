@@ -139,6 +139,26 @@ fn code_value_quantity(value: &str) -> SearchParameter {
     parameter
 }
 
+/// `component-code-value-quantity`, whose components repeat within a resource.
+fn component_code_value_quantity(value: &str) -> SearchParameter {
+    let mut parameter = literal(
+        "component-code-value-quantity",
+        SearchParamType::Composite,
+        value,
+    );
+    parameter.components = vec![
+        CompositeSearchComponent {
+            param_type: SearchParamType::Token,
+            param_name: "component-code".to_string(),
+        },
+        CompositeSearchComponent {
+            param_type: SearchParamType::Quantity,
+            param_name: "component-value-quantity".to_string(),
+        },
+    ];
+    parameter
+}
+
 fn observation(id: &str, code: &str, date: &str, categories: &[&str]) -> Value {
     let categories: Vec<Value> = categories
         .iter()
@@ -238,7 +258,11 @@ where
             (Expect::Ids(expected), Ok(found)) => *found == ids(expected),
             (Expect::Ids(_), Err(_)) => false,
             (Expect::IdsOrRejected(expected, _), Ok(found)) => *found == ids(expected),
-            (Expect::IdsOrRejected(_, name), Err(message)) => message.contains(name),
+            // A refusal names the parameter, or — from a backend's general
+            // modifier gate — the modifier it does not support.
+            (Expect::IdsOrRejected(_, name), Err(message)) => {
+                message.contains(name) || message.contains("unsupported modifier")
+            }
         };
         let expected = match case.expect {
             Expect::Ids(expected) => format!("{expected:?}"),
@@ -419,11 +443,14 @@ where
 /// Containers (DiagnosticReport → one contained Observation each, code X
 /// unless noted):
 /// - `m-tagged`: `t1` — `meta.tag` foo, `meta.profile` …/p1, `meta.security`
-///   R, `valueQuantity` 7 mg
+///   R, `valueQuantity` 7 mg, `subject` Patient/pt1, an `identifier` of type
+///   MR with value MR7
 /// - `m-plain`: `p1` — no `meta`, `valueQuantity` 3 mg
 /// - `m-str`: `s1` — `valueString` "hello"
 /// - `m-other`: `o1` — code Y with text "Glucose level", `valueString`
 ///   "Hello World"
+/// - `m-comp`: `c1` — code Z, components A = 1 mg and B = 9 mg: a composite
+///   must pair a code with the quantity of the *same* component
 pub async fn criteria_are_applied_or_rejected<S>(backend: &S, tenant_base: &str)
 where
     S: ResourceStorage + SearchProvider,
@@ -448,6 +475,15 @@ where
         })
     };
     tagged["valueQuantity"] = quantity(7.0);
+    tagged["subject"] = json!({"reference": "Patient/pt1"});
+    tagged["identifier"] = json!([{
+        "type": {"coding": [{
+            "system": "http://terminology.hl7.org/CodeSystem/v2-0203",
+            "code": "MR",
+        }]},
+        "system": "http://example.org/obs",
+        "value": "MR7",
+    }]);
     let mut plain = observation("p1", "X", "2020-06-15", &["cat1"]);
     plain["valueQuantity"] = quantity(3.0);
     let mut string = observation("s1", "X", "2020-06-15", &["cat1"]);
@@ -455,6 +491,17 @@ where
     let mut other = observation("o1", "Y", "2020-06-15", &["cat1"]);
     other["code"]["text"] = json!("Glucose level");
     other["valueString"] = json!("Hello World");
+    let mut components = observation("c1", "Z", "2020-06-15", &["cat1"]);
+    components["component"] = json!([
+        {
+            "code": {"coding": [{"system": "http://loinc.org", "code": "A"}]},
+            "valueQuantity": quantity(1.0),
+        },
+        {
+            "code": {"coding": [{"system": "http://loinc.org", "code": "B"}]},
+            "valueQuantity": quantity(9.0),
+        },
+    ]);
 
     seed_containers(
         backend,
@@ -464,11 +511,13 @@ where
             ("m-plain", vec![plain]),
             ("m-str", vec![string]),
             ("m-other", vec![other]),
+            ("m-comp", vec![components]),
         ],
     )
     .await;
 
     let value_string = |value: &str| literal("value-string", SearchParamType::String, value);
+    let subject = |value: &str| literal("subject", SearchParamType::Reference, value);
     let controls = [
         Case::new(
             "code=X",
@@ -580,11 +629,39 @@ where
             vec![code_x(), code_value_quantity("X$gt5")],
             Expect::IdsOrRejected(&["m-tagged"], "code-value-quantity"),
         ),
+        // Pairing: code A goes with 1 mg and code B with 9 mg. `A$gt5` holds
+        // for no single component, though A and a quantity > 5 both occur.
+        Case::new(
+            "component-code-value-quantity=A$lt5",
+            vec![component_code_value_quantity("A$lt5")],
+            Expect::IdsOrRejected(&["m-comp"], "component-code-value-quantity"),
+        ),
+        Case::new(
+            "component-code-value-quantity=A$gt5",
+            vec![component_code_value_quantity("A$gt5")],
+            Expect::IdsOrRejected(&[], "component-code-value-quantity"),
+        ),
+        Case::new(
+            "component-code-value-quantity=A$gt5,B$gt5",
+            vec![SearchParameter {
+                values: vec![
+                    SearchValue::new(SearchPrefix::Eq, "A$gt5"),
+                    SearchValue::new(SearchPrefix::Eq, "B$gt5"),
+                ],
+                ..component_code_value_quantity("")
+            }],
+            Expect::IdsOrRejected(&["m-comp"], "component-code-value-quantity"),
+        ),
+        Case::new(
+            "code=X&code-value-quantity=X$lt5",
+            vec![code_x(), code_value_quantity("X$lt5")],
+            Expect::IdsOrRejected(&["m-plain"], "code-value-quantity"),
+        ),
         // 3. Modifiers.
         Case::new(
             "code:not=X",
             vec![with_modifier(code_x(), SearchModifier::Not)],
-            Expect::IdsOrRejected(&["m-other"], "code"),
+            Expect::IdsOrRejected(&["m-comp", "m-other"], "code"),
         ),
         Case::new(
             "code:text=glucose",
@@ -615,7 +692,7 @@ where
         Case::new(
             "value-string:missing=true",
             vec![with_modifier(value_string("true"), SearchModifier::Missing)],
-            Expect::IdsOrRejected(&["m-plain", "m-tagged"], "value-string"),
+            Expect::IdsOrRejected(&["m-comp", "m-plain", "m-tagged"], "value-string"),
         ),
         Case::new(
             "value-string:missing=false",
@@ -632,6 +709,98 @@ where
                 with_modifier(value_string("true"), SearchModifier::Missing),
             ],
             Expect::IdsOrRejected(&["m-plain", "m-tagged"], "value-string"),
+        ),
+        Case::new(
+            "code:code-text=gluc",
+            vec![with_modifier(
+                token("code", "gluc"),
+                SearchModifier::CodeText,
+            )],
+            Expect::IdsOrRejected(&["m-other"], "code"),
+        ),
+        Case::new(
+            "identifier:of-type=…v2-0203|MR|MR7",
+            vec![with_modifier(
+                token(
+                    "identifier",
+                    "http://terminology.hl7.org/CodeSystem/v2-0203|MR|MR7",
+                ),
+                SearchModifier::OfType,
+            )],
+            Expect::IdsOrRejected(&["m-tagged"], "identifier"),
+        ),
+        Case::new(
+            "identifier:of-type=…v2-0203|MR|other",
+            vec![with_modifier(
+                token(
+                    "identifier",
+                    "http://terminology.hl7.org/CodeSystem/v2-0203|MR|other",
+                ),
+                SearchModifier::OfType,
+            )],
+            Expect::IdsOrRejected(&[], "identifier"),
+        ),
+        // 4. The forms of a reference (#1407): `Type/id`, the bare id and
+        // `:Type`. `:identifier` has a scenario of its own, below.
+        Case::new(
+            "subject=Patient/pt1",
+            vec![subject("Patient/pt1")],
+            Expect::Ids(&["m-tagged"]),
+        ),
+        Case::new(
+            "subject=pt1",
+            vec![subject("pt1")],
+            Expect::Ids(&["m-tagged"]),
+        ),
+        Case::new("subject=t1", vec![subject("t1")], Expect::Ids(&[])),
+        Case::new(
+            "subject:Patient=pt1",
+            vec![with_modifier(
+                subject("pt1"),
+                SearchModifier::Type("Patient".to_string()),
+            )],
+            Expect::IdsOrRejected(&["m-tagged"], "subject"),
+        ),
+        Case::new(
+            "subject:Group=pt1",
+            vec![with_modifier(
+                subject("pt1"),
+                SearchModifier::Type("Group".to_string()),
+            )],
+            Expect::IdsOrRejected(&[], "subject"),
+        ),
+        // 5. uri forms, on the one uri parameter an Observation has.
+        Case::new(
+            "_profile:below=http://example.org/StructureDefinition",
+            vec![with_modifier(
+                literal(
+                    "_profile",
+                    SearchParamType::Uri,
+                    "http://example.org/StructureDefinition",
+                ),
+                SearchModifier::Below,
+            )],
+            Expect::IdsOrRejected(&["m-tagged"], "_profile"),
+        ),
+        Case::new(
+            "_profile:below=http://example.org/Other",
+            vec![with_modifier(
+                literal("_profile", SearchParamType::Uri, "http://example.org/Other"),
+                SearchModifier::Below,
+            )],
+            Expect::IdsOrRejected(&[], "_profile"),
+        ),
+        Case::new(
+            "_profile:above=http://example.org/StructureDefinition/p1/extra",
+            vec![with_modifier(
+                literal(
+                    "_profile",
+                    SearchParamType::Uri,
+                    "http://example.org/StructureDefinition/p1/extra",
+                ),
+                SearchModifier::Above,
+            )],
+            Expect::IdsOrRejected(&["m-tagged"], "_profile"),
         ),
     ];
 
@@ -1024,4 +1193,398 @@ where
         }
     }
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// The ids of a search in the order returned, or the refusal's text.
+async fn ordered_ids<S>(
+    backend: &S,
+    tenant: &TenantContext,
+    query: &SearchQuery,
+) -> Result<Vec<String>, String>
+where
+    S: ResourceStorage + SearchProvider,
+{
+    match backend.search(tenant, query).await {
+        Ok(found) => Ok(found
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect()),
+        Err(StorageError::Search(e)) => Err(e.to_string()),
+        Err(other) => panic!("not a search error: {other}"),
+    }
+}
+
+/// `_sort` under `_contained`, and a contained resource nothing but its id is
+/// known about (#1407).
+///
+/// - `_sort` is applied — to the *contained* resource's values, a container
+///   standing where its first matching contained resource does — or the search
+///   is refused with an error naming `_sort`. Returning the matches in some
+///   other order with a 200 is the one thing not allowed.
+/// - A contained resource with no indexed value other than its id is still a
+///   contained resource of its type: `_contained=true` alone and `_id` find it.
+///
+/// Containers (DiagnosticReport, created in this order → contained):
+/// - `s-a`: Observation `oa` (code X, 2020-03-01)
+/// - `s-b`: Observation `ob` (code X, 2020-01-01)
+/// - `s-c`: Observation `oc` (code X, 2020-02-01)
+/// - `s-bare`: `{"resourceType": "Location", "id": "bare"}` — a valid Location
+///   that yields no search value except `_id`
+/// - `s-named`: Location `named` with a `name`, the positive control for it
+///
+/// plus the top-level Observation `s-top` (code X, 2020-02-15). The three
+/// orders that could be mistaken for one another all differ: by container id
+/// `s-a, s-b, s-c`; most recently updated first `s-c, s-b, s-a`; by date
+/// `s-b, s-c, s-a`.
+pub async fn sort_and_id_only_contained<S>(backend: &S, tenant_base: &str)
+where
+    S: ResourceStorage + SearchProvider,
+{
+    use ContainedMode::{Both, Off, On};
+    use ContainedReturn::{Contained, Container};
+    use helios_persistence::types::SortDirective;
+
+    type Sort<'a> = &'a [(&'a str, Option<SearchParamType>)];
+
+    let tenant = TenantContext::new(TenantId::new(tenant_base), TenantPermissions::full_access());
+    for (container, local, when) in [
+        ("s-a", "oa", "2020-03-01"),
+        ("s-b", "ob", "2020-01-01"),
+        ("s-c", "oc", "2020-02-01"),
+    ] {
+        seed_containers(
+            backend,
+            &tenant,
+            vec![(container, vec![observation(local, "X", when, &["cat1"])])],
+        )
+        .await;
+        // `_lastUpdated` orders the containers; keep their timestamps apart.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    seed_containers(
+        backend,
+        &tenant,
+        vec![
+            (
+                "s-bare",
+                vec![json!({"resourceType": "Location", "id": "bare"})],
+            ),
+            (
+                "s-named",
+                vec![json!({"resourceType": "Location", "id": "named", "name": "Ward 7"})],
+            ),
+        ],
+    )
+    .await;
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            observation("s-top", "X", "2020-02-15", &["cat1"]),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed top-level observation");
+
+    let build = |resource_type: &str,
+                 mode: ContainedMode,
+                 returns: ContainedReturn,
+                 parameters: Vec<SearchParameter>,
+                 sort: Sort| {
+        let mut query = SearchQuery::new(resource_type);
+        query.contained = mode;
+        query.contained_return = returns;
+        query.parameters = parameters;
+        query.sort = sort
+            .iter()
+            .map(|(by, ty)| SortDirective::parse(by).with_param_type(*ty))
+            .collect();
+        query
+    };
+    let code_x = || vec![token("code", "X")];
+    let by_date: Sort = &[("date", Some(SearchParamType::Date))];
+    let by_date_desc: Sort = &[("-date", Some(SearchParamType::Date))];
+
+    // Positive controls: every row the cases rely on is indexed, and `_sort`
+    // itself works on this backend for a top-level search.
+    let controls: Vec<(&str, SearchQuery, &[&str])> = vec![
+        (
+            "code=X [true]",
+            build("Observation", On, Container, code_x(), &[]),
+            &["s-a", "s-b", "s-c"],
+        ),
+        (
+            "Location?name=Ward [true]",
+            build(
+                "Location",
+                On,
+                Container,
+                vec![literal("name", SearchParamType::String, "Ward")],
+                &[],
+            ),
+            &["s-named"],
+        ),
+        (
+            "code=X&_sort=date [false]",
+            build("Observation", Off, Container, code_x(), by_date),
+            &["s-top"],
+        ),
+    ];
+    for (label, query, expected) in &controls {
+        let expected: Vec<String> = expected.iter().map(|id| id.to_string()).collect();
+        for attempt in 0..60 {
+            let got = ordered_ids(backend, &tenant, query).await.map(|mut found| {
+                found.sort();
+                found
+            });
+            if got.as_ref().ok() == Some(&expected) {
+                break;
+            }
+            assert!(
+                attempt < 59,
+                "positive control {label} never held: got {got:?}, expected {expected:?} — \
+                 is the backend built with the spec search parameters?"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+
+    // (label, query, the ids expected — in this order when the query sorts —
+    // and the parameter a refusal may name instead, if one is acceptable)
+    let sort = Some("_sort");
+    let cases: Vec<(&str, SearchQuery, &[&str], Option<&str>)> = vec![
+        (
+            "code=X&_sort=date [true]",
+            build("Observation", On, Container, code_x(), by_date),
+            &["s-b", "s-c", "s-a"],
+            sort,
+        ),
+        (
+            "code=X&_sort=-date [true]",
+            build("Observation", On, Container, code_x(), by_date_desc),
+            &["s-a", "s-c", "s-b"],
+            sort,
+        ),
+        (
+            "code=X&_sort=-date [true, contained]",
+            build("Observation", On, Contained, code_x(), by_date_desc),
+            &["oa", "oc", "ob"],
+            sort,
+        ),
+        (
+            "_sort=date, no criterion [true, contained]",
+            build("Observation", On, Contained, vec![], by_date),
+            &["ob", "oc", "oa"],
+            sort,
+        ),
+        // `both` is one list: the top-level match sorts among the containers.
+        (
+            "code=X&_sort=date [both]",
+            build("Observation", Both, Container, code_x(), by_date),
+            &["s-b", "s-c", "s-top", "s-a"],
+            sort,
+        ),
+        // A contained resource has no `meta.lastUpdated`; its container's is
+        // the only one there is.
+        (
+            "code=X&_sort=_lastUpdated [true]",
+            build(
+                "Observation",
+                On,
+                Container,
+                code_x(),
+                &[("_lastUpdated", None)],
+            ),
+            &["s-a", "s-b", "s-c"],
+            sort,
+        ),
+        (
+            "code=X&_sort=-_lastUpdated [true]",
+            build(
+                "Observation",
+                On,
+                Container,
+                code_x(),
+                &[("-_lastUpdated", None)],
+            ),
+            &["s-c", "s-b", "s-a"],
+            sort,
+        ),
+        // The id-only contained resource.
+        (
+            "Location [true]",
+            build("Location", On, Container, vec![], &[]),
+            &["s-bare", "s-named"],
+            None,
+        ),
+        (
+            "Location [true, contained]",
+            build("Location", On, Contained, vec![], &[]),
+            &["bare", "named"],
+            None,
+        ),
+        (
+            "Location?_id=bare [true]",
+            build("Location", On, Container, vec![token("_id", "bare")], &[]),
+            &["s-bare"],
+            None,
+        ),
+        (
+            "Location?name:missing=true [true]",
+            build(
+                "Location",
+                On,
+                Container,
+                vec![with_modifier(
+                    literal("name", SearchParamType::String, "true"),
+                    SearchModifier::Missing,
+                )],
+                &[],
+            ),
+            &["s-bare"],
+            Some("name"),
+        ),
+    ];
+
+    let mut failures = Vec::new();
+    for (label, query, expected, may_refuse) in &cases {
+        let got = ordered_ids(backend, &tenant, query).await.map(|mut found| {
+            if query.sort.is_empty() {
+                found.sort();
+            }
+            found
+        });
+        let ok = match (&got, may_refuse) {
+            (Ok(found), _) => found
+                .iter()
+                .map(String::as_str)
+                .eq(expected.iter().copied()),
+            (Err(message), Some(name)) => message.contains(name) && message.contains("_contained"),
+            (Err(_), None) => false,
+        };
+        eprintln!(
+            "[contained_suite] {} {label} -> {got:?}",
+            if ok { "ok  " } else { "FAIL" }
+        );
+        if !ok {
+            let or_refused = may_refuse
+                .map(|name| format!(" or an error naming '{name}' and _contained"))
+                .unwrap_or_default();
+            failures.push(format!(
+                "{label}: got {got:?}, expected {expected:?}{or_refused}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// `reference:identifier` under `_contained`, for the backends that resolve it
+/// through the reference's *target* (SQLite, PostgreSQL): the contained
+/// resource's `subject` names a top-level Patient, and the search names that
+/// Patient by one of its identifiers (#1407).
+///
+/// Not part of the all-backend scenarios because the backends do not agree on
+/// what `:identifier` reads even for a top-level search: Elasticsearch matches
+/// `Reference.identifier` token values (which the shared extractor does not
+/// index under the reference parameter), and MongoDB refuses the modifier.
+///
+/// Containers (DiagnosticReport → contained Observation, code X): `i-mrn`
+/// (`subject` Patient/ip1) and `i-other` (`subject` Patient/ip2); top-level
+/// Patients `ip1` (identifier `http://example.org/mrn|42`) and `ip2` (`|43`).
+/// The container `i-decoy` holds a contained *Patient* `ip9` with identifier
+/// `|44` and an Observation about `DiagnosticReport/i-decoy`: a contained
+/// resource's identifier rows are stored under its container, and must not
+/// make the container a target.
+pub async fn reference_identifier_resolves_the_target<S>(backend: &S, tenant_base: &str)
+where
+    S: ResourceStorage + SearchProvider,
+{
+    let tenant = TenantContext::new(TenantId::new(tenant_base), TenantPermissions::full_access());
+    let mrn = |value: &str| json!([{"system": "http://example.org/mrn", "value": value}]);
+    let about = |id: &str, reference: &str| {
+        let mut resource = observation(id, "X", "2020-06-15", &["cat1"]);
+        resource["subject"] = json!({"reference": reference});
+        resource
+    };
+    for (id, value) in [("ip1", "42"), ("ip2", "43")] {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": id, "identifier": mrn(value)}),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("seed patient");
+    }
+    seed_containers(
+        backend,
+        &tenant,
+        vec![
+            ("i-mrn", vec![about("o1", "Patient/ip1")]),
+            ("i-other", vec![about("o1", "Patient/ip2")]),
+            (
+                "i-decoy",
+                vec![
+                    json!({"resourceType": "Patient", "id": "ip9", "identifier": mrn("44")}),
+                    about("o1", "DiagnosticReport/i-decoy"),
+                ],
+            ),
+        ],
+    )
+    .await;
+
+    let subject = |value: &str| literal("subject", SearchParamType::Reference, value);
+    let by_identifier =
+        |value: &str| vec![with_modifier(subject(value), SearchModifier::Identifier)];
+    let controls = [
+        Case::new(
+            "subject=Patient/ip1",
+            vec![subject("Patient/ip1")],
+            Expect::Ids(&["i-mrn"]),
+        ),
+        Case::new(
+            "code=X",
+            vec![token("code", "X")],
+            Expect::Ids(&["i-decoy", "i-mrn", "i-other"]),
+        ),
+    ];
+    let cases = [
+        Case::new(
+            "subject:identifier=http://example.org/mrn|42",
+            by_identifier("http://example.org/mrn|42"),
+            Expect::Ids(&["i-mrn"]),
+        ),
+        Case::new(
+            "subject:identifier=42,43",
+            vec![SearchParameter {
+                values: vec![SearchValue::eq("42"), SearchValue::eq("43")],
+                ..by_identifier("42").remove(0)
+            }],
+            Expect::Ids(&["i-mrn", "i-other"]),
+        ),
+        Case::new(
+            "subject:identifier=http://example.org/mrn|nope",
+            by_identifier("http://example.org/mrn|nope"),
+            Expect::Ids(&[]),
+        ),
+        Case::new(
+            "subject:identifier=http://example.org/mrn|44 (a contained Patient's)",
+            by_identifier("http://example.org/mrn|44"),
+            Expect::Ids(&[]),
+        ),
+        Case::new(
+            "code=X&subject:identifier=…|43 [contained]",
+            vec![
+                token("code", "X"),
+                by_identifier("http://example.org/mrn|43").remove(0),
+            ],
+            Expect::Ids(&["o1"]),
+        )
+        .returning_contained(),
+    ];
+
+    assert_cases(backend, &tenant, &controls, &cases).await;
 }

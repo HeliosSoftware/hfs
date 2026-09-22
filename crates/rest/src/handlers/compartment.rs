@@ -151,6 +151,8 @@ where
         .min(state.max_page_size());
     query.count = Some(count as u32);
 
+    let query = resolve_out_of_band(&state, &tenant, query).await?;
+
     // Execute the search
     let result = state
         .storage()
@@ -346,10 +348,11 @@ where
 
     // Run each member-type search, accumulating matches up to the page-size cap.
     let mut collected: Vec<helios_persistence::types::StoredResource> = Vec::new();
-    for query in &queries {
+    for query in queries {
         if collected.len() >= count {
             break;
         }
+        let query = &resolve_out_of_band(&state, &tenant, query).await?;
         match state.storage().search(tenant.context(), query).await {
             Ok(result) => collected.extend(result.resources.items),
             Err(e) => {
@@ -396,6 +399,71 @@ where
     }
 
     Ok((StatusCode::OK, Json(bundle_json)).into_response())
+}
+
+/// Applies the criteria a backend's `search()` does not: the ones the type
+/// search handler resolves before it runs the query (#1407). A compartment
+/// search used to skip all of this, so `Patient/1/Observation?_list=l1` and
+/// `?_has:…` returned the whole compartment and `_contained` reached backends
+/// that cannot answer it.
+///
+/// - `_contained=true|both` needs a backend that indexes contained resources
+///   (501 otherwise), and cannot be combined with `_list`, `_has` or a chained
+///   parameter, which select top-level resources (400, as in the type search).
+/// - `_list`, `_has` and chained parameters are resolved into an `_id` filter.
+///   Unlike the type search this passes no terminology expander: a
+///   terminology-backed modifier on a chain's terminal parameter is refused by
+///   the resolver rather than expanded.
+async fn resolve_out_of_band<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    query: helios_persistence::types::SearchQuery,
+) -> RestResult<helios_persistence::types::SearchQuery>
+where
+    S: ResourceStorage + SearchProvider + Send + Sync,
+{
+    if query.contained != helios_persistence::types::ContainedMode::Off {
+        if !state.storage().supports_contained_search() {
+            return Err(RestError::NotImplemented {
+                feature: "'_contained' search is not supported by this storage backend".to_string(),
+            });
+        }
+        let chained = query.parameters.iter().find(|p| !p.chain.is_empty());
+        let refused = if !query.list.is_empty() {
+            Some("_list".to_string())
+        } else if !query.reverse_chains.is_empty() {
+            Some("_has".to_string())
+        } else {
+            chained.map(|p| {
+                let path: Vec<&str> = p.chain.iter().map(|c| c.target_param.as_str()).collect();
+                format!("{}.{}", p.name, path.join("."))
+            })
+        };
+        if let Some(param) = refused {
+            return Err(RestError::InvalidParameter {
+                message: format!(
+                    "'{param}' cannot be combined with _contained=true or both: it selects \
+                     top-level resources, which a contained resource is not"
+                ),
+                param,
+            });
+        }
+    }
+
+    if let Some(functional) = query.list.iter().find(|v| v.starts_with('$')) {
+        return Err(RestError::NotImplemented {
+            feature: format!(
+                "functional list '{functional}' is not supported; \
+                 use '_list=[List id]' with a stored List resource"
+            ),
+        });
+    }
+    let query = helios_persistence::search::resolve_list(state.storage(), tenant.context(), &query)
+        .await
+        .map_err(RestError::from)?;
+    helios_persistence::search::resolve_chains(state.storage(), tenant.context(), &query)
+        .await
+        .map_err(RestError::from)
 }
 
 /// Applies FHIR unknown-parameter handling to a compartment search.

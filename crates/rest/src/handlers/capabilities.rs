@@ -174,8 +174,8 @@ where
     let revinclude_by_target = build_revinclude_index(&registry);
 
     // The conditional interactions are the storage's to declare, not literals:
-    // MongoDB has no conditional patch, S3 none at all, and a composite's
-    // answer depends on how it is composed (#1384). The conditional handlers
+    // S3 serves none on its own, and a composite's answer depends on how it
+    // is composed (#1384). The conditional handlers
     // refuse with `501` from this same source.
     let conditionals = super::conditional_support::advertised(state.storage(), version);
 
@@ -214,7 +214,9 @@ where
     }
     system_interactions.push(serde_json::json!({ "code": "batch" }));
     system_interactions.push(serde_json::json!({ "code": "history-system" }));
-    system_interactions.push(serde_json::json!({ "code": "search-system" }));
+    // No `search-system`: `GET [base]?params` and `POST [base]/_search` are
+    // refused with `501` (`search_system_not_supported_handler`). It was listed
+    // here unconditionally while no route served it (#1338).
 
     // Standard operations, extended with the system-level SQL on FHIR
     // operations. Partial parameter support is advertised through the

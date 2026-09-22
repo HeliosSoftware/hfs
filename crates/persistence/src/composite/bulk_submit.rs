@@ -470,6 +470,18 @@ impl ResourceStorage for CompositeSubmitJobs {
         self.composite.delete(tenant, resource_type, id).await
     }
 
+    async fn delete_versioned(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: &str,
+    ) -> StorageResult<()> {
+        self.composite
+            .delete_versioned(tenant, resource_type, id, expected_version)
+            .await
+    }
+
     async fn exists(
         &self,
         tenant: &TenantContext,

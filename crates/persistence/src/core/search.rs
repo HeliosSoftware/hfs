@@ -479,6 +479,10 @@ pub trait SearchProvider: ResourceStorage {
 ///
 /// This extends [`SearchProvider`] to support system-level search:
 /// `GET [base]?[parameters]`
+///
+/// Nothing calls this over HTTP yet: `helios-rest` does not route system-level
+/// search and refuses it with `501` (#1338). Only the SQLite and PostgreSQL
+/// backends implement the trait.
 #[async_trait]
 pub trait MultiTypeSearchProvider: SearchProvider {
     /// Searches across multiple resource types.

@@ -128,9 +128,10 @@ mod tests {
     /// nothing: only its declaration is under test.
     struct Declares(&'static [ConditionalInteraction]);
 
-    /// SQLite, PostgreSQL.
+    /// SQLite, PostgreSQL, MongoDB; a composite with a dedicated search backend.
     const ALL: Declares = Declares(&ConditionalInteraction::ALL);
-    /// MongoDB; a composite with a dedicated search backend.
+    /// What MongoDB and those composites declared before #1406; any storage
+    /// that resolves criteria but declines patch.
     const ALL_BUT_PATCH: Declares = Declares(&[
         ConditionalInteraction::Create,
         ConditionalInteraction::Update,

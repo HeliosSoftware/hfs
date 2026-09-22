@@ -1,21 +1,24 @@
 //! #1384: `rest.resource.conditional*` and the `501` of an unsupported
 //! conditional interaction come from one source — what the storage declares.
 //!
-//! The storage that lacks an interaction here is a production-shaped
-//! composite (a primary with its index offloaded plus a dedicated search
-//! backend — the `*-elasticsearch` arrangement, with a second SQLite standing
-//! in for Elasticsearch so no container is needed). It resolves create /
-//! update / delete criteria itself and cannot serve conditional patch.
+//! The second storage here is a production-shaped composite (a primary with
+//! its index offloaded plus a dedicated search backend — the
+//! `*-elasticsearch` arrangement, with a second SQLite standing in for
+//! Elasticsearch so no container is needed). It resolves conditional criteria
+//! itself, through the search backend.
 //!
 //! The statement used to advertise every conditional interaction for every
 //! backend, and a conditional patch on such a composite answered `404`
-//! whatever existed. Plain SQLite, which serves all four, is the
-//! no-regression half; its `/metadata` is also asserted in
-//! `conditional_patch.rs`.
+//! whatever existed (then `501`, #1384). Since #1406 the patch applier is
+//! shared at the persistence level, the composite serves conditional patch,
+//! and declares it — so the statement and the behaviour below changed
+//! together, from that one declaration. The `501` half is held by the unit
+//! tests of `handlers::conditional_support` and by S3, the storage that still
+//! declines. Plain SQLite is the no-regression half; its `/metadata` is also
+//! asserted in `conditional_patch.rs`.
 //!
-//! `conditionalPatch` exists from FHIR R5 on, so the statement only shows the
-//! difference on a build with R5 or R6 enabled (`--features R4,R4B,R5,R6`);
-//! the `501` shows on every build.
+//! `conditionalPatch` exists from FHIR R5 on, so the statement only shows it
+//! on a build with R5 or R6 enabled (`--features R4,R4B,R5,R6`).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -180,11 +183,11 @@ fn has_conditional_patch_element(version: FhirVersion) -> bool {
     matches!(version.as_mime_param(), "5.0" | "6.0")
 }
 
-/// A storage that cannot serve conditional patch says so, and still advertises
-/// what it does serve. Conditional read is the REST layer's own (ETag /
-/// `Last-Modified`), so it does not vary with the storage.
+/// A composite with a dedicated search backend serves all four, and says so
+/// (`conditionalPatch` was `false` until #1406). Conditional read is the REST
+/// layer's own (ETag / `Last-Modified`), so it does not vary with the storage.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_statement_omits_what_the_storage_does_not_serve() {
+async fn the_statement_follows_what_the_composite_serves() {
     let server = composite_server();
 
     for (version, entry) in patient_capabilities(&server).await {
@@ -194,7 +197,7 @@ async fn the_statement_omits_what_the_storage_does_not_serve() {
         assert_eq!(entry["conditionalRead"], "full-support", "{version:?}");
         assert_eq!(
             entry.get("conditionalPatch"),
-            has_conditional_patch_element(version).then_some(&Value::Bool(false)),
+            has_conditional_patch_element(version).then_some(&Value::Bool(true)),
             "{version:?}"
         );
     }
@@ -218,35 +221,61 @@ async fn sqlite_advertises_every_conditional_interaction() {
     }
 }
 
-/// The interaction the statement leaves out is refused as `501` +
-/// `not-supported`, naming what was asked — not answered `404` as though
-/// nothing matched — and changes nothing.
+/// `PATCH [type]?criteria` on the composite: resolved by the search backend,
+/// applied to the primary's content, written through the primary, and visible
+/// to the next search. It was `404` whatever existed, then `501` (#1384).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_unsupported_conditional_patch_is_501_and_patches_nothing() {
+async fn a_conditional_patch_on_the_composite_patches_the_one_match() {
     let server = composite_server();
     let id = create(&server, "P-1").await;
+    create(&server, "P-1-decoy").await;
     // Positive control: the criteria do match, on this storage's search.
     assert_eq!(found(&server, "P-1").await, 1);
 
-    let response = server
-        .patch("/Patient?identifier=urn:zzz:probe|P-1")
-        .add_header(X_TENANT_ID, tenant())
-        .add_header(header::CONTENT_TYPE, HeaderValue::from_static(JSON_PATCH))
-        .bytes(serde_json::to_vec(&activate()).expect("patch").into())
-        .await;
+    let patch = |url: &'static str, if_match: Option<&'static str>, body: Value| {
+        let mut request = server
+            .patch(url)
+            .add_header(X_TENANT_ID, tenant())
+            .add_header(header::CONTENT_TYPE, HeaderValue::from_static(JSON_PATCH));
+        if let Some(if_match) = if_match {
+            request = request.add_header(header::IF_MATCH, HeaderValue::from_static(if_match));
+        }
+        request.bytes(serde_json::to_vec(&body).expect("patch").into())
+    };
 
-    response.assert_status(StatusCode::NOT_IMPLEMENTED);
-    let outcome: Value = response.json();
-    assert_eq!(outcome["resourceType"], "OperationOutcome");
-    assert_eq!(outcome["issue"][0]["code"], "not-supported");
-    let text = outcome["issue"][0]["details"]["text"]
-        .as_str()
-        .or(outcome["issue"][0]["diagnostics"].as_str())
-        .unwrap_or_default();
-    assert!(
-        text.contains("conditional patch (PATCH [type]?criteria)"),
-        "{outcome}"
-    );
+    // Refused, and nothing written: a stale If-Match, no match, a patch that
+    // would change the resource's identity, a failed `test`.
+    patch(
+        "/Patient?identifier=urn:zzz:probe|P-1",
+        Some("W/\"7\""),
+        activate(),
+    )
+    .await
+    .assert_status(StatusCode::PRECONDITION_FAILED);
+    patch("/Patient?identifier=urn:zzz:probe|NOBODY", None, activate())
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+    for body in [
+        json!([{"op": "replace", "path": "/id", "value": "other"}]),
+        json!([{"op": "replace", "path": "/resourceType", "value": "Person"}]),
+        json!([{"op": "test", "path": "/active", "value": true}]),
+    ] {
+        patch("/Patient?identifier=urn:zzz:probe|P-1", None, body)
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    let response = patch(
+        "/Patient?identifier=urn:zzz:probe|P-1",
+        Some("W/\"1\""),
+        activate(),
+    )
+    .await;
+    response.assert_status_ok();
+    let patched: Value = response.json();
+    assert_eq!(patched["id"], id.as_str());
+    assert_eq!(patched["active"], true);
+    assert_eq!(patched["meta"]["versionId"], "2");
 
     let read = server
         .get(&format!("/Patient/{id}"))
@@ -254,8 +283,26 @@ async fn an_unsupported_conditional_patch_is_501_and_patches_nothing() {
         .await;
     read.assert_status_ok();
     let stored: Value = read.json();
-    assert_eq!(stored["active"], false);
-    assert_eq!(stored["meta"]["versionId"], "1");
+    assert_eq!(stored["active"], true);
+    assert_eq!(stored["meta"]["versionId"], "2");
+
+    // The search backend followed the write; the decoy did not move.
+    let active = server
+        .get("/Patient?active=true")
+        .add_header(X_TENANT_ID, tenant())
+        .await;
+    active.assert_status_ok();
+    let active: Value = active.json();
+    let ids: Vec<&str> = active["entry"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| e["resource"]["id"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(ids, [id.as_str()]);
 }
 
 /// The interactions the same storage does advertise are served: the check is

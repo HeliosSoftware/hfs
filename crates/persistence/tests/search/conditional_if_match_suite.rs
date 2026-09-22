@@ -134,8 +134,9 @@ fn is_precondition_failure<T: std::fmt::Debug>(result: &Result<T, StorageError>)
 /// `OptimisticLockFailure` that leaves storage untouched, and a no-match
 /// update does not fall through to its create.
 ///
-/// `supports_patch` is `false` for a backend without `conditional_patch`
-/// (MongoDB), which must then refuse it whatever the precondition says.
+/// `supports_patch` is `false` for a backend that declines `conditional_patch`
+/// (none of the current callers, since #1406), which must then refuse it
+/// whatever the precondition says.
 pub async fn if_match_is_evaluated_against_the_resolved_match<S>(
     backend: &S,
     base: &str,
@@ -328,16 +329,16 @@ pub async fn if_match_is_evaluated_against_the_resolved_match<S>(
 /// resolved after the winner, or by the swap (`VersionConflict`) if it resolved
 /// before. None of them may write version 3.
 ///
-/// `losers_are_concurrency_errors` is `false` for MongoDB: its `update` runs in
-/// a multi-document transaction, and a racing loser there surfaces the server's
-/// `WriteConflict` as `BackendError::Internal` rather than as a
-/// `ConcurrencyError`. The loser still writes nothing — which is what this
-/// asserts for every backend — but its error is not classified.
-pub async fn concurrent_writers_with_the_same_if_match_admit_one<S>(
-    backend: &S,
-    base: &str,
-    losers_are_concurrency_errors: bool,
-) where
+/// That holds on every backend. MongoDB used to be exempt from the second
+/// half: its `update` runs in a multi-document transaction, and a racing loser
+/// there surfaced the server's `WriteConflict` as `BackendError::Internal`
+/// (#1405).
+///
+/// These writers are futures on one task, so a backend whose calls never yield
+/// (SQLite) runs them one after another; `versioned_write_race_suite.rs` is the
+/// test with real parallelism.
+pub async fn concurrent_writers_with_the_same_if_match_admit_one<S>(backend: &S, base: &str)
+where
     S: ResourceStorage + ConditionalStorage + SearchProvider,
 {
     let t = tenant(base, "race");
@@ -374,7 +375,6 @@ pub async fn concurrent_writers_with_the_same_if_match_admit_one<S>(
     for result in &results {
         match result {
             Ok(ConditionalUpdateResult::Updated(_)) | Err(StorageError::Concurrency(_)) => {}
-            Err(_) if !losers_are_concurrency_errors => {}
             other => panic!("a loser is a concurrency refusal, nothing else: {other:?}"),
         }
     }

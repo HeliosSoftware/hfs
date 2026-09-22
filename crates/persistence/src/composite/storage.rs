@@ -45,12 +45,12 @@ use tracing::{debug, instrument, warn};
 use crate::core::history::HistoryParams;
 use crate::core::{
     BundleEntry, BundleProvider, BundleResult, CapabilityProvider, ChainedSearchProvider,
-    ConditionalCreateResult, ConditionalDeleteResult, ConditionalPatchResult, ConditionalStorage,
-    ConditionalUpdateResult, ExportDataProvider, ExportRequest, GroupExportProvider,
-    IncludeProvider, InstanceHistoryProvider, NdjsonBatch, PatchFormat, PatientExportProvider,
-    PurgableStorage, ResourceStorage, RevincludeProvider, SearchProvider, SearchResult, SofRunner,
-    StorageCapabilities, SystemHistoryProvider, TerminologySearchProvider, TextSearchProvider,
-    TypeHistoryProvider, VersionedStorage,
+    ConditionalCreateResult, ConditionalDeleteResult, ConditionalStorage, ConditionalUpdateResult,
+    ExportDataProvider, ExportRequest, GroupExportProvider, IncludeProvider,
+    InstanceHistoryProvider, NdjsonBatch, PatientExportProvider, PurgableStorage, ResourceStorage,
+    RevincludeProvider, SearchProvider, SearchResult, SofRunner, StorageCapabilities,
+    SystemHistoryProvider, TerminologySearchProvider, TextSearchProvider, TypeHistoryProvider,
+    VersionedStorage,
 };
 use crate::error::{BackendError, ResourceError, StorageError, StorageResult, TransactionError};
 use crate::search::ChainResolveOptions;
@@ -64,6 +64,9 @@ use super::config::{CompositeConfig, SyncMode};
 use super::merger::{MergeOptions, ResultMerger};
 use super::router::{QueryRouter, RoutingDecision, RoutingError};
 use super::sync::{SyncEvent, SyncManager, SyncStatus};
+use super::sync_failures::{
+    SecondarySyncFailureLedger, SecondarySyncObserver, SyncFailureRecorder,
+};
 
 /// A dynamically typed storage backend.
 pub type DynStorage = Arc<dyn ResourceStorage + Send + Sync>;
@@ -472,11 +475,56 @@ impl CompositeStorage {
     }
 
     /// Synchronizes a resource change to secondary backends.
+    ///
+    /// `Err` means the event could not even be handed over (the asynchronous
+    /// queue is gone). A secondary that *took* the event and then refused it
+    /// after retries is not an error here — the primary has committed and the
+    /// write stands (#1334) — but it is never silent either: the
+    /// [`SyncManager`] reports every final outcome, from the synchronous path
+    /// and from the asynchronous worker alike, to its
+    /// [`SyncFailureRecorder`], which counts it, emits the structured event
+    /// and records the resource as needing a reindex.
     pub(crate) async fn sync_to_secondaries(&self, event: SyncEvent) -> StorageResult<()> {
         if let Some(ref sync_manager) = self.sync_manager {
-            sync_manager.sync(&event, &self.secondaries).await?;
+            let statuses = sync_manager.sync(&event, &self.secondaries).await?;
+            for status in statuses.iter().filter(|status| !status.success) {
+                // Already counted, logged and recorded by the recorder; this
+                // only ties the failure to the request's own trace span.
+                debug!(
+                    backend_id = %status.backend_id,
+                    retries = status.retry_count,
+                    "Write committed on the primary; secondary sync failed and was recorded"
+                );
+            }
         }
         Ok(())
+    }
+
+    /// Keeps "needs reindex" records for failed secondary syncs in `ledger`
+    /// — normally the primary backend — so they survive a restart and
+    /// [`repair_secondary_sync_failures`](Self::repair_secondary_sync_failures)
+    /// can work through them (#1334). Without one, failures are still counted
+    /// and logged, just not listed.
+    pub fn with_sync_failure_ledger(self, ledger: Arc<dyn SecondarySyncFailureLedger>) -> Self {
+        if let Some(recorder) = self.sync_failure_recorder() {
+            recorder.set_ledger(ledger);
+        }
+        self
+    }
+
+    /// Forwards secondary sync failures to a metrics exporter (#1334).
+    pub fn with_sync_observer(self, observer: Arc<dyn SecondarySyncObserver>) -> Self {
+        if let Some(recorder) = self.sync_failure_recorder() {
+            recorder.set_observer(observer);
+        }
+        self
+    }
+
+    /// Where secondary sync outcomes are reported; `None` without secondaries.
+    pub fn sync_failure_recorder(&self) -> Option<&Arc<SyncFailureRecorder>> {
+        self.sync_manager
+            .as_ref()
+            .map(|manager| manager.failure_recorder())
     }
 
     /// Routes and executes a search query.
@@ -1082,6 +1130,57 @@ impl ResourceStorage for CompositeStorage {
         Ok(())
     }
 
+    /// The primary is the system of record for versions, so the compare-and-
+    /// swap is its alone; secondaries are told about the delete only once it
+    /// has won. Inheriting the trait's default here would turn the primary's
+    /// atomic delete back into read-compare-delete (#1404).
+    #[instrument(skip(self, tenant), fields(resource_type = %resource_type, id = %id))]
+    async fn delete_versioned(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: &str,
+    ) -> StorageResult<()> {
+        let result = self
+            .primary
+            .delete_versioned(tenant, resource_type, id, expected_version)
+            .await;
+
+        // A refused precondition is the primary working, not the primary
+        // failing: racing clients must not be able to mark it unhealthy.
+        let refused = matches!(
+            result,
+            Err(StorageError::Concurrency(_) | StorageError::Resource(_))
+        );
+        let primary_id = self.config.primary_id().unwrap_or("primary");
+        self.update_health(
+            primary_id,
+            result.is_ok() || refused,
+            result
+                .as_ref()
+                .err()
+                .filter(|_| !refused)
+                .map(|e| e.to_string()),
+        );
+
+        result?;
+
+        // Sync to secondaries
+        if let Err(e) = self
+            .sync_to_secondaries(SyncEvent::Delete {
+                resource_type: resource_type.to_string(),
+                resource_id: id.to_string(),
+                tenant_id: tenant.tenant_id().clone(),
+            })
+            .await
+        {
+            warn!(error = %e, "Failed to sync delete to secondaries");
+        }
+
+        Ok(())
+    }
+
     async fn count(
         &self,
         tenant: &TenantContext,
@@ -1380,18 +1479,49 @@ impl SearchProvider for CompositeStorage {
 impl ConditionalStorage for CompositeStorage {
     /// Composed, not copied from the primary (#1384). With a dedicated search
     /// backend the composite resolves the criteria itself and needs only plain
-    /// CRUD from the primary for create / update / delete — which is how
-    /// `s3-elasticsearch` serves them over a primary that declares none. Patch
-    /// is the reverse: only the primary can apply one, and it resolves the
-    /// criteria against its own index, which a dedicated search backend leaves
-    /// offloaded and empty — so no such composite supports it.
+    /// CRUD from the primary — which is how `s3-elasticsearch` serves all four
+    /// over a primary that declares none. Patch included (#1406): the patch is
+    /// applied by the shared [`apply_patch`](crate::core::apply_patch), not by
+    /// the primary.
     fn supports_conditional(&self, interaction: crate::core::ConditionalInteraction) -> bool {
         if self.has_dedicated_search_backend() {
-            return interaction != crate::core::ConditionalInteraction::Patch;
+            return true;
         }
         self.conditional_storage
             .as_ref()
             .is_some_and(|primary| primary.supports_conditional(interaction))
+    }
+
+    /// Criteria go to whichever backend holds the search index: the dedicated
+    /// search backend when there is one — the primary's own index is then
+    /// offloaded and empty — and the primary otherwise.
+    ///
+    /// `conditional_patch` is the trait's provided implementation on top of
+    /// this. Its `read` and `update` are the composite's: the current content
+    /// comes from the primary, not from the search backend's copy, and the
+    /// write compares-and-swaps there and is synced to the secondaries like
+    /// any other update.
+    async fn resolve_conditional_matches(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        search_params: &str,
+    ) -> StorageResult<Vec<StoredResource>> {
+        if self.has_dedicated_search_backend() {
+            return self
+                .find_conditional_matches(tenant, resource_type, search_params)
+                .await;
+        }
+
+        let storage = self.conditional_storage.as_ref().ok_or_else(|| {
+            StorageError::Backend(BackendError::UnsupportedCapability {
+                backend_name: "composite".to_string(),
+                capability: "ConditionalStorage".to_string(),
+            })
+        })?;
+        storage
+            .resolve_conditional_matches(tenant, resource_type, search_params)
+            .await
     }
 
     async fn conditional_create(
@@ -1627,9 +1757,16 @@ impl ConditionalStorage for CompositeStorage {
                         resource_type,
                         Some(&current),
                     )?;
-                    self.primary
-                        .delete(tenant, resource_type, current.id())
-                        .await?;
+                    // `current` is the search backend's copy; the primary's
+                    // compare-and-swap runs on its version, so a stale copy
+                    // is a 409, not a delete (#1404).
+                    crate::core::delete_under_precondition(
+                        self.primary.as_ref(),
+                        tenant,
+                        if_match,
+                        &current,
+                    )
+                    .await?;
 
                     if let Err(e) = self
                         .sync_to_secondaries(SyncEvent::Delete {
@@ -1671,58 +1808,6 @@ impl ConditionalStorage for CompositeStorage {
                 .await
         {
             warn!(error = %e, "Failed to sync conditional_delete to secondaries");
-        }
-
-        Ok(result)
-    }
-
-    async fn conditional_patch(
-        &self,
-        tenant: &TenantContext,
-        resource_type: &str,
-        search_params: &str,
-        patch: &PatchFormat,
-        if_match: &crate::core::EntityTagPrecondition,
-    ) -> StorageResult<ConditionalPatchResult> {
-        let storage = self.conditional_storage.as_ref().ok_or_else(|| {
-            StorageError::Backend(BackendError::UnsupportedCapability {
-                backend_name: "composite".to_string(),
-                capability: "ConditionalStorage".to_string(),
-            })
-        })?;
-
-        // Patch application lives in the primary, and the primary resolves the
-        // criteria against its own index — which, with a dedicated search
-        // backend, is offloaded and empty (even `_id` enumerates index rows on
-        // SQLite). Handed the criteria it matched nothing, so every conditional
-        // patch was a silent no-match; refuse instead, in step with
-        // `supports_conditional` (#1384).
-        if !self.supports_conditional(crate::core::ConditionalInteraction::Patch) {
-            return Err(StorageError::Backend(BackendError::UnsupportedCapability {
-                backend_name: "composite".to_string(),
-                capability: "conditional_patch".to_string(),
-            }));
-        }
-
-        let result = storage
-            .conditional_patch(tenant, resource_type, search_params, patch, if_match)
-            .await?;
-
-        // Sync patched resource to secondaries
-        if let ConditionalPatchResult::Patched(ref stored) = result {
-            if let Err(e) = self
-                .sync_to_secondaries(SyncEvent::Update {
-                    resource_type: resource_type.to_string(),
-                    resource_id: stored.id().to_string(),
-                    content: stored.content().clone(),
-                    tenant_id: tenant.tenant_id().clone(),
-                    version: stored.version_id().to_string(),
-                    fhir_version: stored.fhir_version(),
-                })
-                .await
-            {
-                warn!(error = %e, "Failed to sync conditional_patch to secondaries");
-            }
         }
 
         Ok(result)

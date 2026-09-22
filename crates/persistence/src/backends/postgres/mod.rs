@@ -81,6 +81,7 @@ pub(crate) mod schema;
 pub mod search;
 mod search_impl;
 mod storage;
+mod sync_failures;
 mod transaction;
 mod user_settings;
 

@@ -935,6 +935,36 @@ mod tests {
         TenantContext::new(TenantId::new("t"), TenantPermissions::full_access())
     }
 
+    fn assert_positive_id_rewrite(query: &SearchQuery, expected_ids: &[&str]) {
+        let id_params: Vec<&SearchParameter> = query
+            .parameters
+            .iter()
+            .filter(|parameter| parameter.name == "_id")
+            .collect();
+        assert_eq!(id_params.len(), 1, "the chain rewrite adds one _id filter");
+
+        let id_param = id_params[0];
+        assert_eq!(id_param.modifier, None, "the _id rewrite is positive");
+        assert!(id_param.chain.is_empty());
+        assert!(
+            id_param
+                .values
+                .iter()
+                .all(|value| value.prefix == SearchPrefix::Eq),
+            "every rewritten _id value is an equality"
+        );
+
+        let mut actual: Vec<&str> = id_param
+            .values
+            .iter()
+            .map(|value| value.value.as_str())
+            .collect();
+        actual.sort_unstable();
+        let mut expected = expected_ids.to_vec();
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+    }
+
     #[tokio::test]
     async fn forward_chain_subject_name() {
         let b = backend();
@@ -956,6 +986,7 @@ mod tests {
         });
 
         let rewritten = resolve_chains(&b, &t, &query).await.unwrap();
+        assert_positive_id_rewrite(&rewritten, &["o1"]);
         let result = b.search(&t, &rewritten).await.unwrap();
         let ids: Vec<String> = result
             .resources
@@ -983,6 +1014,7 @@ mod tests {
         });
 
         let rewritten = resolve_chains(&b, &t, &query).await.unwrap();
+        assert_positive_id_rewrite(&rewritten, &["smith"]);
         let result = b.search(&t, &rewritten).await.unwrap();
         let ids: Vec<String> = result
             .resources
