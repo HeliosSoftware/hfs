@@ -10,8 +10,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use futures::StreamExt;
 use helios_fhir::FhirVersion;
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::io::BufReader;
 
 use crate::backends::s3::backend::S3Backend;
@@ -1742,18 +1743,27 @@ async fn resource_scan_hook_returns_the_tenants_live_resources() {
     let scan = backend
         .resource_scan()
         .expect("standalone S3 resolves canonicals by scan");
-    let libraries = scan.scan_resources(&t, "Library").await.expect("scan");
+    let libraries: Vec<Value> = scan
+        .scan_resources(&t, "Library")
+        .await
+        .expect("scan")
+        .map(|r| r.expect("scanned resource"))
+        .collect()
+        .await;
     let urls: Vec<&str> = libraries
         .iter()
         .filter_map(|r| r.get("url").and_then(|u| u.as_str()))
         .collect();
     assert_eq!(urls, ["http://example.org/Library/lib-1"]);
-    assert!(
-        scan.scan_resources(&tenant("tenant-b"), "Library")
-            .await
-            .expect("scan")
-            .is_empty()
-    );
+
+    let other_tenant: Vec<Value> = scan
+        .scan_resources(&tenant("tenant-b"), "Library")
+        .await
+        .expect("scan")
+        .map(|r| r.expect("scanned resource"))
+        .collect()
+        .await;
+    assert!(other_tenant.is_empty());
 }
 
 #[tokio::test]

@@ -1265,16 +1265,21 @@ impl CompartmentFilter {
 
     /// Tests whether `resource` is in the effective patient compartment.
     ///
-    /// Groups whose `Group/{id}` was explicitly requested are first-class
-    /// compartment members and skip the FHIRPath scan. All other types go
-    /// through [`compartment::resource_in_patient_compartment`].
+    /// A Group whose `Group/{id}` was requested directly is a first-class
+    /// compartment member and skips the FHIRPath scan. Every other resource —
+    /// *including* a Group that was not requested directly — goes through
+    /// [`compartment::resource_in_patient_compartment`]. That fall-through
+    /// matters for Group specifically: `Group` is in the patient
+    /// CompartmentDefinition via `member`, so a Group listing a target patient
+    /// as a member is in that patient's compartment even though it was never
+    /// named in `group_refs`.
     pub fn apply(&self, resource: &serde_json::Value) -> Result<bool, SofError> {
         if self.targets.is_empty() {
             return Ok(false);
         }
 
-        if resource.get("resourceType").and_then(|v| v.as_str()) == Some("Group") {
-            let in_group = resource
+        if resource.get("resourceType").and_then(|v| v.as_str()) == Some("Group")
+            && resource
                 .get("id")
                 .and_then(|v| v.as_str())
                 .map(|id| {
@@ -1282,8 +1287,9 @@ impl CompartmentFilter {
                         .iter()
                         .any(|g| g == &format!("Group/{}", id) || g == id)
                 })
-                .unwrap_or(false);
-            return Ok(in_group);
+                .unwrap_or(false)
+        {
+            return Ok(true);
         }
 
         compartment::resource_in_patient_compartment(resource, &self.targets, self.fhir_version)

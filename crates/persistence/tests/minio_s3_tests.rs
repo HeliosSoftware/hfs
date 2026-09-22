@@ -1449,7 +1449,9 @@ async fn test_minio_sof_scan_resources_include_server_meta() {
         ]}]
     });
 
-    let runner = backend.sof_runner().expect("S3 backend must provide a SOF runner");
+    let runner = backend
+        .sof_runner()
+        .expect("S3 backend must provide a SOF runner");
     let mut stream = runner
         .run_view(&t, view, ViewFilters::default())
         .await
@@ -1540,7 +1542,9 @@ async fn test_minio_sof_since_filter() {
         "select": [{ "column": [{ "path": "id", "name": "obs_id" }] }]
     });
 
-    let runner = backend.sof_runner().expect("S3 backend must provide a SOF runner");
+    let runner = backend
+        .sof_runner()
+        .expect("S3 backend must provide a SOF runner");
 
     let collect = |filters: ViewFilters| {
         let runner = runner.clone();
@@ -1559,11 +1563,21 @@ async fn test_minio_sof_since_filter() {
 
     // Unfiltered: both observations present.
     let all = collect(ViewFilters::default()).await;
-    assert!(all.contains(&"s3-since-before".to_string()), "unfiltered must include before: {all:?}");
-    assert!(all.contains(&"s3-since-after".to_string()), "unfiltered must include after: {all:?}");
+    assert!(
+        all.contains(&"s3-since-before".to_string()),
+        "unfiltered must include before: {all:?}"
+    );
+    assert!(
+        all.contains(&"s3-since-after".to_string()),
+        "unfiltered must include after: {all:?}"
+    );
 
     // since=cutoff: only the after-cutoff observation.
-    let filtered = collect(ViewFilters { since: Some(cutoff), ..Default::default() }).await;
+    let filtered = collect(ViewFilters {
+        since: Some(cutoff),
+        ..Default::default()
+    })
+    .await;
     assert_eq!(
         filtered,
         vec!["s3-since-after"],
@@ -1572,8 +1586,15 @@ async fn test_minio_sof_since_filter() {
 
     // since=future: nothing.
     let future_cutoff = cutoff + chrono::Duration::hours(1);
-    let empty = collect(ViewFilters { since: Some(future_cutoff), ..Default::default() }).await;
-    assert!(empty.is_empty(), "future cutoff must return nothing: {empty:?}");
+    let empty = collect(ViewFilters {
+        since: Some(future_cutoff),
+        ..Default::default()
+    })
+    .await;
+    assert!(
+        empty.is_empty(),
+        "future cutoff must return nothing: {empty:?}"
+    );
 }
 
 /// Verifies that the patient compartment filter on S3 returns the correct
@@ -1644,7 +1665,9 @@ async fn test_minio_sof_patient_filter() {
         "select": [{ "column": [{ "path": "id", "name": "obs_id" }] }]
     });
 
-    let runner = backend.sof_runner().expect("S3 backend must provide a SOF runner");
+    let runner = backend
+        .sof_runner()
+        .expect("S3 backend must provide a SOF runner");
 
     let collect = |filters: ViewFilters| {
         let runner = runner.clone();
@@ -1662,14 +1685,22 @@ async fn test_minio_sof_patient_filter() {
     };
 
     let all = collect(ViewFilters::default()).await;
-    assert_eq!(all, vec!["s3-obs-p1-a", "s3-obs-p1-b", "s3-obs-p2-a"], "unfiltered: {all:?}");
+    assert_eq!(
+        all,
+        vec!["s3-obs-p1-a", "s3-obs-p1-b", "s3-obs-p2-a"],
+        "unfiltered: {all:?}"
+    );
 
     let p1 = collect(ViewFilters {
         patient: vec!["Patient/s3-pt-1".to_string()],
         ..Default::default()
     })
     .await;
-    assert_eq!(p1, vec!["s3-obs-p1-a", "s3-obs-p1-b"], "patient/s3-pt-1 filter: {p1:?}");
+    assert_eq!(
+        p1,
+        vec!["s3-obs-p1-a", "s3-obs-p1-b"],
+        "patient/s3-pt-1 filter: {p1:?}"
+    );
 
     let p2 = collect(ViewFilters {
         patient: vec!["Patient/s3-pt-2".to_string()],
@@ -1680,5 +1711,8 @@ async fn test_minio_sof_patient_filter() {
 
     let p1_set: std::collections::HashSet<_> = p1.iter().collect();
     let p2_set: std::collections::HashSet<_> = p2.iter().collect();
-    assert!(p1_set.is_disjoint(&p2_set), "patient filters must return non-overlapping observations");
+    assert!(
+        p1_set.is_disjoint(&p2_set),
+        "patient filters must return non-overlapping observations"
+    );
 }

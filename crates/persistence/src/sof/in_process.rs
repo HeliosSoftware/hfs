@@ -24,7 +24,9 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use helios_fhir::FhirVersion;
-use helios_sof::{CompartmentFilter, PreparedViewDefinition, ResourceChunk, parse_view_definition_for_version};
+use helios_sof::{
+    CompartmentFilter, PreparedViewDefinition, ResourceChunk, parse_view_definition_for_version,
+};
 use serde_json::{Map, Value};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::debug;
@@ -44,7 +46,13 @@ const CHUNK_SIZE: usize = 1024;
 
 /// Number of resource batches that can be queued between the async scan task
 /// and the spawn_blocking engine task before the scan task applies backpressure.
-const RESOURCE_CHANNEL_BUFFER: usize = 4;
+///
+/// The engine holds one batch back beyond this to compute `is_last`, so peak
+/// residency is `(RESOURCE_CHANNEL_BUFFER + 1) * CHUNK_SIZE` resources plus the
+/// batch the scan task is still filling. Together with [`CHUNK_SIZE`] this pair
+/// sets the floor on the run's memory: measured on a 100k-Observation corpus,
+/// 3/1024 peaks around 350 MiB and 1/256 around 175 MiB, for ~5% throughput.
+const RESOURCE_CHANNEL_BUFFER: usize = 3;
 
 /// A pinned, heap-allocated, `Send + 'static` stream of raw FHIR resource JSON.
 ///
@@ -62,6 +70,8 @@ pub type ResourceStream = BoxStream<'static, Result<Value, SofError>>;
 /// [`CHUNK_SIZE`]-sized batches internally.
 #[async_trait]
 pub trait ResourceScan: Send + Sync {
+    /// Yields every live resource of `resource_type` visible to `tenant` as
+    /// raw FHIR JSON, one at a time.
     async fn scan_resources(
         &self,
         tenant: &TenantContext,
@@ -82,6 +92,10 @@ pub struct InProcessSofRunner {
 }
 
 impl InProcessSofRunner {
+    /// Creates a runner that scans resources via `scan` and evaluates views
+    /// against `fhir_version`. `runner_name` is surfaced in logs/diagnostics
+    /// (e.g. `"s3-in-process"`). No storage-backed `resolve()` is configured;
+    /// use [`with_reference_resolver`](Self::with_reference_resolver) to enable it.
     pub fn new(
         scan: Arc<dyn ResourceScan>,
         fhir_version: FhirVersion,
@@ -95,15 +109,21 @@ impl InProcessSofRunner {
         }
     }
 
-    pub fn with_reference_resolver(
-        mut self,
-        resolver: Arc<dyn StorageReferenceResolver>,
-    ) -> Self {
+    /// Enables storage-backed `resolve()`: relative `Type/id` references in the
+    /// resources under evaluation are dereferenced from storage via `resolver`
+    /// (tenant-scoped, version-matched) and made available to FHIRPath
+    /// `resolve()`. See [`crate::sof::reference_resolver`].
+    pub fn with_reference_resolver(mut self, resolver: Arc<dyn StorageReferenceResolver>) -> Self {
         self.resolver = Some(resolver);
         self
     }
 }
 
+/// Maps a `helios_sof` engine error onto the persistence-layer [`SofError`].
+///
+/// Structural/validation problems and the spec's absent-target case become
+/// `InvalidViewDefinition` (surfaced as a 4xx); everything else is a runtime
+/// backend error.
 fn map_engine_error(e: helios_sof::SofError) -> SofError {
     use helios_sof::SofError as E;
     match e {
@@ -113,6 +133,8 @@ fn map_engine_error(e: helios_sof::SofError) -> SofError {
     }
 }
 
+/// Zips one engine row (`columns` × `values`) into a flat JSON object, the
+/// same shape the SQL runners emit. Missing/`None` values become JSON `null`.
 fn row_to_view_row(columns: &[String], values: &[Option<Value>]) -> ViewRow {
     let mut obj = Map::with_capacity(columns.len());
     for (i, column) in columns.iter().enumerate() {
@@ -166,9 +188,12 @@ impl SofRunner for InProcessSofRunner {
             "executing in-process ViewDefinition"
         );
 
-        // Pre-fetch Patient/Group supporting resources when a compartment filter
-        // is active. These collections are small enough to materialise in full;
-        // the large target type (e.g. Observation) is streamed below.
+        // Pre-fetch the Patient/Group supporting resources a compartment filter
+        // needs: absent-target validation and Group member resolution both want
+        // them resident. The large target type (e.g. Observation) is streamed
+        // below, so this is bounded by the Patient/Group collections rather than
+        // by the corpus — but it is still a full materialisation, and for a view
+        // whose target type *is* Patient it is the corpus. Tracked in #1453.
         let compartment_filter: Option<CompartmentFilter> =
             if !filters.patient.is_empty() || !filters.group.is_empty() {
                 let mut supporting: Vec<Value> = Vec::new();
@@ -178,8 +203,7 @@ impl SofRunner for InProcessSofRunner {
                         _ => !filters.group.is_empty(),
                     };
                     if needed {
-                        let mut stream =
-                            self.scan.scan_resources(tenant, supporting_type).await?;
+                        let mut stream = self.scan.scan_resources(tenant, supporting_type).await?;
                         while let Some(item) = stream.next().await {
                             supporting.push(item?);
                         }
@@ -249,13 +273,8 @@ impl SofRunner for InProcessSofRunner {
                 batch.push(resource);
 
                 if batch.len() == CHUNK_SIZE {
-                    let external = resolve_batch_external(
-                        &resolver,
-                        &tenant_owned,
-                        version,
-                        &batch,
-                    )
-                    .await;
+                    let external =
+                        resolve_batch_external(&resolver, &tenant_owned, version, &batch).await;
                     if res_tx
                         .send(Ok((std::mem::take(&mut batch), external)))
                         .await
@@ -280,15 +299,23 @@ impl SofRunner for InProcessSofRunner {
             let mut emitted = 0usize;
             let mut chunk_index = 0usize;
 
-            loop {
-                let (resources, external_json) = match res_rx.blocking_recv() {
-                    None => break,
-                    Some(Err(e)) => {
+            // One-batch lookahead. `is_last` has to mean "no further batches
+            // exist", which an `is_empty()` probe on the receiver cannot tell
+            // you — under backpressure the channel is momentarily drained for
+            // most batches whenever the engine outruns the scan. Holding the
+            // next batch back is the only way to know the current one is final.
+            let mut pending = res_rx.blocking_recv();
+
+            while let Some(item) = pending.take() {
+                let (resources, external_json) = match item {
+                    Err(e) => {
                         let _ = row_tx.blocking_send(Err(e));
                         return;
                     }
-                    Some(Ok(batch)) => batch,
+                    Ok(batch) => batch,
                 };
+                pending = res_rx.blocking_recv();
+                let is_last = pending.is_none();
 
                 let resources: Vec<Value> = match &compartment_filter {
                     Some(cf) => {
@@ -298,8 +325,7 @@ impl SofRunner for InProcessSofRunner {
                                 Ok(true) => filtered.push(r),
                                 Ok(false) => {}
                                 Err(e) => {
-                                    let _ = row_tx
-                                        .blocking_send(Err(map_engine_error(e)));
+                                    let _ = row_tx.blocking_send(Err(map_engine_error(e)));
                                     return;
                                 }
                             }
@@ -309,7 +335,10 @@ impl SofRunner for InProcessSofRunner {
                     None => resources,
                 };
 
-                if resources.is_empty() {
+                // An all-filtered-out batch produces no rows, but the final
+                // batch still has to reach the engine so `is_last` is actually
+                // delivered once per run.
+                if resources.is_empty() && !is_last {
                     continue;
                 }
 
@@ -320,7 +349,6 @@ impl SofRunner for InProcessSofRunner {
                     })
                     .collect();
 
-                let is_last = res_rx.is_empty();
                 let chunk = ResourceChunk {
                     resources,
                     chunk_index,
@@ -366,6 +394,7 @@ mod tests {
     use serde_json::json;
     use tokio_stream::StreamExt;
 
+    /// A `ResourceScan` that streams a fixed set of resources, filtered by type.
     struct StaticScan {
         resources: Vec<Value>,
     }
@@ -380,15 +409,14 @@ mod tests {
             let items: Vec<Value> = self
                 .resources
                 .iter()
-                .filter(|r| {
-                    r.get("resourceType").and_then(Value::as_str) == Some(resource_type)
-                })
+                .filter(|r| r.get("resourceType").and_then(Value::as_str) == Some(resource_type))
                 .cloned()
                 .collect();
             Ok(Box::pin(futures::stream::iter(items.into_iter().map(Ok))))
         }
     }
 
+    /// A resolver that serves a fixed pool of resources by `(type, id)`.
     struct StaticResolver {
         pool: Vec<Value>,
     }
@@ -417,6 +445,8 @@ mod tests {
         TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access())
     }
 
+    /// A view whose column dereferences `Observation.subject` to a Patient that
+    /// is *not* in the scanned set — it can only come from the resolver.
     fn resolve_view() -> Value {
         json!({
             "resourceType": "ViewDefinition",
@@ -460,6 +490,8 @@ mod tests {
         rows
     }
 
+    /// With a resolver, `resolve()` dereferences the stored Patient and the
+    /// view column projects its family name.
     #[tokio::test]
     async fn resolves_stored_reference_during_view_run() {
         let scan = Arc::new(StaticScan {
@@ -481,6 +513,8 @@ mod tests {
         );
     }
 
+    /// Without a resolver, behavior is unchanged: `resolve()` yields a typed
+    /// stub (no `name`), so the projected family is null.
     #[tokio::test]
     async fn without_resolver_reference_is_not_dereferenced() {
         let scan = Arc::new(StaticScan {
@@ -549,6 +583,9 @@ mod tests {
         ids
     }
 
+    /// A `patient` filter on a view whose target type is not Patient: the
+    /// scan only yields Observations, so the referenced Patients have to be
+    /// pulled in for the compartment filter to recognise them.
     #[tokio::test]
     async fn patient_filter_scans_the_referenced_patients() {
         let scan = Arc::new(StaticScan {
@@ -567,6 +604,9 @@ mod tests {
         assert_eq!(ids, vec!["o2"]);
     }
 
+    /// A `group` filter: the Group and its member Patients ride along with
+    /// the scan, the members' compartment decides the rows, and neither the
+    /// Group nor the Patients leak into the view's output.
     #[tokio::test]
     async fn group_filter_scans_the_group_and_its_members() {
         let scan = Arc::new(StaticScan {
@@ -585,6 +625,8 @@ mod tests {
         assert_eq!(ids, vec!["o1"]);
     }
 
+    /// A `group` reference that resolves to no stored Group is still the
+    /// spec's absent-target error, not an empty result.
     #[tokio::test]
     async fn absent_group_is_an_error() {
         let scan = Arc::new(StaticScan {

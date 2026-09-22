@@ -7218,10 +7218,18 @@ async fn mongodb_integration_sof_scan_streams_across_multiple_batches() {
         ids
     }
 
-    let runner = backend.sof_runner().expect("MongoDB backend must provide a SOF runner");
+    let runner = backend
+        .sof_runner()
+        .expect("MongoDB backend must provide a SOF runner");
 
     // Unfiltered: all observations are returned.
-    let all = collect_ids(runner.as_ref(), &tenant, view.clone(), ViewFilters::default()).await;
+    let all = collect_ids(
+        runner.as_ref(),
+        &tenant,
+        view.clone(),
+        ViewFilters::default(),
+    )
+    .await;
     assert_eq!(
         all.len(),
         P1_COUNT + P2_COUNT,
@@ -7359,7 +7367,10 @@ async fn mongodb_integration_sof_since_filter() {
         view: serde_json::Value,
         filters: ViewFilters,
     ) -> Vec<String> {
-        let mut stream = runner.run_view(tenant, view, filters).await.expect("run_view");
+        let mut stream = runner
+            .run_view(tenant, view, filters)
+            .await
+            .expect("run_view");
         let mut ids = Vec::new();
         while let Some(row) = stream.next().await {
             ids.push(row.expect("row")["obs_id"].as_str().unwrap().to_string());
@@ -7368,7 +7379,9 @@ async fn mongodb_integration_sof_since_filter() {
         ids
     }
 
-    let runner = backend.sof_runner().expect("MongoDB must provide a SOF runner");
+    let runner = backend
+        .sof_runner()
+        .expect("MongoDB must provide a SOF runner");
 
     // Patient filter forces the in-process runner. Without `since`, both
     // observations are returned.
