@@ -12,7 +12,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 41;
+pub const SCHEMA_VERSION: i32 = 42;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -395,10 +395,11 @@ async fn migrate_schema(
             37 => migrate_v37_to_v38(client).await?,
             38 => migrate_v38_to_v39(client).await?,
             39 => migrate_v39_to_v40(client).await?,
-            40 => {
-                // The helper writes the v41 marker inside its own transaction,
+            40 => migrate_v40_to_v41(client).await?,
+            41 => {
+                // The helper writes the v42 marker inside its own transaction,
                 // like v37, so the common loop must not stamp it again.
-                migrate_v40_to_v41(client).await?;
+                migrate_v41_to_v42(client).await?;
                 version += 1;
                 continue;
             }
@@ -3737,7 +3738,37 @@ async fn migrate_v39_to_v40(client: &deadpool_postgres::Client) -> StorageResult
     Ok(())
 }
 
-/// v40 -> v41: indexable bare-id reference lookup (#1414).
+/// v40 -> v41: `secondary_sync_failures` (#1334).
+///
+/// The durable "needs reindex" ledger for a composite whose secondary refused
+/// a change this primary had already committed. One row per (tenant, resource,
+/// secondary), so a repeat failure folds into the existing row instead of
+/// growing the table; `last_failed_at` orders the repair queue.
+async fn migrate_v40_to_v41(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS secondary_sync_failures (
+                tenant_id TEXT NOT NULL,
+                resource_type TEXT NOT NULL,
+                resource_id TEXT NOT NULL,
+                backend_id TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                first_failed_at TIMESTAMPTZ NOT NULL,
+                last_failed_at TIMESTAMPTZ NOT NULL,
+                last_error TEXT NOT NULL,
+                attempts BIGINT NOT NULL DEFAULT 0,
+                PRIMARY KEY (tenant_id, resource_type, resource_id, backend_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_secondary_sync_failures_queue
+                ON secondary_sync_failures (last_failed_at);",
+        )
+        .await
+        .map_err(|e| pg_error(format!("Migration v40->v41 failed: {}", e)))?;
+
+    Ok(())
+}
+
+/// v41 -> v42: indexable bare-id reference lookup (#1414).
 ///
 /// A bare logical id (`Observation?patient=<id>`) matched as
 /// `value_reference = $n OR value_reference LIKE '%/<id>'`. The leading-wildcard
@@ -3767,23 +3798,23 @@ async fn migrate_v39_to_v40(client: &deadpool_postgres::Client) -> StorageResult
 /// an invalid index that a later `IF NOT EXISTS` would skip; see the v15 and v19
 /// notes.
 ///
-/// The v41 marker is written in the same transaction as the index. A failure
+/// The v42 marker is written in the same transaction as the index. A failure
 /// before commit rolls both changes back, so the next startup retries the whole
 /// migration. A failure in the best-effort `ANALYZE` below only warns and does
-/// not revert v41.
+/// not revert v42.
 ///
 /// `SET LOCAL statement_timeout = 0` guards the migration transaction against a
 /// deployment-wide statement timeout that would otherwise kill a minutes-long
 /// index build on a production-sized `search_index`. The post-commit `ANALYZE`
 /// has a separate bounded timeout because startup must not wait on it forever.
-async fn migrate_v40_to_v41(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
+async fn migrate_v41_to_v42(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
     let tx = client
         .transaction()
         .await
-        .map_err(|e| pg_error(format!("begin v41 migration: {e}")))?;
+        .map_err(|e| pg_error(format!("begin v42 migration: {e}")))?;
     tx.execute("SET LOCAL statement_timeout = 0", &[])
         .await
-        .map_err(|e| pg_error(format!("disable statement timeout for v41 migration: {e}")))?;
+        .map_err(|e| pg_error(format!("disable statement timeout for v42 migration: {e}")))?;
     let create_index = format!(
         "CREATE INDEX idx_search_reference_target_id \
          ON search_index (tenant_id, resource_type, param_name, ({expr})) \
@@ -3792,26 +3823,26 @@ async fn migrate_v40_to_v41(client: &mut deadpool_postgres::Client) -> StorageRe
     );
     tx.execute(create_index.as_str(), &[])
         .await
-        .map_err(|e| pg_error(format!("Migration v40->v41 failed: {e}")))?;
-    set_schema_version(&tx, 41).await?;
+        .map_err(|e| pg_error(format!("Migration v41->v42 failed: {e}")))?;
+    set_schema_version(&tx, 42).await?;
     tx.commit()
         .await
-        .map_err(|e| pg_error(format!("commit v41 migration: {e}")))?;
+        .map_err(|e| pg_error(format!("commit v42 migration: {e}")))?;
 
     // Best-effort statistics so the planner prices the new index from the
-    // start. A separate transaction: v41 is already committed, and an ANALYZE
+    // start. A separate transaction: v42 is already committed, and an ANALYZE
     // failure must not revert it.
     if let Err(e) = analyze_search_index_with_timeout(client, POST_MIGRATION_ANALYZE_TIMEOUT).await
     {
         tracing::warn!(
-            "Migration v40->v41: optional ANALYZE failed ({e}); plans may use default estimates until autovacuum runs"
+            "Migration v41->v42: optional ANALYZE failed ({e}); plans may use default estimates until autovacuum runs"
         );
     }
 
     Ok(())
 }
 
-/// Best-effort `ANALYZE search_index` after the v41 index build.
+/// Best-effort `ANALYZE search_index` after the v42 index build.
 async fn analyze_search_index_with_timeout(
     client: &mut deadpool_postgres::Client,
     timeout: &str,
@@ -3819,19 +3850,19 @@ async fn analyze_search_index_with_timeout(
     let tx = client
         .transaction()
         .await
-        .map_err(|e| pg_error(format!("begin v41 analyze: {e}")))?;
+        .map_err(|e| pg_error(format!("begin v42 analyze: {e}")))?;
     tx.query_one(
         "SELECT set_config('statement_timeout', $1, true)",
         &[&timeout],
     )
     .await
-    .map_err(|e| pg_error(format!("set timeout for v41 analyze: {e}")))?;
+    .map_err(|e| pg_error(format!("set timeout for v42 analyze: {e}")))?;
     tx.execute("ANALYZE search_index", &[])
         .await
-        .map_err(|e| pg_error(format!("analyze search_index after v41: {e}")))?;
+        .map_err(|e| pg_error(format!("analyze search_index after v42: {e}")))?;
     tx.commit()
         .await
-        .map_err(|e| pg_error(format!("commit v41 analyze: {e}")))
+        .map_err(|e| pg_error(format!("commit v42 analyze: {e}")))
 }
 
 /// v23 -> v24: drop `fk_search_resource`.
@@ -4546,7 +4577,7 @@ mod postgres_integration_migrations {
         .expect("connect migration test backend")
     }
 
-    async fn create_v40_database(pg: &SharedPg, name: &str) -> PostgresBackend {
+    async fn create_v41_database(pg: &SharedPg, name: &str) -> PostgresBackend {
         let backend = create_database(pg, name).await;
         let mut client = backend.get_client().await.unwrap();
         initialize_schema(&mut client)
@@ -4555,11 +4586,11 @@ mod postgres_integration_migrations {
         client
             .execute("DROP INDEX idx_search_reference_target_id", &[])
             .await
-            .expect("remove the v41 index from the fixture");
-        set_schema_version(&client, 40)
+            .expect("remove the v42 index from the fixture");
+        set_schema_version(&client, 41)
             .await
-            .expect("mark fixture as v40");
-        assert_eq!(get_schema_version(&client).await.unwrap(), 40);
+            .expect("mark fixture as v41");
+        assert_eq!(get_schema_version(&client).await.unwrap(), 41);
         backend
     }
 
@@ -5439,12 +5470,12 @@ mod postgres_integration_migrations {
     }
 
     #[tokio::test]
-    async fn postgres_integration_v40_to_v41_builds_valid_idempotent_index() {
+    async fn postgres_integration_v41_to_v42_builds_valid_idempotent_index() {
         let _guard = POSTGRES_TEST_LOCK.lock().await;
         let pg = shared_pg().await;
-        let backend = create_v40_database(
+        let backend = create_v41_database(
             pg,
-            &format!("hfs_v41_test_{}", uuid::Uuid::new_v4().simple()),
+            &format!("hfs_v42_test_{}", uuid::Uuid::new_v4().simple()),
         )
         .await;
         let mut client = backend.get_client().await.unwrap();
@@ -5469,28 +5500,28 @@ mod postgres_integration_migrations {
                 &[],
             )
             .await
-            .expect("seed a pre-v41 reference row");
+            .expect("seed a pre-v42 reference row");
         client
             .batch_execute(
                 "SET statement_timeout = '50ms';
-                 CREATE FUNCTION delay_v41_create_index() RETURNS event_trigger
+                 CREATE FUNCTION delay_v42_create_index() RETURNS event_trigger
                  LANGUAGE plpgsql AS $$
                  BEGIN
                      PERFORM pg_sleep(0.2);
                  END
                  $$;
-                 CREATE EVENT TRIGGER delay_v41_create_index
+                 CREATE EVENT TRIGGER delay_v42_create_index
                  ON ddl_command_start WHEN TAG IN ('CREATE INDEX')
-                 EXECUTE FUNCTION delay_v41_create_index();",
+                 EXECUTE FUNCTION delay_v42_create_index();",
             )
             .await
-            .expect("install delayed v41 CREATE INDEX injection");
+            .expect("install delayed v42 CREATE INDEX injection");
         assert_eq!(statement_timeout(&client).await, "50ms");
 
         let migration_started = tokio::time::Instant::now();
         initialize_schema(&mut client)
             .await
-            .expect("migrate v40 to v41");
+            .expect("migrate v41 to v42");
         let migration_elapsed = migration_started.elapsed();
         assert!(
             migration_elapsed >= Duration::from_millis(150),
@@ -5498,11 +5529,11 @@ mod postgres_integration_migrations {
         );
         client
             .batch_execute(
-                "DROP EVENT TRIGGER delay_v41_create_index;
-                 DROP FUNCTION delay_v41_create_index();",
+                "DROP EVENT TRIGGER delay_v42_create_index;
+                 DROP FUNCTION delay_v42_create_index();",
             )
             .await
-            .expect("remove delayed v41 CREATE INDEX injection");
+            .expect("remove delayed v42 CREATE INDEX injection");
         assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
         assert_eq!(statement_timeout(&client).await, "50ms");
         let preexisting_matches: i64 = client
@@ -5521,18 +5552,18 @@ mod postgres_integration_migrations {
 
         let first = reference_target_index(&client)
             .await
-            .expect("v41 index must exist");
-        assert!(first.valid, "v41 index must be valid: {first:?}");
+            .expect("v42 index must exist");
+        assert!(first.valid, "v42 index must be valid: {first:?}");
         assert!(
             first.expression.contains("split_part(value_reference")
                 && first.expression.contains("'/'::text")
                 && first.expression.contains("-1"),
-            "unexpected v41 index expression: {}",
+            "unexpected v42 index expression: {}",
             first.expression
         );
         assert!(
             first.predicate.contains("value_reference IS NOT NULL"),
-            "unexpected v41 partial predicate: {}",
+            "unexpected v42 partial predicate: {}",
             first.predicate
         );
 
@@ -5548,12 +5579,12 @@ mod postgres_integration_migrations {
     }
 
     #[tokio::test]
-    async fn postgres_integration_v40_to_v41_lock_wait_ignores_statement_timeout() {
+    async fn postgres_integration_v41_to_v42_lock_wait_ignores_statement_timeout() {
         let _guard = POSTGRES_TEST_LOCK.lock().await;
         let pg = shared_pg().await;
-        let backend = create_v40_database(
+        let backend = create_v41_database(
             pg,
-            &format!("hfs_v41_test_{}", uuid::Uuid::new_v4().simple()),
+            &format!("hfs_v42_test_{}", uuid::Uuid::new_v4().simple()),
         )
         .await;
         let lock_holder = backend.get_client().await.unwrap();
@@ -5578,7 +5609,7 @@ mod postgres_integration_migrations {
         let migration_started = tokio::time::Instant::now();
         initialize_schema(&mut migration_client)
             .await
-            .expect("wait for lock and migrate v40 to v41");
+            .expect("wait for lock and migrate v41 to v42");
         let migration_elapsed = migration_started.elapsed();
         assert!(release.await.expect("join lock release task"));
 
@@ -5600,21 +5631,21 @@ mod postgres_integration_migrations {
     }
 
     #[tokio::test]
-    async fn postgres_integration_v40_to_v41_analyze_timeout_is_bounded_and_local() {
+    async fn postgres_integration_v41_to_v42_analyze_timeout_is_bounded_and_local() {
         let _guard = POSTGRES_TEST_LOCK.lock().await;
         let pg = shared_pg().await;
-        let backend = create_v40_database(
+        let backend = create_v41_database(
             pg,
-            &format!("hfs_v41_test_{}", uuid::Uuid::new_v4().simple()),
+            &format!("hfs_v42_test_{}", uuid::Uuid::new_v4().simple()),
         )
         .await;
         let mut migration_client = backend.get_client().await.unwrap();
         initialize_schema(&mut migration_client)
             .await
-            .expect("migrate fixture to v41");
+            .expect("migrate fixture to v42");
         let committed_index = reference_target_index(&migration_client)
             .await
-            .expect("v41 index must be committed before analyze timeout test");
+            .expect("v42 index must be committed before analyze timeout test");
         drop(migration_client);
 
         let mut lock_client = backend.get_client().await.unwrap();
@@ -5646,7 +5677,7 @@ mod postgres_integration_migrations {
             "ANALYZE timeout did not bound startup delay: {analyze_elapsed:?}"
         );
         assert!(
-            error.to_string().contains("analyze search_index after v41"),
+            error.to_string().contains("analyze search_index after v42"),
             "unexpected ANALYZE error: {error}"
         );
         lock_tx
@@ -5662,44 +5693,44 @@ mod postgres_integration_migrations {
         assert_eq!(
             reference_target_index(&analyze_client).await,
             Some(committed_index),
-            "a best-effort ANALYZE timeout must not alter the committed v41 index"
+            "a best-effort ANALYZE timeout must not alter the committed v42 index"
         );
     }
 
     #[tokio::test]
-    async fn postgres_integration_v40_to_v41_rolls_back_index_failure_and_retries() {
+    async fn postgres_integration_v41_to_v42_rolls_back_index_failure_and_retries() {
         let _guard = POSTGRES_TEST_LOCK.lock().await;
         let pg = shared_pg().await;
-        let backend = create_v40_database(
+        let backend = create_v41_database(
             pg,
-            &format!("hfs_v41_test_{}", uuid::Uuid::new_v4().simple()),
+            &format!("hfs_v42_test_{}", uuid::Uuid::new_v4().simple()),
         )
         .await;
         let mut client = backend.get_client().await.unwrap();
         client
             .batch_execute(
                 "SET statement_timeout = '900ms';
-                 CREATE FUNCTION fail_v41_create_index() RETURNS event_trigger
+                 CREATE FUNCTION fail_v42_create_index() RETURNS event_trigger
                  LANGUAGE plpgsql AS $$
                  BEGIN
-                     RAISE EXCEPTION 'injected v41 CREATE INDEX failure';
+                     RAISE EXCEPTION 'injected v42 CREATE INDEX failure';
                  END
                  $$;
-                 CREATE EVENT TRIGGER fail_v41_create_index
+                 CREATE EVENT TRIGGER fail_v42_create_index
                  ON ddl_command_start WHEN TAG IN ('CREATE INDEX')
-                 EXECUTE FUNCTION fail_v41_create_index();",
+                 EXECUTE FUNCTION fail_v42_create_index();",
             )
             .await
-            .expect("install v41 CREATE INDEX failure injection");
+            .expect("install v42 CREATE INDEX failure injection");
 
         let error = initialize_schema(&mut client)
             .await
-            .expect_err("injected CREATE INDEX failure must abort v41");
+            .expect_err("injected CREATE INDEX failure must abort v42");
         assert!(
-            error.to_string().contains("Migration v40->v41 failed"),
+            error.to_string().contains("Migration v41->v42 failed"),
             "unexpected migration error: {error}"
         );
-        assert_eq!(get_schema_version(&client).await.unwrap(), 40);
+        assert_eq!(get_schema_version(&client).await.unwrap(), 41);
         assert!(
             reference_target_index(&client).await.is_none(),
             "a failed transactional build must leave no valid index"
@@ -5712,14 +5743,14 @@ mod postgres_integration_migrations {
 
         client
             .batch_execute(
-                "DROP EVENT TRIGGER fail_v41_create_index;
-                 DROP FUNCTION fail_v41_create_index();",
+                "DROP EVENT TRIGGER fail_v42_create_index;
+                 DROP FUNCTION fail_v42_create_index();",
             )
             .await
-            .expect("remove v41 CREATE INDEX failure injection");
+            .expect("remove v42 CREATE INDEX failure injection");
         initialize_schema(&mut client)
             .await
-            .expect("retry v40 to v41");
+            .expect("retry v41 to v42");
         assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
         assert!(
             reference_target_index(&client)

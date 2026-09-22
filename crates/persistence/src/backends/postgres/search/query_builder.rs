@@ -2627,7 +2627,7 @@ impl PostgresQueryBuilder {
     /// version-agnostic base, so the common `Patient/<id>` literal is what sits
     /// in `value_reference`. A bare id is compared with the last `/`-delimited
     /// segment. This preserves polymorphic matching across relative and absolute
-    /// references while using the v41 expression index. Comparing only the raw
+    /// references while using the v42 expression index. Comparing only the raw
     /// value made `Observation?patient=<id>` return an empty Bundle (#490), while
     /// `patient=Patient/<id>` worked.
     ///
@@ -2647,7 +2647,7 @@ impl PostgresQueryBuilder {
     /// **1.50 ms/call -> 0.47 ms/call**.
     ///
     /// A plain bare id emits one equality on [`REFERENCE_TARGET_ID_EXPR`]. The
-    /// `value_reference IS NOT NULL` conjunct matches the v41 partial-index
+    /// `value_reference IS NOT NULL` conjunct matches the v42 partial-index
     /// predicate. `%` and `_` remain literal id characters because this path no
     /// longer constructs a `LIKE` pattern. The `:contains`, `:below`, and
     /// `:above` modifier paths retain their existing pattern behavior.
@@ -2758,7 +2758,7 @@ impl PostgresQueryBuilder {
                     format!("value_reference = ${exact}")
                 } else {
                     // Bare logical id: compare with the final reference segment.
-                    // The explicit NULL check matches the v41 partial index.
+                    // The explicit NULL check matches the v42 partial index.
                     *param_num += 1;
                     params.push(SqlParam::text(&base));
                     format!(
@@ -5781,7 +5781,7 @@ mod tests {
             frag.sql.contains(&format!(
                 "value_reference IS NOT NULL AND {REFERENCE_TARGET_ID_EXPR} = $3"
             )),
-            "the predicate must match the v41 expression index: {}",
+            "the predicate must match the v42 expression index: {}",
             frag.sql
         );
         assert!(

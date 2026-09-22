@@ -15525,3 +15525,22 @@ async fn mongodb_integration_composite_multi_batch_driver_paging() {
         .expect("search_count must agree with search on the same multi-batch query");
     assert_eq!(count as usize, MATCHING);
 }
+
+/// The backend-agnostic contract of the secondary sync failure ledger
+/// (#1334). Same `#[path]` arrangement as the search suites.
+#[path = "common/sync_failure_ledger_suite.rs"]
+mod sync_failure_ledger_suite;
+
+/// #1334: the "needs reindex" ledger a composite keeps in this primary.
+#[tokio::test]
+async fn mongodb_sync_failure_ledger_contract() {
+    let Some(backend) = create_backend("sync_failure_ledger_1334").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    sync_failure_ledger_suite::ledger_folds_orders_clears_and_counts(
+        &backend,
+        &format!("ledger-1334-{}", uuid::Uuid::new_v4()),
+    )
+    .await;
+}

@@ -10,7 +10,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 33;
+pub const SCHEMA_VERSION: i32 = 34;
 
 /// The `search_index` value indexes. Excludes `idx_search_composite`, which the
 /// delete-by-resource path needs at all times, and `idx_search_token_display`,
@@ -444,6 +444,7 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             30 => migrate_v30_to_v31(conn)?,
             31 => migrate_v31_to_v32(conn)?,
             32 => migrate_v32_to_v33(conn)?,
+            33 => migrate_v33_to_v34(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -1564,6 +1565,35 @@ fn migrate_v32_to_v33(conn: &Connection) -> StorageResult<()> {
         )
         .map_err(|e| migration_err(format!("v33 attempts column: {e}")))?;
     }
+    Ok(())
+}
+
+/// Migrate from schema version 33 to version 34.
+///
+/// Adds `secondary_sync_failures`: the durable "needs reindex" ledger for a
+/// composite whose secondary refused a change the primary had already
+/// committed (#1334). One row per (tenant, resource, secondary), so a repeat
+/// failure folds into the existing row instead of growing the table.
+/// `last_failed_at` orders the repair queue; both timestamps are fixed-width
+/// RFC 3339 text, which sorts chronologically.
+fn migrate_v33_to_v34(conn: &Connection) -> StorageResult<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS secondary_sync_failures (
+            tenant_id TEXT NOT NULL,
+            resource_type TEXT NOT NULL,
+            resource_id TEXT NOT NULL,
+            backend_id TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            first_failed_at TEXT NOT NULL,
+            last_failed_at TEXT NOT NULL,
+            last_error TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (tenant_id, resource_type, resource_id, backend_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_secondary_sync_failures_queue
+            ON secondary_sync_failures (last_failed_at);",
+    )
+    .map_err(|e| migration_err(format!("v34 create secondary_sync_failures: {e}")))?;
     Ok(())
 }
 
