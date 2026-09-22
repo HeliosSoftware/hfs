@@ -743,7 +743,6 @@ mod tests {
 mod token_endpoint_tests {
     use std::time::{Duration, Instant};
 
-    use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use serde_json::json;
     use wiremock::matchers::{body_string_contains, method, path};
