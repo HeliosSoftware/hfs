@@ -9,7 +9,7 @@ This crate provides a complete implementation of the [FHIR RESTful API](https://
 - **Full CRUD Support**: Create, Read, Update, Delete for all FHIR resource types
 - **Versioning**: Version history with vread and history interactions
 - **Conditional Operations**: Conditional create, update, delete, and patch
-- **Search**: Type-level and system-level search with modifiers
+- **Search**: Type-level search with modifiers (system-level search, `GET [base]?params` / `POST [base]/_search`, is refused with `501`)
 - **Batch/Transaction**: Bundle processing with atomic transaction support
 - **Content Negotiation**: JSON format support with proper MIME types
 - **Multi-Tenant**: Built-in tenant isolation for multi-tenant deployments

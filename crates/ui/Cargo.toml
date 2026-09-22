@@ -72,6 +72,9 @@ helios-auth = { path = "../auth", version = "0.2.3" }
 
 # Web framework (matches the version used by helios-hfs / helios-rest)
 axum = "0.8"
+# `oneshot`: a `GET /` that carries a query is handed to the FHIR router
+# instead of being redirected to `/ui` (#1338).
+tower = { version = "0.5", features = ["util"] }
 
 # Spec-bundle reads for non-default FHIR versions run off the async threads
 # (#562), and tenant provisioning runs in the background (#581): the create

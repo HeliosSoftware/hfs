@@ -3,7 +3,10 @@
 //! Implements the FHIR [search interaction](https://hl7.org/fhir/http.html#search):
 //! - `GET [base]/[type]?params` - Type-level search
 //! - `POST [base]/[type]/_search` - Type-level search (POST)
-//! - `GET [base]?params` - System-level search (all types)
+//!
+//! System-level search (`GET [base]?params`, `POST [base]/_search`) is not
+//! served: both forms are routed to [`search_system_not_supported_handler`],
+//! which answers `501` + OperationOutcome (#1338).
 //!
 //! The search handler connects to the persistence layer's SearchProvider trait
 //! to execute searches against the storage backend.
@@ -127,9 +130,44 @@ where
     .await
 }
 
-/// Handler for system-level search.
+/// What a client is told when it attempts a system-level search (#1338).
+/// Worded to sit inside [`RestError::NotImplemented`]'s "Feature '…' is not
+/// implemented." sentence.
+const SYSTEM_SEARCH_NOT_SUPPORTED: &str = "system-level search (GET [base]?[parameters] or POST \
+     [base]/_search, with or without _type); search one resource type at a time instead, with \
+     GET [base]/[type]?[parameters] or POST [base]/[type]/_search";
+
+/// Handler that refuses system-level search.
 ///
-/// Searches across all resource types.
+/// # HTTP Request
+///
+/// `GET [base]?params`, `POST [base]/_search` (and `GET [base]/_search`)
+///
+/// # Response
+///
+/// `501 Not Implemented` with an OperationOutcome (`not-supported`) naming the
+/// type-level search to use instead. The CapabilityStatement does not list
+/// `search-system`. Before #1338 these requests fell through the router: a
+/// bare `405` with no body for `GET [base]`, and "`_search` is not a resource
+/// type" for `[base]/_search`.
+///
+/// The tenant is still resolved first, so a request that names a bad tenant is
+/// refused exactly as it is on every other FHIR route.
+pub async fn search_system_not_supported_handler(_tenant: TenantExtractor) -> RestError {
+    RestError::NotImplemented {
+        feature: SYSTEM_SEARCH_NOT_SUPPORTED.to_string(),
+    }
+}
+
+/// Handler for system-level search — **not routed** (#1338).
+///
+/// Kept as the starting point for the deferred implementation. It is not
+/// mounted because it is not ready to be: it needs
+/// [`MultiTypeSearchProvider`], which only the SQLite and PostgreSQL backends
+/// implement (the router is generic over every backend), and it skips what the
+/// type-level path does around the query — unknown-parameter handling,
+/// terminology expansion, `_include`/`_revinclude`, paging links.
+/// `[base]?params` is answered by [`search_system_not_supported_handler`].
 ///
 /// # HTTP Request
 ///

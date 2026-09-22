@@ -205,22 +205,6 @@ fn purge_fts_rows(
     Ok(())
 }
 
-/// Extracts the `value[x]` payload from a FHIRPath Patch `Parameters.part`
-/// entry whose `name` is `"value"`. Returns the value of the first key
-/// matching `value[A-Z]…` (e.g. `valueString`, `valueQuantity`,
-/// `valueReference`), so every FHIR polymorphic variant is accepted rather
-/// than only the handful the patch handler used to special-case.
-fn extract_part_value(part: &Value) -> Option<Value> {
-    part.as_object()?.iter().find_map(|(k, v)| {
-        let suffix = k.strip_prefix("value")?;
-        suffix
-            .chars()
-            .next()?
-            .is_ascii_uppercase()
-            .then(|| v.clone())
-    })
-}
-
 #[async_trait]
 impl ResourceStorage for SqliteBackend {
     fn backend_name(&self) -> &'static str {
@@ -461,48 +445,15 @@ impl ResourceStorage for SqliteBackend {
         let resource_type = current.resource_type();
         tenant.check_permission(Operation::Update, resource_type)?;
 
-        let conn = self.get_connection()?;
+        let mut conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
         let id = current.id();
 
-        // Check that the resource still exists with the expected version
-        let actual_version: Result<String, _> = conn.query_row(
-            "SELECT version_id FROM resources
-             WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3 AND is_deleted = 0",
-            params![tenant_id, resource_type, id],
-            |row| row.get(0),
-        );
-
-        let actual_version = match actual_version {
-            Ok(v) => v,
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                return Err(StorageError::Resource(ResourceError::NotFound {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                }));
-            }
-            Err(e) => {
-                return Err(internal_error(format!(
-                    "Failed to get current version: {}",
-                    e
-                )));
-            }
-        };
-
-        // Check version match
-        if actual_version != current.version_id() {
-            return Err(StorageError::Concurrency(
-                ConcurrencyError::VersionConflict {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                    expected_version: current.version_id().to_string(),
-                    actual_version,
-                },
-            ));
-        }
-
-        // Calculate new version
-        let new_version: u64 = actual_version.parse().unwrap_or(0) + 1;
+        // The expected version is `current`'s, and the UPDATE below only matches
+        // a row that still carries it — so the new version follows from what the
+        // caller already read.
+        let expected_version = current.version_id();
+        let new_version: u64 = expected_version.parse().unwrap_or(0) + 1;
         let new_version_str = new_version.to_string();
 
         // Ensure the resource has correct type and id
@@ -519,27 +470,85 @@ impl ResourceStorage for SqliteBackend {
         let data = serde_json::to_vec(&resource)
             .map_err(|e| serialization_error(format!("Failed to serialize resource: {}", e)))?;
 
+        // Extract the search values before taking the write lock: it is pure
+        // CPU, and SQLite has one writer.
+        let prepared = (!self.is_search_offloaded())
+            .then(|| self.prepare_index(tenant_id, resource_type, id, &resource));
+
         let now = Utc::now();
         let last_updated = now.to_rfc3339();
+        let fhir_version_str = current.fhir_version().as_mime_param();
 
-        // Update the resource
-        conn.execute(
-            "UPDATE resources SET version_id = ?1, data = ?2, last_updated = ?3
-             WHERE tenant_id = ?4 AND resource_type = ?5 AND id = ?6",
-            params![
-                new_version_str,
-                data,
-                last_updated,
-                tenant_id,
-                resource_type,
-                id
-            ],
-        )
-        .map_err(|e| internal_error(format!("Failed to update resource: {}", e)))?;
+        // Compare-and-swap, history row and search index in ONE transaction.
+        //
+        // This used to be a `SELECT version_id`, a comparison in Rust, and then
+        // an `UPDATE` with no version in its `WHERE`, each statement
+        // auto-committed on a pooled connection. Two writers holding the same
+        // version on two connections both passed the comparison; the second
+        // `UPDATE` then overwrote the first and committed, and only its history
+        // `INSERT` failed — on `PRIMARY KEY (…, version_id)` — so that writer got
+        // a 500 while its content was already the current row, under a version
+        // whose history entry holds the *winner's* content (#1404).
+        //
+        // The version now rides in the `UPDATE`'s predicate, so the comparison
+        // and the write are one statement; and everything that follows shares
+        // its transaction, so a writer that loses leaves nothing behind.
+        // IMMEDIATE takes the write lock up front, where the busy handler
+        // applies (see `purge_tenant_data`).
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| internal_error(format!("Failed to begin update: {}", e)))?;
+
+        let updated = tx
+            .execute(
+                "UPDATE resources SET version_id = ?1, data = ?2, last_updated = ?3
+                 WHERE tenant_id = ?4 AND resource_type = ?5 AND id = ?6
+                   AND version_id = ?7 AND is_deleted = 0",
+                params![
+                    new_version_str,
+                    data,
+                    last_updated,
+                    tenant_id,
+                    resource_type,
+                    id,
+                    expected_version
+                ],
+            )
+            .map_err(|e| internal_error(format!("Failed to update resource: {}", e)))?;
+
+        if updated == 0 {
+            // Matched nothing; which of the two reasons it was costs a query,
+            // but only on the path that is already failing.
+            let actual: Result<String, _> = tx.query_row(
+                "SELECT version_id FROM resources
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3 AND is_deleted = 0",
+                params![tenant_id, resource_type, id],
+                |row| row.get(0),
+            );
+            return match actual {
+                Ok(actual_version) => Err(StorageError::Concurrency(
+                    ConcurrencyError::VersionConflict {
+                        resource_type: resource_type.to_string(),
+                        id: id.to_string(),
+                        expected_version: expected_version.to_string(),
+                        actual_version,
+                    },
+                )),
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    Err(StorageError::Resource(ResourceError::NotFound {
+                        resource_type: resource_type.to_string(),
+                        id: id.to_string(),
+                    }))
+                }
+                Err(e) => Err(internal_error(format!(
+                    "Failed to get current version: {}",
+                    e
+                ))),
+            };
+        }
 
         // Insert into history (preserve the original FHIR version)
-        let fhir_version_str = current.fhir_version().as_mime_param();
-        conn.execute(
+        tx.execute(
             "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
             params![tenant_id, resource_type, id, new_version_str, data, last_updated, fhir_version_str],
@@ -547,8 +556,13 @@ impl ResourceStorage for SqliteBackend {
         .map_err(|e| internal_error(format!("Failed to insert history: {}", e)))?;
 
         // Re-index the resource (delete old entries, add new)
-        self.delete_search_index(&conn, tenant_id, resource_type, id)?;
-        self.index_resource(&conn, tenant_id, resource_type, id, &resource)?;
+        if let Some(prepared) = prepared {
+            self.delete_search_index(&tx, tenant_id, resource_type, id)?;
+            self.write_prepared_index(&tx, tenant_id, resource_type, id, &resource, prepared)?;
+        }
+
+        tx.commit()
+            .map_err(|e| internal_error(format!("Failed to commit update: {}", e)))?;
 
         // A SearchParameter write invalidates this tenant's cached registry.
         if resource_type == "SearchParameter" {
@@ -574,112 +588,17 @@ impl ResourceStorage for SqliteBackend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<()> {
-        tenant.check_permission(Operation::Delete, resource_type)?;
+        self.soft_delete(tenant, resource_type, id, None)
+    }
 
-        let conn = self.get_connection()?;
-        let tenant_id = tenant.tenant_id().as_str();
-
-        // Check if resource exists and get its fhir_version
-        let result: Result<(String, Vec<u8>, String), _> = conn.query_row(
-            "SELECT version_id, data, fhir_version FROM resources
-             WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3 AND is_deleted = 0",
-            params![tenant_id, resource_type, id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        );
-
-        let (current_version, data, fhir_version_str) = match result {
-            Ok(v) => v,
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                return Err(StorageError::Resource(ResourceError::NotFound {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                }));
-            }
-            Err(e) => {
-                return Err(internal_error(format!("Failed to check resource: {}", e)));
-            }
-        };
-
-        let now = Utc::now();
-        let deleted_at = now.to_rfc3339();
-
-        // Calculate new version for the deletion record
-        let new_version: u64 = current_version.parse().unwrap_or(0) + 1;
-        let new_version_str = new_version.to_string();
-
-        // Soft delete the resource, guarded by the version we just read.
-        //
-        // The `version_id`/`is_deleted` predicates make this a compare-and-swap
-        // rather than a blind overwrite. Without them a concurrent writer that
-        // lands between the SELECT above and this UPDATE is silently clobbered,
-        // and worse: `new_version` was computed from the stale read, so the
-        // history INSERT below then collides with the row that writer already
-        // wrote and trips `PRIMARY KEY (tenant_id, resource_type, id,
-        // version_id)`. Because neither statement runs in a transaction, the
-        // UPDATE is already committed at that point — the caller gets a 500 and
-        // the current row now points at a version whose history entry holds
-        // someone else's content.
-        //
-        // MongoDB and S3 already guarded their equivalent writes (a
-        // `version_id` term in the update filter, and a conditional PUT
-        // respectively); this brings SQLite to parity. Losing the race is
-        // reported as `NotFound`, which is what a caller racing a concurrent
-        // delete would have seen anyway.
-        let updated = conn
-            .execute(
-                "UPDATE resources SET is_deleted = 1, deleted_at = ?1, version_id = ?2, last_updated = ?1
-                 WHERE tenant_id = ?3 AND resource_type = ?4 AND id = ?5
-                   AND version_id = ?6 AND is_deleted = 0",
-                params![
-                    deleted_at,
-                    new_version_str,
-                    tenant_id,
-                    resource_type,
-                    id,
-                    current_version
-                ],
-            )
-            .map_err(|e| internal_error(format!("Failed to delete resource: {}", e)))?;
-
-        if updated == 0 {
-            return Err(StorageError::Resource(ResourceError::NotFound {
-                resource_type: resource_type.to_string(),
-                id: id.to_string(),
-            }));
-        }
-
-        // Insert deletion record into history (preserve fhir_version)
-        conn.execute(
-            "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)",
-            params![tenant_id, resource_type, id, new_version_str, data, deleted_at, fhir_version_str],
-        )
-        .map_err(|e| internal_error(format!("Failed to insert deletion history: {}", e)))?;
-
-        // Delete search index entries (skip when search is offloaded). Keyed on
-        // resource_key. The tenant_id/resource_type prefix is required for the
-        // delete to seek idx_search_composite instead of full-scanning
-        // search_index (see delete_search_index, #1197); the soft-delete keeps
-        // the resources row, so the subquery resolves.
-        if !self.is_search_offloaded() {
-            conn.execute(
-                "DELETE FROM search_index
-                  WHERE tenant_id = ?1 AND resource_type = ?2
-                    AND resource_key = (
-                     SELECT rowid FROM resources
-                      WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3
-                 )",
-                params![tenant_id, resource_type, id],
-            )
-            .map_err(|e| internal_error(format!("Failed to delete search index: {}", e)))?;
-        }
-
-        // A SearchParameter delete invalidates this tenant's cached registry.
-        if resource_type == "SearchParameter" {
-            self.tenant_registries().invalidate(tenant_id);
-        }
-
-        Ok(())
+    async fn delete_versioned(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: &str,
+    ) -> StorageResult<()> {
+        self.soft_delete(tenant, resource_type, id, Some(expected_version))
     }
 
     async fn count(
@@ -1279,6 +1198,138 @@ impl ResourceStorage for SqliteBackend {
 
 // Search Index Helpers
 impl SqliteBackend {
+    /// Soft-deletes a resource, optionally only at `expected_version`
+    /// ([`ResourceStorage::delete`] / [`ResourceStorage::delete_versioned`]).
+    ///
+    /// The read of the current row, the tombstone `UPDATE`, the deletion history
+    /// row and the search-index cleanup share one `IMMEDIATE` transaction. They
+    /// used to be auto-committed statements: a failure after the `UPDATE` left a
+    /// tombstone with no history entry, and a writer landing between the read
+    /// and the `UPDATE` turned a plain delete into a spurious `NotFound`. Inside
+    /// the write lock neither can happen, and `expected_version` is compared
+    /// against the very row the `UPDATE` then tombstones — the comparison and
+    /// the delete cannot be separated (#1404).
+    fn soft_delete(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: Option<&str>,
+    ) -> StorageResult<()> {
+        tenant.check_permission(Operation::Delete, resource_type)?;
+
+        let mut conn = self.get_connection()?;
+        let tenant_id = tenant.tenant_id().as_str();
+
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| internal_error(format!("Failed to begin delete: {}", e)))?;
+
+        // Check if resource exists and get its fhir_version
+        let result: Result<(String, Vec<u8>, String), _> = tx.query_row(
+            "SELECT version_id, data, fhir_version FROM resources
+             WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3 AND is_deleted = 0",
+            params![tenant_id, resource_type, id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        );
+
+        let (current_version, data, fhir_version_str) = match result {
+            Ok(v) => v,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                return Err(StorageError::Resource(ResourceError::NotFound {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                }));
+            }
+            Err(e) => {
+                return Err(internal_error(format!("Failed to check resource: {}", e)));
+            }
+        };
+
+        if let Some(expected) = expected_version
+            && expected != current_version
+        {
+            return Err(StorageError::Concurrency(
+                ConcurrencyError::VersionConflict {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                    expected_version: expected.to_string(),
+                    actual_version: current_version,
+                },
+            ));
+        }
+
+        let now = Utc::now();
+        let deleted_at = now.to_rfc3339();
+
+        // Calculate new version for the deletion record
+        let new_version: u64 = current_version.parse().unwrap_or(0) + 1;
+        let new_version_str = new_version.to_string();
+
+        // Soft delete the resource. The `version_id`/`is_deleted` predicates
+        // keep the statement a compare-and-swap in its own right: the write
+        // lock already guarantees the row is the one read above, and the
+        // predicate is what would say so if that ever stopped being true.
+        let updated = tx
+            .execute(
+                "UPDATE resources SET is_deleted = 1, deleted_at = ?1, version_id = ?2, last_updated = ?1
+                 WHERE tenant_id = ?3 AND resource_type = ?4 AND id = ?5
+                   AND version_id = ?6 AND is_deleted = 0",
+                params![
+                    deleted_at,
+                    new_version_str,
+                    tenant_id,
+                    resource_type,
+                    id,
+                    current_version
+                ],
+            )
+            .map_err(|e| internal_error(format!("Failed to delete resource: {}", e)))?;
+
+        if updated == 0 {
+            return Err(StorageError::Resource(ResourceError::NotFound {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+            }));
+        }
+
+        // Insert deletion record into history (preserve fhir_version)
+        tx.execute(
+            "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)",
+            params![tenant_id, resource_type, id, new_version_str, data, deleted_at, fhir_version_str],
+        )
+        .map_err(|e| internal_error(format!("Failed to insert deletion history: {}", e)))?;
+
+        // Delete search index entries (skip when search is offloaded). Keyed on
+        // resource_key. The tenant_id/resource_type prefix is required for the
+        // delete to seek idx_search_composite instead of full-scanning
+        // search_index (see delete_search_index, #1197); the soft-delete keeps
+        // the resources row, so the subquery resolves.
+        if !self.is_search_offloaded() {
+            tx.execute(
+                "DELETE FROM search_index
+                  WHERE tenant_id = ?1 AND resource_type = ?2
+                    AND resource_key = (
+                     SELECT rowid FROM resources
+                      WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3
+                 )",
+                params![tenant_id, resource_type, id],
+            )
+            .map_err(|e| internal_error(format!("Failed to delete search index: {}", e)))?;
+        }
+
+        tx.commit()
+            .map_err(|e| internal_error(format!("Failed to commit delete: {}", e)))?;
+
+        // A SearchParameter delete invalidates this tenant's cached registry.
+        if resource_type == "SearchParameter" {
+            self.tenant_registries().invalidate(tenant_id);
+        }
+
+        Ok(())
+    }
+
     /// Brings a soft-deleted resource back to life with new content.
     ///
     /// FHIR permits a deleted resource to be restored by a subsequent update
@@ -2118,9 +2169,14 @@ impl VersionedStorage for SqliteBackend {
                 },
             ));
         }
+        drop(conn);
 
-        // Perform delete
-        self.delete(tenant, resource_type, id).await
+        // Delete exactly the version the precondition was evaluated against.
+        // A plain `delete` here was check-then-act: a writer landing after the
+        // read above was deleted along with the version the client named
+        // (#1404).
+        self.delete_versioned(tenant, resource_type, id, &current_version)
+            .await
     }
 
     async fn list_versions(
@@ -3234,7 +3290,7 @@ impl ConditionalStorage for SqliteBackend {
                 // Exactly one match - delete it
                 let existing = matches.into_iter().next().unwrap();
                 crate::core::conditional_if_match_gate(if_match, resource_type, Some(&existing))?;
-                self.delete(tenant, resource_type, existing.id()).await?;
+                crate::core::delete_under_precondition(self, tenant, if_match, &existing).await?;
                 Ok(ConditionalDeleteResult::Deleted(existing))
             }
             n => {
@@ -3244,57 +3300,17 @@ impl ConditionalStorage for SqliteBackend {
         }
     }
 
-    /// Patches a resource based on search criteria.
-    ///
-    /// This implements conditional patch as defined in FHIR:
-    /// `PATCH [base]/[type]?[search-params]`
-    ///
-    /// Supports three patch formats:
-    /// - JSON Patch (RFC 6902)
-    /// - FHIRPath Patch (FHIR-specific)
-    /// - JSON Merge Patch (RFC 7386)
-    async fn conditional_patch(
+    /// The criteria resolver the provided
+    /// [`ConditionalStorage::conditional_patch`] is written in terms of: this
+    /// backend has no patch code of its own (#1406).
+    async fn resolve_conditional_matches(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         search_params: &str,
-        patch: &crate::core::PatchFormat,
-        if_match: &crate::core::EntityTagPrecondition,
-    ) -> StorageResult<crate::core::ConditionalPatchResult> {
-        use crate::core::{ConditionalPatchResult, PatchFormat};
-
-        // Find matching resources based on search parameters
-        let matches = self
-            .find_matching_resources(tenant, resource_type, search_params)
-            .await?;
-
-        match matches.len() {
-            0 => Ok(ConditionalPatchResult::NoMatch),
-            1 => {
-                // Exactly one match - apply the patch
-                let existing = matches.into_iter().next().unwrap();
-                crate::core::conditional_if_match_gate(if_match, resource_type, Some(&existing))?;
-                let current_content = existing.content().clone();
-
-                // Apply the patch based on format
-                let patched_content = match patch {
-                    PatchFormat::JsonPatch(patch_doc) => {
-                        self.apply_json_patch(&current_content, patch_doc)?
-                    }
-                    PatchFormat::FhirPathPatch(patch_params) => {
-                        self.apply_fhirpath_patch(&current_content, patch_params)?
-                    }
-                    PatchFormat::MergePatch(merge_doc) => {
-                        self.apply_merge_patch(&current_content, merge_doc)
-                    }
-                };
-
-                // Update the resource with the patched content
-                let updated = self.update(tenant, &existing, patched_content).await?;
-                Ok(ConditionalPatchResult::Patched(updated))
-            }
-            n => Ok(ConditionalPatchResult::MultipleMatches(n)),
-        }
+    ) -> StorageResult<Vec<StoredResource>> {
+        self.find_matching_resources(tenant, resource_type, search_params)
+            .await
     }
 }
 
@@ -3359,199 +3375,6 @@ impl SqliteBackend {
             search_params_str,
             crate::search::ResourceTypeScope::version(self.config().fhir_version),
         )
-    }
-
-    // ========================================================================
-    // Patch Helper Methods
-    // ========================================================================
-
-    /// Applies a JSON Patch (RFC 6902) to a resource.
-    ///
-    /// JSON Patch operations:
-    /// - `add`: Add a value at the specified path
-    /// - `remove`: Remove the value at the specified path
-    /// - `replace`: Replace the value at the specified path
-    /// - `move`: Move a value from one path to another
-    /// - `copy`: Copy a value from one path to another
-    /// - `test`: Test that a value equals the expected value
-    fn apply_json_patch(&self, resource: &Value, patch_doc: &Value) -> StorageResult<Value> {
-        use crate::error::ValidationError;
-
-        // Parse the patch document as an array of operations
-        let patch: json_patch::Patch = serde_json::from_value(patch_doc.clone()).map_err(|e| {
-            StorageError::Validation(ValidationError::InvalidResource {
-                message: format!("Invalid JSON Patch document: {}", e),
-                details: vec![],
-            })
-        })?;
-
-        // Apply the patch to a mutable copy
-        let mut patched = resource.clone();
-        json_patch::patch(&mut patched, &patch).map_err(|e| {
-            StorageError::Validation(ValidationError::InvalidResource {
-                message: format!("Failed to apply JSON Patch: {}", e),
-                details: vec![],
-            })
-        })?;
-
-        Ok(patched)
-    }
-
-    /// Applies a FHIRPath Patch to a resource.
-    ///
-    /// FHIRPath Patch uses a Parameters resource with operation parts:
-    /// - `type`: add, insert, delete, replace, move
-    /// - `path`: FHIRPath expression
-    /// - `name`: element name (for add)
-    /// - `value`: new value
-    ///
-    /// Note: Full FHIRPath Patch support requires the helios-fhirpath evaluator.
-    /// This implementation handles common cases.
-    fn apply_fhirpath_patch(&self, resource: &Value, patch_params: &Value) -> StorageResult<Value> {
-        use crate::error::ValidationError;
-
-        // The patch_params should be a Parameters resource with operation parts
-        let parameter = patch_params.get("parameter").and_then(|p| p.as_array());
-        if parameter.is_none() {
-            return Err(StorageError::Validation(ValidationError::InvalidResource {
-                message: "FHIRPath Patch must have a 'parameter' array".to_string(),
-                details: vec![],
-            }));
-        }
-
-        let mut patched = resource.clone();
-
-        for operation in parameter.unwrap() {
-            // Each operation has parts with name "type", "path", "name", "value"
-            let parts = operation.get("part").and_then(|p| p.as_array());
-            if parts.is_none() {
-                continue;
-            }
-
-            let mut op_type = None;
-            let mut op_path = None;
-            let mut op_name = None;
-            let mut op_value = None;
-
-            for part in parts.unwrap() {
-                match part.get("name").and_then(|n| n.as_str()) {
-                    Some("type") => {
-                        op_type = part
-                            .get("valueCode")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                    }
-                    Some("path") => {
-                        op_path = part
-                            .get("valueString")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                    }
-                    Some("name") => {
-                        op_name = part
-                            .get("valueString")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                    }
-                    Some("value") => {
-                        op_value = extract_part_value(part);
-                    }
-                    _ => {}
-                }
-            }
-
-            // Apply the operation based on type
-            match op_type.as_deref() {
-                Some("replace") => {
-                    if let (Some(path), Some(value)) = (&op_path, &op_value) {
-                        self.fhirpath_replace(&mut patched, path, value)?;
-                    }
-                }
-                Some("add") => {
-                    if let (Some(path), Some(name), Some(value)) = (&op_path, &op_name, &op_value) {
-                        self.fhirpath_add(&mut patched, path, name, value)?;
-                    }
-                }
-                Some("delete") => {
-                    if let Some(path) = &op_path {
-                        self.fhirpath_delete(&mut patched, path)?;
-                    }
-                }
-                _ => {
-                    // Unsupported operation type - skip
-                }
-            }
-        }
-
-        Ok(patched)
-    }
-
-    /// Helper for FHIRPath replace operation.
-    fn fhirpath_replace(
-        &self,
-        resource: &mut Value,
-        path: &str,
-        value: &Value,
-    ) -> StorageResult<()> {
-        // Simple implementation for common paths like "Resource.field"
-        // Full implementation would use helios-fhirpath for path evaluation
-        let parts: Vec<&str> = path.split('.').collect();
-        if parts.len() == 2 {
-            // Simple path like "Patient.active"
-            if let Some(obj) = resource.as_object_mut() {
-                obj.insert(parts[1].to_string(), value.clone());
-            }
-        }
-        Ok(())
-    }
-
-    /// Helper for FHIRPath add operation.
-    fn fhirpath_add(
-        &self,
-        resource: &mut Value,
-        path: &str,
-        name: &str,
-        value: &Value,
-    ) -> StorageResult<()> {
-        // Simple implementation for adding to root or nested object
-        let parts: Vec<&str> = path.split('.').collect();
-        if parts.len() == 1
-            && parts[0]
-                == resource
-                    .get("resourceType")
-                    .and_then(|r| r.as_str())
-                    .unwrap_or("")
-        {
-            // Adding to root level
-            if let Some(obj) = resource.as_object_mut() {
-                obj.insert(name.to_string(), value.clone());
-            }
-        }
-        Ok(())
-    }
-
-    /// Helper for FHIRPath delete operation.
-    fn fhirpath_delete(&self, resource: &mut Value, path: &str) -> StorageResult<()> {
-        // Simple implementation for deleting fields
-        let parts: Vec<&str> = path.split('.').collect();
-        if parts.len() == 2 {
-            if let Some(obj) = resource.as_object_mut() {
-                obj.remove(parts[1]);
-            }
-        }
-        Ok(())
-    }
-
-    /// Applies a JSON Merge Patch (RFC 7386) to a resource.
-    ///
-    /// Merge Patch is simpler than JSON Patch:
-    /// - Fields in the patch replace those in the target
-    /// - null values remove fields from the target
-    /// - Nested objects are merged recursively
-    fn apply_merge_patch(&self, resource: &Value, merge_doc: &Value) -> Value {
-        let mut patched = resource.clone();
-        json_patch::merge(&mut patched, merge_doc);
-        patched
     }
 }
 

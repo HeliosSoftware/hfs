@@ -81,6 +81,22 @@ HFS_SERVER_PORT=3000 HFS_LOG_LEVEL=debug cargo run --bin hfs
 
 Use `HFS_COMPOSITE_SYNC_MODE=synchronous` **and** `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for` when callers need read-your-write search semantics, such as integration tests or bulk loads that immediately search. Either alone still leaves a window: synchronous mode only guarantees the document reached Elasticsearch, and it is not searchable until the next index refresh. See `crates/persistence/README.md` (Search visibility on Elasticsearch-backed composites). Transaction conditional references (`Organization?identifier=…` in a resource body) and `If-None-Exist` creates are exempt: they make acknowledged writes visible before resolving, on any setting (#1047).
 
+### When the search index misses a write (#1334)
+
+On an ES-backed composite the primary is the system of record: a write succeeds once the primary has committed it, in **every** `HFS_COMPOSITE_SYNC_MODE` (synchronous included), even if Elasticsearch then refuses the document after the sync retries. The client sees the same `201`/`200`/`204` either way; the resource is readable by id but missing from (or stale in) search until it is re-synced. That failure is never silent:
+
+- **Metric** (`/metrics`): `composite_secondary_sync_failures_total{backend,operation}` counts final failures (once per failed write, not per retry; `backend` is the secondary's id, `es`; `operation` is `create`/`update`/`delete`). `composite_secondary_sync_needs_reindex` is the number of resources currently recorded as owed. Alert on the gauge staying above zero. No tenant, type or id labels — `/metrics` is public.
+- **Log event**: one `ERROR` "Secondary sync failed; …" per final failure with fields `tenant`, `resource_type`, `id`, `version`, `backend_id`, `operation`, `attempts`, `recorded`, `error`. No resource content.
+- **Durable record**: one row per (tenant, type, id, backend) in the primary's `secondary_sync_failures` table (SQLite, PostgreSQL) or collection (MongoDB): `operation`, `first_failed_at`, `last_failed_at`, `last_error`, `attempts`. It survives restarts. A later successful write of the same resource clears it. **S3 primaries keep no ledger**: metric and log only (`recorded=false`), repair with `$reindex`.
+- **Repair**: a background task re-syncs recorded resources from the primary's *current* state (a delete if the primary no longer has it) and clears the record; a secondary that is still down leaves the record for the next pass. It is idempotent and safe alongside writes. `$reindex` also rebuilds the index; the next pass then finds the records in sync and clears them.
+
+| Variable | Default | Description |
+|---|---|---|
+| `HFS_COMPOSITE_SYNC_REPAIR_INTERVAL` | `60` | Seconds between repair passes; `0` disables the task (the records are still written) |
+| `HFS_COMPOSITE_SYNC_REPAIR_BATCH` | `100` | Records examined per pass, least recently failed first |
+
+To list what is owed: `SELECT * FROM secondary_sync_failures ORDER BY last_failed_at;` on the primary.
+
 ## Storage Backends
 
 | Mode | Value |
@@ -253,6 +269,7 @@ StructureDefinition writes since process start (no startup warm-load yet).
 | delete | DELETE | `/[type]/[id]` |
 | create | POST | `/[type]` |
 | search | GET/POST | `/[type]?params` or `/[type]/_search` |
+| search, system | GET/POST | `/?params` or `/_search` — **not supported**: `501` + OperationOutcome (`not-supported`), and not listed in `/metadata` (#1338). With the UI mounted, bare `GET /` (no query) redirects to `/ui` |
 | history, instance | GET | `/[type]/[id]/_history` |
 | history, type | GET | `/[type]/_history` |
 | history, system | GET | `/_history` |

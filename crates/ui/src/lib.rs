@@ -1844,7 +1844,14 @@ pub fn mount_with_conformance_source_and_runtime(
         // Registered after the UI layers so neither arm of `/` picks them up:
         // the redirect needs none, and `POST /` (FHIR batch) must reach the
         // fallback with the same middleware stack as every other FHIR route.
-        .route("/", get(root_redirect).fallback_service(fhir_app.clone()))
+        .route(
+            "/",
+            get({
+                let fhir_app = fhir_app.clone();
+                move |request: axum::extract::Request| root_get(fhir_app.clone(), request)
+            })
+            .fallback_service(fhir_app.clone()),
+        )
         .fallback_service(fhir_app)
 }
 
@@ -1854,8 +1861,21 @@ pub fn mount_with_conformance_source_and_runtime(
 /// layer — an unauthenticated browser lands on `/ui` instead of a 401.
 /// Temporary (307) rather than HTS's 308: `/` is also the FHIR batch
 /// endpoint, and a permanent redirect gets cached hard by browsers.
-async fn root_redirect() -> axum::response::Redirect {
-    axum::response::Redirect::temporary("/ui")
+///
+/// Only the *bare* root is a browser landing. `GET /?_type=Patient` is a FHIR
+/// request — system-level search — and goes to the FHIR router like every
+/// other FHIR path, so a client gets that router's answer (today a `501`
+/// OperationOutcome, #1338) rather than a redirect to an HTML page.
+async fn root_get(fhir_app: Router, request: axum::extract::Request) -> Response {
+    use tower::ServiceExt;
+
+    if request.uri().query().is_some_and(|query| !query.is_empty()) {
+        return match fhir_app.oneshot(request).await {
+            Ok(response) => response,
+            Err(never) => match never {},
+        };
+    }
+    axum::response::Redirect::temporary("/ui").into_response()
 }
 
 /// Form body for `POST /ui/version` â€” the sidebar selector's submit.

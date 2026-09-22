@@ -465,6 +465,53 @@ async fn root_redirects_to_ui() {
     );
 }
 
+/// #1338: only the *bare* root is a browser landing. `GET /?params` is a FHIR
+/// request (system-level search) and reaches the FHIR router, whose answer the
+/// client gets instead of a redirect to an HTML page. An empty query (`/?`) is
+/// still the bare root.
+#[tokio::test]
+async fn root_get_with_a_query_reaches_the_fhir_app() {
+    let mount = || {
+        let fhir_app = Router::new().route(
+            "/",
+            get(
+                |axum::extract::RawQuery(query): axum::extract::RawQuery| async move {
+                    format!("fhir handled {}", query.unwrap_or_default())
+                },
+            ),
+        );
+        helios_ui::mount_with_conformance_source(
+            fhir_app,
+            "9.9.9",
+            Some(std::path::PathBuf::from("../../data")),
+            nl(true, true),
+            None,
+            None,
+            "default".to_string(),
+            std::sync::Arc::new(helios_ui::StaticConformanceSource::empty()),
+            helios_fhir::FhirVersion::R4,
+            None,
+            "http://localhost:8080".to_string(),
+            None,
+        )
+    };
+
+    let response = mount()
+        .oneshot(Request::get("/?_type=Patient").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_text(response).await, "fhir handled _type=Patient");
+
+    for bare in ["/", "/?"] {
+        let response = mount()
+            .oneshot(Request::get(bare).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT, "{bare}");
+    }
+}
+
 /// #896: owning `GET /` for the redirect must not shadow `POST /` — the FHIR
 /// batch/transaction endpoint on the same path still reaches the fallback.
 #[tokio::test]
