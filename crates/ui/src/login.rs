@@ -32,7 +32,7 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
 use chrono::Utc;
-use helios_auth::{PENDING_COOKIE, SESSION_COOKIE, SessionStore};
+use helios_auth::{AccessOutcome, PENDING_COOKIE, SESSION_COOKIE, SessionStore};
 use serde::Deserialize;
 
 use crate::WebState;
@@ -96,8 +96,19 @@ pub(crate) async fn require_session(
         return next.run(request).await;
     }
 
-    let session = helios_auth::cookie_value(request.headers(), SESSION_COOKIE)
-        .and_then(|id| login.sessions.get(&id));
+    // Resolve the session the way the FHIR layer will a moment later: through
+    // `access_token`, which refreshes a token about to lapse and drops a
+    // session whose refresh is dead. Gating on a bare lookup let a page render
+    // once with a session the API had just discarded — one stale page showing
+    // a raw 401 before the next navigation redirected — so the gate now settles
+    // the session's fate before anything renders.
+    let session = match helios_auth::cookie_value(request.headers(), SESSION_COOKIE) {
+        Some(id) => match login.sessions.access_token(&id).await {
+            AccessOutcome::Token(_) => login.sessions.get(&id),
+            AccessOutcome::NoSession => None,
+        },
+        None => None,
+    };
     match session {
         Some(session) => {
             request.extensions_mut().insert(session_principal(&session));
@@ -166,6 +177,7 @@ pub(crate) async fn login(
     };
     let next = query.next.as_deref().unwrap_or("/ui");
     let (pending_id, authorize_url) = login.sessions.begin(next);
+    tracing::info!(next = %next, "web login started; redirecting to the identity provider");
     let secure = login.sessions.config().cookie_secure;
     let mut response = Redirect::to(&authorize_url).into_response();
     append_cookie(
@@ -227,6 +239,11 @@ pub(crate) async fn callback(
         .await
     {
         Ok((session, next)) => {
+            tracing::info!(
+                subject = %session.principal.subject,
+                user = %session.principal.display(),
+                "web login completed"
+            );
             let mut response = Redirect::to(&next).into_response();
             append_cookie(
                 &mut response,
@@ -252,6 +269,7 @@ pub(crate) async fn logout(State(state): State<WebState>, request: Request) -> R
         .and_then(|id| login.sessions.logout(id));
 
     let post_logout = format!("{}/ui", state.public_base_url.trim_end_matches('/'));
+    let end_session_requested = end_session.is_some();
     let target = match end_session {
         Some((endpoint, id_token_hint)) => {
             let mut query = form_urlencoded::Serializer::new(String::new());
@@ -265,6 +283,10 @@ pub(crate) async fn logout(State(state): State<WebState>, request: Request) -> R
         }
         None => "/ui/login".to_string(),
     };
+    tracing::info!(
+        idp_logout = end_session_requested,
+        "web logout; session cleared"
+    );
     let mut response = Redirect::to(&target).into_response();
     append_cookie(&mut response, &cookie(SESSION_COOKIE, "", Some(0), secure));
     response

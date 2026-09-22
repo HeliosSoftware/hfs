@@ -435,32 +435,49 @@ impl std::fmt::Debug for SessionStore {
 
 /// Fetches the IdP's OpenID Connect discovery document and fills in the
 /// endpoints a [`LoginConfig`] is missing. Endpoints already set (from
-/// explicit configuration) win; the document only supplies the rest.
+/// explicit configuration) win; the document only supplies the rest — the
+/// document is consulted whenever *any* of the three is unset, so an explicit
+/// authorize + token pair (the usual `HFS_SMART_*` setup) still gets the
+/// end-session endpoint that RP-initiated logout needs. Without it a logout
+/// only clears HFS's cookie and the IdP's own SSO session signs the user
+/// straight back in on the next page.
+///
+/// When the document cannot be fetched but authorize + token are explicit,
+/// login is still possible, so that degrades to a warning with no end-session
+/// endpoint rather than a startup failure; with nothing explicit there is
+/// nothing to log in with, and it is an error.
 pub async fn discover_endpoints(
     issuer: &str,
     authorization_endpoint: Option<String>,
     token_endpoint: Option<String>,
     end_session_endpoint: Option<String>,
 ) -> Result<(String, String, Option<String>), AuthError> {
-    if let (Some(auth), Some(token)) = (&authorization_endpoint, &token_endpoint) {
-        return Ok((auth.clone(), token.clone(), end_session_endpoint));
+    if let (Some(auth), Some(token), Some(end)) = (
+        &authorization_endpoint,
+        &token_endpoint,
+        &end_session_endpoint,
+    ) {
+        return Ok((auth.clone(), token.clone(), Some(end.clone())));
     }
     let url = format!(
         "{}/.well-known/openid-configuration",
         issuer.trim_end_matches('/')
     );
-    let doc: Value = reqwest::Client::new()
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| AuthError::InternalError(format!("OIDC discovery at {url} failed: {e}")))?
-        .error_for_status()
-        .map_err(|e| AuthError::InternalError(format!("OIDC discovery at {url} failed: {e}")))?
-        .json()
-        .await
-        .map_err(|e| {
-            AuthError::InternalError(format!("OIDC discovery at {url} unreadable: {e}"))
-        })?;
+    let doc = match fetch_discovery(&url).await {
+        Ok(doc) => doc,
+        Err(err) => {
+            if let (Some(auth), Some(token)) = (&authorization_endpoint, &token_endpoint) {
+                tracing::warn!(
+                    error = %err,
+                    "OIDC discovery failed; logging in with the configured endpoints, but the \
+                     end-session endpoint is unknown — Sign out will not end the IdP session. \
+                     Set HFS_SMART_END_SESSION_ENDPOINT."
+                );
+                return Ok((auth.clone(), token.clone(), None));
+            }
+            return Err(err);
+        }
+    };
     let pick = |explicit: Option<String>, key: &str| -> Option<String> {
         explicit.or_else(|| doc.get(key).and_then(Value::as_str).map(str::to_string))
     };
@@ -470,6 +487,19 @@ pub async fn discover_endpoints(
         .ok_or_else(|| AuthError::InternalError(format!("{url} has no token_endpoint")))?;
     let end_session = pick(end_session_endpoint, "end_session_endpoint");
     Ok((auth, token, end_session))
+}
+
+async fn fetch_discovery(url: &str) -> Result<Value, AuthError> {
+    reqwest::Client::new()
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| AuthError::InternalError(format!("OIDC discovery at {url} failed: {e}")))?
+        .error_for_status()
+        .map_err(|e| AuthError::InternalError(format!("OIDC discovery at {url} failed: {e}")))?
+        .json()
+        .await
+        .map_err(|e| AuthError::InternalError(format!("OIDC discovery at {url} unreadable: {e}")))
 }
 
 /// The value of `cookie_name` in a request's `Cookie` header(s), if present.
@@ -704,5 +734,279 @@ mod tests {
         assert_eq!(p.display(), "demo");
         p.name = Some("Demo User".to_string());
         assert_eq!(p.display(), "Demo User");
+    }
+}
+
+/// Tests that need a token endpoint: the code exchange, refresh, and OpenID
+/// discovery are exercised against a local mock server.
+#[cfg(test)]
+mod token_endpoint_tests {
+    use std::time::{Duration, Instant};
+
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use serde_json::json;
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+
+    fn config_for(server: &MockServer) -> LoginConfig {
+        LoginConfig {
+            client_id: "hfs-web".to_string(),
+            client_secret: None,
+            redirect_uri: "http://localhost:8080/ui/callback".to_string(),
+            scopes: "openid profile email".to_string(),
+            authorization_endpoint: format!("{}/auth", server.uri()),
+            token_endpoint: format!("{}/token", server.uri()),
+            end_session_endpoint: None,
+            cookie_secure: true,
+        }
+    }
+
+    /// An unsigned JWT whose payload carries `claims` — enough for the store,
+    /// which reads a token it received from the token endpoint unverified.
+    fn jwt_with(claims: serde_json::Value) -> String {
+        format!(
+            "eyJhbGciOiJub25lIn0.{}.sig",
+            URL_SAFE_NO_PAD.encode(claims.to_string())
+        )
+    }
+
+    fn seeded(id: &str) -> Session {
+        Session {
+            id: id.to_string(),
+            principal: SessionPrincipal {
+                subject: "demo-sub".to_string(),
+                issuer: "https://idp".to_string(),
+                name: None,
+                preferred_username: None,
+                email: None,
+                picture: None,
+            },
+            access_token: "at-old".to_string(),
+            access_expires_at: Instant::now() + Duration::from_secs(300),
+            refresh_token: Some("rt-1".to_string()),
+            id_token: None,
+            last_seen: Instant::now(),
+            created_at: Utc::now(),
+        }
+    }
+
+    fn state_of(authorize_url: &str) -> String {
+        authorize_url
+            .split("state=")
+            .nth(1)
+            .and_then(|s| s.split('&').next())
+            .expect("state in the authorize url")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn complete_exchanges_the_code_with_pkce_and_establishes_the_session() {
+        let server = MockServer::start().await;
+        let id_token = jwt_with(json!({
+            "sub": "demo-sub", "iss": "https://idp", "name": "Demo User",
+            "preferred_username": "demo", "email": "demo@example.org"
+        }));
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains("grant_type=authorization_code"))
+            .and(body_string_contains("code=the-code"))
+            .and(body_string_contains("code_verifier="))
+            .and(body_string_contains("client_id=hfs-web"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "at-1", "refresh_token": "rt-1", "id_token": id_token,
+                "expires_in": 300, "token_type": "Bearer"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let store = SessionStore::new(config_for(&server));
+        let (pending_id, authorize_url) = store.begin("/ui/resources");
+        let state = state_of(&authorize_url);
+
+        let (session, next) = store
+            .complete(&pending_id, &state, "the-code")
+            .await
+            .expect("code exchange succeeds");
+        assert_eq!(next, "/ui/resources");
+        assert_eq!(session.access_token, "at-1");
+        assert_eq!(session.refresh_token.as_deref(), Some("rt-1"));
+        assert_eq!(session.principal.subject, "demo-sub");
+        assert_eq!(session.principal.display(), "Demo User");
+        assert_eq!(session.principal.email.as_deref(), Some("demo@example.org"));
+        assert!(store.get(&session.id).is_some(), "the session is stored");
+        assert_eq!(store.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_exchange_surfaces_the_idp_error_and_leaves_no_session() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": "invalid_grant", "error_description": "Code not valid"
+            })))
+            .mount(&server)
+            .await;
+        let store = SessionStore::new(config_for(&server));
+        let (pending_id, authorize_url) = store.begin("/ui");
+        let state = state_of(&authorize_url);
+        let err = store
+            .complete(&pending_id, &state, "used")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Code not valid"), "{err}");
+        assert!(store.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_access_token_about_to_expire_is_refreshed_in_place() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .and(body_string_contains("refresh_token=rt-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "at-2", "refresh_token": "rt-2", "expires_in": 300
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let store = SessionStore::new(config_for(&server));
+        let mut session = seeded("s1");
+        session.access_expires_at = Instant::now();
+        store.insert(session);
+
+        match store.access_token("s1").await {
+            AccessOutcome::Token(token) => assert_eq!(token, "at-2"),
+            other => panic!("expected a refreshed token, got {other:?}"),
+        }
+        let stored = store.get("s1").expect("still stored");
+        assert_eq!(stored.access_token, "at-2");
+        assert_eq!(
+            stored.refresh_token.as_deref(),
+            Some("rt-2"),
+            "rotated token kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fresh_access_token_is_returned_without_touching_the_idp() {
+        let server = MockServer::start().await;
+        let store = SessionStore::new(config_for(&server));
+        store.insert(seeded("fresh"));
+        match store.access_token("fresh").await {
+            AccessOutcome::Token(token) => assert_eq!(token, "at-old"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dead_refresh_drops_the_session() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": "invalid_grant", "error_description": "Session not active"
+            })))
+            .mount(&server)
+            .await;
+        let store = SessionStore::new(config_for(&server));
+        let mut session = seeded("dead");
+        session.access_expires_at = Instant::now();
+        store.insert(session);
+
+        assert!(matches!(
+            store.access_token("dead").await,
+            AccessOutcome::NoSession
+        ));
+        assert!(store.get("dead").is_none(), "dropped");
+
+        let mut none = seeded("norefresh");
+        none.access_expires_at = Instant::now();
+        none.refresh_token = None;
+        store.insert(none);
+        assert!(matches!(
+            store.access_token("norefresh").await,
+            AccessOutcome::NoSession
+        ));
+        assert!(store.get("norefresh").is_none());
+    }
+
+    #[tokio::test]
+    async fn discovery_fills_only_what_explicit_configuration_left_out() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "authorization_endpoint": format!("{}/discovered-auth", server.uri()),
+                "token_endpoint": format!("{}/discovered-token", server.uri()),
+                "end_session_endpoint": format!("{}/discovered-logout", server.uri()),
+            })))
+            .mount(&server)
+            .await;
+
+        let (auth, token, end) = discover_endpoints(
+            &server.uri(),
+            Some("https://explicit/auth".to_string()),
+            Some("https://explicit/token".to_string()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(auth, "https://explicit/auth");
+        assert_eq!(token, "https://explicit/token");
+        assert_eq!(
+            end.as_deref(),
+            Some(format!("{}/discovered-logout", server.uri()).as_str())
+        );
+
+        let (auth, token, end) = discover_endpoints(&server.uri(), None, None, None)
+            .await
+            .unwrap();
+        assert!(auth.ends_with("/discovered-auth"));
+        assert!(token.ends_with("/discovered-token"));
+        assert!(end.unwrap().ends_with("/discovered-logout"));
+    }
+
+    #[tokio::test]
+    async fn everything_explicit_skips_discovery_entirely() {
+        let server = MockServer::start().await;
+        let (auth, token, end) = discover_endpoints(
+            &server.uri(),
+            Some("https://explicit/auth".to_string()),
+            Some("https://explicit/token".to_string()),
+            Some("https://explicit/logout".to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(auth, "https://explicit/auth");
+        assert_eq!(token, "https://explicit/token");
+        assert_eq!(end.as_deref(), Some("https://explicit/logout"));
+    }
+
+    #[tokio::test]
+    async fn unreachable_discovery_degrades_to_the_explicit_endpoints_without_end_session() {
+        let server = MockServer::start().await;
+        let (auth, token, end) = discover_endpoints(
+            &server.uri(),
+            Some("https://explicit/auth".to_string()),
+            Some("https://explicit/token".to_string()),
+            None,
+        )
+        .await
+        .expect("login still configurable from the explicit endpoints");
+        assert_eq!(auth, "https://explicit/auth");
+        assert_eq!(token, "https://explicit/token");
+        assert!(end.is_none(), "end-session stays unknown");
+
+        assert!(
+            discover_endpoints(&server.uri(), None, None, None)
+                .await
+                .is_err()
+        );
     }
 }

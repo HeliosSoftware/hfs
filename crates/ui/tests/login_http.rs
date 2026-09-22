@@ -321,3 +321,48 @@ async fn the_login_routes_and_assets_stay_reachable_without_a_session() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_session_whose_token_is_dead_is_dropped_at_the_gate_not_after_a_stale_render() {
+    let _serial = SERIAL.lock().await;
+    let (app, sessions) = app();
+    // Expired access token and no refresh token: the FHIR layer would drop it
+    // on the page's first API call. The gate must settle that before the page
+    // renders, so the user is sent to log in rather than shown a stale page
+    // with a raw 401 in it.
+    sessions.insert(Session {
+        id: "sess-dead".to_string(),
+        principal: SessionPrincipal {
+            subject: "demo-sub".to_string(),
+            issuer: "https://idp.example.com/realms/fhir".to_string(),
+            name: None,
+            preferred_username: None,
+            email: None,
+            picture: None,
+        },
+        access_token: "expired".to_string(),
+        access_expires_at: Instant::now() - Duration::from_secs(1),
+        refresh_token: None,
+        id_token: None,
+        last_seen: Instant::now(),
+        created_at: chrono::Utc::now(),
+    });
+    let response = app
+        .oneshot(
+            Request::get("/ui/status")
+                .header(header::COOKIE, "hfs_session=sess-dead")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers()[header::LOCATION],
+        "/ui/login?next=%2Fui%2Fstatus"
+    );
+    assert!(
+        sessions.get("sess-dead").is_none(),
+        "the dead session is gone"
+    );
+}
