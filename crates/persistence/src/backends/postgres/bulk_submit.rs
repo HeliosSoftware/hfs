@@ -31,17 +31,16 @@ use crate::error::{BackendError, BulkSubmitError, StorageError, StorageResult};
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 
 use super::PostgresBackend;
-use super::cached::query_opt_cached;
+use super::cached::{query_cached, query_opt_cached};
 
 const MAX_GROUPED_FRESH_CREATES: usize = 100;
 
 const FRESH_CREATE_CANDIDATES_SQL: &str = "\
-SELECT 1
+SELECT resource.resource_type, resource.id
 FROM resources AS resource
 JOIN unnest($2::text[], $3::text[]) AS candidate(resource_type, id)
   ON resource.resource_type = candidate.resource_type AND resource.id = candidate.id
-WHERE resource.tenant_id = $1
-LIMIT 1";
+WHERE resource.tenant_id = $1";
 
 struct ProcessedEntryBatch {
     results: Vec<BulkEntryResult>,
@@ -49,6 +48,16 @@ struct ProcessedEntryBatch {
     /// The resources as committed, for observers that index them (#1127);
     /// collected only when one asked, so counting-only runs hold nothing.
     committed_resources: Vec<crate::types::StoredResource>,
+}
+
+struct MixedEntryBatch {
+    results: Vec<BulkEntryResult>,
+    changes: Vec<SubmissionChange>,
+}
+
+enum MixedAttemptError {
+    ReplayWholeBatch(StorageError),
+    Fatal(StorageError),
 }
 
 /// One ingested entry: its receipt, the rollback record its write warrants,
@@ -798,9 +807,11 @@ impl BulkSubmitProvider for PostgresBackend {
         // records, and per-line receipts commit together — one WAL flush per
         // batch instead of four-plus autocommit round trips per resource, and
         // the rollback log can never diverge from what was actually written.
-        // Each entry runs under a savepoint: on Postgres a failed statement
-        // aborts the whole transaction, and the savepoint contains a failure
-        // to its one entry the way SQLite's per-statement independence does.
+        // Existing and legacy-path entries run under savepoints: on Postgres a
+        // failed statement aborts the whole transaction, and the savepoint
+        // contains a failure to its one entry the way SQLite's per-statement
+        // independence does. Eligible fresh runs flush together before the
+        // next savepoint opens.
         let transaction_options = crate::core::TransactionOptions {
             fhir_version: Some(FhirVersion::default_enabled()),
             defer_search_indexing: options.defer_indexing,
@@ -817,46 +828,25 @@ impl BulkSubmitProvider for PostgresBackend {
             options,
             self.is_search_offloaded(),
         ) {
-            match self
-                .try_grouped_fresh_creates(&mut txn, manifest_id, &entries)
-                .await
-            {
-                Ok(Some(provisional)) => {
-                    // Resource and history rows are durable within the
-                    // transaction now. Only at this point may their receipts
-                    // and rollback records be staged: a grouped-write failure
-                    // must leave no bookkeeping that could be replayed.
-                    let (results, changes): (Vec<BulkEntryResult>, Vec<SubmissionChange>) =
-                        provisional.into_iter().unzip();
-                    Self::flush_entry_rows_tx(
-                        &txn,
-                        submission_id,
-                        manifest_id,
-                        file_url,
-                        &results,
-                        &changes,
-                    )
-                    .await?;
-                    ProcessedEntryBatch {
-                        results,
-                        aborted_on_max_errors: false,
-                        // Grouped creates never run while an observer wants
-                        // the committed resources; see
-                        // `is_grouped_fresh_create_eligible`.
-                        committed_resources: Vec::new(),
-                    }
-                }
-                Ok(None) => {
-                    self.process_entries_individually(
+            let existing_keys = self.classify_existing_keys(&txn, &entries).await;
+            let attempt = match existing_keys {
+                Ok(existing_keys) if existing_keys.len() == entries.len() => Ok(None),
+                Ok(existing_keys) => self
+                    .process_mixed_entries_in_tx(
                         &mut txn,
-                        submission_id,
                         manifest_id,
                         &entries,
+                        &existing_keys,
                         options,
                     )
-                    .await?
-                }
-                Err(grouped_error) => {
+                    .await
+                    .map(Some),
+                Err(error) => Err(error),
+            };
+
+            let mixed = match attempt {
+                Ok(mixed) => mixed,
+                Err(MixedAttemptError::ReplayWholeBatch(grouped_error)) => {
                     // The tentative transaction may contain buffered creates
                     // or a partially executed grouped statement. Await its
                     // rollback before trying to acquire the replacement
@@ -877,15 +867,40 @@ impl BulkSubmitProvider for PostgresBackend {
                         transaction_options,
                     )
                     .await?;
-                    self.process_entries_individually(
-                        &mut txn,
-                        submission_id,
-                        manifest_id,
-                        &entries,
-                        options,
-                    )
-                    .await?
+                    None
                 }
+                Err(MixedAttemptError::Fatal(error)) => return Err(error),
+            };
+
+            if let Some(mixed) = mixed {
+                // Only stage receipts and rollback records after every fresh
+                // run has flushed successfully. Bookkeeping failures are not
+                // eligible for whole-batch replay.
+                Self::flush_entry_rows_tx(
+                    &txn,
+                    submission_id,
+                    manifest_id,
+                    file_url,
+                    &mixed.results,
+                    &mixed.changes,
+                )
+                .await?;
+                ProcessedEntryBatch {
+                    results: mixed.results,
+                    aborted_on_max_errors: false,
+                    // This path is excluded whenever an observer wants the
+                    // committed resources; see `is_grouped_fresh_create_eligible`.
+                    committed_resources: Vec::new(),
+                }
+            } else {
+                self.process_entries_individually(
+                    &mut txn,
+                    submission_id,
+                    manifest_id,
+                    &entries,
+                    options,
+                )
+                .await?
             }
         } else {
             self.process_entries_individually(
@@ -1248,18 +1263,14 @@ impl BulkSubmitProvider for PostgresBackend {
 }
 
 impl PostgresBackend {
-    /// Attempts the fast path for a batch whose payload shape guarantees only
-    /// explicit, unique creates. `Ok(None)` means one of those keys already
-    /// exists and the caller should use the individual path in this untouched
-    /// transaction. Errors are limited to the candidate query, `create`, and
-    /// grouped `flush`, so the caller may roll the whole attempt back and replay
-    /// once. Bookkeeping deliberately happens after this helper returns.
-    async fn try_grouped_fresh_creates(
+    /// Classifies the keys already present for this tenant, including
+    /// tombstones. This is only a routing snapshot: absent keys are not
+    /// reserved, so a later fresh-run conflict still requires replay.
+    async fn classify_existing_keys(
         &self,
-        txn: &mut super::transaction::PostgresTransaction,
-        manifest_id: &str,
+        txn: &super::transaction::PostgresTransaction,
         entries: &[NdjsonEntry],
-    ) -> StorageResult<Option<Vec<(BulkEntryResult, SubmissionChange)>>> {
+    ) -> Result<HashSet<(String, String)>, MixedAttemptError> {
         use crate::core::Transaction;
 
         let resource_types: Vec<&str> = entries
@@ -1276,43 +1287,166 @@ impl PostgresBackend {
             })
             .collect();
         let tenant_id = txn.tenant().tenant_id().as_str();
-        let candidate = query_opt_cached(
-            txn.raw_client()?,
+        let client = txn
+            .raw_client()
+            .map_err(MixedAttemptError::ReplayWholeBatch)?;
+        let rows = query_cached(
+            client,
             FRESH_CREATE_CANDIDATES_SQL,
             &[&tenant_id, &resource_types, &resource_ids],
         )
         .await
         .map_err(|error| {
-            internal_error(format!(
+            MixedAttemptError::ReplayWholeBatch(internal_error(format!(
                 "Failed to query grouped fresh-create candidates: {error}"
-            ))
+            )))
         })?;
-        if candidate.is_some() {
-            return Ok(None);
+
+        let mut existing_keys = HashSet::with_capacity(rows.len());
+        for row in rows {
+            existing_keys.insert((row.get(0), row.get(1)));
+        }
+        Ok(existing_keys)
+    }
+
+    /// Processes an eligible batch in input order. Existing keys retain the
+    /// original savepoint behavior; each maximal fresh run is flushed as one
+    /// grouped create before the next existing entry opens its savepoint.
+    async fn process_mixed_entries_in_tx(
+        &self,
+        txn: &mut super::transaction::PostgresTransaction,
+        manifest_id: &str,
+        entries: &[NdjsonEntry],
+        existing_keys: &HashSet<(String, String)>,
+        options: &BulkProcessingOptions,
+    ) -> Result<MixedEntryBatch, MixedAttemptError> {
+        let existing_by_position: Vec<bool> = entries
+            .iter()
+            .map(|entry| {
+                let id = entry
+                    .resource_id
+                    .as_deref()
+                    .expect("mixed-create eligibility requires an explicit id");
+                existing_keys.contains(&(entry.resource_type.clone(), id.to_string()))
+            })
+            .collect();
+
+        let mut results = Vec::with_capacity(entries.len());
+        let mut changes = Vec::with_capacity(entries.len());
+        let mut position = 0;
+
+        while position < entries.len() {
+            if existing_by_position[position] {
+                let (result, change, _) = self
+                    .ingest_entry_with_savepoint(txn, manifest_id, &entries[position], options)
+                    .await
+                    .map_err(MixedAttemptError::Fatal)?;
+                results.push(result);
+                if let Some(change) = change {
+                    changes.push(change);
+                }
+                position += 1;
+                continue;
+            }
+
+            let start = position;
+            position += 1;
+            while position < entries.len() && !existing_by_position[position] {
+                position += 1;
+            }
+            let fresh = self
+                .create_fresh_run(txn, manifest_id, &entries[start..position])
+                .await?;
+            results.extend(fresh.results);
+            changes.extend(fresh.changes);
         }
 
-        let mut provisional = Vec::with_capacity(entries.len());
+        Ok(MixedEntryBatch { results, changes })
+    }
+
+    /// Stages one maximal fresh run, then flushes it before control can move
+    /// to an existing entry's savepoint. Any error here invalidates the routing
+    /// snapshot and replays the whole batch through the individual path.
+    async fn create_fresh_run(
+        &self,
+        txn: &mut super::transaction::PostgresTransaction,
+        manifest_id: &str,
+        entries: &[NdjsonEntry],
+    ) -> Result<MixedEntryBatch, MixedAttemptError> {
+        use crate::core::Transaction;
+
+        let mut results = Vec::with_capacity(entries.len());
+        let mut changes = Vec::with_capacity(entries.len());
         for entry in entries {
             let created = txn
                 .create(&entry.resource_type, entry.resource.clone())
-                .await?;
-            let result = BulkEntryResult::success(
+                .await
+                .map_err(MixedAttemptError::ReplayWholeBatch)?;
+            results.push(BulkEntryResult::success(
                 entry.line_number,
                 &entry.resource_type,
                 created.id(),
                 true,
-            );
-            let change = SubmissionChange::create(
+            ));
+            changes.push(SubmissionChange::create(
                 manifest_id,
                 &entry.resource_type,
                 created.id(),
                 created.version_id(),
-            );
-            provisional.push((result, change));
+            ));
         }
 
-        txn.flush().await?;
-        Ok(Some(provisional))
+        txn.flush()
+            .await
+            .map_err(MixedAttemptError::ReplayWholeBatch)?;
+        Ok(MixedEntryBatch { results, changes })
+    }
+
+    /// Runs one entry under the original savepoint boundary. An ingestion or
+    /// release error becomes a processing-error receipt after a successful
+    /// rollback; failure to create or roll back the savepoint remains fatal.
+    async fn ingest_entry_with_savepoint(
+        &self,
+        txn: &mut super::transaction::PostgresTransaction,
+        manifest_id: &str,
+        entry: &NdjsonEntry,
+        options: &BulkProcessingOptions,
+    ) -> StorageResult<IngestedEntry> {
+        txn.savepoint("bulk_entry").await?;
+        let outcome = match self
+            .ingest_entry_in_tx(txn, manifest_id, entry, options)
+            .await
+        {
+            Ok(ingested) => txn.release_savepoint("bulk_entry").await.map(|_| ingested),
+            Err(error) => Err(error),
+        };
+
+        match outcome {
+            Ok(ingested) => Ok(ingested),
+            Err(error) => {
+                txn.rollback_to_savepoint("bulk_entry")
+                    .await
+                    .map_err(|savepoint_error| {
+                        internal_error(format!("{savepoint_error} after '{error}'"))
+                    })?;
+                Ok((
+                    BulkEntryResult::processing_error(
+                        entry.line_number,
+                        &entry.resource_type,
+                        serde_json::json!({
+                            "resourceType": "OperationOutcome",
+                            "issue": [{
+                                "severity": "error",
+                                "code": "exception",
+                                "diagnostics": error.to_string()
+                            }]
+                        }),
+                    ),
+                    None,
+                    None,
+                ))
+            }
+        }
     }
 
     /// Runs the original per-entry path inside one batch transaction. Each
@@ -1369,37 +1503,9 @@ impl PostgresBackend {
             // The savepoint methods flush at the savepoint boundaries: the
             // release raises this entry's conflict inside its own savepoint,
             // and the rollback undoes only this entry's rows.
-            txn.savepoint("bulk_entry").await?;
-            let outcome = match self
-                .ingest_entry_in_tx(txn, manifest_id, entry, options)
-                .await
-            {
-                Ok(pair) => txn.release_savepoint("bulk_entry").await.map(|_| pair),
-                Err(error) => Err(error),
-            };
-            let (entry_result, change, stored) = match outcome {
-                Ok(ingested) => ingested,
-                Err(error) => {
-                    txn.rollback_to_savepoint("bulk_entry")
-                        .await
-                        .map_err(|savepoint_error| {
-                            internal_error(format!("{savepoint_error} after '{error}'"))
-                        })?;
-                    let failed = BulkEntryResult::processing_error(
-                        entry.line_number,
-                        &entry.resource_type,
-                        serde_json::json!({
-                            "resourceType": "OperationOutcome",
-                            "issue": [{
-                                "severity": "error",
-                                "code": "exception",
-                                "diagnostics": error.to_string()
-                            }]
-                        }),
-                    );
-                    (failed, None, None)
-                }
-            };
+            let (entry_result, change, stored) = self
+                .ingest_entry_with_savepoint(txn, manifest_id, entry, options)
+                .await?;
 
             if entry_result.is_error() {
                 error_count += 1;
