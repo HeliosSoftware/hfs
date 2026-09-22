@@ -74,6 +74,38 @@ pub(super) const MAX_SEARCH_RETRIES: u32 = 2;
 /// Initial backoff before retrying a transient ES error. Doubled per attempt.
 pub(super) const RETRY_BASE_DELAY_MS: u64 = 100;
 
+/// The error type of a read that reached an index whose primary shard has no
+/// started copy.
+const NO_SHARD_AVAILABLE: &str = "no_shard_available_action_exception";
+
+/// Retries for a read answered [`NO_SHARD_AVAILABLE`] (in addition to the
+/// initial attempt), in place of [`MAX_SEARCH_RETRIES`] (#1402).
+///
+/// Unlike the other transient answers this one is *expected*: an index is in
+/// the cluster state — so it is not an `index_not_found_exception`, which
+/// reads as an empty set — from the moment its creation starts, and its
+/// primary shard is started only some time later. The request that creates
+/// the index waits for that; a read from anyone else (another request, the
+/// composite's asynchronous sync worker indexing behind a write, another HFS
+/// instance) does not, and gets a `503` for the whole window. The window is
+/// ~100 ms on an idle single node and was seen to pass the general budget's
+/// ~300 ms on a loaded one, so the first search after the first write of a
+/// resource type failed.
+///
+/// With [`NO_SHARD_RETRY_MAX_DELAY_MS`] the waits are 100, 200, 400, 800 ms
+/// and then four of 1 s: at most [`NO_SHARD_RETRY_BUDGET_MS`] of waiting
+/// before the failure is reported. A shard that is genuinely lost (a red
+/// index) therefore costs a read that long instead of ~300 ms; the answer is
+/// an error either way.
+const MAX_NO_SHARD_RETRIES: u32 = 8;
+
+/// Cap on the doubling backoff between [`MAX_NO_SHARD_RETRIES`] attempts.
+const NO_SHARD_RETRY_MAX_DELAY_MS: u64 = 1_000;
+
+/// Total waiting the [`NO_SHARD_AVAILABLE`] schedule can add to one read.
+#[cfg(test)]
+const NO_SHARD_RETRY_BUDGET_MS: u64 = 5_500;
+
 /// How a non-success Elasticsearch response is handled (#1294).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum EsFailureClass {
@@ -98,7 +130,7 @@ pub(super) enum EsFailureClass {
 const RETRYABLE_ES_ERROR_TYPES: &[&str] = &[
     "es_rejected_execution_exception",
     "circuit_breaking_exception",
-    "no_shard_available_action_exception",
+    NO_SHARD_AVAILABLE,
 ];
 
 /// Error types under which Elasticsearch 7.17 reports a query *value* it could
@@ -393,6 +425,26 @@ enum RetryableFailure {
     Transient { status: u16, body: String },
 }
 
+impl RetryableFailure {
+    /// How many times a read that failed this way is sent again, and how long
+    /// to wait before resend number `attempt` (0-based): the general schedule,
+    /// or the longer one for [`NO_SHARD_AVAILABLE`].
+    fn retry_schedule(&self, attempt: u32) -> (u32, u64) {
+        let delay_ms = RETRY_BASE_DELAY_MS << attempt.min(16);
+        match self {
+            RetryableFailure::Transient { body, .. }
+                if es_error_types(body).iter().any(|t| t == NO_SHARD_AVAILABLE) =>
+            {
+                (
+                    MAX_NO_SHARD_RETRIES,
+                    delay_ms.min(NO_SHARD_RETRY_MAX_DELAY_MS),
+                )
+            }
+            _ => (MAX_SEARCH_RETRIES, delay_ms),
+        }
+    }
+}
+
 /// The result of searching an index that does not exist.
 ///
 /// Indices are created lazily on the first write of a resource type, so a type
@@ -441,9 +493,8 @@ pub(super) async fn send_read_with_retry(
     index: &str,
     body: Value,
 ) -> StorageResult<Option<Value>> {
-    let mut last_failure: Option<RetryableFailure> = None;
-
-    for attempt in 0..=MAX_SEARCH_RETRIES {
+    let mut attempt: u32 = 0;
+    let (attempts, last_failure) = loop {
         let failure = match send_search_once(backend, op, index, body.clone()).await {
             SearchAttempt::Body(v) => return Ok(Some(v)),
             SearchAttempt::EmptyIndex => return Ok(None),
@@ -454,33 +505,34 @@ pub(super) async fn send_read_with_retry(
             }
         };
 
-        if attempt < MAX_SEARCH_RETRIES {
-            let delay_ms = RETRY_BASE_DELAY_MS << attempt;
-            tracing::warn!(
-                attempt = attempt + 1,
-                max = MAX_SEARCH_RETRIES + 1,
-                delay_ms,
-                index,
-                "Retryable ES {} failure, retrying",
-                op.name()
-            );
-            sleep(Duration::from_millis(delay_ms)).await;
+        // The budget is that of the failure just seen, so a read that meets
+        // an unstarted shard and then some other transient answer stops as
+        // soon as it is past the general budget.
+        let (max_retries, delay_ms) = failure.retry_schedule(attempt);
+        if attempt >= max_retries {
+            break (attempt + 1, failure);
         }
-        last_failure = Some(failure);
-    }
+        tracing::warn!(
+            attempt = attempt + 1,
+            max = max_retries + 1,
+            delay_ms,
+            index,
+            "Retryable ES {} failure, retrying",
+            op.name()
+        );
+        sleep(Duration::from_millis(delay_ms)).await;
+        attempt += 1;
+    };
 
-    let attempts = MAX_SEARCH_RETRIES + 1;
-    Err(
-        match last_failure.expect("a retryable branch always sets last_failure") {
-            RetryableFailure::Unreachable(message) => unavailable_error(format!(
-                "Elasticsearch unreachable after {attempts} attempts: {message}"
-            )),
-            RetryableFailure::Transient { status, body } => internal_error(format!(
-                "{} failed after {attempts} attempts (status {status}): {body}",
-                op.title()
-            )),
-        },
-    )
+    Err(match last_failure {
+        RetryableFailure::Unreachable(message) => unavailable_error(format!(
+            "Elasticsearch unreachable after {attempts} attempts: {message}"
+        )),
+        RetryableFailure::Transient { status, body } => internal_error(format!(
+            "{} failed after {attempts} attempts (status {status}): {body}",
+            op.title()
+        )),
+    })
 }
 
 /// Converts an Elasticsearch hit's `sort` array into cursor values, dropping
@@ -1360,6 +1412,47 @@ mod tests {
             }
         })
         .to_string()
+    }
+
+    /// #1402: only a shard with no started copy gets the longer schedule, and
+    /// what that schedule can cost a read is the documented bound.
+    #[test]
+    fn only_an_unstarted_shard_gets_the_longer_retry_schedule() {
+        const SPEE: &str = "search_phase_execution_exception";
+        let transient = |status: u16, body: String| RetryableFailure::Transient { status, body };
+
+        for status in [500, 503] {
+            let no_shard = transient(status, es_error_body(SPEE, NO_SHARD_AVAILABLE, None));
+            let waits: Vec<u64> = (0..MAX_NO_SHARD_RETRIES)
+                .map(|attempt| {
+                    let (max_retries, delay_ms) = no_shard.retry_schedule(attempt);
+                    assert_eq!(max_retries, MAX_NO_SHARD_RETRIES);
+                    delay_ms
+                })
+                .collect();
+            assert_eq!(waits, [100, 200, 400, 800, 1_000, 1_000, 1_000, 1_000]);
+            assert_eq!(waits.iter().sum::<u64>(), NO_SHARD_RETRY_BUDGET_MS);
+        }
+
+        for other in [
+            transient(503, String::new()),
+            transient(
+                503,
+                es_error_body(SPEE, "node_disconnected_exception", None),
+            ),
+            transient(
+                429,
+                es_error_body(
+                    "es_rejected_execution_exception",
+                    "es_rejected_execution_exception",
+                    None,
+                ),
+            ),
+            RetryableFailure::Unreachable("connection refused".to_string()),
+        ] {
+            assert_eq!(other.retry_schedule(0), (MAX_SEARCH_RETRIES, 100));
+            assert_eq!(other.retry_schedule(1), (MAX_SEARCH_RETRIES, 200));
+        }
     }
 
     /// #1294: status × error type → retry / client error / server error.

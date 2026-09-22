@@ -828,6 +828,22 @@ pub async fn ensure_index(
         ));
     }
 
+    // The create request waits for the primary shard by itself (the default
+    // `wait_for_active_shards=1`), so the write that follows cannot race the
+    // allocation. It gives up after its 30 s `timeout` and says so; the index
+    // exists all the same, the write waits for the primary again, and a read
+    // retries an unstarted shard (#1402) — so this is worth a line, not an
+    // error.
+    if let Ok(body) = response.json::<Value>().await
+        && body.get("shards_acknowledged") == Some(&Value::Bool(false))
+    {
+        tracing::warn!(
+            index,
+            "Elasticsearch created the index but its primary shard had not started when \
+             the request timed out; reads of it fail until it does"
+        );
+    }
+
     // Created from the current mapping, marker included.
     backend.mark_schema_checked(&index);
     tracing::debug!("Created Elasticsearch index '{}'", index);

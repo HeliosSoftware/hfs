@@ -310,6 +310,32 @@ async fn index_writes_retry_transient_failures_then_succeed() {
     }
 }
 
+/// #1402: a create-index request that timed out waiting for the primary shard
+/// (`shards_acknowledged: false`) still created the index. The write goes
+/// ahead — Elasticsearch makes the index request wait for the primary — and
+/// the index is not created a second time.
+#[tokio::test]
+async fn a_created_index_whose_primary_has_not_started_does_not_fail_the_write() {
+    let server = MockServer::start().await;
+    on(&server, "HEAD", INDEX_PATH, |_| ResponseTemplate::new(404)).await;
+    on(&server, "PUT", INDEX_PATH, |_| {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "acknowledged": true,
+            "shards_acknowledged": false,
+            "index": "hfs_write-stub_patient"
+        }))
+    })
+    .await;
+    on(&server, "POST", TENANT_DBQ_PATH, |_| swept(0)).await;
+    on(&server, "POST", DOC_PATH, |_| indexed()).await;
+
+    run_index_write(&backend(&server), "create")
+        .await
+        .expect("an unstarted primary must not fail the write");
+    assert_eq!(requests_to(&server, "PUT", INDEX_PATH).await, 1);
+    assert_eq!(requests_to(&server, "POST", DOC_PATH).await, 1);
+}
+
 /// Every retryable answer is retried, and an exhausted retry is an
 /// *unavailable* error: the document was never judged, so a later attempt (the
 /// composite's own retry, a `$reindex`) may well succeed.
