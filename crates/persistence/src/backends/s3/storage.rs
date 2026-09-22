@@ -400,7 +400,7 @@ impl S3Backend {
     ) -> StorageResult<usize> {
         use crate::search::registry::{SearchParameterSource, SearchParameterStatus};
 
-        let loader = SearchParameterLoader::new(FhirVersion::default());
+        let loader = SearchParameterLoader::new(FhirVersion::default_enabled());
         let resources = self.scan_live_resources(tenant, "SearchParameter").await?;
 
         let mut defs = Vec::new();
