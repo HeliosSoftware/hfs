@@ -285,6 +285,122 @@ async fn a_bad_query_that_mentions_index_not_found_is_still_a_bad_query() {
 }
 
 // ---------------------------------------------------------------------------
+// A read of an index that is still being created (#1402).
+// ---------------------------------------------------------------------------
+
+/// Attempts a read answered `no_shard_available_action_exception` gets, the
+/// first included (mirrors the private `MAX_NO_SHARD_RETRIES + 1`).
+const NO_SHARD_READ_ATTEMPTS: usize = 9;
+
+/// A real 7.17.29 answer for a search (and, identically, a count) of an index
+/// whose creation is still in flight: the index is in the cluster state, its
+/// primary shard is not started.
+const NO_SHARD_AVAILABLE: &str = r#"{"error":{"root_cause":[{"type":"no_shard_available_action_exception","reason":"[b25ac7417c31][172.17.0.2:9300][indices:data/read/search[phase/query]]","index_uuid":"EmpvuGepQaG0jYAwhcHI1A","shard":"0","index":"hfs_read-stub_patient"}],"type":"search_phase_execution_exception","reason":"all shards failed","phase":"query","grouped":true,"failed_shards":[{"shard":0,"index":"hfs_read-stub_patient","node":"O31KMMFTRTe1bsMsfGLEvg","reason":{"type":"no_shard_available_action_exception","reason":"[b25ac7417c31][172.17.0.2:9300][indices:data/read/search[phase/query]]","index_uuid":"EmpvuGepQaG0jYAwhcHI1A","shard":"0","index":"hfs_read-stub_patient"}}]},"status":503}"#;
+
+fn no_shard_available() -> ResponseTemplate {
+    ResponseTemplate::new(503).set_body_raw(NO_SHARD_AVAILABLE, "application/json")
+}
+
+/// The issue's sequence: someone else is creating the index, and a read meets
+/// its unstarted primary for longer than the general retry budget lasts. The
+/// read waits the creation out instead of failing.
+#[tokio::test]
+async fn a_read_outlasts_an_index_creation_longer_than_the_general_budget() {
+    const UNSTARTED_ANSWERS: usize = READ_ATTEMPTS + 1;
+
+    let server = MockServer::start().await;
+    for url_path in [SEARCH_PATH, COUNT_PATH] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        on_post(&server, url_path, move |_| {
+            if calls.fetch_add(1, Ordering::SeqCst) < UNSTARTED_ANSWERS {
+                return no_shard_available();
+            }
+            ResponseTemplate::new(200).set_body_json(json!({
+                "count": 0,
+                "hits": { "total": { "value": 0, "relation": "eq" }, "hits": [] }
+            }))
+        })
+        .await;
+    }
+    let es = backend(&server);
+    let query = SearchQuery::new("Patient");
+
+    let result = es
+        .search(&tenant(), &query)
+        .await
+        .expect("an index still being created is waited for");
+    assert!(result.resources.items.is_empty());
+    assert_eq!(
+        requests_to(&server, "POST", SEARCH_PATH).await,
+        UNSTARTED_ANSWERS + 1
+    );
+
+    assert_eq!(es.search_count(&tenant(), &query).await.unwrap(), 0);
+    assert_eq!(
+        requests_to(&server, "POST", COUNT_PATH).await,
+        UNSTARTED_ANSWERS + 1
+    );
+}
+
+/// The wait is bounded: a shard that never starts is an error after the
+/// longer budget, never an empty result.
+#[tokio::test]
+async fn a_shard_that_never_starts_is_an_error_after_a_bounded_wait() {
+    let server = MockServer::start().await;
+    on_post(&server, SEARCH_PATH, |_| no_shard_available()).await;
+
+    let error = backend(&server)
+        .search(&tenant(), &SearchQuery::new("Patient"))
+        .await
+        .map(|_| ())
+        .expect_err("a lost shard is not an empty result");
+
+    assert!(
+        matches!(error, StorageError::Backend(BackendError::Internal { .. })),
+        "{error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("after {NO_SHARD_READ_ATTEMPTS} attempts")),
+        "{error}"
+    );
+    assert_eq!(
+        requests_to(&server, "POST", SEARCH_PATH).await,
+        NO_SHARD_READ_ATTEMPTS
+    );
+}
+
+/// The longer budget belongs to the unstarted shard alone: once the cluster
+/// answers with any other transient failure, a read that is already past the
+/// general budget stops.
+#[tokio::test]
+async fn the_longer_budget_does_not_carry_over_to_other_transient_failures() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    on_post(&server, SEARCH_PATH, move |_| {
+        if calls.fetch_add(1, Ordering::SeqCst) < READ_ATTEMPTS {
+            no_shard_available()
+        } else {
+            error_body(503, "stubbed_exception")
+        }
+    })
+    .await;
+
+    let error = backend(&server)
+        .search(&tenant(), &SearchQuery::new("Patient"))
+        .await
+        .map(|_| ())
+        .expect_err("an overloaded cluster is still an error");
+
+    assert!(error.to_string().contains("stubbed_exception"), "{error}");
+    assert_eq!(
+        requests_to(&server, "POST", SEARCH_PATH).await,
+        READ_ATTEMPTS + 1
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Startup mapping reconcile: which requests it sends.
 // ---------------------------------------------------------------------------
 

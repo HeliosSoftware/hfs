@@ -44,6 +44,90 @@ pub(crate) struct CurrentResourceWithMeta {
 }
 
 impl S3Backend {
+    /// Soft-deletes a resource, optionally only at `expected_version`
+    /// ([`ResourceStorage::delete`] / [`ResourceStorage::delete_versioned`]).
+    ///
+    /// The tombstone is a conditional PUT on the ETag of the object loaded
+    /// here, and `expected_version` is compared on that same object — so a
+    /// writer landing after the comparison changes the ETag and the PUT is
+    /// refused (`OptimisticLockFailure`) rather than deleting a version the
+    /// caller never saw (#1404). That guarantee is the object store's
+    /// conditional write: a store that ignores `If-Match` on PUT gives none.
+    async fn soft_delete(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: Option<&str>,
+    ) -> StorageResult<()> {
+        tenant.check_permission(Operation::Delete, resource_type)?;
+
+        let location = self.tenant_location(tenant)?;
+        let current_key = location.keyspace.current_resource_key(resource_type, id);
+
+        let Some(actual) = self
+            .load_current_with_meta(tenant, resource_type, id)
+            .await?
+        else {
+            return Err(StorageError::Resource(ResourceError::NotFound {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+            }));
+        };
+
+        if actual.resource.is_deleted() {
+            return Err(StorageError::Resource(ResourceError::Gone {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+                deleted_at: actual.resource.deleted_at(),
+            }));
+        }
+
+        if let Some(expected) = expected_version
+            && expected != actual.resource.version_id()
+        {
+            return Err(StorageError::Concurrency(
+                ConcurrencyError::VersionConflict {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                    expected_version: expected.to_string(),
+                    actual_version: actual.resource.version_id().to_string(),
+                },
+            ));
+        }
+
+        let deleted = actual.resource.mark_deleted();
+        let payload = self.serialize_json(&deleted)?;
+
+        match self
+            .put_json_object(
+                &location.bucket,
+                &current_key,
+                &payload,
+                actual.etag.as_deref(),
+                None,
+            )
+            .await
+        {
+            Ok(_) => {
+                self.put_history_and_indexes(&location, &deleted, HistoryMethod::Delete)
+                    .await?;
+                self.maybe_reload_search_param_cache(tenant, resource_type, None)
+                    .await;
+                Ok(())
+            }
+            Err(StorageError::Backend(BackendError::QueryError { .. })) => Err(
+                StorageError::Concurrency(ConcurrencyError::OptimisticLockFailure {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                    expected_etag: actual.etag.unwrap_or_default(),
+                    actual_etag: None,
+                }),
+            ),
+            Err(err) => Err(err),
+        }
+    }
+
     /// Serialises `value` to a JSON byte vector.
     pub(crate) fn serialize_json<T: Serialize>(&self, value: &T) -> StorageResult<Vec<u8>> {
         serde_json::to_vec(value).map_err(|e| {
@@ -400,7 +484,7 @@ impl S3Backend {
     ) -> StorageResult<usize> {
         use crate::search::registry::{SearchParameterSource, SearchParameterStatus};
 
-        let loader = SearchParameterLoader::new(FhirVersion::default());
+        let loader = SearchParameterLoader::new(FhirVersion::default_enabled());
         let resources = self.scan_live_resources(tenant, "SearchParameter").await?;
 
         let mut defs = Vec::new();
@@ -939,59 +1023,18 @@ impl ResourceStorage for S3Backend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<()> {
-        tenant.check_permission(Operation::Delete, resource_type)?;
+        self.soft_delete(tenant, resource_type, id, None).await
+    }
 
-        let location = self.tenant_location(tenant)?;
-        let current_key = location.keyspace.current_resource_key(resource_type, id);
-
-        let Some(actual) = self
-            .load_current_with_meta(tenant, resource_type, id)
-            .await?
-        else {
-            return Err(StorageError::Resource(ResourceError::NotFound {
-                resource_type: resource_type.to_string(),
-                id: id.to_string(),
-            }));
-        };
-
-        if actual.resource.is_deleted() {
-            return Err(StorageError::Resource(ResourceError::Gone {
-                resource_type: resource_type.to_string(),
-                id: id.to_string(),
-                deleted_at: actual.resource.deleted_at(),
-            }));
-        }
-
-        let deleted = actual.resource.mark_deleted();
-        let payload = self.serialize_json(&deleted)?;
-
-        match self
-            .put_json_object(
-                &location.bucket,
-                &current_key,
-                &payload,
-                actual.etag.as_deref(),
-                None,
-            )
+    async fn delete_versioned(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: &str,
+    ) -> StorageResult<()> {
+        self.soft_delete(tenant, resource_type, id, Some(expected_version))
             .await
-        {
-            Ok(_) => {
-                self.put_history_and_indexes(&location, &deleted, HistoryMethod::Delete)
-                    .await?;
-                self.maybe_reload_search_param_cache(tenant, resource_type, None)
-                    .await;
-                Ok(())
-            }
-            Err(StorageError::Backend(BackendError::QueryError { .. })) => Err(
-                StorageError::Concurrency(ConcurrencyError::OptimisticLockFailure {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                    expected_etag: actual.etag.unwrap_or_default(),
-                    actual_etag: None,
-                }),
-            ),
-            Err(err) => Err(err),
-        }
     }
 
     async fn count(
@@ -1406,7 +1449,11 @@ impl VersionedStorage for S3Backend {
             ));
         }
 
-        self.delete(tenant, resource_type, id).await
+        // Delete exactly the version the precondition was evaluated against,
+        // not whatever is current by the time `delete` loads it again (#1404).
+        let actual_version = actual_version.to_string();
+        self.delete_versioned(tenant, resource_type, id, &actual_version)
+            .await
     }
 
     async fn list_versions(

@@ -1,5 +1,5 @@
 import { test, expect } from "../pages/fixtures";
-import { createResource, waitSearchable } from "../pages/api";
+import { createResource, waitSearchable, deleteResources } from "../pages/api";
 import {
   CANONICAL_BUTTON_GEOMETRY,
   readButtonGeometries,
@@ -470,7 +470,7 @@ test.describe("query builder", () => {
   test("drilling preserves a literal comma and every real OR alternative", async ({
     queries,
   }) => {
-    await queries.builder.setUrl("Patient?general-practitioner=a%5C%2Cb,c");
+    await queries.builder.setUrl("Patient?general-practitioner=a%26b%5C%2Cc,d");
     const row = queries.builder.conditionRows.first();
     const drill = queries.builder.drillButton(row);
     await expect(drill).toBeVisible();
@@ -478,11 +478,11 @@ test.describe("query builder", () => {
 
     const chain = queries.builder.chainRows.first();
     await expect(chain.locator(".builder-row__value")).toHaveCount(2);
-    await expect(chain.locator(".builder-row__value").nth(0)).toHaveValue("a,b");
-    await expect(chain.locator(".builder-row__value").nth(1)).toHaveValue("c");
+    await expect(chain.locator(".builder-row__value").nth(0)).toHaveValue("a&b,c");
+    await expect(chain.locator(".builder-row__value").nth(1)).toHaveValue("d");
     await chain.locator(".builder-row__cparam").fill("name");
     await expect(queries.builder.url).toHaveValue(
-      "GET /Patient?general-practitioner.name=a\\,b,c",
+      "GET /Patient?general-practitioner.name=a%26b%5C%2Cc,d",
     );
   });
 
@@ -617,7 +617,7 @@ test.describe("query builder", () => {
 
     await value.fill(`Comma,Edited-${tag}`);
     await expect(queries.builder.url).toHaveValue(
-      `GET /Patient?name:exact=Comma\\,Edited-${tag}`,
+      `GET /Patient?name:exact=Comma%5C%2CEdited-${tag}`,
     );
   });
 
@@ -630,7 +630,7 @@ test.describe("query builder", () => {
     await expect(row.locator(".builder-row__value").nth(0)).toHaveValue("a,b");
     await expect(row.locator(".builder-row__value").nth(1)).toHaveValue("c");
     await row.locator("[data-remove-or]").nth(1).click();
-    await expect(queries.builder.url).toHaveValue("GET /Patient?name=a\\,b");
+    await expect(queries.builder.url).toHaveValue("GET /Patient?name=a%5C%2Cb");
 
     await queries.builder.setUrl("Patient?general-practitioner.name=a%5C%2Cb,c");
     row = queries.builder.chainRows.first();
@@ -641,6 +641,10 @@ test.describe("query builder", () => {
     row = queries.builder.hasRows.first();
     await expect(row.locator(".builder-row__value")).toHaveCount(2);
     await expect(row.locator(".builder-row__value").nth(0)).toHaveValue("a,b");
+    await row.locator(".builder-row__value").nth(0).fill("a&b,c");
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Patient?_has:Observation:patient:code=a%26b%5C%2Cc,c",
+    );
   });
 
   test("malformed FHIR escapes keep the GET unchanged until corrected", async ({ queries }) => {
@@ -654,7 +658,7 @@ test.describe("query builder", () => {
 
     await row.locator(".builder-row__value").fill("a\\x");
     await expect(queries.builder.error).toBeHidden();
-    await expect(queries.builder.url).toHaveValue("GET /Patient?family=a\\\\x");
+    await expect(queries.builder.url).toHaveValue("GET /Patient?family=a%5C%5Cx");
   });
 
   test("operator cleanup keeps malformed escapes blocked until correction", async ({
@@ -684,7 +688,7 @@ test.describe("query builder", () => {
 
     await row.locator(".builder-row__value").fill("a\\x");
     await expect(queries.builder.error).toBeHidden();
-    await expect(queries.builder.url).toHaveValue("GET /Patient?gender=a\\\\x");
+    await expect(queries.builder.url).toHaveValue("GET /Patient?gender=a%5C%5Cx");
     await expect(queries.builder.runButton).toBeEnabled();
     await expect(queries.builder.saveButton).toBeEnabled();
     await expect(queries.builder.copyButton).toBeEnabled();
@@ -2318,6 +2322,259 @@ test.describe("query builder", () => {
 
     await queries.builder.recentToggle.click();
     await expect(queries.builder.recentPanel).toContainText(/Patient/);
+  });
+
+  test("URL encoding: visual ampersands survive Run, Copy, Saved and Recent", async ({
+    context,
+    page,
+    queries,
+    request,
+  }) => {
+    const tag = Date.now().toString(36);
+    const literal = "A&A HEALTHCARE LLC";
+    const savedName = `Ampersand query ${tag}`;
+    const expected = "GET /Location?name=A%26A%20HEALTHCARE%20LLC";
+    const ids: string[] = [];
+    await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+    try {
+      for (let i = 0; i < 2; i++) {
+        ids.push(await createResource(request, "Location", { name: literal }));
+      }
+      const decoy = await createResource(request, "Location", { name: "A ONLY DECOY" });
+      ids.push(decoy);
+      for (const id of ids) await waitSearchable(request, "Location", id);
+
+      await queries.builder.setUrl("Location");
+      await queries.builder.addButton("condition").click();
+      const row = queries.builder.conditionRows.first();
+      await row.locator(".builder-row__key").fill("name");
+      await row.locator(".builder-row__value").fill(literal);
+      await expect(queries.builder.url).toHaveValue(expected);
+
+      const requestSent = queries.page.waitForRequest((candidate) => {
+        const url = new URL(candidate.url());
+        return url.pathname === "/Location" && url.searchParams.has("name");
+      });
+      await queries.builder.runButton.click();
+      const sentUrl = new URL((await requestSent).url());
+      expect(sentUrl.searchParams.getAll("name")).toEqual([literal]);
+      expect([...sentUrl.searchParams.keys()].sort()).toEqual(["_total", "name"]);
+      await queries.results.waitShown();
+      await expect(queries.results.rows).toHaveCount(2);
+      await expect(
+        queries.results.rows.locator(`[data-resource-id="${ids[0]}"]`),
+      ).toHaveCount(1);
+      await expect(
+        queries.results.rows.locator(`[data-resource-id="${ids[1]}"]`),
+      ).toHaveCount(1);
+      await expect(
+        queries.results.rows.locator(`[data-resource-id="${decoy}"]`),
+      ).toHaveCount(0);
+
+      await queries.builder.copyButton.click();
+      await expect
+        .poll(async () => page.evaluate(() => navigator.clipboard.readText()))
+        .toBe(expected);
+
+      await queries.builder.nameInput.fill(savedName);
+      await queries.builder.saveButton.click();
+      await expect(queries.savedList).toContainText(savedName);
+
+      await page.reload({ waitUntil: "networkidle" });
+      await queries.builder.recentToggle.click();
+      await queries.builder.recentPanel.locator("[data-saved-load]", { hasText: savedName }).click();
+      await expect(queries.builder.url).toHaveValue(expected);
+      const values = queries.builder.conditionRows.first().locator(".builder-row__value");
+      await expect(values).toHaveCount(1);
+      await expect(values).toHaveValue(literal);
+
+      const persisted = page.waitForResponse((response) => {
+        const req = response.request();
+        return (
+          new URL(response.url()).pathname === "/_user/settings" &&
+          req.method() === "PATCH" &&
+          response.ok()
+        );
+      });
+      const resent = page.waitForRequest((candidate) => {
+        const url = new URL(candidate.url());
+        return url.pathname === "/Location" && url.searchParams.has("name");
+      });
+      await queries.builder.runButton.click();
+      const [, reloaded] = await Promise.all([
+        persisted,
+        resent,
+        queries.results.waitShown(),
+      ]);
+      expect(new URL(reloaded.url()).searchParams.get("name")).toBe(literal);
+      await page.reload({ waitUntil: "networkidle" });
+      await queries.builder.recentToggle.click();
+      await queries.builder.recentPanel.getByRole("button", { name: expected, exact: true }).click();
+      await expect(queries.builder.url).toHaveValue(expected);
+      await expect(
+        queries.builder.conditionRows.first().locator(".builder-row__value"),
+      ).toHaveValue(literal);
+    } finally {
+      await deleteResources(request, "Location", ids);
+    }
+  });
+
+  test("URL encoding: untouched hydration and cross-row edits", async ({
+    context,
+    page,
+    queries,
+  }) => {
+    const hydrated = "Location?name=A%26A+HEALTHCARE+LLC&_count=2";
+    const literal = "A&A HEALTHCARE LLC";
+    await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+
+    await queries.builder.setUrl(hydrated);
+    await expect(queries.builder.url).toHaveValue(hydrated);
+    await queries.builder.copyButton.click();
+    await expect
+      .poll(async () => page.evaluate(() => navigator.clipboard.readText()))
+      .toBe(hydrated);
+
+    const untouchedRequest = page.waitForRequest((request) => {
+      const url = new URL(request.url());
+      return url.pathname === "/Location" && url.searchParams.has("name");
+    });
+    await queries.builder.runButton.click();
+    const untouchedUrl = new URL((await untouchedRequest).url());
+    expect(untouchedUrl.search).toBe(
+      "?name=A%26A+HEALTHCARE+LLC&_count=2&_total=accurate",
+    );
+    expect(untouchedUrl.searchParams.getAll("name")).toEqual([literal]);
+    await expect(queries.builder.url).toHaveValue(hydrated);
+    await expect
+      .poll(async () => page.evaluate(() => navigator.clipboard.readText()))
+      .toBe(hydrated);
+
+    const countRow = page.locator("#builder-controls .builder-row");
+    await expect(countRow).toHaveCount(1);
+    await expect(countRow.locator(".builder-row__key")).toHaveValue("_count");
+    await countRow.locator(".builder-row__value").fill("3");
+    const canonical = "GET /Location?name=A%26A%20HEALTHCARE%20LLC&_count=3";
+    await expect(queries.builder.url).toHaveValue(canonical);
+
+    const editedRequest = page.waitForRequest((request) => {
+      const url = new URL(request.url());
+      return url.pathname === "/Location" && url.searchParams.get("_count") === "3";
+    });
+    await queries.builder.runButton.click();
+    const editedUrl = new URL((await editedRequest).url());
+    expect(editedUrl.searchParams.getAll("name")).toEqual([literal]);
+    expect(editedUrl.searchParams.getAll("_count")).toEqual(["3"]);
+    expect(editedUrl.searchParams.getAll("_total")).toEqual(["accurate"]);
+
+    const sort = page.locator("#query-results-sort");
+    await expect(sort).toBeEnabled();
+    const sortedRequest = page.waitForRequest((request) => {
+      const url = new URL(request.url());
+      return url.pathname === "/Location" && url.searchParams.has("_sort");
+    });
+    await sort.selectOption("_lastUpdated");
+    const sortedUrl = new URL((await sortedRequest).url());
+    expect(sortedUrl.searchParams.getAll("name")).toEqual([literal]);
+    expect(sortedUrl.searchParams.get("_sort")).toBe("_lastUpdated");
+    await expect(queries.builder.url).toHaveValue(
+      canonical + "&_sort=_lastUpdated",
+    );
+  });
+
+  test("URL encoding: typed values preserve FHIR syntax", async ({ queries }) => {
+    const cases = [
+      {
+        type: "Patient",
+        key: "identifier",
+        initial: null,
+        literal: "http://example.org/a?x=1&y=2|A+B",
+        wire: "http%3A%2F%2Fexample.org%2Fa%3Fx%3D1%26y%3D2%7CA%2BB",
+        comparator: "",
+      },
+      {
+        type: "Patient",
+        key: "general-practitioner",
+        initial: null,
+        literal: "https://example.org/Practitioner/123",
+        wire: "https%3A%2F%2Fexample.org%2FPractitioner%2F123",
+        comparator: "",
+      },
+      {
+        type: "Observation",
+        key: "date",
+        initial: "Observation?date=ge2026-09-21",
+        literal: "2026-09-22T12:00:00+04:00",
+        wire: "ge2026-09-22T12%3A00%3A00%2B04%3A00",
+        comparator: "ge",
+      },
+    ];
+
+    for (const sample of cases) {
+      if (sample.initial) {
+        await queries.builder.setUrl(sample.initial);
+      } else {
+        await queries.builder.setUrl(sample.type);
+        await queries.builder.addButton("condition").click();
+        await queries.builder.conditionRows
+          .first()
+          .locator(".builder-row__key")
+          .fill(sample.key);
+      }
+
+      let row = queries.builder.conditionRows.first();
+      await expect(row.locator(".builder-row__comparator")).toHaveValue(
+        sample.comparator,
+      );
+      await row.locator(".builder-row__value").fill(sample.literal);
+      const expected = `GET /${sample.type}?${sample.key}=${sample.wire}`;
+      await expect(queries.builder.url).toHaveValue(expected);
+
+      await queries.builder.setUrl(expected);
+      await expect(queries.builder.conditionRows).toHaveCount(1);
+      row = queries.builder.conditionRows.first();
+      await expect(row.locator(".builder-row__value")).toHaveValue(sample.literal);
+      await expect(row.locator(".builder-row__comparator")).toHaveValue(
+        sample.comparator,
+      );
+    }
+  });
+
+  test("URL encoding: reserved characters round-trip", async ({ page, queries }) => {
+    const cases = [
+      {
+        literal: "A&B + 50% #=? Muñoz",
+        encoded: "A%26B%20%2B%2050%25%20%23%3D%3F%20Mu%C3%B1oz",
+      },
+      { literal: "A%26B", encoded: "A%2526B" },
+    ];
+
+    for (const sample of cases) {
+      await queries.builder.setUrl("Location");
+      await queries.builder.addButton("condition").click();
+      const row = queries.builder.conditionRows.first();
+      await row.locator(".builder-row__key").fill("name");
+      await row.locator(".builder-row__value").fill(sample.literal);
+      const expected = `GET /Location?name=${sample.encoded}`;
+      await expect(queries.builder.url).toHaveValue(expected);
+
+      const requestSent = page.waitForRequest((request) => {
+        const url = new URL(request.url());
+        return url.pathname === "/Location" && url.searchParams.has("name");
+      });
+      await queries.builder.runButton.click();
+      const sentUrl = new URL((await requestSent).url());
+      expect(sentUrl.search).toBe(`?name=${sample.encoded}&_total=accurate`);
+      expect(sentUrl.searchParams.getAll("name")).toEqual([sample.literal]);
+      expect([...sentUrl.searchParams.keys()].sort()).toEqual(["_total", "name"]);
+      expect(sentUrl.hash).toBe("");
+
+      await queries.builder.setUrl(expected);
+      await expect(queries.builder.conditionRows).toHaveCount(1);
+      await expect(
+        queries.builder.conditionRows.first().locator(".builder-row__value"),
+      ).toHaveValue(sample.literal);
+    }
   });
 
   test("escaped commas survive Copy, Saved and Recent reloads", async ({

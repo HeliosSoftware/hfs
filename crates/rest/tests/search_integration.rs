@@ -5181,3 +5181,82 @@ mod empty_type_total {
         assert_total_is_number_or_absent(&body);
     }
 }
+
+/// Compartment searches (`Patient/p1/Observation?...`) take the same
+/// out-of-band criteria a type search does (#1407): `_list`, `_has` and chained
+/// parameters select top-level resources and are resolved before the backend
+/// runs. The compartment handler used to pass them through unresolved, and the
+/// backends ignore them.
+mod compartment_out_of_band {
+    use super::*;
+
+    async fn seed(backend: &SqliteBackend) {
+        let resources = [
+            json!({"resourceType": "Patient", "id": "p1"}),
+            json!({"resourceType": "Encounter", "id": "e-done", "status": "finished",
+                   "class": {"code": "AMB"}, "subject": {"reference": "Patient/p1"}}),
+            json!({"resourceType": "Encounter", "id": "e-plan", "status": "planned",
+                   "class": {"code": "AMB"}, "subject": {"reference": "Patient/p1"}}),
+            json!({"resourceType": "Observation", "id": "o-done", "status": "final",
+                   "code": {"coding": [{"system": "http://loinc.org", "code": "X"}]},
+                   "subject": {"reference": "Patient/p1"},
+                   "encounter": {"reference": "Encounter/e-done"}}),
+            json!({"resourceType": "Observation", "id": "o-plan", "status": "final",
+                   "code": {"coding": [{"system": "http://loinc.org", "code": "Y"}]},
+                   "subject": {"reference": "Patient/p1"},
+                   "encounter": {"reference": "Encounter/e-plan"}}),
+            json!({"resourceType": "List", "id": "l1", "status": "current", "mode": "working",
+                   "entry": [{"item": {"reference": "Observation/o-done"}}]}),
+        ];
+        for resource in resources {
+            let resource_type = resource["resourceType"].as_str().unwrap().to_string();
+            backend
+                .create(&test_tenant(), &resource_type, resource, FhirVersion::R4)
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn ids(server: &TestServer, url: &str) -> Vec<String> {
+        let response = server
+            .get(url)
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let mut ids: Vec<String> = get_bundle_entries(&body)
+            .iter()
+            .map(|e| e["resource"]["id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[tokio::test]
+    async fn test_compartment_search_resolves_list_has_and_chains() {
+        let (server, backend) = create_test_server().await;
+        seed(&backend).await;
+
+        // Positive control: both Observations are in the compartment.
+        assert_eq!(
+            ids(&server, "/Patient/p1/Observation").await,
+            ["o-done", "o-plan"]
+        );
+        assert_eq!(
+            ids(&server, "/Patient/p1/Observation?_list=l1").await,
+            ["o-done"]
+        );
+        assert_eq!(
+            ids(&server, "/Patient/p1/Observation?encounter.status=planned").await,
+            ["o-plan"]
+        );
+        assert_eq!(
+            ids(
+                &server,
+                "/Patient/p1/Encounter?_has:Observation:encounter:code=X"
+            )
+            .await,
+            ["e-done"]
+        );
+    }
+}

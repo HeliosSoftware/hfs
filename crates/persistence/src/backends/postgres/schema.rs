@@ -9,7 +9,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 40;
+pub const SCHEMA_VERSION: i32 = 41;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -375,6 +375,7 @@ async fn migrate_schema(
             37 => migrate_v37_to_v38(client).await?,
             38 => migrate_v38_to_v39(client).await?,
             39 => migrate_v39_to_v40(client).await?,
+            40 => migrate_v40_to_v41(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -3706,6 +3707,36 @@ async fn migrate_v39_to_v40(client: &deadpool_postgres::Client) -> StorageResult
         )
         .await
         .map_err(|e| pg_error(format!("Migration v39->v40 failed: {}", e)))?;
+
+    Ok(())
+}
+
+/// v40 -> v41: `secondary_sync_failures` (#1334).
+///
+/// The durable "needs reindex" ledger for a composite whose secondary refused
+/// a change this primary had already committed. One row per (tenant, resource,
+/// secondary), so a repeat failure folds into the existing row instead of
+/// growing the table; `last_failed_at` orders the repair queue.
+async fn migrate_v40_to_v41(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS secondary_sync_failures (
+                tenant_id TEXT NOT NULL,
+                resource_type TEXT NOT NULL,
+                resource_id TEXT NOT NULL,
+                backend_id TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                first_failed_at TIMESTAMPTZ NOT NULL,
+                last_failed_at TIMESTAMPTZ NOT NULL,
+                last_error TEXT NOT NULL,
+                attempts BIGINT NOT NULL DEFAULT 0,
+                PRIMARY KEY (tenant_id, resource_type, resource_id, backend_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_secondary_sync_failures_queue
+                ON secondary_sync_failures (last_failed_at);",
+        )
+        .await
+        .map_err(|e| pg_error(format!("Migration v40->v41 failed: {}", e)))?;
 
     Ok(())
 }

@@ -94,7 +94,6 @@ chrono.workspace = true
 # Utilities
 uuid = { version = "1", features = ["v4", "serde"] }
 url = "2.5"
-json-patch = "3"
 futures = "0.3"
 dashmap = "6"
 
