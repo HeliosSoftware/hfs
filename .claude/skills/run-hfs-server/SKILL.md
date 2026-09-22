@@ -253,6 +253,7 @@ StructureDefinition writes since process start (no startup warm-load yet).
 | delete | DELETE | `/[type]/[id]` |
 | create | POST | `/[type]` |
 | search | GET/POST | `/[type]?params` or `/[type]/_search` |
+| search, system | GET/POST | `/?params` or `/_search` — **not supported**: `501` + OperationOutcome (`not-supported`), and not listed in `/metadata` (#1338). With the UI mounted, bare `GET /` (no query) redirects to `/ui` |
 | history, instance | GET | `/[type]/[id]/_history` |
 | history, type | GET | `/[type]/_history` |
 | history, system | GET | `/_history` |

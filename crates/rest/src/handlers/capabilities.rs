@@ -214,7 +214,9 @@ where
     }
     system_interactions.push(serde_json::json!({ "code": "batch" }));
     system_interactions.push(serde_json::json!({ "code": "history-system" }));
-    system_interactions.push(serde_json::json!({ "code": "search-system" }));
+    // No `search-system`: `GET [base]?params` and `POST [base]/_search` are
+    // refused with `501` (`search_system_not_supported_handler`). It was listed
+    // here unconditionally while no route served it (#1338).
 
     // Standard operations, extended with the system-level SQL on FHIR
     // operations. Partial parameter support is advertised through the
