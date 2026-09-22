@@ -130,8 +130,9 @@ Each item notes the spec basis, the fix, the files touched, and backend coverage
   `?date=ge2020&date=le2021`, which is unaffected. Quantity was already
   correct (never in the AND list) and is unchanged; SQLite and
   Elasticsearch were already correct (OR for every type) and are
-  unchanged. PostgreSQL has the same class of defect, more broadly
-  (quantity included) — tracked as a follow-up below, not fixed here.
+  unchanged. PostgreSQL had the same class of defect, more broadly
+  (quantity included); it was fixed in #1300, and its repeated form was
+  folded in #1416 (A7b).
   MongoDB was the outlier here, not an exception to a settled convention:
   the REST extractor, SQLite, Elasticsearch, and the UI's own query
   builder already narrate a comma-separated date range as OR (e.g.
@@ -142,21 +143,60 @@ Each item notes the spec basis, the fix, the files touched, and backend coverage
   assertions narrate builder hydration only, not result counts, so they
   are unaffected by this fix either way.
   Files: `crates/persistence/src/backends/mongodb/search_impl.rs`.
+- **A7b - PostgreSQL: comma-separated values were ANDed, fixed in #1300, and
+  the repeated form now folds into one set intersection (#1416).** Same class
+  of defect as A7a and wider: `build_date_condition`, `build_number_condition`,
+  `build_quantity_condition`, and `build_last_updated_condition` each folded
+  their per-value conditions with `.and()`, while string, token, reference,
+  uri, composite, `_id`, and full-text already ORed. Each condition was its own
+  `id IN (SELECT ...)` sublink, so the AND applied *across rows*:
+  `date=2019,2021` read as "has a 2019 date and a 2021 date", usually empty but
+  without MongoDB's whole-result wipeout, which is why the defect was easy to
+  miss here. #1300 replaced the four copies of the fold with one `or_values`
+  fold: a parameter whose values are all membership tests emits ONE sublink
+  with the predicates ORed inside (following `build_token_condition`), and
+  `_lastUpdated`, which compares a `resources` column, ORs its ranges
+  directly. A single value builds byte-identical SQL, `validate_date_values`
+  rejects an uninterpretable value before a query is built, and a list of only
+  invalid values is still `FALSE`. The comma list is OR; the repeated form
+  (`?p=a&p=b`, separate `SearchParameter`s ANDed in `build_search_query_for`)
+  is the conjunction, as the spec requires.
+  **Performance follow-up (#1416).** The repeat was still built as two
+  `id IN (...)` sublinks, which is two semi-joins; PostgreSQL 16 could run the
+  pair as a nested loop that re-executed one arm's date index scan once per
+  candidate of the other. On a 24,000-Patient corpus that was 18,000 rescanning
+  probes of `idx_search_date_recent`, 7.4M buffers, and a 33.4 s page against a
+  shipped 30 s `statement_timeout`. #1416 folds eligible repeats into ONE
+  membership test whose arms are the occurrences' own selects joined by
+  `INTERSECT`, a set operation evaluated once per arm; the same page then takes
+  21.3 ms and 15,360 buffers, and the rescanning node is absent from every
+  capture. Method and numbers: `docs/postgres-repeated-date-benchmark.md`; the
+  durable CI check is sections BV to BZ of
+  `.github/scripts/pg-search-plans.sql`.
+  **The fold is generic, not Date-specific.** It keys on the parameter name:
+  any name that appears two or more times, all of whose occurrences build as a
+  simple positive `search_index` membership test on that name, folds, whatever
+  the type; a denormalized composite folds too because it is one row predicate.
+  If any occurrence is ineligible the whole name keeps the previous
+  per-occurrence conjunction, so no constraint is dropped or re-read: an
+  occurrence that builds no condition, a value the builder fails closed on (a
+  bare `FALSE`), `:missing`, `:not`, `_id` and `_lastUpdated` column
+  predicates, full-text, `:identifier`, the compartment clause, and the legacy
+  composite aggregate (a `GROUP BY ... HAVING` aggregate, not a row predicate)
+  all remain unfused. Test coverage: `query_builder::tests` pins the shapes,
+  the placeholder order, the eligible forms, and representative ineligible
+  ones: an unparseable value, both `:missing` values, `:not`, and the legacy
+  composite aggregate. The gate's own test adds the wrapper-like exclusions
+  that have no query-level case, such as the compartment clause's
+  `param_name IN (...)` list and a set-expression arm. `search_impl.rs`'s
+  fast-path test pins that a set operation is still not extractable as a
+  single index predicate, and
+  `postgres_integration_comma_list_is_or_and_repeated_param_is_and` pins the
+  end-to-end semantics: multi-valued `Encounter.period`, `search_count`, both
+  `_total` modes, cursor and offset paging, and tenant isolation.
 
 ## Out of first cut (tracked follow-ups)
 - A5a for Postgres / Elasticsearch / MongoDB query builders.
 - A5b all-types compartment search.
 - A1b full `|` / `$` escaping inside token & composite value parsing.
 - Per-param `modifier` arrays in the CapabilityStatement.
-- **A7b — PostgreSQL: comma-separated date/number/quantity/`_lastUpdated`
-  values are ANDed across per-value subqueries** (`build_date_condition`,
-  `build_number_condition`, `build_quantity_condition`,
-  `build_last_updated_condition` in
-  `crates/persistence/src/backends/postgres/search/query_builder.rs`), the
-  same class of defect as A7a and wider (quantity is affected there, unlike
-  MongoDB). The failure mode differs from MongoDB's: each condition is its
-  own `id IN (SELECT ...)` subquery, so the AND is applied *across rows*
-  rather than within one row — `date=2019,2021` reads as "has a 2019 date
-  **and** a 2021 date" (not automatically empty) rather than MongoDB's
-  whole-result-emptying failure, which makes it easy to misread Postgres as
-  unaffected. Not fixed here; reuse A7a's test shape when it is.
