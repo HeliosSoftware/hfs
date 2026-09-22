@@ -1766,6 +1766,54 @@ async fn resource_scan_hook_returns_the_tenants_live_resources() {
     assert!(other_tenant.is_empty());
 }
 
+/// #1453: the by-id half of the scan hook. The in-process SoF runner uses it
+/// to build a compartment filter without draining the Patient/Group
+/// collections, so it must fetch exactly the ids asked for, skip deleted and
+/// absent ones, and stay tenant-scoped.
+#[tokio::test]
+async fn resource_scan_reads_named_resources_by_id() {
+    let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+    let t = tenant("tenant-a");
+    for id in ["p1", "p2", "gone"] {
+        backend
+            .create(
+                &t,
+                "Patient",
+                json!({"resourceType": "Patient", "id": id}),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("create Patient");
+    }
+    backend.delete(&t, "Patient", "gone").await.expect("delete");
+
+    let scan = backend
+        .resource_scan()
+        .expect("standalone S3 exposes a scan");
+    let ids = ["p1", "gone", "absent"].map(str::to_string);
+
+    let found = scan
+        .read_resources(&t, "Patient", &ids)
+        .await
+        .expect("read by id");
+    let mut found_ids: Vec<&str> = found
+        .iter()
+        .filter_map(|r| r.get("id").and_then(|v| v.as_str()))
+        .collect();
+    found_ids.sort();
+    assert_eq!(
+        found_ids,
+        ["p1"],
+        "only the live, named resource is returned"
+    );
+
+    let other_tenant = scan
+        .read_resources(&tenant("tenant-b"), "Patient", &ids)
+        .await
+        .expect("read by id");
+    assert!(other_tenant.is_empty(), "reads must not cross tenants");
+}
+
 #[tokio::test]
 async fn tenant_registry_unsupported_without_system_bucket() {
     let mock = Arc::new(MockS3Client::with_buckets(&["bucket-a"]));

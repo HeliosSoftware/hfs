@@ -1889,6 +1889,48 @@ impl crate::sof::in_process::ResourceScan for S3Backend {
 
         Ok(Box::pin(scan_stream))
     }
+
+    async fn read_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[String],
+    ) -> Result<Vec<Value>, crate::core::sof_runner::SofError> {
+        use crate::core::sof_runner::SofError;
+        use futures::stream::{self, StreamExt};
+
+        // One GET per id against the `current.json` key — no LIST, so the cost
+        // is the number of ids rather than the size of the type's keyspace.
+        let loaded: Vec<Result<Option<StoredResource>, SofError>> =
+            stream::iter(ids.iter().cloned())
+                .map(|id| {
+                    let backend = self.clone();
+                    let tenant = tenant.clone();
+                    let resource_type = resource_type.to_string();
+                    async move {
+                        backend
+                            .load_current_with_meta(&tenant, &resource_type, &id)
+                            .await
+                            .map(|current| {
+                                current
+                                    .map(|c| c.resource)
+                                    .filter(|resource| !resource.is_deleted())
+                            })
+                            .map_err(|e| SofError::Storage(e.to_string()))
+                    }
+                })
+                .buffer_unordered(self.bulk_write_concurrency())
+                .collect()
+                .await;
+
+        let mut out = Vec::with_capacity(ids.len());
+        for result in loaded {
+            if let Some(resource) = result? {
+                out.push(resource.into_content_with_meta());
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]

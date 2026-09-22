@@ -528,6 +528,27 @@ mod tests {
                 Scan::Broken => Err(SofError::Storage("bucket unreachable".to_string())),
             }
         }
+
+        async fn read_resources(
+            &self,
+            _tenant: &TenantContext,
+            resource_type: &str,
+            ids: &[String],
+        ) -> Result<Vec<Value>, SofError> {
+            match self {
+                Scan::Of(resources) => Ok(resources
+                    .iter()
+                    .filter(|r| {
+                        r.get("resourceType").and_then(Value::as_str) == Some(resource_type)
+                            && r.get("id")
+                                .and_then(Value::as_str)
+                                .is_some_and(|id| ids.iter().any(|want| want == id))
+                    })
+                    .cloned()
+                    .collect()),
+                Scan::Broken => Err(SofError::Storage("bucket unreachable".to_string())),
+            }
+        }
     }
 
     fn tenant() -> TenantContext {
