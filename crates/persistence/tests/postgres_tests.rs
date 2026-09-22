@@ -18770,7 +18770,7 @@ mod postgres_integration {
         {
             let backend = create_backend().await;
             let tenant = create_tenant(&format!("bulk_submit_cancel_{label}"));
-            let sub_id = SubmissionId::generate(&format!("pg-cancel-{label}"));
+            let sub_id = SubmissionId::generate(format!("pg-cancel-{label}"));
             backend
                 .create_submission(&tenant, &sub_id, None)
                 .await
