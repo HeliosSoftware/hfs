@@ -1928,9 +1928,16 @@ fn spawn_export_workers<Dp>(
 /// wrapped in [`CompositeSubmitJobs`], which syncs each finished manifest's
 /// resources into the secondary index (#882). Under bulk fast-load the worker
 /// fires a per-type reindex after each manifest that rebuilds Elasticsearch
-/// too, so the wrapper's per-resource sync would only duplicate that work; the
-/// raw primary is used instead. Fast-load without a reindex hook still needs
-/// the wrapper, otherwise the data never reaches Elasticsearch.
+/// too, so the wrapper's per-resource sync would only duplicate that work (#903)
+/// and is switched off with `with_ingest_sync(false)`. The wrapper itself stays
+/// in the chain: it is what mirrors a rolled-back change onto Elasticsearch
+/// (a rolled-back create becomes a delete) and forwards the #1125 rebuild
+/// ledger to the primary. Handing the worker the raw primary instead left
+/// rolled-back resources searchable in Elasticsearch after they were gone from
+/// the primary (#1161). Aborting a submission rolls nothing back on any
+/// primary, so abort leaves Elasticsearch alone. Fast-load without a reindex
+/// hook keeps the per-resource sync, otherwise the data never reaches
+/// Elasticsearch.
 ///
 /// With `HFS_BULK_SUBMIT_DEFER_INDEXING=false` (#1127, #1242) the wrapper is
 /// itself wrapped in [`IndexingSubmitJobs`]: every committed batch is handed to
@@ -1991,9 +1998,9 @@ fn composite_submit_jobs(
     } else if has_reindex_hook {
         info!(
             "Bulk submit defers indexing (DEFER_INDEXING=true); Elasticsearch is rebuilt \
-             per type after each manifest"
+             per type after each manifest, and rollbacks are mirrored to it"
         );
-        primary
+        Arc::new(CompositeSubmitJobs::new(primary, composite).with_ingest_sync(false))
     } else {
         info!(
             "Bulk submit syncs each finished manifest into Elasticsearch (no reindex hook); \
@@ -2480,7 +2487,8 @@ async fn start_sqlite_elasticsearch(
     // primary skips local indexing when search is offloaded, and without the
     // wrapper bulk-loaded data is invisible to every search (#882). In
     // fast-load mode the post-manifest reindex already rebuilds Elasticsearch,
-    // so the per-resource sync is skipped rather than done twice (#903).
+    // so the wrapper skips its per-resource sync rather than doing it twice
+    // (#903), but stays in the chain to mirror rollbacks (#1161).
     let submit_jobs = composite_submit_jobs(
         sqlite.clone(),
         sqlite.clone(),
@@ -2774,7 +2782,8 @@ async fn start_postgres_elasticsearch(
         .map(|op| automatic_reindex_hook_with_ledger(op, &config, None));
     // Wrapped like sqlite-es: finished manifests sync their ingested
     // resources into Elasticsearch, which the raw primary never does (#882),
-    // unless fast-load's post-manifest reindex covers it (#903).
+    // unless fast-load's post-manifest reindex covers it (#903); rollbacks are
+    // mirrored to Elasticsearch either way (#1161).
     let submit_jobs = composite_submit_jobs(
         pg.clone(),
         pg.clone(),
@@ -3009,7 +3018,9 @@ async fn start_mongodb_elasticsearch(
     // hooks" — on this backend those hooks are exactly what is turned off
     // (`search_offloaded`, logged above as "MongoDB search indexing disabled"),
     // so nothing indexed the bulk-loaded data anywhere and 99.9 % of an import
-    // was readable by id and invisible to every search (#1021).
+    // was readable by id and invisible to every search (#1021). Under fast-load
+    // the wrapper skips its per-resource sync but still mirrors rollbacks
+    // (#903, #1161).
     let submit_jobs = composite_submit_jobs(
         mongo.clone(),
         mongo.clone(),
@@ -3460,6 +3471,8 @@ async fn start_s3_elasticsearch(
     // indexing hooks for the composite's search half to be "fed by", which is
     // what the comment this replaces claimed. Without the wrapper a completed
     // `$bulk-submit` here leaves its resources searchable nowhere (#1021).
+    // Under fast-load the wrapper skips its per-resource sync but still mirrors
+    // rollbacks (#903, #1161).
     let reindex_hook = ops
         .reindex
         .clone()

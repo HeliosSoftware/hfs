@@ -692,7 +692,9 @@ where
         );
     }
 
-    // submissionStatus=stopped → abort (rolls back recorded changes).
+    // submissionStatus=stopped → abort. This stops the submission: it is marked
+    // `aborted` and its pending/processing manifests `failed`. Entries already
+    // ingested are kept, not rolled back (#968, #1161).
     if req.submission_status == "stopped" {
         jobs.abort_submission(ctx, &sub_id, "submissionStatus=stopped")
             .await
@@ -1299,7 +1301,8 @@ where
     let ctx = &target.tenant;
     let sub_id = &target.submission_id;
 
-    // Cooperative cancel (rolls back recorded changes).
+    // Cooperative cancel: marks the submission `aborted` and its pending/processing
+    // manifests `failed`. Already-ingested entries are kept, not rolled back.
     let _ = jobs
         .abort_submission(ctx, sub_id, "cancelled via DELETE")
         .await;

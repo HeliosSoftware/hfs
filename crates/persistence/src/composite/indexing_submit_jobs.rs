@@ -47,7 +47,8 @@ use crate::core::bulk_submit::{
 use crate::core::bulk_submit_publication::{ManifestPublicationResult, ManifestPublicationStatus};
 use crate::core::bulk_submit_worker::{
     BulkSubmitJobStore, IngestSyncReport, ManifestFetchParams, ManifestLease, ManifestWorkerView,
-    PollTokenTarget, SubmitClaimStrategy, SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
+    PendingReindex, PollTokenTarget, SubmitClaimStrategy, SubmitFileRecord, SubmitFileRow,
+    SubmitWorkerStorage,
 };
 use crate::core::storage::ResourceStorage;
 use crate::core::{ActivityCell, DailyResourceCount, ResourceCountDelta, SofRunner, TenantRecord};
@@ -710,6 +711,31 @@ impl SubmitWorkerStorage for IndexingSubmitJobs {
         self.inner.checkpoint_after_file().await;
     }
 
+    // The #1125 rebuild ledger lives on the inner store's manifest rows. The
+    // trait defaults are no-ops, so without these forwards a marker set when
+    // the sink rejected a type would be dropped, and a restart would never
+    // re-fire that rebuild (#1161).
+    async fn mark_manifest_index_pending(&self, lease: &ManifestLease) -> StorageResult<()> {
+        self.inner.mark_manifest_index_pending(lease).await
+    }
+
+    async fn clear_manifest_index_pending(
+        &self,
+        tenant: &TenantContext,
+        manifest_id: &str,
+    ) -> StorageResult<()> {
+        self.inner
+            .clear_manifest_index_pending(tenant, manifest_id)
+            .await
+    }
+
+    async fn list_manifests_awaiting_reindex(
+        &self,
+        limit: u32,
+    ) -> StorageResult<Vec<PendingReindex>> {
+        self.inner.list_manifests_awaiting_reindex(limit).await
+    }
+
     async fn set_manifest_fetch_params(
         &self,
         tenant: &TenantContext,
@@ -899,6 +925,62 @@ mod tests {
         assert!(
             h.jobs.complete_submission(&tenant(), &h.sub).await.is_err(),
             "completing twice must surface the store's rejection"
+        );
+    }
+
+    /// #1125/#1161: the rebuild ledger is the inner store's, so marking,
+    /// listing and clearing through the wrapper must reach the SQLite rows
+    /// rather than fall through to the trait's no-op defaults.
+    #[tokio::test]
+    async fn the_deferred_rebuild_ledger_is_forwarded_to_the_inner_store() {
+        let h = harness(SpyTarget::default()).await;
+        h.jobs
+            .process_entries(
+                &tenant(),
+                &h.sub,
+                &h.lease.manifest_id,
+                patients(&["p-ledger"]),
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            h.jobs
+                .list_manifests_awaiting_reindex(16)
+                .await
+                .unwrap()
+                .is_empty(),
+            "nothing is pending before the marker is set"
+        );
+
+        h.jobs.mark_manifest_index_pending(&h.lease).await.unwrap();
+        let pending = h.jobs.list_manifests_awaiting_reindex(16).await.unwrap();
+        assert_eq!(pending.len(), 1, "the marker reached the inner store");
+        assert_eq!(pending[0].manifest_id, h.lease.manifest_id);
+        assert_eq!(pending[0].submission, h.sub);
+        assert_eq!(pending[0].resource_types, vec!["Patient".to_string()]);
+        assert_eq!(
+            h.sqlite
+                .list_manifests_awaiting_reindex(16)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the inner store itself holds the marker"
+        );
+
+        h.jobs
+            .clear_manifest_index_pending(&tenant(), &h.lease.manifest_id)
+            .await
+            .unwrap();
+        assert!(
+            h.sqlite
+                .list_manifests_awaiting_reindex(16)
+                .await
+                .unwrap()
+                .is_empty(),
+            "clearing through the wrapper cleared the inner store's marker"
         );
     }
 

@@ -2179,6 +2179,251 @@ mod es_integration {
         );
     }
 
+    /// What the #1161 tests share: an offloaded SQLite primary and a real
+    /// Elasticsearch behind a composite, the `$bulk-submit` job store wired as
+    /// `hfs` wires it for deferred indexing — the composite wrapper with its
+    /// per-resource ingest sync off — and one manifest of `resources` Patients
+    /// ingested through that store and then indexed by the deferred rebuild.
+    #[cfg(feature = "sqlite")]
+    struct DeferredSubmit {
+        _dir: tempfile::TempDir,
+        sqlite: Arc<helios_persistence::backends::sqlite::SqliteBackend>,
+        es: Arc<ElasticsearchBackend>,
+        jobs: helios_persistence::composite::CompositeSubmitJobs,
+        tenant: TenantContext,
+        submission: helios_persistence::core::SubmissionId,
+    }
+
+    /// Builds [`DeferredSubmit`]: ingests `resources` Patients with indexing
+    /// deferred, asserts the ingest itself put nothing in Elasticsearch, runs
+    /// the per-type rebuild the worker fires after the manifest, and waits
+    /// until Elasticsearch holds every one of them.
+    #[cfg(feature = "sqlite")]
+    async fn deferred_submit_rebuilt(tenant_name: &str, resources: usize) -> DeferredSubmit {
+        use std::collections::HashMap;
+
+        use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
+        use helios_persistence::composite::{
+            CompositeConfig, CompositeStorage, CompositeSubmitJobs, DynStorage, SyncMode,
+        };
+        use helios_persistence::core::{
+            BulkProcessingOptions, BulkSubmitJobStore, BulkSubmitProvider, NdjsonEntry,
+            SubmissionId, SubmitClaimStrategy, SubmitWorkerStorage, WorkerId,
+        };
+        use helios_persistence::search::{ReindexOperation, ReindexRequest, ReindexStatus};
+
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("data"))
+            .unwrap_or_else(|| PathBuf::from("data"));
+        let sqlite = SqliteBackend::with_config(
+            dir.path().join("fhir.db"),
+            SqliteBackendConfig {
+                data_dir: Some(data_dir),
+                search_offloaded: true,
+                ..Default::default()
+            },
+        )
+        .expect("Failed to create SQLite backend");
+        sqlite.init_schema().expect("Failed to initialize schema");
+        let sqlite = Arc::new(sqlite);
+        let es = Arc::new(create_backend().await);
+        let tenant = create_tenant(tenant_name);
+
+        let config = CompositeConfig::builder()
+            .primary("sqlite", BackendKind::Sqlite)
+            .search_backend("es", BackendKind::Elasticsearch)
+            .sync_mode(SyncMode::Synchronous)
+            .build()
+            .expect("composite config");
+        let mut backends: HashMap<String, DynStorage> = HashMap::new();
+        backends.insert("sqlite".to_string(), sqlite.clone() as DynStorage);
+        backends.insert("es".to_string(), es.clone() as DynStorage);
+        let composite = Arc::new(CompositeStorage::new(config, backends).expect("composite"));
+        let jobs =
+            CompositeSubmitJobs::new(sqlite.clone() as Arc<dyn BulkSubmitJobStore>, composite)
+                .with_ingest_sync(false);
+
+        let submission = SubmissionId::generate(tenant_name);
+        jobs.create_submission(&tenant, &submission, None)
+            .await
+            .unwrap();
+        jobs.add_manifest(&tenant, &submission, Some("http://provider/m.json"), None)
+            .await
+            .unwrap();
+        let lease = jobs
+            .claim_next_manifest(
+                &WorkerId::new(format!("w-{tenant_name}")),
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .unwrap()
+            .expect("claimable manifest");
+        let entries = (0..resources)
+            .map(|n| {
+                NdjsonEntry::new(
+                    n as u64 + 1,
+                    "Patient",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": format!("{tenant_name}-{n}"),
+                        "name": [{"family": "Deferred"}]
+                    }),
+                )
+            })
+            .collect();
+        jobs.process_entries(
+            &tenant,
+            &submission,
+            &lease.manifest_id,
+            entries,
+            &BulkProcessingOptions::new(),
+        )
+        .await
+        .unwrap();
+        let report = jobs.sync_ingested(&lease).await.unwrap();
+        assert_eq!(
+            report.synced, 0,
+            "precondition: deferred ingest syncs nothing per resource"
+        );
+        jobs.finish_manifest(&lease).await.unwrap();
+        assert_eq!(
+            sqlite.count(&tenant, Some("Patient")).await.unwrap(),
+            resources as u64
+        );
+        await_es_count(&es, &tenant, "Patient", 0).await;
+
+        // The post-manifest rebuild, as `ReindexOnFinish` runs it.
+        let op = ReindexOperation::with_parts(
+            sqlite.clone(),
+            vec![sqlite.clone(), es.clone()],
+            sqlite.tenant_registries().clone(),
+        );
+        let job_id = op
+            .start(
+                tenant.clone(),
+                ReindexRequest::for_types(vec!["Patient"]).with_batch_size(10),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut finished = None;
+        for _ in 0..600 {
+            let progress = op.get_progress(&job_id).await.unwrap();
+            if progress.status.is_finished() {
+                finished = Some(progress);
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+        let progress = finished.expect("the deferred rebuild timed out");
+        assert_eq!(
+            progress.status,
+            ReindexStatus::Completed,
+            "{:?}",
+            progress.error_message
+        );
+        await_es_count(&es, &tenant, "Patient", resources as u64).await;
+
+        DeferredSubmit {
+            _dir: dir,
+            sqlite,
+            es,
+            jobs,
+            tenant,
+            submission,
+        }
+    }
+
+    /// #1161: on `sqlite-es` with deferred indexing, a rolled-back submission
+    /// used to leave its documents in Elasticsearch — gone from the primary,
+    /// still matched by search. With the composite job store kept in the chain
+    /// (ingest sync off), every rolled-back create is mirrored as a delete, so
+    /// afterwards neither store holds any of them.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn es_integration_sqlite_es_deferred_rollback_leaves_no_orphans() {
+        use helios_persistence::core::BulkSubmitRollbackProvider;
+
+        const RESOURCES: usize = 12;
+        let s = deferred_submit_rebuilt("deferred-rollback", RESOURCES).await;
+
+        let changes = s
+            .jobs
+            .list_changes(&s.tenant, &s.submission, 100, 0)
+            .await
+            .unwrap();
+        assert_eq!(changes.len(), RESOURCES, "one recorded create per entry");
+        for change in &changes {
+            assert!(
+                s.jobs
+                    .rollback_change(&s.tenant, &s.submission, change)
+                    .await
+                    .unwrap(),
+                "{change:?} was not rolled back"
+            );
+        }
+
+        assert_eq!(
+            s.sqlite.count(&s.tenant, Some("Patient")).await.unwrap(),
+            0,
+            "the primary reverted every create"
+        );
+        await_es_count(&s.es, &s.tenant, "Patient", 0).await;
+        assert!(
+            s.es.read(&s.tenant, "Patient", "deferred-rollback-0")
+                .await
+                .unwrap()
+                .is_none(),
+            "a rolled-back resource must not survive in Elasticsearch"
+        );
+    }
+
+    /// #1161: abort is not a rollback — no primary deletes what the aborted
+    /// submission already ingested (#968) — so Elasticsearch must not either,
+    /// or the resources become readable by id yet invisible to every search
+    /// (#882, #1021). After an abort on the deferred path both stores agree.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn es_integration_sqlite_es_deferred_abort_keeps_search_consistent() {
+        use helios_persistence::core::{BulkSubmitProvider, SubmissionStatus};
+
+        const RESOURCES: usize = 8;
+        let s = deferred_submit_rebuilt("deferred-abort", RESOURCES).await;
+        s.jobs
+            .add_manifest(
+                &s.tenant,
+                &s.submission,
+                Some("http://provider/m2.json"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let cancelled = s
+            .jobs
+            .abort_submission(&s.tenant, &s.submission, "submissionStatus=stopped")
+            .await
+            .unwrap();
+        assert_eq!(cancelled, 1, "the still-pending manifest is cancelled");
+        let summary = s
+            .jobs
+            .get_submission(&s.tenant, &s.submission)
+            .await
+            .unwrap()
+            .expect("submission");
+        assert_eq!(summary.status, SubmissionStatus::Aborted);
+
+        let primary = s.sqlite.count(&s.tenant, Some("Patient")).await.unwrap();
+        assert_eq!(
+            primary, RESOURCES as u64,
+            "abort keeps what was ingested (#968)"
+        );
+        await_es_count(&s.es, &s.tenant, "Patient", primary).await;
+    }
+
     #[tokio::test]
     async fn es_integration_create_with_id() {
         let backend = create_backend().await;
