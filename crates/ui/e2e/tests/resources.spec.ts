@@ -1,5 +1,10 @@
 import { test, expect } from "../pages/fixtures";
-import { createResource, updateResource, waitSearchable } from "../pages/api";
+import {
+  createResource,
+  updateResource,
+  waitSearchable,
+  deleteResources,
+} from "../pages/api";
 import type { ResourcesPage } from "../pages/resources";
 
 // The Resources workspace beyond the edit flows: the type rail (filter + live
@@ -190,6 +195,89 @@ test("a ?url= deep link still wins over the default Patient context", async ({ r
   await expect(resources.railItem("Observation")).toHaveAttribute("aria-current", "true");
   await expect(resources.createLabel).toHaveText("Create new Observation");
   await resources.results.waitShown();
+});
+
+test("URL encoding: Resources and deep links retain visual ampersands", async ({
+  page,
+  request,
+  resources,
+}) => {
+  const literal = "A&A HEALTHCARE LLC";
+  const expected = "GET /Location?name=A%26A%20HEALTHCARE%20LLC&_summary=true";
+  const deepLink = "/Location?name=A%26A%20HEALTHCARE%20LLC&_summary=true";
+  const ids: string[] = [];
+  const expectHydrated = async (withResults: boolean) => {
+    await expect(resources.builder.url).toHaveValue(expected);
+    await expect(resources.builder.conditionRows).toHaveCount(1);
+    await expect(
+      resources.builder.conditionRows.first().locator(".builder-row__value"),
+    ).toHaveValue(literal);
+    if (!withResults) return;
+    await expect(resources.results.rows).toHaveCount(2);
+    await expect(
+      resources.results.rows.locator(`[data-resource-id="${ids[0]}"]`),
+    ).toHaveCount(1);
+    await expect(
+      resources.results.rows.locator(`[data-resource-id="${ids[1]}"]`),
+    ).toHaveCount(1);
+    await expect(
+      resources.results.rows.locator(`[data-resource-id="${ids[2]}"]`),
+    ).toHaveCount(0);
+  };
+
+  try {
+    for (let i = 0; i < 2; i++) {
+      ids.push(await createResource(request, "Location", { name: literal }));
+    }
+    ids.push(await createResource(request, "Location", { name: "A ONLY DECOY" }));
+    for (const id of ids) await waitSearchable(request, "Location", id);
+
+    await resources.goto("Location");
+    await switchToBuilderMode(resources);
+    await resources.builder.addButton("condition").click();
+    const row = resources.builder.conditionRows.first();
+    await row.locator(".builder-row__key").fill("name");
+    await row.locator(".builder-row__value").fill(literal);
+    await expect(resources.builder.url).toHaveValue(expected);
+
+    const requestSent = page.waitForRequest((candidate) => {
+      const url = new URL(candidate.url());
+      return url.pathname === "/Location" && url.searchParams.has("name");
+    });
+    const recentPersisted = page.waitForResponse((response) => {
+      return (
+        new URL(response.url()).pathname === "/_user/settings" &&
+        response.request().method() === "PATCH" &&
+        response.ok()
+      );
+    });
+    await resources.builder.runButton.click();
+    const [sent] = await Promise.all([requestSent, recentPersisted]);
+    const sentUrl = new URL(sent.url());
+    expect(sentUrl.searchParams.getAll("name")).toEqual([literal]);
+    await expectHydrated(true);
+
+    await page.reload({ waitUntil: "networkidle" });
+    await switchToBuilderMode(resources);
+    await resources.builder.recentToggle.click();
+    await resources.builder.recentPanel
+      .getByRole("button", { name: expected, exact: true })
+      .click();
+    await expectHydrated(false);
+
+    for (const route of ["/ui/resources", "/ui/queries"]) {
+      const url = route + "?url=" + encodeURIComponent(deepLink);
+      await page.goto(url, { waitUntil: "networkidle" });
+      await switchToBuilderMode(resources);
+      await expectHydrated(true);
+
+      await page.reload({ waitUntil: "networkidle" });
+      await switchToBuilderMode(resources);
+      await expectHydrated(true);
+    }
+  } finally {
+    await deleteResources(request, "Location", ids);
+  }
 });
 
 test("invalid, wrong-case, and empty inputs fail closed without losing the typed query", async ({
