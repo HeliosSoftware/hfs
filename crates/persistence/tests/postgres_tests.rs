@@ -17018,26 +17018,27 @@ mod postgres_integration {
             .unwrap();
         assert_eq!(results.len(), 4);
         assert!(results[2].unchanged);
-        let observed = observer.batches.lock().unwrap();
-        assert_eq!(observed.len(), 1);
-        assert_eq!(
-            observed[0].0,
-            vec![
-                "observer-changed".to_string(),
-                "observer-fresh-a".to_string(),
-                "observer-same".to_string(),
-                "observer-fresh-b".to_string(),
-            ]
-        );
-        assert_eq!(
-            observed[0].1,
-            vec![
-                "observer-changed".to_string(),
-                "observer-fresh-a".to_string(),
-                "observer-fresh-b".to_string(),
-            ]
-        );
-        drop(observed);
+        {
+            let observed = observer.batches.lock().unwrap();
+            assert_eq!(observed.len(), 1);
+            assert_eq!(
+                observed[0].0,
+                vec![
+                    "observer-changed".to_string(),
+                    "observer-fresh-a".to_string(),
+                    "observer-same".to_string(),
+                    "observer-fresh-b".to_string(),
+                ]
+            );
+            assert_eq!(
+                observed[0].1,
+                vec![
+                    "observer-changed".to_string(),
+                    "observer-fresh-a".to_string(),
+                    "observer-fresh-b".to_string(),
+                ]
+            );
+        }
 
         let page = backend
             .get_entry_results_page(&tenant, &submission, &manifest.manifest_id, None, 10, None)
