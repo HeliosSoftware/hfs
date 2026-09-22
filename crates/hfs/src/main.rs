@@ -2114,6 +2114,17 @@ fn use_independent_submit_files(
     feature = "mongodb",
     feature = "s3"
 ))]
+struct SubmitFileScheduling {
+    concurrency: u32,
+    independent_tasks: bool,
+}
+
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "s3"
+))]
 async fn build_bulk_submit(
     config: &ServerConfig,
     jobs: Arc<dyn BulkSubmitJobStore>,
@@ -2233,7 +2244,10 @@ async fn build_bulk_submit(
         .map(StorageBackendMode::primary_backend_kind)
         .unwrap_or(BackendKind::Sqlite);
     let file_concurrency = cfg.effective_file_concurrency(backend_kind);
-    let independent_file_tasks = use_independent_submit_files(backend_mode, file_concurrency);
+    let file_scheduling = SubmitFileScheduling {
+        concurrency: file_concurrency,
+        independent_tasks: use_independent_submit_files(backend_mode, file_concurrency),
+    };
     if file_concurrency < cfg.file_concurrency.max(1) {
         warn!(
             configured = cfg.file_concurrency,
@@ -2250,8 +2264,7 @@ async fn build_bulk_submit(
         fetcher.clone(),
         output.clone(),
         &cfg,
-        file_concurrency,
-        independent_file_tasks,
+        file_scheduling,
         reindex_hook,
         write_observer,
     );
@@ -2276,8 +2289,7 @@ fn spawn_submit_workers(
     fetcher: Arc<dyn SubmitInputFetcher>,
     output: Arc<dyn ExportOutputStore>,
     cfg: &helios_rest::config::BulkSubmitConfig,
-    file_concurrency: u32,
-    independent_file_tasks: bool,
+    file_scheduling: SubmitFileScheduling,
     reindex_hook: Option<Arc<dyn helios_persistence::core::DeferredReindexHook>>,
     write_observer: Arc<dyn WriteObserver>,
 ) {
@@ -2330,8 +2342,8 @@ fn spawn_submit_workers(
             }
         });
     }
-    let file_concurrency = file_concurrency.max(1) as usize;
-    let scheduling = if independent_file_tasks {
+    let file_concurrency = file_scheduling.concurrency.max(1) as usize;
+    let scheduling = if file_scheduling.independent_tasks {
         "independent-tasks"
     } else {
         "inline"
@@ -2355,7 +2367,7 @@ fn spawn_submit_workers(
                     .with_file_concurrency(file_concurrency)
                     .with_batch_size(batch_size)
                     .with_skip_unchanged(skip_unchanged);
-            if independent_file_tasks {
+            if file_scheduling.independent_tasks {
                 worker = worker.with_independent_file_tasks();
             }
             loop {
