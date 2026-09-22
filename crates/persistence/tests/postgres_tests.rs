@@ -118,6 +118,11 @@ mod modifier_parity_suite;
 #[path = "search/versioned_write_race_suite.rs"]
 mod versioned_write_race_suite;
 
+/// The backend-agnostic conditional patch suite (#1406). Same `#[path]`
+/// arrangement.
+#[path = "search/conditional_patch_suite.rs"]
+mod conditional_patch_suite;
+
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
 
@@ -19229,6 +19234,18 @@ mod postgres_integration {
                     expect: Expect::Ids(&["ob-grp"]),
                 },
             ],
+        )
+        .await;
+    }
+
+    /// #1406: conditional patch is the trait's provided implementation over
+    /// the backend's criteria resolver and the shared patch applier.
+    #[tokio::test]
+    async fn postgres_integration_conditional_patch() {
+        let backend = create_backend().await;
+        super::conditional_patch_suite::conditional_patch_resolves_gates_applies_and_swaps(
+            &backend,
+            &unique_base("cond_patch_1406"),
         )
         .await;
     }

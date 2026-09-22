@@ -161,6 +161,23 @@ async fn sqlite_versioned_delete_is_a_compare_and_swap() {
         .await;
 }
 
+/// The backend-agnostic conditional patch suite (#1406). Same `#[path]`
+/// arrangement.
+#[path = "search/conditional_patch_suite.rs"]
+mod conditional_patch_suite;
+
+/// #1406: conditional patch is the trait's provided implementation over the
+/// backend's criteria resolver and the shared patch applier.
+#[tokio::test]
+async fn sqlite_conditional_patch() {
+    let backend = create_backend();
+    conditional_patch_suite::conditional_patch_resolves_gates_applies_and_swaps(
+        &backend,
+        "cond-patch-1406",
+    )
+    .await;
+}
+
 fn create_backend() -> SqliteBackend {
     // Configure with data directory to load spec SearchParameters
     // CARGO_MANIFEST_DIR for tests is crates/persistence

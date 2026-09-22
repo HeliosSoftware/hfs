@@ -13,9 +13,8 @@ use regex::escape as regex_escape;
 use serde_json::Value;
 
 use crate::core::{
-    ConditionalCreateResult, ConditionalDeleteResult, ConditionalPatchResult, ConditionalStorage,
-    ConditionalUpdateResult, IncludeProvider, PatchFormat, ResourceStorage, RevincludeProvider,
-    SearchProvider, SearchResult,
+    ConditionalCreateResult, ConditionalDeleteResult, ConditionalStorage, ConditionalUpdateResult,
+    IncludeProvider, ResourceStorage, RevincludeProvider, SearchProvider, SearchResult,
 };
 use crate::error::{BackendError, QueryErrorExt, SearchError, StorageError, StorageResult};
 use crate::search::{DatePredicate, FhirDateValue, StorageResolution};
@@ -890,19 +889,17 @@ impl ConditionalStorage for MongoBackend {
         }
     }
 
-    async fn conditional_patch(
+    /// The criteria resolver the provided
+    /// [`ConditionalStorage::conditional_patch`] is written in terms of
+    /// (#1406).
+    async fn resolve_conditional_matches(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         search_params: &str,
-        patch: &PatchFormat,
-        if_match: &crate::core::EntityTagPrecondition,
-    ) -> StorageResult<ConditionalPatchResult> {
-        let _ = (tenant, resource_type, search_params, patch, if_match);
-        Err(StorageError::Backend(BackendError::UnsupportedCapability {
-            backend_name: "mongodb".to_string(),
-            capability: "conditional_patch".to_string(),
-        }))
+    ) -> StorageResult<Vec<StoredResource>> {
+        self.find_matching_resources(tenant, resource_type, search_params)
+            .await
     }
 }
 

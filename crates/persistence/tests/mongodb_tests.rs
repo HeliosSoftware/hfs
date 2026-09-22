@@ -716,8 +716,8 @@ async fn mongodb_system_qualified_tokens_in_chains() {
 mod conditional_if_match_suite;
 
 /// #1381: `If-Match` is evaluated against the resource the criteria resolve
-/// to. MongoDB has no `conditional_patch`, so that arm asserts it stays
-/// unsupported. Needs the full registry: `identifier` is not embedded.
+/// to, on conditional update, delete and patch (#1406). Needs the full
+/// registry: `identifier` is not embedded.
 #[tokio::test]
 async fn mongodb_conditional_writes_honour_if_match() {
     let Some(backend) = create_backend_with_full_registry("cond_if_match_1381").await else {
@@ -727,7 +727,7 @@ async fn mongodb_conditional_writes_honour_if_match() {
     conditional_if_match_suite::if_match_is_evaluated_against_the_resolved_match(
         &backend,
         "cond-if-match-1381",
-        false,
+        true,
     )
     .await;
 }
@@ -775,6 +775,27 @@ async fn mongodb_modifier_parity() {
         &backend,
         "modifier-parity-1408",
         &[],
+    )
+    .await;
+}
+
+/// The backend-agnostic conditional patch suite (#1406). Same `#[path]`
+/// arrangement.
+#[path = "search/conditional_patch_suite.rs"]
+mod conditional_patch_suite;
+
+/// #1406: MongoDB had no `conditional_patch`; it now serves the trait's
+/// provided implementation. Needs the full registry: `identifier` is not
+/// embedded.
+#[tokio::test]
+async fn mongodb_conditional_patch() {
+    let Some(backend) = create_backend_with_full_registry("cond_patch_1406").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    conditional_patch_suite::conditional_patch_resolves_gates_applies_and_swaps(
+        &backend,
+        "cond-patch-1406",
     )
     .await;
 }
@@ -7391,33 +7412,49 @@ async fn mongodb_integration_conditional_create_multiple_matches() {
     }
 }
 
+/// Was `..._not_supported`, asserting `UnsupportedCapability`: MongoDB had no
+/// `conditional_patch` until #1406. `_id` is one of the embedded parameters,
+/// so this needs no spec registry; `mongodb_conditional_patch` is the full
+/// suite.
 #[tokio::test]
-async fn mongodb_integration_conditional_patch_not_supported() {
-    let Some(backend) = create_backend("conditional_patch_not_supported").await else {
+async fn mongodb_integration_conditional_patch_is_supported() {
+    let Some(backend) = create_backend("conditional_patch_supported").await else {
         eprintln!(
-            "Skipping mongodb_integration_conditional_patch_not_supported (requires Docker or HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_conditional_patch_is_supported (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
 
     let tenant = create_tenant("tenant-conditional-patch");
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "cond-patch-1", "active": false}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
 
     let result = backend
         .conditional_patch(
             &tenant,
             "Patient",
-            "identifier=http://hospital.org/mrn|MRN-COND-PATCH",
+            "_id=cond-patch-1",
             &PatchFormat::MergePatch(json!({ "active": true })),
             &helios_persistence::core::EntityTagPrecondition::Absent,
         )
-        .await;
+        .await
+        .unwrap();
 
-    assert!(matches!(
-        result,
-        Err(StorageError::Backend(
-            BackendError::UnsupportedCapability { .. }
-        ))
-    ));
+    match result {
+        helios_persistence::core::ConditionalPatchResult::Patched(stored) => {
+            assert_eq!(stored.id(), "cond-patch-1");
+            assert_eq!(stored.version_id(), "2");
+            assert_eq!(stored.content()["active"], json!(true));
+        }
+        other => panic!("expected Patched, got {:?}", other),
+    }
 }
 
 #[tokio::test]

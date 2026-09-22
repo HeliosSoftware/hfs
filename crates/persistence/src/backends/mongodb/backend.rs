@@ -278,8 +278,7 @@ impl MongoBackend {
             BackendCapability::ConditionalCreate,
             BackendCapability::ConditionalUpdate,
             BackendCapability::ConditionalDelete,
-            // No `ConditionalPatch`: `conditional_patch` answers
-            // `UnsupportedCapability` on this backend.
+            BackendCapability::ConditionalPatch,
             BackendCapability::SharedSchema,
         ]
     }
