@@ -38,6 +38,15 @@
         "include.in.token.scope": "true",
         "display.on.consent.screen": "false"
       }
+    },
+    {
+      "name": "user/*.cruds",
+      "description": "Full user-context SMART access on all resource types — what an interactively signed-in user of the web UI acts with (issue #1449)",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "false"
+      }
     }
   ],
   "clients": [
@@ -116,7 +125,7 @@
         "http://localhost:8080/*"
       ],
       "webOrigins": ["http://localhost:8080"],
-      "defaultClientScopes": ["system/*.cruds"],
+      "defaultClientScopes": ["basic", "profile", "email", "user/*.cruds"],
       "attributes": {
         "pkce.code.challenge.method": "S256",
         "post.logout.redirect.uris": "http://localhost:8080/*"

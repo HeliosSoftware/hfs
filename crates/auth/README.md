@@ -153,11 +153,21 @@ The authorize and token endpoints come from `HFS_SMART_AUTHORIZE_ENDPOINT` /
 `.well-known/openid-configuration` at startup. The session store is in-process:
 a session does not survive a restart and is not shared across nodes.
 
-**The user's access token must carry scopes HFS honors.** Authorization is
-SMART v2 `system/…` scopes on the token's `scope` claim; an IdP user with no
-such scope signs in and then gets `403` on every FHIR call. The bundled
-Keycloak realm gives the `hfs-web` client `system/*.cruds` as a default client
-scope for exactly this reason — mirror that for a real IdP.
+**The user's access token must be one HFS can validate and authorize.** Two
+things the IdP has to put in it:
+
+- **`sub`.** HFS rejects a token without a subject (`401 Missing required
+  claim: sub`). On Keycloak 26 `sub` comes from the built-in `basic` client
+  scope, which a client does not get unless it is assigned; `profile` and
+  `email` likewise supply the display claims the UI shows.
+- **SMART scopes.** Authorization is SMART v2 scopes on the `scope` claim; a
+  user with none signs in and then gets `403` on every FHIR call. An
+  interactively signed-in user acts in the **`user/`** context (`user/*.cruds`,
+  or narrower), which HFS accepts as-is.
+
+The bundled Keycloak realm therefore gives the `hfs-web` client
+`basic`, `profile`, `email` and `user/*.cruds` as default client scopes — mirror
+that for a real IdP.
 
 ```bash
 # Local Keycloak (docker/keycloak): the `hfs-web` public client is pre-registered.
