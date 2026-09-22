@@ -68,6 +68,23 @@ async fn sqlite_contained_unconstrained_and_out_of_band_constraints() {
         .await;
 }
 
+/// #1407: `_sort` under `_contained` is applied or refused by name, and a
+/// contained resource with nothing indexed but its id is still found.
+#[tokio::test]
+async fn sqlite_contained_sort_and_id_only_contained() {
+    let backend = create_backend();
+    contained_suite::sort_and_id_only_contained(&backend, "contained-sort-1407").await;
+}
+
+/// #1407: `reference:identifier` under `_contained` resolves the reference's
+/// top-level target.
+#[tokio::test]
+async fn sqlite_contained_reference_identifier_resolves_the_target() {
+    let backend = create_backend();
+    contained_suite::reference_identifier_resolves_the_target(&backend, "contained-ident-1407")
+        .await;
+}
+
 /// The backend-agnostic conditional `If-Match` suite (#1381). Same `#[path]`
 /// arrangement.
 #[path = "search/conditional_if_match_suite.rs"]
@@ -93,7 +110,87 @@ async fn sqlite_conditional_writers_with_the_same_if_match_admit_one() {
     conditional_if_match_suite::concurrent_writers_with_the_same_if_match_admit_one(
         &backend,
         "cond-if-match-race-1381",
-        true,
+    )
+    .await;
+}
+
+/// The backend-agnostic race suite for version-aware writes (#1404, #1405).
+/// Same `#[path]` arrangement.
+#[path = "search/versioned_write_race_suite.rs"]
+mod versioned_write_race_suite;
+
+/// A file-backed (WAL) backend with the default pool — what `hfs` runs in
+/// production. Several pooled connections on several runtime threads is the
+/// configuration in which SQLite writers really interleave; the shared-cache
+/// `:memory:` database serialises them at the table lock instead.
+fn create_file_backend(dir: &tempfile::TempDir) -> SqliteBackend {
+    let backend =
+        SqliteBackend::with_config(dir.path().join("race.db"), SqliteBackendConfig::default())
+            .expect("Failed to create SQLite backend");
+    backend.init_schema().expect("Failed to initialize schema");
+    backend
+}
+
+/// #1404: of several writers holding the same version, one `update` writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn sqlite_concurrent_updates_from_the_same_version_admit_one() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = std::sync::Arc::new(create_file_backend(&dir));
+    versioned_write_race_suite::concurrent_updates_from_the_same_version_admit_one(
+        backend,
+        "update-race-1404",
+        40,
+    )
+    .await;
+}
+
+/// #1404: an update and a versioned delete of the same version: one wins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn sqlite_concurrent_update_and_versioned_delete_admit_one() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = std::sync::Arc::new(create_file_backend(&dir));
+    versioned_write_race_suite::concurrent_update_and_versioned_delete_admit_one(
+        backend,
+        "delete-race-1404",
+        40,
+    )
+    .await;
+}
+
+/// #1404: an update racing an unconditional delete leaves a contiguous history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn sqlite_concurrent_update_and_plain_delete_stay_consistent() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = std::sync::Arc::new(create_file_backend(&dir));
+    versioned_write_race_suite::concurrent_update_and_plain_delete_stay_consistent(
+        backend,
+        "plain-delete-race-1404",
+        40,
+    )
+    .await;
+}
+
+/// #1404: `delete_versioned` compares and deletes in one step.
+#[tokio::test]
+async fn sqlite_versioned_delete_is_a_compare_and_swap() {
+    let backend = create_backend();
+    versioned_write_race_suite::versioned_delete_is_a_compare_and_swap(&backend, "delete-cas-1404")
+        .await;
+}
+
+/// The backend-agnostic conditional patch suite (#1406). Same `#[path]`
+/// arrangement.
+#[path = "search/conditional_patch_suite.rs"]
+mod conditional_patch_suite;
+
+/// #1406: conditional patch is the trait's provided implementation over the
+/// backend's criteria resolver and the shared patch applier.
+#[tokio::test]
+async fn sqlite_conditional_patch() {
+    let backend = create_backend();
+    conditional_patch_suite::conditional_patch_resolves_gates_applies_and_swaps(
+        &backend,
+        "cond-patch-1406",
     )
     .await;
 }

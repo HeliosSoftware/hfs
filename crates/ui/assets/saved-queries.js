@@ -1724,7 +1724,8 @@
           var wire = serializedConditionAlternative(input);
           if (wire === null) return;
           var comparator = alternative.querySelector(".builder-row__comparator");
-          values.push((comparator ? comparator.value : "") + wire);
+          // URL-encode each comparator+value alternative; commas joining them are FHIR/structural OR.
+          values.push(encodeURIComponent((comparator ? comparator.value : "") + wire));
         });
       } else {
         row.querySelectorAll(".builder-row__value").forEach(function (vi) {

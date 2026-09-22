@@ -224,22 +224,6 @@ fn serialization_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::SerializationError { message })
 }
 
-/// Extracts the `value[x]` payload from a FHIRPath Patch `Parameters.part`
-/// entry whose `name` is `"value"`. Returns the value of the first key
-/// matching `value[A-Z]…` (e.g. `valueString`, `valueQuantity`,
-/// `valueReference`), so every FHIR polymorphic variant is accepted rather
-/// than only the handful the patch handler used to special-case.
-fn extract_part_value(part: &Value) -> Option<Value> {
-    part.as_object()?.iter().find_map(|(k, v)| {
-        let suffix = k.strip_prefix("value")?;
-        suffix
-            .chars()
-            .next()?
-            .is_ascii_uppercase()
-            .then(|| v.clone())
-    })
-}
-
 #[async_trait]
 
 impl ResourceStorage for PostgresBackend {
@@ -601,167 +585,18 @@ impl ResourceStorage for PostgresBackend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<()> {
-        tenant.check_permission(Operation::Delete, resource_type)?;
+        self.soft_delete(tenant, resource_type, id, None).await
+    }
 
-        let client = self.get_client().await?;
-        let tenant_id = tenant.tenant_id().as_str();
-
-        let now = Utc::now();
-
-        // Soft delete the resource and write its deletion history row, in one
-        // statement, deriving the tombstone's version from the row itself.
-        //
-        // Three things used to be separate here: a `SELECT version_id`, an
-        // `UPDATE` compare-and-swapping against it, and an `INSERT` of the
-        // history row. The `INSERT` was folded into the `UPDATE` first; this
-        // folds in the `SELECT` too, so a delete is one round trip where it was
-        // three. On the crud suite that is 275,382 statements and 275,382
-        // occupied-connection round trips removed from a workload that already
-        // demands ~36 cores' worth of PostgreSQL execution on a 4-core host —
-        // the round trip, not the 0.06 ms of execution behind it, is what is
-        // being bought back.
-        //
-        // ## Why this is *more* atomic, not less
-        //
-        // The read-then-CAS it replaces was correct but pessimistic. Under READ
-        // COMMITTED, a writer landing between the `SELECT` and the `UPDATE`
-        // meant the `version_id = <stale>` predicate matched nothing, and this
-        // returned `NotFound` — a 404 for a resource that plainly existed and
-        // was live. Computing `version_id + 1` inside the `UPDATE`'s target list
-        // removes the window rather than detecting it: PostgreSQL takes the row
-        // lock, and if the row was concurrently updated it re-evaluates both the
-        // qualifier and the target list against the *committed new* version of
-        // the tuple (EvalPlanQual). So the tombstone's version is always exactly
-        // one more than whatever version is current at the instant the row is
-        // locked, never one more than a version that has since moved on.
-        //
-        // That is what preserves the primary-key fix the CAS was introduced for.
-        // `resource_history` is keyed `PRIMARY KEY (tenant_id, resource_type,
-        // id, version_id)` (schema.rs). The failure the CAS prevented was a
-        // history row computed from a stale read colliding with one a concurrent
-        // writer had already inserted. A version derived from the locked row
-        // cannot be stale, so it cannot collide — the invariant is enforced by
-        // construction instead of by a guard that has to lose a race to notice.
-        //
-        // A concurrent *delete* is still resolved correctly and still costs
-        // nothing extra: the loser re-evaluates `is_deleted = FALSE` against the
-        // committed tombstone, matches no row, and reports `NotFound`, which is
-        // exactly what it reported before.
-        //
-        // ## What changes, stated plainly
-        //
-        // An unconditional `DELETE` that races a concurrent `UPDATE` now
-        // succeeds — deleting the version that writer just committed — where it
-        // used to fail with `NotFound`. That is a deliberate correction: FHIR's
-        // delete interaction (https://hl7.org/fhir/http.html#delete) carries no
-        // precondition of its own, so "delete the current state" is the right
-        // reading and the 404 was spurious. Callers that *do* want a
-        // precondition use `If-Match`, which is evaluated above this layer.
-        //
-        // What this does NOT change: that `If-Match` on `DELETE` is evaluated by
-        // the REST handler (and by `delete_with_match`) against its own earlier
-        // read and is therefore still check-then-act. It was check-then-act
-        // before this change too — the CAS removed here guarded the version
-        // *this function* had read a microsecond earlier, never the version the
-        // caller's precondition was evaluated against — so no precondition
-        // guarantee moves in either direction. Making `If-Match` on `DELETE`
-        // atomic needs the expected version threaded into this statement, which
-        // is a signature change and a separate piece of work.
-        //
-        // ## The version arithmetic
-        //
-        // `version_id` is `TEXT`, so the increment is guarded rather than a bare
-        // cast: a non-numeric value would make `::bigint` raise 22P02 and turn a
-        // delete into a 500. The `CASE` reproduces the Rust it replaces —
-        // `current_version.parse::<u64>().unwrap_or(0) + 1` — for every value
-        // this server can have written (`'7'` -> 8, `'007'` -> 8, `''` and
-        // `'abc'` -> 1, matching `unwrap_or(0)`). `CASE` does not evaluate the
-        // branch it did not select, so the cast never runs on a value the regex
-        // rejected. Version ids are server-issued decimal integers on every
-        // write path in this backend, so the fallback is unreachable in
-        // practice and is here only so that it degrades the same way the Rust
-        // did rather than differently.
-        //
-        // `RETURNING` feeds the history row from the tuple just written, so the
-        // deletion entry carries the resource's own `fhir_version` without
-        // making a round trip through the client. As in `create` and `update`,
-        // no matching row means the CTE yields nothing, the insert selects
-        // nothing, and the statement reports zero rows affected — one signal for
-        // both writes. One statement is also one implicit transaction: the
-        // tombstone lands with the delete or neither does.
-        //
-        // ## The tombstone stores `'null'::jsonb`, not the resource
-        //
-        // A deletion entry is the record that the resource was deleted, not a
-        // version of the resource: FHIR gives it `request.method = DELETE` and
-        // no `resource` in a history Bundle, and `410 Gone` on a vread of that
-        // version. `history_entry_to_json` has always omitted the body, and the
-        // vread handler now answers `410`, so nothing can ask for these bytes.
-        //
-        // Storing them was not free. `data` is a JSONB body of a few kilobytes;
-        // the `UPDATE` above does not touch that column, so `resources` keeps
-        // its existing TOAST datum untouched, but a TOAST pointer cannot be
-        // shared across tables — inserting it into `resource_history` detoasts
-        // the value, re-compresses it, writes it, and puts the whole body in the
-        // WAL a second time. That was 10.6% of the crud suite's Postgres
-        // execution time on run 33213565802 for a row no reader can reach.
-        //
-        // `'null'::jsonb` rather than `NULL` because `resource_history.data` is
-        // `NOT NULL` (schema v1) and both `vread` and the history readers deserialise
-        // the column into a `serde_json::Value` with a non-nullable `FromSql`;
-        // a SQL `NULL` would panic in `row.get`, and widening the column would
-        // put a migration and six read sites in the way of a write-path change.
-        // `Value::Null` reaches the same readers as a well-formed value that
-        // renders as `null`, and they already discard it for a deleted version.
-        //
-        // Rows written by an older build keep their bodies and are read back
-        // exactly as before; nothing needs backfilling, because the only reader
-        // was already dropping the value on the floor.
-        let updated = execute_cached(
-                &client,
-                "WITH del AS (
-                     UPDATE resources
-                     SET is_deleted = TRUE,
-                         deleted_at = $1,
-                         last_updated = $1,
-                         version_id = ((CASE WHEN version_id ~ '^[0-9]+$' THEN version_id::bigint ELSE 0 END) + 1)::text
-                     WHERE tenant_id = $2 AND resource_type = $3 AND id = $4
-                       AND is_deleted = FALSE
-                     RETURNING tenant_id, resource_type, id, version_id, last_updated, is_deleted, fhir_version
-                 )
-                 INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
-                 SELECT tenant_id, resource_type, id, version_id, 'null'::jsonb, last_updated, is_deleted, fhir_version FROM del",
-                &[&now, &tenant_id, &resource_type, &id],
-            )
+    async fn delete_versioned(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: &str,
+    ) -> StorageResult<()> {
+        self.soft_delete(tenant, resource_type, id, Some(expected_version))
             .await
-            .map_err(|e| internal_error(format!("Failed to delete resource: {}", e)))?;
-
-        if updated == 0 {
-            return Err(StorageError::Resource(ResourceError::NotFound {
-                resource_type: resource_type.to_string(),
-                id: id.to_string(),
-            }));
-        }
-
-        // Delete search index entries (skip when search is offloaded)
-        if !self.is_search_offloaded() {
-            execute_cached(
-                    &client,
-                    "DELETE FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
-                    &[&tenant_id, &resource_type, &id],
-                )
-                .await
-                .map_err(|e| internal_error(format!("Failed to delete search index: {}", e)))?;
-        }
-
-        // A SearchParameter delete invalidates the tenant overlays.
-        if resource_type == "SearchParameter" {
-            if let Err(e) = self.reload_stored_cache().await {
-                tracing::warn!("SearchParameter cache reload failed: {e}");
-            }
-        }
-
-        Ok(())
     }
 
     async fn count(
@@ -1276,6 +1111,204 @@ impl ResourceStorage for PostgresBackend {
 // ============================================================================
 
 impl PostgresBackend {
+    /// Soft-deletes a resource, optionally only at `expected_version`
+    /// ([`ResourceStorage::delete`] / [`ResourceStorage::delete_versioned`]).
+    async fn soft_delete(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: Option<&str>,
+    ) -> StorageResult<()> {
+        tenant.check_permission(Operation::Delete, resource_type)?;
+
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+
+        let now = Utc::now();
+
+        // Soft delete the resource and write its deletion history row, in one
+        // statement, deriving the tombstone's version from the row itself.
+        //
+        // Three things used to be separate here: a `SELECT version_id`, an
+        // `UPDATE` compare-and-swapping against it, and an `INSERT` of the
+        // history row. The `INSERT` was folded into the `UPDATE` first; this
+        // folds in the `SELECT` too, so a delete is one round trip where it was
+        // three. On the crud suite that is 275,382 statements and 275,382
+        // occupied-connection round trips removed from a workload that already
+        // demands ~36 cores' worth of PostgreSQL execution on a 4-core host —
+        // the round trip, not the 0.06 ms of execution behind it, is what is
+        // being bought back.
+        //
+        // ## Why this is *more* atomic, not less
+        //
+        // The read-then-CAS it replaces was correct but pessimistic. Under READ
+        // COMMITTED, a writer landing between the `SELECT` and the `UPDATE`
+        // meant the `version_id = <stale>` predicate matched nothing, and this
+        // returned `NotFound` — a 404 for a resource that plainly existed and
+        // was live. Computing `version_id + 1` inside the `UPDATE`'s target list
+        // removes the window rather than detecting it: PostgreSQL takes the row
+        // lock, and if the row was concurrently updated it re-evaluates both the
+        // qualifier and the target list against the *committed new* version of
+        // the tuple (EvalPlanQual). So the tombstone's version is always exactly
+        // one more than whatever version is current at the instant the row is
+        // locked, never one more than a version that has since moved on.
+        //
+        // That is what preserves the primary-key fix the CAS was introduced for.
+        // `resource_history` is keyed `PRIMARY KEY (tenant_id, resource_type,
+        // id, version_id)` (schema.rs). The failure the CAS prevented was a
+        // history row computed from a stale read colliding with one a concurrent
+        // writer had already inserted. A version derived from the locked row
+        // cannot be stale, so it cannot collide — the invariant is enforced by
+        // construction instead of by a guard that has to lose a race to notice.
+        //
+        // A concurrent *delete* is still resolved correctly and still costs
+        // nothing extra: the loser re-evaluates `is_deleted = FALSE` against the
+        // committed tombstone, matches no row, and reports `NotFound`, which is
+        // exactly what it reported before.
+        //
+        // ## What changes, stated plainly
+        //
+        // An unconditional `DELETE` that races a concurrent `UPDATE` now
+        // succeeds — deleting the version that writer just committed — where it
+        // used to fail with `NotFound`. That is a deliberate correction: FHIR's
+        // delete interaction (https://hl7.org/fhir/http.html#delete) carries no
+        // precondition of its own, so "delete the current state" is the right
+        // reading and the 404 was spurious. Callers that *do* want a
+        // precondition use `If-Match`, which is evaluated above this layer.
+        //
+        // ## The versioned form (#1404)
+        //
+        // `If-Match` on `DELETE` used to be evaluated above this layer against
+        // an earlier read and followed by this unconditional statement —
+        // check-then-act, so a writer landing in between was deleted along with
+        // the version the client named. `expected_version` threads the
+        // precondition into the statement: `$5 IS NULL OR version_id = $5` is
+        // evaluated on the locked row, and re-evaluated by EvalPlanQual against
+        // the committed tuple if a writer got there first, so the comparison and
+        // the delete cannot be separated. With no expected version the
+        // predicate is constant-true and the statement is the one above.
+        //
+        // ## The version arithmetic
+        //
+        // `version_id` is `TEXT`, so the increment is guarded rather than a bare
+        // cast: a non-numeric value would make `::bigint` raise 22P02 and turn a
+        // delete into a 500. The `CASE` reproduces the Rust it replaces —
+        // `current_version.parse::<u64>().unwrap_or(0) + 1` — for every value
+        // this server can have written (`'7'` -> 8, `'007'` -> 8, `''` and
+        // `'abc'` -> 1, matching `unwrap_or(0)`). `CASE` does not evaluate the
+        // branch it did not select, so the cast never runs on a value the regex
+        // rejected. Version ids are server-issued decimal integers on every
+        // write path in this backend, so the fallback is unreachable in
+        // practice and is here only so that it degrades the same way the Rust
+        // did rather than differently.
+        //
+        // `RETURNING` feeds the history row from the tuple just written, so the
+        // deletion entry carries the resource's own `fhir_version` without
+        // making a round trip through the client. As in `create` and `update`,
+        // no matching row means the CTE yields nothing, the insert selects
+        // nothing, and the statement reports zero rows affected — one signal for
+        // both writes. One statement is also one implicit transaction: the
+        // tombstone lands with the delete or neither does.
+        //
+        // ## The tombstone stores `'null'::jsonb`, not the resource
+        //
+        // A deletion entry is the record that the resource was deleted, not a
+        // version of the resource: FHIR gives it `request.method = DELETE` and
+        // no `resource` in a history Bundle, and `410 Gone` on a vread of that
+        // version. `history_entry_to_json` has always omitted the body, and the
+        // vread handler now answers `410`, so nothing can ask for these bytes.
+        //
+        // Storing them was not free. `data` is a JSONB body of a few kilobytes;
+        // the `UPDATE` above does not touch that column, so `resources` keeps
+        // its existing TOAST datum untouched, but a TOAST pointer cannot be
+        // shared across tables — inserting it into `resource_history` detoasts
+        // the value, re-compresses it, writes it, and puts the whole body in the
+        // WAL a second time. That was 10.6% of the crud suite's Postgres
+        // execution time on run 33213565802 for a row no reader can reach.
+        //
+        // `'null'::jsonb` rather than `NULL` because `resource_history.data` is
+        // `NOT NULL` (schema v1) and both `vread` and the history readers deserialise
+        // the column into a `serde_json::Value` with a non-nullable `FromSql`;
+        // a SQL `NULL` would panic in `row.get`, and widening the column would
+        // put a migration and six read sites in the way of a write-path change.
+        // `Value::Null` reaches the same readers as a well-formed value that
+        // renders as `null`, and they already discard it for a deleted version.
+        //
+        // Rows written by an older build keep their bodies and are read back
+        // exactly as before; nothing needs backfilling, because the only reader
+        // was already dropping the value on the floor.
+        let updated = execute_cached(
+                &client,
+                "WITH del AS (
+                     UPDATE resources
+                     SET is_deleted = TRUE,
+                         deleted_at = $1,
+                         last_updated = $1,
+                         version_id = ((CASE WHEN version_id ~ '^[0-9]+$' THEN version_id::bigint ELSE 0 END) + 1)::text
+                     WHERE tenant_id = $2 AND resource_type = $3 AND id = $4
+                       AND is_deleted = FALSE
+                       AND ($5::text IS NULL OR version_id = $5::text)
+                     RETURNING tenant_id, resource_type, id, version_id, last_updated, is_deleted, fhir_version
+                 )
+                 INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
+                 SELECT tenant_id, resource_type, id, version_id, 'null'::jsonb, last_updated, is_deleted, fhir_version FROM del",
+                &[&now, &tenant_id, &resource_type, &id, &expected_version],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to delete resource: {}", e)))?;
+
+        if updated == 0 {
+            // Matched nothing. For a versioned delete that is either "nothing
+            // live" or "live at another version"; telling them apart costs a
+            // query, but only on the path that is already failing.
+            if let Some(expected) = expected_version {
+                let actual = client
+                    .query_opt(
+                        "SELECT version_id FROM resources
+                         WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = FALSE",
+                        &[&tenant_id, &resource_type, &id],
+                    )
+                    .await
+                    .map_err(|e| internal_error(format!("Failed to get current version: {}", e)))?;
+                if let Some(row) = actual {
+                    return Err(StorageError::Concurrency(
+                        ConcurrencyError::VersionConflict {
+                            resource_type: resource_type.to_string(),
+                            id: id.to_string(),
+                            expected_version: expected.to_string(),
+                            actual_version: row.get::<_, String>(0),
+                        },
+                    ));
+                }
+            }
+            return Err(StorageError::Resource(ResourceError::NotFound {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+            }));
+        }
+
+        // Delete search index entries (skip when search is offloaded)
+        if !self.is_search_offloaded() {
+            execute_cached(
+                    &client,
+                    "DELETE FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
+                    &[&tenant_id, &resource_type, &id],
+                )
+                .await
+                .map_err(|e| internal_error(format!("Failed to delete search index: {}", e)))?;
+        }
+
+        // A SearchParameter delete invalidates the tenant overlays.
+        if resource_type == "SearchParameter" {
+            if let Err(e) = self.reload_stored_cache().await {
+                tracing::warn!("SearchParameter cache reload failed: {e}");
+            }
+        }
+
+        Ok(())
+    }
+
     /// Brings a soft-deleted resource back to life with new content.
     ///
     /// FHIR permits a deleted resource to be restored by a subsequent update
@@ -2136,8 +2169,12 @@ impl VersionedStorage for PostgresBackend {
             ));
         }
 
-        // Perform delete
-        self.delete(tenant, resource_type, id).await
+        // Delete exactly the version the precondition was evaluated against.
+        // A plain `delete` here was check-then-act: a writer landing after the
+        // read above was deleted along with the version the client named
+        // (#1404).
+        self.delete_versioned(tenant, resource_type, id, &current_version)
+            .await
     }
 
     async fn list_versions(
@@ -3168,7 +3205,7 @@ impl ConditionalStorage for PostgresBackend {
                 // Exactly one match - delete it
                 let existing = matches.into_iter().next().unwrap();
                 crate::core::conditional_if_match_gate(if_match, resource_type, Some(&existing))?;
-                self.delete(tenant, resource_type, existing.id()).await?;
+                crate::core::delete_under_precondition(self, tenant, if_match, &existing).await?;
                 Ok(ConditionalDeleteResult::Deleted(existing))
             }
             n => {
@@ -3178,48 +3215,17 @@ impl ConditionalStorage for PostgresBackend {
         }
     }
 
-    async fn conditional_patch(
+    /// The criteria resolver the provided
+    /// [`ConditionalStorage::conditional_patch`] is written in terms of: this
+    /// backend has no patch code of its own (#1406).
+    async fn resolve_conditional_matches(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         search_params: &str,
-        patch: &crate::core::PatchFormat,
-        if_match: &crate::core::EntityTagPrecondition,
-    ) -> StorageResult<crate::core::ConditionalPatchResult> {
-        use crate::core::{ConditionalPatchResult, PatchFormat};
-
-        // Find matching resources based on search parameters
-        let matches = self
-            .find_matching_resources(tenant, resource_type, search_params)
-            .await?;
-
-        match matches.len() {
-            0 => Ok(ConditionalPatchResult::NoMatch),
-            1 => {
-                // Exactly one match - apply the patch
-                let existing = matches.into_iter().next().unwrap();
-                crate::core::conditional_if_match_gate(if_match, resource_type, Some(&existing))?;
-                let current_content = existing.content().clone();
-
-                // Apply the patch based on format
-                let patched_content = match patch {
-                    PatchFormat::JsonPatch(patch_doc) => {
-                        self.apply_json_patch(&current_content, patch_doc)?
-                    }
-                    PatchFormat::FhirPathPatch(patch_params) => {
-                        self.apply_fhirpath_patch(&current_content, patch_params)?
-                    }
-                    PatchFormat::MergePatch(merge_doc) => {
-                        self.apply_merge_patch(&current_content, merge_doc)
-                    }
-                };
-
-                // Update the resource with the patched content
-                let updated = self.update(tenant, &existing, patched_content).await?;
-                Ok(ConditionalPatchResult::Patched(updated))
-            }
-            n => Ok(ConditionalPatchResult::MultipleMatches(n)),
-        }
+    ) -> StorageResult<Vec<StoredResource>> {
+        self.find_matching_resources(tenant, resource_type, search_params)
+            .await
     }
 }
 
@@ -3289,166 +3295,6 @@ impl PostgresBackend {
             search_params_str,
             crate::search::ResourceTypeScope::version(self.config().fhir_version),
         )
-    }
-
-    // ========================================================================
-    // Patch Helper Methods
-    // ========================================================================
-
-    /// Applies a JSON Patch (RFC 6902) to a resource.
-    fn apply_json_patch(&self, resource: &Value, patch_doc: &Value) -> StorageResult<Value> {
-        use crate::error::ValidationError;
-
-        let patch: json_patch::Patch = serde_json::from_value(patch_doc.clone()).map_err(|e| {
-            StorageError::Validation(ValidationError::InvalidResource {
-                message: format!("Invalid JSON Patch document: {}", e),
-                details: vec![],
-            })
-        })?;
-
-        let mut patched = resource.clone();
-        json_patch::patch(&mut patched, &patch).map_err(|e| {
-            StorageError::Validation(ValidationError::InvalidResource {
-                message: format!("Failed to apply JSON Patch: {}", e),
-                details: vec![],
-            })
-        })?;
-
-        Ok(patched)
-    }
-
-    /// Applies a FHIRPath Patch to a resource.
-    fn apply_fhirpath_patch(&self, resource: &Value, patch_params: &Value) -> StorageResult<Value> {
-        use crate::error::ValidationError;
-
-        let parameter = patch_params.get("parameter").and_then(|p| p.as_array());
-        if parameter.is_none() {
-            return Err(StorageError::Validation(ValidationError::InvalidResource {
-                message: "FHIRPath Patch must have a 'parameter' array".to_string(),
-                details: vec![],
-            }));
-        }
-
-        let mut patched = resource.clone();
-
-        for operation in parameter.unwrap() {
-            let parts = operation.get("part").and_then(|p| p.as_array());
-            if parts.is_none() {
-                continue;
-            }
-
-            let mut op_type = None;
-            let mut op_path = None;
-            let mut op_name = None;
-            let mut op_value = None;
-
-            for part in parts.unwrap() {
-                match part.get("name").and_then(|n| n.as_str()) {
-                    Some("type") => {
-                        op_type = part
-                            .get("valueCode")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                    }
-                    Some("path") => {
-                        op_path = part
-                            .get("valueString")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                    }
-                    Some("name") => {
-                        op_name = part
-                            .get("valueString")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                    }
-                    Some("value") => {
-                        op_value = extract_part_value(part);
-                    }
-                    _ => {}
-                }
-            }
-
-            match op_type.as_deref() {
-                Some("replace") => {
-                    if let (Some(path), Some(value)) = (&op_path, &op_value) {
-                        self.fhirpath_replace(&mut patched, path, value)?;
-                    }
-                }
-                Some("add") => {
-                    if let (Some(path), Some(name), Some(value)) = (&op_path, &op_name, &op_value) {
-                        self.fhirpath_add(&mut patched, path, name, value)?;
-                    }
-                }
-                Some("delete") => {
-                    if let Some(path) = &op_path {
-                        self.fhirpath_delete(&mut patched, path)?;
-                    }
-                }
-                _ => {
-                    // Unsupported operation type - skip
-                }
-            }
-        }
-
-        Ok(patched)
-    }
-
-    /// Helper for FHIRPath replace operation.
-    fn fhirpath_replace(
-        &self,
-        resource: &mut Value,
-        path: &str,
-        value: &Value,
-    ) -> StorageResult<()> {
-        let parts: Vec<&str> = path.split('.').collect();
-        if parts.len() == 2 {
-            if let Some(obj) = resource.as_object_mut() {
-                obj.insert(parts[1].to_string(), value.clone());
-            }
-        }
-        Ok(())
-    }
-
-    /// Helper for FHIRPath add operation.
-    fn fhirpath_add(
-        &self,
-        resource: &mut Value,
-        path: &str,
-        name: &str,
-        value: &Value,
-    ) -> StorageResult<()> {
-        let parts: Vec<&str> = path.split('.').collect();
-        if parts.len() == 1
-            && parts[0]
-                == resource
-                    .get("resourceType")
-                    .and_then(|r| r.as_str())
-                    .unwrap_or("")
-        {
-            if let Some(obj) = resource.as_object_mut() {
-                obj.insert(name.to_string(), value.clone());
-            }
-        }
-        Ok(())
-    }
-
-    /// Helper for FHIRPath delete operation.
-    fn fhirpath_delete(&self, resource: &mut Value, path: &str) -> StorageResult<()> {
-        let parts: Vec<&str> = path.split('.').collect();
-        if parts.len() == 2 {
-            if let Some(obj) = resource.as_object_mut() {
-                obj.remove(parts[1]);
-            }
-        }
-        Ok(())
-    }
-
-    /// Applies a JSON Merge Patch (RFC 7386) to a resource.
-    fn apply_merge_patch(&self, resource: &Value, merge_doc: &Value) -> Value {
-        let mut patched = resource.clone();
-        json_patch::merge(&mut patched, merge_doc);
-        patched
     }
 }
 

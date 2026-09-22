@@ -217,11 +217,16 @@ impl ReferenceHandler {
              ELSE value_reference END";
 
         // Builds `<ref-base> IN (SELECT Type/id FROM search_index si2 WHERE ... AND <pred>)`.
+        //
+        // `si2.is_contained = 0`: a contained resource's identifier rows are
+        // stored under its *container's* type and id, and would otherwise make
+        // the container a target by an identifier that is not its own (#1407).
         fn target_in(pred: String) -> String {
             format!(
                 "{REF_BASE} IN (SELECT si2.resource_type || '/' || si2.resource_id \
                  FROM search_index si2 \
-                 WHERE si2.tenant_id = ?1 AND si2.param_name = 'identifier' AND {pred})"
+                 WHERE si2.tenant_id = ?1 AND si2.param_name = 'identifier' \
+                 AND si2.is_contained = 0 AND {pred})"
             )
         }
 

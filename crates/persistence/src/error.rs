@@ -254,6 +254,11 @@ pub enum ValidationError {
         /// Human-readable failure detail.
         message: String,
     },
+
+    /// A patch document could not be applied; nothing was written. Kept typed
+    /// so the REST layer chooses the status per cause (#1406).
+    #[error(transparent)]
+    Patch(#[from] crate::core::PatchError),
 }
 
 /// Detailed validation error information.

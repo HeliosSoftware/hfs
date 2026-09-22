@@ -110,7 +110,7 @@ verbatim and not misread as the `ap` prefix (regression-tested in the REST extra
 | `_content` (full content) | backend FTS | ✓ | ✓ | ✗ | ✓ |
 | `_filter` | backend | ✓ | ✗ | ✗ | ✗ |
 | `_has` (reverse chaining) | REST + backend | ✓ | ✓ | ✗ | ✗ |
-| `_type` (system search) | REST | ✓ | ✓ | ✓ | ✓ |
+| `_type` (system search) | — (REST refuses system-level search with `501`, #1338) | ✗ | ✗ | ✗ | ✗ |
 | `_list` | passthrough param | ○ | ○ | ○ | ○ |
 | `_query` | — | ✗ | ✗ | ✗ | ✗ |
 | `_contained` / `_containedType` | stripped by REST | ✗ | ✗ | ✗ | ✗ |

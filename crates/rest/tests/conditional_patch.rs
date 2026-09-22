@@ -429,13 +429,19 @@ async fn patch_documents_are_held_to_the_instance_endpoints_rules() {
             .await
             .assert_status(StatusCode::NOT_IMPLEMENTED);
 
-        // `resourceType` cannot be patched.
+        // `resourceType` cannot be patched, nor can `id` (#1406: a patched
+        // `id` used to be silently undone by the backend and answered `200`).
         for (content_type, body) in [
             (
                 JSON_PATCH,
                 json!([{"op": "replace", "path": "/resourceType", "value": "Person"}]),
             ),
             (MERGE_PATCH, json!({"resourceType": "Person"})),
+            (
+                JSON_PATCH,
+                json!([{"op": "replace", "path": "/id", "value": "other"}]),
+            ),
+            (MERGE_PATCH, json!({"id": "other"})),
         ] {
             let response = patch(&server, url, content_type, &body).await;
             assert_outcome(&response, StatusCode::BAD_REQUEST, &format!("{url} {body}"));

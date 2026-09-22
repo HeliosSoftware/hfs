@@ -429,6 +429,7 @@ mod mongodb {
                 BackendCapability::ConditionalCreate,
                 BackendCapability::ConditionalUpdate,
                 BackendCapability::ConditionalDelete,
+                BackendCapability::ConditionalPatch,
                 BackendCapability::SharedSchema,
             ],
         );
@@ -444,11 +445,10 @@ mod mongodb {
         assert_shared_schema_instance_is_consistent("mongodb", &backend);
     }
 
-    /// No `ConditionalPatch`: `MongoBackend::conditional_patch` answers
-    /// `UnsupportedCapability`, and the CapabilityStatement advertised
-    /// `conditionalPatch` for it anyway (#1384).
+    /// All four: `conditional_patch` is the trait's provided implementation
+    /// over MongoDB's criteria resolver (#1406; it was unimplemented, #1384).
     #[test]
-    fn mongodb_declares_every_conditional_interaction_but_patch() {
+    fn mongodb_declares_every_conditional_interaction() {
         assert_declares_exactly_these_conditionals(
             "mongodb",
             &MongoBackend::declared_capabilities(),
@@ -456,6 +456,7 @@ mod mongodb {
                 BackendCapability::ConditionalCreate,
                 BackendCapability::ConditionalUpdate,
                 BackendCapability::ConditionalDelete,
+                BackendCapability::ConditionalPatch,
             ],
         );
     }

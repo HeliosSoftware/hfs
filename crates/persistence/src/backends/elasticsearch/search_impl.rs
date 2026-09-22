@@ -826,6 +826,15 @@ impl ElasticsearchBackend {
     /// for itself — and this materializes the `_offset`/`_count` window of it
     /// (no keyset cursor). `_total` and `search_count` are the length of that
     /// same list (#1383).
+    ///
+    /// `_sort` is applied, by the query itself, to each hit's own values — a
+    /// contained document carries the contained resource's search values, so
+    /// `_sort=date` orders by the *contained* resource's date, across the
+    /// top-level and contained hits of `both` alike. A container stands where
+    /// its first matching contained resource does. A contained resource has no
+    /// `meta.lastUpdated` of its own: its document carries the container's, and
+    /// that is what `_sort=_lastUpdated` reads. The SQL backends and MongoDB
+    /// refuse `_sort` here instead (#1407).
     async fn search_contained(
         &self,
         tenant: &TenantContext,
@@ -989,6 +998,22 @@ impl ElasticsearchBackend {
         let Some(body) = send_search_with_retry(self, &index, es_query.body).await? else {
             return Ok(Vec::new());
         };
+
+        // One request returns at most `max_result_window` hits, and the result
+        // list is de-duplicated from the hits, so past that bound the list —
+        // and with it `_total`, `search_count` and the pages beyond it — is
+        // truncated. It cannot be repaired from `hits.total`, which counts
+        // documents, not containers. Say so rather than report a short total
+        // as if it were exact (#1407).
+        let hit_count = body["hits"]["hits"].as_array().map_or(0, Vec::len);
+        if hit_count >= self.config().max_result_window as usize {
+            tracing::warn!(
+                resource_type = %resource_type,
+                max_result_window = self.config().max_result_window,
+                "_contained search reached max_result_window: the result list and its \
+                 _total are truncated to the first {hit_count} hits"
+            );
+        }
 
         let mut keys: Vec<ContainedKey> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();

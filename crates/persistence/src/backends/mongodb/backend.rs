@@ -278,8 +278,7 @@ impl MongoBackend {
             BackendCapability::ConditionalCreate,
             BackendCapability::ConditionalUpdate,
             BackendCapability::ConditionalDelete,
-            // No `ConditionalPatch`: `conditional_patch` answers
-            // `UnsupportedCapability` on this backend.
+            BackendCapability::ConditionalPatch,
             BackendCapability::SharedSchema,
         ]
     }
@@ -877,21 +876,31 @@ impl MongoBackend {
     /// rejected is a visible 400 rather than the old silent wrong answer;
     /// narrowing it would need a name-aware capability path.
     ///
-    /// `:above`/`:below` are now implemented for `uri` (#1002):
-    /// `build_uri_filter` resolves them segment-aware, mirroring SQLite and
-    /// Elasticsearch, so they are advertised there. `:in`/`:not-in` stay
+    /// `:above`/`:below` are implemented for `uri` (#1002) and `reference`
+    /// (#1408): `build_uri_filter` / `build_reference_filter` resolve them
+    /// segment-aware, mirroring SQLite and Elasticsearch, so they are
+    /// advertised there. Token `:of-type` and reference `:identifier` are
+    /// served too (#1408) — the latter by `resolve_reference_identifier` in
+    /// `matching_resource_ids`, ahead of the filter builders — as is the
+    /// reference `:[type]` qualifier, which like on the other backends is not
+    /// a named modifier and so is not listed. `:in`/`:not-in` stay
     /// unimplemented and unadvertised for every type (rejected outright by
-    /// `validate_query_support`), as do token `:above`/`:below`/`:of-type`/
-    /// `:text-advanced` and reference `:identifier`/`:above`/`:below`/
-    /// `:text-advanced` — token/reference `:above`/`:below` need terminology
-    /// subsumption and hierarchy resolution respectively, neither of which is
-    /// implemented — each still hits an `UnsupportedModifier` catch-all in
-    /// its type-specific builder.
+    /// `validate_query_support`), as do token `:above`/`:below` (terminology
+    /// subsumption) and `:text-advanced` on token and reference — each still
+    /// hits an `UnsupportedModifier` catch-all in its type-specific builder.
     pub(super) fn modifiers_for_type(param_type: SearchParamType) -> Vec<&'static str> {
         match param_type {
             SearchParamType::String => vec!["exact", "contains", "text", "missing"],
-            SearchParamType::Token => vec!["text", "code-text", "not", "missing"],
-            SearchParamType::Reference => vec!["contains", "text", "code-text", "missing"],
+            SearchParamType::Token => vec!["text", "code-text", "of-type", "not", "missing"],
+            SearchParamType::Reference => vec![
+                "identifier",
+                "contains",
+                "text",
+                "code-text",
+                "below",
+                "above",
+                "missing",
+            ],
             SearchParamType::Uri => vec!["exact", "contains", "below", "above", "missing"],
             SearchParamType::Date | SearchParamType::Number | SearchParamType::Quantity => {
                 vec!["missing"]
@@ -976,20 +985,25 @@ mod capability_tests {
 
         // Token honors text/code-text but not the non-spec :code; :not and
         // :missing ARE honored (#881, generically in `matching_resource_ids`),
-        // but :of-type is still rejected by `build_token_filter`.
+        // and so is :of-type (#1408). Terminology-backed modifiers are not.
         let t = MongoBackend::modifiers_for_type(SearchParamType::Token);
         assert!(!t.contains(&"code"));
         assert!(t.contains(&"code-text"));
         assert!(t.contains(&"not"));
         assert!(t.contains(&"missing"));
-        assert!(!t.contains(&"of-type"));
+        assert!(t.contains(&"of-type"));
+        assert!(!t.contains(&"in"));
+        assert!(!t.contains(&"above"));
 
-        // Reference honors contains/text/code-text/missing but not :identifier.
+        // Reference honors contains/text/code-text/missing, and :identifier
+        // and :above/:below (#1408).
         let r = MongoBackend::modifiers_for_type(SearchParamType::Reference);
         assert!(r.contains(&"contains"));
         assert!(r.contains(&"text"));
         assert!(r.contains(&"missing"));
-        assert!(!r.contains(&"identifier"));
+        assert!(r.contains(&"identifier"));
+        assert!(r.contains(&"above"));
+        assert!(r.contains(&"below"));
 
         // Uri honors exact/contains/missing and :above/:below (#1002,
         // segment-aware in build_uri_filter).
@@ -1095,8 +1109,8 @@ mod capability_tests {
                 // `:not-in` outright for every parameter type; advertising
                 // either would be a straightforward regression back to
                 // over-promising. `:above`/`:below` are rejected for every
-                // type EXCEPT uri (#1002: build_uri_filter resolves them
-                // there, segment-aware).
+                // type EXCEPT uri (#1002) and reference (#1408), whose
+                // builders resolve them segment-aware.
                 assert!(
                     !matches!(modifier_str, "in" | "not-in"),
                     "{param_type} advertises `{modifier_str}`, which \
@@ -1104,9 +1118,12 @@ mod capability_tests {
                 );
                 assert!(
                     !matches!(modifier_str, "above" | "below")
-                        || param_type == SearchParamType::Uri,
+                        || matches!(
+                            param_type,
+                            SearchParamType::Uri | SearchParamType::Reference
+                        ),
                     "{param_type} advertises `{modifier_str}`, which \
-                     validate_query_support rejects for every type except uri"
+                     validate_query_support rejects for every type except uri and reference"
                 );
 
                 // The advertised string must be a real, round-trippable
@@ -1117,11 +1134,18 @@ mod capability_tests {
                          SearchModifier::parse does not recognize"
                     )
                 });
+                // `Display` writes `of-type` in its legacy camelCase, which
+                // `parse` reads back; every other spelling is its own.
                 assert_eq!(
-                    parsed.to_string(),
-                    modifier_str,
+                    SearchModifier::parse(&parsed.to_string()),
+                    Some(parsed.clone()),
                     "{param_type}'s advertised `{modifier_str}` does not round-trip \
                      through SearchModifier::parse/Display"
+                );
+                assert!(
+                    parsed.to_string() == modifier_str || modifier_str == "of-type",
+                    "{param_type} advertises `{modifier_str}`, which is not the \
+                     spelling SearchModifier writes"
                 );
 
                 // `:missing` and `:not` are resolved generically in
@@ -1131,8 +1155,11 @@ mod capability_tests {
                 // than setting it — setting it would wrongly fail (e.g. token's
                 // `build_token_filter` has no `Missing`/`Not` arm and would hit
                 // its `Some(other) => Err(UnsupportedModifier)` catch-all).
+                // Reference `:identifier` is resolved there too (#1408), by
+                // `resolve_reference_identifier`: it needs the database, which
+                // a filter builder does not have, so the builder never sees it.
                 let probe_modifier = match modifier_str {
-                    "missing" | "not" => None,
+                    "missing" | "not" | "identifier" => None,
                     other => Some(SearchModifier::parse(other).unwrap()),
                 };
 
