@@ -1389,6 +1389,50 @@ mod tests {
         );
     }
 
+    /// `Group` is in the patient CompartmentDefinition via `member`, so a Group
+    /// that lists a filtered patient as a member is in that patient's
+    /// compartment — even though the Group itself was never named in
+    /// `group_refs`. The `CompartmentFilter` refactor briefly short-circuited
+    /// every Group to "was it requested directly?", which silently dropped
+    /// these from `patient=` runs on all three callers of this helper.
+    #[cfg(feature = "R4")]
+    #[test]
+    fn test_group_member_of_filtered_patient_is_in_the_compartment() {
+        let resources = vec![
+            serde_json::json!({ "resourceType": "Patient", "id": "p1" }),
+            serde_json::json!({
+                "resourceType": "Group",
+                "id": "g1",
+                "type": "person",
+                "actual": true,
+                "member": [{ "entity": { "reference": "Patient/p1" } }]
+            }),
+            serde_json::json!({
+                "resourceType": "Group",
+                "id": "g2",
+                "type": "person",
+                "actual": true,
+                "member": [{ "entity": { "reference": "Patient/other" } }]
+            }),
+        ];
+
+        let filtered = filter_resources_by_patient_and_group(
+            resources,
+            &["Patient/p1".to_string()],
+            &[],
+            helios_fhir::FhirVersion::R4,
+        )
+        .unwrap();
+
+        let ids: Vec<&str> = filtered.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert_eq!(
+            ids,
+            vec!["p1", "g1"],
+            "Group/g1 has member Patient/p1 so it is in that compartment; \
+             Group/g2 does not: {ids:?}"
+        );
+    }
+
     #[test]
     fn test_resolve_view_reference_relative() {
         let result = resolve_view_reference("ViewDefinition/123");

@@ -1397,3 +1397,322 @@ async fn test_minio_count_by_tenant_survives_deregistration() {
         vec![("count-a".to_string(), 1), ("count-b".to_string(), 2)]
     );
 }
+
+// ============================================================================
+// SQL-on-FHIR streaming tests
+// ============================================================================
+
+/// Verifies that `scan_resources` on the S3 backend yields resources with
+/// server-populated `meta.versionId` and `meta.lastUpdated` merged in.
+///
+/// The S3 backend stores these fields separately from the resource body. The
+/// `since` filter and any ViewDefinition that reads `meta.*` both rely on
+/// `into_content_with_meta` being called during the scan; a regression to
+/// `content().clone()` would silently return null for both fields.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_sof_scan_resources_include_server_meta() {
+    use helios_persistence::core::sof_runner::ViewFilters;
+    use tokio_stream::StreamExt;
+
+    if skip_if_disabled("test_minio_sof_scan_resources_include_server_meta") {
+        return;
+    }
+
+    let harness = make_prefix_backend("sof-meta").await;
+    let backend = &harness.backend;
+    let t = tenant("sof-meta-tenant");
+
+    backend
+        .create(
+            &t,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "meta-obs-1",
+                "status": "final",
+                "code": { "text": "x" }
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    // ViewDefinition that extracts the server-managed meta fields.
+    let view = json!({
+        "resourceType": "ViewDefinition",
+        "resource": "Observation",
+        "status": "active",
+        "select": [{ "column": [
+            { "path": "id",                "name": "obs_id" },
+            { "path": "meta.versionId",    "name": "version_id" },
+            { "path": "meta.lastUpdated",  "name": "last_updated" }
+        ]}]
+    });
+
+    let runner = backend
+        .sof_runner()
+        .expect("S3 backend must provide a SOF runner");
+    let mut stream = runner
+        .run_view(&t, view, ViewFilters::default())
+        .await
+        .expect("run_view");
+
+    let row = stream
+        .next()
+        .await
+        .expect("at least one row")
+        .expect("row must not be an error");
+
+    assert_eq!(row["obs_id"], "meta-obs-1");
+    assert!(
+        row["version_id"].is_string() && !row["version_id"].as_str().unwrap().is_empty(),
+        "meta.versionId must be a non-empty string from the server; got: {:?}",
+        row["version_id"]
+    );
+    assert!(
+        row["last_updated"].is_string() && !row["last_updated"].as_str().unwrap().is_empty(),
+        "meta.lastUpdated must be a non-empty string from the server; got: {:?}",
+        row["last_updated"]
+    );
+}
+
+/// Verifies that the `since` filter works end-to-end on the S3 backend.
+///
+/// Correctness depends on `into_content_with_meta` being used in `scan_resources`
+/// so that `meta.lastUpdated` is present when the in-process runner evaluates the
+/// `since` cutoff. This test would silently pass without the fix only if
+/// `meta.lastUpdated` happened to be embedded in the stored body, which it is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_sof_since_filter() {
+    use helios_persistence::core::sof_runner::ViewFilters;
+    use tokio_stream::StreamExt;
+
+    if skip_if_disabled("test_minio_sof_since_filter") {
+        return;
+    }
+
+    let harness = make_prefix_backend("sof-since").await;
+    let backend = &harness.backend;
+    let t = tenant("sof-since-tenant");
+
+    backend
+        .create(
+            &t,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "s3-since-before",
+                "status": "final",
+                "code": { "text": "x" }
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let stored_before = backend
+        .read(&t, "Observation", "s3-since-before")
+        .await
+        .unwrap()
+        .unwrap();
+    let cutoff = stored_before.last_modified();
+
+    // Guarantee a strictly later timestamp for the second resource.
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+    backend
+        .create(
+            &t,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "s3-since-after",
+                "status": "final",
+                "code": { "text": "x" }
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let view = json!({
+        "resourceType": "ViewDefinition",
+        "resource": "Observation",
+        "status": "active",
+        "select": [{ "column": [{ "path": "id", "name": "obs_id" }] }]
+    });
+
+    let runner = backend
+        .sof_runner()
+        .expect("S3 backend must provide a SOF runner");
+
+    let collect = |filters: ViewFilters| {
+        let runner = runner.clone();
+        let t = t.clone();
+        let view = view.clone();
+        async move {
+            let mut stream = runner.run_view(&t, view, filters).await.expect("run_view");
+            let mut ids = Vec::new();
+            while let Some(row) = stream.next().await {
+                ids.push(row.expect("row")["obs_id"].as_str().unwrap().to_string());
+            }
+            ids.sort();
+            ids
+        }
+    };
+
+    // Unfiltered: both observations present.
+    let all = collect(ViewFilters::default()).await;
+    assert!(
+        all.contains(&"s3-since-before".to_string()),
+        "unfiltered must include before: {all:?}"
+    );
+    assert!(
+        all.contains(&"s3-since-after".to_string()),
+        "unfiltered must include after: {all:?}"
+    );
+
+    // since=cutoff: only the after-cutoff observation.
+    let filtered = collect(ViewFilters {
+        since: Some(cutoff),
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(
+        filtered,
+        vec!["s3-since-after"],
+        "since filter must exclude before-cutoff; cutoff={cutoff:?}: {filtered:?}"
+    );
+
+    // since=future: nothing.
+    let future_cutoff = cutoff + chrono::Duration::hours(1);
+    let empty = collect(ViewFilters {
+        since: Some(future_cutoff),
+        ..Default::default()
+    })
+    .await;
+    assert!(
+        empty.is_empty(),
+        "future cutoff must return nothing: {empty:?}"
+    );
+}
+
+/// Verifies that the patient compartment filter on S3 returns the correct
+/// observations for each patient, and that the two sets are disjoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_sof_patient_filter() {
+    use helios_persistence::core::sof_runner::ViewFilters;
+    use tokio_stream::StreamExt;
+
+    if skip_if_disabled("test_minio_sof_patient_filter") {
+        return;
+    }
+
+    let harness = make_prefix_backend("sof-patient").await;
+    let backend = &harness.backend;
+    let t = tenant("sof-patient-tenant");
+
+    for resource in [
+        json!({ "resourceType": "Patient", "id": "s3-pt-1" }),
+        json!({ "resourceType": "Patient", "id": "s3-pt-2" }),
+    ] {
+        backend
+            .create(&t, "Patient", resource, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+
+    for id in ["s3-obs-p1-a", "s3-obs-p1-b"] {
+        backend
+            .create(
+                &t,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": id,
+                    "status": "final",
+                    "code": { "text": "x" },
+                    "subject": { "reference": "Patient/s3-pt-1" }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    for id in ["s3-obs-p2-a"] {
+        backend
+            .create(
+                &t,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": id,
+                    "status": "final",
+                    "code": { "text": "x" },
+                    "subject": { "reference": "Patient/s3-pt-2" }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let view = json!({
+        "resourceType": "ViewDefinition",
+        "resource": "Observation",
+        "status": "active",
+        "select": [{ "column": [{ "path": "id", "name": "obs_id" }] }]
+    });
+
+    let runner = backend
+        .sof_runner()
+        .expect("S3 backend must provide a SOF runner");
+
+    let collect = |filters: ViewFilters| {
+        let runner = runner.clone();
+        let t = t.clone();
+        let view = view.clone();
+        async move {
+            let mut stream = runner.run_view(&t, view, filters).await.expect("run_view");
+            let mut ids = Vec::new();
+            while let Some(row) = stream.next().await {
+                ids.push(row.expect("row")["obs_id"].as_str().unwrap().to_string());
+            }
+            ids.sort();
+            ids
+        }
+    };
+
+    let all = collect(ViewFilters::default()).await;
+    assert_eq!(
+        all,
+        vec!["s3-obs-p1-a", "s3-obs-p1-b", "s3-obs-p2-a"],
+        "unfiltered: {all:?}"
+    );
+
+    let p1 = collect(ViewFilters {
+        patient: vec!["Patient/s3-pt-1".to_string()],
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(
+        p1,
+        vec!["s3-obs-p1-a", "s3-obs-p1-b"],
+        "patient/s3-pt-1 filter: {p1:?}"
+    );
+
+    let p2 = collect(ViewFilters {
+        patient: vec!["Patient/s3-pt-2".to_string()],
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(p2, vec!["s3-obs-p2-a"], "patient/s3-pt-2 filter: {p2:?}");
+
+    let p1_set: std::collections::HashSet<_> = p1.iter().collect();
+    let p2_set: std::collections::HashSet<_> = p2.iter().collect();
+    assert!(
+        p1_set.is_disjoint(&p2_set),
+        "patient filters must return non-overlapping observations"
+    );
+}
