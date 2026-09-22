@@ -124,6 +124,60 @@ These populate the `GET /.well-known/smart-configuration` response:
 | `HFS_SMART_MANAGEMENT_ENDPOINT` | Token management endpoint |
 | `HFS_SMART_REGISTRATION_ENDPOINT` | Dynamic client registration endpoint |
 | `HFS_SMART_REVOCATION_ENDPOINT` | Token revocation endpoint |
+| `HFS_SMART_END_SESSION_ENDPOINT` | OIDC end-session (RP-initiated logout) endpoint; used by the web UI's Sign out. Discovered from the issuer when unset |
+
+### Web UI Interactive Login
+
+The web UI (`crates/ui`) signs users in with **Authorization Code + PKCE**
+against the same IdP (issue #1449). HFS is not the authorization server: the
+browser is sent to the IdP's login screen, comes back to `/ui/callback` with a
+code, and HFS exchanges it for tokens that stay **server-side**, referenced by
+an `HttpOnly; SameSite=Lax` session cookie (`hfs_session`). The auth middleware
+then treats a request carrying that cookie — and no `Authorization` header of
+its own — as if it had sent `Authorization: Bearer <session access token>`, so
+the pages' browser-originated FHIR calls are validated, scope-checked and
+audited exactly like any bearer. A cross-site request never rides the cookie.
+
+Off unless `HFS_UI_LOGIN_CLIENT_ID` is set (auth must be enabled):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HFS_UI_LOGIN_CLIENT_ID` | unset | OAuth client id registered at the IdP for the UI (e.g. `hfs-web`). Setting it enables the login and the session gate on every `/ui` page |
+| `HFS_UI_LOGIN_CLIENT_SECRET` | unset | Only for a confidential client; a public PKCE client leaves it unset |
+| `HFS_UI_LOGIN_REDIRECT_URI` | `{HFS_BASE_URL}/ui/callback` | The `redirect_uri` registered at the IdP |
+| `HFS_UI_LOGIN_SCOPES` | `openid profile email` | Scopes requested at authorization |
+| `HFS_UI_LOGIN_COOKIE_SECURE` | `true` | `Secure` attribute on the session cookie. Set `false` only for plain-HTTP local development |
+
+The authorize and token endpoints come from `HFS_SMART_AUTHORIZE_ENDPOINT` /
+`HFS_SMART_TOKEN_ENDPOINT` when set, otherwise from the issuer's
+`.well-known/openid-configuration` at startup. The session store is in-process:
+a session does not survive a restart and is not shared across nodes.
+
+**The user's access token must be one HFS can validate and authorize.** Two
+things the IdP has to put in it:
+
+- **`sub`.** HFS rejects a token without a subject (`401 Missing required
+  claim: sub`). On Keycloak 26 `sub` comes from the built-in `basic` client
+  scope, which a client does not get unless it is assigned; `profile` and
+  `email` likewise supply the display claims the UI shows.
+- **SMART scopes.** Authorization is SMART v2 scopes on the `scope` claim; a
+  user with none signs in and then gets `403` on every FHIR call. An
+  interactively signed-in user acts in the **`user/`** context (`user/*.cruds`,
+  or narrower), which HFS accepts as-is.
+
+The bundled Keycloak realm therefore gives the `hfs-web` client
+`basic`, `profile`, `email` and `user/*.cruds` as default client scopes — mirror
+that for a real IdP.
+
+```bash
+# Local Keycloak (docker/keycloak): the `hfs-web` public client is pre-registered.
+HFS_UI_LOGIN_CLIENT_ID=hfs-web \
+  HFS_UI_LOGIN_COOKIE_SECURE=false \
+  HFS_AUTH_ENABLED=true HFS_AUTH_ISSUER=http://localhost:8180/realms/fhir \
+  HFS_AUTH_JWKS_URL=http://localhost:8180/realms/fhir/protocol/openid-connect/certs \
+  cargo run --bin hfs
+# then open http://localhost:8080/ui → redirected to the Keycloak login (demo / demo)
+```
 
 ## Running with Authentication
 

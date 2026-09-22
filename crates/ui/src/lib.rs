@@ -46,6 +46,7 @@ mod conformance;
 mod editor;
 mod history;
 mod i18n;
+mod login;
 mod lookup;
 mod rail_state;
 mod search_params;
@@ -63,6 +64,8 @@ mod sql_views;
 mod subscriptions;
 mod tenants;
 mod vd_complete;
+
+pub use login::{LoginRuntime, SignedIn, set_interactive_login};
 
 #[doc(hidden)]
 pub use conformance::{
@@ -202,6 +205,10 @@ struct WebState {
     /// seeds and purges started from the tenants page report to it, so the
     /// dashboard's live figures follow them. `None` reports nothing.
     write_observer: Option<Arc<dyn helios_persistence::core::WriteObserver>>,
+    /// The interactive browser login (#1449), when the server installed one
+    /// with [`set_interactive_login`]. `None` means no login and no session
+    /// gate — the pre-#1449 behaviour.
+    login: Option<Arc<login::LoginRuntime>>,
 }
 
 /// The settings keys holding the user's FHIR-version and tenant choices, and
@@ -1784,7 +1791,13 @@ pub fn mount_with_conformance_source_and_runtime(
         // The tenant selector (#344): lazily-loaded options and the persisted
         // choice, mirroring /ui/version.
         .route("/ui/tenant/options", get(tenant_options))
-        .route("/ui/tenant", axum::routing::post(set_tenant));
+        .route("/ui/tenant", axum::routing::post(set_tenant))
+        // Interactive browser login (#1449): Authorization Code + PKCE against
+        // the configured IdP, a server-side session, and RP-initiated logout.
+        // Answer 404 until a login is installed (see `login::installed`).
+        .route("/ui/login", get(login::login))
+        .route("/ui/callback", get(login::callback))
+        .route("/ui/logout", axum::routing::post(login::logout));
 
     if nl_enabled {
         router = router.route("/ui/search", get(search));
@@ -1813,6 +1826,7 @@ pub fn mount_with_conformance_source_and_runtime(
             PatientNameSearchSupport::Enabled
         ))),
         tenant_path_routing,
+        login: login::installed(),
     };
 
     router
@@ -1826,6 +1840,14 @@ pub fn mount_with_conformance_source_and_runtime(
         // One effective FHIR version per request (stored choice or default),
         // in request extensions next to the locale.
         .layer(middleware::from_fn_with_state(state.clone(), resolve_prefs))
+        // Outermost of the UI layers so it runs first: with a login installed
+        // it stamps the signed-in Principal that `resolve_prefs` keys the
+        // per-user settings on, or turns the request away to `/ui/login`
+        // (#1449). Without one it is a no-op.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            login::require_session,
+        ))
         .with_state(state)
         // Registered after the UI layers so neither arm of `/` picks them up:
         // the redirect needs none, and `POST /` (FHIR batch) must reach the

@@ -1054,6 +1054,7 @@ fn patient_name_search_support(mode: StorageBackendMode) -> helios_ui::PatientNa
 async fn init_auth_with_audit(
     audit_sink: Arc<dyn AuditSink>,
     tenant_url_routing: bool,
+    public_base_url: &str,
 ) -> anyhow::Result<(AuthConfig, Option<Arc<AuthMiddlewareState>>)> {
     let auth_config = AuthConfig::from_env();
 
@@ -1106,6 +1107,17 @@ async fn init_auth_with_audit(
 
     let audit_config = AuditConfig::from_env();
 
+    // The web UI's browser login (#1449) shares one session store between the
+    // REST auth layer (which turns the session cookie into a bearer) and the
+    // UI (which establishes sessions). Built here, before either is mounted.
+    let sessions = init_login_sessions(&auth_config, public_base_url).await?;
+    #[cfg(feature = "ui")]
+    if let Some(sessions) = &sessions {
+        helios_ui::set_interactive_login(helios_ui::LoginRuntime {
+            sessions: Arc::clone(sessions),
+        });
+    }
+
     let auth_state = Arc::new(AuthMiddlewareState {
         provider: Arc::new(provider),
         config: Arc::new(auth_config.clone()),
@@ -1113,9 +1125,67 @@ async fn init_auth_with_audit(
         audit_source_observer: audit_config.source_observer.clone(),
         audit_exclusion_filter: ExclusionFilter::new(audit_config.exclusions.clone()),
         tenant_url_routing,
+        sessions,
     });
 
     Ok((auth_config, Some(auth_state)))
+}
+
+/// Builds the interactive-login session store when the web UI's IdP client is
+/// configured (`HFS_UI_LOGIN_CLIENT_ID`), resolving the authorize/token/
+/// end-session endpoints from explicit `HFS_SMART_*` settings or, failing
+/// those, from the issuer's OpenID Connect discovery document. `None` when no
+/// client is configured — auth stays bearer-only and the UI has no login.
+async fn init_login_sessions(
+    auth_config: &AuthConfig,
+    public_base_url: &str,
+) -> anyhow::Result<Option<Arc<helios_auth::SessionStore>>> {
+    let Some(client_id) = auth_config.web_client_id.clone() else {
+        return Ok(None);
+    };
+    let issuer = auth_config
+        .expected_issuer
+        .as_deref()
+        .expect("validate() guarantees an issuer when auth is enabled");
+    let (authorization_endpoint, token_endpoint, end_session_endpoint) =
+        helios_auth::discover_endpoints(
+            issuer,
+            auth_config.smart_authorize_endpoint.clone(),
+            auth_config.smart_token_endpoint.clone(),
+            auth_config.smart_end_session_endpoint.clone(),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("interactive login could not be configured: {e}"))?;
+    let redirect_uri = auth_config
+        .web_redirect_uri
+        .clone()
+        .unwrap_or_else(|| format!("{}/ui/callback", public_base_url.trim_end_matches('/')));
+    info!(
+        client_id = %client_id,
+        redirect_uri = %redirect_uri,
+        authorization_endpoint = %authorization_endpoint,
+        end_session = ?end_session_endpoint,
+        cookie_secure = auth_config.web_cookie_secure,
+        "Interactive browser login ENABLED"
+    );
+    if !auth_config.web_cookie_secure {
+        warn!(
+            "HFS_UI_LOGIN_COOKIE_SECURE=false: the session cookie is sent over plain HTTP. \
+             Only for local development."
+        );
+    }
+    Ok(Some(Arc::new(helios_auth::SessionStore::new(
+        helios_auth::LoginConfig {
+            client_id,
+            client_secret: auth_config.web_client_secret.clone(),
+            redirect_uri,
+            scopes: auth_config.web_scopes.clone(),
+            authorization_endpoint,
+            token_endpoint,
+            end_session_endpoint,
+            cookie_secure: auth_config.web_cookie_secure,
+        },
+    ))))
 }
 
 /// Initializes the audit subsystem from environment configuration.
@@ -1247,6 +1317,7 @@ async fn main() -> anyhow::Result<()> {
     let (auth_config, auth_state) = init_auth_with_audit(
         audit_sink,
         config.multitenancy.routing_mode.supports_url_path(),
+        &config.base_url,
     )
     .await?;
 
