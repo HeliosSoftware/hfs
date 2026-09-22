@@ -223,13 +223,68 @@ where
     // 3.0.0-ballot.
     let mut operations = build_rest_operations(state);
 
+    // When auth is on, a client must be able to discover SMART App Launch from
+    // the CapabilityStatement itself, not only from
+    // `/.well-known/smart-configuration`: SMART's discovery reads both, and the
+    // security block was a `cors`-only literal regardless of auth (#1441). The
+    // endpoints come from the same `AuthConfig` that backs the discovery
+    // document, so the two never disagree. Advertised only when auth is enabled
+    // *and* both required oauth-uris (authorize, token) are configured — a plain
+    // bearer deployment with no SMART endpoints is not SMART-on-FHIR and stays
+    // `cors`-only rather than publishing an incomplete profile.
+    let mut security = serde_json::json!({
+        "cors": state.config().enable_cors,
+        "description": "This server supports CORS for cross-origin requests"
+    });
+    let auth = state.auth_config();
+    if auth.enabled
+        && auth.smart_authorize_endpoint.is_some()
+        && auth.smart_token_endpoint.is_some()
+    {
+        security["service"] = serde_json::json!([{
+            "coding": [{
+                "system": "http://terminology.hl7.org/CodeSystem/restful-security-service",
+                "code": "SMART-on-FHIR",
+                "display": "SMART-on-FHIR"
+            }],
+            "text": "OAuth2 using SMART-on-FHIR profile (see http://docs.smarthealthit.org)"
+        }]);
+
+        // `oauth-uris` sub-extensions, in SMART's documented order. `authorize`
+        // and `token` are always present here (guarded above); the rest are
+        // added only when configured.
+        let mut oauth_uris = vec![
+            serde_json::json!({
+                "url": "authorize",
+                "valueUri": auth.smart_authorize_endpoint.as_deref().unwrap()
+            }),
+            serde_json::json!({
+                "url": "token",
+                "valueUri": auth.smart_token_endpoint.as_deref().unwrap()
+            }),
+        ];
+        if let Some(uri) = auth.smart_introspection_endpoint.as_deref() {
+            oauth_uris.push(serde_json::json!({ "url": "introspect", "valueUri": uri }));
+        }
+        if let Some(uri) = auth.smart_revocation_endpoint.as_deref() {
+            oauth_uris.push(serde_json::json!({ "url": "revoke", "valueUri": uri }));
+        }
+        if let Some(uri) = auth.smart_registration_endpoint.as_deref() {
+            oauth_uris.push(serde_json::json!({ "url": "register", "valueUri": uri }));
+        }
+        if let Some(uri) = auth.smart_management_endpoint.as_deref() {
+            oauth_uris.push(serde_json::json!({ "url": "manage", "valueUri": uri }));
+        }
+        security["extension"] = serde_json::json!([{
+            "url": "http://fhir-registry.smarthealthit.org/StructureDefinition/oauth-uris",
+            "extension": oauth_uris
+        }]);
+    }
+
     let rest_entry = serde_json::json!({
         "mode": "server",
         "documentation": "Helios FHIR RESTful API",
-        "security": {
-            "cors": state.config().enable_cors,
-            "description": "This server supports CORS for cross-origin requests"
-        },
+        "security": security,
         "resource": resources,
         "interaction": system_interactions
     });
