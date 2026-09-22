@@ -742,7 +742,6 @@ async fn mongodb_conditional_writers_with_the_same_if_match_admit_one() {
     conditional_if_match_suite::concurrent_writers_with_the_same_if_match_admit_one(
         &backend,
         "cond-if-match-race-1381",
-        false,
     )
     .await;
 }
@@ -778,6 +777,71 @@ async fn mongodb_modifier_parity() {
         &[],
     )
     .await;
+}
+
+/// The backend-agnostic race suite for version-aware writes (#1404, #1405).
+/// Same `#[path]` arrangement.
+#[path = "search/versioned_write_race_suite.rs"]
+mod versioned_write_race_suite;
+
+/// #1405: of several writers holding the same version, one `update` writes and
+/// every loser is a `ConcurrencyError` — the server's `WriteConflict` used to
+/// reach them as `BackendError::Internal`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn mongodb_concurrent_updates_from_the_same_version_admit_one() {
+    let Some(backend) = create_backend("update_race_1405").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    versioned_write_race_suite::concurrent_updates_from_the_same_version_admit_one(
+        std::sync::Arc::new(backend),
+        "update-race-1405",
+        10,
+    )
+    .await;
+}
+
+/// #1404: an update and a versioned delete of the same version: one wins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn mongodb_concurrent_update_and_versioned_delete_admit_one() {
+    let Some(backend) = create_backend("delete_race_1404").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    versioned_write_race_suite::concurrent_update_and_versioned_delete_admit_one(
+        std::sync::Arc::new(backend),
+        "delete-race-1404",
+        10,
+    )
+    .await;
+}
+
+/// #1405: an update racing an unconditional delete — the one write that is
+/// retried after a `WriteConflict` — leaves a contiguous history and no
+/// `Internal` error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn mongodb_concurrent_update_and_plain_delete_stay_consistent() {
+    let Some(backend) = create_backend("plain_delete_race_1405").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    versioned_write_race_suite::concurrent_update_and_plain_delete_stay_consistent(
+        std::sync::Arc::new(backend),
+        "plain-delete-race-1405",
+        10,
+    )
+    .await;
+}
+
+/// #1404: `delete_versioned` compares and deletes in one step.
+#[tokio::test]
+async fn mongodb_versioned_delete_is_a_compare_and_swap() {
+    let Some(backend) = create_backend("delete_cas_1404").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    versioned_write_race_suite::versioned_delete_is_a_compare_and_swap(&backend, "delete-cas-1404")
+        .await;
 }
 
 /// #1062: a comma-separated value list on one `SearchParameter` is OR per

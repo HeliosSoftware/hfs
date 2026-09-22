@@ -113,6 +113,11 @@ mod empty_value_suite;
 #[path = "search/modifier_parity_suite.rs"]
 mod modifier_parity_suite;
 
+/// The backend-agnostic race suite for version-aware writes (#1404, #1405).
+/// Same `#[path]` arrangement.
+#[path = "search/versioned_write_race_suite.rs"]
+mod versioned_write_race_suite;
+
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
 
@@ -19163,7 +19168,6 @@ mod postgres_integration {
         super::conditional_if_match_suite::concurrent_writers_with_the_same_if_match_admit_one(
             &backend,
             &unique_base("cond_if_match_race_1381"),
-            true,
         )
         .await;
     }
@@ -19317,5 +19321,53 @@ mod postgres_integration {
             .unwrap();
 
         assert!(included.is_empty());
+    }
+
+    /// #1404: of several writers holding the same version, one `update` writes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn postgres_integration_concurrent_updates_from_the_same_version_admit_one() {
+        let backend = create_backend().await;
+        super::versioned_write_race_suite::concurrent_updates_from_the_same_version_admit_one(
+            std::sync::Arc::new(backend),
+            &unique_base("update_race_1404"),
+            10,
+        )
+        .await;
+    }
+
+    /// #1404: an update and a versioned delete of the same version: one wins.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn postgres_integration_concurrent_update_and_versioned_delete_admit_one() {
+        let backend = create_backend().await;
+        super::versioned_write_race_suite::concurrent_update_and_versioned_delete_admit_one(
+            std::sync::Arc::new(backend),
+            &unique_base("delete_race_1404"),
+            10,
+        )
+        .await;
+    }
+
+    /// #1404: an update racing an unconditional delete leaves a contiguous
+    /// history.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn postgres_integration_concurrent_update_and_plain_delete_stay_consistent() {
+        let backend = create_backend().await;
+        super::versioned_write_race_suite::concurrent_update_and_plain_delete_stay_consistent(
+            std::sync::Arc::new(backend),
+            &unique_base("plain_delete_race_1404"),
+            10,
+        )
+        .await;
+    }
+
+    /// #1404: `delete_versioned` compares and deletes in one step.
+    #[tokio::test]
+    async fn postgres_integration_versioned_delete_is_a_compare_and_swap() {
+        let backend = create_backend().await;
+        super::versioned_write_race_suite::versioned_delete_is_a_compare_and_swap(
+            &backend,
+            &unique_base("delete_cas_1404"),
+        )
+        .await;
     }
 }

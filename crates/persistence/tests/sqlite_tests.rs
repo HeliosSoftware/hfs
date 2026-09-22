@@ -93,9 +93,72 @@ async fn sqlite_conditional_writers_with_the_same_if_match_admit_one() {
     conditional_if_match_suite::concurrent_writers_with_the_same_if_match_admit_one(
         &backend,
         "cond-if-match-race-1381",
-        true,
     )
     .await;
+}
+
+/// The backend-agnostic race suite for version-aware writes (#1404, #1405).
+/// Same `#[path]` arrangement.
+#[path = "search/versioned_write_race_suite.rs"]
+mod versioned_write_race_suite;
+
+/// A file-backed (WAL) backend with the default pool — what `hfs` runs in
+/// production. Several pooled connections on several runtime threads is the
+/// configuration in which SQLite writers really interleave; the shared-cache
+/// `:memory:` database serialises them at the table lock instead.
+fn create_file_backend(dir: &tempfile::TempDir) -> SqliteBackend {
+    let backend =
+        SqliteBackend::with_config(dir.path().join("race.db"), SqliteBackendConfig::default())
+            .expect("Failed to create SQLite backend");
+    backend.init_schema().expect("Failed to initialize schema");
+    backend
+}
+
+/// #1404: of several writers holding the same version, one `update` writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn sqlite_concurrent_updates_from_the_same_version_admit_one() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = std::sync::Arc::new(create_file_backend(&dir));
+    versioned_write_race_suite::concurrent_updates_from_the_same_version_admit_one(
+        backend,
+        "update-race-1404",
+        40,
+    )
+    .await;
+}
+
+/// #1404: an update and a versioned delete of the same version: one wins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn sqlite_concurrent_update_and_versioned_delete_admit_one() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = std::sync::Arc::new(create_file_backend(&dir));
+    versioned_write_race_suite::concurrent_update_and_versioned_delete_admit_one(
+        backend,
+        "delete-race-1404",
+        40,
+    )
+    .await;
+}
+
+/// #1404: an update racing an unconditional delete leaves a contiguous history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn sqlite_concurrent_update_and_plain_delete_stay_consistent() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = std::sync::Arc::new(create_file_backend(&dir));
+    versioned_write_race_suite::concurrent_update_and_plain_delete_stay_consistent(
+        backend,
+        "plain-delete-race-1404",
+        40,
+    )
+    .await;
+}
+
+/// #1404: `delete_versioned` compares and deletes in one step.
+#[tokio::test]
+async fn sqlite_versioned_delete_is_a_compare_and_swap() {
+    let backend = create_backend();
+    versioned_write_race_suite::versioned_delete_is_a_compare_and_swap(&backend, "delete-cas-1404")
+        .await;
 }
 
 fn create_backend() -> SqliteBackend {
