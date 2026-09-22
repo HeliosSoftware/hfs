@@ -1156,6 +1156,9 @@ test("a persisted pageshow clears the restored Start Export busy state", async (
 }) => {
   await bulkExport.goto();
   await bulkExport.nameInput.fill("Busy state export");
+  const restingWidth = await bulkExport.startButton.evaluate(
+    (button) => button.getBoundingClientRect().width,
+  );
   await bulkExport.form.evaluate((form) => {
     HTMLFormElement.prototype.submit = function () {};
     form.dispatchEvent(new SubmitEvent("submit", { bubbles: true, cancelable: true }));
@@ -1163,6 +1166,12 @@ test("a persisted pageshow clears the restored Start Export busy state", async (
 
   await expect(bulkExport.startButton).toHaveAttribute("aria-busy", "true");
   await expect(bulkExport.startButton).toBeDisabled();
+  // The ring's room is reserved at rest (.btn--busy-slot, #1253 review): the
+  // label stays and Start Export keeps its width while busy.
+  await expect(bulkExport.startButton).toHaveText("Start Export");
+  expect(
+    await bulkExport.startButton.evaluate((button) => button.getBoundingClientRect().width),
+  ).toBe(restingWidth);
   await page.evaluate(() => {
     window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
   });

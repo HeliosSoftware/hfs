@@ -403,6 +403,9 @@ test("execute busies the whole footer, ignores re-entrant clicks, and lands focu
   const restingColor = await page
     .locator("#batch-execute-top")
     .evaluate((button) => getComputedStyle(button).color);
+  const restingWidth = await page
+    .locator("#batch-execute-top")
+    .evaluate((button) => button.getBoundingClientRect().width);
   await page.locator("#batch-execute-top").click();
 
   // Execute spins and Cancel goes inert with it: a
@@ -417,16 +420,19 @@ test("execute busies the whole footer, ignores re-entrant clicks, and lands focu
 
   // The default-motion busy button (#1253): the label stays readable in its
   // resting color and the animated ring sits beside it in the flex row, not
-  // over an emptied pill. The filled primary gets the explicit white ring
-  // (accent-on-accent vanishes in dark theme).
+  // over an emptied pill. The ring's room was reserved before the click
+  // (.btn--busy-slot), so the button keeps its width. The filled primary
+  // gets the explicit white ring (accent-on-accent vanishes in dark theme).
   await expect(page.locator("#batch-execute-top")).toHaveText("Execute");
   const busyStyle = await page.locator("#batch-execute-top").evaluate((button) => ({
+    width: button.getBoundingClientRect().width,
     color: getComputedStyle(button).color,
     content: getComputedStyle(button, "::after").content,
     position: getComputedStyle(button, "::after").position,
     animation: getComputedStyle(button, "::after").animationName,
     ringTop: getComputedStyle(button, "::after").borderTopColor,
   }));
+  expect(busyStyle.width).toBe(restingWidth);
   expect(busyStyle.color).toBe(restingColor);
   expect(busyStyle.color).not.toBe("rgba(0, 0, 0, 0)");
   expect(busyStyle.content).toBe('""');

@@ -1700,9 +1700,8 @@ select.field__input {
 /* The busy button (#679), driven by busy.js: the label stays and the ring
    joins it as a trailing flex item, spaced by .btn's own gap (#1253). A
    blanked label left an empty pill that read as "the action vanished", not
-   "working". The button grows by the ring plus the gap while busy; the
-   height and padding hold. Under reduced motion the ring remains as a
-   static glyph (the animation stops above). */
+   "working". Under reduced motion the ring remains as a static glyph (the
+   animation stops above). */
 .btn[aria-busy="true"] {
   cursor: progress;
 }
@@ -1710,6 +1709,23 @@ select.field__input {
 .btn[aria-busy="true"]::after {
   content: "";
   flex: none;
+}
+
+/* A button busy.js can mark busy carries .btn--busy-slot, so the ring's
+   room (14px ring + 6px gap) is there before the click and the button never
+   changes width (#1253 review). At rest the room is split into two empty
+   4px boxes, one each side (4 + 6 gap on both sides = 20), which keeps the
+   label centered; busy drops the leading box and the trailing one becomes
+   the ring. Without the class a busy button still works, it just grows. */
+.btn--busy-slot::before,
+.btn--busy-slot::after {
+  content: "";
+  flex: none;
+  width: 4px;
+}
+
+.btn--busy-slot[aria-busy="true"]::before {
+  display: none;
 }
 
 /* The ring must not inherit accent-on-accent on the filled button — the
