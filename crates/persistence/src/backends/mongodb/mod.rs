@@ -28,6 +28,7 @@ mod search_impl;
 pub(crate) mod search_index_builder;
 pub(crate) mod search_index_catalog;
 mod storage;
+mod sync_failures;
 mod user_settings;
 
 pub use backend::{MongoBackend, MongoBackendConfig};

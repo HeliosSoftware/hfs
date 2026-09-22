@@ -123,6 +123,11 @@ mod versioned_write_race_suite;
 #[path = "search/conditional_patch_suite.rs"]
 mod conditional_patch_suite;
 
+/// The backend-agnostic contract of the secondary sync failure ledger
+/// (#1334). Same `#[path]` arrangement.
+#[path = "common/sync_failure_ledger_suite.rs"]
+mod sync_failure_ledger_suite;
+
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
 
@@ -19408,6 +19413,17 @@ mod postgres_integration {
         super::versioned_write_race_suite::versioned_delete_is_a_compare_and_swap(
             &backend,
             &unique_base("delete_cas_1404"),
+        )
+        .await;
+    }
+
+    /// #1334: the "needs reindex" ledger a composite keeps in this primary.
+    #[tokio::test]
+    async fn postgres_integration_sync_failure_ledger_contract() {
+        let backend = create_backend().await;
+        super::sync_failure_ledger_suite::ledger_folds_orders_clears_and_counts(
+            &backend,
+            &format!("ledger-1334-{}", uuid::Uuid::new_v4()),
         )
         .await;
     }
