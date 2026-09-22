@@ -15396,6 +15396,26 @@ mod postgres_integration {
             .with_batch_observer(observer)
     }
 
+    fn fresh_patient_entries(
+        count: usize,
+        prefix: &str,
+    ) -> Vec<helios_persistence::core::NdjsonEntry> {
+        use helios_persistence::core::NdjsonEntry;
+
+        (1..=count)
+            .map(|line| {
+                NdjsonEntry::new(
+                    line as u64,
+                    "Patient",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": format!("{prefix}-{line:04}")
+                    }),
+                )
+            })
+            .collect()
+    }
+
     async fn assert_bulk_submit_table_count(
         client: &tokio_postgres::Client,
         table: &str,
@@ -15407,33 +15427,239 @@ mod postgres_integration {
         assert_eq!(actual, expected, "unexpected {table} row count");
     }
 
-    /// #1136: a clean eligible batch keeps every observable per-entry
-    /// contract while PostgreSQL flushes all 100 creates at once.
+    /// #1136/#1455: clean eligible batches keep every observable per-entry
+    /// contract while PostgreSQL flushes ordered groups of at most 100.
     #[tokio::test]
     async fn postgres_bulk_submit_grouped_fresh_create_preserves_full_batch_contract() {
         use helios_persistence::core::{
             BulkEntryOutcome, BulkSubmitProvider, BulkSubmitRollbackProvider, NdjsonEntry,
         };
 
+        for size in [100usize, 101, 128, 500, 1000] {
+            let (backend, dbname) = isolated_reindex_backend().await;
+            let tenant = create_tenant(&format!("bulk-submit-grouped-clean-{size}"));
+            let tenant_id = tenant.tenant_id().as_str().to_string();
+            let (submission, manifest) =
+                new_bulk_submit_manifest(&backend, &tenant, &format!("grouped-clean-{size}")).await;
+            let client = reindex_test_client_for(&dbname).await;
+            install_resource_insert_statement_counter(&client).await;
+            let observer = std::sync::Arc::new(RecordingBulkSubmitBatches::default());
+            let entries: Vec<_> = (1..=size as u64)
+                .map(|line| {
+                    NdjsonEntry::new(
+                        line,
+                        "Patient",
+                        json!({
+                            "resourceType": "Patient",
+                            "id": format!("fresh-{line:04}"),
+                            "active": line % 2 == 0
+                        }),
+                    )
+                })
+                .collect();
+
+            let results = backend
+                .process_entries(
+                    &tenant,
+                    &submission,
+                    &manifest.manifest_id,
+                    entries,
+                    &grouped_create_options(observer.clone()),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(results.len(), size);
+            for (index, result) in results.iter().enumerate() {
+                let line = (index + 1) as u64;
+                let id = format!("fresh-{line:04}");
+                assert_eq!(result.line_number, line);
+                assert_eq!(result.resource_type, "Patient");
+                assert_eq!(result.resource_id.as_deref(), Some(id.as_str()));
+                assert!(result.created);
+                assert_eq!(result.outcome, BulkEntryOutcome::Success);
+            }
+
+            let batches = observer.0.lock().unwrap().clone();
+            assert_eq!(batches.len(), 1);
+            assert_eq!(batches[0].len(), size);
+            for (index, observed) in batches[0].iter().enumerate() {
+                let line = (index + 1) as u64;
+                let id = format!("fresh-{line:04}");
+                assert_eq!(observed.line_number, line);
+                assert_eq!(observed.resource_type, "Patient");
+                assert_eq!(observed.resource_id.as_deref(), Some(id.as_str()));
+                assert!(observed.created);
+                assert_eq!(observed.outcome, "success");
+            }
+
+            let stored = backend
+                .read(&tenant, "Patient", "fresh-0042")
+                .await
+                .unwrap()
+                .expect("grouped resource");
+            assert_eq!(stored.version_id(), "1");
+            assert_eq!(stored.tenant_id(), tenant.tenant_id());
+            assert_eq!(stored.fhir_version(), FhirVersion::R4);
+            assert_eq!(stored.content()["resourceType"], "Patient");
+            assert_eq!(stored.content()["id"], "fresh-0042");
+            assert_eq!(stored.content()["active"], true);
+
+            let page = backend
+                .get_entry_results_page(
+                    &tenant,
+                    &submission,
+                    &manifest.manifest_id,
+                    None,
+                    size as u32 + 1,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(page.entries.len(), size);
+            for (index, entry) in page.entries.iter().enumerate() {
+                let line = (index + 1) as u64;
+                let id = format!("fresh-{line:04}");
+                assert_eq!(entry.result.line_number, line);
+                assert_eq!(entry.result.resource_id.as_deref(), Some(id.as_str()));
+                assert!(entry.result.created);
+                assert_eq!(entry.result.outcome, BulkEntryOutcome::Success);
+            }
+
+            let changes = backend
+                .list_changes(&tenant, &submission, size as u32 + 1, 0)
+                .await
+                .unwrap();
+            assert_eq!(changes.len(), size);
+            let expected_ids: std::collections::BTreeSet<_> =
+                (1..=size).map(|line| format!("fresh-{line:04}")).collect();
+            let change_ids: std::collections::BTreeSet<_> = changes
+                .iter()
+                .map(|change| change.resource_id.clone())
+                .collect();
+            assert_eq!(change_ids, expected_ids);
+            for change in &changes {
+                assert_eq!(change.manifest_id, manifest.manifest_id);
+                assert_eq!(
+                    change.change_type,
+                    helios_persistence::core::ChangeType::Create
+                );
+                assert_eq!(change.resource_type, "Patient");
+                assert_eq!(change.new_version, "1");
+                assert!(change.previous_version.is_none());
+                assert!(change.previous_content.is_none());
+            }
+            let counts = backend
+                .get_entry_counts(&tenant, &submission, &manifest.manifest_id)
+                .await
+                .unwrap();
+            assert_eq!((counts.total, counts.success), (size as u64, size as u64));
+            assert_eq!(
+                (
+                    counts.validation_error,
+                    counts.processing_error,
+                    counts.skipped
+                ),
+                (0, 0, 0)
+            );
+
+            let manifest_after = backend
+                .get_manifest(&tenant, &submission, &manifest.manifest_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(manifest_after.total_entries, size as u64);
+            assert_eq!(manifest_after.processed_entries, size as u64);
+            assert_eq!(manifest_after.failed_entries, 0);
+
+            let expected = size as i64;
+            assert_eq!(
+                resource_insert_statements(&client).await,
+                size.div_ceil(100) as i64
+            );
+            assert_bulk_submit_table_count(&client, "resources", &tenant_id, expected).await;
+            assert_bulk_submit_table_count(&client, "resource_history", &tenant_id, expected).await;
+            assert_bulk_submit_table_count(&client, "bulk_entry_results", &tenant_id, expected)
+                .await;
+            assert_bulk_submit_table_count(
+                &client,
+                "bulk_submission_changes",
+                &tenant_id,
+                expected,
+            )
+            .await;
+            let history_rows = client
+                .query(
+                    "SELECT id, version_id, data->>'resourceType', data->>'id',
+                            data->>'active'
+                     FROM resource_history
+                     WHERE tenant_id = $1
+                     ORDER BY id, version_id::integer",
+                    &[&tenant_id],
+                )
+                .await
+                .unwrap();
+            assert_eq!(history_rows.len(), size);
+            for (index, row) in history_rows.iter().enumerate() {
+                let line = index + 1;
+                let expected_id = format!("fresh-{line:04}");
+                assert_eq!(row.get::<_, String>(0), expected_id);
+                assert_eq!(row.get::<_, String>(1), "1");
+                assert_eq!(row.get::<_, String>(2), "Patient");
+                assert_eq!(row.get::<_, String>(3), expected_id);
+                assert_eq!(row.get::<_, String>(4), (line % 2 == 0).to_string());
+            }
+            let bad_rows: i64 = client
+                .query_one(
+                    "SELECT COUNT(*) FROM resources
+                     WHERE tenant_id = $1 AND
+                           (version_id <> '1' OR is_deleted OR fhir_version <> '4.0' OR
+                            data->>'resourceType' <> resource_type OR data->>'id' <> id)",
+                    &[&tenant_id],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(bad_rows, 0);
+        }
+    }
+
+    /// #1455: compact input JSON, rather than allocator overhead, bounds each
+    /// grouped statement. An oversized resource is sent alone between its
+    /// small neighbours and every row remains durable in input order.
+    #[tokio::test]
+    async fn postgres_bulk_submit_grouped_chunks_respect_content_budget() {
+        use helios_persistence::core::{BulkSubmitProvider, NdjsonEntry};
+
         let (backend, dbname) = isolated_reindex_backend().await;
-        let tenant = create_tenant("bulk-submit-grouped-clean");
+        let tenant = create_tenant("bulk-submit-grouped-content-budget");
         let tenant_id = tenant.tenant_id().as_str().to_string();
         let (submission, manifest) =
-            new_bulk_submit_manifest(&backend, &tenant, "grouped-clean").await;
+            new_bulk_submit_manifest(&backend, &tenant, "grouped-content-budget").await;
+        let client = reindex_test_client_for(&dbname).await;
+        install_resource_insert_statement_counter(&client).await;
         let observer = std::sync::Arc::new(RecordingBulkSubmitBatches::default());
-        let entries: Vec<_> = (1..=100)
-            .map(|line| {
-                NdjsonEntry::new(
-                    line,
-                    "Patient",
-                    json!({
-                        "resourceType": "Patient",
-                        "id": format!("fresh-{line:03}"),
-                        "active": line % 2 == 0
-                    }),
-                )
-            })
-            .collect();
+        let entries = vec![
+            NdjsonEntry::new(
+                1,
+                "Patient",
+                json!({"resourceType":"Patient","id":"small-before","payload":"x"}),
+            ),
+            NdjsonEntry::new(
+                2,
+                "Patient",
+                json!({
+                    "resourceType":"Patient",
+                    "id":"oversized",
+                    "payload":"x".repeat(8 * 1024 * 1024)
+                }),
+            ),
+            NdjsonEntry::new(
+                3,
+                "Patient",
+                json!({"resourceType":"Patient","id":"small-after","payload":"z"}),
+            ),
+        ];
 
         let results = backend
             .process_entries(
@@ -15446,106 +15672,89 @@ mod postgres_integration {
             .await
             .unwrap();
 
-        assert_eq!(results.len(), 100);
-        for (index, result) in results.iter().enumerate() {
-            let line = (index + 1) as u64;
-            let id = format!("fresh-{line:03}");
-            assert_eq!(result.line_number, line);
-            assert_eq!(result.resource_type, "Patient");
-            assert_eq!(result.resource_id.as_deref(), Some(id.as_str()));
-            assert!(result.created);
-            assert_eq!(result.outcome, BulkEntryOutcome::Success);
-        }
-
-        let batches = observer.0.lock().unwrap().clone();
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].len(), 100);
-        for (index, observed) in batches[0].iter().enumerate() {
-            let line = (index + 1) as u64;
-            let id = format!("fresh-{line:03}");
-            assert_eq!(observed.line_number, line);
-            assert_eq!(observed.resource_type, "Patient");
-            assert_eq!(observed.resource_id.as_deref(), Some(id.as_str()));
-            assert!(observed.created);
-            assert_eq!(observed.outcome, "success");
-        }
-
-        let stored = backend
-            .read(&tenant, "Patient", "fresh-042")
-            .await
-            .unwrap()
-            .expect("grouped resource");
-        assert_eq!(stored.version_id(), "1");
-        assert_eq!(stored.tenant_id(), tenant.tenant_id());
-        assert_eq!(stored.fhir_version(), FhirVersion::R4);
-        assert_eq!(stored.content()["resourceType"], "Patient");
-        assert_eq!(stored.content()["id"], "fresh-042");
-        assert_eq!(stored.content()["active"], true);
-
-        let page = backend
-            .get_entry_results_page(&tenant, &submission, &manifest.manifest_id, None, 101, None)
-            .await
-            .unwrap();
-        assert_eq!(page.entries.len(), 100);
-        for (index, entry) in page.entries.iter().enumerate() {
-            let line = (index + 1) as u64;
-            let id = format!("fresh-{line:03}");
-            assert_eq!(entry.result.line_number, line);
-            assert_eq!(entry.result.resource_id.as_deref(), Some(id.as_str()));
-            assert!(entry.result.created);
-            assert_eq!(entry.result.outcome, BulkEntryOutcome::Success);
-        }
-
-        let changes = backend
-            .list_changes(&tenant, &submission, 101, 0)
-            .await
-            .unwrap();
-        assert_eq!(changes.len(), 100);
-        assert!(changes.iter().all(|change| {
-            change.change_type == helios_persistence::core::ChangeType::Create
-                && change.new_version == "1"
-                && change.previous_version.is_none()
-        }));
-        let counts = backend
-            .get_entry_counts(&tenant, &submission, &manifest.manifest_id)
-            .await
-            .unwrap();
-        assert_eq!((counts.total, counts.success), (100, 100));
+        assert_eq!(resource_insert_statements(&client).await, 3);
         assert_eq!(
-            (
-                counts.validation_error,
-                counts.processing_error,
-                counts.skipped
-            ),
-            (0, 0, 0)
+            results
+                .iter()
+                .map(|result| result.resource_id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["small-before", "oversized", "small-after"]
         );
-
-        let manifest_after = backend
-            .get_manifest(&tenant, &submission, &manifest.manifest_id)
+        assert!(
+            results
+                .iter()
+                .all(|result| result.is_success() && result.created)
+        );
+        assert_eq!(observer.0.lock().unwrap().len(), 1);
+        for table in [
+            "resources",
+            "resource_history",
+            "bulk_entry_results",
+            "bulk_submission_changes",
+        ] {
+            assert_bulk_submit_table_count(&client, table, &tenant_id, 3).await;
+        }
+        let stored = backend
+            .read(&tenant, "Patient", "oversized")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(manifest_after.total_entries, 100);
-        assert_eq!(manifest_after.processed_entries, 100);
-        assert_eq!(manifest_after.failed_entries, 0);
+        assert_eq!(
+            stored.content()["payload"].as_str().unwrap().len(),
+            8 * 1024 * 1024
+        );
+    }
 
+    /// Duplicate keys across count chunks must be rejected by the full-input
+    /// eligibility pass, preserving the original ordered create-then-update
+    /// behavior without a speculative grouped statement.
+    #[tokio::test]
+    async fn postgres_bulk_submit_grouped_chunks_preflight_all_keys() {
+        use helios_persistence::core::BulkSubmitProvider;
+
+        let (backend, dbname) = isolated_reindex_backend().await;
+        let tenant = create_tenant("bulk-submit-grouped-cross-chunk-duplicate");
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        let (submission, manifest) =
+            new_bulk_submit_manifest(&backend, &tenant, "grouped-cross-chunk-duplicate").await;
         let client = reindex_test_client_for(&dbname).await;
-        assert_bulk_submit_table_count(&client, "resources", &tenant_id, 100).await;
-        assert_bulk_submit_table_count(&client, "resource_history", &tenant_id, 100).await;
-        assert_bulk_submit_table_count(&client, "bulk_entry_results", &tenant_id, 100).await;
-        assert_bulk_submit_table_count(&client, "bulk_submission_changes", &tenant_id, 100).await;
-        let bad_rows: i64 = client
-            .query_one(
-                "SELECT COUNT(*) FROM resources
-                 WHERE tenant_id = $1 AND
-                       (version_id <> '1' OR is_deleted OR fhir_version <> '4.0' OR
-                        data->>'resourceType' <> resource_type OR data->>'id' <> id)",
-                &[&tenant_id],
+        install_resource_insert_statement_counter(&client).await;
+        let observer = std::sync::Arc::new(RecordingBulkSubmitBatches::default());
+        let mut entries = fresh_patient_entries(101, "cross-duplicate");
+        entries[100].resource_id = Some("cross-duplicate-0001".to_string());
+        entries[100].resource["id"] = json!("cross-duplicate-0001");
+
+        let results = backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest.manifest_id,
+                entries,
+                &grouped_create_options(observer.clone()),
             )
             .await
+            .unwrap();
+
+        assert_eq!(resource_insert_statements(&client).await, 100);
+        assert_eq!(results.len(), 101);
+        assert!(
+            results[..100]
+                .iter()
+                .all(|result| result.is_success() && result.created)
+        );
+        assert!(results[100].is_success());
+        assert!(!results[100].created);
+        let duplicate = backend
+            .read(&tenant, "Patient", "cross-duplicate-0001")
+            .await
             .unwrap()
-            .get(0);
-        assert_eq!(bad_rows, 0);
+            .unwrap();
+        assert_eq!(duplicate.version_id(), "2");
+        assert_eq!(observer.0.lock().unwrap().len(), 1);
+        assert_bulk_submit_table_count(&client, "resources", &tenant_id, 100).await;
+        assert_bulk_submit_table_count(&client, "resource_history", &tenant_id, 101).await;
+        assert_bulk_submit_table_count(&client, "bulk_entry_results", &tenant_id, 101).await;
+        assert_bulk_submit_table_count(&client, "bulk_submission_changes", &tenant_id, 101).await;
     }
 
     /// A permission error after a provisional create must discard the whole
@@ -15635,7 +15844,10 @@ mod postgres_integration {
     /// individual savepoints.
     #[tokio::test]
     async fn postgres_bulk_submit_grouped_row_failure_replays_with_pool_size_one() {
-        use helios_persistence::core::{BulkEntryOutcome, BulkSubmitProvider, NdjsonEntry};
+        use helios_persistence::core::{
+            BulkEntryOutcome, BulkSubmitProvider, BulkSubmitRollbackProvider, ChangeType,
+            NdjsonEntry,
+        };
 
         let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
         let tenant = create_tenant("bulk-submit-grouped-row-error");
@@ -15659,17 +15871,12 @@ mod postgres_integration {
             .await
             .unwrap();
         let observer = std::sync::Arc::new(RecordingBulkSubmitBatches::default());
-        let entries = ["good-a", "bad", "good-b"]
-            .into_iter()
-            .enumerate()
-            .map(|(index, id)| {
-                NdjsonEntry::new(
-                    (index + 1) as u64,
-                    "Patient",
-                    json!({"resourceType":"Patient","id":id}),
-                )
-            })
-            .collect();
+        let mut entries = fresh_patient_entries(200, "pool-good");
+        entries.push(NdjsonEntry::new(
+            201,
+            "Patient",
+            json!({"resourceType":"Patient","id":"bad"}),
+        ));
 
         let results = tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -15684,26 +15891,92 @@ mod postgres_integration {
         .await
         .expect("replay deadlocked while waiting for the only pool connection")
         .unwrap();
-        assert_eq!(results.len(), 3);
-        assert!(results[0].is_success());
-        assert_eq!(results[1].outcome, BulkEntryOutcome::ProcessingError);
-        assert!(results[2].is_success());
-        assert_eq!(observer.0.lock().unwrap().len(), 1);
+        assert_eq!(results.len(), 201);
+        for (index, result) in results[..200].iter().enumerate() {
+            let line = index + 1;
+            let expected_id = format!("pool-good-{line:04}");
+            assert_eq!(result.line_number, line as u64);
+            assert_eq!(result.resource_type, "Patient");
+            assert_eq!(result.resource_id.as_deref(), Some(expected_id.as_str()));
+            assert!(result.is_success() && result.created);
+            assert!(result.operation_outcome.is_none());
+        }
+        assert_eq!(results[200].line_number, 201);
+        assert_eq!(results[200].resource_type, "Patient");
+        assert!(results[200].resource_id.is_none());
+        assert_eq!(results[200].outcome, BulkEntryOutcome::ProcessingError);
+        assert!(results[200].operation_outcome.is_some());
+        let observed = observer.0.lock().unwrap().clone();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].len(), results.len());
+        for (actual, expected) in observed[0].iter().zip(&results) {
+            assert_eq!(actual.line_number, expected.line_number);
+            assert_eq!(actual.resource_type, expected.resource_type);
+            assert_eq!(actual.resource_id, expected.resource_id);
+            assert_eq!(actual.created, expected.created);
+            assert_eq!(actual.outcome, expected.outcome.to_string());
+        }
 
-        assert_bulk_submit_table_count(&client, "resources", &tenant_id, 2).await;
-        assert_bulk_submit_table_count(&client, "resource_history", &tenant_id, 2).await;
-        assert_bulk_submit_table_count(&client, "bulk_entry_results", &tenant_id, 3).await;
-        assert_bulk_submit_table_count(&client, "bulk_submission_changes", &tenant_id, 2).await;
-        for id in ["good-a", "good-b"] {
-            let history: i64 = client
-                .query_one(
-                    "SELECT COUNT(*) FROM resource_history WHERE tenant_id = $1 AND id = $2",
-                    &[&tenant_id, &id],
-                )
-                .await
-                .unwrap()
-                .get(0);
-            assert_eq!(history, 1, "{id} must be created once after replay");
+        let receipts = backend
+            .get_entry_results_page(&tenant, &submission, &manifest.manifest_id, None, 202, None)
+            .await
+            .unwrap();
+        assert!(receipts.next.is_none());
+        assert_eq!(receipts.entries.len(), results.len());
+        for (receipt, expected) in receipts.entries.iter().zip(&results) {
+            assert_eq!(receipt.result.line_number, expected.line_number);
+            assert_eq!(receipt.result.resource_type, expected.resource_type);
+            assert_eq!(receipt.result.resource_id, expected.resource_id);
+            assert_eq!(receipt.result.created, expected.created);
+            assert_eq!(receipt.result.outcome, expected.outcome);
+            assert_eq!(receipt.result.operation_outcome, expected.operation_outcome);
+            let identity = receipt.stored_identity.as_ref().unwrap();
+            assert_eq!(identity.file_url, "https://provider.example/fresh.ndjson");
+            assert_eq!(identity.line_number, expected.line_number);
+        }
+
+        assert_bulk_submit_table_count(&client, "resources", &tenant_id, 200).await;
+        assert_bulk_submit_table_count(&client, "resource_history", &tenant_id, 200).await;
+        assert_bulk_submit_table_count(&client, "bulk_entry_results", &tenant_id, 201).await;
+        assert_bulk_submit_table_count(&client, "bulk_submission_changes", &tenant_id, 200).await;
+        let history_rows = client
+            .query(
+                "SELECT id, version_id, data->>'resourceType', data->>'id'
+                 FROM resource_history
+                 WHERE tenant_id = $1
+                 ORDER BY id, version_id::integer",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(history_rows.len(), 200);
+        for (index, row) in history_rows.iter().enumerate() {
+            let expected_id = format!("pool-good-{:04}", index + 1);
+            assert_eq!(row.get::<_, String>(0), expected_id);
+            assert_eq!(row.get::<_, String>(1), "1");
+            assert_eq!(row.get::<_, String>(2), "Patient");
+            assert_eq!(row.get::<_, String>(3), expected_id);
+        }
+        let changes = backend
+            .list_changes(&tenant, &submission, 202, 0)
+            .await
+            .unwrap();
+        assert_eq!(changes.len(), 200);
+        let expected_change_ids: std::collections::BTreeSet<_> = (1..=200)
+            .map(|line| format!("pool-good-{line:04}"))
+            .collect();
+        let change_ids: std::collections::BTreeSet<_> = changes
+            .iter()
+            .map(|change| change.resource_id.clone())
+            .collect();
+        assert_eq!(change_ids, expected_change_ids);
+        for change in &changes {
+            assert_eq!(change.manifest_id, manifest.manifest_id);
+            assert_eq!(change.change_type, ChangeType::Create);
+            assert_eq!(change.resource_type, "Patient");
+            assert_eq!(change.new_version, "1");
+            assert!(change.previous_version.is_none());
+            assert!(change.previous_content.is_none());
         }
         let counts = backend
             .get_entry_counts(&tenant, &submission, &manifest.manifest_id)
@@ -15711,7 +15984,7 @@ mod postgres_integration {
             .unwrap();
         assert_eq!(
             (counts.total, counts.success, counts.processing_error),
-            (3, 2, 1)
+            (201, 200, 1)
         );
     }
 
@@ -15745,9 +16018,9 @@ mod postgres_integration {
             .get(0)
     }
 
-    /// An active target-tenant key must select the individual path before any
-    /// grouped insert is attempted. The fresh companion therefore accounts for
-    /// the only resource INSERT statement.
+    /// An active target-tenant key in the final lookup slice must select the
+    /// individual path before any grouped insert is attempted. The 100 fresh
+    /// predecessors therefore account for exactly 100 INSERT statements.
     #[tokio::test]
     async fn postgres_bulk_submit_active_candidate_routes_before_grouped_insert() {
         use helios_persistence::core::{
@@ -15778,37 +16051,36 @@ mod postgres_integration {
             let options =
                 grouped_create_options(observer.clone()).with_allow_updates(allow_updates);
 
+            let mut entries = fresh_patient_entries(100, "active-preflight");
+            entries.push(NdjsonEntry::new(
+                101,
+                "Patient",
+                json!({"resourceType":"Patient","id":"active","name":[{"family":"Submitted"}]}),
+            ));
             let results = backend
                 .process_entries(
                     &tenant,
                     &submission,
                     &manifest.manifest_id,
-                    vec![
-                        NdjsonEntry::new(
-                            1,
-                            "Patient",
-                            json!({"resourceType":"Patient","id":"active","name":[{"family":"Submitted"}]}),
-                        ),
-                        NdjsonEntry::new(
-                            2,
-                            "Patient",
-                            json!({"resourceType":"Patient","id":"fresh"}),
-                        ),
-                    ],
+                    entries,
                     &options,
                 )
                 .await
                 .unwrap();
 
-            assert_eq!(results.len(), 2);
+            assert_eq!(results.len(), 101);
+            assert!(
+                results[..100]
+                    .iter()
+                    .all(|result| result.is_success() && result.created)
+            );
             if allow_updates {
-                assert!(results[0].is_success());
-                assert!(!results[0].created);
+                assert!(results[100].is_success());
+                assert!(!results[100].created);
             } else {
-                assert_eq!(results[0].outcome, BulkEntryOutcome::Skipped);
+                assert_eq!(results[100].outcome, BulkEntryOutcome::Skipped);
             }
-            assert!(results[1].is_success() && results[1].created);
-            assert_eq!(resource_insert_statements(&client).await, 1);
+            assert_eq!(resource_insert_statements(&client).await, 100);
             assert_eq!(observer.0.lock().unwrap().len(), 1);
 
             let active = backend
@@ -15822,24 +16094,24 @@ mod postgres_integration {
             );
             assert_eq!(active.version_id(), if allow_updates { "2" } else { "1" });
             let changes = backend
-                .list_changes(&tenant, &submission, 10, 0)
+                .list_changes(&tenant, &submission, 202, 0)
                 .await
                 .unwrap();
-            assert_eq!(changes.len(), if allow_updates { 2 } else { 1 });
+            assert_eq!(changes.len(), if allow_updates { 101 } else { 100 });
             let counts = backend
                 .get_entry_counts(&tenant, &submission, &manifest.manifest_id)
                 .await
                 .unwrap();
-            assert_eq!(counts.total, 2);
-            assert_eq!(counts.success, if allow_updates { 2 } else { 1 });
+            assert_eq!(counts.total, 101);
+            assert_eq!(counts.success, if allow_updates { 101 } else { 100 });
             assert_eq!(counts.skipped, if allow_updates { 0 } else { 1 });
             assert_eq!(counts.processing_error, 0);
         }
     }
 
-    /// Soft-deleted rows are candidates too. Finding the row before the grouped
-    /// attempt leaves exactly one failed individual INSERT; filtering deleted
-    /// rows from the candidate query would add an earlier grouped attempt.
+    /// Soft-deleted rows are candidates too. Finding one in the final lookup
+    /// slice leaves 100 successful and one failed individual INSERT; filtering
+    /// tombstones from preflight would add an earlier grouped attempt.
     #[tokio::test]
     async fn postgres_bulk_submit_deleted_candidate_routes_before_grouped_insert() {
         use helios_persistence::core::{BulkEntryOutcome, BulkSubmitProvider, NdjsonEntry};
@@ -15869,24 +16141,31 @@ mod postgres_integration {
             let options =
                 grouped_create_options(observer.clone()).with_allow_updates(allow_updates);
 
+            let mut entries = fresh_patient_entries(100, "deleted-preflight");
+            entries.push(NdjsonEntry::new(
+                101,
+                "Patient",
+                json!({"resourceType":"Patient","id":"deleted"}),
+            ));
             let results = backend
                 .process_entries(
                     &tenant,
                     &submission,
                     &manifest.manifest_id,
-                    vec![NdjsonEntry::new(
-                        1,
-                        "Patient",
-                        json!({"resourceType":"Patient","id":"deleted"}),
-                    )],
+                    entries,
                     &options,
                 )
                 .await
                 .unwrap();
 
-            assert_eq!(results.len(), 1);
-            assert_eq!(results[0].outcome, BulkEntryOutcome::ProcessingError);
-            assert_eq!(resource_insert_statements(&client).await, 1);
+            assert_eq!(results.len(), 101);
+            assert!(
+                results[..100]
+                    .iter()
+                    .all(|result| result.is_success() && result.created)
+            );
+            assert_eq!(results[100].outcome, BulkEntryOutcome::ProcessingError);
+            assert_eq!(resource_insert_statements(&client).await, 101);
             assert_eq!(observer.0.lock().unwrap().len(), 1);
             assert!(matches!(
                 backend.read(&tenant, "Patient", "deleted").await,
@@ -15898,7 +16177,7 @@ mod postgres_integration {
                 .unwrap();
             assert_eq!(
                 (counts.total, counts.success, counts.processing_error),
-                (1, 0, 1)
+                (101, 100, 1)
             );
         }
     }
@@ -16005,13 +16284,93 @@ mod postgres_integration {
         }
     }
 
+    /// A PostgreSQL primary whose search is offloaded (the pg-es wiring) keeps
+    /// the original individual path even for a large otherwise-eligible batch.
+    #[tokio::test]
+    async fn postgres_bulk_submit_grouped_over_100_excludes_search_offload() {
+        use helios_persistence::core::BulkSubmitProvider;
+
+        let (mut backend, dbname) = isolated_reindex_backend().await;
+        backend.set_search_offloaded(true);
+        let tenant = create_tenant("grouped-over-100-search-offloaded");
+        let (submission, manifest) =
+            new_bulk_submit_manifest(&backend, &tenant, "grouped-over-100-search-offloaded").await;
+        let client = reindex_test_client_for(&dbname).await;
+        install_resource_insert_statement_counter(&client).await;
+        let observer = std::sync::Arc::new(RecordingBulkSubmitBatches::default());
+
+        let results = backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest.manifest_id,
+                fresh_patient_entries(101, "offloaded"),
+                &grouped_create_options(observer.clone()),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            results
+                .iter()
+                .all(|result| result.is_success() && result.created)
+        );
+        assert_eq!(resource_insert_statements(&client).await, 101);
+        assert_eq!(observer.0.lock().unwrap()[0].len(), 101);
+    }
+
+    /// An observer that asks for committed resources keeps the individual path
+    /// and receives the exact ordered contents for a batch above 100.
+    #[tokio::test]
+    async fn postgres_bulk_submit_grouped_over_100_excludes_resource_observer() {
+        use helios_persistence::core::{BulkProcessingOptions, BulkSubmitProvider};
+
+        let (backend, dbname) = isolated_reindex_backend().await;
+        let tenant = create_tenant("grouped-over-100-resource-observer");
+        let (submission, manifest) =
+            new_bulk_submit_manifest(&backend, &tenant, "grouped-over-100-resource-observer").await;
+        let client = reindex_test_client_for(&dbname).await;
+        install_resource_insert_statement_counter(&client).await;
+        let observer = std::sync::Arc::new(RecordingCommittedResources::default());
+        let expected: Vec<_> = (1..=101)
+            .map(|line| format!("observed-{line:04}"))
+            .collect();
+        let options = BulkProcessingOptions::new()
+            .with_defer_indexing(true)
+            .with_file_url("https://provider.example/observed.ndjson")
+            .with_batch_observer(observer.clone());
+
+        let results = backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest.manifest_id,
+                fresh_patient_entries(101, "observed"),
+                &options,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            results
+                .iter()
+                .all(|result| result.is_success() && result.created)
+        );
+        assert_eq!(resource_insert_statements(&client).await, 101);
+        let observed = observer.batches.lock().unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].0, expected);
+        assert_eq!(observed[0].1, expected);
+    }
+
     /// The candidate query can race a competing insert. A trigger blocks the
     /// grouped insert after that query has completed, while another transaction
     /// inserts and commits the conflicting key under the same advisory lock.
     #[tokio::test]
     async fn postgres_bulk_submit_grouped_concurrent_conflict_replays_for_both_update_modes() {
         use helios_persistence::core::{
-            BulkEntryOutcome, BulkSubmitProvider, BulkSubmitRollbackProvider, NdjsonEntry,
+            BulkEntryOutcome, BulkSubmitProvider, BulkSubmitRollbackProvider, ChangeType,
+            NdjsonEntry,
         };
         use std::sync::Arc;
 
@@ -16063,24 +16422,19 @@ mod postgres_integration {
             let task_tenant = tenant.clone();
             let task_submission = submission.clone();
             let task_manifest_id = manifest.manifest_id.clone();
+            let mut entries = fresh_patient_entries(200, "before-race");
+            entries.push(NdjsonEntry::new(
+                201,
+                "Patient",
+                json!({"resourceType":"Patient","id":"race","name":[{"family":"Submitted"}]}),
+            ));
             let ingest = tokio::spawn(async move {
                 task_backend
                     .process_entries(
                         &task_tenant,
                         &task_submission,
                         &task_manifest_id,
-                        vec![
-                            NdjsonEntry::new(
-                                1,
-                                "Patient",
-                                json!({"resourceType":"Patient","id":"before-race"}),
-                            ),
-                            NdjsonEntry::new(
-                                2,
-                                "Patient",
-                                json!({"resourceType":"Patient","id":"race","name":[{"family":"Submitted"}]}),
-                            ),
-                        ],
+                        entries,
                         &options,
                     )
                     .await
@@ -16142,40 +16496,101 @@ mod postgres_integration {
                 .expect("ingest remained blocked after the competitor committed")
                 .unwrap()
                 .unwrap();
-            assert_eq!(results.len(), 2);
-            assert!(results[0].is_success() && results[0].created);
+            assert_eq!(results.len(), 201);
+            for (index, result) in results[..200].iter().enumerate() {
+                let line = index + 1;
+                let expected_id = format!("before-race-{line:04}");
+                assert_eq!(result.line_number, line as u64);
+                assert_eq!(result.resource_type, "Patient");
+                assert_eq!(result.resource_id.as_deref(), Some(expected_id.as_str()));
+                assert!(result.is_success() && result.created);
+                assert!(result.operation_outcome.is_none());
+            }
+            assert_eq!(results[200].line_number, 201);
+            assert_eq!(results[200].resource_type, "Patient");
             if allow_updates {
-                assert!(results[1].is_success());
-                assert!(!results[1].created);
-                assert_eq!(results[1].resource_id.as_deref(), Some("race"));
+                assert!(results[200].is_success());
+                assert!(!results[200].created);
+                assert_eq!(results[200].resource_id.as_deref(), Some("race"));
+                assert!(results[200].operation_outcome.is_none());
             } else {
-                assert_eq!(results[1].outcome, BulkEntryOutcome::Skipped);
+                assert_eq!(results[200].outcome, BulkEntryOutcome::Skipped);
+                assert!(results[200].resource_id.is_none());
+                assert!(!results[200].created);
+                assert_eq!(
+                    results[200].operation_outcome.as_ref().unwrap()["issue"][0]["diagnostics"],
+                    "updates not allowed"
+                );
             }
             let observed = observer.0.lock().unwrap().clone();
             assert_eq!(observed.len(), 1);
-            assert_eq!(observed[0].len(), 2);
-            assert_eq!(observed[0][0].resource_id.as_deref(), Some("before-race"));
+            assert_eq!(observed[0].len(), 201);
+            for (actual, expected) in observed[0].iter().zip(&results) {
+                assert_eq!(actual.line_number, expected.line_number);
+                assert_eq!(actual.resource_type, expected.resource_type);
+                assert_eq!(actual.resource_id, expected.resource_id);
+                assert_eq!(actual.created, expected.created);
+                assert_eq!(actual.outcome, expected.outcome.to_string());
+            }
 
-            let before_history: i64 = client
-                .query_one(
-                    "SELECT COUNT(*) FROM resource_history
-                     WHERE tenant_id = $1 AND id = 'before-race'",
+            let receipts = backend
+                .get_entry_results_page(
+                    &tenant,
+                    &submission,
+                    &manifest.manifest_id,
+                    None,
+                    202,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(receipts.next.is_none());
+            assert_eq!(receipts.entries.len(), results.len());
+            for (receipt, expected) in receipts.entries.iter().zip(&results) {
+                assert_eq!(receipt.result.line_number, expected.line_number);
+                assert_eq!(receipt.result.resource_type, expected.resource_type);
+                assert_eq!(receipt.result.resource_id, expected.resource_id);
+                assert_eq!(receipt.result.created, expected.created);
+                assert_eq!(receipt.result.outcome, expected.outcome);
+                assert_eq!(receipt.result.operation_outcome, expected.operation_outcome);
+                let identity = receipt.stored_identity.as_ref().unwrap();
+                assert_eq!(identity.file_url, "https://provider.example/fresh.ndjson");
+                assert_eq!(identity.line_number, expected.line_number);
+            }
+
+            let history_rows = client
+                .query(
+                    "SELECT id, version_id, data->>'resourceType', data->>'id',
+                            data->'name'->0->>'family'
+                     FROM resource_history
+                     WHERE tenant_id = $1
+                     ORDER BY id, version_id::integer",
                     &[&tenant_id],
                 )
                 .await
-                .unwrap()
-                .get(0);
-            assert_eq!(before_history, 1, "the provisional create survived replay");
-            let race_history: i64 = client
-                .query_one(
-                    "SELECT COUNT(*) FROM resource_history
-                     WHERE tenant_id = $1 AND id = 'race'",
-                    &[&tenant_id],
-                )
-                .await
-                .unwrap()
-                .get(0);
-            assert_eq!(race_history, if allow_updates { 2 } else { 1 });
+                .unwrap();
+            assert_eq!(history_rows.len(), if allow_updates { 202 } else { 201 });
+            for (index, row) in history_rows.iter().take(200).enumerate() {
+                let expected_id = format!("before-race-{:04}", index + 1);
+                assert_eq!(row.get::<_, String>(0), expected_id);
+                assert_eq!(row.get::<_, String>(1), "1");
+                assert_eq!(row.get::<_, String>(2), "Patient");
+                assert_eq!(row.get::<_, String>(3), expected_id);
+                assert_eq!(row.get::<_, Option<String>>(4), None);
+            }
+            let race_rows = &history_rows[200..];
+            assert_eq!(race_rows[0].get::<_, String>(0), "race");
+            assert_eq!(race_rows[0].get::<_, String>(1), "1");
+            assert_eq!(race_rows[0].get::<_, String>(2), "Patient");
+            assert_eq!(race_rows[0].get::<_, String>(3), "race");
+            assert_eq!(race_rows[0].get::<_, String>(4), "Competitor");
+            if allow_updates {
+                assert_eq!(race_rows[1].get::<_, String>(0), "race");
+                assert_eq!(race_rows[1].get::<_, String>(1), "2");
+                assert_eq!(race_rows[1].get::<_, String>(2), "Patient");
+                assert_eq!(race_rows[1].get::<_, String>(3), "race");
+                assert_eq!(race_rows[1].get::<_, String>(4), "Submitted");
+            }
             let race = backend
                 .read(&tenant, "Patient", "race")
                 .await
@@ -16192,16 +16607,46 @@ mod postgres_integration {
             assert_eq!(race.version_id(), if allow_updates { "2" } else { "1" });
 
             let changes = backend
-                .list_changes(&tenant, &submission, 10, 0)
+                .list_changes(&tenant, &submission, 202, 0)
                 .await
                 .unwrap();
-            assert_eq!(changes.len(), if allow_updates { 2 } else { 1 });
+            assert_eq!(changes.len(), if allow_updates { 201 } else { 200 });
+            let mut expected_change_ids: std::collections::BTreeSet<_> = (1..=200)
+                .map(|line| format!("before-race-{line:04}"))
+                .collect();
+            if allow_updates {
+                expected_change_ids.insert("race".to_string());
+            }
+            let change_ids: std::collections::BTreeSet<_> = changes
+                .iter()
+                .map(|change| change.resource_id.clone())
+                .collect();
+            assert_eq!(change_ids, expected_change_ids);
+            for change in &changes {
+                assert_eq!(change.manifest_id, manifest.manifest_id);
+                assert_eq!(change.resource_type, "Patient");
+                if change.resource_id == "race" {
+                    assert!(allow_updates);
+                    assert_eq!(change.change_type, ChangeType::Update);
+                    assert_eq!(change.previous_version.as_deref(), Some("1"));
+                    assert_eq!(change.new_version, "2");
+                    assert_eq!(
+                        change.previous_content.as_ref().unwrap()["name"][0]["family"],
+                        "Competitor"
+                    );
+                } else {
+                    assert_eq!(change.change_type, ChangeType::Create);
+                    assert!(change.previous_version.is_none());
+                    assert_eq!(change.new_version, "1");
+                    assert!(change.previous_content.is_none());
+                }
+            }
             let counts = backend
                 .get_entry_counts(&tenant, &submission, &manifest.manifest_id)
                 .await
                 .unwrap();
-            assert_eq!(counts.total, 2);
-            assert_eq!(counts.success, if allow_updates { 2 } else { 1 });
+            assert_eq!(counts.total, 201);
+            assert_eq!(counts.success, if allow_updates { 201 } else { 200 });
             assert_eq!(counts.skipped, if allow_updates { 0 } else { 1 });
             assert_eq!(counts.processing_error, 0);
         }
@@ -16238,7 +16683,7 @@ mod postgres_integration {
     /// The caller must roll back the transaction without replaying resources.
     #[tokio::test]
     async fn postgres_bulk_submit_post_flush_bookkeeping_failure_does_not_replay() {
-        use helios_persistence::core::{BulkSubmitProvider, NdjsonEntry};
+        use helios_persistence::core::BulkSubmitProvider;
 
         for (fault_table, label) in [
             ("bulk_entry_results", "receipt"),
@@ -16268,17 +16713,7 @@ mod postgres_integration {
                 .await
                 .unwrap();
             let observer = std::sync::Arc::new(RecordingBulkSubmitBatches::default());
-            let entries = [format!("{label}-a"), format!("{label}-b")]
-                .into_iter()
-                .enumerate()
-                .map(|(index, id)| {
-                    NdjsonEntry::new(
-                        (index + 1) as u64,
-                        "Patient",
-                        json!({"resourceType":"Patient","id":id}),
-                    )
-                })
-                .collect();
+            let entries = fresh_patient_entries(201, &format!("{label}-failure"));
 
             assert!(
                 backend
@@ -16293,7 +16728,7 @@ mod postgres_integration {
                     .is_err()
             );
             assert!(observer.0.lock().unwrap().is_empty());
-            assert_eq!(grouped_resource_attempts(&client).await, 2);
+            assert_eq!(grouped_resource_attempts(&client).await, 201);
             for table in [
                 "resources",
                 "resource_history",
@@ -16323,7 +16758,7 @@ mod postgres_integration {
     /// the transaction committed.
     #[tokio::test]
     async fn postgres_bulk_submit_deferred_commit_failure_does_not_replay() {
-        use helios_persistence::core::{BulkSubmitProvider, NdjsonEntry};
+        use helios_persistence::core::BulkSubmitProvider;
 
         let (backend, dbname) = isolated_reindex_backend().await;
         let tenant = create_tenant("grouped-commit-failure");
@@ -16349,17 +16784,7 @@ mod postgres_integration {
             .await
             .unwrap();
         let observer = std::sync::Arc::new(RecordingBulkSubmitBatches::default());
-        let entries = ["commit-a", "commit-b"]
-            .into_iter()
-            .enumerate()
-            .map(|(index, id)| {
-                NdjsonEntry::new(
-                    (index + 1) as u64,
-                    "Patient",
-                    json!({"resourceType":"Patient","id":id}),
-                )
-            })
-            .collect();
+        let entries = fresh_patient_entries(201, "commit-failure");
 
         assert!(
             backend
@@ -16374,7 +16799,7 @@ mod postgres_integration {
                 .is_err()
         );
         assert!(observer.0.lock().unwrap().is_empty());
-        assert_eq!(grouped_resource_attempts(&client).await, 2);
+        assert_eq!(grouped_resource_attempts(&client).await, 201);
         for table in [
             "resources",
             "resource_history",
@@ -16398,6 +16823,76 @@ mod postgres_integration {
         );
     }
 
+    /// The submission-activity timestamp is deliberately updated after the
+    /// resource transaction commits and after observers are notified. Its
+    /// failure must surface without replaying or hiding the durable batch.
+    #[tokio::test]
+    async fn postgres_bulk_submit_post_commit_activity_failure_preserves_committed_batch() {
+        use helios_persistence::core::BulkSubmitProvider;
+
+        let (backend, dbname) = isolated_reindex_backend().await;
+        let tenant = create_tenant("grouped-post-commit-activity-failure");
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        let (submission, manifest) =
+            new_bulk_submit_manifest(&backend, &tenant, "grouped-post-commit-activity-failure")
+                .await;
+        let client = reindex_test_client_for(&dbname).await;
+        install_resource_attempt_counter(&client, &tenant_id).await;
+        client
+            .batch_execute(&format!(
+                "CREATE FUNCTION reject_submission_activity() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   IF NEW.tenant_id = '{tenant_id}' THEN
+                     RAISE EXCEPTION 'deliberate post-commit activity failure';
+                   END IF;
+                   RETURN NEW;
+                 END $$;
+                 CREATE TRIGGER reject_submission_activity
+                 BEFORE UPDATE OF updated_at ON bulk_submissions
+                 FOR EACH ROW EXECUTE FUNCTION reject_submission_activity();"
+            ))
+            .await
+            .unwrap();
+        let observer = std::sync::Arc::new(RecordingBulkSubmitBatches::default());
+
+        let error = backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest.manifest_id,
+                fresh_patient_entries(201, "post-commit"),
+                &grouped_create_options(observer.clone()),
+            )
+            .await
+            .expect_err("the post-commit activity write must surface");
+        assert!(error.to_string().contains("Failed to update submission"));
+        assert_eq!(grouped_resource_attempts(&client).await, 201);
+        let observed = observer.0.lock().unwrap().clone();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].len(), 201);
+        for table in [
+            "resources",
+            "resource_history",
+            "bulk_entry_results",
+            "bulk_submission_changes",
+        ] {
+            assert_bulk_submit_table_count(&client, table, &tenant_id, 201).await;
+        }
+        let current = backend
+            .get_manifest(&tenant, &submission, &manifest.manifest_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                current.total_entries,
+                current.processed_entries,
+                current.failed_entries
+            ),
+            (201, 201, 0)
+        );
+    }
+
     /// #1127 moved the manifest counters into the batch transaction, so they
     /// commit — or vanish — with the rows they describe. A counter failure
     /// therefore takes the whole batch down with it: nothing durable, nothing
@@ -16406,7 +16901,7 @@ mod postgres_integration {
     /// charging the same lines twice.
     #[tokio::test]
     async fn postgres_bulk_submit_counter_failure_rolls_back_the_whole_batch() {
-        use helios_persistence::core::{BulkSubmitProvider, NdjsonEntry};
+        use helios_persistence::core::BulkSubmitProvider;
 
         let (backend, dbname) = isolated_reindex_backend().await;
         let tenant = create_tenant("grouped-tail-failure");
@@ -16431,17 +16926,7 @@ mod postgres_integration {
             .await
             .unwrap();
         let observer = std::sync::Arc::new(RecordingBulkSubmitBatches::default());
-        let entries = ["tail-a", "tail-b"]
-            .into_iter()
-            .enumerate()
-            .map(|(index, id)| {
-                NdjsonEntry::new(
-                    (index + 1) as u64,
-                    "Patient",
-                    json!({"resourceType":"Patient","id":id}),
-                )
-            })
-            .collect();
+        let entries = fresh_patient_entries(201, "counter-failure");
 
         assert!(
             backend
@@ -16459,8 +16944,8 @@ mod postgres_integration {
         // never see work the transaction rolled back.
         assert_eq!(observer.0.lock().unwrap().len(), 0);
         // The attempt counter is a sequence, so it survives the rollback and
-        // still proves both creates were flushed as one grouped statement.
-        assert_eq!(grouped_resource_attempts(&client).await, 2);
+        // still proves all three groups were attempted exactly once.
+        assert_eq!(grouped_resource_attempts(&client).await, 201);
         for table in [
             "resources",
             "resource_history",
@@ -16489,7 +16974,7 @@ mod postgres_integration {
     /// open a replay transaction.
     #[tokio::test]
     async fn postgres_bulk_submit_grouped_rollback_failure_stops_before_replay() {
-        use helios_persistence::core::{BulkSubmitProvider, NdjsonEntry};
+        use helios_persistence::core::BulkSubmitProvider;
 
         let (backend, dbname) = isolated_reindex_backend().await;
         let tenant = create_tenant("grouped-rollback-failure");
@@ -16515,17 +17000,7 @@ mod postgres_integration {
             .await
             .unwrap();
         let observer = std::sync::Arc::new(RecordingBulkSubmitBatches::default());
-        let entries = ["terminate-a", "terminate-b"]
-            .into_iter()
-            .enumerate()
-            .map(|(index, id)| {
-                NdjsonEntry::new(
-                    (index + 1) as u64,
-                    "Patient",
-                    json!({"resourceType":"Patient","id":id}),
-                )
-            })
-            .collect();
+        let entries = fresh_patient_entries(201, "terminate");
 
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -16558,6 +17033,138 @@ mod postgres_integration {
             "bulk_submission_changes",
         ] {
             assert_bulk_submit_table_count(&client, table, &tenant_id, 0).await;
+        }
+        let current = backend
+            .get_manifest(&tenant, &submission, &manifest.manifest_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                current.total_entries,
+                current.processed_entries,
+                current.failed_entries
+            ),
+            (0, 0, 0)
+        );
+    }
+
+    /// Dropping an ingest task while a grouped statement is already submitted
+    /// relies on `PostgresTransaction::drop` to finish ROLLBACK before the only
+    /// pooled connection is returned. The SQL operation may finish after task
+    /// cancellation, but none of its rows or bookkeeping may become durable.
+    #[tokio::test]
+    async fn postgres_bulk_submit_grouped_task_drop_waits_for_rollback_before_pool_return() {
+        use helios_persistence::core::BulkSubmitProvider;
+        use std::sync::Arc;
+
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let backend = Arc::new(backend);
+        let tenant = create_tenant("grouped-task-drop");
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        let (submission, manifest) =
+            new_bulk_submit_manifest(&backend, &tenant, "grouped-task-drop").await;
+        let locker = reindex_test_client_for(&dbname).await;
+        locker
+            .batch_execute(&format!(
+                "CREATE FUNCTION block_grouped_task_drop() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   IF NEW.tenant_id = '{tenant_id}' AND NEW.id = 'drop-blocked' THEN
+                     PERFORM pg_advisory_xact_lock(hashtext(NEW.tenant_id), hashtext(NEW.id));
+                   END IF;
+                   RETURN NEW;
+                 END $$;
+                 CREATE TRIGGER block_grouped_task_drop
+                 BEFORE INSERT ON resources
+                 FOR EACH ROW EXECUTE FUNCTION block_grouped_task_drop();
+                 BEGIN;"
+            ))
+            .await
+            .unwrap();
+        let owner_pid: i32 = locker
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        locker
+            .query_one(
+                "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
+                &[&tenant_id, &"drop-blocked"],
+            )
+            .await
+            .unwrap();
+
+        let observer = Arc::new(RecordingBulkSubmitBatches::default());
+        let mut entries = fresh_patient_entries(101, "drop");
+        entries[0].resource_id = Some("drop-blocked".to_string());
+        entries[0].resource["id"] = json!("drop-blocked");
+        let task_backend = backend.clone();
+        let task_tenant = tenant.clone();
+        let task_submission = submission.clone();
+        let task_manifest_id = manifest.manifest_id.clone();
+        let task_observer = observer.clone();
+        let ingest = tokio::spawn(async move {
+            task_backend
+                .process_entries(
+                    &task_tenant,
+                    &task_submission,
+                    &task_manifest_id,
+                    entries,
+                    &grouped_create_options(task_observer),
+                )
+                .await
+        });
+
+        let mut waiter_seen = false;
+        for _ in 0..400 {
+            waiter_seen = locker
+                .query_one(
+                    "SELECT EXISTS (
+                       SELECT 1 FROM pg_stat_activity AS activity
+                       WHERE $1 = ANY(pg_blocking_pids(activity.pid))
+                         AND activity.datname = current_database()
+                         AND activity.pid <> $1
+                     )",
+                    &[&owner_pid],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if waiter_seen {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            waiter_seen,
+            "grouped INSERT never reached the advisory lock"
+        );
+
+        ingest.abort();
+        assert!(
+            ingest.await.unwrap_err().is_cancelled(),
+            "the in-flight ingest task was not cancelled"
+        );
+        // Let the already-submitted INSERT finish. Transaction Drop has queued
+        // ROLLBACK on that same connection behind it.
+        locker.batch_execute("COMMIT").await.unwrap();
+
+        let returned =
+            tokio::time::timeout(std::time::Duration::from_secs(10), backend.get_client())
+                .await
+                .expect("the only pooled connection was not returned after task-drop rollback")
+                .expect("the returned pooled connection is usable");
+        returned.query_one("SELECT 1", &[]).await.unwrap();
+        drop(returned);
+
+        assert!(observer.0.lock().unwrap().is_empty());
+        for table in [
+            "resources",
+            "resource_history",
+            "bulk_entry_results",
+            "bulk_submission_changes",
+        ] {
+            assert_bulk_submit_table_count(&locker, table, &tenant_id, 0).await;
         }
         let current = backend
             .get_manifest(&tenant, &submission, &manifest.manifest_id)
@@ -18007,6 +18614,120 @@ mod postgres_integration {
         }
     }
 
+    /// #1455: stream batching may end with a partial batch that is still over
+    /// the old 100-entry ceiling. Both the full 128-entry batch and the final
+    /// 101-entry batch use ordered grouped creates and retain the complete
+    /// durable receipt/change contract.
+    #[tokio::test]
+    async fn postgres_bulk_submit_grouped_stream_partial_final_batch_preserves_contract() {
+        use helios_persistence::core::{
+            BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider, ChangeType,
+            StreamingBulkSubmitProvider,
+        };
+
+        let (backend, dbname) = isolated_reindex_backend().await;
+        let tenant = create_tenant("bulk-submit-grouped-stream-partial");
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        let (submission, manifest) =
+            new_bulk_submit_manifest(&backend, &tenant, "grouped-stream-partial").await;
+        let client = reindex_test_client_for(&dbname).await;
+        install_resource_insert_statement_counter(&client).await;
+        let observer = std::sync::Arc::new(RecordingBulkSubmitBatches::default());
+        let options = BulkProcessingOptions::new()
+            .with_batch_size(128)
+            .with_defer_indexing(true)
+            .with_file_url("https://provider.example/grouped-stream.ndjson")
+            .with_batch_observer(observer.clone());
+        let lines = (1..=229)
+            .map(|line| format!("{{\"resourceType\":\"Patient\",\"id\":\"stream-{line:04}\"}}\n"))
+            .collect::<String>()
+            .into_bytes();
+        let reader = Box::new(tokio::io::BufReader::new(std::io::Cursor::new(lines)));
+
+        let streamed = backend
+            .process_ndjson_stream(
+                &tenant,
+                &submission,
+                &manifest.manifest_id,
+                "Patient",
+                reader,
+                &options,
+            )
+            .await
+            .unwrap();
+
+        assert!(!streamed.aborted);
+        assert_eq!(streamed.lines_processed, 229);
+        assert_eq!(streamed.counts.total, 229);
+        assert_eq!(streamed.counts.success, 229);
+        assert_eq!(streamed.counts.processing_error, 0);
+        assert_eq!(resource_insert_statements(&client).await, 4);
+
+        let batches = observer.0.lock().unwrap().clone();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].len(), 128);
+        assert_eq!(batches[1].len(), 101);
+        let observed_ids: Vec<_> = batches
+            .iter()
+            .flat_map(|batch| batch.iter())
+            .map(|entry| entry.resource_id.as_deref().unwrap().to_string())
+            .collect();
+        let expected_ids: Vec<_> = (1..=229).map(|line| format!("stream-{line:04}")).collect();
+        assert_eq!(observed_ids, expected_ids);
+
+        let receipts = backend
+            .get_entry_results_page(&tenant, &submission, &manifest.manifest_id, None, 230, None)
+            .await
+            .unwrap();
+        assert_eq!(receipts.entries.len(), 229);
+        for (index, receipt) in receipts.entries.iter().enumerate() {
+            let line = index + 1;
+            assert_eq!(receipt.result.line_number, line as u64);
+            let expected = format!("stream-{line:04}");
+            assert_eq!(
+                receipt.result.resource_id.as_deref(),
+                Some(expected.as_str())
+            );
+            assert!(receipt.result.is_success() && receipt.result.created);
+        }
+        let changes = backend
+            .list_changes(&tenant, &submission, 230, 0)
+            .await
+            .unwrap();
+        assert_eq!(changes.len(), 229);
+        assert!(changes.iter().all(|change| {
+            change.change_type == ChangeType::Create
+                && change.previous_version.is_none()
+                && change.new_version == "1"
+        }));
+        for table in [
+            "resources",
+            "resource_history",
+            "bulk_entry_results",
+            "bulk_submission_changes",
+        ] {
+            assert_bulk_submit_table_count(&client, table, &tenant_id, 229).await;
+        }
+        let current = backend
+            .get_manifest(&tenant, &submission, &manifest.manifest_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                current.total_entries,
+                current.processed_entries,
+                current.failed_entries
+            ),
+            (229, 229, 0)
+        );
+        for id in ["stream-0001", "stream-0128", "stream-0129", "stream-0229"] {
+            let stored = backend.read(&tenant, "Patient", id).await.unwrap().unwrap();
+            assert_eq!(stored.id(), id);
+            assert_eq!(stored.version_id(), "1");
+        }
+    }
+
     /// Wraps a reader so that `token` is tripped the first time the ingest
     /// actually reads from the stream.
     struct CancelOnFirstRead<R> {
@@ -18044,84 +18765,107 @@ mod postgres_integration {
         // Like the batch test: a synchronous manifest has no worker lease, so
         // serialize against the claim queue.
         let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
-        let backend = create_backend().await;
-        let tenant = create_tenant("bulk_submit_cancel");
-        let sub_id = SubmissionId::generate("pg-cancel-test");
-        backend
-            .create_submission(&tenant, &sub_id, None)
-            .await
-            .unwrap();
-        let manifest = backend
-            .add_manifest(&tenant, &sub_id, Some("https://provider/c.json"), None)
-            .await
-            .unwrap();
-
-        let cancel = CancelToken::new();
-        let options = BulkProcessingOptions::new()
-            .with_batch_size(2)
-            .with_cancel(cancel.clone());
-
-        // Six Patients, enough for three batches of two.
-        let lines = (1..=6)
-            .map(|i| format!("{{\"resourceType\":\"Patient\",\"id\":\"pg-cancel-{i}\"}}\n"))
-            .collect::<String>()
-            .into_bytes();
-        let reader = Box::new(tokio::io::BufReader::new(CancelOnFirstRead {
-            inner: std::io::Cursor::new(lines),
-            token: cancel,
-            tripped: false,
-        }));
-        let result = backend
-            .process_ndjson_stream(
-                &tenant,
-                &sub_id,
-                &manifest.manifest_id,
-                "Patient",
-                reader,
-                &options,
-            )
-            .await
-            .unwrap();
-
-        // Terminate the submission before releasing the shared lock, for the
-        // same reason as the batch test above.
-        backend
-            .abort_submission(&tenant, &sub_id, "test cleanup")
-            .await
-            .unwrap();
-
-        assert!(result.aborted);
-        assert_eq!(result.abort_reason.as_deref(), Some(CANCELLED_ABORT_REASON));
-        assert_eq!(
-            result.counts.success, 2,
-            "the batch already committed when the token tripped is kept"
-        );
-        assert_eq!(
-            result.lines_processed, 2,
-            "the remaining four lines were never read"
-        );
-
-        let counts = backend
-            .get_entry_counts(&tenant, &sub_id, &manifest.manifest_id)
-            .await
-            .unwrap();
-        assert_eq!(counts.total, 2, "the partial counts are durable");
-        assert!(
+        for (label, batch_size, defer_indexing, total_lines) in
+            [("default", 2, false, 6), ("grouped", 101, true, 202)]
+        {
+            let backend = create_backend().await;
+            let tenant = create_tenant(&format!("bulk_submit_cancel_{label}"));
+            let sub_id = SubmissionId::generate(&format!("pg-cancel-{label}"));
             backend
-                .read(&tenant, "Patient", "pg-cancel-2")
+                .create_submission(&tenant, &sub_id, None)
                 .await
-                .unwrap()
-                .is_some(),
-            "the first batch really landed"
-        );
-        assert!(
+                .unwrap();
+            let manifest = backend
+                .add_manifest(&tenant, &sub_id, Some("https://provider/c.json"), None)
+                .await
+                .unwrap();
+
+            let cancel = CancelToken::new();
+            let options = BulkProcessingOptions::new()
+                .with_batch_size(batch_size)
+                .with_defer_indexing(defer_indexing)
+                .with_cancel(cancel.clone());
+
+            let lines = (1..=total_lines)
+                .map(|line| {
+                    format!(
+                        "{{\"resourceType\":\"Patient\",\"id\":\"pg-cancel-{label}-{line}\"}}\n"
+                    )
+                })
+                .collect::<String>()
+                .into_bytes();
+            let reader = Box::new(tokio::io::BufReader::new(CancelOnFirstRead {
+                inner: std::io::Cursor::new(lines),
+                token: cancel,
+                tripped: false,
+            }));
+            let result = backend
+                .process_ndjson_stream(
+                    &tenant,
+                    &sub_id,
+                    &manifest.manifest_id,
+                    "Patient",
+                    reader,
+                    &options,
+                )
+                .await
+                .unwrap();
+
+            // Terminate the submission before releasing the shared lock, for
+            // the same reason as the batch test above.
             backend
-                .read(&tenant, "Patient", "pg-cancel-3")
+                .abort_submission(&tenant, &sub_id, "test cleanup")
                 .await
-                .unwrap()
-                .is_none(),
-            "nothing after the cancellation point was ingested"
-        );
+                .unwrap();
+
+            assert!(result.aborted, "{label}");
+            assert_eq!(
+                result.abort_reason.as_deref(),
+                Some(CANCELLED_ABORT_REASON),
+                "{label}"
+            );
+            assert_eq!(
+                result.counts.success, batch_size as u64,
+                "{label}: the committed batch is kept"
+            );
+            assert_eq!(
+                result.lines_processed, batch_size as u64,
+                "{label}: the second batch was never read"
+            );
+
+            let counts = backend
+                .get_entry_counts(&tenant, &sub_id, &manifest.manifest_id)
+                .await
+                .unwrap();
+            assert_eq!(
+                counts.total, batch_size as u64,
+                "{label}: partial counts are durable"
+            );
+            assert!(
+                backend
+                    .read(
+                        &tenant,
+                        "Patient",
+                        &format!("pg-cancel-{label}-{batch_size}")
+                    )
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "{label}: the first batch landed"
+            );
+            assert!(
+                backend
+                    .read(
+                        &tenant,
+                        "Patient",
+                        &format!("pg-cancel-{label}-{}", batch_size + 1)
+                    )
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{label}: no row after the cancellation point was ingested"
+            );
+        }
     }
 
     /// #1127, PostgreSQL: re-walking a file — what a reclaimed manifest or a
