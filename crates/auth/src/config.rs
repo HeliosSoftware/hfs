@@ -47,6 +47,26 @@ pub struct AuthConfig {
     /// `Authorization: Bearer <token>` header is added to outbound calls.
     /// Subscription-supplied headers take precedence.
     pub outbound_bearer_token: Option<String>,
+
+    // Interactive browser login for the web UI (issue #1449). Only consulted
+    // when `enabled` is true; the flow is off unless `web_client_id` is set.
+    /// OAuth client id registered at the IdP for the web UI's Authorization
+    /// Code + PKCE login (e.g. `hfs-web`). Unset disables the browser login.
+    pub web_client_id: Option<String>,
+    /// Client secret for a confidential web client. A public client (PKCE
+    /// only, the default) leaves this unset.
+    pub web_client_secret: Option<String>,
+    /// The `redirect_uri` registered at the IdP. Unset means
+    /// `{HFS_BASE_URL}/ui/callback`, which the server fills in at startup.
+    pub web_redirect_uri: Option<String>,
+    /// Scopes requested at authorization. Defaults to `openid profile email`.
+    pub web_scopes: String,
+    /// Whether the session cookie carries the `Secure` attribute. Defaults to
+    /// true; turn off only for plain-HTTP local development.
+    pub web_cookie_secure: bool,
+    /// The IdP's end-session (RP-initiated logout) endpoint. Discovered from
+    /// `.well-known/openid-configuration` when unset.
+    pub smart_end_session_endpoint: Option<String>,
 }
 
 impl AuthConfig {
@@ -78,6 +98,23 @@ impl AuthConfig {
             smart_registration_endpoint: env::var("HFS_SMART_REGISTRATION_ENDPOINT").ok(),
             smart_revocation_endpoint: env::var("HFS_SMART_REVOCATION_ENDPOINT").ok(),
             outbound_bearer_token: env::var("HFS_OUTBOUND_BEARER_TOKEN").ok(),
+            web_client_id: env::var("HFS_UI_LOGIN_CLIENT_ID")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            web_client_secret: env::var("HFS_UI_LOGIN_CLIENT_SECRET")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            web_redirect_uri: env::var("HFS_UI_LOGIN_REDIRECT_URI")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            web_scopes: env::var("HFS_UI_LOGIN_SCOPES")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "openid profile email".to_string()),
+            web_cookie_secure: env::var("HFS_UI_LOGIN_COOKIE_SECURE")
+                .map(|v| !(v.eq_ignore_ascii_case("false") || v == "0"))
+                .unwrap_or(true),
+            smart_end_session_endpoint: env::var("HFS_SMART_END_SESSION_ENDPOINT").ok(),
         }
     }
 
@@ -164,6 +201,12 @@ impl Default for AuthConfig {
             smart_registration_endpoint: None,
             smart_revocation_endpoint: None,
             outbound_bearer_token: None,
+            web_client_id: None,
+            web_client_secret: None,
+            web_redirect_uri: None,
+            web_scopes: "openid profile email".to_string(),
+            web_cookie_secure: true,
+            smart_end_session_endpoint: None,
         }
     }
 }

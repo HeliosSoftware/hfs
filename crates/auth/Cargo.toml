@@ -32,6 +32,13 @@ async-trait = "0.1"
 # Time
 chrono.workspace = true
 
+# Interactive login sessions (PKCE, session ids, cookie/query handling)
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+http = "1"
+form_urlencoded = "1"
+
 # Logging
 tracing = "0.1"
 
