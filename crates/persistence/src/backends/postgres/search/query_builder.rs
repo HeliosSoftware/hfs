@@ -6,6 +6,7 @@
 
 use chrono::{DateTime, Utc};
 
+use super::REFERENCE_TARGET_ID_EXPR;
 use crate::backends::postgres::schema::IndexLayout;
 use crate::error::SearchError;
 use crate::search::IMPLICIT_TOKEN_SYSTEM;
@@ -2622,13 +2623,13 @@ impl PostgresQueryBuilder {
     ///
     /// Per [FHIR R4 search on references](https://hl7.org/fhir/R4/search.html#reference),
     /// `[parameter]=[id]` — a bare logical id — is the *primary* form, with
-    /// `[type]/[id]` an additional one. References are indexed as written
-    /// (`search/writer.rs` stores `Reference.reference` verbatim), so the
-    /// overwhelmingly common `Patient/<id>` literal is what sits in
-    /// `value_reference`; matching a bare id therefore needs a suffix match, not
-    /// just equality. Comparing only the raw value made `Observation?patient=<id>`
-    /// — the single most common search shape in FHIR — return an empty Bundle
-    /// (#490), while `patient=Patient/<id>` worked.
+    /// `[type]/[id]` an additional one. References are indexed as their
+    /// version-agnostic base, so the common `Patient/<id>` literal is what sits
+    /// in `value_reference`. A bare id is compared with the last `/`-delimited
+    /// segment. This preserves polymorphic matching across relative and absolute
+    /// references while using the v42 expression index. Comparing only the raw
+    /// value made `Observation?patient=<id>` return an empty Bundle (#490), while
+    /// `patient=Patient/<id>` worked.
     ///
     /// A `:Type` modifier resolves the ambiguity up front: `subject:Patient=<id>`
     /// is normalized to `Patient/<id>` and matched as a type-prefixed reference,
@@ -2645,29 +2646,11 @@ impl PostgresQueryBuilder {
     /// heap tuple. Measured on a 3.4M-row replica over 300 searches, warm:
     /// **1.50 ms/call -> 0.47 ms/call**.
     ///
-    /// # The bare-id form is still not sargable, and that is not fixed here
-    ///
-    /// `Observation?patient=<id>` emits `value_reference = $n OR value_reference
-    /// LIKE '%/<id>'`. A leading-wildcard `LIKE` cannot be turned into index
-    /// bounds in any operator class, and an OR is index-usable only when every
-    /// arm is — so the planner has no index for the value at all. Measured on
-    /// the same replica against a 1.34M-row `Observation.subject` slice: a
-    /// **parallel Seq Scan of the whole `search_index`**, 259 ms and 71,943
-    /// buffers, against 0.47 ms for the `Type/id` form. The benchmark only ever
-    /// sends `Type/id`, which is why this has never shown up in a run.
-    ///
-    /// Making it sargable needs a stored bare target id — a column plus an index,
-    /// i.e. one more btree insert per reference row on the write path v28 spent
-    /// a whole migration reducing. It is a separate change with its own
-    /// arithmetic; it is written down here rather than guessed at.
-    ///
-    /// # LIKE escaping
-    ///
-    /// The plain path binds fully-formed patterns built with [`like_escape`] and
-    /// `ESCAPE '\'` rather than concatenating the raw value into a pattern in SQL.
-    /// The suffix match makes this load-bearing: an unescaped `%` would turn
-    /// `patient=%` into `LIKE '%/%'` and match every reference. (The `:contains`,
-    /// `:below` and `:above` paths keep their existing unescaped behavior.)
+    /// A plain bare id emits one equality on [`REFERENCE_TARGET_ID_EXPR`]. The
+    /// `value_reference IS NOT NULL` conjunct matches the v42 partial-index
+    /// predicate. `%` and `_` remain literal id characters because this path no
+    /// longer constructs a `LIKE` pattern. The `:contains`, `:below`, and
+    /// `:above` modifier paths retain their existing pattern behavior.
     fn build_reference_condition(param: &SearchParameter, offset: usize) -> Option<SqlFragment> {
         if matches!(param.modifier.as_ref(), Some(SearchModifier::Identifier)) {
             return Self::build_reference_identifier_condition(param, offset);
@@ -2675,10 +2658,10 @@ impl PostgresQueryBuilder {
 
         let mut conditions: Vec<String> = Vec::new();
         let mut params: Vec<SqlParam> = Vec::new();
-        // The plain path binds a variable number of parameters per value (one for
-        // a type-prefixed reference, two for a bare id), so `param_num` runs as
-        // a counter rather than `offset + i`. `build_search_query` advances the
-        // next parameter's offset by `params.len()`, so this stays consistent.
+        // Each plain reference value binds once, but the modifier paths share
+        // this loop, so `param_num` runs as a counter rather than `offset + i`.
+        // `build_search_query` advances the next parameter's offset by
+        // `params.len()`, so this stays consistent.
         let mut param_num = offset;
         for value in &param.values {
             let (predicate, value_params) =
@@ -2765,8 +2748,6 @@ impl PostgresQueryBuilder {
                     }
                     _ => stripped.to_string(),
                 };
-                let escaped = like_escape(&base);
-
                 if base.contains('/') {
                     // `Type/id` or an absolute URL. One equality: the stored
                     // value is the version-agnostic base (schema v33), so a
@@ -2776,18 +2757,12 @@ impl PostgresQueryBuilder {
                     params.push(SqlParam::text(&base));
                     format!("value_reference = ${exact}")
                 } else {
-                    // Bare logical id: also match any reference ending in `/id`.
-                    // The suffix arm is a leading-wildcard `LIKE` and is not
-                    // sargable in any operator class — see the note on
-                    // `build_reference_condition` about what that costs.
-                    let exact = *param_num + 1;
-                    let suffix = *param_num + 2;
-                    *param_num += 2;
+                    // Bare logical id: compare with the final reference segment.
+                    // The explicit NULL check matches the v42 partial index.
+                    *param_num += 1;
                     params.push(SqlParam::text(&base));
-                    params.push(SqlParam::text(&format!("%/{}", escaped)));
                     format!(
-                        "(value_reference = ${exact} \
-                          OR value_reference LIKE ${suffix} ESCAPE '\\')"
+                        "(value_reference IS NOT NULL AND {REFERENCE_TARGET_ID_EXPR} = ${param_num})"
                     )
                 }
             }
@@ -4483,9 +4458,11 @@ mod tests {
         assert_eq!(
             branch(reference_param("subject", None, "p1")),
             (
-                "(param_name = 'subject' AND (((value_reference = $3 OR value_reference LIKE $4 ESCAPE '\\'))))"
-                    .to_string(),
-                2
+                format!(
+                    "(param_name = 'subject' AND (((value_reference IS NOT NULL AND \
+                     {REFERENCE_TARGET_ID_EXPR} = $3))))"
+                ),
+                1
             )
         );
         assert_eq!(
@@ -5729,6 +5706,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reference_or_list_mixes_bare_and_type_prefixed_values() {
+        let param = SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: vec![
+                SearchValue::new(SearchPrefix::Eq, "patient-1"),
+                SearchValue::new(SearchPrefix::Eq, "Patient/patient-2"),
+            ],
+            chain: vec![],
+            components: vec![],
+        };
+        let query = SearchQuery::new("Observation").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("reference OR-list");
+
+        assert_eq!(
+            frag.sql.matches("id IN (SELECT").count(),
+            1,
+            "reference OR-list must remain one subquery: {}",
+            frag.sql
+        );
+        assert!(
+            frag.sql.contains(&format!(
+                "(value_reference IS NOT NULL AND {REFERENCE_TARGET_ID_EXPR} = $3) OR value_reference = $4"
+            )),
+            "each OR arm must use its assigned placeholder: {}",
+            frag.sql
+        );
+        let params: Vec<&str> = frag
+            .params
+            .iter()
+            .map(|param| match param {
+                SqlParam::Text(value) => value.as_str(),
+                other => panic!("expected text params, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(params, ["patient-1", "Patient/patient-2"]);
+    }
+
     /// A bare logical id is the primary form of a reference search
     /// (`Observation?patient=<id>`), and must match a stored `Patient/<id>`.
     /// Postgres previously compared the raw value only, so a bare id matched
@@ -5756,8 +5773,20 @@ mod tests {
             .collect();
         assert_eq!(
             params,
-            vec!["patient-1", "%/patient-1"],
-            "a bare id must match exactly and as a `/id` suffix: {}",
+            vec!["patient-1"],
+            "a bare id must use one equality bind: {}",
+            frag.sql
+        );
+        assert!(
+            frag.sql.contains(&format!(
+                "value_reference IS NOT NULL AND {REFERENCE_TARGET_ID_EXPR} = $3"
+            )),
+            "the predicate must match the v42 expression index: {}",
+            frag.sql
+        );
+        assert!(
+            !frag.sql.contains("LIKE"),
+            "a bare id must not be turned into a pattern: {}",
             frag.sql
         );
         assert_eq!(
@@ -5943,36 +5972,80 @@ mod tests {
             SqlParam::Text(t) => assert_eq!(t, "patient-1"),
             other => panic!("expected a text param, got {:?}", other),
         }
-        assert_eq!(frag.params.len(), 2, "version-stripped back to a bare id");
+        assert_eq!(frag.params.len(), 1, "version-stripped back to a bare id");
+        assert!(frag.sql.contains(&format!(
+            "value_reference IS NOT NULL AND {REFERENCE_TARGET_ID_EXPR} = $3"
+        )));
     }
 
-    /// The suffix match makes LIKE escaping load-bearing: unescaped, `patient=%`
-    /// would become `LIKE '%/%'` and match every stored reference.
+    /// Bare ids use equality, so SQL pattern metacharacters remain literal.
     #[test]
-    fn reference_bare_id_escapes_like_metacharacters() {
+    fn reference_bare_id_treats_like_metacharacters_literally() {
         let param = SearchParameter {
             name: "subject".to_string(),
             param_type: SearchParamType::Reference,
             modifier: None,
-            values: vec![SearchValue::new(SearchPrefix::Eq, "%")],
+            values: vec![
+                SearchValue::new(SearchPrefix::Eq, "%"),
+                SearchValue::new(SearchPrefix::Eq, "_"),
+            ],
             chain: vec![],
             components: vec![],
         };
         let query = SearchQuery::new("Observation").with_parameter(param);
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("wildcard reference");
+        let frag =
+            PostgresQueryBuilder::build_search_query(&query, 2).expect("metacharacter references");
 
-        match &frag.params[1] {
-            SqlParam::Text(t) => assert_eq!(
-                t, "%/\\%",
-                "only the leading wildcard is live; the value's own '%' is escaped"
-            ),
-            other => panic!("expected a text param, got {:?}", other),
-        }
+        let params: Vec<&str> = frag
+            .params
+            .iter()
+            .map(|param| match param {
+                SqlParam::Text(value) => value.as_str(),
+                other => panic!("expected text params, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(params, ["%", "_"]);
         assert!(
-            frag.sql.contains("ESCAPE '\\'"),
-            "the pattern must carry its escape clause: {}",
+            !frag.sql.contains("LIKE") && !frag.sql.contains("ESCAPE"),
+            "metacharacters must be compared as data: {}",
             frag.sql
         );
+        assert!(
+            frag.sql
+                .contains(&format!("{REFERENCE_TARGET_ID_EXPR} = $3"))
+        );
+        assert!(
+            frag.sql
+                .contains(&format!("{REFERENCE_TARGET_ID_EXPR} = $4"))
+        );
+    }
+
+    #[test]
+    fn reference_bare_id_advances_the_next_parameter_offset_once() {
+        let query = SearchQuery::new("Observation")
+            .with_parameter(reference_param("subject", None, "patient-1"))
+            .with_parameter(token_param("status", None, "final"));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2)
+            .expect("reference followed by token");
+
+        assert!(
+            frag.sql
+                .contains(&format!("{REFERENCE_TARGET_ID_EXPR} = $3"))
+        );
+        assert!(
+            frag.sql.contains("value_token_code = $4"),
+            "the later parameter must start after the bare-id bind: {}",
+            frag.sql
+        );
+        let params: Vec<&str> = frag
+            .params
+            .iter()
+            .map(|param| match param {
+                SqlParam::Text(value) => value.as_str(),
+                other => panic!("expected text params, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(params, ["patient-1", "final"]);
     }
 
     #[test]
