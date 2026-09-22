@@ -956,6 +956,26 @@ fn signing_kid(pem: &str, alg: &str) -> Option<String> {
 /// `private_key_jwt`) against the submission's token endpoint. The signing key
 /// is the server-wide `HFS_BULK_SUBMIT_PRIVATE_KEY`, shared with the consumer
 /// side's protected-file fetches; the client id is per-submission.
+/// Builds the SMART Backend Services `private_key_jwt` client-assertion claims.
+///
+/// `iat` is required: Keycloak (and any RFC 7523 verifier following its
+/// guidance) rejects a client assertion whose `exp` is more than ~60s out
+/// unless it also carries `iat` ("Token expiration is too far in the future and
+/// iat claim not present"). The consumer-side assertion in
+/// `crates/rest/src/bulk_submit_oauth.rs` already sets it; this one did not, so
+/// the Import page's backend-services submit failed against Keycloak with a 400
+/// (#1437). `iat` and `exp` come off one `now` so they stay consistent.
+fn client_assertion_claims(client_id: &str, token_url: &str, now: i64) -> serde_json::Value {
+    json!({
+        "iss": client_id,
+        "sub": client_id,
+        "aud": token_url,
+        "iat": now,
+        "exp": now + 300,
+        "jti": uuid::Uuid::new_v4().to_string(),
+    })
+}
+
 async fn backend_services_token(client_id: &str, token_url: &str) -> Result<String, String> {
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 
@@ -975,13 +995,7 @@ async fn backend_services_token(client_id: &str, token_url: &str) -> Result<Stri
             EncodingKey::from_ec_pem(pem.as_bytes()).map_err(|e| e.to_string())?,
         ),
     };
-    let claims = json!({
-        "iss": client_id,
-        "sub": client_id,
-        "aud": token_url,
-        "exp": Utc::now().timestamp() + 300,
-        "jti": uuid::Uuid::new_v4().to_string(),
-    });
+    let claims = client_assertion_claims(client_id, token_url, Utc::now().timestamp());
     let mut header = Header::new(algorithm);
     header.kid = signing_kid(&pem, &alg);
     let assertion = encode(&header, &claims, &key).map_err(|e| e.to_string())?;
@@ -1915,6 +1929,24 @@ mod tests {
         // Non-matching recipients keep the indeterminate sweep.
         assert_eq!(progress_percent("halfway there"), None);
         assert_eq!(progress_percent("processing lots"), None);
+    }
+
+    /// #1437: the client assertion must carry `iat` (Keycloak rejects it
+    /// otherwise), with `exp` exactly 300s later and the SMART Backend Services
+    /// `iss`/`sub`/`aud` set.
+    #[test]
+    fn client_assertion_claims_carry_iat_and_matching_exp() {
+        let now = 1_700_000_000i64;
+        let claims = client_assertion_claims("hfs-import", "https://idp/token", now);
+        assert_eq!(claims["iat"], now);
+        assert_eq!(claims["exp"], now + 300);
+        assert_eq!(claims["iss"], "hfs-import");
+        assert_eq!(claims["sub"], "hfs-import");
+        assert_eq!(claims["aud"], "https://idp/token");
+        assert!(
+            claims["jti"].as_str().is_some_and(|j| !j.is_empty()),
+            "jti is a non-empty unique id"
+        );
     }
 
     /// #1069: only a provider close-out is terminal; `failed` can still be
