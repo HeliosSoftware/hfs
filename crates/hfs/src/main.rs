@@ -2101,6 +2101,19 @@ fn composite_submit_jobs(
     feature = "mongodb",
     feature = "s3"
 ))]
+fn use_independent_submit_files(
+    mode: Option<StorageBackendMode>,
+    effective_file_concurrency: u32,
+) -> bool {
+    matches!(mode, Some(StorageBackendMode::Postgres)) && effective_file_concurrency > 1
+}
+
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "s3"
+))]
 async fn build_bulk_submit(
     config: &ServerConfig,
     jobs: Arc<dyn BulkSubmitJobStore>,
@@ -2215,11 +2228,12 @@ async fn build_bulk_submit(
     // lock until they outlast `busy_timeout` and abort the manifest (#942).
     // Ignore the configured value there, and warn about it, rather than letting
     // it fail the import.
-    let backend_kind = config
-        .storage_backend_mode()
-        .map(|mode| mode.primary_backend_kind())
+    let backend_mode = config.storage_backend_mode().ok();
+    let backend_kind = backend_mode
+        .map(StorageBackendMode::primary_backend_kind)
         .unwrap_or(BackendKind::Sqlite);
     let file_concurrency = cfg.effective_file_concurrency(backend_kind);
+    let independent_file_tasks = use_independent_submit_files(backend_mode, file_concurrency);
     if file_concurrency < cfg.file_concurrency.max(1) {
         warn!(
             configured = cfg.file_concurrency,
@@ -2237,6 +2251,7 @@ async fn build_bulk_submit(
         output.clone(),
         &cfg,
         file_concurrency,
+        independent_file_tasks,
         reindex_hook,
         write_observer,
     );
@@ -2262,6 +2277,7 @@ fn spawn_submit_workers(
     output: Arc<dyn ExportOutputStore>,
     cfg: &helios_rest::config::BulkSubmitConfig,
     file_concurrency: u32,
+    independent_file_tasks: bool,
     reindex_hook: Option<Arc<dyn helios_persistence::core::DeferredReindexHook>>,
     write_observer: Arc<dyn WriteObserver>,
 ) {
@@ -2315,12 +2331,15 @@ fn spawn_submit_workers(
         });
     }
     let file_concurrency = file_concurrency.max(1) as usize;
-    if file_concurrency > 1 {
-        info!(
-            file_concurrency,
-            "Bulk submit fan-out: ingesting a manifest's output files concurrently"
-        );
-    }
+    let scheduling = if independent_file_tasks {
+        "independent-tasks"
+    } else {
+        "inline"
+    };
+    info!(
+        file_concurrency,
+        scheduling, "Bulk submit file scheduling selected"
+    );
     for i in 0..cfg.worker_concurrency {
         let jobs = jobs.clone();
         let fetcher = fetcher.clone();
@@ -2329,12 +2348,16 @@ fn spawn_submit_workers(
         let write_observer = write_observer.clone();
         let worker_id = WorkerId::new(format!("hfs-submit-worker-{i}"));
         tokio::spawn(async move {
-            let worker = DefaultSubmitWorker::new(jobs.clone(), fetcher, output, worker_id.clone())
-                .with_deferred_indexing(defer_indexing, reindex_hook.clone())
-                .with_write_observer(Some(write_observer))
-                .with_file_concurrency(file_concurrency)
-                .with_batch_size(batch_size)
-                .with_skip_unchanged(skip_unchanged);
+            let mut worker =
+                DefaultSubmitWorker::new(jobs.clone(), fetcher, output, worker_id.clone())
+                    .with_deferred_indexing(defer_indexing, reindex_hook.clone())
+                    .with_write_observer(Some(write_observer))
+                    .with_file_concurrency(file_concurrency)
+                    .with_batch_size(batch_size)
+                    .with_skip_unchanged(skip_unchanged);
+            if independent_file_tasks {
+                worker = worker.with_independent_file_tasks();
+            }
             loop {
                 match jobs.claim_next_manifest(&worker_id, lease).await {
                     Ok(Some(claimed)) => {
@@ -3933,6 +3956,55 @@ mod tests {
             StorageBackendMode::S3Elasticsearch.primary_backend_kind(),
             BackendKind::S3
         );
+    }
+
+    #[test]
+    fn bulk_submit_file_scheduling_selection() {
+        let modes = [
+            Some(StorageBackendMode::Sqlite),
+            Some(StorageBackendMode::SqliteElasticsearch),
+            Some(StorageBackendMode::Postgres),
+            Some(StorageBackendMode::PostgresElasticsearch),
+            Some(StorageBackendMode::MongoDB),
+            Some(StorageBackendMode::MongoDBElasticsearch),
+            Some(StorageBackendMode::S3),
+            Some(StorageBackendMode::S3Elasticsearch),
+            None,
+        ];
+
+        for mode in modes {
+            for effective in [0, 1, 2, 8] {
+                let expected = matches!(mode, Some(StorageBackendMode::Postgres)) && effective > 1;
+                assert_eq!(
+                    use_independent_submit_files(mode, effective),
+                    expected,
+                    "mode={mode:?} effective={effective}"
+                );
+            }
+
+            for configured in [0, 1, 2, 8] {
+                let cfg = helios_rest::config::BulkSubmitConfig {
+                    file_concurrency: configured,
+                    ..Default::default()
+                };
+                let backend = mode
+                    .map(StorageBackendMode::primary_backend_kind)
+                    .unwrap_or(BackendKind::Sqlite);
+                let effective = cfg.effective_file_concurrency(backend);
+                let expected = matches!(mode, Some(StorageBackendMode::Postgres)) && effective > 1;
+                assert_eq!(
+                    use_independent_submit_files(mode, effective),
+                    expected,
+                    "mode={mode:?} configured={configured} effective={effective}"
+                );
+            }
+        }
+
+        assert!(!use_independent_submit_files(None, 8));
+        assert!(!use_independent_submit_files(
+            Some(StorageBackendMode::PostgresElasticsearch),
+            8,
+        ));
     }
 
     #[cfg(feature = "ui")]

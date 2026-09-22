@@ -9,6 +9,8 @@
 //!
 //! [`BulkSubmitProvider`]: crate::core::bulk_submit::BulkSubmitProvider
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
@@ -683,12 +685,125 @@ pub struct DefaultSubmitWorker<Js: ?Sized, Fetcher: ?Sized, Os: ?Sized> {
     /// (PostgreSQL) turns into near-linear throughput; SQLite's single writer
     /// caps the gain but still benefits from overlapped fetch and extraction.
     file_concurrency: usize,
+    /// Runs each admitted output file in its own Tokio task. Kept optional so
+    /// library callers whose fetcher or output store borrows local state keep
+    /// the inline path and its non-`'static` bounds.
+    owned_file_executor: Option<Arc<dyn OwnedFileExecutor>>,
     /// Entries per ingest transaction (`HFS_BULK_SUBMIT_BATCH_SIZE`, #1127).
     /// `None` keeps the engine's default.
     batch_size: Option<u32>,
     /// Leave content-identical resources untouched instead of writing a new
     /// version (`HFS_BULK_SUBMIT_SKIP_UNCHANGED`, #1127).
     skip_unchanged: bool,
+}
+
+/// Services captured by the opt-in executor for independent file tasks.
+///
+/// The adapter itself is sized even when one of the services behind its
+/// `Arc`s is a trait object.
+struct OwnedFileServices<Js: ?Sized, Fetcher: ?Sized, Os: ?Sized> {
+    jobs: Arc<Js>,
+    fetcher: Arc<Fetcher>,
+    output: Arc<Os>,
+}
+
+trait OwnedFileExecutor: Send + Sync {
+    fn process(
+        &self,
+        context: OwnedFileContext,
+    ) -> Pin<Box<dyn Future<Output = StorageResult<()>> + Send + 'static>>;
+}
+
+impl<Js, Fetcher, Os> OwnedFileExecutor for OwnedFileServices<Js, Fetcher, Os>
+where
+    Js: BulkSubmitJobStore + ?Sized + 'static,
+    Fetcher: SubmitInputFetcher + ?Sized + 'static,
+    Os: ExportOutputStore + ?Sized + 'static,
+{
+    fn process(
+        &self,
+        context: OwnedFileContext,
+    ) -> Pin<Box<dyn Future<Output = StorageResult<()>> + Send + 'static>> {
+        let jobs = Arc::clone(&self.jobs);
+        let fetcher = Arc::clone(&self.fetcher);
+        let output = Arc::clone(&self.output);
+        Box::pin(async move {
+            process_output_file(
+                jobs.as_ref(),
+                fetcher.as_ref(),
+                output.as_ref(),
+                context.as_borrowed(),
+            )
+            .await
+        })
+    }
+}
+
+/// Immutable run inputs and mutable state shared by every output file.
+///
+/// Independent tasks clone this one allocation when a file is admitted. The
+/// manifest's file list remains parent-owned, so queued files do not acquire a
+/// per-file context before the scheduler has capacity for them.
+struct OwnedFileRunContext {
+    lease: ManifestLease,
+    manifest_url: String,
+    request_headers: Vec<(String, String)>,
+    oauth_metadata_urls: Vec<String>,
+    encryption_key: Option<Value>,
+    requires_access_token: bool,
+    options: BulkProcessingOptions,
+    file_count: u64,
+    presized: bool,
+    failed: AtomicU64,
+    file_level_failed: AtomicU64,
+    opened: AtomicU64,
+    totals_known: AtomicBool,
+    progress: ByteProgress,
+    error_records: tokio::sync::Mutex<Vec<SubmitFileRecord>>,
+    file_failures: std::sync::Mutex<Vec<(String, String)>>,
+    lease_control: LeaseControl,
+}
+
+/// The small, per-file value moved into an independent task.
+struct OwnedFileContext {
+    run: Arc<OwnedFileRunContext>,
+    file: RemoteFile,
+    input_index: usize,
+    error_part_index: u32,
+}
+
+/// Borrowed view used by the common file processor.
+struct BorrowedFileContext<'a> {
+    run: &'a OwnedFileRunContext,
+    file: &'a RemoteFile,
+    error_part_index: u32,
+}
+
+impl OwnedFileContext {
+    fn new(run: Arc<OwnedFileRunContext>, file: RemoteFile, input_index: usize) -> Self {
+        let error_part_index = u32::try_from(input_index)
+            .expect("artifact count validation bounds output indexes")
+            .checked_add(MANIFEST_FETCH_ERROR_PART_INDEX + 1)
+            .expect("artifact count validation bounds output part indexes");
+        Self {
+            run,
+            file,
+            input_index,
+            error_part_index,
+        }
+    }
+
+    fn as_borrowed(&self) -> BorrowedFileContext<'_> {
+        debug_assert_eq!(
+            self.error_part_index,
+            u32::try_from(self.input_index).unwrap() + MANIFEST_FETCH_ERROR_PART_INDEX + 1
+        );
+        BorrowedFileContext {
+            run: &self.run,
+            file: &self.file,
+            error_part_index: self.error_part_index,
+        }
+    }
 }
 
 /// A pass-through [`AsyncBufRead`] that adds every consumed byte to a shared
@@ -763,6 +878,15 @@ impl tokio::io::AsyncBufRead for CountingReader {
 ///
 /// Dropping the keeper stops the renewal task.
 struct LeaseKeeper {
+    control: LeaseControl,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+/// Cloneable control shared with independent file tasks. The keeper alone
+/// owns the heartbeat task; children can only observe cancellation and lease
+/// loss, or publish a conclusive fenced-write loss.
+#[derive(Clone)]
+struct LeaseControl {
     /// Held rather than only subscribed to, so `run_job` can declare the lease
     /// lost too when a fenced write answers `LeaseLost`.
     lost: tokio::sync::watch::Sender<bool>,
@@ -770,7 +894,6 @@ struct LeaseKeeper {
     /// Newest expiry the worker renewed to outside the keeper's task, in Unix
     /// milliseconds (see [`LeaseKeeper::note_renewed`]).
     renewed_until: Arc<AtomicI64>,
-    handle: tokio::task::JoinHandle<()>,
 }
 
 /// The slice of a job store the [`LeaseKeeper`] uses.
@@ -881,6 +1004,8 @@ impl LeaseKeeper {
                 // that has not landed by `expiry` is indistinguishable from a
                 // lost one: the manifest is claimable either way.
                 let mut renewed = None;
+                #[cfg(perf_phases)]
+                let mut first_heartbeat_attempt = true;
                 loop {
                     expiry = latest_expiry(expiry, &renewed_elsewhere);
                     let left = (expiry - Utc::now())
@@ -889,7 +1014,19 @@ impl LeaseKeeper {
                     if left.is_zero() {
                         break;
                     }
-                    match tokio::time::timeout(left, jobs.heartbeat(&lease)).await {
+                    #[cfg(perf_phases)]
+                    if first_heartbeat_attempt {
+                        crate::perf::record_duration(
+                            crate::perf::Phase::SubmitHeartbeatScheduleDelay,
+                            heartbeat_at.elapsed(),
+                        );
+                        first_heartbeat_attempt = false;
+                    }
+                    let heartbeat = async {
+                        let _rpc = crate::perf::span(crate::perf::Phase::SubmitHeartbeatRpc);
+                        jobs.heartbeat(&lease).await
+                    };
+                    match tokio::time::timeout(left, heartbeat).await {
                         Ok(Ok(new_expiry)) => {
                             tracing::debug!(
                                 submission = %lease.submission_id,
@@ -927,7 +1064,7 @@ impl LeaseKeeper {
                                      manifest; abandoning this run"
                                 );
                             }
-                            let _ = flag.send(true);
+                            flag.send_replace(true);
                             return;
                         }
                         Ok(Err(LeaseError::Storage(e))) => {
@@ -968,16 +1105,18 @@ impl LeaseKeeper {
                         "bulk-submit lease could not be renewed before it expired; \
                          abandoning the manifest so it can be reclaimed"
                     );
-                    let _ = flag.send(true);
+                    flag.send_replace(true);
                     return;
                 };
                 expiry = new_expiry;
             }
         });
         Self {
-            lost,
-            cancel,
-            renewed_until,
+            control: LeaseControl {
+                lost,
+                cancel,
+                renewed_until,
+            },
             handle,
         }
     }
@@ -985,28 +1124,22 @@ impl LeaseKeeper {
     /// Records a renewal the worker made outside the keeper's own task, so
     /// the keeper measures its deadline from the newest expiry and does not
     /// declare a freshly renewed lease lost (#1127).
+    #[cfg(test)]
     fn note_renewed(&self, expiry: DateTime<Utc>) {
-        self.renewed_until
-            .fetch_max(expiry.timestamp_millis(), Ordering::Relaxed);
+        self.control.note_renewed(expiry);
     }
 
     /// Whether the job in flight should wind down: either the lease is gone or
     /// the submission stopped being ingestable (#968). Both exit the same way —
     /// leave the manifest alone and let whoever owns its outcome record it.
     fn should_stop(&self) -> bool {
-        *self.lost.borrow() || self.cancel.is_cancelled()
+        self.control.should_stop()
     }
 
     /// Whether the stop is an abort rather than a lost lease. The two exit
     /// identically but read very differently in an operator's log.
     fn cancelled(&self) -> bool {
-        self.cancel.is_cancelled()
-    }
-
-    /// Marks the lease lost from outside the renewal task — used when a fenced
-    /// write answers `LeaseLost`, which is as conclusive as a failed heartbeat.
-    fn declare_lost(&self) {
-        let _ = self.lost.send(true);
+        self.control.cancelled()
     }
 
     /// Resolves once the lease is lost, and never otherwise. Raced against the
@@ -1016,6 +1149,37 @@ impl LeaseKeeper {
     /// checked between batches *inside* the ingest, so the files wind
     /// themselves down and the fan-out ends normally (#968). Resolving this on
     /// a cancel too would report an aborted run as one whose lease was lost.
+    async fn lost(&self) {
+        self.control.lost().await;
+    }
+
+    fn control(&self) -> LeaseControl {
+        self.control.clone()
+    }
+}
+
+impl LeaseControl {
+    fn note_renewed(&self, expiry: DateTime<Utc>) {
+        self.renewed_until
+            .fetch_max(expiry.timestamp_millis(), Ordering::Relaxed);
+    }
+
+    fn should_stop(&self) -> bool {
+        *self.lost.borrow() || self.cancel.is_cancelled()
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
+    fn lease_lost(&self) -> bool {
+        *self.lost.borrow()
+    }
+
+    fn declare_lost(&self) {
+        self.lost.send_replace(true);
+    }
+
     async fn lost(&self) {
         let mut rx = self.lost.subscribe();
         while !*rx.borrow_and_update() {
@@ -1132,6 +1296,7 @@ where
             reindex_hook: None,
             write_observer: None,
             file_concurrency: 1,
+            owned_file_executor: None,
             batch_size: None,
             skip_unchanged: false,
         }
@@ -1442,12 +1607,10 @@ where
         // Percentages need every file's size; one sizeless file (e.g. a
         // gzip-decompressed stream) poisons the total for the whole manifest
         // and the status endpoint falls back to manifest-count progress.
-        let totals_known = AtomicBool::new(true);
         // Files whose download has *started*, for the `downloading file N of M`
         // report. Approximate by construction when `file_concurrency > 1` —
         // several files are in flight at once — which is fine for a coarse
         // "it is moving" signal that the byte counters take over from.
-        let opened = AtomicU64::new(0);
 
         // 2. Ingest the `output` files. Up to `file_concurrency` at a time run
         // concurrently (fan-out): each file's fetch, parse, and write overlaps
@@ -1461,7 +1624,26 @@ where
         // This tally is run-local and feeds the status artifacts only. The
         // manifest's persisted counters are cumulative across runs and belong
         // to the ingestion engine's per-batch bookkeeping (#969).
-        let failed_at = AtomicU64::new(0);
+        let lease_control = keeper.control();
+        let file_run = Arc::new(OwnedFileRunContext {
+            lease: lease.clone(),
+            manifest_url: manifest_url.clone(),
+            request_headers: view.file_request_headers.clone(),
+            oauth_metadata_urls: view.oauth_metadata_urls.clone(),
+            encryption_key: view.file_encryption_key.clone(),
+            requires_access_token: manifest.requires_access_token,
+            options: opts,
+            file_count,
+            presized,
+            failed: AtomicU64::new(0),
+            file_level_failed: AtomicU64::new(0),
+            opened: AtomicU64::new(0),
+            totals_known: AtomicBool::new(true),
+            progress: progress.clone(),
+            error_records: tokio::sync::Mutex::new(Vec::new()),
+            file_failures: std::sync::Mutex::new(Vec::new()),
+            lease_control,
+        });
         // The share of `failed_at` that is *file*-level: a file that never
         // opened, or one whose stream broke part-way. Each already writes its
         // own `failed to fetch/ingest file ...` artifact and produces no entry
@@ -1470,250 +1652,84 @@ where
         // engine counted but never persisted (#1127). Kept separate rather than
         // held out of `failed_at`, because the manifest counters and the
         // terminal status still have to see these failures.
-        let file_level_at = AtomicU64::new(0);
         // File-level fetch/ingest failures write their own finalized artifacts.
         // No staged row exists; all finalized records are collected and handed
         // to one publication call after the whole run.
-        let error_records = Arc::new(tokio::sync::Mutex::new(Vec::<SubmitFileRecord>::new()));
         // Every input file that could not be ingested to its end, as
         // `(redacted url, cause)`. Any entry fails the manifest (#1127): a file
         // cut short mid-stream leaves its committed batches in storage and
         // silently drops the rest, which must never read `completed`.
-        let file_failures = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
-        // Shared borrows for the concurrent per-file futures. Iterating by
-        // index keeps the map closure's argument owned (a `usize`), so the
-        // future it returns can borrow `manifest.output[i]` for the manifest's
-        // lifetime without a higher-ranked-lifetime bound the closure can't name.
-        let failed_ref = &failed_at;
-        let file_level_ref = &file_level_at;
-        let opened_ref = &opened;
-        let totals_ref = &totals_known;
-        let progress_ref = &progress;
-        let keeper_ref = &keeper;
-        let view_ref = &view;
-        let opts_ref = &opts;
-        let lease_ref = &lease;
-        let manifest_ref = &manifest;
-        let manifest_url_ref = &manifest_url;
-        let error_records_ref = &error_records;
-        let file_failures_ref = &file_failures;
-
-        let mut ingest = futures::stream::iter(0..manifest.output.len())
-            .map(|i| async move {
-                if keeper_ref.should_stop() {
-                    return Ok::<(), StorageError>(());
-                }
-                let file = &manifest_ref.output[i];
-                let resource_type = file
-                    .resource_type
-                    .clone()
-                    .unwrap_or_else(|| "Resource".into());
-                // Opening a file can itself be a long wait (the remote has to
-                // start streaming), and until its first batch commits nothing
-                // else moves — so say which file is being pulled (#953).
-                let nth = opened_ref.fetch_add(1, Ordering::Relaxed) + 1;
-                self.report_phase(lease_ref, ManifestPhase::Downloading, nth, file_count)
-                    .await;
-                let (inner, file_bytes_total) = match self
-                    .fetcher
-                    .open_file_stream(
-                        &file.url,
-                        &view_ref.file_request_headers,
-                        manifest_ref.requires_access_token,
-                        &view_ref.oauth_metadata_urls,
-                        view_ref.file_encryption_key.as_ref(),
-                    )
-                    .await
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let cause = error_chain(&e);
-                        let url = redact_url(&file.url);
-                        tracing::warn!(
-                            submission = %lease_ref.submission_id,
-                            manifest = %lease_ref.manifest_id,
-                            url = %url,
-                            error = %cause,
-                            "bulk-submit could not open an input file; the manifest will fail"
-                        );
-                        let file_error = self
-                            .write_manifest_error(
-                                lease_ref,
-                                manifest_url_ref,
-                                i as u32 + 2,
-                                &format!("failed to fetch file {url}: {cause}"),
-                            )
-                            .await?;
-                        push_failure(file_failures_ref, url, cause);
-                        error_records_ref.lock().await.push(file_error);
-                        failed_ref.fetch_add(1, Ordering::Relaxed);
-                        file_level_ref.fetch_add(1, Ordering::Relaxed);
-                        // No batch ran for a file that never opened, so this
-                        // failure is the worker's to add.
-                        if let Err(e) = self.jobs.add_manifest_progress(lease_ref, 0, 1, 0).await {
-                            return fenced_write_outcome(keeper_ref, e);
-                        }
-                        return Ok(());
-                    }
-                };
-                if !presized {
-                    match file_bytes_total {
-                        Some(len) if totals_ref.load(Ordering::Relaxed) => {
-                            progress_ref.total.fetch_add(len, Ordering::Relaxed);
-                        }
-                        Some(_) => {}
-                        None => {
-                            totals_ref.store(false, Ordering::Relaxed);
-                            progress_ref.total.store(0, Ordering::Relaxed);
-                        }
-                    }
-                }
-                let stream: Box<dyn tokio::io::AsyncBufRead + Send + Unpin> =
-                    Box::new(CountingReader {
-                        inner,
-                        consumed: Arc::clone(&progress_ref.consumed),
-                    });
-
-                // Per-file options: the file url is part of every entry result's
-                // identity, since line numbers restart in each file (#457).
-                let file_opts = opts_ref.clone().with_file_url(&file.url);
-                match self
-                    .jobs
-                    .process_ndjson_stream(
-                        &lease_ref.tenant,
-                        &lease_ref.submission_id,
-                        &lease_ref.manifest_id,
-                        &resource_type,
-                        stream,
-                        &file_opts,
-                    )
-                    .await
-                {
-                    Ok(result) => {
-                        failed_ref.fetch_add(result.counts.error_count(), Ordering::Relaxed);
-                        // Every entry a batch committed was counted by that
-                        // batch. The lines the stream threw out before they
-                        // reached one — unparseable, or carrying the wrong
-                        // resource type — were counted by nobody, so they are
-                        // the worker's to add (#969).
-                        if result.unbatched_errors > 0
-                            && let Err(e) = self
-                                .jobs
-                                .add_manifest_progress(
-                                    lease_ref,
-                                    0,
-                                    result.unbatched_errors,
-                                    result.unbatched_errors,
-                                )
-                                .await
-                        {
-                            return fenced_write_outcome(keeper_ref, e);
-                        }
-                    }
-                    Err(e) => {
-                        let cause = error_chain(&e);
-                        let url = redact_url(&file.url);
-                        tracing::warn!(
-                            submission = %lease_ref.submission_id,
-                            manifest = %lease_ref.manifest_id,
-                            url = %url,
-                            error = %cause,
-                            "bulk-submit input file failed part-way; its committed batches stay, \
-                             the rest of the file was not ingested and the manifest will fail"
-                        );
-                        let file_error = self
-                            .write_manifest_error(
-                                lease_ref,
-                                manifest_url_ref,
-                                i as u32 + 2,
-                                &format!("failed to ingest file {url}: {cause}"),
-                            )
-                            .await?;
-                        push_failure(file_failures_ref, url, cause);
-                        error_records_ref.lock().await.push(file_error);
-                        failed_ref.fetch_add(1, Ordering::Relaxed);
-                        file_level_ref.fetch_add(1, Ordering::Relaxed);
-                        // Every entry this file did commit was already counted
-                        // by its own batch; the file-level failure was not.
-                        if let Err(e) = self.jobs.add_manifest_progress(lease_ref, 0, 1, 0).await {
-                            return fenced_write_outcome(keeper_ref, e);
-                        }
-                    }
-                }
-
-                // File boundary: no batch holds the write lock here, so fold
-                // the WAL back into the database before the next file (#978).
-                // Renew first, so the checkpoint — which can hold the write
-                // lock for minutes on a large WAL — starts with a full lease
-                // in hand instead of whatever the keeper last left (#1127).
-                // Skipped once the run is winding down: an aborted manifest has
-                // already left `processing`, so a renewal would only report a
-                // lease "lost" to the abort itself.
-                if !keeper_ref.should_stop()
-                    && !self.renew_before_checkpoint(lease_ref, keeper_ref).await
-                {
+        if self.file_concurrency > 1
+            && let Some(executor) = &self.owned_file_executor
+        {
+            match run_independent_file_tasks(
+                Arc::clone(executor),
+                manifest.output.clone(),
+                Arc::clone(&file_run),
+                self.file_concurrency,
+            )
+            .await?
+            {
+                IndependentCompletion::Completed => {}
+                IndependentCompletion::Cancelled => {
+                    log_wind_down(&lease, true);
                     return Ok(());
                 }
-                self.jobs.checkpoint_after_file().await;
-
-                let total = progress_ref.total.load(Ordering::Relaxed);
-                if total > 0 {
-                    let _ = self
-                        .jobs
-                        .update_manifest_bytes(
-                            lease_ref,
-                            progress_ref.consumed.load(Ordering::Relaxed),
-                            total,
-                        )
-                        .await;
+                IndependentCompletion::LeaseLost => {
+                    warn_lease_lost(&lease, "draining independent output-file tasks");
+                    return Ok(());
                 }
-                Ok(())
-            })
-            .buffer_unordered(self.file_concurrency.max(1));
-        // Race the whole fan-out against the lease: losing it has to stop the
-        // ingest *inside* a file, not merely between files. A batch already
-        // committed stays committed and re-ingests idempotently when the
-        // manifest is reclaimed; continuing to write past expiry would let a
-        // second worker ingest the same manifest alongside this one (#969).
-        let drain = async {
-            while let Some(result) = ingest.next().await {
-                result?;
             }
-            Ok::<(), StorageError>(())
-        };
-        let completed = tokio::select! {
-            biased;
-            _ = keeper.lost() => false,
-            result = drain => {
-                result?;
-                true
+        } else {
+            let mut ingest = futures::stream::iter(manifest.output.iter().cloned().enumerate())
+                .map(|(input_index, file)| {
+                    let context = OwnedFileContext::new(Arc::clone(&file_run), file, input_index);
+                    async move {
+                        process_output_file(
+                            self.jobs.as_ref(),
+                            self.fetcher.as_ref(),
+                            self.output.as_ref(),
+                            context.as_borrowed(),
+                        )
+                        .await
+                    }
+                })
+                .buffer_unordered(self.file_concurrency.max(1));
+            let drain = async {
+                while let Some(result) = ingest.next().await {
+                    result?;
+                }
+                Ok::<(), StorageError>(())
+            };
+            let completed = tokio::select! {
+                biased;
+                _ = keeper.lost() => false,
+                result = drain => {
+                    result?;
+                    true
+                }
+            };
+            drop(ingest);
+            if !completed {
+                warn_lease_lost(&lease, "draining inline output-file futures");
+                return Ok(());
             }
-        };
-        drop(ingest);
-        if !completed {
-            tracing::warn!(
-                submission = %lease.submission_id,
-                manifest = %lease.manifest_id,
-                worker = %lease.worker_id,
-                "bulk-submit run abandoned mid-manifest: its lease is no longer held"
-            );
-            return Ok(());
         }
         // Every output file has been consumed to its end. The counters keep
         // outranking the phase at the status endpoint, so this is rendered as
         // a suffix on the progress line rather than in place of it (#1218).
         self.report_phase(&lease, ManifestPhase::Downloaded, file_count, file_count)
             .await;
-        let mut failed = failed_at.load(Ordering::Relaxed);
+        let mut failed = file_run.failed.load(Ordering::Relaxed);
         // Carried to the receipt step so the summary OperationOutcome can
         // discount the failures that already have an artifact of their own.
-        let file_level_failures = file_level_at.load(Ordering::Relaxed);
+        let file_level_failures = file_run.file_level_failed.load(Ordering::Relaxed);
 
         // 2b. Process `deleted` files — transaction Bundles / resource refs to
         // remove. Successful deletions across every deleted file share one
         // part-0 receipt; a deleted-file fetch failure gets a source-ordinal
         // error artifact and does not abort the remaining files.
-        let mut records = error_records.lock().await.clone();
+        let mut records = file_run.error_records.lock().await.clone();
         let mut deleted_refs = Vec::new();
         for (input_index, file) in manifest.deleted.iter().enumerate() {
             if keeper.should_stop() {
@@ -1754,7 +1770,7 @@ where
                             )
                             .await?;
                         records.push(deleted_error);
-                        push_failure(&file_failures, url, cause);
+                        push_failure(&file_run.file_failures, url, cause);
                     }
                 }
                 Err(e) => {
@@ -1776,7 +1792,7 @@ where
                         )
                         .await?;
                     records.push(deleted_error);
-                    push_failure(&file_failures, url, cause);
+                    push_failure(&file_run.file_failures, url, cause);
                 }
             }
         }
@@ -1824,7 +1840,7 @@ where
                 .add_manifest_progress(&lease, 0, sync.unindexed, 0)
                 .await
             {
-                return fenced_write_outcome(&keeper, e);
+                return fenced_write_outcome(&file_run.lease_control, e);
             }
         }
         failed += sync.unindexed;
@@ -1882,7 +1898,8 @@ where
         // so what did commit stays visible, but the status must not tell the
         // operator the import succeeded.
         let file_failures = std::mem::take(
-            &mut *file_failures
+            &mut *file_run
+                .file_failures
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
@@ -1902,6 +1919,7 @@ where
         let published = self
             .publish_collected_artifacts(&lease, keeper, records, terminal)
             .await?;
+        crate::perf::log_submit_runtime_metrics();
 
         // 5. Fast-load (#903): the manifest ingested without search indexing —
         // rebuild the indexes for its resource types now. Fire-and-forget:
@@ -2394,45 +2412,6 @@ where
         }
     }
 
-    /// Renews the lease right before a file-boundary WAL checkpoint and tells
-    /// the keeper about the new expiry (#1127). Returns `false` when the lease
-    /// turned out to be lost, in which case the keeper has been told and the
-    /// file ends quietly; a storage error or a renewal that does not answer in
-    /// time is only logged, since the keeper keeps renewing on its own.
-    async fn renew_before_checkpoint(&self, lease: &ManifestLease, keeper: &LeaseKeeper) -> bool {
-        match tokio::time::timeout(lease.lease_duration, self.jobs.heartbeat(lease)).await {
-            Ok(Ok(expiry)) => {
-                keeper.note_renewed(expiry);
-                true
-            }
-            Ok(Err(LeaseError::LeaseLost { .. })) => {
-                warn_lease_lost(lease, "renewing before a WAL checkpoint");
-                keeper.declare_lost();
-                false
-            }
-            Ok(Err(LeaseError::Storage(e))) => {
-                tracing::warn!(
-                    submission = %lease.submission_id,
-                    manifest = %lease.manifest_id,
-                    error = %e,
-                    "bulk-submit could not renew the lease before a WAL checkpoint; \
-                     the keeper keeps renewing"
-                );
-                true
-            }
-            Err(_elapsed) => {
-                tracing::warn!(
-                    submission = %lease.submission_id,
-                    manifest = %lease.manifest_id,
-                    waited_ms = u64::try_from(lease.lease_duration.as_millis()).unwrap_or(u64::MAX),
-                    "bulk-submit lease renewal before a WAL checkpoint timed out; \
-                     the keeper keeps renewing"
-                );
-                true
-            }
-        }
-    }
-
     /// Rebuilds search indexes for the manifest's resource types after
     /// deferred ingestion. Fire-and-forget: only publication storage errors
     /// may affect the run.
@@ -2492,16 +2471,535 @@ where
     }
 }
 
+impl<Js, Fetcher, Os> DefaultSubmitWorker<Js, Fetcher, Os>
+where
+    Js: BulkSubmitJobStore + ?Sized + 'static,
+    Fetcher: SubmitInputFetcher + ?Sized + 'static,
+    Os: ExportOutputStore + ?Sized + 'static,
+{
+    /// Runs admitted output files in independent Tokio tasks.
+    ///
+    /// This is opt-in because spawning requires owned, `'static` services.
+    /// Callers that wrap borrowed services can keep using the inline scheduler.
+    /// A configured file concurrency of one also remains inline.
+    pub fn with_independent_file_tasks(mut self) -> Self {
+        self.owned_file_executor = Some(Arc::new(OwnedFileServices {
+            jobs: Arc::clone(&self.jobs),
+            fetcher: Arc::clone(&self.fetcher),
+            output: Arc::clone(&self.output),
+        }));
+        self
+    }
+}
+
+async fn report_file_phase<Js: BulkSubmitJobStore + ?Sized>(
+    jobs: &Js,
+    lease: &ManifestLease,
+    phase: ManifestPhase,
+    files_done: u64,
+    files_total: u64,
+) {
+    if let Err(e) = jobs
+        .update_manifest_phase(lease, phase, files_done, files_total)
+        .await
+    {
+        tracing::debug!(
+            submission = %lease.submission_id,
+            manifest = %lease.manifest_id,
+            %phase,
+            error = %e,
+            "could not record bulk-submit pre-ingest phase"
+        );
+    }
+}
+
+async fn write_file_error<Os: ExportOutputStore + ?Sized>(
+    output: &Os,
+    lease: &ManifestLease,
+    manifest_url: &str,
+    part_index: u32,
+    message: &str,
+) -> StorageResult<SubmitFileRecord> {
+    let outcome = json!({
+        "resourceType": "OperationOutcome",
+        "issue": [{
+            "severity": "error",
+            "code": "processing",
+            "diagnostics": message
+        }]
+    })
+    .to_string();
+    let key = submit_artifact_key(
+        &lease.tenant,
+        &lease.submission_id,
+        &lease.manifest_id,
+        "error",
+        Some("OperationOutcome"),
+        part_index,
+        lease.fencing_token,
+    );
+    let mut writer = output.open_writer(&key).await?;
+    writer
+        .write_line(&outcome)
+        .await
+        .map_err(artifact_write_error)?;
+    let finalized = output.finalize_part(&key, writer).await?;
+    Ok(SubmitFileRecord {
+        manifest_url: Some(manifest_url.to_string()),
+        file_type: "error".to_string(),
+        resource_type: Some("OperationOutcome".to_string()),
+        part_index,
+        file_path: key.resource_type,
+        line_count: finalized.line_count,
+        byte_count: finalized.size_bytes,
+        count_severity: Some(json!({"error": 1})),
+    })
+}
+
+async fn renew_file_lease<Js: BulkSubmitJobStore + ?Sized>(
+    jobs: &Js,
+    lease: &ManifestLease,
+    control: &LeaseControl,
+) -> bool {
+    match tokio::time::timeout(lease.lease_duration, jobs.heartbeat(lease)).await {
+        Ok(Ok(expiry)) => {
+            control.note_renewed(expiry);
+            true
+        }
+        Ok(Err(LeaseError::LeaseLost { .. })) => {
+            warn_lease_lost(lease, "renewing before a WAL checkpoint");
+            control.declare_lost();
+            false
+        }
+        Ok(Err(LeaseError::Storage(e))) => {
+            tracing::warn!(
+                submission = %lease.submission_id,
+                manifest = %lease.manifest_id,
+                error = %e,
+                "bulk-submit could not renew the lease before a WAL checkpoint; the keeper keeps renewing"
+            );
+            true
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                submission = %lease.submission_id,
+                manifest = %lease.manifest_id,
+                waited_ms = u64::try_from(lease.lease_duration.as_millis()).unwrap_or(u64::MAX),
+                "bulk-submit lease renewal before a WAL checkpoint timed out; the keeper keeps renewing"
+            );
+            true
+        }
+    }
+}
+
+/// Processes one output file. Inline futures and independent tasks both use
+/// this function so fetch, receipt, checkpoint, and fencing behavior cannot
+/// drift between schedulers.
+async fn process_output_file<Js, Fetcher, Os>(
+    jobs: &Js,
+    fetcher: &Fetcher,
+    output: &Os,
+    context: BorrowedFileContext<'_>,
+) -> StorageResult<()>
+where
+    Js: BulkSubmitJobStore + ?Sized,
+    Fetcher: SubmitInputFetcher + ?Sized,
+    Os: ExportOutputStore + ?Sized,
+{
+    let run = context.run;
+    if run.lease_control.should_stop() {
+        return Ok(());
+    }
+    let resource_type = context
+        .file
+        .resource_type
+        .clone()
+        .unwrap_or_else(|| "Resource".into());
+    let nth = run.opened.fetch_add(1, Ordering::Relaxed) + 1;
+    report_file_phase(
+        jobs,
+        &run.lease,
+        ManifestPhase::Downloading,
+        nth,
+        run.file_count,
+    )
+    .await;
+    let (inner, file_bytes_total) = match fetcher
+        .open_file_stream(
+            &context.file.url,
+            &run.request_headers,
+            run.requires_access_token,
+            &run.oauth_metadata_urls,
+            run.encryption_key.as_ref(),
+        )
+        .await
+    {
+        Ok(stream) => stream,
+        Err(e) => {
+            let cause = error_chain(&e);
+            let url = redact_url(&context.file.url);
+            tracing::warn!(
+                submission = %run.lease.submission_id,
+                manifest = %run.lease.manifest_id,
+                url = %url,
+                error = %cause,
+                "bulk-submit could not open an input file; the manifest will fail"
+            );
+            let file_error = write_file_error(
+                output,
+                &run.lease,
+                &run.manifest_url,
+                context.error_part_index,
+                &format!("failed to fetch file {url}: {cause}"),
+            )
+            .await?;
+            push_failure(&run.file_failures, url, cause);
+            run.error_records.lock().await.push(file_error);
+            run.failed.fetch_add(1, Ordering::Relaxed);
+            run.file_level_failed.fetch_add(1, Ordering::Relaxed);
+            if let Err(e) = jobs.add_manifest_progress(&run.lease, 0, 1, 0).await {
+                return fenced_write_outcome(&run.lease_control, e);
+            }
+            return Ok(());
+        }
+    };
+    if !run.presized {
+        match file_bytes_total {
+            Some(len) if run.totals_known.load(Ordering::Relaxed) => {
+                run.progress.total.fetch_add(len, Ordering::Relaxed);
+            }
+            Some(_) => {}
+            None => {
+                run.totals_known.store(false, Ordering::Relaxed);
+                run.progress.total.store(0, Ordering::Relaxed);
+            }
+        }
+    }
+    let stream: Box<dyn tokio::io::AsyncBufRead + Send + Unpin> = Box::new(CountingReader {
+        inner,
+        consumed: Arc::clone(&run.progress.consumed),
+    });
+    let file_options = run.options.clone().with_file_url(&context.file.url);
+    match jobs
+        .process_ndjson_stream(
+            &run.lease.tenant,
+            &run.lease.submission_id,
+            &run.lease.manifest_id,
+            &resource_type,
+            stream,
+            &file_options,
+        )
+        .await
+    {
+        Ok(result) => {
+            run.failed
+                .fetch_add(result.counts.error_count(), Ordering::Relaxed);
+            if result.unbatched_errors > 0
+                && let Err(e) = jobs
+                    .add_manifest_progress(
+                        &run.lease,
+                        0,
+                        result.unbatched_errors,
+                        result.unbatched_errors,
+                    )
+                    .await
+            {
+                return fenced_write_outcome(&run.lease_control, e);
+            }
+        }
+        Err(e) => {
+            let cause = error_chain(&e);
+            let url = redact_url(&context.file.url);
+            tracing::warn!(
+                submission = %run.lease.submission_id,
+                manifest = %run.lease.manifest_id,
+                url = %url,
+                error = %cause,
+                "bulk-submit input file failed part-way; its committed batches stay, the rest of the file was not ingested and the manifest will fail"
+            );
+            let file_error = write_file_error(
+                output,
+                &run.lease,
+                &run.manifest_url,
+                context.error_part_index,
+                &format!("failed to ingest file {url}: {cause}"),
+            )
+            .await?;
+            push_failure(&run.file_failures, url, cause);
+            run.error_records.lock().await.push(file_error);
+            run.failed.fetch_add(1, Ordering::Relaxed);
+            run.file_level_failed.fetch_add(1, Ordering::Relaxed);
+            if let Err(e) = jobs.add_manifest_progress(&run.lease, 0, 1, 0).await {
+                return fenced_write_outcome(&run.lease_control, e);
+            }
+        }
+    }
+
+    if !run.lease_control.should_stop()
+        && !renew_file_lease(jobs, &run.lease, &run.lease_control).await
+    {
+        return Ok(());
+    }
+    jobs.checkpoint_after_file().await;
+    let total = run.progress.total.load(Ordering::Relaxed);
+    if total > 0 {
+        let _ = jobs
+            .update_manifest_bytes(
+                &run.lease,
+                run.progress.consumed.load(Ordering::Relaxed),
+                total,
+            )
+            .await;
+    }
+    Ok(())
+}
+
+enum IndependentStop {
+    Cancelled,
+    LeaseLost,
+    Failed(StorageError),
+    Panicked(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndependentCompletion {
+    Completed,
+    Cancelled,
+    LeaseLost,
+}
+
+struct IndependentFileTasks {
+    tasks: Option<tokio::task::JoinSet<StorageResult<()>>>,
+    cancel: CancelToken,
+}
+
+impl IndependentFileTasks {
+    fn new(cancel: CancelToken) -> Self {
+        Self {
+            tasks: Some(tokio::task::JoinSet::new()),
+            cancel,
+        }
+    }
+
+    fn tasks(&mut self) -> &mut tokio::task::JoinSet<StorageResult<()>> {
+        self.tasks.as_mut().expect("task set is armed")
+    }
+
+    fn disarm(mut self) {
+        let tasks = self.tasks.take().expect("task set is armed");
+        debug_assert!(tasks.is_empty());
+    }
+}
+
+impl Drop for IndependentFileTasks {
+    fn drop(&mut self) {
+        if let Some(tasks) = self.tasks.as_mut() {
+            self.cancel.cancel();
+            tasks.abort_all();
+        }
+    }
+}
+
+fn observe_independent_stop(
+    control: &LeaseControl,
+    stop: &mut Option<IndependentStop>,
+    force_cleanup: &mut bool,
+    lease_escalation_logged: &mut bool,
+) {
+    let cancelled = control.cancelled();
+    let lease_lost = control.lease_lost();
+    if stop.is_none() {
+        if cancelled {
+            *stop = Some(IndependentStop::Cancelled);
+        } else if lease_lost {
+            *stop = Some(IndependentStop::LeaseLost);
+            *force_cleanup = true;
+        }
+    }
+    if lease_lost && matches!(stop, Some(IndependentStop::Cancelled)) {
+        if !*lease_escalation_logged {
+            tracing::warn!(
+                "bulk-submit independent file drain lost its lease after cancellation; forcing cleanup"
+            );
+            *lease_escalation_logged = true;
+        }
+        *force_cleanup = true;
+    }
+}
+
+fn process_independent_join(
+    joined: Result<StorageResult<()>, tokio::task::JoinError>,
+    control: &LeaseControl,
+    stop: &mut Option<IndependentStop>,
+    force_cleanup: &mut bool,
+    lease_escalation_logged: &mut bool,
+) {
+    // External causes always outrank the child result observed at this same
+    // boundary. A later child failure can still escalate a cooperative abort.
+    observe_independent_stop(control, stop, force_cleanup, lease_escalation_logged);
+    match joined {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            if stop.is_none() {
+                *stop = Some(IndependentStop::Failed(error));
+            } else if matches!(stop, Some(IndependentStop::Cancelled)) {
+                tracing::warn!(
+                    error = %error,
+                    "bulk-submit independent child failed while cancellation was draining; forcing cleanup"
+                );
+            }
+            *force_cleanup = true;
+        }
+        Err(error) if *force_cleanup && error.is_cancelled() => {
+            // Expected result of our own abort_all; the captured cause stays
+            // authoritative and cleanup joins do not create a new one.
+        }
+        Err(error) => {
+            let child_failure = error.to_string();
+            if stop.is_none() {
+                *stop = Some(IndependentStop::Panicked(child_failure));
+            } else if matches!(stop, Some(IndependentStop::Cancelled)) {
+                tracing::warn!(
+                    error = %child_failure,
+                    "bulk-submit independent child failed while cancellation was draining; forcing cleanup"
+                );
+            }
+            *force_cleanup = true;
+        }
+    }
+}
+
+fn drain_ready_independent_joins(
+    tasks: &mut IndependentFileTasks,
+    active: &mut usize,
+    control: &LeaseControl,
+    stop: &mut Option<IndependentStop>,
+    force_cleanup: &mut bool,
+    lease_escalation_logged: &mut bool,
+) {
+    while let Some(joined) = tasks.tasks().try_join_next() {
+        *active = active
+            .checked_sub(1)
+            .expect("a ready independent task must be active");
+        process_independent_join(
+            joined,
+            control,
+            stop,
+            force_cleanup,
+            lease_escalation_logged,
+        );
+    }
+}
+
+async fn run_independent_file_tasks(
+    executor: Arc<dyn OwnedFileExecutor>,
+    files: Vec<RemoteFile>,
+    run: Arc<OwnedFileRunContext>,
+    concurrency: usize,
+) -> StorageResult<IndependentCompletion> {
+    use tokio::time::MissedTickBehavior;
+
+    let mut files = files.into_iter().enumerate();
+    let control = &run.lease_control;
+    let mut tasks = IndependentFileTasks::new(control.cancel.clone());
+    let concurrency = concurrency.max(1);
+    let mut active = 0_usize;
+    let mut exhausted = false;
+    let mut stop: Option<IndependentStop> = None;
+    let mut force_cleanup = false;
+    let mut abort_requested = false;
+    let mut lease_escalation_logged = false;
+    let mut interval = tokio::time::interval(Duration::from_millis(50));
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        observe_independent_stop(
+            control,
+            &mut stop,
+            &mut force_cleanup,
+            &mut lease_escalation_logged,
+        );
+        // A successful completion must not refill its slot while another
+        // already-completed child is carrying a fatal result.
+        drain_ready_independent_joins(
+            &mut tasks,
+            &mut active,
+            control,
+            &mut stop,
+            &mut force_cleanup,
+            &mut lease_escalation_logged,
+        );
+        observe_independent_stop(
+            control,
+            &mut stop,
+            &mut force_cleanup,
+            &mut lease_escalation_logged,
+        );
+
+        if force_cleanup && !abort_requested {
+            control.cancel.cancel();
+            tasks.tasks().abort_all();
+            abort_requested = true;
+        }
+
+        if stop.is_none() && active < concurrency && !exhausted {
+            match files.next() {
+                Some((input_index, file)) => {
+                    let context = OwnedFileContext::new(Arc::clone(&run), file, input_index);
+                    let executor = Arc::clone(&executor);
+                    tasks
+                        .tasks()
+                        .spawn(async move { executor.process(context).await });
+                    active += 1;
+                    continue;
+                }
+                None => exhausted = true,
+            }
+        }
+
+        if active == 0 {
+            break;
+        }
+        let joined = tokio::select! {
+            biased;
+            _ = interval.tick() => None,
+            _ = control.lost(), if !force_cleanup => None,
+            joined = tasks.tasks().join_next() => joined,
+        };
+        if let Some(joined) = joined {
+            active -= 1;
+            process_independent_join(
+                joined,
+                control,
+                &mut stop,
+                &mut force_cleanup,
+                &mut lease_escalation_logged,
+            );
+        }
+    }
+
+    tasks.disarm();
+    match stop {
+        None => Ok(IndependentCompletion::Completed),
+        Some(IndependentStop::Cancelled) => Ok(IndependentCompletion::Cancelled),
+        Some(IndependentStop::LeaseLost) => Ok(IndependentCompletion::LeaseLost),
+        Some(IndependentStop::Failed(error)) => Err(error),
+        Some(IndependentStop::Panicked(error)) => Err(internal_error(format!(
+            "independent bulk-submit file task failed: {error}"
+        ))),
+    }
+}
+
 /// Resolves what a failed fenced write means for the file being ingested.
 ///
 /// A storage error aborts the whole job, as it always has. A lost lease is not
 /// an error at all: the manifest belongs to someone else now, so the keeper is
 /// told, which stops the sibling files too, and this one ends quietly (#969).
-fn fenced_write_outcome(keeper: &LeaseKeeper, e: LeaseError) -> StorageResult<()> {
+fn fenced_write_outcome(control: &LeaseControl, e: LeaseError) -> StorageResult<()> {
     match e {
         LeaseError::Storage(e) => Err(e),
         LeaseError::LeaseLost { .. } => {
-            keeper.declare_lost();
+            control.declare_lost();
             Ok(())
         }
     }
@@ -3140,7 +3638,9 @@ mod tests {
                 "http://localhost",
             )),
             WorkerId::new("empty-receipts"),
-        );
+        )
+        .with_file_concurrency(2)
+        .with_independent_file_tasks();
         worker.run_job(lease).await.unwrap();
 
         assert_eq!(
@@ -3810,6 +4310,266 @@ mod tests {
         }
     }
 
+    struct BorrowedFetcher<'a>(&'a dyn SubmitInputFetcher);
+
+    #[async_trait]
+    impl SubmitInputFetcher for BorrowedFetcher<'_> {
+        async fn fetch_manifest(
+            &self,
+            url: &str,
+            headers: &[(String, String)],
+            oauth: &[String],
+            encryption_key: Option<&Value>,
+        ) -> StorageResult<RemoteManifest> {
+            self.0
+                .fetch_manifest(url, headers, oauth, encryption_key)
+                .await
+        }
+
+        async fn open_file_stream(
+            &self,
+            url: &str,
+            headers: &[(String, String)],
+            requires_access_token: bool,
+            oauth: &[String],
+            encryption_key: Option<&Value>,
+        ) -> StorageResult<(Box<dyn tokio::io::AsyncBufRead + Send + Unpin>, Option<u64>)> {
+            self.0
+                .open_file_stream(url, headers, requires_access_token, oauth, encryption_key)
+                .await
+        }
+
+        async fn file_size(
+            &self,
+            url: &str,
+            headers: &[(String, String)],
+            requires_access_token: bool,
+            oauth: &[String],
+        ) -> StorageResult<Option<u64>> {
+            self.0
+                .file_size(url, headers, requires_access_token, oauth)
+                .await
+        }
+    }
+
+    struct BorrowedOutput<'a>(&'a dyn ExportOutputStore);
+
+    #[async_trait]
+    impl ExportOutputStore for BorrowedOutput<'_> {
+        async fn open_writer(
+            &self,
+            key: &ExportPartKey,
+        ) -> StorageResult<crate::core::bulk_export_output::ExportPartWriter> {
+            self.0.open_writer(key).await
+        }
+
+        async fn finalize_part(
+            &self,
+            key: &ExportPartKey,
+            writer: crate::core::bulk_export_output::ExportPartWriter,
+        ) -> StorageResult<crate::core::bulk_export_output::FinalizedPart> {
+            self.0.finalize_part(key, writer).await
+        }
+
+        async fn download_url(
+            &self,
+            key: &ExportPartKey,
+            ttl: StdDuration,
+        ) -> StorageResult<crate::core::bulk_export_output::DownloadUrl> {
+            self.0.download_url(key, ttl).await
+        }
+
+        async fn open_reader(
+            &self,
+            key: &ExportPartKey,
+        ) -> StorageResult<std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>> {
+            self.0.open_reader(key).await
+        }
+
+        async fn delete_job_outputs(
+            &self,
+            tenant: &TenantContext,
+            job_id: &crate::core::bulk_export::ExportJobId,
+        ) -> StorageResult<()> {
+            self.0.delete_job_outputs(tenant, job_id).await
+        }
+    }
+
+    struct TaskRecordingExecutor {
+        task_ids: Arc<std::sync::Mutex<Vec<tokio::task::Id>>>,
+        admitted: Arc<AtomicU64>,
+        maximum_active: Arc<AtomicU64>,
+        active: Arc<AtomicU64>,
+    }
+
+    impl OwnedFileExecutor for TaskRecordingExecutor {
+        fn process(
+            &self,
+            _context: OwnedFileContext,
+        ) -> Pin<Box<dyn Future<Output = StorageResult<()>> + Send + 'static>> {
+            let task_ids = Arc::clone(&self.task_ids);
+            let admitted = Arc::clone(&self.admitted);
+            let maximum_active = Arc::clone(&self.maximum_active);
+            let active = Arc::clone(&self.active);
+            Box::pin(async move {
+                admitted.fetch_add(1, Ordering::SeqCst);
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum_active.fetch_max(current, Ordering::SeqCst);
+                task_ids.lock().unwrap().push(tokio::task::id());
+                tokio::time::sleep(StdDuration::from_millis(20)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    type ScriptedFileFuture = Pin<Box<dyn Future<Output = StorageResult<()>> + Send + 'static>>;
+
+    struct ScriptedExecutor {
+        action: Arc<dyn Fn(OwnedFileContext) -> ScriptedFileFuture + Send + Sync>,
+    }
+
+    impl OwnedFileExecutor for ScriptedExecutor {
+        fn process(&self, context: OwnedFileContext) -> ScriptedFileFuture {
+            (self.action)(context)
+        }
+    }
+
+    fn scripted_executor<F>(action: F) -> Arc<dyn OwnedFileExecutor>
+    where
+        F: Fn(OwnedFileContext) -> ScriptedFileFuture + Send + Sync + 'static,
+    {
+        Arc::new(ScriptedExecutor {
+            action: Arc::new(action),
+        })
+    }
+
+    fn blocked_executor(
+        admitted: Arc<AtomicU64>,
+        dropped: Arc<AtomicU64>,
+        release: Arc<tokio::sync::Notify>,
+    ) -> Arc<dyn OwnedFileExecutor> {
+        scripted_executor(move |_| {
+            let admitted = Arc::clone(&admitted);
+            let dropped = Arc::clone(&dropped);
+            let release = Arc::clone(&release);
+            Box::pin(async move {
+                admitted.fetch_add(1, Ordering::SeqCst);
+                let _sentinel = TaskDropSentinel::new(dropped);
+                release.notified().await;
+                Ok(())
+            })
+        })
+    }
+
+    struct TaskDropSentinel {
+        dropped: Arc<AtomicU64>,
+    }
+
+    impl TaskDropSentinel {
+        fn new(dropped: Arc<AtomicU64>) -> Self {
+            Self { dropped }
+        }
+    }
+
+    impl Drop for TaskDropSentinel {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct BlockingCommitObserver {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        finished: AtomicBool,
+    }
+
+    #[async_trait]
+    impl BatchCommitObserver for BlockingCommitObserver {
+        async fn batch_committed(&self, _batch: &BatchCommitted<'_>) {
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.finished.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn scheduler_control() -> LeaseControl {
+        let (lost, _) = tokio::sync::watch::channel(false);
+        LeaseControl {
+            lost,
+            cancel: CancelToken::new(),
+            renewed_until: Arc::new(AtomicI64::new(Utc::now().timestamp_millis())),
+        }
+    }
+
+    struct SchedulerInput {
+        files: Vec<RemoteFile>,
+        run: Arc<OwnedFileRunContext>,
+    }
+
+    fn scheduler_contexts(count: usize, control: &LeaseControl) -> SchedulerInput {
+        let files = (0..count)
+            .map(|input_index| RemoteFile {
+                resource_type: Some("Patient".to_string()),
+                url: format!("http://provider/{input_index}.ndjson"),
+                count: None,
+            })
+            .collect();
+        let run = Arc::new(OwnedFileRunContext {
+            lease: keeper_lease(),
+            manifest_url: "http://provider/manifest.json".to_string(),
+            request_headers: Vec::new(),
+            oauth_metadata_urls: Vec::new(),
+            encryption_key: None,
+            requires_access_token: false,
+            options: BulkProcessingOptions::new(),
+            file_count: count as u64,
+            presized: false,
+            failed: AtomicU64::new(0),
+            file_level_failed: AtomicU64::new(0),
+            opened: AtomicU64::new(0),
+            totals_known: AtomicBool::new(true),
+            progress: ByteProgress::default(),
+            error_records: tokio::sync::Mutex::new(Vec::new()),
+            file_failures: std::sync::Mutex::new(Vec::new()),
+            lease_control: control.clone(),
+        });
+        SchedulerInput { files, run }
+    }
+
+    fn with_test_file_scheduling<Js, Fetcher, Os>(
+        worker: DefaultSubmitWorker<Js, Fetcher, Os>,
+        independent: bool,
+        concurrency: usize,
+    ) -> DefaultSubmitWorker<Js, Fetcher, Os>
+    where
+        Js: BulkSubmitJobStore + ?Sized + 'static,
+        Fetcher: SubmitInputFetcher + ?Sized + 'static,
+        Os: ExportOutputStore + ?Sized + 'static,
+    {
+        let worker = worker.with_file_concurrency(concurrency);
+        if independent {
+            worker.with_independent_file_tasks()
+        } else {
+            worker
+        }
+    }
+
+    async fn wait_for_count(counter: &AtomicU64, expected: u64, message: &str) {
+        tokio::time::timeout(StdDuration::from_secs(2), async {
+            while counter.load(Ordering::SeqCst) != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "{message}: expected {expected}, got {}",
+                counter.load(Ordering::SeqCst)
+            )
+        });
+    }
+
     /// Which step of the output store a [`FaultOutputStore`] breaks.
     #[derive(Clone, Copy)]
     enum OutputFault {
@@ -4235,87 +4995,92 @@ mod tests {
     /// produced, no matter what order the responses land in.
     #[tokio::test]
     async fn test_presizing_is_correct_with_file_concurrency() {
-        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
-        backend.init_schema().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let output = Arc::new(LocalFsOutputStore::new(
-            tmp.path().to_path_buf(),
-            "http://localhost:8080",
-        ));
+        for independent in [false, true] {
+            let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+            backend.init_schema().unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            let output = Arc::new(LocalFsOutputStore::new(
+                tmp.path().to_path_buf(),
+                "http://localhost:8080",
+            ));
 
-        let tenant = tenant();
-        let sub_id = SubmissionId::generate("mock-system");
-        backend
-            .create_submission(&tenant, &sub_id, None)
-            .await
-            .unwrap();
-        backend
-            .add_manifest(
-                &tenant,
-                &sub_id,
-                Some("http://provider/manifest.json"),
-                None,
-            )
-            .await
-            .unwrap();
+            let tenant = tenant();
+            let sub_id = SubmissionId::generate("mock-system");
+            backend
+                .create_submission(&tenant, &sub_id, None)
+                .await
+                .unwrap();
+            backend
+                .add_manifest(
+                    &tenant,
+                    &sub_id,
+                    Some("http://provider/manifest.json"),
+                    None,
+                )
+                .await
+                .unwrap();
 
-        let types = [
-            "Patient",
-            "Observation",
-            "Condition",
-            "Encounter",
-            "Procedure",
-            "Immunization",
-        ];
-        let mut files = std::collections::HashMap::new();
-        let mut output_files = Vec::new();
-        let mut expected: u64 = 0;
-        for (i, ty) in types.iter().enumerate() {
-            let url = format!("http://provider/{ty}.ndjson");
-            // Different lengths per file, so a dropped or double-counted HEAD
-            // cannot coincidentally still sum to `expected`.
-            let body = format!("{{\"resourceType\":\"{ty}\",\"id\":\"c{i}\"}}\n");
-            expected += body.len() as u64;
-            files.insert(url.clone(), body.into_bytes());
-            output_files.push(RemoteFile {
-                resource_type: Some((*ty).to_string()),
-                url,
-                count: None,
+            let types = [
+                "Patient",
+                "Observation",
+                "Condition",
+                "Encounter",
+                "Procedure",
+                "Immunization",
+            ];
+            let mut files = std::collections::HashMap::new();
+            let mut output_files = Vec::new();
+            let mut expected: u64 = 0;
+            for (i, ty) in types.iter().enumerate() {
+                let url = format!("http://provider/{ty}.ndjson");
+                // Different lengths per file, so a dropped or double-counted HEAD
+                // cannot coincidentally still sum to `expected`.
+                let body = format!("{{\"resourceType\":\"{ty}\",\"id\":\"c{i}\"}}\n");
+                expected += body.len() as u64;
+                files.insert(url.clone(), body.into_bytes());
+                output_files.push(RemoteFile {
+                    resource_type: Some((*ty).to_string()),
+                    url,
+                    count: None,
+                });
+            }
+            let fetcher = Arc::new(MockFetcher {
+                files,
+                manifest: RemoteManifest {
+                    requires_access_token: false,
+                    output: output_files,
+                    deleted: vec![],
+                },
             });
+
+            let worker = with_test_file_scheduling(
+                DefaultSubmitWorker::new(
+                    backend.clone(),
+                    fetcher,
+                    output,
+                    WorkerId::new("concurrent-presize"),
+                ),
+                independent,
+                4,
+            );
+            let lease = backend
+                .claim_next_manifest(
+                    &WorkerId::new("concurrent-presize"),
+                    StdDuration::from_secs(60),
+                )
+                .await
+                .unwrap()
+                .expect("claimable manifest");
+            worker.run_job(lease).await.unwrap();
+
+            let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+            assert_eq!(
+                manifests[0].bytes_total, expected,
+                "concurrent HEADs must sum to the same denominator as the serial loop"
+            );
+            assert_eq!(manifests[0].bytes_processed, expected);
+            assert_eq!(manifests[0].files_total, types.len() as u64);
         }
-        let fetcher = Arc::new(MockFetcher {
-            files,
-            manifest: RemoteManifest {
-                requires_access_token: false,
-                output: output_files,
-                deleted: vec![],
-            },
-        });
-
-        let worker = DefaultSubmitWorker::new(
-            backend.clone(),
-            fetcher,
-            output,
-            WorkerId::new("concurrent-presize"),
-        )
-        .with_file_concurrency(4);
-        let lease = backend
-            .claim_next_manifest(
-                &WorkerId::new("concurrent-presize"),
-                StdDuration::from_secs(60),
-            )
-            .await
-            .unwrap()
-            .expect("claimable manifest");
-        worker.run_job(lease).await.unwrap();
-
-        let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
-        assert_eq!(
-            manifests[0].bytes_total, expected,
-            "concurrent HEADs must sum to the same denominator as the serial loop"
-        );
-        assert_eq!(manifests[0].bytes_processed, expected);
-        assert_eq!(manifests[0].files_total, types.len() as u64);
     }
 
     #[tokio::test]
@@ -4695,133 +5460,140 @@ mod tests {
     /// committed before the break — the file-level failure does not erase them.
     #[tokio::test]
     async fn test_worker_reports_batches_committed_before_a_file_fails() {
-        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
-        backend.init_schema().unwrap();
-        let tenant = tenant();
-        let sub_id = SubmissionId::generate("mock-system");
-        backend
-            .create_submission(&tenant, &sub_id, None)
-            .await
-            .unwrap();
-        // Two full batches commit; the third is still filling when the read
-        // error surfaces and fails the file.
-        // A presigned URL: its signature must not reach the manifest (#1127).
-        let url = "http://provider/patient.ndjson?X-Amz-Signature=secret";
-        let fetcher = Arc::new(BrokenTailFetcher(observed_manifest(
-            vec![(url, patient_lines("b", 250))],
-            vec![("Patient", url)],
-            None,
-        )));
-
-        let observer = Arc::new(RecordingWriteObserver::default());
-        // Inlined instead of `run_observed_manifest` so the output store — and
-        // with it the published artifacts — outlives the run and can be read
-        // back below.
-        backend
-            .add_manifest(
-                &tenant,
-                &sub_id,
-                Some("http://provider/manifest.json"),
+        for independent in [false, true] {
+            let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+            backend.init_schema().unwrap();
+            let tenant = tenant();
+            let sub_id = SubmissionId::generate("mock-system");
+            backend
+                .create_submission(&tenant, &sub_id, None)
+                .await
+                .unwrap();
+            // Two full batches commit; the third is still filling when the read
+            // error surfaces and fails the file.
+            // A presigned URL: its signature must not reach the manifest (#1127).
+            let url = "http://provider/patient.ndjson?X-Amz-Signature=secret";
+            let fetcher = Arc::new(BrokenTailFetcher(observed_manifest(
+                vec![(url, patient_lines("b", 250))],
+                vec![("Patient", url)],
                 None,
-            )
-            .await
-            .unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let output = Arc::new(LocalFsOutputStore::new(
-            tmp.path().to_path_buf(),
-            "http://localhost:8080",
-        ));
-        let worker = DefaultSubmitWorker::new(
-            backend.clone(),
-            fetcher,
-            output.clone(),
-            WorkerId::new("test-worker"),
-        )
-        .with_write_observer(Some(observer.clone()));
-        let lease = backend
-            .claim_next_manifest(&WorkerId::new("test-worker"), StdDuration::from_secs(60))
-            .await
-            .unwrap()
-            .expect("claimable manifest");
-        worker.run_job(lease).await.unwrap();
+            )));
 
-        let t = || "t1".to_string();
-        let p = || "Patient".to_string();
-        assert_eq!(
-            observer.counts(),
-            vec![(t(), p(), 100, 0, 0), (t(), p(), 100, 0, 0)],
-            "the committed batches are reported even though the file failed"
-        );
-        assert_eq!(
-            backend.count(&tenant, Some("Patient")).await.unwrap(),
-            200,
-            "and they are exactly what storage holds"
-        );
+            let observer = Arc::new(RecordingWriteObserver::default());
+            // Inlined instead of `run_observed_manifest` so the output store — and
+            // with it the published artifacts — outlives the run and can be read
+            // back below.
+            backend
+                .add_manifest(
+                    &tenant,
+                    &sub_id,
+                    Some("http://provider/manifest.json"),
+                    None,
+                )
+                .await
+                .unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            let output = Arc::new(LocalFsOutputStore::new(
+                tmp.path().to_path_buf(),
+                "http://localhost:8080",
+            ));
+            let worker = with_test_file_scheduling(
+                DefaultSubmitWorker::new(
+                    backend.clone(),
+                    fetcher,
+                    output.clone(),
+                    WorkerId::new("test-worker"),
+                )
+                .with_write_observer(Some(observer.clone())),
+                independent,
+                2,
+            );
+            let lease = backend
+                .claim_next_manifest(&WorkerId::new("test-worker"), StdDuration::from_secs(60))
+                .await
+                .unwrap()
+                .expect("claimable manifest");
+            worker.run_job(lease).await.unwrap();
 
-        // #1127: 50 of the file's 250 Patients never reached storage, so the
-        // manifest must not read `completed`, and its message says why without
-        // leaking the URL's signature.
-        let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
-        assert_eq!(manifests[0].status, ManifestStatus::Failed);
-        let message: Option<String> = backend
-            .get_connection()
-            .unwrap()
-            .query_row(
-                "SELECT publication_error_message FROM bulk_manifests
+            let t = || "t1".to_string();
+            let p = || "Patient".to_string();
+            assert_eq!(
+                observer.counts(),
+                vec![(t(), p(), 100, 0, 0), (t(), p(), 100, 0, 0)],
+                "the committed batches are reported even though the file failed"
+            );
+            assert_eq!(
+                backend.count(&tenant, Some("Patient")).await.unwrap(),
+                200,
+                "and they are exactly what storage holds"
+            );
+
+            // #1127: 50 of the file's 250 Patients never reached storage, so the
+            // manifest must not read `completed`, and its message says why without
+            // leaking the URL's signature.
+            let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+            assert_eq!(manifests[0].status, ManifestStatus::Failed);
+            let message: Option<String> = backend
+                .get_connection()
+                .unwrap()
+                .query_row(
+                    "SELECT publication_error_message FROM bulk_manifests
                  WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3",
-                params![
-                    tenant.tenant_id().as_str(),
-                    sub_id.submitter,
-                    sub_id.submission_id
-                ],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let message = message.expect("a failed manifest carries its error message");
-        assert!(message.contains("1 of 1 input file(s)"), "{message}");
-        assert!(message.contains("connection reset"), "{message}");
-        assert!(
-            message.contains("http://provider/patient.ndjson?[redacted]"),
-            "{message}"
-        );
-        assert!(!message.contains("secret"), "{message}");
-        let rows = backend.list_submit_files(&tenant, &sub_id).await.unwrap();
-        assert!(
-            rows.iter().any(|row| row.file_type == "output"),
-            "the committed batches' receipts are still published"
-        );
+                    params![
+                        tenant.tenant_id().as_str(),
+                        sub_id.submitter,
+                        sub_id.submission_id
+                    ],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let message = message.expect("a failed manifest carries its error message");
+            assert!(message.contains("1 of 1 input file(s)"), "{message}");
+            assert!(message.contains("connection reset"), "{message}");
+            assert!(
+                message.contains("http://provider/patient.ndjson?[redacted]"),
+                "{message}"
+            );
+            assert!(!message.contains("secret"), "{message}");
+            let rows = backend.list_submit_files(&tenant, &sub_id).await.unwrap();
+            assert!(
+                rows.iter().any(|row| row.file_type == "output"),
+                "the committed batches' receipts are still published"
+            );
 
-        // #1127: the broken file is *one* error artifact. It used to also be
-        // summarized as an uncaptured entry failure, so the status manifest
-        // showed two outcomes for a single broken file — the second of them
-        // claiming a resource "could not be parsed" when none had been.
-        let errors = rows
-            .iter()
-            .filter(|row| row.file_type == "error")
-            .collect::<Vec<_>>();
-        assert_eq!(errors.len(), 1, "one broken file, one error artifact");
-        let error = errors[0];
-        assert_eq!(error.count_severity, Some(json!({"error": 1})));
-        let key = ExportPartKey {
-            tenant_id: tenant.tenant_id().as_str().to_string(),
-            job_id: submission_output_job_id(&sub_id),
-            resource_type: error.file_path.clone(),
-            file_type: error.file_type.clone(),
-            part_index: error.part_index,
-            fencing_token: error.fencing_token,
-        };
-        let mut reader = output.open_reader(&key).await.unwrap();
-        let mut bytes = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut bytes)
-            .await
-            .unwrap();
-        let outcome: Value = serde_json::from_str(std::str::from_utf8(&bytes).unwrap()).unwrap();
-        let diagnostics = outcome["issue"][0]["diagnostics"].as_str().unwrap();
-        assert!(
-            diagnostics.starts_with("failed to ingest file "),
-            "{diagnostics}"
-        );
-        assert!(diagnostics.contains("connection reset"), "{diagnostics}");
+            // #1127: the broken file is *one* error artifact. It used to also be
+            // summarized as an uncaptured entry failure, so the status manifest
+            // showed two outcomes for a single broken file — the second of them
+            // claiming a resource "could not be parsed" when none had been.
+            let errors = rows
+                .iter()
+                .filter(|row| row.file_type == "error")
+                .collect::<Vec<_>>();
+            assert_eq!(errors.len(), 1, "one broken file, one error artifact");
+            let error = errors[0];
+            assert_eq!(error.count_severity, Some(json!({"error": 1})));
+            let key = ExportPartKey {
+                tenant_id: tenant.tenant_id().as_str().to_string(),
+                job_id: submission_output_job_id(&sub_id),
+                resource_type: error.file_path.clone(),
+                file_type: error.file_type.clone(),
+                part_index: error.part_index,
+                fencing_token: error.fencing_token,
+            };
+            let mut reader = output.open_reader(&key).await.unwrap();
+            let mut bytes = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut bytes)
+                .await
+                .unwrap();
+            let outcome: Value =
+                serde_json::from_str(std::str::from_utf8(&bytes).unwrap()).unwrap();
+            let diagnostics = outcome["issue"][0]["diagnostics"].as_str().unwrap();
+            assert!(
+                diagnostics.starts_with("failed to ingest file "),
+                "{diagnostics}"
+            );
+            assert!(diagnostics.contains("connection reset"), "{diagnostics}");
+        }
     }
 
     /// A `deleted` file whose stream breaks mid-body fails the manifest instead
@@ -4862,56 +5634,62 @@ mod tests {
     /// and then dropped, so every run committed batches of the engine default.
     #[tokio::test]
     async fn test_worker_honours_its_batch_size() {
-        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
-        backend.init_schema().unwrap();
-        let tenant = tenant();
-        let sub_id = SubmissionId::generate("mock-system");
-        backend
-            .create_submission(&tenant, &sub_id, None)
-            .await
-            .unwrap();
-        backend
-            .add_manifest(
-                &tenant,
-                &sub_id,
-                Some("http://provider/manifest.json"),
+        for independent in [false, true] {
+            let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+            backend.init_schema().unwrap();
+            let tenant = tenant();
+            let sub_id = SubmissionId::generate("mock-system");
+            backend
+                .create_submission(&tenant, &sub_id, None)
+                .await
+                .unwrap();
+            backend
+                .add_manifest(
+                    &tenant,
+                    &sub_id,
+                    Some("http://provider/manifest.json"),
+                    None,
+                )
+                .await
+                .unwrap();
+            let fetcher = Arc::new(observed_manifest(
+                vec![("http://provider/patient.ndjson", patient_lines("bs", 120))],
+                vec![("Patient", "http://provider/patient.ndjson")],
                 None,
-            )
-            .await
-            .unwrap();
-        let fetcher = Arc::new(observed_manifest(
-            vec![("http://provider/patient.ndjson", patient_lines("bs", 120))],
-            vec![("Patient", "http://provider/patient.ndjson")],
-            None,
-        ));
-        let tmp = tempfile::tempdir().unwrap();
-        let output = Arc::new(LocalFsOutputStore::new(
-            tmp.path().to_path_buf(),
-            "http://localhost:8080",
-        ));
-        let observer = Arc::new(RecordingWriteObserver::default());
-        let worker = DefaultSubmitWorker::new(
-            backend.clone(),
-            fetcher,
-            output,
-            WorkerId::new("batch-size-worker"),
-        )
-        .with_write_observer(Some(observer.clone()))
-        .with_batch_size(50);
-        let lease = backend
-            .claim_next_manifest(
-                &WorkerId::new("batch-size-worker"),
-                StdDuration::from_secs(60),
-            )
-            .await
-            .unwrap()
-            .expect("claimable manifest");
-        worker.run_job(lease).await.unwrap();
+            ));
+            let tmp = tempfile::tempdir().unwrap();
+            let output = Arc::new(LocalFsOutputStore::new(
+                tmp.path().to_path_buf(),
+                "http://localhost:8080",
+            ));
+            let observer = Arc::new(RecordingWriteObserver::default());
+            let worker = with_test_file_scheduling(
+                DefaultSubmitWorker::new(
+                    backend.clone(),
+                    fetcher,
+                    output,
+                    WorkerId::new("batch-size-worker"),
+                )
+                .with_write_observer(Some(observer.clone()))
+                .with_batch_size(50),
+                independent,
+                2,
+            );
+            let lease = backend
+                .claim_next_manifest(
+                    &WorkerId::new("batch-size-worker"),
+                    StdDuration::from_secs(60),
+                )
+                .await
+                .unwrap()
+                .expect("claimable manifest");
+            worker.run_job(lease).await.unwrap();
 
-        let batches: Vec<u64> = observer.counts().iter().map(|c| c.2).collect();
-        assert_eq!(batches, vec![50, 50, 20]);
-        let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
-        assert_eq!(manifests[0].status, ManifestStatus::Completed);
+            let batches: Vec<u64> = observer.counts().iter().map(|c| c.2).collect();
+            assert_eq!(batches, vec![50, 50, 20]);
+            let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+            assert_eq!(manifests[0].status, ManifestStatus::Completed);
+        }
     }
 
     #[test]
@@ -5696,100 +6474,787 @@ mod tests {
 
     #[tokio::test]
     async fn test_fan_out_ingests_every_file_of_a_multi_file_manifest() {
-        // Fan-out (file_concurrency > 1) must ingest all of a manifest's files —
-        // each carrying a distinct resource type — with the same result as the
-        // sequential path: every resource stored, and the counts complete.
+        for independent in [false, true] {
+            // Fan-out (file_concurrency > 1) must ingest all of a manifest's files —
+            // each carrying a distinct resource type — with the same result as the
+            // sequential path: every resource stored, and the counts complete.
+            let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+            backend.init_schema().unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            let output = Arc::new(LocalFsOutputStore::new(
+                tmp.path().to_path_buf(),
+                "http://localhost:8080",
+            ));
+
+            let tenant = tenant();
+            let sub_id = SubmissionId::generate("mock-system");
+            backend
+                .create_submission(&tenant, &sub_id, None)
+                .await
+                .unwrap();
+            backend
+                .add_manifest(
+                    &tenant,
+                    &sub_id,
+                    Some("http://provider/manifest.json"),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            // Six files of six distinct types, two resources each.
+            let types = [
+                "Patient",
+                "Observation",
+                "Condition",
+                "Encounter",
+                "Procedure",
+                "Immunization",
+            ];
+            let mut files = std::collections::HashMap::new();
+            let mut output_files = Vec::new();
+            for t in types {
+                let url = format!("http://provider/{t}.ndjson");
+                let body = format!(
+                    "{{\"resourceType\":\"{t}\",\"id\":\"{t}-1\"}}\n{{\"resourceType\":\"{t}\",\"id\":\"{t}-2\"}}\n"
+                );
+                files.insert(url.clone(), body.into_bytes());
+                output_files.push(RemoteFile {
+                    resource_type: Some(t.to_string()),
+                    url,
+                    count: None,
+                });
+            }
+            let fetcher = Arc::new(MockFetcher {
+                files,
+                manifest: RemoteManifest {
+                    requires_access_token: false,
+                    output: output_files,
+                    deleted: vec![],
+                },
+            });
+
+            let worker = with_test_file_scheduling(
+                DefaultSubmitWorker::new(
+                    backend.clone(),
+                    fetcher,
+                    output,
+                    WorkerId::new("fanout-worker"),
+                ),
+                independent,
+                4,
+            );
+            let lease = backend
+                .claim_next_manifest(&WorkerId::new("fanout-worker"), StdDuration::from_secs(60))
+                .await
+                .unwrap()
+                .expect("claimable manifest");
+            worker.run_job(lease).await.unwrap();
+
+            // Every resource of every type is stored.
+            for t in types {
+                let count = backend.count(&tenant, Some(t)).await.unwrap();
+                assert_eq!(count, 2, "expected 2 {t} resources after fan-out ingest");
+            }
+
+            // The manifest's terminal counts cover all 12 entries with no failures.
+            let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+            assert_eq!(manifests[0].processed_entries, 12);
+            assert_eq!(manifests[0].failed_entries, 0);
+
+            // One `output` receipt per type.
+            let receipts = backend.list_submit_files(&tenant, &sub_id).await.unwrap();
+            for t in types {
+                assert!(
+                    receipts
+                        .iter()
+                        .any(|f| f.file_type == "output" && f.resource_type.as_deref() == Some(t)),
+                    "missing output receipt for {t}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_independent_file_builder_accepts_concrete_and_trait_object_services_in_any_order() {
         let backend = Arc::new(SqliteBackend::in_memory().unwrap());
         backend.init_schema().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let output = Arc::new(LocalFsOutputStore::new(
-            tmp.path().to_path_buf(),
-            "http://localhost:8080",
-        ));
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
 
+        let concrete = DefaultSubmitWorker::new(
+            backend.clone(),
+            patient_fetcher(""),
+            Arc::new(LocalFsOutputStore::new(
+                first_dir.path().to_path_buf(),
+                "http://localhost",
+            )),
+            WorkerId::new("concrete-builder"),
+        )
+        .with_independent_file_tasks()
+        .with_file_concurrency(3);
+        assert!(concrete.owned_file_executor.is_some());
+        assert_eq!(concrete.file_concurrency, 3);
+
+        let jobs: Arc<dyn BulkSubmitJobStore> = backend;
+        let fetcher: Arc<dyn SubmitInputFetcher> = patient_fetcher("");
+        let output: Arc<dyn ExportOutputStore> = Arc::new(LocalFsOutputStore::new(
+            second_dir.path().to_path_buf(),
+            "http://localhost",
+        ));
+        let erased =
+            DefaultSubmitWorker::new(jobs, fetcher, output, WorkerId::new("erased-builder"))
+                .with_file_concurrency(3)
+                .with_independent_file_tasks();
+        assert!(erased.owned_file_executor.is_some());
+        assert_eq!(erased.file_concurrency, 3);
+    }
+
+    #[tokio::test]
+    async fn test_inline_worker_accepts_borrowed_services_at_concurrency_two() {
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
         let tenant = tenant();
-        let sub_id = SubmissionId::generate("mock-system");
-        backend
-            .create_submission(&tenant, &sub_id, None)
+        let submission = seed(&backend, &tenant).await;
+        let fetcher = patient_fetcher("{\"resourceType\":\"Patient\",\"id\":\"borrowed\"}\n");
+        let directory = tempfile::tempdir().unwrap();
+        let output = LocalFsOutputStore::new(directory.path().to_path_buf(), "http://localhost");
+        let worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            Arc::new(BorrowedFetcher(fetcher.as_ref())),
+            Arc::new(BorrowedOutput(&output)),
+            WorkerId::new("borrowed-services"),
+        )
+        .with_file_concurrency(2);
+        assert!(worker.owned_file_executor.is_none());
+        let lease = backend
+            .claim_next_manifest(
+                &WorkerId::new("borrowed-services"),
+                StdDuration::from_secs(60),
+            )
             .await
+            .unwrap()
+            .expect("claimable manifest");
+
+        tokio::time::timeout(StdDuration::from_secs(5), worker.run_job(lease))
+            .await
+            .expect("borrowed inline worker must finish")
             .unwrap();
+
+        assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
+        let manifests = backend.list_manifests(&tenant, &submission).await.unwrap();
+        assert_eq!(manifests[0].processed_entries, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_independent_scheduler_uses_one_bounded_task_per_file() {
+        let task_ids = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let admitted = Arc::new(AtomicU64::new(0));
+        let maximum_active = Arc::new(AtomicU64::new(0));
+        let active = Arc::new(AtomicU64::new(0));
+        let executor = Arc::new(TaskRecordingExecutor {
+            task_ids: Arc::clone(&task_ids),
+            admitted: Arc::clone(&admitted),
+            maximum_active: Arc::clone(&maximum_active),
+            active,
+        });
+        let executor: Arc<dyn OwnedFileExecutor> = executor;
+        let control = scheduler_control();
+        let input = scheduler_contexts(6, &control);
+
+        let completed = tokio::time::timeout(
+            StdDuration::from_secs(2),
+            run_independent_file_tasks(executor, input.files, input.run, 3),
+        )
+        .await
+        .expect("the bounded scheduler must drain")
+        .unwrap();
+
+        assert_eq!(completed, IndependentCompletion::Completed);
+        assert_eq!(admitted.load(Ordering::SeqCst), 6);
+        assert_eq!(maximum_active.load(Ordering::SeqCst), 3);
+        let ids = task_ids.lock().unwrap();
+        let distinct: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(distinct.len(), 6, "each file must use its own Tokio task");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_independent_files_ready_failure_prevents_refill_after_ready_success() {
+        let control = scheduler_control();
+        let admitted = Arc::new(AtomicU64::new(0));
+        let success_finished = Arc::new(tokio::sync::Notify::new());
+        let executor = scripted_executor({
+            let admitted = Arc::clone(&admitted);
+            let success_finished = Arc::clone(&success_finished);
+            move |context| {
+                let admitted = Arc::clone(&admitted);
+                let success_finished = Arc::clone(&success_finished);
+                Box::pin(async move {
+                    admitted.fetch_add(1, Ordering::SeqCst);
+                    match context.input_index {
+                        0 => {
+                            // Wake the fatal sibling before this successful
+                            // task publishes its own completion to the JoinSet.
+                            success_finished.notify_one();
+                            Ok(())
+                        }
+                        1 => {
+                            success_finished.notified().await;
+                            Err(fault_error("ready sibling failed"))
+                        }
+                        _ => panic!("a queued file was admitted after a ready failure"),
+                    }
+                })
+            }
+        });
+        let input = scheduler_contexts(3, &control);
+
+        let error = tokio::time::timeout(
+            StdDuration::from_secs(2),
+            run_independent_file_tasks(executor, input.files, input.run, 2),
+        )
+        .await
+        .expect("the ready results must drain")
+        .expect_err("the ready fatal result must win before refill");
+
+        assert!(error.to_string().contains("ready sibling failed"));
+        assert_eq!(
+            admitted.load(Ordering::SeqCst),
+            2,
+            "the queued third file must never be admitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_independent_file_builder_with_concurrency_one_stays_inline_for_one_file() {
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tenant = tenant();
+        let submission = seed(&backend, &tenant).await;
+        let directory = tempfile::tempdir().unwrap();
+        let mut worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            patient_fetcher("{\"resourceType\":\"Patient\",\"id\":\"inline-one\"}\n"),
+            Arc::new(LocalFsOutputStore::new(
+                directory.path().to_path_buf(),
+                "http://localhost",
+            )),
+            WorkerId::new("inline-one"),
+        )
+        .with_independent_file_tasks()
+        .with_file_concurrency(1);
+        worker.owned_file_executor = Some(scripted_executor(|_| {
+            Box::pin(async { panic!("concurrency one must not invoke the owned executor") })
+        }));
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("inline-one"), StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("claimable manifest");
+
+        tokio::time::timeout(StdDuration::from_secs(5), worker.run_job(lease))
+            .await
+            .expect("the one-file inline run must finish")
+            .unwrap();
+
+        assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
+        let manifests = backend.list_manifests(&tenant, &submission).await.unwrap();
+        assert_eq!(manifests[0].processed_entries, 1);
+        assert_eq!(manifests[0].status, ManifestStatus::Completed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_independent_files_with_unequal_sizes_and_durations_refill_by_completion() {
+        let control = scheduler_control();
+        let admitted = Arc::new(AtomicU64::new(0));
+        let completed = Arc::new(AtomicU64::new(0));
+        let completion_order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let gates = Arc::new(
+            (0..3)
+                .map(|_| Arc::new(tokio::sync::Notify::new()))
+                .collect::<Vec<_>>(),
+        );
+        let executor = scripted_executor({
+            let admitted = Arc::clone(&admitted);
+            let completed = Arc::clone(&completed);
+            let completion_order = Arc::clone(&completion_order);
+            let gates = Arc::clone(&gates);
+            move |context| {
+                let admitted = Arc::clone(&admitted);
+                let completed = Arc::clone(&completed);
+                let completion_order = Arc::clone(&completion_order);
+                let gate = Arc::clone(&gates[context.input_index]);
+                Box::pin(async move {
+                    admitted.fetch_add(1, Ordering::SeqCst);
+                    gate.notified().await;
+                    completion_order.lock().unwrap().push(context.input_index);
+                    completed.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }
+        });
+        let mut input = scheduler_contexts(3, &control);
+        for (index, file) in input.files.iter_mut().enumerate() {
+            file.count = Some([10, 1, 100][index]);
+        }
+        let run = tokio::spawn(async move {
+            run_independent_file_tasks(executor, input.files, input.run, 2).await
+        });
+
+        wait_for_count(&admitted, 2, "the first two unequal files must be admitted").await;
+        gates[1].notify_one();
+        wait_for_count(&admitted, 3, "the short file must refill the free slot").await;
+        gates[2].notify_one();
+        wait_for_count(&completed, 2, "the replacement file must finish second").await;
+        gates[0].notify_one();
+
+        let outcome = tokio::time::timeout(StdDuration::from_secs(2), run)
+            .await
+            .expect("unequal file tasks must drain")
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome, IndependentCompletion::Completed);
+        assert_eq!(*completion_order.lock().unwrap(), vec![1, 2, 0]);
+        assert!(
+            !control.cancelled(),
+            "healthy completion must not cancel the run"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_independent_file_run_completes_deleted_publication_and_reindex() {
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tenant = tenant();
         backend
-            .add_manifest(
+            .create(
                 &tenant,
-                &sub_id,
-                Some("http://provider/manifest.json"),
-                None,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "remove-after-output"}),
+                helios_fhir::FhirVersion::default(),
             )
             .await
             .unwrap();
-
-        // Six files of six distinct types, two resources each.
-        let types = [
-            "Patient",
-            "Observation",
-            "Condition",
-            "Encounter",
-            "Procedure",
-            "Immunization",
-        ];
-        let mut files = std::collections::HashMap::new();
-        let mut output_files = Vec::new();
-        for t in types {
-            let url = format!("http://provider/{t}.ndjson");
-            let body = format!(
-                "{{\"resourceType\":\"{t}\",\"id\":\"{t}-1\"}}\n{{\"resourceType\":\"{t}\",\"id\":\"{t}-2\"}}\n"
-            );
-            files.insert(url.clone(), body.into_bytes());
-            output_files.push(RemoteFile {
-                resource_type: Some(t.to_string()),
-                url,
-                count: None,
-            });
-        }
-        let fetcher = Arc::new(MockFetcher {
-            files,
-            manifest: RemoteManifest {
-                requires_access_token: false,
-                output: output_files,
-                deleted: vec![],
-            },
+        let submission = seed(&backend, &tenant).await;
+        let directory = tempfile::tempdir().unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            directory.path().to_path_buf(),
+            "http://localhost",
+        ));
+        let fetcher = Arc::new(observed_manifest(
+            vec![
+                (
+                    "http://provider/healthy-output.ndjson",
+                    "{\"resourceType\":\"Patient\",\"id\":\"independent-healthy\"}\n".to_string(),
+                ),
+                (
+                    "http://provider/healthy-deleted.ndjson",
+                    "{\"resourceType\":\"Patient\",\"id\":\"remove-after-output\"}\n".to_string(),
+                ),
+            ],
+            vec![("Patient", "http://provider/healthy-output.ndjson")],
+            Some("http://provider/healthy-deleted.ndjson"),
+        ));
+        let hook = Arc::new(MockReindexHook {
+            calls: std::sync::Mutex::new(Vec::new()),
+            contexts: std::sync::Mutex::new(Vec::new()),
         });
-
         let worker = DefaultSubmitWorker::new(
             backend.clone(),
             fetcher,
             output,
-            WorkerId::new("fanout-worker"),
+            WorkerId::new("independent-healthy"),
         )
-        .with_file_concurrency(4);
+        .with_file_concurrency(2)
+        .with_independent_file_tasks()
+        .with_deferred_indexing(true, Some(hook.clone()));
         let lease = backend
-            .claim_next_manifest(&WorkerId::new("fanout-worker"), StdDuration::from_secs(60))
+            .claim_next_manifest(
+                &WorkerId::new("independent-healthy"),
+                StdDuration::from_secs(60),
+            )
             .await
             .unwrap()
-            .expect("claimable manifest");
-        worker.run_job(lease).await.unwrap();
+            .expect("claimable healthy manifest");
 
-        // Every resource of every type is stored.
-        for t in types {
-            let count = backend.count(&tenant, Some(t)).await.unwrap();
-            assert_eq!(count, 2, "expected 2 {t} resources after fan-out ingest");
+        tokio::time::timeout(StdDuration::from_secs(5), worker.run_job(lease))
+            .await
+            .expect("the healthy independent run must finish")
+            .unwrap();
+
+        assert_eq!(
+            backend.list_manifests(&tenant, &submission).await.unwrap()[0].status,
+            ManifestStatus::Completed
+        );
+        assert!(
+            backend
+                .read(&tenant, "Patient", "independent-healthy")
+                .await
+                .unwrap()
+                .is_some(),
+            "the independently ingested resource remains readable"
+        );
+        assert!(
+            matches!(
+                backend
+                    .read(&tenant, "Patient", "remove-after-output")
+                    .await,
+                Ok(None)
+                    | Err(StorageError::Resource(
+                        crate::error::ResourceError::Gone { .. }
+                    ))
+            ),
+            "healthy task completion must continue into deleted processing"
+        );
+        let files = backend
+            .list_submit_files(&tenant, &submission)
+            .await
+            .unwrap();
+        assert!(files.iter().any(|file| file.file_type == "output"));
+        assert!(files.iter().any(|file| file.file_type == "deleted"));
+        assert_eq!(
+            hook.calls.lock().unwrap().clone(),
+            vec![vec!["Patient".to_string()]],
+            "healthy completion must continue through publication and deferred reindex"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_independent_files_cancellation_stops_admission_and_drains_cooperatively() {
+        let control = scheduler_control();
+        let admitted = Arc::new(AtomicU64::new(0));
+        let dropped = Arc::new(AtomicU64::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let executor = blocked_executor(
+            Arc::clone(&admitted),
+            Arc::clone(&dropped),
+            Arc::clone(&release),
+        );
+        let input = scheduler_contexts(5, &control);
+        let run = tokio::spawn(async move {
+            run_independent_file_tasks(executor, input.files, input.run, 2).await
+        });
+
+        wait_for_count(&admitted, 2, "the scheduler must fill its two slots").await;
+        control.cancel.cancel();
+        release.notify_waiters();
+
+        let outcome = tokio::time::timeout(StdDuration::from_secs(2), run)
+            .await
+            .expect("cooperative cancellation must drain released children")
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome, IndependentCompletion::Cancelled);
+        assert_eq!(admitted.load(Ordering::SeqCst), 2);
+        assert_eq!(dropped.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_independent_files_cancellation_waits_for_post_commit_observer() {
+        let control = scheduler_control();
+        let admitted = Arc::new(AtomicU64::new(0));
+        let observer = Arc::new(BlockingCommitObserver {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            finished: AtomicBool::new(false),
+        });
+        let executor = scripted_executor({
+            let admitted = Arc::clone(&admitted);
+            move |context| {
+                let admitted = Arc::clone(&admitted);
+                Box::pin(async move {
+                    admitted.fetch_add(1, Ordering::SeqCst);
+                    let results = [BulkEntryResult::success(
+                        1,
+                        "Patient",
+                        "committed-before-cancel",
+                        true,
+                    )];
+                    context
+                        .run
+                        .options
+                        .notify_batch_committed(
+                            &context.run.lease.tenant,
+                            &context.run.lease.submission_id,
+                            &context.run.lease.manifest_id,
+                            &results,
+                            &[],
+                        )
+                        .await;
+                    Ok(())
+                })
+            }
+        });
+        let mut input = scheduler_contexts(2, &control);
+        Arc::get_mut(&mut input.run).unwrap().options =
+            BulkProcessingOptions::new().with_batch_observer(observer.clone());
+        let mut run = tokio::spawn(async move {
+            run_independent_file_tasks(executor, input.files, input.run, 1).await
+        });
+
+        tokio::time::timeout(StdDuration::from_secs(2), observer.entered.notified())
+            .await
+            .expect("the durable batch must enter its observer");
+        control.cancel.cancel();
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(100), &mut run)
+                .await
+                .is_err(),
+            "submission cancellation must not abort an observer after commit"
+        );
+        observer.release.notify_one();
+
+        let outcome = tokio::time::timeout(StdDuration::from_secs(2), run)
+            .await
+            .expect("the observer must finish and let cancellation drain")
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome, IndependentCompletion::Cancelled);
+        assert!(observer.finished.load(Ordering::SeqCst));
+        assert_eq!(admitted.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_independent_files_lease_loss_stops_admission_and_aborts_siblings() {
+        let control = scheduler_control();
+        let admitted = Arc::new(AtomicU64::new(0));
+        let dropped = Arc::new(AtomicU64::new(0));
+        let executor = blocked_executor(
+            Arc::clone(&admitted),
+            Arc::clone(&dropped),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        let input = scheduler_contexts(5, &control);
+        let run = tokio::spawn(async move {
+            run_independent_file_tasks(executor, input.files, input.run, 2).await
+        });
+
+        wait_for_count(&admitted, 2, "the scheduler must fill its two slots").await;
+        control.declare_lost();
+
+        let outcome = tokio::time::timeout(StdDuration::from_secs(2), run)
+            .await
+            .expect("lease loss must abort and drain children")
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome, IndependentCompletion::LeaseLost);
+        assert_eq!(admitted.load(Ordering::SeqCst), 2);
+        assert_eq!(dropped.load(Ordering::SeqCst), 2);
+        assert!(control.cancelled(), "forced cleanup must trip cancellation");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_independent_files_fatal_error_stops_admission_and_aborts_siblings() {
+        let control = scheduler_control();
+        let admitted = Arc::new(AtomicU64::new(0));
+        let dropped = Arc::new(AtomicU64::new(0));
+        let fail = Arc::new(tokio::sync::Notify::new());
+        let executor = scripted_executor({
+            let admitted = Arc::clone(&admitted);
+            let dropped = Arc::clone(&dropped);
+            let fail = Arc::clone(&fail);
+            move |context| {
+                let admitted = Arc::clone(&admitted);
+                let dropped = Arc::clone(&dropped);
+                let fail = Arc::clone(&fail);
+                Box::pin(async move {
+                    admitted.fetch_add(1, Ordering::SeqCst);
+                    let _sentinel = TaskDropSentinel::new(dropped);
+                    if context.input_index == 0 {
+                        fail.notified().await;
+                        Err(fault_error("fatal child bookkeeping error"))
+                    } else {
+                        std::future::pending().await
+                    }
+                })
+            }
+        });
+        let input = scheduler_contexts(5, &control);
+        let run = tokio::spawn(async move {
+            run_independent_file_tasks(executor, input.files, input.run, 2).await
+        });
+
+        wait_for_count(
+            &admitted,
+            2,
+            "fatal test must start one child and one sibling",
+        )
+        .await;
+        fail.notify_one();
+
+        let error = tokio::time::timeout(StdDuration::from_secs(2), run)
+            .await
+            .expect("fatal cleanup must drain")
+            .unwrap()
+            .expect_err("the original storage error must propagate");
+        assert!(error.to_string().contains("fatal child bookkeeping error"));
+        assert_eq!(admitted.load(Ordering::SeqCst), 2);
+        assert_eq!(dropped.load(Ordering::SeqCst), 2);
+        assert!(control.cancelled());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_independent_files_child_panic_stops_admission_and_aborts_siblings() {
+        let control = scheduler_control();
+        let admitted = Arc::new(AtomicU64::new(0));
+        let dropped = Arc::new(AtomicU64::new(0));
+        let panic_now = Arc::new(tokio::sync::Notify::new());
+        let executor = scripted_executor({
+            let admitted = Arc::clone(&admitted);
+            let dropped = Arc::clone(&dropped);
+            let panic_now = Arc::clone(&panic_now);
+            move |context| {
+                let admitted = Arc::clone(&admitted);
+                let dropped = Arc::clone(&dropped);
+                let panic_now = Arc::clone(&panic_now);
+                Box::pin(async move {
+                    admitted.fetch_add(1, Ordering::SeqCst);
+                    let _sentinel = TaskDropSentinel::new(dropped);
+                    if context.input_index == 0 {
+                        panic_now.notified().await;
+                        panic!("deliberate independent child panic");
+                    }
+                    std::future::pending().await
+                })
+            }
+        });
+        let input = scheduler_contexts(5, &control);
+        let run = tokio::spawn(async move {
+            run_independent_file_tasks(executor, input.files, input.run, 2).await
+        });
+
+        wait_for_count(
+            &admitted,
+            2,
+            "panic test must start one child and one sibling",
+        )
+        .await;
+        panic_now.notify_one();
+
+        let error = tokio::time::timeout(StdDuration::from_secs(2), run)
+            .await
+            .expect("panic cleanup must drain")
+            .unwrap()
+            .expect_err("a child panic must become an internal storage error");
+        assert!(
+            error
+                .to_string()
+                .contains("independent bulk-submit file task failed")
+        );
+        assert_eq!(admitted.load(Ordering::SeqCst), 2);
+        assert_eq!(dropped.load(Ordering::SeqCst), 2);
+        assert!(control.cancelled());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_independent_files_simultaneous_stop_precedence_is_cancel_then_lease_then_child() {
+        async fn run_case(cancel: bool, lose_lease: bool) -> IndependentCompletion {
+            let control = scheduler_control();
+            let admitted = Arc::new(AtomicU64::new(0));
+            let fail = Arc::new(tokio::sync::Notify::new());
+            let executor = scripted_executor({
+                let admitted = Arc::clone(&admitted);
+                let fail = Arc::clone(&fail);
+                move |_| {
+                    let admitted = Arc::clone(&admitted);
+                    let fail = Arc::clone(&fail);
+                    Box::pin(async move {
+                        admitted.fetch_add(1, Ordering::SeqCst);
+                        fail.notified().await;
+                        Err(fault_error("simultaneous child failure"))
+                    })
+                }
+            });
+            let input = scheduler_contexts(2, &control);
+            let run = tokio::spawn(async move {
+                run_independent_file_tasks(executor, input.files, input.run, 1).await
+            });
+            wait_for_count(&admitted, 1, "the precedence child must be admitted").await;
+            if cancel {
+                control.cancel.cancel();
+            }
+            if lose_lease {
+                control.declare_lost();
+            }
+            fail.notify_one();
+            tokio::time::timeout(StdDuration::from_secs(2), run)
+                .await
+                .expect("simultaneous stop must drain")
+                .unwrap()
+                .expect("external stop must outrank the child error")
         }
 
-        // The manifest's terminal counts cover all 12 entries with no failures.
-        let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
-        assert_eq!(manifests[0].processed_entries, 12);
-        assert_eq!(manifests[0].failed_entries, 0);
+        assert_eq!(run_case(true, true).await, IndependentCompletion::Cancelled);
+        assert_eq!(
+            run_case(false, true).await,
+            IndependentCompletion::LeaseLost
+        );
+    }
 
-        // One `output` receipt per type.
-        let receipts = backend.list_submit_files(&tenant, &sub_id).await.unwrap();
-        for t in types {
-            assert!(
-                receipts
-                    .iter()
-                    .any(|f| f.file_type == "output" && f.resource_type.as_deref() == Some(t)),
-                "missing output receipt for {t}"
-            );
-        }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_independent_files_lease_loss_escalates_a_cooperative_cancel_drain() {
+        let control = scheduler_control();
+        let admitted = Arc::new(AtomicU64::new(0));
+        let dropped = Arc::new(AtomicU64::new(0));
+        let executor = blocked_executor(
+            Arc::clone(&admitted),
+            Arc::clone(&dropped),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        let input = scheduler_contexts(4, &control);
+        let mut run = tokio::spawn(async move {
+            run_independent_file_tasks(executor, input.files, input.run, 2).await
+        });
+
+        wait_for_count(&admitted, 2, "both cooperative children must start").await;
+        control.cancel.cancel();
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(100), &mut run)
+                .await
+                .is_err(),
+            "cancellation alone must keep cooperatively draining blocked children"
+        );
+        control.declare_lost();
+
+        let outcome = tokio::time::timeout(StdDuration::from_secs(2), run)
+            .await
+            .expect("lease loss must escalate and drain")
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome, IndependentCompletion::Cancelled);
+        assert_eq!(admitted.load(Ordering::SeqCst), 2);
+        assert_eq!(dropped.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_independent_files_parent_future_drop_eventually_releases_children() {
+        let control = scheduler_control();
+        let admitted = Arc::new(AtomicU64::new(0));
+        let dropped = Arc::new(AtomicU64::new(0));
+        let executor = blocked_executor(
+            Arc::clone(&admitted),
+            Arc::clone(&dropped),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        let input = scheduler_contexts(4, &control);
+        let run = tokio::spawn(async move {
+            run_independent_file_tasks(executor, input.files, input.run, 2).await
+        });
+
+        wait_for_count(&admitted, 2, "both children must start before parent drop").await;
+        run.abort();
+        let join = run
+            .await
+            .expect_err("the parent scheduler future must be cancelled");
+        assert!(join.is_cancelled());
+        wait_for_count(
+            &dropped,
+            2,
+            "JoinSet drop must eventually release every admitted child",
+        )
+        .await;
+        assert!(control.cancelled());
+        assert_eq!(admitted.load(Ordering::SeqCst), 2);
     }
 
     /// A fetcher whose `fetch_manifest` always fails (unreachable / bad manifest).
@@ -6015,63 +7480,69 @@ mod tests {
 
     #[tokio::test]
     async fn test_worker_partial_success_on_invalid_ndjson() {
-        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
-        backend.init_schema().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let output = Arc::new(LocalFsOutputStore::new(
-            tmp.path().to_path_buf(),
-            "http://x",
-        ));
-        let tenant = tenant();
-        let sub_id = seed(&backend, &tenant).await;
+        for independent in [false, true] {
+            let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+            backend.init_schema().unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            let output = Arc::new(LocalFsOutputStore::new(
+                tmp.path().to_path_buf(),
+                "http://x",
+            ));
+            let tenant = tenant();
+            let sub_id = seed(&backend, &tenant).await;
 
-        // One valid Patient, one malformed JSON line.
-        let ndjson = "{\"resourceType\":\"Patient\",\"id\":\"ok\"}\nnot-json\n";
-        let mut files = std::collections::HashMap::new();
-        files.insert(
-            "http://provider/p.ndjson".to_string(),
-            ndjson.as_bytes().to_vec(),
-        );
-        let fetcher = Arc::new(MockFetcher {
-            files,
-            manifest: RemoteManifest {
-                requires_access_token: false,
-                output: vec![RemoteFile {
-                    resource_type: Some("Patient".to_string()),
-                    url: "http://provider/p.ndjson".to_string(),
-                    count: Some(2),
-                }],
-                deleted: vec![],
-            },
-        });
-        let worker = DefaultSubmitWorker::new(backend.clone(), fetcher, output, WorkerId::new("w"));
-        let lease = backend
-            .claim_next_manifest(&WorkerId::new("w"), StdDuration::from_secs(60))
-            .await
-            .unwrap()
-            .unwrap();
-        worker.run_job(lease).await.unwrap();
+            // One valid Patient, one malformed JSON line.
+            let ndjson = "{\"resourceType\":\"Patient\",\"id\":\"ok\"}\nnot-json\n";
+            let mut files = std::collections::HashMap::new();
+            files.insert(
+                "http://provider/p.ndjson".to_string(),
+                ndjson.as_bytes().to_vec(),
+            );
+            let fetcher = Arc::new(MockFetcher {
+                files,
+                manifest: RemoteManifest {
+                    requires_access_token: false,
+                    output: vec![RemoteFile {
+                        resource_type: Some("Patient".to_string()),
+                        url: "http://provider/p.ndjson".to_string(),
+                        count: Some(2),
+                    }],
+                    deleted: vec![],
+                },
+            });
+            let worker = with_test_file_scheduling(
+                DefaultSubmitWorker::new(backend.clone(), fetcher, output, WorkerId::new("w")),
+                independent,
+                2,
+            );
+            let lease = backend
+                .claim_next_manifest(&WorkerId::new("w"), StdDuration::from_secs(60))
+                .await
+                .unwrap()
+                .unwrap();
+            worker.run_job(lease).await.unwrap();
 
-        let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
-        let counts = backend
-            .get_entry_counts(&tenant, &sub_id, &manifests[0].manifest_id)
-            .await
-            .unwrap();
-        // Partial success: one ingested; the malformed line is counted as a
-        // failure on the manifest and surfaced as a summary error artifact, and
-        // the manifest still completes.
-        assert_eq!(counts.success, 1);
-        // Exactly one: the malformed line, charged by the worker because no
-        // batch saw it, and by nobody else (#969).
-        assert_eq!(manifests[0].failed_entries, 1);
-        assert_eq!(manifests[0].processed_entries, 1);
-        assert_eq!(
-            manifests[0].status,
-            crate::core::bulk_submit::ManifestStatus::Completed
-        );
-        let files = backend.list_submit_files(&tenant, &sub_id).await.unwrap();
-        assert!(files.iter().any(|f| f.file_type == "error"));
-        assert!(files.iter().any(|f| f.file_type == "output"));
+            let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+            let counts = backend
+                .get_entry_counts(&tenant, &sub_id, &manifests[0].manifest_id)
+                .await
+                .unwrap();
+            // Partial success: one ingested; the malformed line is counted as a
+            // failure on the manifest and surfaced as a summary error artifact, and
+            // the manifest still completes.
+            assert_eq!(counts.success, 1);
+            // Exactly one: the malformed line, charged by the worker because no
+            // batch saw it, and by nobody else (#969).
+            assert_eq!(manifests[0].failed_entries, 1);
+            assert_eq!(manifests[0].processed_entries, 1);
+            assert_eq!(
+                manifests[0].status,
+                crate::core::bulk_submit::ManifestStatus::Completed
+            );
+            let files = backend.list_submit_files(&tenant, &sub_id).await.unwrap();
+            assert!(files.iter().any(|f| f.file_type == "error"));
+            assert!(files.iter().any(|f| f.file_type == "output"));
+        }
     }
 
     /// A manifest reclaimed after a worker died keeps the progress its earlier
@@ -6082,49 +7553,55 @@ mod tests {
     /// entry the moment it was re-walked.
     #[tokio::test]
     async fn test_worker_progress_survives_a_reclaimed_manifest() {
-        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
-        backend.init_schema().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let output = Arc::new(LocalFsOutputStore::new(
-            tmp.path().to_path_buf(),
-            "http://x",
-        ));
-        let tenant = tenant();
-        let sub_id = seed(&backend, &tenant).await;
+        for independent in [false, true] {
+            let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+            backend.init_schema().unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            let output = Arc::new(LocalFsOutputStore::new(
+                tmp.path().to_path_buf(),
+                "http://x",
+            ));
+            let tenant = tenant();
+            let sub_id = seed(&backend, &tenant).await;
 
-        let lease = backend
-            .claim_next_manifest(&WorkerId::new("w"), StdDuration::from_secs(60))
-            .await
-            .unwrap()
-            .unwrap();
-        // Stands in for everything an earlier, interrupted run had ingested.
-        backend
-            .add_manifest_progress(&lease, 6_034_873, 7, 5_564_073)
-            .await
-            .unwrap();
-        assert_eq!(
-            backend
-                .get_manifest_for_worker(&lease)
+            let lease = backend
+                .claim_next_manifest(&WorkerId::new("w"), StdDuration::from_secs(60))
                 .await
                 .unwrap()
-                .last_processed_line,
-            5_564_073
-        );
+                .unwrap();
+            // Stands in for everything an earlier, interrupted run had ingested.
+            backend
+                .add_manifest_progress(&lease, 6_034_873, 7, 5_564_073)
+                .await
+                .unwrap();
+            assert_eq!(
+                backend
+                    .get_manifest_for_worker(&lease)
+                    .await
+                    .unwrap()
+                    .last_processed_line,
+                5_564_073
+            );
 
-        let worker = DefaultSubmitWorker::new(
-            backend.clone(),
-            patient_fetcher("{\"resourceType\":\"Patient\",\"id\":\"p1\"}\n"),
-            output,
-            WorkerId::new("w"),
-        );
-        worker.run_job(lease).await.unwrap();
+            let worker = with_test_file_scheduling(
+                DefaultSubmitWorker::new(
+                    backend.clone(),
+                    patient_fetcher("{\"resourceType\":\"Patient\",\"id\":\"p1\"}\n"),
+                    output,
+                    WorkerId::new("w"),
+                ),
+                independent,
+                2,
+            );
+            worker.run_job(lease).await.unwrap();
 
-        let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
-        assert_eq!(
-            manifests[0].processed_entries, 6_034_874,
-            "the re-walked entry must add to the earlier run's total, not replace it"
-        );
-        assert_eq!(manifests[0].failed_entries, 7);
+            let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+            assert_eq!(
+                manifests[0].processed_entries, 6_034_874,
+                "the re-walked entry must add to the earlier run's total, not replace it"
+            );
+            assert_eq!(manifests[0].failed_entries, 7);
+        }
     }
 
     #[tokio::test]
@@ -6196,7 +7673,8 @@ mod tests {
             output.clone(),
             WorkerId::new("concurrent-errors-worker"),
         )
-        .with_file_concurrency(3);
+        .with_file_concurrency(3)
+        .with_independent_file_tasks();
         worker.run_job(lease.clone()).await.unwrap();
 
         // Every input file failed to open: the manifest is failed (#1127), and
@@ -7140,6 +8618,22 @@ mod tests {
     #[tokio::test]
     async fn test_lease_keeper_gives_up_when_heartbeats_keep_failing() {
         assert!(keeper_loses_lease(Renewal::Fails, StdDuration::from_secs(15)).await);
+    }
+
+    #[tokio::test]
+    async fn test_lease_loss_declared_before_subscription_is_retained() {
+        let (lost, _) = tokio::sync::watch::channel(false);
+        let control = LeaseControl {
+            lost,
+            cancel: CancelToken::new(),
+            renewed_until: Arc::new(AtomicI64::new(Utc::now().timestamp_millis())),
+        };
+
+        control.declare_lost();
+
+        tokio::time::timeout(StdDuration::from_secs(1), control.lost())
+            .await
+            .expect("a loss published before the receiver existed must remain visible");
     }
 
     /// The converse: a lease that is being renewed is never declared lost, so
