@@ -583,6 +583,17 @@ async fn mongodb_contained_unconstrained_and_out_of_band_constraints() {
         .await;
 }
 
+/// #1407: `_sort` under `_contained` is applied or refused by name, and a
+/// contained resource with nothing indexed but its id is still found.
+#[tokio::test]
+async fn mongodb_contained_sort_and_id_only_contained() {
+    let Some(backend) = create_backend_with_full_registry("contained_sort").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    contained_suite::sort_and_id_only_contained(&backend, "contained-sort-1407").await;
+}
+
 /// The backend-agnostic suite for exponent-form number and quantity search
 /// values (#1337). Same `#[path]` arrangement.
 #[path = "search/number_exponent_suite.rs"]

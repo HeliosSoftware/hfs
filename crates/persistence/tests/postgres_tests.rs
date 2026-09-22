@@ -19093,6 +19093,30 @@ mod postgres_integration {
         .await;
     }
 
+    /// #1407: `_sort` under `_contained` is applied or refused by name, and a
+    /// contained resource with nothing indexed but its id is still found.
+    #[tokio::test]
+    async fn postgres_integration_contained_sort_and_id_only_contained() {
+        let backend = create_backend().await;
+        super::contained_suite::sort_and_id_only_contained(
+            &backend,
+            &unique_base("contained_sort"),
+        )
+        .await;
+    }
+
+    /// #1407: `reference:identifier` under `_contained` resolves the
+    /// reference's top-level target.
+    #[tokio::test]
+    async fn postgres_integration_contained_reference_identifier_resolves_the_target() {
+        let backend = create_backend().await;
+        super::contained_suite::reference_identifier_resolves_the_target(
+            &backend,
+            &unique_base("contained_ident"),
+        )
+        .await;
+    }
+
     /// #1337: `1e2` is one significant figure, `[50, 150)`.
     #[tokio::test]
     async fn postgres_integration_exponent_values_use_significant_figures() {
