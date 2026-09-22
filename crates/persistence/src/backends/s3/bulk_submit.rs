@@ -339,6 +339,14 @@ impl BulkSubmitProvider for S3Backend {
         let mut error_count = 0u32;
         let file_url = options.file_url.as_deref();
 
+        // Archive the batch's raw NDJSON in one object upfront — the input is
+        // preserved in full before any processing, and the per-entry raw PUT is
+        // gone (#1429). A failure here aborts before any entry is written, so
+        // the #1078 "report what was written" contract is trivially satisfied
+        // (nothing was).
+        self.persist_raw_batch(&location, submission_id, manifest_id, file_url, &entries)
+            .await?;
+
         // S3 writes each entry on its own, so an entry is durable as soon as
         // its write returns. The loop runs in a block so that however it ends —
         // exhausted, max errors reached, or a storage error part-way — the
@@ -352,8 +360,27 @@ impl BulkSubmitProvider for S3Backend {
         // entry is captured and propagated after the successful receipts are
         // reported, matching the serial block's #1078 contract. A cap keeps the
         // serial early-stop semantics.
+        //
+        // Two entries in one batch that target the same resource id are
+        // order-dependent — last write wins — so processing them concurrently
+        // would race to a non-deterministic result. A batch with any such id
+        // collision therefore stays serial (a bulk file usually carries
+        // distinct resources, so the common case still parallelizes). Entries
+        // with no client id are server-assigned a unique one and never collide.
+        let has_id_collision = {
+            let mut seen = std::collections::HashSet::new();
+            !entries
+                .iter()
+                .all(|entry| match entry.resource_id.as_deref() {
+                    Some(id) => seen.insert((entry.resource_type.as_str(), id)),
+                    None => true,
+                })
+        };
         let concurrency = Self::s3_ingest_concurrency();
-        let walked: StorageResult<()> = if options.max_errors == 0 && concurrency > 1 {
+        let walked: StorageResult<()> = if options.max_errors == 0
+            && concurrency > 1
+            && !has_id_collision
+        {
             use futures::stream::{self, StreamExt};
             let outcomes: Vec<StorageResult<BulkEntryResult>> = stream::iter(entries)
                 .map(|entry| {
@@ -418,9 +445,8 @@ impl BulkSubmitProvider for S3Backend {
                         continue;
                     }
 
-                    self.persist_raw_entry(&location, submission_id, manifest_id, file_url, &entry)
-                        .await?;
-
+                    // The raw line was archived for the whole batch upfront
+                    // (persist_raw_batch), so the loop no longer PUTs it per entry.
                     let result = match self
                         .process_single_entry(tenant, submission_id, manifest_id, &entry, options)
                         .await
@@ -833,8 +859,7 @@ impl S3Backend {
         entry: NdjsonEntry,
         options: &BulkProcessingOptions,
     ) -> StorageResult<BulkEntryResult> {
-        self.persist_raw_entry(location, submission_id, manifest_id, file_url, &entry)
-            .await?;
+        // The raw line was archived for the whole batch upfront (persist_raw_batch).
         let result = match self
             .process_single_entry(tenant, submission_id, manifest_id, &entry, options)
             .await
@@ -984,40 +1009,51 @@ impl S3Backend {
         }
     }
 
-    /// Archives the raw NDJSON payload for a single entry to S3.
+    /// Archives the raw NDJSON of one ingest batch to S3 in a single object —
+    /// every line of the batch, keyed by its first line number.
     ///
-    /// Stored under `raw/<manifest>/<file>/<line>.ndjson` so that the original
-    /// data is preserved for auditing after ingestion. `file_url` is the
-    /// manifest output file the line came from, and is required for the same
-    /// reason it is on [`Self::persist_entry_result`].
-    async fn persist_raw_entry(
+    /// Stored under `raw/<manifest>/<file>/batch-<first_line>.ndjson` so the
+    /// original data is preserved for auditing after ingestion. This is written
+    /// once per batch rather than once per entry: the archive has no reader, so
+    /// coalescing it drops one PUT per resource with no read contract to
+    /// preserve (#1429). `file_url` is the manifest output file the lines came
+    /// from, and discriminates otherwise-colliding batches for the same reason
+    /// it is on [`Self::persist_entry_result`]. An empty batch writes nothing.
+    async fn persist_raw_batch(
         &self,
         location: &TenantLocation,
         submission_id: &SubmissionId,
         manifest_id: &str,
         file_url: Option<&str>,
-        entry: &NdjsonEntry,
+        entries: &[NdjsonEntry],
     ) -> StorageResult<()> {
-        let key = location.keyspace.submit_raw_line_key(
+        let Some(first) = entries.first() else {
+            return Ok(());
+        };
+        let key = location.keyspace.submit_raw_batch_key(
             &submission_id.submitter,
             &submission_id.submission_id,
             manifest_id,
             file_url,
-            entry.line_number,
+            first.line_number,
         );
 
-        let mut line = serde_json::to_string(&entry.resource).map_err(|e| {
-            StorageError::BulkSubmit(BulkSubmitError::ParseError {
-                line: entry.line_number,
-                message: format!("failed to serialize raw NDJSON entry: {e}"),
-            })
-        })?;
-        line.push('\n');
+        let mut body = String::new();
+        for entry in entries {
+            let line = serde_json::to_string(&entry.resource).map_err(|e| {
+                StorageError::BulkSubmit(BulkSubmitError::ParseError {
+                    line: entry.line_number,
+                    message: format!("failed to serialize raw NDJSON entry: {e}"),
+                })
+            })?;
+            body.push_str(&line);
+            body.push('\n');
+        }
 
         self.put_bytes_object(
             &location.bucket,
             &key,
-            line.as_bytes(),
+            body.as_bytes(),
             Some("application/fhir+ndjson"),
         )
         .await?;
