@@ -535,9 +535,12 @@ fn public_status_url(
 }
 
 /// Forwards the caller's credentials and tenant onto a self-call, so the
-/// export runs as the user who asked for it. When the browser sent no
-/// `Authorization` the process's outbound service credential is used instead
-/// (#1438): every request here targets this server, never a third party.
+/// export runs as the user who asked for it: the browser's own
+/// `Authorization` when it sent one; else the signed-in session's bearer
+/// (#1480) — a browser signed in through the web UI carries the session
+/// cookie, not a header, and its exports must still run as that user; else
+/// the process's outbound service credential (#1438). Every request here
+/// targets this server, never a third party.
 pub(crate) async fn forward_identity(
     state: &WebState,
     mut request: reqwest::RequestBuilder,
@@ -547,13 +550,16 @@ pub(crate) async fn forward_identity(
 ) -> Result<reqwest::RequestBuilder, String> {
     match headers.get("authorization").and_then(|v| v.to_str().ok()) {
         Some(auth) => request = request.header("Authorization", auth),
-        None => {
-            request = state
-                .outbound_auth
-                .authorize(request, audience)
-                .await
-                .map_err(|e| format!("outbound credential unavailable: {e}"))?;
-        }
+        None => match crate::login::session_authorization(state, headers).await {
+            Some(bearer) => request = request.header("Authorization", bearer),
+            None => {
+                request = state
+                    .outbound_auth
+                    .authorize(request, audience)
+                    .await
+                    .map_err(|e| format!("outbound credential unavailable: {e}"))?;
+            }
+        },
     }
     request = request.header("X-Tenant-ID", tenant);
     Ok(request)

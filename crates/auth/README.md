@@ -148,6 +148,17 @@ Off unless `HFS_UI_LOGIN_CLIENT_ID` is set (auth must be enabled):
 | `HFS_UI_LOGIN_SCOPES` | `openid profile email` | Scopes requested at authorization |
 | `HFS_UI_LOGIN_COOKIE_SECURE` | `true` | `Secure` attribute on the session cookie. Set `false` only for plain-HTTP local development |
 
+A page that starts a job on the user's behalf — the Export page's `$export`
+kick-off, poll and download, the SQL Export page's `$sql-export`, the
+Patient/Group pickers — makes a server-side self-call that runs **as the
+signed-in user**: the session's access token is forwarded (refreshed the
+same way the middleware does it), so the job carries the user's own scopes
+and is audited as them. The outbound service credential
+(`HFS_OUTBOUND_BEARER_TOKEN`) is only the fallback when there is no session.
+The Import page is the exception: its `$bulk-submit` needs the
+`system/bulk-submit` scope, which a user token does not carry, so it keeps
+using the service credential.
+
 The authorize and token endpoints come from `HFS_SMART_AUTHORIZE_ENDPOINT` /
 `HFS_SMART_TOKEN_ENDPOINT` when set, otherwise from the issuer's
 `.well-known/openid-configuration` at startup. The session store is in-process:
