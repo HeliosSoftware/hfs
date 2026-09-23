@@ -823,7 +823,7 @@ where
         // rather than silently exporting an unfiltered set. When two filters
         // target the same resource type, the first one wins — the kick-off
         // path does not combine multiple filters for one type today.
-        let mut filters: HashMap<&str, &SearchQuery> = HashMap::new();
+        let mut filters: HashMap<&str, SearchQuery> = HashMap::new();
         for tf in &request.type_filters {
             let Some(compiled) = tf.compiled.as_ref() else {
                 return Err(LeaseError::Storage(StorageError::BulkExport(
@@ -835,7 +835,20 @@ where
                     },
                 )));
             };
-            filters.entry(tf.resource_type.as_str()).or_insert(compiled);
+            if filters.contains_key(tf.resource_type.as_str()) {
+                continue;
+            }
+            // A filter may carry a chain or `_has`, which `search()` does not
+            // read (#1389). Resolve it once per job into an `_id` filter, as
+            // REST does for a type search, so every batch is intersected with
+            // what the filter asks for rather than failing on it.
+            let resolving = crate::search::resolve_chains(self.data.as_ref(), tenant, compiled);
+            let resolved = tokio::select! {
+                biased;
+                _ = keeper.lost() => return Ok(JobOutcome::Abandoned),
+                resolved = resolving => resolved.map_err(LeaseError::Storage)?,
+            };
+            filters.insert(tf.resource_type.as_str(), resolved);
         }
 
         // For Group exports, resolve the member patient IDs once.
