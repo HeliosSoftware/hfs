@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 
 use crate::error::{BackendError, StorageResult};
@@ -148,6 +149,8 @@ pub struct ChainQueryBuilder {
     config: ChainConfig,
     /// Parameter offset for SQL placeholders.
     param_offset: usize,
+    /// The instant a terminal date's `ap` window is measured from.
+    now: DateTime<Utc>,
 }
 
 impl ChainQueryBuilder {
@@ -163,6 +166,7 @@ impl ChainQueryBuilder {
             registry,
             config: ChainConfig::default(),
             param_offset: 2, // Default: after ?1 (tenant) and ?2 (resource_type)
+            now: Utc::now(),
         }
     }
 
@@ -175,6 +179,13 @@ impl ChainQueryBuilder {
     /// Sets the parameter offset for SQL placeholders.
     pub fn with_param_offset(mut self, offset: usize) -> Self {
         self.param_offset = offset;
+        self
+    }
+
+    /// Measures terminal `ap` date windows from `now` rather than from the
+    /// time the builder was created.
+    pub fn with_now(mut self, now: DateTime<Utc>) -> Self {
+        self.now = now;
         self
     }
 
@@ -489,7 +500,7 @@ impl ChainQueryBuilder {
             SearchParamType::Date => {
                 // For date, use range comparison based on prefix
                 let date_col = format!("{}.value_date", alias);
-                build_date_condition(&date_col, value, param_num)
+                build_date_condition(&date_col, value, param_num, self.now)
             }
             SearchParamType::Number => {
                 return Ok(build_number_condition(&alias, value, param_num));
@@ -624,7 +635,8 @@ impl ChainQueryBuilder {
                 Arc::clone(&self.registry),
             )
             .with_config(self.config.clone())
-            .with_param_offset(param_num - 1);
+            .with_param_offset(param_num - 1)
+            .with_now(self.now);
 
             let (inner_sql, inner_params) =
                 inner_builder.build_reverse_chain_recursive(inner, depth + 1, param_num)?;
@@ -715,7 +727,7 @@ impl ChainQueryBuilder {
             ),
             SearchParamType::Date => {
                 let date_col = format!("{}.value_date", alias);
-                build_date_condition(&date_col, value, param_num)
+                build_date_condition(&date_col, value, param_num, self.now)
             }
             SearchParamType::Number => {
                 return Ok(build_number_condition(&alias, value, param_num));
@@ -738,7 +750,12 @@ impl ChainQueryBuilder {
 }
 
 /// Builds a date comparison condition.
-fn build_date_condition(column: &str, value: &SearchValue, param_num: usize) -> (String, SqlParam) {
+fn build_date_condition(
+    column: &str,
+    value: &SearchValue,
+    param_num: usize,
+    now: DateTime<Utc>,
+) -> (String, SqlParam) {
     // Matches nothing, still binding `?param_num`, for a value that is not a
     // date — which the search gate rejects before a chain is ever built.
     let (sql, bound) = super::parameter_handlers::date::date_condition_or_nothing(
@@ -746,6 +763,7 @@ fn build_date_condition(column: &str, value: &SearchValue, param_num: usize) -> 
         value.prefix,
         &value.value,
         param_num,
+        now,
     );
     (sql, SqlParam::String(bound))
 }
@@ -755,9 +773,9 @@ fn build_date_condition(column: &str, value: &SearchValue, param_num: usize) -> 
 /// Delegates to [`NumberHandler`](super::parameter_handlers::NumberHandler),
 /// the unchained `number` search's handler, so a chained number means what the
 /// unchained one does: the implicit-precision range for `eq`/`ne` (`100` is
-/// `[99.5, 100.5)`), the exact value for the comparators, for `ap` a bound
-/// `BETWEEN` whose margin is taken from the magnitude (so a negative value has
-/// its bounds in order), and `1 = 0` for a value that is not a number.
+/// `[99.5, 100.5)`), the exact value for the comparators, for `ap` the shared
+/// window as a bound `BETWEEN` (in order for a negative value too), and
+/// `1 = 0` for a value that is not a number.
 ///
 /// This used to be its own operator table. Its `ap` arm wrote both bounds into
 /// the SQL text and still returned a bind, so rusqlite refused the statement
@@ -1018,7 +1036,7 @@ mod date_condition_tests {
     #[test]
     fn chained_dates_are_precision_aware() {
         let value = SearchValue::new(SearchPrefix::Eq, "1995-10-02");
-        let (sql, param) = build_date_condition("t2.value_date", &value, 7);
+        let (sql, param) = build_date_condition("t2.value_date", &value, 7, Utc::now());
         assert_eq!(
             sql,
             "(datetime(t2.value_date) >= datetime(?7) AND datetime(t2.value_date) < datetime(?7, '+1 day'))"
@@ -1032,7 +1050,7 @@ mod date_condition_tests {
     #[test]
     fn chained_full_precision_is_equality() {
         let value = SearchValue::new(SearchPrefix::Eq, "2016-01-23T13:07:42-04:00");
-        let (sql, _) = build_date_condition("t2.value_date", &value, 3);
+        let (sql, _) = build_date_condition("t2.value_date", &value, 3, Utc::now());
         assert_eq!(sql, "datetime(t2.value_date) = datetime(?3)");
     }
 }
@@ -1105,6 +1123,8 @@ mod numeric_condition_tests {
                 "(si1.value_number BETWEEN ?3 AND ?4)",
                 &[-110.0, -90.0],
             ),
+            // Zero: the window never narrows below half the precision (#1390).
+            ("ap0", "(si1.value_number BETWEEN ?3 AND ?4)", &[-0.5, 0.5]),
         ];
         for (value, predicate, binds) in cases {
             let (sql, params) = build_number_condition("si1", &SearchValue::parse(value), 3);

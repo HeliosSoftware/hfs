@@ -2,6 +2,7 @@
 //!
 //! Translates FHIR `SearchQuery` into Elasticsearch Query DSL JSON.
 
+use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
 use crate::types::{
@@ -113,9 +114,12 @@ impl<'a> EsQueryBuilder<'a> {
             crate::types::ContainedMode::Both => {}
         }
 
+        // One instant for every `ap` date window in the query (#1390).
+        let now = query.reference_now();
+
         // Process each search parameter
         for param in &query.parameters {
-            if let Some(clause) = self.build_parameter_clause(param) {
+            if let Some(clause) = self.build_parameter_clause(param, now) {
                 must_clauses.push(clause);
             }
         }
@@ -246,8 +250,9 @@ impl<'a> EsQueryBuilder<'a> {
         }))
     }
 
-    /// Builds a clause for a single search parameter.
-    fn build_parameter_clause(&self, param: &SearchParameter) -> Option<Value> {
+    /// Builds a clause for a single search parameter. `now` is the instant
+    /// `ap` date windows are measured from.
+    fn build_parameter_clause(&self, param: &SearchParameter, now: DateTime<Utc>) -> Option<Value> {
         // Presence is independent of the parameter's ordinary value syntax.
         // Resolve it before `_id` and `_lastUpdated`, which would otherwise
         // interpret the boolean literal as an ID or date value.
@@ -267,7 +272,7 @@ impl<'a> EsQueryBuilder<'a> {
         // Handle special parameters
         match param.name.as_str() {
             "_id" => return self.build_id_clause(param),
-            "_lastUpdated" => return self.build_last_updated_clause(param),
+            "_lastUpdated" => return self.build_last_updated_clause(param, now),
             "_text" => return fts::build_text_clause(param),
             "_content" => return fts::build_content_clause(param),
             _ => {}
@@ -277,7 +282,7 @@ impl<'a> EsQueryBuilder<'a> {
         let clauses: Vec<Value> = param
             .values
             .iter()
-            .filter_map(|value| self.build_value_clause(param, &value.value, value.prefix))
+            .filter_map(|value| self.build_value_clause(param, &value.value, value.prefix, now))
             .collect();
 
         if clauses.is_empty() {
@@ -316,16 +321,17 @@ impl<'a> EsQueryBuilder<'a> {
         param: &SearchParameter,
         value: &str,
         prefix: SearchPrefix,
+        now: DateTime<Utc>,
     ) -> Option<Value> {
         match param.param_type {
             SearchParamType::String => string::build_clause(param, value),
             SearchParamType::Token => token::build_clause(param, value),
-            SearchParamType::Date => date::build_clause(&param.name, value, prefix),
+            SearchParamType::Date => date::build_clause(&param.name, value, prefix, now),
             SearchParamType::Number => number::build_clause(&param.name, value, prefix),
             SearchParamType::Quantity => quantity::build_clause(&param.name, value, prefix),
             SearchParamType::Reference => reference::build_clause(param, value),
             SearchParamType::Uri => uri::build_clause(param, value),
-            SearchParamType::Composite => composite::build_clause(param, value),
+            SearchParamType::Composite => composite::build_clause(param, value, now),
             SearchParamType::Special => None,
         }
     }
@@ -367,12 +373,16 @@ impl<'a> EsQueryBuilder<'a> {
     /// (#892). Previously every value was folded into one `range` map, so
     /// `ne`/`sa`/`eb`/`ap` degraded to `eq` and a second value overwrote the
     /// first.
-    fn build_last_updated_clause(&self, param: &SearchParameter) -> Option<Value> {
+    fn build_last_updated_clause(
+        &self,
+        param: &SearchParameter,
+        now: DateTime<Utc>,
+    ) -> Option<Value> {
         let mut clauses: Vec<Value> = param
             .values
             .iter()
             .map(
-                |value| match date::field_range("last_updated", &value.value, value.prefix) {
+                |value| match date::field_range("last_updated", &value.value, value.prefix, now) {
                     Some(date::DateRange::Within(range)) => range,
                     Some(date::DateRange::Outside(range)) => {
                         json!({ "bool": { "must_not": [range] } })
@@ -1120,7 +1130,7 @@ mod tests {
                 components: vec![],
             };
             assert_eq!(
-                builder.build_parameter_clause(&param),
+                builder.build_parameter_clause(&param, Utc::now()),
                 Some(json!({ "match_none": {} })),
                 "{context}"
             );

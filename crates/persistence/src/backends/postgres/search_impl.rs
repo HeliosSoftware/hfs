@@ -520,6 +520,17 @@ impl SearchProvider for PostgresBackend {
         reject_contained_missing(query)?;
         reject_unsupported_metadata_modifier(query)?;
 
+        // One reference instant for the whole search, its `_total` count
+        // included: `ap` date windows are measured from it (#1390).
+        let resolved;
+        let query = match query.now {
+            Some(_) => query,
+            None => {
+                resolved = query.clone().with_now(Utc::now());
+                &resolved
+            }
+        };
+
         // `_contained` search uses a dedicated path (different index columns and
         // heterogeneous result types); standard search handles `_contained=false`.
         // This is the only entry point into that path, so the gate above is not

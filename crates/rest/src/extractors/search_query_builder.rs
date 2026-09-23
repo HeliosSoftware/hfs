@@ -68,7 +68,9 @@ fn build_query(
     registry: &SearchParameterRegistry,
     types: TypeScope,
 ) -> Result<SearchQuery, RestError> {
-    let mut query = SearchQuery::new(resource_type);
+    // One instant per request for `ap` date windows (#1390), so every value,
+    // and the search and its count, measure the margin from the same `now`.
+    let mut query = SearchQuery::new(resource_type).with_now(chrono::Utc::now());
 
     // Process system parameters
     if let Some(count) = params.count() {

@@ -47,6 +47,9 @@ pub fn make_sqlite_backend_for(fhir_version: FhirVersion) -> SqliteBackend {
     backend
 }
 
+/// Backend-agnostic scenarios, shared with the PostgreSQL, MongoDB and
+/// Elasticsearch test binaries via `#[path]` (#1390).
+pub mod ap_prefix_suite;
 pub mod chained_tests;
 /// Backend-agnostic scenarios, shared with the PostgreSQL, MongoDB and
 /// Elasticsearch test binaries via `#[path]` (#1293, #1295, #1296, #1297).

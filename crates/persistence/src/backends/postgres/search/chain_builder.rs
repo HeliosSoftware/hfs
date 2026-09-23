@@ -12,6 +12,7 @@
 
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 
 use crate::error::{BackendError, StorageResult};
@@ -129,6 +130,9 @@ pub struct ChainQueryBuilder {
     /// Callers typically reserve `$1` for `tenant_id`, so the default offset
     /// of `1` makes the first chain-supplied param `$2`.
     param_offset: usize,
+    /// The instant `ap` date windows are measured from; see
+    /// [`crate::types::SearchQuery::reference_now`].
+    now: DateTime<Utc>,
 }
 
 impl ChainQueryBuilder {
@@ -144,6 +148,7 @@ impl ChainQueryBuilder {
             registry,
             config: ChainConfig::default(),
             param_offset: 1,
+            now: Utc::now(),
         }
     }
 
@@ -156,6 +161,13 @@ impl ChainQueryBuilder {
     /// Sets the parameter offset used when allocating `$N` placeholders.
     pub fn with_param_offset(mut self, offset: usize) -> Self {
         self.param_offset = offset;
+        self
+    }
+
+    /// Sets the instant `ap` date windows are measured from. Defaults to the
+    /// time the builder was created.
+    pub fn with_now(mut self, now: DateTime<Utc>) -> Self {
+        self.now = now;
         self
     }
 
@@ -378,7 +390,7 @@ impl ChainQueryBuilder {
         let alias = format!("si{}", chain.links.len());
 
         if let Some(condition) =
-            resources_backed_condition(&chain.terminal_param, &alias, value, param_num)
+            resources_backed_condition(&chain.terminal_param, &alias, value, param_num, self.now)
         {
             return Ok(condition);
         }
@@ -437,7 +449,7 @@ impl ChainQueryBuilder {
             ),
             SearchParamType::Date => {
                 let date_col = format!("{}.value_date", alias);
-                build_date_condition(&date_col, value, param_num)
+                build_date_condition(&date_col, value, param_num, self.now)
             }
             SearchParamType::Number => build_number_condition(&alias, value, param_num),
             SearchParamType::Quantity => build_quantity_condition(&alias, value, param_num),
@@ -574,7 +586,8 @@ impl ChainQueryBuilder {
                 Arc::clone(&self.registry),
             )
             .with_config(self.config.clone())
-            .with_param_offset(param_num - 1);
+            .with_param_offset(param_num - 1)
+            .with_now(self.now);
 
             let (inner_sql, inner_params) =
                 inner_builder.build_reverse_chain_recursive(inner, depth + 1, param_num)?;
@@ -616,7 +629,9 @@ impl ChainQueryBuilder {
 
         let alias = format!("si{}", depth);
 
-        if let Some(condition) = resources_backed_condition(param_name, &alias, value, param_num) {
+        if let Some(condition) =
+            resources_backed_condition(param_name, &alias, value, param_num, self.now)
+        {
             return Ok(condition);
         }
 
@@ -674,7 +689,7 @@ impl ChainQueryBuilder {
             ),
             SearchParamType::Date => {
                 let date_col = format!("{}.value_date", alias);
-                build_date_condition(&date_col, value, param_num)
+                build_date_condition(&date_col, value, param_num, self.now)
             }
             SearchParamType::Number => build_number_condition(&alias, value, param_num),
             SearchParamType::Quantity => build_quantity_condition(&alias, value, param_num),
@@ -730,6 +745,7 @@ fn resources_backed_condition(
     alias: &str,
     value: &SearchValue,
     param_num: usize,
+    now: DateTime<Utc>,
 ) -> Option<(String, Vec<SqlParam>)> {
     match param_name {
         "_id" => Some((
@@ -740,6 +756,7 @@ fn resources_backed_condition(
             &format!("{}.last_updated", alias),
             value,
             param_num,
+            now,
         )),
         _ => None,
     }
@@ -765,10 +782,11 @@ fn build_date_condition(
     column: &str,
     value: &SearchValue,
     param_num: usize,
+    now: DateTime<Utc>,
 ) -> (String, Vec<SqlParam>) {
     // `date_predicate` pre-increments: it numbers its first bind `next + 1`.
     let mut next = param_num - 1;
-    let (sql, params) = date_predicate(column, value.prefix, &value.value, &mut next);
+    let (sql, params) = date_predicate(column, value.prefix, &value.value, now, &mut next);
     debug_assert_eq!(next, param_num - 1 + params.len());
     // Parenthesized: the predicate may be `a AND b`, and it is spliced after
     // an `AND` in the terminal subquery today but need not always be.
@@ -780,8 +798,9 @@ fn build_date_condition(
 /// Delegates to [`number_predicate`], the unchained `number` search's
 /// predicate, so a chained number means what the unchained one does: the
 /// implicit-precision range for `eq`/`ne` (`100` is `[99.5, 100.5)`), the exact
-/// value for the comparators, and for `ap` a bound `BETWEEN` whose margin is
-/// taken from the magnitude, so a negative value has its bounds in order.
+/// value for the comparators, and for `ap` a bound `BETWEEN` over the shared
+/// window (`ap100` is `[90, 110]`), whose bounds are in order for a negative
+/// value too.
 ///
 /// This used to be its own operator table. Its `ap` arm wrote both bounds into
 /// the SQL text and still returned a bind, so the statement was given one more
@@ -1192,6 +1211,29 @@ mod tests {
         }
     }
 
+    /// #1390: a chained date's `ap` is the shared window measured from the
+    /// builder's `now`, not the scalar `=` on the start of the range.
+    #[test]
+    fn a_chained_date_ap_is_the_shared_window_around_now() {
+        let now = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .expect("an instant")
+            .with_timezone(&Utc);
+        let (sql, params) =
+            build_date_condition("si1.value_date", &SearchValue::parse("ap2016"), 2, now);
+        assert_eq!(sql, "(si1.value_date >= $2 AND si1.value_date < $3)");
+        let binds: Vec<String> = params
+            .iter()
+            .map(|p| match p {
+                SqlParam::Timestamp(ts) => ts.to_rfc3339(),
+                other => panic!("must bind a timestamp: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            binds,
+            ["2015-02-06T07:12:00+00:00", "2017-11-25T16:48:00+00:00"]
+        );
+    }
+
     /// #1306: a chained quantity reads `number|system|code` as the unchained
     /// search does, against aliased columns, still without placeholder gaps.
     #[test]
@@ -1281,11 +1323,15 @@ mod tests {
         for param in super::super::writer::PARAMS_ANSWERED_FROM_RESOURCES {
             assert!(resources_backed(param), "{param} must be recognised");
             assert!(
-                resources_backed_condition(param, "si1", &SearchValue::eq("x"), 2).is_some(),
+                resources_backed_condition(param, "si1", &SearchValue::eq("x"), 2, Utc::now())
+                    .is_some(),
                 "{param} has no `resources` column mapping"
             );
         }
-        assert!(resources_backed_condition("code", "si1", &SearchValue::eq("x"), 2).is_none());
+        assert!(
+            resources_backed_condition("code", "si1", &SearchValue::eq("x"), 2, Utc::now())
+                .is_none()
+        );
     }
 
     #[test]

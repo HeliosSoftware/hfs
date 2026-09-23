@@ -4198,6 +4198,9 @@ impl MongoBackend {
         }
 
         let typed_params = self.build_search_parameters(tenant, resource_type, &parsed_params)?;
+        // One instant for every filter of this match, so an `ap` date window
+        // does not move between the driver probe and the checks (#1390).
+        let now = Utc::now();
         // Result-shaping names (`_format`, …) are not criteria; with nothing
         // left, an empty filter would match the whole type.
         if typed_params.is_empty() {
@@ -4251,13 +4254,14 @@ impl MongoBackend {
             for (i, param) in index_params.iter().enumerate() {
                 let count = if param.param_type == SearchParamType::Composite {
                     match self
-                        .composite_driver_probe(
+                        .composite_driver_probe_at(
                             &search_index,
                             tenant_id,
                             resource_type,
                             param,
                             PROBE_LIMIT as u64,
                             Some(&mut *session),
+                            now,
                         )
                         .await?
                     {
@@ -4269,7 +4273,8 @@ impl MongoBackend {
                         }
                     }
                 } else {
-                    let filter = self.build_search_index_filter(tenant_id, resource_type, param)?;
+                    let filter =
+                        self.build_search_index_filter_at(tenant_id, resource_type, param, now)?;
                     let pipeline = vec![
                         doc! { "$match": filter },
                         doc! { "$limit": PROBE_LIMIT },
@@ -4307,7 +4312,12 @@ impl MongoBackend {
         let driver_filter = if let Some((filter, _)) = composite_probes.remove(&driver_idx) {
             filter
         } else {
-            self.build_search_index_filter(tenant_id, resource_type, index_params[driver_idx])?
+            self.build_search_index_filter_at(
+                tenant_id,
+                resource_type,
+                index_params[driver_idx],
+                now,
+            )?
         };
 
         let mut last_index_id: Option<Bson> = None;
@@ -4367,13 +4377,14 @@ impl MongoBackend {
                 // still needs the grouped pair check (#1206).
                 if param.param_type == SearchParamType::Composite {
                     let passing = self
-                        .composite_pair_check(
+                        .composite_pair_check_at(
                             &search_index,
                             tenant_id,
                             resource_type,
                             param,
                             &candidate_ids,
                             Some(&mut *session),
+                            now,
                         )
                         .await?;
                     candidate_ids.retain(|id| passing.contains(id));
@@ -4383,7 +4394,7 @@ impl MongoBackend {
                     continue;
                 }
                 let param_filter =
-                    self.build_search_index_filter(tenant_id, resource_type, param)?;
+                    self.build_search_index_filter_at(tenant_id, resource_type, param, now)?;
                 let bounded_filter = doc! {
                     "$and": [
                         param_filter,

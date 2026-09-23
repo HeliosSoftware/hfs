@@ -58,10 +58,16 @@
 //! | `lt` / `eb` | `t < start` | `Before(start)` |
 //! | `ge` | `t ≥ start` | `AtOrAfter(start)` |
 //! | `le` | `t < end` | `Before(end)` |
+//! | `ap` | `start − m ≤ t < end + m` | `Within` |
 //!
-//! `ap` is deliberately absent: each backend keeps its own approximation
-//! window around the same parsed range, so [`FhirDateValue::predicate`]
-//! returns `None` for it.
+//! `ap` has one window on every backend (#1390). FHIR recommends a margin of
+//! 10% of the gap between now and the value, so `m` is a tenth of the distance
+//! from `now` to the nearest edge of the range, and `0` when `now` falls inside
+//! it: the window is never narrower than `eq`. Because the window depends on
+//! the current time, `now` is passed in, never read from a clock here; a
+//! request fixes it once ([`crate::types::SearchQuery::now`]) so every value
+//! of it, and its count, see the same instant. The page cursor does not carry
+//! `now`, so a later page measures the window from its own request's instant.
 
 use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
 
@@ -259,23 +265,48 @@ impl FhirDateValue {
     /// The comparison `prefix` makes against a stored point, per the table in
     /// the module docs.
     ///
-    /// `None` for `ap`, whose window is each backend's own; it should be built
-    /// around [`Self::range_at`].
+    /// `now` only matters for `ap`, whose margin is a tenth of the distance
+    /// from `now` to the range.
     pub fn predicate(
         &self,
         prefix: SearchPrefix,
         resolution: StorageResolution,
-    ) -> Option<DatePredicate> {
+        now: DateTime<Utc>,
+    ) -> DatePredicate {
         let (start, end) = self.range_at(resolution);
-        Some(match prefix {
+        match prefix {
             SearchPrefix::Eq => DatePredicate::Within { ge: start, lt: end },
             SearchPrefix::Ne => DatePredicate::Outside { lt: start, ge: end },
             SearchPrefix::Gt | SearchPrefix::Sa => DatePredicate::AtOrAfter(end),
             SearchPrefix::Lt | SearchPrefix::Eb => DatePredicate::Before(start),
             SearchPrefix::Ge => DatePredicate::AtOrAfter(start),
             SearchPrefix::Le => DatePredicate::Before(end),
-            SearchPrefix::Ap => return None,
-        })
+            SearchPrefix::Ap => {
+                let gap = if now < start {
+                    start - now
+                } else if now >= end {
+                    now - end
+                } else {
+                    Duration::zero()
+                };
+                // Rounded up to a whole millisecond: `now` carries
+                // nanoseconds, and a backend that stores milliseconds would
+                // otherwise truncate `end + m` and lose its last millisecond.
+                let tenth = gap / 10;
+                let mut margin = Duration::milliseconds(tenth.num_milliseconds());
+                if margin < tenth {
+                    margin += Duration::milliseconds(1);
+                }
+                DatePredicate::Within {
+                    ge: start
+                        .checked_sub_signed(margin)
+                        .unwrap_or(DateTime::<Utc>::MIN_UTC),
+                    lt: end
+                        .checked_add_signed(margin)
+                        .unwrap_or(DateTime::<Utc>::MAX_UTC),
+                }
+            }
+        }
     }
 }
 
@@ -881,16 +912,123 @@ mod tests {
             (SearchPrefix::Le, DatePredicate::Before(e)),
         ] {
             assert_eq!(
-                value.predicate(prefix, StorageResolution::Micros),
-                Some(expected),
+                value.predicate(
+                    prefix,
+                    StorageResolution::Micros,
+                    utc("2026-01-01T00:00:00Z")
+                ),
+                expected,
                 "{prefix}"
             );
         }
-        // `ap` stays with the backend.
+    }
+
+    /// `ap` widens the range by a tenth of its distance from `now` (#1390).
+    #[test]
+    fn ap_widens_the_range_by_a_tenth_of_the_gap_to_now() {
+        let now = utc("2026-01-01T00:00:00Z");
+        let ap =
+            |raw: &str| parsed(raw).predicate(SearchPrefix::Ap, StorageResolution::Micros, now);
+        let tenth_of = |a: &str, b: &str| (utc(b) - utc(a)) / 10;
+
+        // Past: the gap runs from the end of 2016 to now, 9 years.
+        let m = tenth_of("2017-01-01T00:00:00Z", "2026-01-01T00:00:00Z");
         assert_eq!(
-            value.predicate(SearchPrefix::Ap, StorageResolution::Micros),
-            None
+            ap("2016"),
+            DatePredicate::Within {
+                ge: utc("2016-01-01T00:00:00Z") - m,
+                lt: utc("2017-01-01T00:00:00Z") + m,
+            }
         );
+
+        // Future: the gap runs from now to the start of 2036, 10 years.
+        let m = tenth_of("2026-01-01T00:00:00Z", "2036-01-01T00:00:00Z");
+        assert_eq!(
+            ap("2036-01-01"),
+            DatePredicate::Within {
+                ge: utc("2036-01-01T00:00:00Z") - m,
+                lt: utc("2036-01-02T00:00:00Z") + m,
+            }
+        );
+
+        // Minute precision: the minute ends 59 minutes before now, so the
+        // margin is 5 minutes 54 seconds.
+        assert_eq!(
+            ap("2025-12-31T23:00Z"),
+            DatePredicate::Within {
+                ge: utc("2025-12-31T22:54:06Z"),
+                lt: utc("2025-12-31T23:06:54Z"),
+            }
+        );
+    }
+
+    /// A sub-millisecond `now` still gives a whole-millisecond margin, rounded
+    /// up, so millisecond storage cannot narrow the window.
+    #[test]
+    fn ap_margin_is_rounded_up_to_a_millisecond() {
+        // The second ends 9.001 s before `now`: a tenth is 900.1 ms, rounded
+        // up to 901 ms.
+        let now = utc("2026-01-01T00:00:10.001Z");
+        assert_eq!(
+            parsed("2026-01-01T00:00:00Z").predicate(
+                SearchPrefix::Ap,
+                StorageResolution::Millis,
+                now
+            ),
+            DatePredicate::Within {
+                ge: utc("2025-12-31T23:59:59.099Z"),
+                lt: utc("2026-01-01T00:00:01.901Z"),
+            }
+        );
+    }
+
+    /// With `now` inside the range, or on its start, the gap is zero and `ap`
+    /// is exactly `eq`.
+    #[test]
+    fn ap_is_eq_when_now_is_in_the_range() {
+        let now = utc("2026-01-01T00:00:00Z");
+        for raw in [
+            "2026",
+            "2026-01",
+            "2026-01-01",
+            "2026-01-01T00:00Z",
+            "2025-12-31T19:00:00-05:00",
+        ] {
+            let value = parsed(raw);
+            assert_eq!(
+                value.predicate(SearchPrefix::Ap, StorageResolution::Micros, now),
+                value.predicate(SearchPrefix::Eq, StorageResolution::Micros, now),
+                "{raw}"
+            );
+        }
+    }
+
+    /// Whatever `now` is, `ap` matches everything `eq` matches.
+    #[test]
+    fn ap_contains_eq() {
+        for now in [
+            "1900-01-01T00:00:00Z",
+            "2016-06-15T12:00:00Z",
+            "2100-01-01T00:00:00Z",
+        ] {
+            let now = utc(now);
+            for raw in [
+                "2016",
+                "2016-06",
+                "2016-06-15",
+                "2016-06-15T12:34Z",
+                "2016-06-15T12:34:56.789Z",
+            ] {
+                let value = parsed(raw);
+                let DatePredicate::Within { ge, lt } =
+                    value.predicate(SearchPrefix::Ap, StorageResolution::Millis, now)
+                else {
+                    panic!("ap must be a window: {raw}");
+                };
+                let (start, end) = value.range_at(StorageResolution::Millis);
+                assert!(ge <= start && end <= lt, "{raw} at {now}");
+            }
+        }
     }
 
     #[test]
@@ -900,8 +1038,7 @@ mod tests {
         let value = parsed("2013-04-05T23:30:00-04:00");
         let hit = |prefix| {
             value
-                .predicate(prefix, StorageResolution::Millis)
-                .unwrap()
+                .predicate(prefix, StorageResolution::Millis, stored)
                 .matches(stored)
         };
         assert!(hit(SearchPrefix::Eq));

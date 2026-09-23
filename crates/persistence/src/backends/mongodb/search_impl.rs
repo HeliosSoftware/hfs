@@ -1,5 +1,6 @@
 //! Search and conditional-operation implementation for MongoDB backend.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
@@ -64,11 +65,19 @@ fn chrono_to_bson(dt: DateTime<Utc>) -> BsonDateTime {
 /// milliseconds, so the range is clamped to that: a microsecond search value
 /// still finds the millisecond-truncated date stored for it.
 ///
+/// `ap` is the shared window (#1390): the range widened by a tenth of its gap
+/// to `now`, the instant the search fixed once for all of its values.
+///
 /// A value that is not a date is an error here, never a filter. The search
 /// gate (`validate_date_values`) reports it first on every ordinary path;
 /// this is what the in-transaction conditional paths, which build filters
 /// without passing the gate, fall back on.
-fn build_date_filter_doc(value: &SearchValue, param: &str, field: &str) -> StorageResult<Document> {
+fn build_date_filter_doc(
+    value: &SearchValue,
+    param: &str,
+    field: &str,
+    now: DateTime<Utc>,
+) -> StorageResult<Document> {
     let parsed = FhirDateValue::parse(&value.value).map_err(|error| {
         StorageError::Search(SearchError::InvalidDateValue {
             param: param.to_string(),
@@ -77,28 +86,21 @@ fn build_date_filter_doc(value: &SearchValue, param: &str, field: &str) -> Stora
         })
     })?;
 
-    let Some(predicate) = parsed.predicate(value.prefix, StorageResolution::Millis) else {
-        // `ap`, which the shared layer leaves to each backend: ±12h around
-        // the start of the range, as before.
-        let (start, _) = parsed.range_at(StorageResolution::Millis);
-        let lower = chrono_to_bson(start - chrono::Duration::hours(12));
-        let upper = chrono_to_bson(start + chrono::Duration::hours(12));
-        return Ok(doc! { field: { "$gte": lower, "$lte": upper } });
-    };
-
-    Ok(match predicate {
-        DatePredicate::Within { ge, lt } => {
-            doc! { field: { "$gte": chrono_to_bson(ge), "$lt": chrono_to_bson(lt) } }
-        }
-        DatePredicate::Outside { lt, ge } => doc! {
-            "$or": [
-                { field: { "$lt": chrono_to_bson(lt) } },
-                { field: { "$gte": chrono_to_bson(ge) } },
-            ]
+    Ok(
+        match parsed.predicate(value.prefix, StorageResolution::Millis, now) {
+            DatePredicate::Within { ge, lt } => {
+                doc! { field: { "$gte": chrono_to_bson(ge), "$lt": chrono_to_bson(lt) } }
+            }
+            DatePredicate::Outside { lt, ge } => doc! {
+                "$or": [
+                    { field: { "$lt": chrono_to_bson(lt) } },
+                    { field: { "$gte": chrono_to_bson(ge) } },
+                ]
+            },
+            DatePredicate::AtOrAfter(bound) => doc! { field: { "$gte": chrono_to_bson(bound) } },
+            DatePredicate::Before(bound) => doc! { field: { "$lt": chrono_to_bson(bound) } },
         },
-        DatePredicate::AtOrAfter(bound) => doc! { field: { "$gte": chrono_to_bson(bound) } },
-        DatePredicate::Before(bound) => doc! { field: { "$lt": chrono_to_bson(bound) } },
-    })
+    )
 }
 
 /// The error for a number or quantity search value whose number is not one.
@@ -363,6 +365,17 @@ pub(super) fn missing_presence_filter(
     filter
 }
 
+/// `query` with the instant its `ap` date windows are measured from fixed
+/// (#1390), so the index filters, the resource filter and a search's count all
+/// see one instant even when the caller left [`SearchQuery::now`] unset.
+fn pin_now(query: &SearchQuery) -> Cow<'_, SearchQuery> {
+    if query.now.is_some() {
+        Cow::Borrowed(query)
+    } else {
+        Cow::Owned(query.clone().with_now(Utc::now()))
+    }
+}
+
 /// Rejects `_contained=true|both` combined with a composite search parameter
 /// (#1206 review finding 3).
 ///
@@ -556,6 +569,7 @@ impl SearchProvider for MongoBackend {
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
         reject_contained_composite(query)?;
+        let query = &*pin_now(query);
 
         // `_contained` search uses a dedicated path (separate index rows and
         // heterogeneous result types); standard search handles `_contained=false`
@@ -740,6 +754,7 @@ impl SearchProvider for MongoBackend {
         query: &SearchQuery,
     ) -> StorageResult<u64> {
         reject_contained_composite(query)?;
+        let query = &*pin_now(query);
         self.validate_query_support(query)?;
 
         // Under `_contained` the count is of what `search` returns (#1383),
@@ -1114,6 +1129,7 @@ impl MongoBackend {
         let mut distinct_names: Vec<String> = Vec::new();
         // `_id` is the contained resource's local id, a field of every row.
         let mut id_clauses: Vec<Bson> = Vec::new();
+        let now = query.reference_now();
         for param in &query.parameters {
             if let Some(reason) = contained_unsupported_reason(param) {
                 return Err(reject_contained_parameter(param, &reason));
@@ -1127,7 +1143,7 @@ impl MongoBackend {
             }
             // Reuse the standard per-param value filter, dropping the tenant /
             // resource_type scoping (handled by the pipeline's top `$match`).
-            let mut branch = self.build_search_index_filter("", "", param)?;
+            let mut branch = self.build_search_index_filter_at("", "", param, now)?;
             branch.remove("tenant_id");
             branch.remove("resource_type");
             branches.push(branch);
@@ -1838,6 +1854,7 @@ impl MongoBackend {
         if query.parameters.iter().any(crate::search::has_empty_value) {
             return Ok(Some(HashSet::new()));
         }
+        let now = query.reference_now();
 
         let mut normal: Vec<&SearchParameter> = Vec::new();
         let mut missing: Vec<&SearchParameter> = Vec::new();
@@ -1901,7 +1918,7 @@ impl MongoBackend {
         let normal_filter = |i: usize| -> StorageResult<Document> {
             match identifier_filters.get(&i) {
                 Some(filter) => Ok(filter.clone()),
-                None => self.build_search_index_filter(tenant_id, resource_type, normal[i]),
+                None => self.build_search_index_filter_at(tenant_id, resource_type, normal[i], now),
             }
         };
 
@@ -1921,13 +1938,14 @@ impl MongoBackend {
             for (i, param) in normal.iter().enumerate() {
                 let count = if param.param_type == SearchParamType::Composite {
                     match self
-                        .composite_driver_probe(
+                        .composite_driver_probe_at(
                             &search_index,
                             tenant_id,
                             resource_type,
                             param,
                             PROBE_ROW_LIMIT,
                             None,
+                            now,
                         )
                         .await?
                     {
@@ -2000,13 +2018,14 @@ impl MongoBackend {
                 // same `composite_group` (#1206).
                 if param.param_type == SearchParamType::Composite {
                     let passing = self
-                        .composite_pair_check(
+                        .composite_pair_check_at(
                             &search_index,
                             tenant_id,
                             resource_type,
                             param,
                             &candidates,
                             None,
+                            now,
                         )
                         .await?;
                     candidates.retain(|id| passing.contains(id));
@@ -2073,7 +2092,7 @@ impl MongoBackend {
                 let mut positive = (*param).clone();
                 positive.modifier = None;
                 let pos_filter =
-                    self.build_search_index_filter(tenant_id, resource_type, &positive)?;
+                    self.build_search_index_filter_at(tenant_id, resource_type, &positive, now)?;
                 let bounded = doc! {
                     "$and": [
                         pos_filter,
@@ -2153,6 +2172,7 @@ impl MongoBackend {
             .compartment
             .as_ref()
             .is_some_and(|c| !c.params.is_empty() && !c.reference.is_empty());
+        let now = query.reference_now();
         let mut matched: Option<HashSet<String>> = None;
 
         for param in missing {
@@ -2188,7 +2208,8 @@ impl MongoBackend {
         for param in not_params {
             let mut positive = (*param).clone();
             positive.modifier = None;
-            let filter = self.build_search_index_filter(tenant_id, resource_type, &positive)?;
+            let filter =
+                self.build_search_index_filter_at(tenant_id, resource_type, &positive, now)?;
             let matching = self.distinct_resource_ids(search_index, filter).await?;
             let all = self.all_resource_ids(db, tenant_id, resource_type).await?;
             let ids = all.difference(&matching).cloned().collect::<HashSet<_>>();
@@ -2267,11 +2288,25 @@ impl MongoBackend {
         Ok(Some(ids))
     }
 
+    /// [`Self::build_search_index_filter_at`] with `ap` dates measured from
+    /// the current time, for the conditional paths that have no search query.
     pub(super) fn build_search_index_filter(
         &self,
         tenant_id: &str,
         resource_type: &str,
         param: &SearchParameter,
+    ) -> StorageResult<Document> {
+        self.build_search_index_filter_at(tenant_id, resource_type, param, Utc::now())
+    }
+
+    /// The search-index filter for one parameter, `ap` dates measured from
+    /// `now`.
+    pub(super) fn build_search_index_filter_at(
+        &self,
+        tenant_id: &str,
+        resource_type: &str,
+        param: &SearchParameter,
+        now: DateTime<Utc>,
     ) -> StorageResult<Document> {
         if param.param_type == SearchParamType::Composite {
             return Err(internal_error(format!(
@@ -2312,7 +2347,7 @@ impl MongoBackend {
         let value_filters = param
             .values
             .iter()
-            .map(|value| self.build_index_value_filter(param, value, &targets))
+            .map(|value| self.build_index_value_filter(param, value, &targets, now))
             .collect::<StorageResult<Vec<_>>>()?;
 
         if value_filters.len() == 1 {
@@ -2396,6 +2431,7 @@ impl MongoBackend {
         tenant_id: &str,
         resource_type: &str,
         param: &SearchParameter,
+        now: DateTime<Utc>,
     ) -> StorageResult<Vec<Vec<ComponentFilter>>> {
         if param.values.is_empty() {
             return Err(StorageError::Search(SearchError::QueryParseError {
@@ -2440,7 +2476,7 @@ impl MongoBackend {
                     component_value.clone(),
                 );
                 let predicate =
-                    self.build_index_value_filter(&synthetic, &component_value, &targets)?;
+                    self.build_index_value_filter(&synthetic, &component_value, &targets, now)?;
 
                 let mut scoped = doc! {
                     "tenant_id": tenant_id,
@@ -2543,7 +2579,8 @@ impl MongoBackend {
     /// there is one); the returned count is the sum of their probe counts,
     /// used only to compete with other parameters for the driver slot in
     /// `matching_resource_ids`.
-    pub(super) async fn composite_driver_probe(
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn composite_driver_probe_at(
         &self,
         search_index: &mongodb::Collection<Document>,
         tenant_id: &str,
@@ -2551,9 +2588,10 @@ impl MongoBackend {
         param: &SearchParameter,
         probe_limit: u64,
         mut session: Option<&mut mongodb::ClientSession>,
+        now: DateTime<Utc>,
     ) -> StorageResult<Option<(Document, u64)>> {
         let per_value_filters =
-            self.composite_component_filters(tenant_id, resource_type, param)?;
+            self.composite_component_filters(tenant_id, resource_type, param, now)?;
 
         let mut arms: Vec<Document> = Vec::new();
         let mut total: u64 = 0;
@@ -2623,7 +2661,8 @@ impl MongoBackend {
     /// `candidates` bounds every query issued here — this is the per-batch
     /// check reused by both `matching_resource_ids` (no session) and the
     /// ifNoneExist matcher in `storage.rs` (with a transaction session).
-    pub(super) async fn composite_pair_check(
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn composite_pair_check_at(
         &self,
         search_index: &mongodb::Collection<Document>,
         tenant_id: &str,
@@ -2631,13 +2670,14 @@ impl MongoBackend {
         param: &SearchParameter,
         candidates: &HashSet<String>,
         mut session: Option<&mut mongodb::ClientSession>,
+        now: DateTime<Utc>,
     ) -> StorageResult<HashSet<String>> {
         if candidates.is_empty() {
             return Ok(HashSet::new());
         }
 
         let per_value_filters =
-            self.composite_component_filters(tenant_id, resource_type, param)?;
+            self.composite_component_filters(tenant_id, resource_type, param, now)?;
         let candidate_ids: Vec<Bson> = candidates.iter().cloned().map(Bson::String).collect();
         let projection = doc! { "resource_id": 1, "composite_group": 1, "_id": 0 };
 
@@ -2712,6 +2752,7 @@ impl MongoBackend {
         param: &SearchParameter,
         value: &SearchValue,
         reference_targets: &[String],
+        now: DateTime<Utc>,
     ) -> StorageResult<Document> {
         match param.name.as_str() {
             "_text" | "_content" => {
@@ -2731,7 +2772,7 @@ impl MongoBackend {
         match param.param_type {
             SearchParamType::String => self.build_string_filter(param, value),
             SearchParamType::Token => self.build_token_filter(param, value),
-            SearchParamType::Date => self.build_date_filter(value, &param.name, "value_date"),
+            SearchParamType::Date => self.build_date_filter(value, &param.name, "value_date", now),
             SearchParamType::Number => self.build_number_filter(&param.name, value),
             SearchParamType::Reference => {
                 self.build_reference_filter(param, value, reference_targets)
@@ -3255,8 +3296,9 @@ impl MongoBackend {
         value: &SearchValue,
         param: &str,
         field: &str,
+        now: DateTime<Utc>,
     ) -> StorageResult<Document> {
-        build_date_filter_doc(value, param, field)
+        build_date_filter_doc(value, param, field, now)
     }
 
     /// Builds a MongoDB filter for a quantity parameter.
@@ -3315,8 +3357,8 @@ impl MongoBackend {
         let parsed = number.value;
         Ok(match prefix {
             SearchPrefix::Ap => {
-                let delta = (parsed.abs() * 0.1).max(0.1);
-                doc! { "$gte": parsed - delta, "$lte": parsed + delta }
+                let (lo, hi) = number.approx_range();
+                doc! { "$gte": lo, "$lte": hi }
             }
             SearchPrefix::Eq => {
                 let (lo, hi) = number.implicit_range();
@@ -3335,8 +3377,8 @@ impl MongoBackend {
 
     /// Maps a comparator prefix to its MongoDB query operator. The number and
     /// quantity filters only route `gt`/`lt`/`ge`/`le`/`sa`/`eb` through here:
-    /// `eq`/`ne` build the implicit-precision range and `ap` its delta range
-    /// directly in `build_number_filter` / `build_quantity_filter`.
+    /// `eq`/`ne` build the implicit-precision range and `ap` the shared
+    /// approximate range directly in `numeric_condition`.
     fn prefix_to_mongo_operator(prefix: SearchPrefix) -> StorageResult<&'static str> {
         match prefix {
             SearchPrefix::Eq => Ok("$eq"),
@@ -3345,7 +3387,10 @@ impl MongoBackend {
             SearchPrefix::Lt | SearchPrefix::Eb => Ok("$lt"),
             SearchPrefix::Ge => Ok("$gte"),
             SearchPrefix::Le => Ok("$lte"),
-            SearchPrefix::Ap => Ok("$eq"),
+            SearchPrefix::Ap => Err(internal_error(
+                "`ap` has no single MongoDB operator; numeric_condition builds its range"
+                    .to_string(),
+            )),
         }
     }
 
@@ -3382,7 +3427,9 @@ impl MongoBackend {
                     conditions.push(self.build_resource_id_condition(param)?);
                 }
                 "_lastUpdated" => {
-                    conditions.extend(self.build_resource_last_updated_conditions(param)?);
+                    conditions.extend(
+                        self.build_resource_last_updated_conditions(param, query.reference_now())?,
+                    );
                 }
                 _ => {}
             }
@@ -3454,13 +3501,14 @@ impl MongoBackend {
     fn build_resource_last_updated_conditions(
         &self,
         param: &SearchParameter,
+        now: DateTime<Utc>,
     ) -> StorageResult<Vec<Document>> {
         match &param.modifier {
             None => {
                 let mut conditions = param
                     .values
                     .iter()
-                    .map(|value| self.build_date_filter(value, &param.name, "last_updated"))
+                    .map(|value| self.build_date_filter(value, &param.name, "last_updated", now))
                     .collect::<StorageResult<Vec<_>>>()?;
 
                 // #1062: comma-separated `_lastUpdated` values are OR, the
@@ -4000,8 +4048,20 @@ impl RevincludeProvider for MongoBackend {
 mod date_filter_tests {
     use super::*;
 
+    /// The instant `ap` windows are measured from in these tests.
+    fn now() -> DateTime<Utc> {
+        instant("2026-01-01T00:00:00Z")
+    }
+
+    fn instant(rfc3339: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(rfc3339)
+            .expect("valid instant")
+            .with_timezone(&Utc)
+    }
+
     fn filter(raw: &str) -> Document {
-        build_date_filter_doc(&SearchValue::parse(raw), "date", "value_date").expect("valid date")
+        build_date_filter_doc(&SearchValue::parse(raw), "date", "value_date", now())
+            .expect("valid date")
     }
 
     fn bounds(d: &Document) -> &Document {
@@ -4169,18 +4229,22 @@ mod date_filter_tests {
         );
     }
 
-    /// ap: ±12h around the start, unchanged semantics.
+    /// ap: the shared window (#1390), the day widened by a tenth of its gap
+    /// to `now` — the day ends 3652 days before 2026-01-01, so 365.2 days.
     #[test]
-    fn ap_keeps_the_twelve_hour_window() {
-        let ap = filter("ap1995-10-02");
+    fn ap_widens_the_range_by_a_tenth_of_its_gap_to_now() {
+        let ap = filter("ap2016-01-01");
+        let margin = chrono::Duration::milliseconds(3652 * 86_400_000 / 10);
         assert_eq!(
             bounds(&ap).get_datetime("$gte").unwrap(),
-            &at("1995-10-01T12:00:00Z")
+            &chrono_to_bson(instant("2016-01-01T00:00:00Z") - margin)
         );
         assert_eq!(
-            bounds(&ap).get_datetime("$lte").unwrap(),
-            &at("1995-10-02T12:00:00Z")
+            bounds(&ap).get_datetime("$lt").unwrap(),
+            &chrono_to_bson(instant("2016-01-02T00:00:00Z") + margin)
         );
+        // A range holding `now` has no gap: `ap` is `eq`.
+        assert_eq!(filter("ap2026-01-01"), filter("2026-01-01"));
     }
 
     /// Garbage stays an error, not a silent full scan — under every prefix,
@@ -4196,8 +4260,9 @@ mod date_filter_tests {
             "2013-04-05T09:20:00z",
             "",
         ] {
-            let error = build_date_filter_doc(&SearchValue::parse(raw), "date", "value_date")
-                .expect_err(raw);
+            let error =
+                build_date_filter_doc(&SearchValue::parse(raw), "date", "value_date", now())
+                    .expect_err(raw);
             assert!(
                 matches!(
                     &error,
@@ -4896,7 +4961,7 @@ mod composite_component_filter_tests {
         let backend = backend();
         let param = code_value_quantity_param("8302-2$150");
         let per_value = backend
-            .composite_component_filters("t1", "Observation", &param)
+            .composite_component_filters("t1", "Observation", &param, Utc::now())
             .expect("valid composite filters");
         assert_eq!(per_value.len(), 1, "one composite value");
         let components = &per_value[0];
@@ -4938,7 +5003,7 @@ mod composite_component_filter_tests {
         let backend = backend();
         let param = code_value_quantity_param("8302-2$ne150");
         let per_value = backend
-            .composite_component_filters("t1", "Observation", &param)
+            .composite_component_filters("t1", "Observation", &param, Utc::now())
             .expect("valid composite filters");
         assert!(
             per_value[0][1].negated,
@@ -4988,7 +5053,7 @@ mod composite_component_filter_tests {
 
         let ne_param = code_value_quantity_param("8302-2$ne150");
         let per_value = backend
-            .composite_component_filters("t1", "Observation", &ne_param)
+            .composite_component_filters("t1", "Observation", &ne_param, Utc::now())
             .expect("valid composite filters");
         assert!(
             !per_value[0][0].negated,
@@ -5001,7 +5066,7 @@ mod composite_component_filter_tests {
 
         let gt_param = code_value_quantity_param("8302-2$gt150");
         let per_value = backend
-            .composite_component_filters("t1", "Observation", &gt_param)
+            .composite_component_filters("t1", "Observation", &gt_param, Utc::now())
             .expect("valid composite filters");
         assert!(
             !per_value[0][0].negated,
@@ -5021,7 +5086,7 @@ mod composite_component_filter_tests {
             ..code_value_quantity_param("unused")
         };
         let err = backend
-            .composite_component_filters("t1", "Observation", &param)
+            .composite_component_filters("t1", "Observation", &param, Utc::now())
             .expect_err("empty values must error");
         assert!(
             matches!(

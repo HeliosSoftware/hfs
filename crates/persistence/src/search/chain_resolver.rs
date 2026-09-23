@@ -70,13 +70,30 @@ pub struct ChainResolveOptions<'a> {
     /// no backend can answer it, and the terminal search would otherwise match
     /// literally or not at all (#1317).
     pub terminology: Option<&'a dyn TerminologyExpander>,
+
+    /// The instant `ap` date windows in a terminal search are measured from
+    /// (#1390). [`resolve_chains_with`] fills it from the outer query, so a
+    /// chain's terminal sees the same `now` as the search it belongs to;
+    /// `None` leaves each terminal search to read the clock itself.
+    pub now: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl std::fmt::Debug for ChainResolveOptions<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChainResolveOptions")
             .field("terminology", &self.terminology.is_some())
+            .field("now", &self.now)
             .finish()
+    }
+}
+
+/// A resolver sub-search of `resource_type`, measuring `ap` date windows from
+/// the outer search's instant when the options carry one.
+fn sub_query(resource_type: &str, options: ChainResolveOptions<'_>) -> SearchQuery {
+    let query = SearchQuery::new(resource_type);
+    match options.now {
+        Some(now) => query.with_now(now),
+        None => query,
     }
 }
 
@@ -117,6 +134,10 @@ where
     if !query_has_chains(query) {
         return Ok(query.clone());
     }
+    let options = ChainResolveOptions {
+        now: Some(options.now.unwrap_or_else(|| query.reference_now())),
+        ..options
+    };
 
     let base_type = query.resource_type.clone();
     let mut id_sets: Vec<HashSet<String>> = Vec::new();
@@ -437,7 +458,7 @@ where
     // Deepest hop: search each candidate terminal type, union the refs.
     let mut current_refs: Vec<String> = Vec::new();
     for terminal_target in &terminal_types {
-        let terminal_query = SearchQuery::new(terminal_target).with_parameter(SearchParameter {
+        let terminal_query = sub_query(terminal_target, options).with_parameter(SearchParameter {
             name: terminal_param.clone(),
             param_type: terminal.param_type,
             // Set on the terminal search itself, so every check a backend runs
@@ -474,7 +495,7 @@ where
         for parent_type in &parent_types_per_hop[i] {
             for chunk in current_refs.chunks(CHAIN_VALUE_CHUNK) {
                 let values: Vec<SearchValue> = chunk.iter().map(SearchValue::eq).collect();
-                let query = SearchQuery::new(parent_type).with_parameter(SearchParameter {
+                let query = sub_query(parent_type, options).with_parameter(SearchParameter {
                     name: ref_param.clone(),
                     param_type: SearchParamType::Reference,
                     modifier: None,
@@ -570,7 +591,7 @@ where
         if inner_ids.is_empty() {
             return Ok(Some(Vec::new()));
         }
-        SearchQuery::new(&reverse_chain.source_type).with_parameter(SearchParameter {
+        sub_query(&reverse_chain.source_type, options).with_parameter(SearchParameter {
             name: "_id".to_string(),
             param_type: SearchParamType::Token,
             modifier: None,
@@ -641,7 +662,7 @@ where
                 return Ok(None);
             }
         }
-        SearchQuery::new(&reverse_chain.source_type).with_parameter(SearchParameter {
+        sub_query(&reverse_chain.source_type, options).with_parameter(SearchParameter {
             name: search_param.to_string(),
             param_type: terminal.param_type,
             modifier: terminal.modifier,
@@ -1674,6 +1695,7 @@ mod tests {
             ChainResolveOptions::default(),
             ChainResolveOptions {
                 terminology: Some(&expander),
+                ..Default::default()
             },
         ] {
             for q in [
@@ -1810,6 +1832,7 @@ mod tests {
     ) -> StorageResult<Vec<String>> {
         let options = ChainResolveOptions {
             terminology: Some(expander),
+            ..Default::default()
         };
         let rewritten = resolve_chains_with(b, t, query, options).await?;
         let mut ids: Vec<String> = b

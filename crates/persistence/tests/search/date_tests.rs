@@ -292,6 +292,15 @@ async fn test_date_precision_and_validation_suite() {
     super::date_precision_suite::sub_day_precision_and_validation(&backend, "date-precision").await;
 }
 
+/// The shared `ap` prefix tables for number, quantity and date (#1390);
+/// PostgreSQL, MongoDB and Elasticsearch run the same ones.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_ap_prefix_suite() {
+    let backend = super::make_sqlite_backend();
+    super::ap_prefix_suite::ap_prefix(&backend, "ap-prefix", true).await;
+}
+
 /// The shared table for stored dateTimes with minutes but no seconds (#1315);
 /// PostgreSQL and MongoDB run the same one. SQLite never had the gap — it
 /// indexes the text as stored and `strftime` reads `hh:mm` — so this pins it.

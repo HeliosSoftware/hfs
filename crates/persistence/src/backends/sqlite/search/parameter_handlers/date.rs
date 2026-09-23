@@ -1,6 +1,8 @@
 //! Date parameter SQL handler.
 
-use crate::search::{DateValuePrecision, FhirDateValue};
+use chrono::{DateTime, Datelike, Utc};
+
+use crate::search::{DatePredicate, DateValuePrecision, FhirDateValue, StorageResolution};
 use crate::types::{SearchPrefix, SearchValue};
 
 use super::super::query_builder::{SqlFragment, SqlParam};
@@ -28,9 +30,14 @@ use super::super::query_builder::{SqlFragment, SqlParam};
 /// first cut to three fractional digits in SQL ([`truncated_to_millis`]):
 /// `last_updated` holds nanoseconds, which SQLite would *round* to the
 /// nearest millisecond while `meta.lastUpdated` (what the client searches
-/// with) truncates — off by one millisecond half the time. The approximate
-/// prefix keeps `datetime()`: its ±10-second window is coarser than a second
-/// anyway.
+/// with) truncates — off by one millisecond half the time.
+///
+/// `ap` is the shared window ([`FhirDateValue::predicate`], #1390): the
+/// value's range widened by a tenth of its distance from `now`. Its bounds
+/// are the bound range start moved by a whole number of milliseconds, written
+/// as `'±S seconds'` modifiers computed here — numbers, never client text —
+/// so it still needs one parameter, and it is compared at the millisecond
+/// because the margin rarely falls on a whole second.
 ///
 /// The search value itself is read by [`FhirDateValue`], the grammar every
 /// backend shares, and what is bound is a canonical UTC string built from the
@@ -39,9 +46,9 @@ use super::super::query_builder::{SqlFragment, SqlParam};
 /// for that (#1295), and it returns NULL for a leap second or for an offset
 /// whose `+` was form-decoded into a space (#1296).
 ///
-/// This does not translate [`crate::search::DatePredicate`]: the single-bind
-/// SQL above predates it and already agrees with it (the tests hold the two
-/// against each other), with one documented exception. A fraction is always
+/// Other than for `ap`, this does not translate [`DatePredicate`]: the
+/// single-bind SQL above predates it and already agrees with it (the tests
+/// hold the two against each other), with one documented exception. A fraction is always
 /// compared at the millisecond — `.5` means `[.500, .501)` here, not
 /// `[.5, .6)`, and digits past the third are cut — because both sides go
 /// through the same millisecond truncation.
@@ -56,6 +63,7 @@ pub(crate) fn date_condition(
     prefix: SearchPrefix,
     value: &str,
     param_num: usize,
+    now: DateTime<Utc>,
 ) -> Option<(String, String)> {
     let parsed = match FhirDateValue::parse(value) {
         Ok(parsed) => parsed,
@@ -91,8 +99,12 @@ pub(crate) fn date_condition(
         }
     };
 
+    if prefix == SearchPrefix::Ap {
+        return Some((approx_condition(column, &parsed, param_num, now), start));
+    }
+
     let normalize = |expr: &str| {
-        if has_fractional_seconds && prefix != SearchPrefix::Ap {
+        if has_fractional_seconds {
             format!(
                 "strftime('%Y-%m-%d %H:%M:%f', {})",
                 truncated_to_millis(expr)
@@ -118,20 +130,65 @@ pub(crate) fn date_condition(
         (SearchPrefix::Ge, _) => format!("{col} >= {p}"),
         (SearchPrefix::Le, Some(m)) => format!("{col} < {}", end(m)),
         (SearchPrefix::Le, None) => format!("{col} <= {p}"),
-        (SearchPrefix::Ap, _) => {
-            let m = match precision {
-                DateValuePrecision::Year => "1 year",
-                DateValuePrecision::Month => "1 month",
-                DateValuePrecision::Day => "1 day",
-                DateValuePrecision::Minute => "10 minutes",
-                DateValuePrecision::Second | DateValuePrecision::Fraction(_) => "10 seconds",
-            };
-            format!(
-                "{col} BETWEEN datetime(?{param_num}, '-{m}') AND datetime(?{param_num}, '+{m}')"
-            )
-        }
+        (SearchPrefix::Ap, _) => unreachable!("`ap` returned above"),
     };
     Some((sql, start))
+}
+
+/// The `ap` condition of [`date_condition`]: `[ge, lt)` of the shared window,
+/// each bound written as the bound parameter (`parsed`'s range start, cut to
+/// the millisecond) plus a whole number of milliseconds, and compared at the
+/// millisecond on both sides.
+///
+/// A bound outside the years SQLite's date functions accept (0000–9999) —
+/// where the shared window saturates, or a far-off value's margin reaches —
+/// is dropped: nothing stored lies beyond it, and SQLite would make it NULL.
+fn approx_condition(
+    column: &str,
+    parsed: &FhirDateValue,
+    param_num: usize,
+    now: DateTime<Utc>,
+) -> String {
+    let DatePredicate::Within { ge, lt } =
+        parsed.predicate(SearchPrefix::Ap, StorageResolution::Millis, now)
+    else {
+        unreachable!("the shared `ap` predicate is always a window");
+    };
+    let (bound, _) = parsed.range_at(StorageResolution::Millis);
+    let shifted = |expr: &str, offset_ms: i64| {
+        let sign = if offset_ms < 0 { '-' } else { '+' };
+        let offset_ms = offset_ms.unsigned_abs();
+        format!(
+            "strftime('%Y-%m-%d %H:%M:%f', {expr}, '{sign}{}.{:03} seconds')",
+            offset_ms / 1000,
+            offset_ms % 1000
+        )
+    };
+    let col = format!(
+        "strftime('%Y-%m-%d %H:%M:%f', {})",
+        truncated_to_millis(column)
+    );
+    let param = format!("?{param_num}");
+    let in_range = |t: DateTime<Utc>| (0..=9999).contains(&t.year());
+
+    let mut sides = Vec::new();
+    if in_range(ge) {
+        sides.push(format!(
+            "{col} >= {}",
+            shifted(&param, (ge - bound).num_milliseconds())
+        ));
+    }
+    if in_range(lt) {
+        sides.push(format!(
+            "{col} < {}",
+            shifted(&param, (lt - bound).num_milliseconds())
+        ));
+    }
+    if sides.is_empty() {
+        // Still refer to the parameter, so the numbering around it holds.
+        sides.push(format!("{col} IS NOT NULL AND {param} IS NOT NULL"));
+    }
+    format!("({})", sides.join(" AND "))
 }
 
 /// [`date_condition`] for callers whose return type promises exactly one bind
@@ -143,8 +200,9 @@ pub(crate) fn date_condition_or_nothing(
     prefix: SearchPrefix,
     value: &str,
     param_num: usize,
+    now: DateTime<Utc>,
 ) -> (String, String) {
-    date_condition(column, prefix, value, param_num)
+    date_condition(column, prefix, value, param_num, now)
         .unwrap_or_else(|| (format!("(1 = 0 AND ?{param_num} IS NULL)"), String::new()))
 }
 
@@ -178,15 +236,23 @@ impl DateHandler {
     /// - "2024-01" matches the entire month
     /// - "2024-01-15" matches the entire day
     ///
+    /// `now` is the instant an `ap` window is measured from.
+    ///
     /// A value that is not a date yields `1 = 0`, the match-nothing fragment
     /// the composite handler already uses, with no bind parameter.
-    pub fn build_sql(value: &SearchValue, param_offset: usize) -> SqlFragment {
+    pub fn build_sql(value: &SearchValue, param_offset: usize, now: DateTime<Utc>) -> SqlFragment {
         let param_num = param_offset + 1;
-        match date_condition("value_date", value.prefix, &value.value, param_num) {
+        match date_condition("value_date", value.prefix, &value.value, param_num, now) {
             Some((sql, bound)) => SqlFragment::with_params(sql, vec![SqlParam::string(bound)]),
             None => SqlFragment::new("1 = 0"),
         }
     }
+}
+
+/// The `now` the tests measure `ap` windows from.
+#[cfg(test)]
+fn test_now() -> DateTime<Utc> {
+    "2026-01-01T00:00:00Z".parse().unwrap()
 }
 
 #[cfg(test)]
@@ -194,7 +260,7 @@ mod tests {
     use super::*;
 
     fn sql_and_param(prefix: SearchPrefix, value: &str) -> (String, String) {
-        date_condition("value_date", prefix, value, 1).expect("a valid date value")
+        date_condition("value_date", prefix, value, 1, test_now()).expect("a valid date value")
     }
 
     #[test]
@@ -251,10 +317,63 @@ mod tests {
     }
 
     #[test]
-    fn ap_scales_with_precision() {
-        let (sql, param) = sql_and_param(SearchPrefix::Ap, "2024-01-15");
-        assert!(sql.contains("BETWEEN datetime(?1, '-1 day') AND datetime(?1, '+1 day')"));
-        assert_eq!(param, "2024-01-15T00:00:00");
+    fn ap_is_the_shared_window_around_the_bound_range_start() {
+        // `2016` ends 9 years (3287 days) before `now`: a margin of 328.7 days
+        // either side of the (leap) year, as offsets from the one parameter.
+        let (sql, param) = sql_and_param(SearchPrefix::Ap, "2016");
+        let col = format!(
+            "strftime('%Y-%m-%d %H:%M:%f', {})",
+            truncated_to_millis("value_date")
+        );
+        assert_eq!(
+            sql,
+            format!(
+                "({col} >= strftime('%Y-%m-%d %H:%M:%f', ?1, '-28399680.000 seconds') \
+                 AND {col} < strftime('%Y-%m-%d %H:%M:%f', ?1, '+60022080.000 seconds'))"
+            )
+        );
+        assert_eq!(param, "2016-01-01T00:00:00");
+    }
+
+    #[test]
+    fn ap_matches_what_the_shared_window_holds() {
+        // Past: 328.7 days either side of 2016.
+        assert!(sqlite_matches(SearchPrefix::Ap, "2016", "2015-03-01"));
+        assert!(!sqlite_matches(SearchPrefix::Ap, "2016", "2015-01-15"));
+        assert!(sqlite_matches(
+            SearchPrefix::Ap,
+            "2016",
+            "2017-06-01T10:00:00Z"
+        ));
+        assert!(!sqlite_matches(SearchPrefix::Ap, "2016", "2017-12-15"));
+        // `now` inside the range: no margin, the same as `eq`.
+        assert!(sqlite_matches(
+            SearchPrefix::Ap,
+            "2026",
+            "2026-12-31T23:59:59.999Z"
+        ));
+        assert!(!sqlite_matches(SearchPrefix::Ap, "2026", "2027-01-01"));
+        assert!(!sqlite_matches(
+            SearchPrefix::Ap,
+            "2026",
+            "2025-12-31T23:59:59Z"
+        ));
+    }
+
+    #[test]
+    fn ap_binds_exactly_one_parameter() {
+        let value = SearchValue::new(SearchPrefix::Ap, "2024-01-15");
+        let frag = DateHandler::build_sql(&value, 0, test_now());
+        assert_eq!(frag.params.len(), 1);
+    }
+
+    #[test]
+    fn ap_drops_a_bound_past_the_years_sqlite_reads() {
+        // `9999` is ~7973 years after `now`: its upper bound falls past 9999.
+        let (sql, _) = sql_and_param(SearchPrefix::Ap, "9999");
+        assert!(sql.contains(">="), "{sql}");
+        assert!(!sql.contains(" < "), "{sql}");
+        assert!(sqlite_matches(SearchPrefix::Ap, "9999", "9999-12-31"));
     }
 
     #[test]
@@ -262,7 +381,7 @@ mod tests {
         // The multi-value caller advances the offset by one per value, so eq
         // must not consume two slots.
         let value = SearchValue::new(SearchPrefix::Eq, "2024-01-15");
-        let frag = DateHandler::build_sql(&value, 0);
+        let frag = DateHandler::build_sql(&value, 0, test_now());
         assert_eq!(frag.params.len(), 1);
     }
 
@@ -333,8 +452,19 @@ mod tests {
     /// `last_updated` value (the `Utc::now().to_rfc3339()` shape the resources
     /// table holds), returning whether the search value matches it.
     fn sqlite_matches(prefix: SearchPrefix, search: &str, stored: &str) -> bool {
+        sqlite_matches_at(prefix, search, stored, test_now())
+    }
+
+    /// [`sqlite_matches`] with `ap` measured from `now`.
+    fn sqlite_matches_at(
+        prefix: SearchPrefix,
+        search: &str,
+        stored: &str,
+        now: DateTime<Utc>,
+    ) -> bool {
         let conn = rusqlite::Connection::open_in_memory().expect("in-memory sqlite");
-        let (sql, bound) = date_condition("?2", prefix, search, 1).expect("a valid date value");
+        let (sql, bound) =
+            date_condition("?2", prefix, search, 1, now).expect("a valid date value");
         conn.query_row(
             &format!("SELECT {sql}"),
             rusqlite::params![bound, stored],
@@ -435,10 +565,34 @@ mod tests {
             "2026-09-06T08:44:27.828Z",
             stored
         ));
-        assert!(
-            sqlite_matches(SearchPrefix::Ap, "2026-09-06T08:44:30.000Z", stored),
-            "approximate keeps its ±10-second window"
-        );
+        // `ap` is compared at the millisecond too: 100 s from `now`, its
+        // window is ±10 s; with `now` on the value, just that millisecond.
+        let now = "2026-09-06T08:46:10Z".parse().unwrap();
+        assert!(sqlite_matches_at(
+            SearchPrefix::Ap,
+            "2026-09-06T08:44:30.000Z",
+            stored,
+            now
+        ));
+        assert!(!sqlite_matches_at(
+            SearchPrefix::Ap,
+            "2026-09-06T08:44:40.000Z",
+            stored,
+            now
+        ));
+        let at_value = "2026-09-06T08:44:27.828Z";
+        assert!(sqlite_matches_at(
+            SearchPrefix::Ap,
+            at_value,
+            stored,
+            at_value.parse().unwrap()
+        ));
+        assert!(!sqlite_matches_at(
+            SearchPrefix::Ap,
+            "2026-09-06T08:44:27.827Z",
+            stored,
+            at_value.parse().unwrap()
+        ));
     }
 }
 
@@ -447,7 +601,7 @@ mod prefix_coverage_tests {
     use super::*;
 
     fn sql(prefix: SearchPrefix, value: &str) -> String {
-        date_condition("value_date", prefix, value, 1)
+        date_condition("value_date", prefix, value, 1, test_now())
             .expect("a valid date value")
             .0
     }
@@ -502,16 +656,38 @@ mod prefix_coverage_tests {
     }
 
     #[test]
-    fn ap_at_finer_precisions_scales_its_window() {
-        assert!(sql(SearchPrefix::Ap, "2016-01-23T13:07:42Z").contains("'-10 seconds'"));
-        assert!(sql(SearchPrefix::Ap, "1995").contains("'-1 year'"));
-        assert!(sql(SearchPrefix::Ap, "1995-10").contains("'-1 month'"));
+    fn ap_with_now_in_the_range_is_the_range_at_the_millisecond() {
+        let (sql, _) = date_condition(
+            "value_date",
+            SearchPrefix::Ap,
+            "2016-01-23T13:07:42Z",
+            1,
+            "2016-01-23T13:07:42.5Z".parse().unwrap(),
+        )
+        .unwrap();
+        let col = format!(
+            "strftime('%Y-%m-%d %H:%M:%f', {})",
+            truncated_to_millis("value_date")
+        );
+        assert_eq!(
+            sql,
+            format!(
+                "({col} >= strftime('%Y-%m-%d %H:%M:%f', ?1, '+0.000 seconds') \
+                 AND {col} < strftime('%Y-%m-%d %H:%M:%f', ?1, '+1.000 seconds'))"
+            )
+        );
     }
 
     #[test]
     fn aliased_columns_pass_through() {
-        let (sql, bound) =
-            date_condition("t3.value_date", SearchPrefix::Eq, "1995-10-02", 4).unwrap();
+        let (sql, bound) = date_condition(
+            "t3.value_date",
+            SearchPrefix::Eq,
+            "1995-10-02",
+            4,
+            test_now(),
+        )
+        .unwrap();
         assert_eq!(
             sql,
             "(datetime(t3.value_date) >= datetime(?4) AND datetime(t3.value_date) < datetime(?4, '+1 day'))"
@@ -538,7 +714,7 @@ mod shared_grammar_tests {
         ] {
             for prefix in [SearchPrefix::Eq, SearchPrefix::Ne, SearchPrefix::Lt] {
                 assert_eq!(
-                    date_condition("value_date", prefix, value, 1),
+                    date_condition("value_date", prefix, value, 1, test_now()),
                     None,
                     "{prefix}{value}"
                 );
@@ -549,7 +725,11 @@ mod shared_grammar_tests {
     #[test]
     fn handlers_match_nothing_for_a_value_that_is_not_a_date() {
         // `ne` included: invalid input never returns more than valid input could.
-        let frag = DateHandler::build_sql(&SearchValue::new(SearchPrefix::Ne, "2024-02-30"), 0);
+        let frag = DateHandler::build_sql(
+            &SearchValue::new(SearchPrefix::Ne, "2024-02-30"),
+            0,
+            test_now(),
+        );
         assert_eq!(frag.sql, "1 = 0");
         assert!(frag.params.is_empty());
 
@@ -557,7 +737,7 @@ mod shared_grammar_tests {
         // the binds around it holds.
         let conn = rusqlite::Connection::open_in_memory().expect("in-memory sqlite");
         let (sql, bound) =
-            date_condition_or_nothing("value_date", SearchPrefix::Ne, "2024-02-30", 1);
+            date_condition_or_nothing("value_date", SearchPrefix::Ne, "2024-02-30", 1, test_now());
         assert_eq!(sql, "(1 = 0 AND ?1 IS NULL)");
         let matched: bool = conn
             .query_row(&format!("SELECT {sql}"), rusqlite::params![bound], |row| {
@@ -569,8 +749,14 @@ mod shared_grammar_tests {
 
     #[test]
     fn minute_precision_is_a_one_minute_range() {
-        let (sql, param) =
-            date_condition("value_date", SearchPrefix::Eq, "2013-04-05T09:20", 1).unwrap();
+        let (sql, param) = date_condition(
+            "value_date",
+            SearchPrefix::Eq,
+            "2013-04-05T09:20",
+            1,
+            test_now(),
+        )
+        .unwrap();
         assert_eq!(
             sql,
             "(datetime(value_date) >= datetime(?1) AND datetime(value_date) < datetime(?1, '+1 minute'))"
@@ -582,14 +768,21 @@ mod shared_grammar_tests {
     fn what_datetime_cannot_read_is_bound_in_a_form_it_can() {
         // A leap second, and a `+` that form decoding turned into a space
         // (#1296): `datetime()` returns NULL for both as written.
-        let (_, param) =
-            date_condition("value_date", SearchPrefix::Eq, "2016-12-31T23:59:60Z", 1).unwrap();
+        let (_, param) = date_condition(
+            "value_date",
+            SearchPrefix::Eq,
+            "2016-12-31T23:59:60Z",
+            1,
+            test_now(),
+        )
+        .unwrap();
         assert_eq!(param, "2017-01-01T00:00:00Z");
         let (_, param) = date_condition(
             "value_date",
             SearchPrefix::Eq,
             "2013-04-05T18:50:00 05:30",
             1,
+            test_now(),
         )
         .unwrap();
         assert_eq!(param, "2013-04-05T13:20:00Z");
@@ -597,8 +790,19 @@ mod shared_grammar_tests {
 
     /// Evaluates the generated condition in SQLite against one stored value.
     fn sqlite_matches(prefix: SearchPrefix, search: &str, stored: &str) -> bool {
+        sqlite_matches_at(prefix, search, stored, test_now())
+    }
+
+    /// [`sqlite_matches`] with `ap` measured from `now`.
+    fn sqlite_matches_at(
+        prefix: SearchPrefix,
+        search: &str,
+        stored: &str,
+        now: DateTime<Utc>,
+    ) -> bool {
         let conn = rusqlite::Connection::open_in_memory().expect("in-memory sqlite");
-        let (sql, bound) = date_condition("?2", prefix, search, 1).expect("a valid date value");
+        let (sql, bound) =
+            date_condition("?2", prefix, search, 1, now).expect("a valid date value");
         conn.query_row(
             &format!("SELECT {sql}"),
             rusqlite::params![bound, stored],
@@ -610,7 +814,8 @@ mod shared_grammar_tests {
     /// This handler keeps its own single-bind SQL rather than translating
     /// `DatePredicate`, so hold the two against each other: for every prefix
     /// the shared layer defines, at every precision, SQLite must answer what
-    /// the shared predicate answers.
+    /// the shared predicate answers — `ap` included, from `now`s before,
+    /// inside and after the searched ranges.
     #[test]
     fn sql_agrees_with_the_shared_predicate() {
         let searches = [
@@ -648,7 +853,7 @@ mod shared_grammar_tests {
         ];
         for search in searches {
             let value = FhirDateValue::parse(search).unwrap();
-            for prefix in [
+            for (prefix, now) in [
                 SearchPrefix::Eq,
                 SearchPrefix::Ne,
                 SearchPrefix::Gt,
@@ -657,15 +862,26 @@ mod shared_grammar_tests {
                 SearchPrefix::Le,
                 SearchPrefix::Sa,
                 SearchPrefix::Eb,
-            ] {
-                let predicate = value.predicate(prefix, StorageResolution::Millis).unwrap();
+            ]
+            .into_iter()
+            .map(|prefix| (prefix, test_now()))
+            .chain(
+                [
+                    "2013-04-01T00:00:00Z",
+                    "2013-04-06T03:30:00Z",
+                    "2013-04-10T00:00:00Z",
+                    "2026-01-01T00:00:00Z",
+                ]
+                .map(|now| (SearchPrefix::Ap, now.parse().unwrap())),
+            ) {
+                let predicate = value.predicate(prefix, StorageResolution::Millis, now);
                 for text in stored {
                     // A stored date-only value is its first instant, in UTC.
                     let point = FhirDateValue::parse(text).unwrap().start;
                     assert_eq!(
-                        sqlite_matches(prefix, search, text),
+                        sqlite_matches_at(prefix, search, text, now),
                         predicate.matches(point),
-                        "{prefix}{search} against stored {text}"
+                        "{prefix}{search} (now {now}) against stored {text}"
                     );
                 }
             }

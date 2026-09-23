@@ -1,5 +1,7 @@
 //! Composite parameter SQL handler.
 
+use chrono::{DateTime, Utc};
+
 use crate::types::{CompositeSearchComponent, SearchParamType, SearchPrefix, SearchValue};
 
 use super::super::query_builder::SqlFragment;
@@ -33,11 +35,14 @@ impl CompositeHandler {
     /// composite instance), we would need the extractor to populate composite_group
     /// during indexing and use a more complex query. For now, we match all conditions
     /// which works for simple cases.
+    ///
+    /// `now` is the instant a date component's `ap` window is measured from.
     pub fn build_composite_sql(
         value: &SearchValue,
         _param_name: &str,
         components: &[CompositeSearchComponent],
         param_offset: usize,
+        now: DateTime<Utc>,
     ) -> SqlFragment {
         let composite_value = &value.value;
         let parts: Vec<&str> = composite_value.split('$').collect();
@@ -57,6 +62,7 @@ impl CompositeHandler {
                 &component_value,
                 component.param_type,
                 current_offset,
+                now,
             );
 
             if fragment.sql == "1 = 0" {
@@ -86,6 +92,7 @@ impl CompositeHandler {
         value: &SearchValue,
         components: &[CompositeSearchComponent],
         param_offset: usize,
+        now: DateTime<Utc>,
     ) -> Option<Vec<SqlFragment>> {
         let parts: Vec<&str> = value.value.split('$').collect();
         if parts.len() != components.len() || components.is_empty() {
@@ -100,6 +107,7 @@ impl CompositeHandler {
                 &component_value,
                 component.param_type,
                 current_offset,
+                now,
             );
             if fragment.sql == "1 = 0" {
                 return None;
@@ -120,6 +128,7 @@ impl CompositeHandler {
         value: &SearchValue,
         components: &[CompositeComponentDef],
         param_offset: usize,
+        now: DateTime<Utc>,
     ) -> SqlFragment {
         let composite_value = &value.value;
         let parts: Vec<&str> = composite_value.split('$').collect();
@@ -138,7 +147,8 @@ impl CompositeHandler {
             let component_value = Self::parse_component_value(part, component.param_type);
 
             // Generate SQL for this component based on its type
-            let fragment = Self::build_component_sql(&component_value, component, current_offset);
+            let fragment =
+                Self::build_component_sql(&component_value, component, current_offset, now);
 
             if fragment.sql == "1 = 0" {
                 // Invalid component value
@@ -160,11 +170,12 @@ impl CompositeHandler {
         value: &SearchValue,
         param_type: SearchParamType,
         param_offset: usize,
+        now: DateTime<Utc>,
     ) -> SqlFragment {
         match param_type {
             SearchParamType::Token => TokenHandler::build_sql(value, None, param_offset),
             SearchParamType::String => StringHandler::build_sql(value, None, param_offset),
-            SearchParamType::Date => DateHandler::build_sql(value, param_offset),
+            SearchParamType::Date => DateHandler::build_sql(value, param_offset, now),
             SearchParamType::Number => NumberHandler::build_sql(value, param_offset),
             SearchParamType::Quantity => QuantityHandler::build_sql(value, param_offset),
             _ => SqlFragment::new("1 = 0"),
@@ -216,6 +227,7 @@ impl CompositeHandler {
         value: &SearchValue,
         component: &CompositeComponentDef,
         param_offset: usize,
+        now: DateTime<Utc>,
     ) -> SqlFragment {
         match component.param_type {
             SearchParamType::Token => {
@@ -223,7 +235,7 @@ impl CompositeHandler {
                 TokenHandler::build_sql(value, None, param_offset)
             }
             SearchParamType::String => StringHandler::build_sql(value, None, param_offset),
-            SearchParamType::Date => DateHandler::build_sql(value, param_offset),
+            SearchParamType::Date => DateHandler::build_sql(value, param_offset, now),
             SearchParamType::Number => NumberHandler::build_sql(value, param_offset),
             SearchParamType::Quantity => QuantityHandler::build_sql(value, param_offset),
             _ => {
@@ -253,7 +265,7 @@ mod tests {
             },
         ];
 
-        let frag = CompositeHandler::build_sql(&value, &components, 0);
+        let frag = CompositeHandler::build_sql(&value, &components, 0, Utc::now());
 
         assert!(frag.sql.contains("value_token_system"));
         assert!(frag.sql.contains("value_quantity_value"));
@@ -275,7 +287,7 @@ mod tests {
             },
         ];
 
-        let frag = CompositeHandler::build_sql(&value, &components, 0);
+        let frag = CompositeHandler::build_sql(&value, &components, 0, Utc::now());
 
         // Should fail due to mismatch
         assert!(frag.sql.contains("1 = 0"));
@@ -296,7 +308,7 @@ mod tests {
             },
         ];
 
-        let frag = CompositeHandler::build_sql(&value, &components, 0);
+        let frag = CompositeHandler::build_sql(&value, &components, 0, Utc::now());
 
         assert!(frag.sql.contains("value_token_code"));
         assert!(frag.sql.contains("value_date"));

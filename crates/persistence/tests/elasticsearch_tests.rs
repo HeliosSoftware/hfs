@@ -507,7 +507,13 @@ mod parameter_handler_tests {
         #[test]
         fn test_date_eq() {
             use super::*;
-            let clause = date::build_clause("birthdate", "2000-01-15", SearchPrefix::Eq).unwrap();
+            let clause = date::build_clause(
+                "birthdate",
+                "2000-01-15",
+                SearchPrefix::Eq,
+                chrono::Utc::now(),
+            )
+            .unwrap();
             let s = serde_json::to_string(&clause).unwrap();
             assert!(s.contains("search_params.date"));
             assert!(s.contains("2000-01-15"));
@@ -516,7 +522,13 @@ mod parameter_handler_tests {
         #[test]
         fn test_date_gt() {
             use super::*;
-            let clause = date::build_clause("birthdate", "2000-01-15", SearchPrefix::Gt).unwrap();
+            let clause = date::build_clause(
+                "birthdate",
+                "2000-01-15",
+                SearchPrefix::Gt,
+                chrono::Utc::now(),
+            )
+            .unwrap();
             let s = serde_json::to_string(&clause).unwrap();
             assert!(s.contains("search_params.date"));
         }
@@ -668,6 +680,11 @@ mod date_precision_suite;
 /// `#[path]` arrangement.
 #[path = "search/contained_suite.rs"]
 mod contained_suite;
+
+/// The backend-agnostic `ap` prefix suite for number, quantity and date
+/// (#1390). Same `#[path]` arrangement.
+#[path = "search/ap_prefix_suite.rs"]
+mod ap_prefix_suite;
 
 /// The backend-agnostic suite for exponent-form number and quantity search
 /// values (#1337). Same `#[path]` arrangement.
@@ -1067,6 +1084,13 @@ mod es_integration {
             true,
         )
         .await;
+    }
+
+    /// #1390: one `ap` window per parameter type, shared by every backend.
+    #[tokio::test]
+    async fn es_ap_prefix_suite() {
+        let backend = create_backend().await;
+        super::ap_prefix_suite::ap_prefix(&backend, "ap-prefix-1390", true).await;
     }
 
     /// #1340: a number that did not parse made the handler return `None`,

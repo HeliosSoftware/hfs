@@ -27,6 +27,8 @@
 //! _filter=(status eq active or status eq pending) and category eq urgent
 //! ```
 
+use chrono::{DateTime, Utc};
+
 use super::query_builder::{SqlFragment, SqlParam};
 
 /// Comparison operators supported by _filter.
@@ -445,12 +447,25 @@ impl<'a> FilterParser<'a> {
 /// SQL generator for filter expressions.
 pub struct FilterSqlGenerator {
     param_offset: usize,
+    /// The instant a date comparison's `ap` window is measured from.
+    now: DateTime<Utc>,
 }
 
 impl FilterSqlGenerator {
-    /// Creates a new SQL generator with the given parameter offset.
+    /// Creates a new SQL generator with the given parameter offset, measuring
+    /// `ap` date windows from the current time.
     pub fn new(param_offset: usize) -> Self {
-        Self { param_offset }
+        Self {
+            param_offset,
+            now: Utc::now(),
+        }
+    }
+
+    /// Measures `ap` date windows from `now`: the search's instant, so a
+    /// `_filter` date agrees with the query's other date parameters.
+    pub fn with_now(mut self, now: DateTime<Utc>) -> Self {
+        self.now = now;
+        self
     }
 
     /// Generates SQL for a filter expression.
@@ -535,7 +550,7 @@ impl FilterSqlGenerator {
                 // that is not a date matches nothing rather than whatever
                 // `datetime()` would have made of it.
                 let (sql, bound) = super::parameter_handlers::date::date_condition_or_nothing(
-                    column, prefix, value, param_num,
+                    column, prefix, value, param_num, self.now,
                 );
                 return (column, sql, bound);
             }
@@ -850,6 +865,28 @@ mod date_filter_tests {
         let sa = FilterSqlGenerator::new(1)
             .generate(&FilterParser::parse("birthdate sa 1995-10-02").unwrap());
         assert!(sa.sql.contains("'+1 day'"), "{}", sa.sql);
+    }
+
+    /// #1390: a `_filter` date `ap` is the shared window, measured from the
+    /// generator's `now`, and still binds one parameter.
+    #[test]
+    fn filter_date_ap_is_the_shared_window() {
+        let now = "2026-01-01T00:00:00Z".parse().unwrap();
+        let frag = FilterSqlGenerator::new(1)
+            .with_now(now)
+            .generate(&FilterParser::parse("birthdate ap 2016").unwrap());
+        // 2016 ends 3287 days before `now`: 328.7 days either side.
+        assert!(
+            frag.sql.contains("?2, '-28399680.000 seconds'"),
+            "{}",
+            frag.sql
+        );
+        assert!(
+            frag.sql.contains("?2, '+60022080.000 seconds'"),
+            "{}",
+            frag.sql
+        );
+        assert_eq!(frag.params.len(), 1);
     }
 
     /// Non-date columns keep the plain text operators.

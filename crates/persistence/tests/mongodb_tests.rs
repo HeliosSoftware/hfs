@@ -594,6 +594,11 @@ async fn mongodb_contained_sort_and_id_only_contained() {
     contained_suite::sort_and_id_only_contained(&backend, "contained-sort-1407").await;
 }
 
+/// The backend-agnostic `ap` prefix suite for number, quantity and date
+/// (#1390). Same `#[path]` arrangement.
+#[path = "search/ap_prefix_suite.rs"]
+mod ap_prefix_suite;
+
 /// The backend-agnostic suite for exponent-form number and quantity search
 /// values (#1337). Same `#[path]` arrangement.
 #[path = "search/number_exponent_suite.rs"]
@@ -614,6 +619,18 @@ async fn mongodb_exponent_values_use_significant_figures() {
         false,
     )
     .await;
+}
+
+/// #1390: one `ap` window per parameter type, shared by every backend. Needs
+/// the full registry so `factor-override`, `value-quantity` and
+/// `Procedure.date` extract. No canonical-unit quantity match, hence `false`.
+#[tokio::test]
+async fn mongodb_ap_prefix_suite() {
+    let Some(backend) = create_backend_with_full_registry("ap_prefix").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    ap_prefix_suite::ap_prefix(&backend, "ap-prefix-1390", false).await;
 }
 
 /// The backend-agnostic number / quantity validation suite (#1319, #1340).

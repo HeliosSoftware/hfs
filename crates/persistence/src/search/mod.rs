@@ -108,7 +108,7 @@ pub use numeric_value::{
     FhirNumberValue, FhirQuantityValue, NumberValueError, NumberValueErrorReason,
     validate_numeric_parameter, validate_numeric_values,
 };
-pub use range::{implicit_precision, implicit_range};
+pub use range::{approx_range, implicit_precision, implicit_range};
 pub use registry::{
     RegistryUpdate, SearchParameterDefinition, SearchParameterRegistry, SearchParameterSource,
     SearchParameterStatus, fallback_param_type, resolve_param_targets, resolve_param_type,

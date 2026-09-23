@@ -73,6 +73,11 @@ mod date_precision_suite;
 #[path = "search/date_minute_index_suite.rs"]
 mod date_minute_index_suite;
 
+/// The backend-agnostic `ap` prefix suite for number, quantity and date
+/// (#1390). Same `#[path]` arrangement.
+#[path = "search/ap_prefix_suite.rs"]
+mod ap_prefix_suite;
+
 /// The backend-agnostic suite for exponent-form number and quantity search
 /// values (#1337). Same `#[path]` arrangement.
 #[path = "search/number_exponent_suite.rs"]
@@ -25066,6 +25071,13 @@ mod postgres_integration {
             true,
         )
         .await;
+    }
+
+    /// #1390: one `ap` window per parameter type, shared by every backend.
+    #[tokio::test]
+    async fn postgres_integration_ap_prefix_suite() {
+        let backend = create_backend().await;
+        super::ap_prefix_suite::ap_prefix(&backend, &unique_base("ap_prefix"), true).await;
     }
 
     /// #1379: `gender=<system>|female` never matched a `code` element.

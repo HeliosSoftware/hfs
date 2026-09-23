@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 pub use helios_fhir::search::SearchParamType;
@@ -730,6 +731,14 @@ pub struct SearchQuery {
 
     /// Raw query parameters for debugging.
     pub raw_params: HashMap<String, Vec<String>>,
+
+    /// The instant `ap` date windows are measured from (#1390): FHIR's margin
+    /// is a tenth of the gap between now and the value. Fixed once per request
+    /// so every value, and a search and its count, see the same instant;
+    /// `None` means the current time, read once per search — see
+    /// [`Self::reference_now`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub now: Option<DateTime<Utc>>,
 }
 
 /// Compartment membership constraint for a compartment search.
@@ -851,6 +860,19 @@ impl SearchQuery {
     pub fn with_count(mut self, count: u32) -> Self {
         self.count = Some(count);
         self
+    }
+
+    /// Fixes the instant `ap` date windows are measured from.
+    pub fn with_now(mut self, now: DateTime<Utc>) -> Self {
+        self.now = Some(now);
+        self
+    }
+
+    /// The instant `ap` date windows are measured from: [`Self::now`], or the
+    /// current time when unset. A backend calls this once per search and
+    /// passes the result down, so every value of the query sees one instant.
+    pub fn reference_now(&self) -> DateTime<Utc> {
+        self.now.unwrap_or_else(Utc::now)
     }
 
     /// Sets the cursor for keyset pagination.
