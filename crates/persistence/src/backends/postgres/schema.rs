@@ -4485,7 +4485,7 @@ fn pg_error(message: String) -> crate::error::StorageError {
 /// rejects while Windows normalises it away.
 #[cfg(test)]
 #[path = "../../../tests/common/container_cleanup.rs"]
-mod container_cleanup;
+pub(super) mod container_cleanup;
 
 #[cfg(test)]
 mod postgres_integration_migrations {

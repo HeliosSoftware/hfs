@@ -618,6 +618,8 @@ impl SearchProvider for PostgresBackend {
         Ok(count as u64)
     }
 
+    /// Returns the query-resolution cache. Guarded index writes derive their
+    /// definitions from persisted SearchParameters under the tenant gate.
     fn search_param_registry(
         &self,
         tenant: &crate::tenant::TenantContext,
