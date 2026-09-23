@@ -403,7 +403,13 @@ async fn migrate_schema(
                 version += 1;
                 continue;
             }
-            42 => migrate_v42_to_v43(client).await?,
+            42 => {
+                // The helper writes the v43 marker inside its own transaction,
+                // like v42, so the common loop must not stamp it again.
+                migrate_v42_to_v43(client).await?;
+                version += 1;
+                continue;
+            }
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -3873,22 +3879,38 @@ async fn analyze_search_index_with_timeout(
 /// a restart. `kind` keeps sessions and pending logins apart; `expires_at`
 /// drives the sweep. Independent of the FHIR `resources` table, like
 /// `user_settings`.
-async fn migrate_v42_to_v43(client: &deadpool_postgres::Client) -> StorageResult<()> {
-    client
-        .batch_execute(
-            "CREATE TABLE IF NOT EXISTS login_sessions (
-                id         TEXT PRIMARY KEY,
-                kind       TEXT NOT NULL,
-                data       JSONB NOT NULL,
-                version    BIGINT NOT NULL DEFAULT 1,
-                expires_at TIMESTAMPTZ NOT NULL,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-            CREATE INDEX IF NOT EXISTS idx_login_sessions_expires
-                ON login_sessions (expires_at);",
-        )
+///
+/// Runs in its own transaction with `SET LOCAL statement_timeout = 0` and
+/// writes the v43 marker inside it, like v42: a deployment-wide statement
+/// timeout must not be able to cut a migration's DDL short, the setting
+/// reverts at commit, and a failure rolls the table and the marker back
+/// together so the next startup retries the whole step.
+async fn migrate_v42_to_v43(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
+    let tx = client
+        .transaction()
         .await
-        .map_err(|e| pg_error(format!("Migration v42->v43 failed: {e}")))?;
+        .map_err(|e| pg_error(format!("begin v43 migration: {e}")))?;
+    tx.execute("SET LOCAL statement_timeout = 0", &[])
+        .await
+        .map_err(|e| pg_error(format!("disable statement timeout for v43 migration: {e}")))?;
+    tx.batch_execute(
+        "CREATE TABLE IF NOT EXISTS login_sessions (
+            id         TEXT PRIMARY KEY,
+            kind       TEXT NOT NULL,
+            data       JSONB NOT NULL,
+            version    BIGINT NOT NULL DEFAULT 1,
+            expires_at TIMESTAMPTZ NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_login_sessions_expires
+            ON login_sessions (expires_at);",
+    )
+    .await
+    .map_err(|e| pg_error(format!("Migration v42->v43 failed: {e}")))?;
+    set_schema_version(&tx, 43).await?;
+    tx.commit()
+        .await
+        .map_err(|e| pg_error(format!("commit v43 migration: {e}")))?;
     Ok(())
 }
 
