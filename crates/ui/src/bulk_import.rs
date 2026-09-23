@@ -665,7 +665,7 @@ pub async fn create(
         mid.clone(),
         serde_json::to_value(&manifest).unwrap_or(Value::Null),
     );
-    submit_one_with_id(&mut submission, &id, &mid, &rt.id).await;
+    submit_one_with_id(&state, &mut submission, &id, &mid, &rt.id).await;
     match save(&state, &rt, &id, &submission, Some(0)).await {
         Ok(_) => Redirect::to(&format!("/ui/bulk-import/{id}")).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
@@ -952,10 +952,104 @@ fn signing_kid(pem: &str, alg: &str) -> Option<String> {
     }
 }
 
+/// Which credential a self-call on a submission's behalf carries (#1436).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelfCallCredential {
+    /// The submission's own SMART Backend Services client: mint a token.
+    BackendServices,
+    /// The recipient is this server: the process's outbound service
+    /// credential, the same one the conformance pages self-call with.
+    Outbound,
+    /// The recipient is another server and the submission has no client of
+    /// its own: send nothing rather than leak this server's token.
+    None,
+}
+
+/// Picks the credential for a request to `recipient_base_url`. A recipient is
+/// "this server" when its origin matches the public base URL the UI
+/// advertises or the loopback address it calls itself at.
+fn self_call_credential(
+    auth: &str,
+    recipient_base_url: &str,
+    public_base_url: &str,
+    self_base_url: &str,
+) -> SelfCallCredential {
+    if auth == "backend-services" {
+        return SelfCallCredential::BackendServices;
+    }
+    let origin = |url: &str| {
+        reqwest::Url::parse(url).ok().map(|u| {
+            (
+                u.scheme().to_string(),
+                u.host_str().unwrap_or_default().to_ascii_lowercase(),
+                u.port_or_known_default(),
+            )
+        })
+    };
+    let Some(recipient) = origin(recipient_base_url) else {
+        return SelfCallCredential::None;
+    };
+    if [public_base_url, self_base_url]
+        .iter()
+        .any(|base| origin(base).as_ref() == Some(&recipient))
+    {
+        SelfCallCredential::Outbound
+    } else {
+        SelfCallCredential::None
+    }
+}
+
+/// Applies the submission's credential to a self-call bound for `target`.
+async fn authorize_self_call(
+    state: &WebState,
+    submission: &Submission,
+    request: reqwest::RequestBuilder,
+    target: &str,
+) -> Result<reqwest::RequestBuilder, String> {
+    match self_call_credential(
+        &submission.auth,
+        &submission.recipient_base_url,
+        &state.public_base_url,
+        &state.self_base_url,
+    ) {
+        SelfCallCredential::BackendServices => {
+            let token =
+                backend_services_token(&submission.client_id, &submission.token_url).await?;
+            Ok(request.bearer_auth(token))
+        }
+        SelfCallCredential::Outbound => state
+            .outbound_auth
+            .authorize(request, target)
+            .await
+            .map_err(|e| format!("outbound credential unavailable: {e}")),
+        SelfCallCredential::None => Ok(request),
+    }
+}
+
 /// Mints a SMART Backend Services access token (`client_credentials` +
 /// `private_key_jwt`) against the submission's token endpoint. The signing key
 /// is the server-wide `HFS_BULK_SUBMIT_PRIVATE_KEY`, shared with the consumer
 /// side's protected-file fetches; the client id is per-submission.
+/// Builds the SMART Backend Services `private_key_jwt` client-assertion claims.
+///
+/// `iat` is required: Keycloak (and any RFC 7523 verifier following its
+/// guidance) rejects a client assertion whose `exp` is more than ~60s out
+/// unless it also carries `iat` ("Token expiration is too far in the future and
+/// iat claim not present"). The consumer-side assertion in
+/// `crates/rest/src/bulk_submit_oauth.rs` already sets it; this one did not, so
+/// the Import page's backend-services submit failed against Keycloak with a 400
+/// (#1437). `iat` and `exp` come off one `now` so they stay consistent.
+fn client_assertion_claims(client_id: &str, token_url: &str, now: i64) -> serde_json::Value {
+    json!({
+        "iss": client_id,
+        "sub": client_id,
+        "aud": token_url,
+        "iat": now,
+        "exp": now + 300,
+        "jti": uuid::Uuid::new_v4().to_string(),
+    })
+}
+
 async fn backend_services_token(client_id: &str, token_url: &str) -> Result<String, String> {
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 
@@ -975,13 +1069,7 @@ async fn backend_services_token(client_id: &str, token_url: &str) -> Result<Stri
             EncodingKey::from_ec_pem(pem.as_bytes()).map_err(|e| e.to_string())?,
         ),
     };
-    let claims = json!({
-        "iss": client_id,
-        "sub": client_id,
-        "aud": token_url,
-        "exp": Utc::now().timestamp() + 300,
-        "jti": uuid::Uuid::new_v4().to_string(),
-    });
+    let claims = client_assertion_claims(client_id, token_url, Utc::now().timestamp());
     let mut header = Header::new(algorithm);
     header.kid = signing_kid(&pem, &alg);
     let assertion = encode(&header, &claims, &key).map_err(|e| e.to_string())?;
@@ -1025,12 +1113,13 @@ fn kickoff_target(submission: &Submission) -> String {
 /// POSTs a kick-off to the recipient, returning
 /// `(status, content-type, body-excerpt)`.
 async fn post_kickoff(
+    state: &WebState,
     submission: &Submission,
     parameters: &Value,
     tenant: &str,
 ) -> Result<(u16, String, String), String> {
     let target = kickoff_target(submission);
-    let mut request = with_tenant(
+    let request = with_tenant(
         http_client()
             .post(&target)
             .header("Content-Type", "application/fhir+json")
@@ -1039,10 +1128,7 @@ async fn post_kickoff(
             .json(parameters),
         tenant,
     );
-    if submission.auth == "backend-services" {
-        let token = backend_services_token(&submission.client_id, &submission.token_url).await?;
-        request = request.bearer_auth(token);
-    }
+    let request = authorize_self_call(state, submission, request, &target).await?;
     let response = request
         .send()
         .await
@@ -1098,7 +1184,12 @@ fn summarize_error_body(content_type: &str, body: &str) -> String {
 /// Kicks off recipient-side status tracking: `POST $bulk-submit-status`
 /// (submitter + submissionId, `Prefer: respond-async`), returning the poll
 /// URL the recipient hands back in `Content-Location`.
-async fn status_kickoff(submission: &Submission, id: &str, tenant: &str) -> Result<String, String> {
+async fn status_kickoff(
+    state: &WebState,
+    submission: &Submission,
+    id: &str,
+    tenant: &str,
+) -> Result<String, String> {
     let target = public_url_with_segments(&submission.recipient_base_url, ["$bulk-submit-status"]);
     // Only the identifying parameters ride the status kick-off.
     let parameters = kickoff_parameters(submission, id, "", None);
@@ -1111,7 +1202,7 @@ async fn status_kickoff(submission: &Submission, id: &str, tenant: &str) -> Resu
         .collect();
     let body = json!({ "resourceType": "Parameters", "parameter": identifying });
 
-    let mut request = with_tenant(
+    let request = with_tenant(
         http_client()
             .post(&target)
             .header("Content-Type", "application/fhir+json")
@@ -1120,10 +1211,7 @@ async fn status_kickoff(submission: &Submission, id: &str, tenant: &str) -> Resu
             .json(&body),
         tenant,
     );
-    if submission.auth == "backend-services" {
-        let token = backend_services_token(&submission.client_id, &submission.token_url).await?;
-        request = request.bearer_auth(token);
-    }
+    let request = authorize_self_call(state, submission, request, &target).await?;
     let response = request
         .send()
         .await
@@ -1163,8 +1251,8 @@ fn http_client() -> &'static reqwest::Client {
 /// Stamps the selected tenant onto a self-call. The recipient is this HFS
 /// process (#689): under header routing the tenant travels only here, and
 /// under `both` the URL prefix already agrees with it. `Authorization` is
-/// deliberately not forwarded — `/ui` sits outside the auth layer (#320)
-/// and backend-services kick-offs mint their own bearer (#1006).
+/// deliberately not forwarded — `/ui` sits outside the auth layer (#320);
+/// the credential comes from [`authorize_self_call`] (#1006, #1436).
 fn with_tenant(request: reqwest::RequestBuilder, tenant: &str) -> reqwest::RequestBuilder {
     request.header("X-Tenant-ID", tenant)
 }
@@ -1267,18 +1355,27 @@ fn severity_total(cs: &Value, codes: [&str; 2]) -> Option<u64> {
 /// failure changes a closed-out submission's status (#1069). `202` and `429`
 /// carry `Retry-After`; both push `next_poll_at` out so the card's refresh
 /// cadence never turns into a poll the recipient would reject (#790).
-async fn poll_status(submission: &mut Submission, tenant: &str) {
+async fn poll_status(state: &WebState, submission: &mut Submission, tenant: &str) {
     let poll_url = submission.poll_url.clone();
-    let response = match with_tenant(
+    let request = with_tenant(
         http_client()
             .get(&poll_url)
             .header("Accept", "application/json")
             .timeout(std::time::Duration::from_secs(STATUS_POLL_TIMEOUT_SECS)),
         tenant,
-    )
-    .send()
-    .await
-    {
+    );
+    // The poll authenticates like the kick-offs it follows (#1436); a
+    // credential that cannot be produced is reported and backed off like a
+    // transport failure, never sent as an unauthenticated request.
+    let request = match authorize_self_call(state, submission, request, &poll_url).await {
+        Ok(request) => request,
+        Err(e) => {
+            push_log(submission, format!("Status poll failed: {e}"));
+            hold_polls_for(submission, STATUS_POLL_FAILURE_BACKOFF_SECS);
+            return;
+        }
+    };
+    let response = match request.send().await {
         Ok(r) => r,
         Err(e) => {
             push_log(
@@ -1424,7 +1521,13 @@ async fn poll_status(submission: &mut Submission, tenant: &str) {
 
 /// Fires the kick-off for one manifest and records the outcome on the
 /// submission (status, log, poll URL).
-async fn submit_one_with_id(submission: &mut Submission, id: &str, mid: &str, tenant: &str) {
+async fn submit_one_with_id(
+    state: &WebState,
+    submission: &mut Submission,
+    id: &str,
+    mid: &str,
+    tenant: &str,
+) {
     let Some(m) = submission
         .manifests
         .get(mid)
@@ -1437,7 +1540,7 @@ async fn submit_one_with_id(submission: &mut Submission, id: &str, mid: &str, te
         format!("Submitting manifest \"{}\"...", m.manifest_url),
     );
     let parameters = kickoff_parameters(submission, id, "in-progress", Some(&m));
-    match post_kickoff(submission, &parameters, tenant).await {
+    match post_kickoff(state, submission, &parameters, tenant).await {
         Ok((status, _, _)) if (200..300).contains(&status) => {
             push_log(
                 submission,
@@ -1450,7 +1553,7 @@ async fn submit_one_with_id(submission: &mut Submission, id: &str, mid: &str, te
             // Start recipient-side status tracking on the first accepted
             // manifest; later submissions reuse the same poll URL.
             if submission.poll_url.is_empty() {
-                match status_kickoff(submission, id, tenant).await {
+                match status_kickoff(state, submission, id, tenant).await {
                     Ok(poll_url) => {
                         push_log(submission, "Bulk status kick-off request".to_string());
                         submission.poll_url = poll_url;
@@ -1534,7 +1637,7 @@ async fn set_status(
     // recipient, auth and identity it needs are immutable on a submission.
     // Recording its outcome is what races the status fragment's own writes,
     // so that part is re-derived on a fresh copy for as long as it loses.
-    let outcome = request_status_change(&s, &id, status, &rt.id).await;
+    let outcome = request_status_change(&state, &s, &id, status, &rt.id).await;
     let committed = commit(&state, &rt, &id, |fresh| {
         // The precondition is re-checked on the fresh copy: a poll that
         // landed a `200` meanwhile has closed the submission out already.
@@ -1575,13 +1678,14 @@ enum KickoffOutcome {
 
 /// POSTs the status-only kick-off and classifies the result.
 async fn request_status_change(
+    state: &WebState,
     submission: &Submission,
     id: &str,
     status: &str,
     tenant: &str,
 ) -> KickoffOutcome {
     let parameters = kickoff_parameters(submission, id, status, None);
-    match post_kickoff(submission, &parameters, tenant).await {
+    match post_kickoff(state, submission, &parameters, tenant).await {
         Ok((code, _, _)) if (200..300).contains(&code) => KickoffOutcome::Acknowledged(code),
         Ok((code, content_type, body)) => KickoffOutcome::Refused(format!(
             "{code}: {}",
@@ -1702,7 +1806,12 @@ fn pending_status_due(submission: &Submission) -> bool {
 }
 
 /// Re-sends the queued status change and records what came back.
-async fn retry_pending_status(submission: &mut Submission, id: &str, tenant: &str) {
+async fn retry_pending_status(
+    state: &WebState,
+    submission: &mut Submission,
+    id: &str,
+    tenant: &str,
+) {
     let status = submission.pending_status.clone();
     push_log(
         submission,
@@ -1711,7 +1820,7 @@ async fn retry_pending_status(submission: &mut Submission, id: &str, tenant: &st
             submission.pending_status_attempts + 1
         ),
     );
-    let outcome = request_status_change(submission, id, &status, tenant).await;
+    let outcome = request_status_change(state, submission, id, &status, tenant).await;
     apply_status_change(submission, &status, &outcome);
 }
 
@@ -1766,7 +1875,7 @@ pub async fn status_fragment(
     // A closed-out submission is never polled, even if it was stored with a
     // poll URL before #1069 — the recipient's answer no longer decides it.
     if !s.poll_url.is_empty() && !is_terminal(&s.status) && poll_due(&s) {
-        poll_status(&mut s, &rt.id).await;
+        poll_status(&state, &mut s, &rt.id).await;
         changed = true;
     }
     // A status change the recipient never answered is re-sent from here, on
@@ -1777,7 +1886,7 @@ pub async fn status_fragment(
     // operator asked for is moot once the recipient reports the import
     // finished, and no kick-off can be sent for it any more.
     if pending_status_due(&s) {
-        retry_pending_status(&mut s, &id, &rt.id).await;
+        retry_pending_status(&state, &mut s, &id, &rt.id).await;
         changed = true;
     } else if !s.pending_status.is_empty() && !can_change_status(&s.status) {
         let (pending, status) = (s.pending_status.clone(), s.status.clone());
@@ -1892,6 +2001,67 @@ pub async fn test_auth(
 mod tests {
     use super::*;
 
+    /// #1436: a submission without a client of its own authenticates its
+    /// self-calls with the process's outbound credential — but only when the
+    /// recipient is this server, so the token never travels to a third party.
+    #[test]
+    fn self_call_credential_follows_the_recipient_and_the_submission_auth() {
+        let public = "http://localhost:8080";
+        let lo = "http://127.0.0.1:8080";
+        // backend-services always mints its own token, whoever the recipient is
+        assert_eq!(
+            self_call_credential(
+                "backend-services",
+                "https://recipient.example/fhir",
+                public,
+                lo
+            ),
+            SelfCallCredential::BackendServices
+        );
+        assert_eq!(
+            self_call_credential("backend-services", public, public, lo),
+            SelfCallCredential::BackendServices
+        );
+        // none + this server (public base, with or without a tenant path, or loopback)
+        for recipient in [
+            "http://localhost:8080",
+            "http://localhost:8080/",
+            "http://localhost:8080/clinic-a",
+            "http://LOCALHOST:8080/fhir",
+            "http://127.0.0.1:8080",
+        ] {
+            assert_eq!(
+                self_call_credential("none", recipient, public, lo),
+                SelfCallCredential::Outbound,
+                "{recipient}"
+            );
+        }
+        // none + a remote recipient, or a merely similar origin: nothing
+        for recipient in [
+            "https://recipient.example/fhir",
+            "http://localhost:8081",
+            "https://localhost:8080",
+            "http://localhost",
+            "not a url",
+        ] {
+            assert_eq!(
+                self_call_credential("none", recipient, public, lo),
+                SelfCallCredential::None,
+                "{recipient}"
+            );
+        }
+        // a public base URL on the default port matches a recipient that omits it
+        assert_eq!(
+            self_call_credential(
+                "none",
+                "https://fhir.example.org",
+                "https://fhir.example.org:443/base",
+                lo
+            ),
+            SelfCallCredential::Outbound
+        );
+    }
+
     #[test]
     fn progress_percent_reads_both_hfs_wordings_and_foreign_case() {
         // Current HFS wording (#954, ASCII-only since the sentence travels in
@@ -1915,6 +2085,24 @@ mod tests {
         // Non-matching recipients keep the indeterminate sweep.
         assert_eq!(progress_percent("halfway there"), None);
         assert_eq!(progress_percent("processing lots"), None);
+    }
+
+    /// #1437: the client assertion must carry `iat` (Keycloak rejects it
+    /// otherwise), with `exp` exactly 300s later and the SMART Backend Services
+    /// `iss`/`sub`/`aud` set.
+    #[test]
+    fn client_assertion_claims_carry_iat_and_matching_exp() {
+        let now = 1_700_000_000i64;
+        let claims = client_assertion_claims("hfs-import", "https://idp/token", now);
+        assert_eq!(claims["iat"], now);
+        assert_eq!(claims["exp"], now + 300);
+        assert_eq!(claims["iss"], "hfs-import");
+        assert_eq!(claims["sub"], "hfs-import");
+        assert_eq!(claims["aud"], "https://idp/token");
+        assert!(
+            claims["jti"].as_str().is_some_and(|j| !j.is_empty()),
+            "jti is a non-empty unique id"
+        );
     }
 
     /// #1069: only a provider close-out is terminal; `failed` can still be

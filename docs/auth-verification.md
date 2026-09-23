@@ -154,6 +154,14 @@ Browser                     HFS (crates/ui + new routes)              IdP (Keycl
    │ ─────────────────────────────▶│  authenticated                      │
 ```
 
+> **Status:** built in #1449. `GET /ui/login`, `GET /ui/callback` and
+> `POST /ui/logout` live in `crates/ui/src/login.rs`; the shared session store,
+> PKCE and token exchange in `crates/auth/src/session.rs`; and the REST auth
+> middleware turns the session cookie into the session's bearer for the pages'
+> browser-originated FHIR calls (`AuthMiddlewareState::sessions`). Configure it
+> with `HFS_UI_LOGIN_CLIENT_ID` (see the auth crate README). The list below is
+> kept as the design record.
+
 ### What HFS needs to add (design, not built here)
 
 - **Two routes** in `crates/ui` (or a small `helios-web-auth` module):

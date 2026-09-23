@@ -5,8 +5,11 @@
 //! with a `|version` suffix). This module centralises the resolution so both
 //! handlers stay in sync.
 
+use futures::StreamExt;
+use helios_persistence::core::SofError;
 use helios_persistence::core::search::SearchProvider;
 use helios_persistence::error::{BackendError, StorageError};
+use helios_persistence::sof::in_process::ResourceStream;
 use helios_persistence::tenant::TenantContext;
 use helios_persistence::types::{
     SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
@@ -172,25 +175,45 @@ where
         .map_err(|e| RestError::InternalError {
             message: format!("canonical lookup failed for {resource_type} url={url}: {e}"),
         })?;
-    newest_canonical_match(resources, url).ok_or_else(|| RestError::NotFound {
-        resource_type: resource_type.to_string(),
-        id: url.to_string(),
-    })
+    newest_canonical_match(resources, url)
+        .await
+        .map_err(|e| RestError::InternalError {
+            message: format!("canonical lookup failed for {resource_type} url={url}: {e}"),
+        })?
+        .ok_or_else(|| RestError::NotFound {
+            resource_type: resource_type.to_string(),
+            id: url.to_string(),
+        })
 }
 
-/// Picks, among scanned `resources`, the one [`canonical_matches`] selects for
-/// `url` — the most recently updated when several versions match, which is
+/// Picks, among the scanned resources, the one [`canonical_matches`] selects
+/// for `url` — the most recently updated when several versions match, which is
 /// the rule the search path applies through `last_modified`.
-fn newest_canonical_match(resources: Vec<Value>, url: &str) -> Option<Value> {
-    resources
-        .into_iter()
-        .filter(|resource| canonical_matches(resource, url))
-        .max_by_key(|resource| {
-            resource
-                .pointer("/meta/lastUpdated")
-                .and_then(Value::as_str)
-                .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
-        })
+///
+/// Folds over the scan stream keeping only the running best, so a canonical
+/// lookup on a search-less backend costs one resource of memory rather than
+/// the whole resource type.
+async fn newest_canonical_match(
+    resources: ResourceStream,
+    url: &str,
+) -> Result<Option<Value>, SofError> {
+    let mut resources = resources;
+    let mut best: Option<(Option<chrono::DateTime<chrono::FixedOffset>>, Value)> = None;
+    while let Some(resource) = resources.next().await {
+        let resource = resource?;
+        if !canonical_matches(&resource, url) {
+            continue;
+        }
+        let stamp = resource
+            .pointer("/meta/lastUpdated")
+            .and_then(Value::as_str)
+            .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok());
+        // `>=` mirrors `max_by_key`, which keeps the last of equal keys.
+        if best.as_ref().is_none_or(|(seen, _)| stamp >= *seen) {
+            best = Some((stamp, resource));
+        }
+    }
+    Ok(best.map(|(_, resource)| resource))
 }
 
 /// The one canonical-matching rule shared by storage lookups
@@ -236,7 +259,7 @@ fn split_canonical_version(url: &str) -> (String, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_matches, newest_canonical_match, resolve_by_canonical_url,
+        ResourceStream, canonical_matches, newest_canonical_match, resolve_by_canonical_url,
         split_canonical_version,
     };
     use crate::config::ServerConfig;
@@ -293,8 +316,8 @@ mod tests {
     /// #1228: on a backend without search the canonical is matched over a scan.
     /// The pick must follow the search path's rules — a pinned version selects
     /// that version, an unpinned canonical the most recently updated match.
-    #[test]
-    fn newest_canonical_match_follows_the_search_paths_rules() {
+    #[tokio::test]
+    async fn newest_canonical_match_follows_the_search_paths_rules() {
         let scanned = vec![
             json!({"resourceType": "ViewDefinition", "id": "other", "url": "http://example.org/other",
                    "meta": {"lastUpdated": "2026-09-17T12:00:00Z"}}),
@@ -303,15 +326,28 @@ mod tests {
             json!({"resourceType": "ViewDefinition", "id": "new", "url": "http://example.org/vd", "version": "2.0.0",
                    "meta": {"lastUpdated": "2026-09-10T00:00:00Z"}}),
         ];
-        let pick = |url: &str| {
-            newest_canonical_match(scanned.clone(), url)
-                .and_then(|r| r.get("id").and_then(Value::as_str).map(str::to_string))
+        let pick = |url: &'static str| {
+            let scanned = scanned.clone();
+            async move {
+                let stream: ResourceStream =
+                    Box::pin(futures::stream::iter(scanned.into_iter().map(Ok)));
+                newest_canonical_match(stream, url)
+                    .await
+                    .expect("scan must not error")
+                    .and_then(|r| r.get("id").and_then(Value::as_str).map(str::to_string))
+            }
         };
-        assert_eq!(pick("http://example.org/vd").as_deref(), Some("new"));
-        assert_eq!(pick("http://example.org/vd|1.0.0").as_deref(), Some("old"));
-        assert_eq!(pick("http://example.org/vd@2.0.0").as_deref(), Some("new"));
-        assert_eq!(pick("http://example.org/vd|9.9.9"), None);
-        assert_eq!(pick("http://example.org/missing"), None);
+        assert_eq!(pick("http://example.org/vd").await.as_deref(), Some("new"));
+        assert_eq!(
+            pick("http://example.org/vd|1.0.0").await.as_deref(),
+            Some("old")
+        );
+        assert_eq!(
+            pick("http://example.org/vd@2.0.0").await.as_deref(),
+            Some("new")
+        );
+        assert_eq!(pick("http://example.org/vd|9.9.9").await, None);
+        assert_eq!(pick("http://example.org/missing").await, None);
     }
 
     #[test]
@@ -477,12 +513,36 @@ mod tests {
             &self,
             _tenant: &TenantContext,
             resource_type: &str,
+        ) -> Result<ResourceStream, SofError> {
+            match self {
+                Scan::Of(resources) => {
+                    let matched: Vec<Value> = resources
+                        .iter()
+                        .filter(|r| {
+                            r.get("resourceType").and_then(Value::as_str) == Some(resource_type)
+                        })
+                        .cloned()
+                        .collect();
+                    Ok(Box::pin(futures::stream::iter(matched.into_iter().map(Ok))))
+                }
+                Scan::Broken => Err(SofError::Storage("bucket unreachable".to_string())),
+            }
+        }
+
+        async fn read_resources(
+            &self,
+            _tenant: &TenantContext,
+            resource_type: &str,
+            ids: &[String],
         ) -> Result<Vec<Value>, SofError> {
             match self {
                 Scan::Of(resources) => Ok(resources
                     .iter()
                     .filter(|r| {
                         r.get("resourceType").and_then(Value::as_str) == Some(resource_type)
+                            && r.get("id")
+                                .and_then(Value::as_str)
+                                .is_some_and(|id| ids.iter().any(|want| want == id))
                     })
                     .cloned()
                     .collect()),

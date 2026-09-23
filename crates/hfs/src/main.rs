@@ -1054,6 +1054,7 @@ fn patient_name_search_support(mode: StorageBackendMode) -> helios_ui::PatientNa
 async fn init_auth_with_audit(
     audit_sink: Arc<dyn AuditSink>,
     tenant_url_routing: bool,
+    public_base_url: &str,
 ) -> anyhow::Result<(AuthConfig, Option<Arc<AuthMiddlewareState>>)> {
     let auth_config = AuthConfig::from_env();
 
@@ -1106,6 +1107,17 @@ async fn init_auth_with_audit(
 
     let audit_config = AuditConfig::from_env();
 
+    // The web UI's browser login (#1449) shares one session store between the
+    // REST auth layer (which turns the session cookie into a bearer) and the
+    // UI (which establishes sessions). Built here, before either is mounted.
+    let sessions = init_login_sessions(&auth_config, public_base_url).await?;
+    #[cfg(feature = "ui")]
+    if let Some(sessions) = &sessions {
+        helios_ui::set_interactive_login(helios_ui::LoginRuntime {
+            sessions: Arc::clone(sessions),
+        });
+    }
+
     let auth_state = Arc::new(AuthMiddlewareState {
         provider: Arc::new(provider),
         config: Arc::new(auth_config.clone()),
@@ -1113,9 +1125,67 @@ async fn init_auth_with_audit(
         audit_source_observer: audit_config.source_observer.clone(),
         audit_exclusion_filter: ExclusionFilter::new(audit_config.exclusions.clone()),
         tenant_url_routing,
+        sessions,
     });
 
     Ok((auth_config, Some(auth_state)))
+}
+
+/// Builds the interactive-login session store when the web UI's IdP client is
+/// configured (`HFS_UI_LOGIN_CLIENT_ID`), resolving the authorize/token/
+/// end-session endpoints from explicit `HFS_SMART_*` settings or, failing
+/// those, from the issuer's OpenID Connect discovery document. `None` when no
+/// client is configured — auth stays bearer-only and the UI has no login.
+async fn init_login_sessions(
+    auth_config: &AuthConfig,
+    public_base_url: &str,
+) -> anyhow::Result<Option<Arc<helios_auth::SessionStore>>> {
+    let Some(client_id) = auth_config.web_client_id.clone() else {
+        return Ok(None);
+    };
+    let issuer = auth_config
+        .expected_issuer
+        .as_deref()
+        .expect("validate() guarantees an issuer when auth is enabled");
+    let (authorization_endpoint, token_endpoint, end_session_endpoint) =
+        helios_auth::discover_endpoints(
+            issuer,
+            auth_config.smart_authorize_endpoint.clone(),
+            auth_config.smart_token_endpoint.clone(),
+            auth_config.smart_end_session_endpoint.clone(),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("interactive login could not be configured: {e}"))?;
+    let redirect_uri = auth_config
+        .web_redirect_uri
+        .clone()
+        .unwrap_or_else(|| format!("{}/ui/callback", public_base_url.trim_end_matches('/')));
+    info!(
+        client_id = %client_id,
+        redirect_uri = %redirect_uri,
+        authorization_endpoint = %authorization_endpoint,
+        end_session = ?end_session_endpoint,
+        cookie_secure = auth_config.web_cookie_secure,
+        "Interactive browser login ENABLED"
+    );
+    if !auth_config.web_cookie_secure {
+        warn!(
+            "HFS_UI_LOGIN_COOKIE_SECURE=false: the session cookie is sent over plain HTTP. \
+             Only for local development."
+        );
+    }
+    Ok(Some(Arc::new(helios_auth::SessionStore::new(
+        helios_auth::LoginConfig {
+            client_id,
+            client_secret: auth_config.web_client_secret.clone(),
+            redirect_uri,
+            scopes: auth_config.web_scopes.clone(),
+            authorization_endpoint,
+            token_endpoint,
+            end_session_endpoint,
+            cookie_secure: auth_config.web_cookie_secure,
+        },
+    ))))
 }
 
 /// Initializes the audit subsystem from environment configuration.
@@ -1247,6 +1317,7 @@ async fn main() -> anyhow::Result<()> {
     let (auth_config, auth_state) = init_auth_with_audit(
         audit_sink,
         config.multitenancy.routing_mode.supports_url_path(),
+        &config.base_url,
     )
     .await?;
 
@@ -2012,9 +2083,16 @@ fn spawn_export_workers<Dp>(
 /// wrapped in [`CompositeSubmitJobs`], which syncs each finished manifest's
 /// resources into the secondary index (#882). Under bulk fast-load the worker
 /// fires a per-type reindex after each manifest that rebuilds Elasticsearch
-/// too, so the wrapper's per-resource sync would only duplicate that work; the
-/// raw primary is used instead. Fast-load without a reindex hook still needs
-/// the wrapper, otherwise the data never reaches Elasticsearch.
+/// too, so the wrapper's per-resource sync would only duplicate that work (#903)
+/// and is switched off with `with_ingest_sync(false)`. The wrapper itself stays
+/// in the chain: it is what mirrors a rolled-back change onto Elasticsearch
+/// (a rolled-back create becomes a delete) and forwards the #1125 rebuild
+/// ledger to the primary. Handing the worker the raw primary instead left
+/// rolled-back resources searchable in Elasticsearch after they were gone from
+/// the primary (#1161). Aborting a submission rolls nothing back on any
+/// primary, so abort leaves Elasticsearch alone. Fast-load without a reindex
+/// hook keeps the per-resource sync, otherwise the data never reaches
+/// Elasticsearch.
 ///
 /// With `HFS_BULK_SUBMIT_DEFER_INDEXING=false` (#1127, #1242) the wrapper is
 /// itself wrapped in [`IndexingSubmitJobs`]: every committed batch is handed to
@@ -2075,9 +2153,9 @@ fn composite_submit_jobs(
     } else if has_reindex_hook {
         info!(
             "Bulk submit defers indexing (DEFER_INDEXING=true); Elasticsearch is rebuilt \
-             per type after each manifest"
+             per type after each manifest, and rollbacks are mirrored to it"
         );
-        primary
+        Arc::new(CompositeSubmitJobs::new(primary, composite).with_ingest_sync(false))
     } else {
         info!(
             "Bulk submit syncs each finished manifest into Elasticsearch (no reindex hook); \
@@ -2569,7 +2647,8 @@ async fn start_sqlite_elasticsearch(
     // primary skips local indexing when search is offloaded, and without the
     // wrapper bulk-loaded data is invisible to every search (#882). In
     // fast-load mode the post-manifest reindex already rebuilds Elasticsearch,
-    // so the per-resource sync is skipped rather than done twice (#903).
+    // so the wrapper skips its per-resource sync rather than doing it twice
+    // (#903), but stays in the chain to mirror rollbacks (#1161).
     let submit_jobs = composite_submit_jobs(
         sqlite.clone(),
         sqlite.clone(),
@@ -2868,7 +2947,8 @@ async fn start_postgres_elasticsearch(
         .map(|op| automatic_reindex_hook_with_ledger(op, &config, None));
     // Wrapped like sqlite-es: finished manifests sync their ingested
     // resources into Elasticsearch, which the raw primary never does (#882),
-    // unless fast-load's post-manifest reindex covers it (#903).
+    // unless fast-load's post-manifest reindex covers it (#903); rollbacks are
+    // mirrored to Elasticsearch either way (#1161).
     let submit_jobs = composite_submit_jobs(
         pg.clone(),
         pg.clone(),
@@ -3108,7 +3188,9 @@ async fn start_mongodb_elasticsearch(
     // hooks" — on this backend those hooks are exactly what is turned off
     // (`search_offloaded`, logged above as "MongoDB search indexing disabled"),
     // so nothing indexed the bulk-loaded data anywhere and 99.9 % of an import
-    // was readable by id and invisible to every search (#1021).
+    // was readable by id and invisible to every search (#1021). Under fast-load
+    // the wrapper skips its per-resource sync but still mirrors rollbacks
+    // (#903, #1161).
     let submit_jobs = composite_submit_jobs(
         mongo.clone(),
         mongo.clone(),
@@ -3563,6 +3645,8 @@ async fn start_s3_elasticsearch(
     // indexing hooks for the composite's search half to be "fed by", which is
     // what the comment this replaces claimed. Without the wrapper a completed
     // `$bulk-submit` here leaves its resources searchable nowhere (#1021).
+    // Under fast-load the wrapper skips its per-resource sync but still mirrors
+    // rollbacks (#903, #1161).
     let reindex_hook = ops
         .reindex
         .clone()
@@ -4088,5 +4172,148 @@ mod tests {
         let outcome: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(outcome["resourceType"], "OperationOutcome");
         assert_eq!(outcome["issue"][0]["code"], "not-found");
+    }
+
+    // ── Deferred bulk-submit job store (#1161) ──────────────────
+
+    #[cfg(all(feature = "elasticsearch", feature = "sqlite"))]
+    mod composite_submit_jobs_1161 {
+        use super::*;
+        use helios_fhir::FhirVersion;
+        use helios_persistence::composite::{
+            CompositeConfig, CompositeStorage, DynStorage, SyncMode,
+        };
+        use helios_persistence::core::{SubmissionChange, SubmissionId};
+        use helios_persistence::{StorageResult, StoredResource, TenantId, TenantPermissions};
+        use parking_lot::Mutex;
+        use serde_json::Value;
+
+        /// A search secondary that only records deletes; nothing else is
+        /// reached by a rollback.
+        struct DeleteSpy {
+            deletes: Arc<Mutex<Vec<String>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl ResourceStorage for DeleteSpy {
+            fn backend_name(&self) -> &'static str {
+                "delete-spy"
+            }
+
+            async fn create(
+                &self,
+                _tenant: &TenantContext,
+                _resource_type: &str,
+                _resource: Value,
+                _fhir_version: FhirVersion,
+            ) -> StorageResult<StoredResource> {
+                unimplemented!("a rollback never creates on the secondary")
+            }
+
+            async fn create_or_update(
+                &self,
+                _tenant: &TenantContext,
+                _resource_type: &str,
+                _id: &str,
+                _resource: Value,
+                _fhir_version: FhirVersion,
+            ) -> StorageResult<(StoredResource, bool)> {
+                unimplemented!("a rollback of a create never upserts")
+            }
+
+            async fn read(
+                &self,
+                _tenant: &TenantContext,
+                _resource_type: &str,
+                _id: &str,
+            ) -> StorageResult<Option<StoredResource>> {
+                Ok(None)
+            }
+
+            async fn update(
+                &self,
+                _tenant: &TenantContext,
+                _current: &StoredResource,
+                _resource: Value,
+            ) -> StorageResult<StoredResource> {
+                unimplemented!("a rollback of a create never updates")
+            }
+
+            async fn delete(
+                &self,
+                _tenant: &TenantContext,
+                resource_type: &str,
+                id: &str,
+            ) -> StorageResult<()> {
+                self.deletes
+                    .lock()
+                    .push(format!("delete {resource_type}/{id}"));
+                Ok(())
+            }
+
+            async fn count(
+                &self,
+                _tenant: &TenantContext,
+                _resource_type: Option<&str>,
+            ) -> StorageResult<u64> {
+                Ok(0)
+            }
+        }
+
+        /// #1161: the job store `composite_submit_jobs` hands the worker under
+        /// deferred indexing must mirror a rolled-back create to the search
+        /// backend. Returning the raw primary there left the document in
+        /// Elasticsearch after the primary had dropped it.
+        #[tokio::test]
+        async fn deferred_submit_jobs_mirror_rollbacks_to_the_search_backend() {
+            let sqlite = Arc::new(SqliteBackend::in_memory().unwrap());
+            sqlite.init_schema().unwrap();
+            let deletes = Arc::new(Mutex::new(Vec::new()));
+
+            let config = CompositeConfig::builder()
+                .primary("sqlite", BackendKind::Sqlite)
+                .search_backend("es", BackendKind::Elasticsearch)
+                // Synchronous, so the delete lands before the assertion.
+                .sync_mode(SyncMode::Synchronous)
+                .build()
+                .unwrap();
+            let mut backends = std::collections::HashMap::new();
+            backends.insert("sqlite".to_string(), sqlite.clone() as DynStorage);
+            backends.insert(
+                "es".to_string(),
+                Arc::new(DeleteSpy {
+                    deletes: deletes.clone(),
+                }) as DynStorage,
+            );
+            let composite = Arc::new(CompositeStorage::new(config, backends).unwrap());
+
+            let cfg = helios_rest::config::BulkSubmitConfig {
+                defer_indexing: true,
+                ..Default::default()
+            };
+            let jobs = composite_submit_jobs(
+                sqlite.clone(),
+                sqlite.clone(),
+                composite,
+                Vec::new(),
+                &cfg,
+                true,
+            );
+
+            // No ingest needed: SQLite treats a create that is already gone
+            // as reverted, which is all the wrapper needs to mirror it.
+            let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+            let change = SubmissionChange::create("m1", "Patient", "p-1161", "1");
+            let sub = SubmissionId::generate("t1161");
+            assert!(jobs.rollback_change(&tenant, &sub, &change).await.unwrap());
+
+            assert_eq!(
+                deletes.lock().clone(),
+                vec!["delete Patient/p-1161".to_string()],
+                "the deferred-path job store must mirror rollbacks to the search backend \
+                 (#1161); nothing recorded means composite_submit_jobs handed the worker \
+                 the raw primary"
+            );
+        }
     }
 }

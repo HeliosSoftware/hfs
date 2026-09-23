@@ -46,6 +46,7 @@ mod conformance;
 mod editor;
 mod history;
 mod i18n;
+mod login;
 mod lookup;
 mod rail_state;
 mod search_params;
@@ -63,6 +64,8 @@ mod sql_views;
 mod subscriptions;
 mod tenants;
 mod vd_complete;
+
+pub use login::{LoginRuntime, SignedIn, set_interactive_login};
 
 #[doc(hidden)]
 pub use conformance::{
@@ -173,6 +176,10 @@ struct WebState {
     /// Trusted loopback base used for UI calls back into this HFS process.
     /// Unlike `public_base_url`, this never carries a reverse-proxy prefix.
     self_base_url: String,
+    /// Credential for the UI's self-calls that carry no caller identity
+    /// (the Import page's own kick-offs and polls, the Export workspace,
+    /// #1436/#1438): the same provider the conformance source uses.
+    outbound_auth: Arc<dyn helios_auth::outbound::OutboundAuthProvider>,
     /// Runtime capability cache. A standards-compliant 501 from Patient name
     /// search downgrades this process to exact-id lookup only.
     patient_name_search: Arc<AtomicBool>,
@@ -198,6 +205,10 @@ struct WebState {
     /// seeds and purges started from the tenants page report to it, so the
     /// dashboard's live figures follow them. `None` reports nothing.
     write_observer: Option<Arc<dyn helios_persistence::core::WriteObserver>>,
+    /// The interactive browser login (#1449), when the server installed one
+    /// with [`set_interactive_login`]. `None` means no login and no session
+    /// gate — the pre-#1449 behaviour.
+    login: Option<Arc<login::LoginRuntime>>,
 }
 
 /// The settings keys holding the user's FHIR-version and tenant choices, and
@@ -1376,7 +1387,7 @@ pub fn mount_with_body_limit_and_tenant_routing(
 ) -> Router {
     let source: Arc<dyn ConformanceSource> = Arc::new(conformance::HttpConformanceSource::new(
         self_base_url.clone(),
-        outbound_auth,
+        outbound_auth.clone(),
         fhir_version,
         data_dir.clone(),
     ));
@@ -1396,6 +1407,7 @@ pub fn mount_with_body_limit_and_tenant_routing(
         tenant_path_routing,
         bulk_provider,
         self_base_url,
+        outbound_auth,
         patient_name_search,
         write_observer,
     )
@@ -1509,6 +1521,7 @@ pub fn mount_with_conformance_source_and_body_limit_and_tenant_routing(
         tenant_path_routing,
         bulk_provider,
         public_base_url,
+        Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
         PatientNameSearchSupport::Enabled,
         None,
     )
@@ -1533,6 +1546,7 @@ pub fn mount_with_conformance_source_and_runtime(
     tenant_path_routing: bool,
     bulk_provider: Option<Arc<dyn BulkProviderStore>>,
     self_base_url: String,
+    outbound_auth: Arc<dyn helios_auth::outbound::OutboundAuthProvider>,
     patient_name_search: PatientNameSearchSupport,
     write_observer: Option<Arc<dyn helios_persistence::core::WriteObserver>>,
 ) -> Router {
@@ -1777,7 +1791,13 @@ pub fn mount_with_conformance_source_and_runtime(
         // The tenant selector (#344): lazily-loaded options and the persisted
         // choice, mirroring /ui/version.
         .route("/ui/tenant/options", get(tenant_options))
-        .route("/ui/tenant", axum::routing::post(set_tenant));
+        .route("/ui/tenant", axum::routing::post(set_tenant))
+        // Interactive browser login (#1449): Authorization Code + PKCE against
+        // the configured IdP, a server-side session, and RP-initiated logout.
+        // Answer 404 until a login is installed (see `login::installed`).
+        .route("/ui/login", get(login::login))
+        .route("/ui/callback", get(login::callback))
+        .route("/ui/logout", axum::routing::post(login::logout));
 
     if nl_enabled {
         router = router.route("/ui/search", get(search));
@@ -1800,11 +1820,13 @@ pub fn mount_with_conformance_source_and_runtime(
         terminology,
         public_base_url,
         self_base_url,
+        outbound_auth,
         patient_name_search: Arc::new(AtomicBool::new(matches!(
             patient_name_search,
             PatientNameSearchSupport::Enabled
         ))),
         tenant_path_routing,
+        login: login::installed(),
     };
 
     router
@@ -1818,6 +1840,14 @@ pub fn mount_with_conformance_source_and_runtime(
         // One effective FHIR version per request (stored choice or default),
         // in request extensions next to the locale.
         .layer(middleware::from_fn_with_state(state.clone(), resolve_prefs))
+        // Outermost of the UI layers so it runs first: with a login installed
+        // it stamps the signed-in Principal that `resolve_prefs` keys the
+        // per-user settings on, or turns the request away to `/ui/login`
+        // (#1449). Without one it is a no-op.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            login::require_session,
+        ))
         .with_state(state)
         // Registered after the UI layers so neither arm of `/` picks them up:
         // the redirect needs none, and `POST /` (FHIR batch) must reach the
