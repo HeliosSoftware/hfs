@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use helios_fhir::FhirVersion;
 use serde_json::Value;
 use std::collections::HashSet;
+use std::sync::LazyLock;
 use std::time::Duration as StdDuration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use uuid::Uuid;
@@ -31,7 +32,7 @@ use crate::error::{BackendError, BulkSubmitError, StorageError, StorageResult};
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 
 use super::PostgresBackend;
-use super::cached::{query_cached, query_opt_cached};
+use super::cached::{execute_cached, query_cached, query_one_cached, query_opt_cached};
 
 const MAX_GROUPED_FRESH_CREATES: usize = 100;
 
@@ -158,6 +159,14 @@ const SUBMISSION_MANIFEST_COLUMNS: &str = "\
 manifest_id, manifest_url, replaces_manifest_url, status, added_at, total_entries, \
 processed_entries, failed_entries, lease_expiry, bytes_processed, bytes_total, phase, \
 files_done, files_total";
+
+static GET_MANIFEST_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT {SUBMISSION_MANIFEST_COLUMNS}
+         FROM bulk_manifests
+         WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4"
+    )
+});
 
 /// Decodes one `bulk_manifests` row selected with
 /// [`SUBMISSION_MANIFEST_COLUMNS`], reading every field by column name.
@@ -685,22 +694,18 @@ impl BulkSubmitProvider for PostgresBackend {
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
 
-        let rows = client
-            .query(
-                &format!(
-                    "SELECT {SUBMISSION_MANIFEST_COLUMNS}
-                     FROM bulk_manifests
-                     WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4"
-                ),
-                &[
-                    &tenant_id,
-                    &submission_id.submitter.as_str(),
-                    &submission_id.submission_id.as_str(),
-                    &manifest_id,
-                ],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to get manifest: {}", e)))?;
+        let rows = query_cached(
+            &client,
+            &GET_MANIFEST_SQL,
+            &[
+                &tenant_id,
+                &submission_id.submitter.as_str(),
+                &submission_id.submission_id.as_str(),
+                &manifest_id,
+            ],
+        )
+        .await
+        .map_err(|e| internal_error(format!("Failed to get manifest: {}", e)))?;
 
         if rows.is_empty() {
             return Ok(None);
@@ -784,8 +789,8 @@ impl BulkSubmitProvider for PostgresBackend {
         // cannot read as if it had never happened (#968).
         {
             let client = self.get_client().await?;
-            client
-                .execute(
+            execute_cached(
+                &client,
                     "UPDATE bulk_manifests SET status = 'processing'
                      WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4
                        AND status = 'pending'",
@@ -795,9 +800,9 @@ impl BulkSubmitProvider for PostgresBackend {
                         &submission_id.submission_id.as_str(),
                         &manifest_id,
                     ],
-                )
-                .await
-                .map_err(|e| internal_error(format!("Failed to update manifest status: {}", e)))?;
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to update manifest status: {}", e)))?;
         }
 
         let file_url = options.file_url.as_deref().unwrap_or("");
@@ -942,8 +947,8 @@ impl BulkSubmitProvider for PostgresBackend {
                 Some(url) => {
                     // Creates the file's row or locks the existing one, and
                     // returns what earlier passes already counted.
-                    let row = client
-                        .query_one(
+                    let row = query_one_cached(
+                        client,
                             "INSERT INTO bulk_manifest_file_progress
                                 (tenant_id, submitter, submission_id, manifest_id, file_url)
                              VALUES ($1, $2, $3, $4, $5)
@@ -951,16 +956,16 @@ impl BulkSubmitProvider for PostgresBackend {
                              DO UPDATE SET max_line = bulk_manifest_file_progress.max_line
                              RETURNING max_line",
                             &[&tenant_id, &submitter, &sub_id_str, &manifest_id, &url],
-                        )
-                        .await
-                        .map_err(|e| {
-                            internal_error(format!("Failed to lock file progress: {}", e))
-                        })?;
+                    )
+                    .await
+                    .map_err(|e| {
+                        internal_error(format!("Failed to lock file progress: {}", e))
+                    })?;
                     let counted: i64 = row.get(0);
                     let tally = BatchTally::beyond(&results, Some(counted.max(0) as u64));
-                    client
-                        .execute(
-                            "UPDATE bulk_manifest_file_progress SET
+                    execute_cached(
+                        client,
+                        "UPDATE bulk_manifest_file_progress SET
                                 max_line = GREATEST(max_line, $1::BIGINT),
                                 total_entries = total_entries + $2::BIGINT,
                                 processed_entries = processed_entries + $3::BIGINT,
@@ -968,23 +973,23 @@ impl BulkSubmitProvider for PostgresBackend {
                                 skipped_entries = skipped_entries + $5::BIGINT
                              WHERE tenant_id = $6 AND submitter = $7 AND submission_id = $8
                                AND manifest_id = $9 AND file_url = $10",
-                            &[
-                                &tally.last_line,
-                                &tally.entries,
-                                &tally.succeeded,
-                                &tally.failed,
-                                &tally.skipped,
-                                &tenant_id,
-                                &submitter,
-                                &sub_id_str,
-                                &manifest_id,
-                                &url,
-                            ],
-                        )
-                        .await
-                        .map_err(|e| {
-                            internal_error(format!("Failed to update file progress: {}", e))
-                        })?;
+                        &[
+                            &tally.last_line,
+                            &tally.entries,
+                            &tally.succeeded,
+                            &tally.failed,
+                            &tally.skipped,
+                            &tenant_id,
+                            &submitter,
+                            &sub_id_str,
+                            &manifest_id,
+                            &url,
+                        ],
+                    )
+                    .await
+                    .map_err(|e| {
+                        internal_error(format!("Failed to update file progress: {}", e))
+                    })?;
                     tally
                 }
                 None => BatchTally::beyond(&results, None),
@@ -992,8 +997,8 @@ impl BulkSubmitProvider for PostgresBackend {
             // `processed_entries` counts successes, `skipped_entries` the
             // deliberate skips, and `last_processed_line` advances by the
             // entries newly charged (#969, #954).
-            client
-                .execute(
+            execute_cached(
+                client,
                     "UPDATE bulk_manifests SET
                         total_entries = total_entries + $1,
                         processed_entries = processed_entries + $2,
@@ -1012,9 +1017,9 @@ impl BulkSubmitProvider for PostgresBackend {
                         &sub_id_str,
                         &manifest_id,
                     ],
-                )
-                .await
-                .map_err(|e| internal_error(format!("Failed to update manifest counts: {}", e)))?;
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to update manifest counts: {}", e)))?;
         }
 
         crate::core::Transaction::commit(Box::new(txn)).await?;
@@ -1042,19 +1047,19 @@ impl BulkSubmitProvider for PostgresBackend {
         let now = Utc::now();
         let client = self.get_client().await?;
         // Update submission updated_at
-        client
-            .execute(
-                "UPDATE bulk_submissions SET updated_at = $1
+        execute_cached(
+            &client,
+            "UPDATE bulk_submissions SET updated_at = $1
                  WHERE tenant_id = $2 AND submitter = $3 AND submission_id = $4",
-                &[
-                    &now,
-                    &tenant_id,
-                    &submission_id.submitter.as_str(),
-                    &submission_id.submission_id.as_str(),
-                ],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to update submission: {}", e)))?;
+            &[
+                &now,
+                &tenant_id,
+                &submission_id.submitter.as_str(),
+                &submission_id.submission_id.as_str(),
+            ],
+        )
+        .await
+        .map_err(|e| internal_error(format!("Failed to update submission: {}", e)))?;
 
         Ok(results)
     }

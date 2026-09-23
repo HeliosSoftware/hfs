@@ -16241,6 +16241,948 @@ mod postgres_integration {
         assert_eq!(actual, expected, "unexpected {table} row count");
     }
 
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct PreparedBookkeepingStatement {
+        name: String,
+        statement: String,
+        custom_plans: i64,
+    }
+
+    fn fixed_bookkeeping_statement_kind(statement: &str) -> Option<&'static str> {
+        let normalized = statement
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
+        if normalized.starts_with("select manifest_id, manifest_url")
+            && normalized.contains("from bulk_manifests")
+            && normalized.contains("manifest_id = $4")
+        {
+            Some("get_manifest")
+        } else if normalized.starts_with("update bulk_manifests set status = 'processing'") {
+            Some("promote_manifest")
+        } else if normalized.starts_with("insert into bulk_manifest_file_progress") {
+            Some("lock_file_progress")
+        } else if normalized.starts_with("update bulk_manifest_file_progress set") {
+            Some("update_file_progress")
+        } else if normalized.starts_with("update bulk_manifests set total_entries =") {
+            Some("update_manifest_counts")
+        } else if normalized.starts_with("update bulk_submissions set updated_at = $1") {
+            Some("touch_submission")
+        } else {
+            None
+        }
+    }
+
+    async fn fixed_bookkeeping_statements(
+        client: &tokio_postgres::Client,
+    ) -> std::collections::BTreeMap<&'static str, PreparedBookkeepingStatement> {
+        let mut statements = std::collections::BTreeMap::new();
+        for row in client
+            .query(
+                "SELECT name, statement, custom_plans
+                 FROM pg_prepared_statements
+                 ORDER BY name",
+                &[],
+            )
+            .await
+            .unwrap()
+        {
+            let statement: String = row.get("statement");
+            let Some(kind) = fixed_bookkeeping_statement_kind(&statement) else {
+                continue;
+            };
+            let old = statements.insert(
+                kind,
+                PreparedBookkeepingStatement {
+                    name: row.get("name"),
+                    statement,
+                    custom_plans: row.get("custom_plans"),
+                },
+            );
+            assert!(old.is_none(), "duplicate fixed bookkeeping shape: {kind}");
+        }
+        statements
+    }
+
+    async fn assert_six_fixed_bookkeeping_statements(
+        client: &tokio_postgres::Client,
+    ) -> std::collections::BTreeMap<&'static str, PreparedBookkeepingStatement> {
+        let statements = fixed_bookkeeping_statements(client).await;
+        assert_eq!(
+            statements.keys().copied().collect::<Vec<_>>(),
+            vec![
+                "get_manifest",
+                "lock_file_progress",
+                "promote_manifest",
+                "touch_submission",
+                "update_file_progress",
+                "update_manifest_counts",
+            ],
+            "the connection must retain exactly the six fixed bookkeeping shapes: {statements:#?}"
+        );
+        statements
+    }
+
+    fn one_patient_entry(
+        line_number: u64,
+        id: impl Into<String>,
+    ) -> helios_persistence::core::NdjsonEntry {
+        let id = id.into();
+        helios_persistence::core::NdjsonEntry::new(
+            line_number,
+            "Patient",
+            json!({
+                "resourceType": "Patient",
+                "id": id,
+                "name": [{"family": format!("Family-{line_number}")}]
+            }),
+        )
+    }
+
+    struct FixedBookkeepingMeasurementFetcher {
+        file_url: String,
+        body: Vec<u8>,
+    }
+
+    #[async_trait::async_trait]
+    impl helios_persistence::core::SubmitInputFetcher for FixedBookkeepingMeasurementFetcher {
+        async fn fetch_manifest(
+            &self,
+            _url: &str,
+            _headers: &[(String, String)],
+            _oauth: &[String],
+            _key: Option<&serde_json::Value>,
+        ) -> helios_persistence::error::StorageResult<helios_persistence::core::RemoteManifest>
+        {
+            Ok(helios_persistence::core::RemoteManifest {
+                output: vec![helios_persistence::core::RemoteFile {
+                    resource_type: Some("Patient".to_string()),
+                    url: self.file_url.clone(),
+                    count: Some(10_000),
+                }],
+                ..Default::default()
+            })
+        }
+
+        async fn open_file_stream(
+            &self,
+            url: &str,
+            _headers: &[(String, String)],
+            _requires_access_token: bool,
+            _oauth: &[String],
+            _key: Option<&serde_json::Value>,
+        ) -> helios_persistence::error::StorageResult<(
+            Box<dyn tokio::io::AsyncBufRead + Send + Unpin>,
+            Option<u64>,
+        )> {
+            assert_eq!(url, self.file_url);
+            Ok((
+                Box::new(tokio::io::BufReader::new(std::io::Cursor::new(
+                    self.body.clone(),
+                ))),
+                Some(self.body.len() as u64),
+            ))
+        }
+    }
+
+    /// #1458: all six fixed import-bookkeeping statements stay bounded by SQL
+    /// shape, not by tenant, submission, manifest, file, or resource values.
+    #[tokio::test]
+    async fn postgres_bulk_submit_fixed_bookkeeping_cache_reuses_connection_statements() {
+        use helios_persistence::core::{BulkProcessingOptions, BulkSubmitProvider};
+
+        let (backend, _dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenant_a = create_tenant("fixed-cache-a");
+        let tenant_b = create_tenant("fixed-cache-b");
+        let (submission_a, manifest_a) =
+            new_bulk_submit_manifest(&backend, &tenant_a, "fixed-cache-a").await;
+        let (submission_b, manifest_b) =
+            new_bulk_submit_manifest(&backend, &tenant_b, "fixed-cache-b").await;
+
+        backend
+            .process_entries(
+                &tenant_a,
+                &submission_a,
+                &manifest_a.manifest_id,
+                vec![one_patient_entry(1, "fixed-cache-warm")],
+                &helios_persistence::core::BulkProcessingOptions::new()
+                    .with_defer_indexing(true)
+                    .with_file_url("https://provider.example/fixed-cache-warm.ndjson"),
+            )
+            .await
+            .unwrap();
+
+        // Do not hold this pooled client across `process_entries`: the backend
+        // has one connection so doing so would test a pool timeout, not caching.
+        let before = {
+            let client = backend.get_client().await.unwrap();
+            assert_six_fixed_bookkeeping_statements(&client).await
+        };
+
+        for batch in 0..10_u64 {
+            let (tenant, submission, manifest) = if batch % 2 == 0 {
+                (&tenant_a, &submission_a, &manifest_a)
+            } else {
+                (&tenant_b, &submission_b, &manifest_b)
+            };
+            backend
+                .process_entries(
+                    tenant,
+                    submission,
+                    &manifest.manifest_id,
+                    vec![one_patient_entry(batch + 2, format!("fixed-cache-{batch}"))],
+                    &BulkProcessingOptions::new()
+                        .with_defer_indexing(true)
+                        .with_file_url(format!(
+                            "https://provider.example/fixed-cache-{batch}.ndjson"
+                        )),
+                )
+                .await
+                .unwrap();
+        }
+
+        let after = {
+            let client = backend.get_client().await.unwrap();
+            assert_six_fixed_bookkeeping_statements(&client).await
+        };
+        for (kind, before_statement) in &before {
+            let after_statement = &after[kind];
+            assert_eq!(after_statement.name, before_statement.name, "{kind} name");
+            assert_eq!(
+                after_statement.statement, before_statement.statement,
+                "{kind} SQL text"
+            );
+            assert_eq!(
+                after_statement.custom_plans,
+                before_statement.custom_plans + 10,
+                "{kind} must execute one custom plan per value-varying batch"
+            );
+        }
+    }
+
+    /// #1458: cached statements survive an ordinary transaction rollback, but
+    /// are rebuilt from an empty cache when deadpool replaces the connection.
+    #[tokio::test]
+    async fn postgres_bulk_submit_fixed_bookkeeping_cache_survives_rollback_and_reconnect() {
+        use helios_persistence::core::{BulkProcessingOptions, BulkSubmitProvider};
+
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenant = create_tenant("fixed-cache-reconnect");
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        let (submission, manifest) =
+            new_bulk_submit_manifest(&backend, &tenant, "fixed-cache-reconnect").await;
+        backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest.manifest_id,
+                vec![one_patient_entry(1, "fixed-cache-reconnect-warm")],
+                &BulkProcessingOptions::new()
+                    .with_defer_indexing(true)
+                    .with_file_url("fixed-cache-reconnect-warm.ndjson"),
+            )
+            .await
+            .unwrap();
+
+        let (before, old_pid) = {
+            let client = backend.get_client().await.unwrap();
+            let statements = assert_six_fixed_bookkeeping_statements(&client).await;
+            let pid: i32 = client
+                .query_one("SELECT pg_backend_pid()", &[])
+                .await
+                .unwrap()
+                .get(0);
+            (statements, pid)
+        };
+
+        let admin = reindex_test_client_for(&dbname).await;
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let function = format!("fail_fixed_cache_counts_{suffix}");
+        let trigger = format!("fail_fixed_cache_counts_{suffix}");
+        admin
+            .batch_execute(&format!(
+                "CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   IF NEW.tenant_id = '{tenant_id}' THEN
+                     RAISE EXCEPTION 'forced late bookkeeping rollback';
+                   END IF;
+                   RETURN NEW;
+                 END $$;
+                 CREATE TRIGGER {trigger}
+                 BEFORE UPDATE OF total_entries ON bulk_manifests
+                 FOR EACH ROW EXECUTE FUNCTION {function}();"
+            ))
+            .await
+            .unwrap();
+        let failed = backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest.manifest_id,
+                vec![one_patient_entry(2, "fixed-cache-rolled-back")],
+                &BulkProcessingOptions::new()
+                    .with_defer_indexing(true)
+                    .with_file_url("fixed-cache-rolled-back.ndjson"),
+            )
+            .await;
+        let failed = failed.unwrap_err().to_string();
+        assert!(
+            failed.contains("Failed to update manifest counts"),
+            "unexpected late bookkeeping error: {failed}"
+        );
+
+        let after_rollback = {
+            let client = backend.get_client().await.unwrap();
+            assert_six_fixed_bookkeeping_statements(&client).await
+        };
+        for (kind, before_statement) in &before {
+            let after_statement = &after_rollback[kind];
+            assert_eq!(after_statement.name, before_statement.name, "{kind} name");
+            assert_eq!(
+                after_statement.statement, before_statement.statement,
+                "{kind} SQL"
+            );
+            let expected_delta = i64::from(*kind != "touch_submission");
+            assert_eq!(
+                after_statement.custom_plans,
+                before_statement.custom_plans + expected_delta,
+                "unexpected execution count after the rolled-back batch for {kind}"
+            );
+        }
+
+        admin
+            .batch_execute(&format!(
+                "DROP TRIGGER {trigger} ON bulk_manifests;
+                 DROP FUNCTION {function}();"
+            ))
+            .await
+            .unwrap();
+
+        backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest.manifest_id,
+                vec![one_patient_entry(3, "fixed-cache-after-rollback")],
+                &BulkProcessingOptions::new()
+                    .with_defer_indexing(true)
+                    .with_file_url("fixed-cache-after-rollback.ndjson"),
+            )
+            .await
+            .unwrap();
+        let (same_pid, after_success) = {
+            let client = backend.get_client().await.unwrap();
+            let pid: i32 = client
+                .query_one("SELECT pg_backend_pid()", &[])
+                .await
+                .unwrap()
+                .get(0);
+            (pid, assert_six_fixed_bookkeeping_statements(&client).await)
+        };
+        assert_eq!(
+            same_pid, old_pid,
+            "the successful batch after rollback must reuse the same physical connection"
+        );
+        for (kind, rolled_back_statement) in &after_rollback {
+            let successful_statement = &after_success[kind];
+            assert_eq!(
+                successful_statement.name, rolled_back_statement.name,
+                "{kind} name after rollback"
+            );
+            assert_eq!(
+                successful_statement.statement, rolled_back_statement.statement,
+                "{kind} SQL after rollback"
+            );
+            assert_eq!(
+                successful_statement.custom_plans,
+                rolled_back_statement.custom_plans + 1,
+                "{kind} must execute once in the successful batch after rollback"
+            );
+        }
+
+        let terminated: bool = admin
+            .query_one("SELECT pg_terminate_backend($1)", &[&old_pid])
+            .await
+            .unwrap()
+            .get(0);
+        assert!(terminated, "the pooled session must be terminated");
+
+        let (new_pid, empty) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let client = backend.get_client().await.unwrap();
+                match client.query_one("SELECT pg_backend_pid()", &[]).await {
+                    Ok(row) => {
+                        let pid: i32 = row.get(0);
+                        let statements = fixed_bookkeeping_statements(&client).await;
+                        break (pid, statements);
+                    }
+                    Err(_) => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await
+        .expect("deadpool did not replace the terminated connection");
+        assert_ne!(new_pid, old_pid);
+        assert!(
+            empty.is_empty(),
+            "a replacement session must begin without target statements: {empty:#?}"
+        );
+
+        backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest.manifest_id,
+                vec![one_patient_entry(4, "fixed-cache-after-reconnect")],
+                &BulkProcessingOptions::new()
+                    .with_defer_indexing(true)
+                    .with_file_url("fixed-cache-after-reconnect.ndjson"),
+            )
+            .await
+            .unwrap();
+        let rebuilt = {
+            let client = backend.get_client().await.unwrap();
+            assert_six_fixed_bookkeeping_statements(&client).await
+        };
+        assert!(
+            rebuilt
+                .values()
+                .all(|statement| statement.custom_plans == 1),
+            "each target statement must execute once while warming the replacement session: {rebuilt:#?}"
+        );
+    }
+
+    /// #1458: `query_one_cached` retains `query_one` cardinality. A trigger
+    /// that suppresses the progress row must fail the batch instead of turning
+    /// a zero-row result into a default or replaying it on another connection.
+    #[tokio::test]
+    async fn postgres_bulk_submit_fixed_bookkeeping_query_one_preserves_cardinality() {
+        use helios_persistence::core::{BulkProcessingOptions, BulkSubmitProvider, ManifestStatus};
+
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenant = create_tenant("fixed-cache-cardinality");
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        let (submission, manifest) =
+            new_bulk_submit_manifest(&backend, &tenant, "fixed-cache-cardinality").await;
+        let observer = std::sync::Arc::new(RecordingBulkSubmitBatches::default());
+        let file_url = "fixed-cache-cardinality.ndjson";
+
+        let admin = reindex_test_client_for(&dbname).await;
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let attempts = format!("fixed_cache_attempts_{suffix}");
+        let function = format!("suppress_fixed_cache_progress_{suffix}");
+        let trigger = format!("suppress_fixed_cache_progress_{suffix}");
+        admin
+            .batch_execute(&format!(
+                "CREATE SEQUENCE {attempts};
+                 CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   IF NEW.tenant_id = '{tenant_id}' AND NEW.file_url = '{file_url}' THEN
+                     PERFORM nextval('{attempts}');
+                     RETURN NULL;
+                   END IF;
+                   RETURN NEW;
+                 END $$;
+                 CREATE TRIGGER {trigger}
+                 BEFORE INSERT ON bulk_manifest_file_progress
+                 FOR EACH ROW EXECUTE FUNCTION {function}();"
+            ))
+            .await
+            .unwrap();
+
+        let error = backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest.manifest_id,
+                vec![one_patient_entry(1, "fixed-cache-cardinality")],
+                &BulkProcessingOptions::new()
+                    .with_defer_indexing(true)
+                    .with_file_url(file_url)
+                    .with_batch_observer(observer.clone()),
+            )
+            .await
+            .expect_err("a zero-row query_one result must fail the batch");
+        assert!(
+            error.to_string().contains("Failed to lock file progress"),
+            "unexpected cardinality error: {error}"
+        );
+        assert!(observer.0.lock().unwrap().is_empty());
+        let attempt_count: i64 = admin
+            .query_one(&format!("SELECT last_value FROM {attempts}"), &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(attempt_count, 1, "the failed batch must not replay");
+        for table in [
+            "resources",
+            "resource_history",
+            "bulk_entry_results",
+            "bulk_submission_changes",
+            "bulk_manifest_file_progress",
+        ] {
+            assert_bulk_submit_table_count(&admin, table, &tenant_id, 0).await;
+        }
+        let current = backend
+            .get_manifest(&tenant, &submission, &manifest.manifest_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            current.status,
+            ManifestStatus::Processing,
+            "the independent pending-to-processing promotion remains durable"
+        );
+        assert_eq!(
+            (
+                current.total_entries,
+                current.processed_entries,
+                current.failed_entries
+            ),
+            (0, 0, 0)
+        );
+
+        admin
+            .batch_execute(&format!(
+                "DROP TRIGGER {trigger} ON bulk_manifest_file_progress;
+                 DROP FUNCTION {function}();"
+            ))
+            .await
+            .unwrap();
+        let results = backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest.manifest_id,
+                vec![one_patient_entry(1, "fixed-cache-cardinality")],
+                &BulkProcessingOptions::new()
+                    .with_defer_indexing(true)
+                    .with_file_url(file_url)
+                    .with_batch_observer(observer.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_success());
+        assert_eq!(observer.0.lock().unwrap().len(), 1);
+        for table in [
+            "resources",
+            "resource_history",
+            "bulk_entry_results",
+            "bulk_submission_changes",
+            "bulk_manifest_file_progress",
+        ] {
+            assert_bulk_submit_table_count(&admin, table, &tenant_id, 1).await;
+        }
+    }
+
+    /// A failure while updating a cached file-progress statement rolls back
+    /// the resource batch and leaves the file available for a later retry.
+    #[tokio::test]
+    async fn postgres_bulk_submit_cached_file_progress_error_rolls_back_batch() {
+        use helios_persistence::core::{BulkProcessingOptions, BulkSubmitProvider, ManifestStatus};
+
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenant = create_tenant("fixed-cache-progress-error");
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        let (submission, manifest) =
+            new_bulk_submit_manifest(&backend, &tenant, "fixed-cache-progress-error").await;
+        let admin = reindex_test_client_for(&dbname).await;
+        let observer = std::sync::Arc::new(RecordingBulkSubmitBatches::default());
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let function = format!("fail_fixed_cache_progress_{suffix}");
+        let trigger = format!("fail_fixed_cache_progress_{suffix}");
+        admin
+            .batch_execute(&format!(
+                "CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   IF NEW.tenant_id = '{tenant_id}' THEN
+                     RAISE EXCEPTION 'forced file progress failure';
+                   END IF;
+                   RETURN NEW;
+                 END $$;
+                 CREATE TRIGGER {trigger}
+                 BEFORE UPDATE ON bulk_manifest_file_progress
+                 FOR EACH ROW EXECUTE FUNCTION {function}();"
+            ))
+            .await
+            .unwrap();
+
+        let options = BulkProcessingOptions::new()
+            .with_defer_indexing(true)
+            .with_file_url("fixed-cache-progress-error.ndjson")
+            .with_batch_observer(observer.clone());
+        let error = backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest.manifest_id,
+                vec![one_patient_entry(1, "fixed-cache-progress-error")],
+                &options,
+            )
+            .await
+            .expect_err("the failed file-progress update must reject the batch");
+        assert!(
+            error.to_string().contains("Failed to update file progress"),
+            "unexpected file-progress error: {error}"
+        );
+        assert!(observer.0.lock().unwrap().is_empty());
+        for table in [
+            "resources",
+            "resource_history",
+            "bulk_entry_results",
+            "bulk_submission_changes",
+            "bulk_manifest_file_progress",
+        ] {
+            assert_bulk_submit_table_count(&admin, table, &tenant_id, 0).await;
+        }
+        let current = backend
+            .get_manifest(&tenant, &submission, &manifest.manifest_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.status, ManifestStatus::Processing);
+        assert_eq!((current.total_entries, current.processed_entries), (0, 0));
+
+        admin
+            .batch_execute(&format!(
+                "DROP TRIGGER {trigger} ON bulk_manifest_file_progress;
+                 DROP FUNCTION {function}();"
+            ))
+            .await
+            .unwrap();
+        let results = backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest.manifest_id,
+                vec![one_patient_entry(1, "fixed-cache-progress-error")],
+                &options,
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_success());
+        assert_eq!(observer.0.lock().unwrap().len(), 1);
+    }
+
+    /// The submission timestamp is updated after the batch commits, so a
+    /// cached-statement error at that point must retain the committed batch.
+    #[tokio::test]
+    async fn postgres_bulk_submit_cached_submission_touch_error_keeps_committed_batch() {
+        use helios_persistence::core::{BulkProcessingOptions, BulkSubmitProvider};
+
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenant = create_tenant("fixed-cache-touch-error");
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        let (submission, manifest) =
+            new_bulk_submit_manifest(&backend, &tenant, "fixed-cache-touch-error").await;
+        let admin = reindex_test_client_for(&dbname).await;
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let function = format!("fail_fixed_cache_touch_{suffix}");
+        let trigger = format!("fail_fixed_cache_touch_{suffix}");
+        admin
+            .batch_execute(&format!(
+                "CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   IF NEW.tenant_id = '{tenant_id}' THEN
+                     RAISE EXCEPTION 'forced submission touch failure';
+                   END IF;
+                   RETURN NEW;
+                 END $$;
+                 CREATE TRIGGER {trigger}
+                 BEFORE UPDATE OF updated_at ON bulk_submissions
+                 FOR EACH ROW EXECUTE FUNCTION {function}();"
+            ))
+            .await
+            .unwrap();
+
+        let observer = std::sync::Arc::new(RecordingBulkSubmitBatches::default());
+        let error = backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest.manifest_id,
+                vec![one_patient_entry(1, "fixed-cache-touch-error")],
+                &BulkProcessingOptions::new()
+                    .with_defer_indexing(true)
+                    .with_file_url("fixed-cache-touch-error.ndjson")
+                    .with_batch_observer(observer.clone()),
+            )
+            .await
+            .expect_err("the failed submission update must report an error");
+        assert!(
+            error.to_string().contains("Failed to update submission"),
+            "unexpected submission update error: {error}"
+        );
+        assert_eq!(observer.0.lock().unwrap().len(), 1);
+        for table in [
+            "resources",
+            "resource_history",
+            "bulk_entry_results",
+            "bulk_submission_changes",
+            "bulk_manifest_file_progress",
+        ] {
+            assert_bulk_submit_table_count(&admin, table, &tenant_id, 1).await;
+        }
+        let current = backend
+            .get_manifest(&tenant, &submission, &manifest.manifest_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((current.total_entries, current.processed_entries), (1, 1));
+    }
+
+    /// Selects the PostgreSQL deployment used by the ignored measurement.
+    ///
+    /// When `HFS_1458_MEASUREMENT_PG_PORT` is set, it must name a PostgreSQL
+    /// 16 port on `localhost`; the harness connects to database/user/password
+    /// `postgres` and creates a fresh isolated database for each trial. This
+    /// lets separately prebuilt base and candidate binaries use the same
+    /// externally managed server. Without the variable, the ordinary shared
+    /// Testcontainers PostgreSQL fixture is used.
+    async fn fixed_bookkeeping_measurement_backend() -> (PostgresBackend, String, String) {
+        let Ok(port) = std::env::var("HFS_1458_MEASUREMENT_PG_PORT") else {
+            let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+            return (backend, dbname, "testcontainers".to_string());
+        };
+        let port: u16 = port
+            .parse()
+            .expect("HFS_1458_MEASUREMENT_PG_PORT must be a TCP port");
+        let dbname = format!("hfs_1458_measurement_{}", uuid::Uuid::new_v4().simple());
+        let admin_url =
+            format!("host=localhost port={port} user=postgres password=postgres dbname=postgres");
+        let (admin, connection) = tokio_postgres::connect(&admin_url, tokio_postgres::NoTls)
+            .await
+            .expect("connect to external PostgreSQL measurement deployment");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        admin
+            .batch_execute(&format!("CREATE DATABASE {dbname}"))
+            .await
+            .expect("create isolated external measurement database");
+
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|path| path.parent())
+            .map(|path| path.join("data"))
+            .unwrap_or_else(|| PathBuf::from("data"));
+        let config = PostgresConfig {
+            host: "localhost".to_string(),
+            port,
+            dbname: dbname.clone(),
+            user: "postgres".to_string(),
+            password: Some("postgres".to_string()),
+            max_connections: 1,
+            data_dir: Some(data_dir),
+            ..Default::default()
+        };
+        let schema_backend = PostgresBackend::new(PostgresConfig {
+            max_connections: 5,
+            ..config.clone()
+        })
+        .await
+        .expect("connect to external measurement database");
+        schema_backend
+            .init_schema()
+            .await
+            .expect("initialize external measurement database");
+        drop(schema_backend);
+        let backend = PostgresBackend::new(config)
+            .await
+            .expect("connect measurement backend with a one-connection pool");
+        (backend, dbname, format!("external:localhost:{port}"))
+    }
+
+    /// Manual #1458 performance harness. It deliberately remains ignored:
+    /// timing is valid only when the host and the shared PostgreSQL deployment
+    /// are otherwise idle. One invocation runs three fresh databases against
+    /// that same PostgreSQL 16 deployment and keeps the pool at one connection.
+    #[tokio::test]
+    #[ignore = "manual 10k-resource performance measurement; requires an idle host"]
+    async fn postgres_bulk_submit_fixed_bookkeeping_cache_measurement() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        use helios_persistence::backends::local_fs::LocalFsOutputStore;
+        use helios_persistence::core::{
+            BulkSubmitJobStore, BulkSubmitProvider, DefaultSubmitWorker, ExportOutputStore,
+            ManifestStatus, SearchProvider, SubmissionId, SubmitInputFetcher, WorkerId,
+        };
+        use helios_persistence::search::{ReindexOperation, ReindexRequest, ReindexStatus};
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        fn search_query(name: &str, param_type: SearchParamType, value: &str) -> SearchQuery {
+            SearchQuery::new("Patient").with_parameter(SearchParameter {
+                name: name.to_string(),
+                param_type,
+                modifier: None,
+                values: vec![SearchValue::eq(value)],
+                chain: vec![],
+                components: vec![],
+            })
+        }
+
+        let mut body = String::new();
+        for index in 0..10_000 {
+            body.push_str(
+                &json!({
+                    "resourceType": "Patient",
+                    "id": format!("fixed-cache-measurement-{index:05}"),
+                    "name": [{"family": format!("Benchmark-{index:05}")}],
+                    "text": {
+                        "status": "generated",
+                        "div": format!(
+                            "<div xmlns=\"http://www.w3.org/1999/xhtml\">xanthochromia {index}</div>"
+                        )
+                    }
+                })
+                .to_string(),
+            );
+            body.push('\n');
+        }
+        let body = body.into_bytes();
+
+        for trial in 1..=3 {
+            let (backend, dbname, deployment) = fixed_bookkeeping_measurement_backend().await;
+            let backend = Arc::new(backend);
+            let tenant = create_tenant(&format!("fixed-cache-measurement-{trial}"));
+            let submission = SubmissionId::generate(format!("fixed-cache-measurement-{trial}"));
+            let manifest_url =
+                format!("https://provider.example/fixed-cache-measurement-{trial}/manifest.json");
+            let file_url =
+                format!("https://provider.example/fixed-cache-measurement-{trial}/patients.ndjson");
+            backend
+                .create_submission(&tenant, &submission, None)
+                .await
+                .unwrap();
+            let manifest = backend
+                .add_manifest(&tenant, &submission, Some(&manifest_url), None)
+                .await
+                .unwrap();
+            let worker_id = WorkerId::new(format!("fixed-cache-measurement-worker-{trial}"));
+            let lease = claim_specific_manifest(
+                &backend,
+                &worker_id,
+                &submission,
+                &manifest.manifest_id,
+                Duration::from_secs(300),
+            )
+            .await;
+            let fetcher: Arc<dyn SubmitInputFetcher> =
+                Arc::new(FixedBookkeepingMeasurementFetcher {
+                    file_url,
+                    body: body.clone(),
+                });
+            let output_dir = tempfile::tempdir().unwrap();
+            let output: Arc<dyn ExportOutputStore> = Arc::new(
+                LocalFsOutputStore::new(output_dir.path(), "http://localhost:8080")
+                    .with_access_token_required(false),
+            );
+            let jobs: Arc<dyn BulkSubmitJobStore> = backend.clone();
+            let worker = DefaultSubmitWorker::new(jobs, fetcher, output, worker_id)
+                .with_batch_size(100)
+                .with_deferred_indexing(true, None);
+
+            let ingest_started = Instant::now();
+            worker.run_job(lease).await.unwrap();
+            let terminal_elapsed = ingest_started.elapsed();
+            let stored_manifest = backend
+                .get_manifest(&tenant, &submission, &manifest.manifest_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored_manifest.status, ManifestStatus::Completed);
+            let receipts = backend
+                .get_entry_counts(&tenant, &submission, &manifest.manifest_id)
+                .await
+                .unwrap();
+            assert_eq!((receipts.total, receipts.success), (10_000, 10_000));
+
+            let cache = {
+                let client = backend.get_client().await.unwrap();
+                fixed_bookkeeping_statements(&client).await
+            };
+            let structured = search_query("name", SearchParamType::String, "Benchmark");
+            let full_text = search_query("_text", SearchParamType::Special, "xanthochromia");
+            assert!(
+                backend
+                    .search(&tenant, &structured)
+                    .await
+                    .unwrap()
+                    .resources
+                    .items
+                    .is_empty(),
+                "terminal receipts must precede deferred structured-search readiness"
+            );
+            assert!(
+                backend
+                    .search(&tenant, &full_text)
+                    .await
+                    .unwrap()
+                    .resources
+                    .items
+                    .is_empty(),
+                "terminal receipts must precede deferred FTS readiness"
+            );
+
+            let reindex_started = Instant::now();
+            let reindex =
+                ReindexOperation::new(backend.clone(), backend.tenant_registries().clone());
+            let job_id = reindex
+                .start(
+                    tenant.clone(),
+                    ReindexRequest::for_types(["Patient"]).with_batch_size(1000),
+                    None,
+                )
+                .await
+                .unwrap();
+            let progress = tokio::time::timeout(Duration::from_secs(600), async {
+                loop {
+                    let progress = reindex.get_progress(&job_id).await.unwrap();
+                    if progress.status.is_finished() {
+                        break progress;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .expect("reindex did not become terminal");
+            assert_eq!(progress.status, ReindexStatus::Completed);
+            assert!(progress.errors.is_empty(), "reindex errors: {progress:?}");
+            let search_ready_elapsed = reindex_started.elapsed();
+            assert!(
+                !backend
+                    .search(&tenant, &structured)
+                    .await
+                    .unwrap()
+                    .resources
+                    .items
+                    .is_empty(),
+                "structured search must be ready after reindex"
+            );
+            assert!(
+                !backend
+                    .search(&tenant, &full_text)
+                    .await
+                    .unwrap()
+                    .resources
+                    .items
+                    .is_empty(),
+                "FTS must be ready after reindex"
+            );
+            println!(
+                "trial={trial} deployment={deployment} database={dbname} resources=10000 batch_size=100 \
+                 terminal_elapsed={terminal_elapsed:?} reindex_elapsed={search_ready_elapsed:?} \
+                 cache={cache:#?}"
+            );
+        }
+    }
+
     /// #1136: a clean eligible batch keeps every observable per-entry
     /// contract while PostgreSQL flushes all 100 creates at once.
     #[tokio::test]

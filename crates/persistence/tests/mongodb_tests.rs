@@ -50,7 +50,7 @@ use helios_persistence::types::{
     SearchParameter, SearchPrefix, SearchQuery, SearchValue, SortDirective, TotalMode,
 };
 use mongodb::Client;
-use mongodb::bson::{Document, doc};
+use mongodb::bson::{Bson, Document, doc};
 use serde_json::json;
 
 const MONGODB_MAX_DATABASE_NAME_LEN: usize = 63;
@@ -10110,6 +10110,7 @@ mod bulk_submit {
     /// A `failCommand` failpoint scoped to one client's `appName`.
     struct FailPoint {
         admin: mongodb::Database,
+        initial_count: i64,
         _lock: tokio::sync::MutexGuard<'static, ()>,
     }
 
@@ -10142,7 +10143,7 @@ mod bulk_submit {
                 return None;
             }
             data.insert("appName", app_name);
-            admin
+            let response = admin
                 .run_command(doc! {
                     "configureFailPoint": "failCommand",
                     "mode": mode,
@@ -10150,7 +10151,28 @@ mod bulk_submit {
                 })
                 .await
                 .expect("configureFailPoint failCommand");
-            Some(FailPoint { admin, _lock: lock })
+            let initial_count = match response.get("count") {
+                Some(Bson::Int32(count)) => i64::from(*count),
+                Some(Bson::Int64(count)) => *count,
+                count => panic!("configureFailPoint returned an invalid count: {count:?}"),
+            };
+            Some(FailPoint {
+                admin,
+                initial_count,
+                _lock: lock,
+            })
+        }
+
+        /// Waits until this configuration has matched `additional` commands.
+        async fn wait_until_entered(&self, additional: i64) {
+            self.admin
+                .run_command(doc! {
+                    "waitForFailPoint": "failCommand",
+                    "timesEntered": self.initial_count + additional,
+                    "maxTimeMS": 10_000_i64,
+                })
+                .await
+                .expect("waitForFailPoint failCommand");
         }
 
         /// Turns the failpoint off and releases the lock. Call at the end of
@@ -13276,12 +13298,11 @@ mod bulk_submit {
     }
 
     /// Spec §5.2 case 6. Proves cancellation ends the retry loop before its
-    /// 6-attempt budget: the in-flight batch's receipts carry an attempt count
-    /// under 6. 150 ms is after attempt 1 fails and inside the first sleep.
-    /// Wall-clock elapsed is not asserted beyond a loose hang guard — a
-    /// `closeConnection` failpoint costs a real reconnect per attempt, and how
-    /// long that takes is environment-dependent, not something cancellation
-    /// controls.
+    /// 6-attempt budget. The failpoint's entry count synchronizes cancellation
+    /// with the first insert instead of assuming it reaches the server within a
+    /// fixed delay. Wall-clock elapsed is not asserted beyond a loose hang guard
+    /// — a `closeConnection` failpoint costs a real reconnect, and how long that
+    /// takes is environment-dependent, not something cancellation controls.
     #[tokio::test]
     async fn cancel_during_backoff_returns_promptly() {
         let test = "submit_fp_cancel_backoff";
@@ -13306,7 +13327,6 @@ mod bulk_submit {
         let options = BulkProcessingOptions::new()
             .with_batch_size(3)
             .with_cancel(cancel.clone());
-        let started = std::time::Instant::now();
         let run = {
             let backend = backend.clone();
             let tenant = tenant.clone();
@@ -13325,7 +13345,8 @@ mod bulk_submit {
                     .await
             })
         };
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        fail_point.wait_until_entered(1).await;
+        let started = std::time::Instant::now();
         cancel.cancel();
         let result = run.await.unwrap().unwrap();
         let elapsed = started.elapsed();
@@ -13353,13 +13374,22 @@ mod bulk_submit {
             let r = &entry.result;
             assert_eq!(r.outcome, BulkEntryOutcome::ProcessingError, "{r:?}");
             let issue = &r.operation_outcome.as_ref().unwrap()["issue"][0];
+            assert_eq!(issue["code"], "transient", "{issue:?}");
             let diagnostics = issue["diagnostics"].as_str().unwrap();
+            // The formatter deliberately omits "after 1 attempts". If the
+            // client observes cancellation immediately after the first failed
+            // insert, the absent suffix therefore means one attempt.
             let attempts: u32 = diagnostics
                 .split("(after ")
                 .nth(1)
-                .and_then(|s| s.split(' ').next())
-                .and_then(|s| s.parse().ok())
-                .unwrap_or_else(|| panic!("no attempt count in {diagnostics}"));
+                .map(|suffix| {
+                    suffix
+                        .split(' ')
+                        .next()
+                        .and_then(|count| count.parse().ok())
+                        .unwrap_or_else(|| panic!("invalid attempt count in {diagnostics}"))
+                })
+                .unwrap_or(1);
             assert!(
                 attempts < 6,
                 "cancellation should stop the retry loop short of its budget: {diagnostics}"
