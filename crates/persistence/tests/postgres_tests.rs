@@ -11935,6 +11935,28 @@ mod postgres_integration {
         Vec<(String, i64)>,
         Vec<(String, i64)>,
     ) {
+        reindex_page_fts_trigger_case_with_sqlstate(
+            target_id,
+            target_is_oversized,
+            leading_is_oversized,
+            trigger_message,
+            None,
+        )
+        .await
+    }
+
+    async fn reindex_page_fts_trigger_case_with_sqlstate(
+        target_id: &str,
+        target_is_oversized: bool,
+        leading_is_oversized: bool,
+        trigger_message: &str,
+        trigger_sqlstate: Option<&str>,
+    ) -> (
+        Vec<helios_persistence::types::StoredResource>,
+        Vec<Result<usize, StorageError>>,
+        Vec<(String, i64)>,
+        Vec<(String, i64)>,
+    ) {
         use helios_persistence::search::{ReindexSource, ReindexTarget};
 
         let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
@@ -11984,12 +12006,15 @@ mod postgres_integration {
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let function_name = format!("reject_reindex_fts_{suffix}");
         let trigger_name = format!("reject_reindex_fts_{suffix}");
+        let sqlstate_clause = trigger_sqlstate
+            .map(|sqlstate| format!(" USING ERRCODE = '{sqlstate}'"))
+            .unwrap_or_default();
         client
             .batch_execute(&format!(
                 "CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
                  BEGIN
                    IF NEW.tenant_id = '{tenant_id}' AND NEW.resource_id = '{target_id}' THEN
-                     RAISE EXCEPTION '{trigger_message}';
+                     RAISE EXCEPTION '{trigger_message}'{sqlstate_clause};
                    END IF;
                    RETURN NEW;
                  END $$;
@@ -12174,6 +12199,1358 @@ mod postgres_integration {
             fts_rows,
             vec![("a-normal".to_string(), 1), ("c-normal".to_string(), 1)]
         );
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_reindex_error_locations_truncated_fts_retry() {
+        let (resources, results, _search_rows, _fts_rows) =
+            reindex_page_fts_trigger_case_with_sqlstate(
+                "b-oversized",
+                true,
+                false,
+                "truncated FTS retry timeout",
+                Some("57014"),
+            )
+            .await;
+
+        let ids: Vec<_> = resources.iter().map(|resource| resource.id()).collect();
+        assert_eq!(ids, vec!["a-normal", "b-oversized", "c-normal"]);
+        assert_eq!(results.len(), ids.len(), "every page slot must survive");
+        for (id, result) in ids.iter().zip(&results) {
+            if *id == "b-oversized" {
+                match result.as_ref().expect_err("truncated FTS retry must fail") {
+                    StorageError::Backend(BackendError::Timeout {
+                        backend_name,
+                        message,
+                    }) => {
+                        assert_eq!(backend_name, "postgres");
+                        assert_eq!(message, "Failed to insert FTS content: db error");
+                    }
+                    other => panic!("truncated FTS retry must classify as Timeout, got {other:?}"),
+                }
+            } else {
+                assert!(result.is_ok(), "{id} should be reindexed");
+            }
+        }
+    }
+
+    /// Focused red regression for issue #1463: a final standalone fallback
+    /// failure carrying SQLSTATE 57014 must classify as
+    /// `BackendError::Timeout`, not `Internal`.
+    ///
+    /// Red against current production, which drops the typed driver cause
+    /// before the page boundary can inspect it. Raises a real PostgreSQL
+    /// error with `ERRCODE = '57014'` from a `resource_fts` trigger, so
+    /// both the grouped attempt and the final per-resource fallback fail on
+    /// the FTS upsert.
+    #[tokio::test]
+    async fn postgres_integration_reindex_error_sqlstate_57014() {
+        use helios_persistence::search::{ReindexSource, ReindexTarget};
+
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenant = create_tenant("reindex-error-57014");
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        for id in ["a-normal", "b-target", "c-normal"] {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({"resourceType": "Observation", "id": id, "status": id}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let page = backend
+            .fetch_resources_page(&tenant, "Observation", None, 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.resources
+                .iter()
+                .map(|resource| resource.id())
+                .collect::<Vec<_>>(),
+            vec!["a-normal", "b-target", "c-normal"]
+        );
+
+        let client = reindex_test_client_for(&dbname).await;
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let function_name = format!("reject_reindex_fts_timeout_{suffix}");
+        let trigger_name = format!("reject_reindex_fts_timeout_{suffix}");
+        client
+            .batch_execute(&format!(
+                "CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   IF NEW.tenant_id = '{tenant_id}' AND NEW.resource_id = 'b-target' THEN
+                     RAISE EXCEPTION 'statement timeout simulation' USING ERRCODE = '57014';
+                   END IF;
+                   RETURN NEW;
+                 END $$;
+                 CREATE TRIGGER {trigger_name} BEFORE INSERT ON resource_fts
+                 FOR EACH ROW EXECUTE FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            backend.write_search_entries_page(&tenant, &page.resources),
+        )
+        .await
+        .expect("FTS page fallback must not deadlock a one-connection pool");
+
+        client
+            .batch_execute(&format!(
+                "DROP TRIGGER {trigger_name} ON resource_fts;
+                 DROP FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 3);
+        for (resource, result) in page.resources.iter().zip(&results) {
+            if resource.id() == "b-target" {
+                let error = result.as_ref().expect_err("trigger target must fail");
+                match error {
+                    StorageError::Backend(BackendError::Timeout {
+                        backend_name,
+                        message,
+                    }) => {
+                        assert_eq!(backend_name, "postgres");
+                        assert_eq!(message, "Failed to insert FTS content: db error");
+                    }
+                    other => panic!(
+                        "SQLSTATE 57014 final fallback failure must classify as Timeout, got {other:?}"
+                    ),
+                }
+            } else {
+                assert!(result.is_ok(), "{} should be reindexed", resource.id());
+            }
+        }
+    }
+
+    /// SQLSTATE matrix for issue #1463: the final standalone fallback of
+    /// `write_search_entries_page` must classify real PostgreSQL failures by
+    /// code — `57014` as `BackendError::Timeout`; `53300`, `53400`, `57P01`,
+    /// `57P02`, `57P03` as `BackendError::Unavailable`; and `40001`, `40P01`,
+    /// `23514`, `ZZ999` as `BackendError::Internal` carrying the driver error
+    /// with the message unchanged.
+    ///
+    /// Each case raises a real PostgreSQL error with
+    /// `RAISE EXCEPTION ... USING ERRCODE = '<code>'` from a `resource_fts`
+    /// trigger, following the `..._57014` pattern above, so both the grouped
+    /// attempt and the final per-resource fallback fail on the FTS upsert.
+    #[tokio::test]
+    async fn postgres_integration_reindex_error_sqlstate_matrix() {
+        use helios_persistence::search::{ReindexSource, ReindexTarget};
+
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenant = create_tenant("reindex-error-matrix");
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        for id in ["a-normal", "b-target", "c-normal"] {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({"resourceType": "Observation", "id": id, "status": id}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let page = backend
+            .fetch_resources_page(&tenant, "Observation", None, 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.resources
+                .iter()
+                .map(|resource| resource.id())
+                .collect::<Vec<_>>(),
+            vec!["a-normal", "b-target", "c-normal"]
+        );
+
+        let client = reindex_test_client_for(&dbname).await;
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        // (SQLSTATE, expected classification).
+        let cases = [
+            ("57014", "timeout"),
+            ("53300", "unavailable"),
+            ("53400", "unavailable"),
+            ("57P01", "unavailable"),
+            ("57P02", "unavailable"),
+            ("57P03", "unavailable"),
+            ("40001", "internal"),
+            ("40P01", "internal"),
+            ("23514", "internal"),
+            ("ZZ999", "internal"),
+        ];
+        for (code, expected) in cases {
+            let tag = code.to_lowercase();
+            let function_name = format!("rrm_{tag}_{run}");
+            let trigger_name = format!("trrm_{tag}_{run}");
+            client
+                .batch_execute(&format!(
+                    "CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
+                     BEGIN
+                       IF NEW.tenant_id = '{tenant_id}' AND NEW.resource_id = 'b-target' THEN
+                         RAISE EXCEPTION 'reindex matrix simulation {code}' USING ERRCODE = '{code}';
+                       END IF;
+                       RETURN NEW;
+                     END $$;
+                     CREATE TRIGGER {trigger_name} BEFORE INSERT ON resource_fts
+                     FOR EACH ROW EXECUTE FUNCTION {function_name}();"
+                ))
+                .await
+                .unwrap();
+
+            let results = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                backend.write_search_entries_page(&tenant, &page.resources),
+            )
+            .await
+            .expect("FTS page fallback must not deadlock a one-connection pool");
+
+            client
+                .batch_execute(&format!(
+                    "DROP TRIGGER {trigger_name} ON resource_fts;
+                     DROP FUNCTION {function_name}();"
+                ))
+                .await
+                .unwrap();
+
+            assert_eq!(
+                results.len(),
+                3,
+                "SQLSTATE {code} must keep resource slots in order"
+            );
+            for (resource, result) in page.resources.iter().zip(&results) {
+                if resource.id() == "b-target" {
+                    let error = match result {
+                        Err(error) => error,
+                        Ok(_) => panic!("SQLSTATE {code} trigger target must fail"),
+                    };
+                    match expected {
+                        "timeout" => match error {
+                            StorageError::Backend(BackendError::Timeout {
+                                backend_name,
+                                message,
+                            }) => {
+                                assert_eq!(backend_name, "postgres");
+                                assert_eq!(message, "Failed to insert FTS content: db error");
+                            }
+                            other => {
+                                panic!("SQLSTATE {code} must classify as Timeout, got {other:?}")
+                            }
+                        },
+                        "unavailable" => match error {
+                            StorageError::Backend(BackendError::Unavailable {
+                                backend_name,
+                                message,
+                            }) => {
+                                assert_eq!(backend_name, "postgres");
+                                assert_eq!(message, "Failed to insert FTS content: db error");
+                            }
+                            other => panic!(
+                                "SQLSTATE {code} must classify as Unavailable, got {other:?}"
+                            ),
+                        },
+                        _ => match error {
+                            StorageError::Backend(BackendError::Internal {
+                                backend_name,
+                                message,
+                                source,
+                            }) => {
+                                assert_eq!(backend_name, "postgres");
+                                assert_eq!(message, "Failed to insert FTS content: db error");
+                                let source = source
+                                    .as_ref()
+                                    .expect("Internal must keep the driver error");
+                                assert!(
+                                    source.downcast_ref::<tokio_postgres::Error>().is_some(),
+                                    "SQLSTATE {code} source must be tokio_postgres::Error, got {source:?}"
+                                );
+                            }
+                            other => {
+                                panic!("SQLSTATE {code} must classify as Internal, got {other:?}")
+                            }
+                        },
+                    }
+                } else {
+                    assert!(result.is_ok(), "{} should be reindexed", resource.id());
+                }
+            }
+        }
+    }
+
+    /// One-shot grouped FTS failure for issue #1463: the grouped page attempt
+    /// must fail, but the per-resource fallback must then succeed for all three
+    /// resources.
+    ///
+    /// The trigger rejects only the first matching `resource_fts` insert and
+    /// counts attempts in a sequence (sequences survive the grouped attempt's
+    /// rollback), so the group's insert fails while every per-resource insert
+    /// in the fallback succeeds. All three slots stay `Ok` in input order,
+    /// each resource ends with exactly one `resource_fts` row and a rebuilt
+    /// `search_index`, and the bystander tenant is untouched.
+    #[tokio::test]
+    async fn postgres_integration_reindex_error_fallback_success() {
+        use helios_persistence::search::{ReindexSource, ReindexTarget};
+
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenant = create_tenant("reindex-error-fallback-success");
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        let bystander = create_tenant("reindex-error-fallback-success-bystander");
+        let bystander_id = bystander.tenant_id().as_str().to_string();
+        for id in ["fallback-ok-a", "fallback-once", "fallback-ok-c"] {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({"resourceType": "Observation", "id": id, "status": id}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        backend
+            .create(
+                &bystander,
+                "Observation",
+                json!({"resourceType": "Observation", "id": "bystander", "status": "bystander"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let page = backend
+            .fetch_resources_page(&tenant, "Observation", None, 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.resources
+                .iter()
+                .map(|resource| resource.id())
+                .collect::<Vec<_>>(),
+            vec!["fallback-ok-a", "fallback-once", "fallback-ok-c"]
+        );
+
+        let client = reindex_test_client_for(&dbname).await;
+        let page_ids = vec!["fallback-ok-a", "fallback-once", "fallback-ok-c"];
+        let expected_search_rows: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM search_index
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = ANY($2::text[])",
+                &[&tenant_id, &page_ids],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert!(
+            expected_search_rows > 0,
+            "create must leave search entries to rebuild"
+        );
+        let bystander_search_before: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM search_index
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = 'bystander'",
+                &[&bystander_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let bystander_fts_before: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM resource_fts
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = 'bystander'",
+                &[&bystander_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let attempts = format!("reindex_fallback_once_attempts_{suffix}");
+        let function_name = format!("reject_first_reindex_fts_{suffix}");
+        let trigger_name = format!("reject_first_reindex_fts_{suffix}");
+        client
+            .batch_execute(&format!(
+                "CREATE SEQUENCE {attempts};
+                 CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   IF NEW.tenant_id = '{tenant_id}' AND nextval('{attempts}') = 1 THEN
+                     RAISE EXCEPTION 'one shot' USING ERRCODE = '57014';
+                   END IF;
+                   RETURN NEW;
+                 END $$;
+                 CREATE TRIGGER {trigger_name} BEFORE INSERT ON resource_fts
+                 FOR EACH ROW EXECUTE FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            backend.write_search_entries_page(&tenant, &page.resources),
+        )
+        .await
+        .expect("FTS page fallback must not deadlock a one-connection pool");
+
+        let fired: i64 = client
+            .query_one(&format!("SELECT last_value FROM {attempts}"), &[])
+            .await
+            .unwrap()
+            .get(0);
+        client
+            .batch_execute(&format!(
+                "DROP TRIGGER {trigger_name} ON resource_fts;
+                 DROP FUNCTION {function_name}();
+                 DROP SEQUENCE {attempts};"
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            results.len(),
+            3,
+            "every page slot must survive the fallback"
+        );
+        for (resource, result) in page.resources.iter().zip(&results) {
+            assert!(
+                result.is_ok(),
+                "{} must succeed on the per-resource fallback: {result:?}",
+                resource.id()
+            );
+        }
+        assert_eq!(
+            fired, 4,
+            "the grouped attempt must fire the trigger once and the fallback once per resource"
+        );
+
+        let search_rows: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM search_index
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = ANY($2::text[])",
+                &[&tenant_id, &page_ids],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            search_rows, expected_search_rows,
+            "the fallback must rebuild exactly the created search entries, without duplicates"
+        );
+        let fts_rows: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM resource_fts
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = ANY($2::text[])",
+                &[&tenant_id, &page_ids],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            fts_rows, 3,
+            "each reindexed resource must end with exactly one full-text row"
+        );
+
+        let bystander_search_after: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM search_index
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = 'bystander'",
+                &[&bystander_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let bystander_fts_after: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM resource_fts
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = 'bystander'",
+                &[&bystander_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            bystander_search_after, bystander_search_before,
+            "another tenant's search entries must be unchanged"
+        );
+        assert_eq!(
+            bystander_fts_after, bystander_fts_before,
+            "another tenant's full-text row must be unchanged"
+        );
+    }
+
+    /// Foreground CRUD shares the issue-#1463 search-index writer choke point:
+    /// a `search_index` insert failure during `ResourceStorage::create` must
+    /// surface as `BackendError::Internal` with the typed driver error as its
+    /// source — not reclassified.
+    ///
+    /// The `57014` → `Timeout` classification lives only in the standalone
+    /// reindex fallback (`classify_standalone_reindex_error`); the foreground
+    /// path propagates the writer error unchanged, so the exact writer message
+    /// `Failed to insert search index rows: <server message>` is preserved.
+    /// Raises a real PostgreSQL error with `ERRCODE = '57014'` from a
+    /// `search_index` trigger scoped to one Observation, then calls the public
+    /// `ResourceStorage::create`.
+    #[tokio::test]
+    async fn postgres_integration_reindex_error_shared_callers_foreground_crud() {
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenant = create_tenant("reindex-shared-crud");
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+
+        let client = reindex_test_client_for(&dbname).await;
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let server_message = format!("crud search index probe {suffix}");
+        let function_name = format!("reject_shared_crud_search_index_{suffix}");
+        let trigger_name = format!("reject_shared_crud_search_index_{suffix}");
+        client
+            .batch_execute(&format!(
+                "CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   IF NEW.tenant_id = '{tenant_id}' AND NEW.resource_id = 'crud-target' THEN
+                     RAISE EXCEPTION '{server_message}' USING ERRCODE = '57014';
+                   END IF;
+                   RETURN NEW;
+                 END $$;
+                 CREATE TRIGGER {trigger_name} BEFORE INSERT ON search_index
+                 FOR EACH ROW EXECUTE FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        let result = backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({"resourceType": "Observation", "id": "crud-target", "status": "final"}),
+                FhirVersion::default(),
+            )
+            .await;
+
+        client
+            .batch_execute(&format!(
+                "DROP TRIGGER {trigger_name} ON search_index;
+                 DROP FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        let error = result.expect_err("trigger target create must fail");
+        match error {
+            StorageError::Backend(BackendError::Internal {
+                backend_name,
+                message,
+                source,
+            }) => {
+                assert_eq!(backend_name, "postgres");
+                assert_eq!(
+                    message,
+                    format!("Failed to insert search index rows: {server_message}")
+                );
+                let source = source
+                    .as_ref()
+                    .expect("Internal must keep the driver error");
+                assert!(
+                    source.downcast_ref::<tokio_postgres::Error>().is_some(),
+                    "foreground CRUD source must be tokio_postgres::Error, got {source:?}"
+                );
+            }
+            other => {
+                panic!("foreground CRUD search-index failure must stay Internal, got {other:?}")
+            }
+        }
+    }
+
+    /// Transaction/bundle ingest shares the issue-#1463 search-index writer
+    /// choke point: a `search_index` insert failure during the buffered
+    /// transaction flush (`PostgresSearchIndexWriter::insert_rows_multi`) must
+    /// surface as `BackendError::Internal` with the typed driver error as its
+    /// source — not reclassified.
+    ///
+    /// The `57014` → `Timeout` classification lives only in the standalone
+    /// reindex fallback (`classify_standalone_reindex_error`); the ingest path
+    /// propagates the writer error unchanged, so the exact writer message
+    /// `Failed to insert search index rows: <server message>` is preserved.
+    /// Raises a real PostgreSQL error with `ERRCODE = '57014'` from a
+    /// `search_index` trigger scoped to one Observation, then creates two
+    /// resources through the public `TransactionProvider::begin_transaction` +
+    /// `Transaction::create` + `commit` route (which flushes both creates as
+    /// one `insert_rows_multi` batch).
+    #[tokio::test]
+    async fn postgres_integration_reindex_error_shared_callers_ingest() {
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenant = create_tenant("reindex-shared-ingest");
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+
+        let client = reindex_test_client_for(&dbname).await;
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let server_message = format!("ingest search index probe {suffix}");
+        let function_name = format!("reject_shared_ingest_search_index_{suffix}");
+        let trigger_name = format!("reject_shared_ingest_search_index_{suffix}");
+        client
+            .batch_execute(&format!(
+                "CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   IF NEW.tenant_id = '{tenant_id}' AND NEW.resource_id = 'ingest-target' THEN
+                     RAISE EXCEPTION '{server_message}' USING ERRCODE = '57014';
+                   END IF;
+                   RETURN NEW;
+                 END $$;
+                 CREATE TRIGGER {trigger_name} BEFORE INSERT ON search_index
+                 FOR EACH ROW EXECUTE FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        let mut transaction = backend
+            .begin_transaction(&tenant, TransactionOptions::new())
+            .await
+            .unwrap();
+        transaction
+            .create(
+                "Observation",
+                json!({"resourceType": "Observation", "id": "ingest-target", "status": "final"}),
+            )
+            .await
+            .unwrap();
+        transaction
+            .create(
+                "Observation",
+                json!({"resourceType": "Observation", "id": "ingest-ok", "status": "final"}),
+            )
+            .await
+            .unwrap();
+        let result = Box::new(transaction).commit().await;
+
+        client
+            .batch_execute(&format!(
+                "DROP TRIGGER {trigger_name} ON search_index;
+                 DROP FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        let error = result.expect_err("trigger target ingest must fail");
+        match error {
+            StorageError::Backend(BackendError::Internal {
+                backend_name,
+                message,
+                source,
+            }) => {
+                assert_eq!(backend_name, "postgres");
+                assert_eq!(
+                    message,
+                    format!("Failed to insert search index rows: {server_message}")
+                );
+                let source = source
+                    .as_ref()
+                    .expect("Internal must keep the driver error");
+                assert!(
+                    source.downcast_ref::<tokio_postgres::Error>().is_some(),
+                    "ingest source must be tokio_postgres::Error, got {source:?}"
+                );
+            }
+            other => {
+                panic!("ingest search-index failure must stay Internal, got {other:?}")
+            }
+        }
+    }
+
+    /// Offloaded shared caller for issue #1463: with search reads offloaded,
+    /// `write_search_entries_page` early-routes to the individual writer and
+    /// skips the standalone reindex classification, so a `57014` FTS failure
+    /// must stay `BackendError::Internal` with the typed driver error as its
+    /// source — not reclassified to `Timeout`.
+    ///
+    /// Creates one small Observation before offloading (foreground indexing
+    /// still on), fetches the page, then sets `search_offloaded`. Raises a
+    /// real PostgreSQL error with `ERRCODE = '57014'` from a `resource_fts`
+    /// trigger scoped to the target, then calls the public
+    /// `write_search_entries_page`. No Elasticsearch service is involved.
+    #[tokio::test]
+    async fn postgres_integration_reindex_error_shared_callers_offloaded() {
+        use helios_persistence::search::{ReindexSource, ReindexTarget};
+
+        let (mut backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenant = create_tenant("reindex-shared-offloaded");
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({"resourceType": "Observation", "id": "offloaded-target", "status": "final"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let page = backend
+            .fetch_resources_page(&tenant, "Observation", None, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.resources
+                .iter()
+                .map(|resource| resource.id())
+                .collect::<Vec<_>>(),
+            vec!["offloaded-target"]
+        );
+        backend.set_search_offloaded(true);
+
+        let client = reindex_test_client_for(&dbname).await;
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let server_message = format!("offloaded fts probe {suffix}");
+        let function_name = format!("reject_shared_offloaded_fts_{suffix}");
+        let trigger_name = format!("reject_shared_offloaded_fts_{suffix}");
+        client
+            .batch_execute(&format!(
+                "CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   IF NEW.tenant_id = '{tenant_id}' AND NEW.resource_id = 'offloaded-target' THEN
+                     RAISE EXCEPTION '{server_message}' USING ERRCODE = '57014';
+                   END IF;
+                   RETURN NEW;
+                 END $$;
+                 CREATE TRIGGER {trigger_name} BEFORE INSERT ON resource_fts
+                 FOR EACH ROW EXECUTE FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            backend.write_search_entries_page(&tenant, &page.resources),
+        )
+        .await
+        .expect("offloaded FTS page must not deadlock a one-connection pool");
+
+        client
+            .batch_execute(&format!(
+                "DROP TRIGGER {trigger_name} ON resource_fts;
+                 DROP FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        let error = results
+            .into_iter()
+            .next()
+            .expect("one resource must yield one result")
+            .expect_err("trigger target must fail");
+        match error {
+            StorageError::Backend(BackendError::Internal {
+                backend_name,
+                message,
+                source,
+            }) => {
+                assert_eq!(backend_name, "postgres");
+                assert_eq!(message, "Failed to insert FTS content: db error");
+                let source = source
+                    .as_ref()
+                    .expect("Internal must keep the driver error");
+                assert!(
+                    source.downcast_ref::<tokio_postgres::Error>().is_some(),
+                    "offloaded source must be tokio_postgres::Error, got {source:?}"
+                );
+            }
+            other => {
+                panic!("offloaded FTS failure must stay Internal, got {other:?}")
+            }
+        }
+    }
+
+    /// Final standalone fallback at the `search_index` DELETE for issue #1463:
+    /// a `BEFORE DELETE ON search_index` trigger raising real `57014` for the
+    /// target makes the grouped page delete fail, and the final individual
+    /// `delete_search_entries` for the target fails the same way, so the
+    /// standalone fallback classifies it as `BackendError::Timeout` with the
+    /// complete exact message `Failed to delete search index: db error`.
+    ///
+    /// Three small Observations plus another-tenant bystander isolate the
+    /// failure: the other page slots stay `Ok` in input order and the
+    /// bystander's `search_index` rows are unchanged.
+    #[tokio::test]
+    async fn postgres_integration_reindex_error_locations_search_delete() {
+        use helios_persistence::search::{ReindexSource, ReindexTarget};
+
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenant = create_tenant("reindex-locations-delete");
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        let bystander = create_tenant("reindex-locations-delete-bystander");
+        let bystander_id = bystander.tenant_id().as_str().to_string();
+        for id in ["a-normal", "b-target", "c-normal"] {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({"resourceType": "Observation", "id": id, "status": "final"}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        backend
+            .create(
+                &bystander,
+                "Observation",
+                json!({"resourceType": "Observation", "id": "bystander", "status": "final"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let page = backend
+            .fetch_resources_page(&tenant, "Observation", None, 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.resources
+                .iter()
+                .map(|resource| resource.id())
+                .collect::<Vec<_>>(),
+            vec!["a-normal", "b-target", "c-normal"]
+        );
+
+        let client = reindex_test_client_for(&dbname).await;
+        let bystander_search_before: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM search_index
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = 'bystander'",
+                &[&bystander_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let function_name = format!("reject_reindex_search_delete_{suffix}");
+        let trigger_name = format!("reject_reindex_search_delete_{suffix}");
+        client
+            .batch_execute(&format!(
+                "CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   IF OLD.tenant_id = '{tenant_id}' AND OLD.resource_id = 'b-target' THEN
+                     RAISE EXCEPTION 'search delete simulation' USING ERRCODE = '57014';
+                   END IF;
+                   RETURN OLD;
+                 END $$;
+                 CREATE TRIGGER {trigger_name} BEFORE DELETE ON search_index
+                 FOR EACH ROW EXECUTE FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            backend.write_search_entries_page(&tenant, &page.resources),
+        )
+        .await
+        .expect("search-index delete fallback must not deadlock a one-connection pool");
+
+        client
+            .batch_execute(&format!(
+                "DROP TRIGGER {trigger_name} ON search_index;
+                 DROP FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            results.len(),
+            3,
+            "every page slot must survive the fallback"
+        );
+        for (resource, result) in page.resources.iter().zip(&results) {
+            if resource.id() == "b-target" {
+                let error = result.as_ref().expect_err("trigger target must fail");
+                match error {
+                    StorageError::Backend(BackendError::Timeout {
+                        backend_name,
+                        message,
+                    }) => {
+                        assert_eq!(backend_name, "postgres");
+                        assert_eq!(message, "Failed to delete search index: db error");
+                    }
+                    other => panic!(
+                        "search_index DELETE fallback failure must classify as Timeout, got {other:?}"
+                    ),
+                }
+            } else {
+                assert!(result.is_ok(), "{} should be reindexed", resource.id());
+            }
+        }
+
+        let bystander_search_after: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM search_index
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = 'bystander'",
+                &[&bystander_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            bystander_search_after, bystander_search_before,
+            "another tenant's search entries must be unchanged"
+        );
+    }
+
+    /// Final standalone fallback at the `search_index` INSERT for issue #1463:
+    /// a `BEFORE INSERT ON search_index` trigger raising real `53300` for the
+    /// target makes the grouped `insert_rows_multi` fail, and the final
+    /// individual writer fails the same way, so the standalone fallback
+    /// classifies it as `BackendError::Unavailable` with the exact rich writer
+    /// message `Failed to insert search index rows: <server message>`.
+    ///
+    /// Three small Observations plus another-tenant bystander isolate the
+    /// failure: the other page slots stay `Ok` in input order and the
+    /// bystander's `search_index` rows are unchanged.
+    #[tokio::test]
+    async fn postgres_integration_reindex_error_locations_search_insert() {
+        use helios_persistence::search::{ReindexSource, ReindexTarget};
+
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenant = create_tenant("reindex-locations-insert");
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        let bystander = create_tenant("reindex-locations-insert-bystander");
+        let bystander_id = bystander.tenant_id().as_str().to_string();
+        for id in ["a-normal", "b-target", "c-normal"] {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({"resourceType": "Observation", "id": id, "status": "final"}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        backend
+            .create(
+                &bystander,
+                "Observation",
+                json!({"resourceType": "Observation", "id": "bystander", "status": "final"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let page = backend
+            .fetch_resources_page(&tenant, "Observation", None, 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.resources
+                .iter()
+                .map(|resource| resource.id())
+                .collect::<Vec<_>>(),
+            vec!["a-normal", "b-target", "c-normal"]
+        );
+
+        let client = reindex_test_client_for(&dbname).await;
+        let bystander_search_before: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM search_index
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = 'bystander'",
+                &[&bystander_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let server_message = format!("search insert probe {suffix}");
+        let function_name = format!("reject_reindex_search_insert_{suffix}");
+        let trigger_name = format!("reject_reindex_search_insert_{suffix}");
+        client
+            .batch_execute(&format!(
+                "CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   IF NEW.tenant_id = '{tenant_id}' AND NEW.resource_id = 'b-target' THEN
+                     RAISE EXCEPTION '{server_message}' USING ERRCODE = '53300';
+                   END IF;
+                   RETURN NEW;
+                 END $$;
+                 CREATE TRIGGER {trigger_name} BEFORE INSERT ON search_index
+                 FOR EACH ROW EXECUTE FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            backend.write_search_entries_page(&tenant, &page.resources),
+        )
+        .await
+        .expect("search-index insert fallback must not deadlock a one-connection pool");
+
+        client
+            .batch_execute(&format!(
+                "DROP TRIGGER {trigger_name} ON search_index;
+                 DROP FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            results.len(),
+            3,
+            "every page slot must survive the fallback"
+        );
+        for (resource, result) in page.resources.iter().zip(&results) {
+            if resource.id() == "b-target" {
+                let error = match result {
+                    Err(error) => error,
+                    Ok(_) => panic!("trigger target must fail"),
+                };
+                match error {
+                    StorageError::Backend(BackendError::Unavailable {
+                        backend_name,
+                        message,
+                    }) => {
+                        assert_eq!(backend_name, "postgres");
+                        assert_eq!(
+                            message.as_str(),
+                            format!("Failed to insert search index rows: {server_message}")
+                        );
+                    }
+                    other => panic!(
+                        "search_index INSERT fallback failure must classify as Unavailable, got {other:?}"
+                    ),
+                }
+            } else {
+                assert!(result.is_ok(), "{} should be reindexed", resource.id());
+            }
+        }
+
+        let bystander_search_after: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM search_index
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = 'bystander'",
+                &[&bystander_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            bystander_search_after, bystander_search_before,
+            "another tenant's search entries must be unchanged"
+        );
+    }
+
+    /// Final standalone fallback at the empty-content `resource_fts` DELETE
+    /// for issue #1463. The trigger raises real `57014` during both the grouped
+    /// delete and again in the individual fallback's `delete_search_entries`
+    /// FTS cleanup, before that fallback attempts to write the empty content.
+    /// The target slot must retain the original timeout classification and
+    /// complete error message.
+    #[tokio::test]
+    async fn postgres_integration_reindex_error_locations_fts_delete() {
+        use helios_persistence::search::ReindexTarget;
+        use helios_persistence::types::StoredResource;
+
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenant = create_tenant("reindex-locations-fts-delete");
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        let bystander = create_tenant("reindex-locations-fts-delete-bystander");
+        let bystander_id = bystander.tenant_id().as_str().to_string();
+        let ids = ["a-normal", "b-target", "c-normal"];
+        let resources: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                StoredResource::new(
+                    "Patient",
+                    *id,
+                    tenant.tenant_id().clone(),
+                    if *id == "b-target" {
+                        json!({})
+                    } else {
+                        json!({
+                            "resourceType": "Patient",
+                            "id": id,
+                            "name": [{"family": "Reindex"}]
+                        })
+                    },
+                    FhirVersion::default(),
+                )
+            })
+            .collect();
+
+        let client = reindex_test_client_for(&dbname).await;
+        client
+            .execute(
+                "INSERT INTO resource_fts
+                 (tenant_id, resource_type, resource_id, narrative_tsvector, content_tsvector)
+                 VALUES ($1, 'Patient', 'b-target', to_tsvector('english', 'stale'), to_tsvector('english', 'stale')),
+                        ($2, 'Patient', 'bystander', to_tsvector('english', 'bystander'), to_tsvector('english', 'bystander'))",
+                &[&tenant_id, &bystander_id],
+            )
+            .await
+            .unwrap();
+        let bystander_before: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM resource_fts
+                 WHERE tenant_id = $1 AND resource_type = 'Patient' AND resource_id = 'bystander'",
+                &[&bystander_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let attempts = format!("fts_delete_attempts_{suffix}");
+        let function_name = format!("reject_reindex_fts_delete_{suffix}");
+        let trigger_name = format!("reject_reindex_fts_delete_{suffix}");
+        client
+            .batch_execute(&format!(
+                "CREATE SEQUENCE {attempts};
+                 CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   IF OLD.tenant_id = '{tenant_id}' AND OLD.resource_type = 'Patient'
+                     AND OLD.resource_id = 'b-target' THEN
+                     PERFORM nextval('{attempts}');
+                     RAISE EXCEPTION 'FTS delete simulation' USING ERRCODE = '57014';
+                   END IF;
+                   RETURN OLD;
+                 END $$;
+                 CREATE TRIGGER {trigger_name} BEFORE DELETE ON resource_fts
+                 FOR EACH ROW EXECUTE FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            backend.write_search_entries_page(&tenant, &resources),
+        )
+        .await
+        .expect("FTS delete fallback must not deadlock a one-connection pool");
+
+        let attempted: i64 = client
+            .query_one(&format!("SELECT last_value FROM {attempts}"), &[])
+            .await
+            .unwrap()
+            .get(0);
+        client
+            .batch_execute(&format!(
+                "DROP TRIGGER {trigger_name} ON resource_fts;
+                 DROP FUNCTION {function_name}();
+                 DROP SEQUENCE {attempts};"
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(attempted, 2, "group delete and individual retry both fail");
+        assert_eq!(results.len(), ids.len(), "every page slot must survive");
+        assert_eq!(
+            resources
+                .iter()
+                .map(|resource| resource.id())
+                .collect::<Vec<_>>(),
+            ids,
+            "results correspond to the input resource IDs in slot order"
+        );
+        for (id, result) in ids.iter().zip(&results) {
+            if *id == "b-target" {
+                match result.as_ref().expect_err("FTS trigger target must fail") {
+                    StorageError::Backend(BackendError::Timeout {
+                        backend_name,
+                        message,
+                    }) => {
+                        assert_eq!(backend_name, "postgres");
+                        assert_eq!(message, "Failed to delete FTS index: db error");
+                    }
+                    other => {
+                        panic!("empty FTS DELETE fallback must classify as Timeout, got {other:?}")
+                    }
+                }
+            } else {
+                assert!(result.is_ok(), "{id} should be reindexed");
+            }
+        }
+
+        let bystander_after: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM resource_fts
+                 WHERE tenant_id = $1 AND resource_type = 'Patient' AND resource_id = 'bystander'",
+                &[&bystander_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            bystander_after, bystander_before,
+            "another tenant is unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_reindex_error_replacement_replay() {
+        use helios_persistence::search::{ReindexSource, ReindexTarget};
+
+        async fn table_snapshot(
+            client: &tokio_postgres::Client,
+            tenant_id: &str,
+            table: &str,
+        ) -> Vec<String> {
+            let sql = match table {
+                "search_index" => {
+                    "SELECT (to_jsonb(s) - 'id')::text
+                     FROM search_index s WHERE tenant_id = $1"
+                }
+                "resource_fts" => {
+                    "SELECT to_jsonb(f)::text
+                     FROM resource_fts f WHERE tenant_id = $1"
+                }
+                "resources" => {
+                    "SELECT to_jsonb(r)::text
+                     FROM resources r WHERE tenant_id = $1"
+                }
+                "resource_history" => {
+                    "SELECT to_jsonb(h)::text
+                     FROM resource_history h WHERE tenant_id = $1"
+                }
+                _ => panic!("unsupported snapshot table {table}"),
+            };
+            let mut rows: Vec<String> = client
+                .query(sql, &[&tenant_id])
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.get(0))
+                .collect();
+            rows.sort();
+            rows
+        }
+
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenant = create_tenant("reindex-replacement-replay");
+        let bystander = create_tenant("reindex-replacement-replay-bystander");
+        for (scoped_tenant, id, family) in [
+            (&tenant, "replacement-a", "Alpha"),
+            (&tenant, "replacement-b", "Bravo"),
+            (&tenant, "replacement-c", "Charlie"),
+            (&bystander, "replacement-bystander", "Bystander"),
+        ] {
+            backend
+                .create(
+                    scoped_tenant,
+                    "Patient",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": id,
+                        "identifier": [
+                            {"system": "http://example.org/mrn", "value": format!("MRN-{id}")},
+                            {"system": "http://example.org/alternate", "value": format!("ALT-{id}")}
+                        ],
+                        "name": [{"family": family, "given": ["Replay"]}],
+                        "active": true
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let page = backend
+            .fetch_resources_page(&tenant, "Patient", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(page.resources.len(), 3);
+        let mut page_ids: Vec<_> = page
+            .resources
+            .iter()
+            .map(|resource| resource.id())
+            .collect();
+        page_ids.sort();
+        assert_eq!(
+            page_ids,
+            vec!["replacement-a", "replacement-b", "replacement-c"]
+        );
+
+        let page_results = backend
+            .write_search_entries_page(&tenant, &page.resources)
+            .await;
+        assert_eq!(page_results.len(), page.resources.len());
+        assert!(
+            page_results.iter().all(Result::is_ok),
+            "the initial page write must commit successfully: {page_results:?}"
+        );
+
+        let client = reindex_test_client_for(&dbname).await;
+        let tenant_id = tenant.tenant_id().as_str();
+        let bystander_id = bystander.tenant_id().as_str();
+        let target_baseline: Vec<_> = [
+            "search_index",
+            "resource_fts",
+            "resources",
+            "resource_history",
+        ]
+        .into_iter()
+        .map(|table| table.to_string())
+        .collect();
+        let mut target_before = Vec::with_capacity(target_baseline.len());
+        let mut bystander_before = Vec::with_capacity(target_baseline.len());
+        for table in &target_baseline {
+            target_before.push((
+                table.clone(),
+                table_snapshot(&client, tenant_id, table).await,
+            ));
+            bystander_before.push((
+                table.clone(),
+                table_snapshot(&client, bystander_id, table).await,
+            ));
+        }
+        assert!(
+            !target_before[0].1.is_empty(),
+            "search index baseline exists"
+        );
+        assert!(!target_before[1].1.is_empty(), "FTS baseline exists");
+        assert_eq!(target_before[2].1.len(), 3, "three current resources");
+        assert_eq!(target_before[3].1.len(), 3, "three history rows");
+
+        for resource in &page.resources {
+            backend
+                .delete_search_entries(&tenant, resource.resource_type(), resource.id())
+                .await
+                .unwrap();
+            backend
+                .write_search_entries(&tenant, resource)
+                .await
+                .unwrap();
+
+            for (table, expected_rows) in &target_before {
+                assert_eq!(
+                    table_snapshot(&client, tenant_id, table).await,
+                    *expected_rows,
+                    "{table} must remain logically identical after replacing {}",
+                    resource.id()
+                );
+            }
+            for (table, expected_rows) in &bystander_before {
+                assert_eq!(
+                    table_snapshot(&client, bystander_id, table).await,
+                    *expected_rows,
+                    "another tenant's {table} rows must remain unchanged"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -12811,7 +14188,7 @@ mod postgres_integration {
                     .sum();
                 assert!(page_ids.len() <= 4);
                 assert!(
-                    page_bytes <= cap || (page_ids.len() == 1 && page_bytes > cap),
+                    page_bytes <= cap || page_ids.len() == 1,
                     "cap {cap}, page {page_ids:?}, bytes {page_bytes}"
                 );
                 if pages.is_empty() {

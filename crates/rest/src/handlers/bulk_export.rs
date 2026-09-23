@@ -782,6 +782,18 @@ where
     jobs.delete_export(tenant.context(), &job_id)
         .await
         .map_err(map_storage_err)?;
+    // Sweep the outputs again now the row is gone (#1272). Cancellation is
+    // cooperative, so a worker may still be mid-batch: it can recreate the
+    // job directory and finalize one more part after the first sweep, then
+    // see the job cancelled and exit without touching its outputs. This
+    // second sweep reclaims that straggler. A worker that is still writing
+    // after this point finds the row gone on its way out and deletes the
+    // outputs itself, so whichever side runs last, the last operation on the
+    // job's directory is a delete.
+    output
+        .delete_job_outputs(tenant.context(), &job_id)
+        .await
+        .map_err(map_storage_err)?;
 
     emit_export_audit(
         &state,
