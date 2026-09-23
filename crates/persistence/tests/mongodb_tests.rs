@@ -594,6 +594,51 @@ async fn mongodb_contained_sort_and_id_only_contained() {
     contained_suite::sort_and_id_only_contained(&backend, "contained-sort-1407").await;
 }
 
+/// #1407: composites under `_contained` are matched within one contained
+/// resource — a code pairs with the quantity of the *same* component, never
+/// across components or sibling contained resources. Strict: unlike the
+/// `criteria_are_applied_or_rejected` composite cases, which accept a refusal
+/// naming the parameter, these cases demand the answer. Mixed criteria must
+/// also match on the same contained resource.
+#[tokio::test]
+async fn mongodb_contained_composites_pair_within_one_resource() {
+    let Some(backend) = create_backend_with_full_registry("contained_comp").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    contained_suite::contained_composites_pair_within_one_resource(
+        &backend,
+        "contained-composites-1407",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mongodb_contained_rejects_ambiguous_composites_and_modifiers() {
+    let Some(backend) = create_backend_with_full_registry("contained_comp_guard").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    contained_suite::ambiguous_composite_and_modifier_rejected(
+        &backend,
+        "contained-composite-guard-1407",
+    )
+    .await;
+}
+
+// Strict `_contained=both` dedup (#1407): a container of the searched type
+// that also matches top-level is listed and counted once. Fails while the
+// overlap is deduped per top-level page and double-counted in `_total`.
+#[tokio::test]
+async fn mongodb_contained_both_dedups_container_also_matching_top_level() {
+    let Some(backend) = create_backend_with_full_registry("contained_both").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    contained_suite::both_dedups_container_also_matching_top_level(&backend, "contained-both-1407")
+        .await;
+}
+
 /// The backend-agnostic suite for exponent-form number and quantity search
 /// values (#1337). Same `#[path]` arrangement.
 #[path = "search/number_exponent_suite.rs"]
@@ -5173,11 +5218,31 @@ async fn mongodb_integration_contained_both_dedupes_a_container_that_is_also_a_t
         vec!["Patient/dual", "Observation/obs-holder"],
         "dual must appear once, top-level first"
     );
-    // total = top_total (1: dual) + contained_total (2: dual and
-    // obs-holder, both matched as containers before de-duplication) = 3.
-    // A dual match is counted in both sources — this is the documented
-    // trade-off of paging each source on the server independently.
-    assert_eq!(r.total, Some(3));
+    // The overlap contributes once to both the result set and its count.
+    assert_eq!(r.total, Some(2));
+    assert_eq!(backend.search_count(&tenant, &q).await.unwrap(), 2);
+
+    // Paging across the top-level/contained boundary must not return the
+    // overlapping container again or leave an empty slot on the second page.
+    q.count = Some(1);
+    for (offset, expected) in [
+        (0, vec!["Patient/dual"]),
+        (1, vec!["Observation/obs-holder"]),
+        (2, vec![]),
+    ] {
+        q.offset = Some(offset);
+        let page = backend.search(&tenant, &q).await.unwrap();
+        assert_eq!(
+            page.resources
+                .items
+                .iter()
+                .map(|x| x.url())
+                .collect::<Vec<_>>(),
+            expected,
+            "unexpected page at offset {offset}"
+        );
+        assert_eq!(page.total, Some(2), "wrong total at offset {offset}");
+    }
 }
 
 #[tokio::test]
@@ -15545,46 +15610,56 @@ async fn mongodb_integration_composite_conditional_create_matches_existing() {
     }
 }
 
-/// Fix 3 (blocking): `_contained` combined with a composite parameter must
-/// be a clear 400, not a silent partial filter -- `matching_contained`
-/// skips `Composite` params entirely, so `_contained=both` would otherwise
-/// filter only its top-level half by the composite and let the contained
-/// half ignore it.
+/// A supported token + quantity composite applies to contained resources
+/// under `_contained=both`, including the count path.
 #[tokio::test]
-async fn mongodb_integration_contained_rejects_composite_parameter() {
+async fn mongodb_integration_contained_matches_composite_parameter() {
     use helios_persistence::types::ContainedMode;
 
     let Some(backend) = create_backend_with_full_registry("contained_composite").await else {
         eprintln!(
-            "Skipping mongodb_integration_contained_rejects_composite_parameter (requires Docker or HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_contained_matches_composite_parameter (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
     let tenant = create_tenant("tenant-contained-composite");
+    backend
+        .create(
+            &tenant,
+            "DiagnosticReport",
+            json!({
+                "resourceType": "DiagnosticReport",
+                "id": "container",
+                "status": "final",
+                "code": {"text": "panel"},
+                "contained": [{
+                    "resourceType": "Observation",
+                    "id": "height",
+                    "status": "final",
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "8302-2"}]},
+                    "valueQuantity": {"value": 170, "system": "http://unitsofmeasure.org", "code": "cm"}
+                }]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed contained height");
 
     let mut query = code_value_quantity_query("http://loinc.org|8302-2$gt150");
     query.contained = ContainedMode::Both;
 
-    let err = backend
+    let found = backend
         .search(&tenant, &query)
         .await
-        .expect_err("composite + _contained=both must be rejected, not silently under-filtered");
-    assert!(
-        matches!(
-            err,
-            StorageError::Search(SearchError::InvalidComposite { .. })
-        ),
-        "expected InvalidComposite, got {err:?}"
-    );
+        .expect("supported composite under _contained=both");
+    assert_eq!(found.resources.items.len(), 1);
+    assert_eq!(found.resources.items[0].id(), "container");
 
-    let count_err = backend
+    let count = backend
         .search_count(&tenant, &query)
         .await
-        .expect_err("search_count must reject the same combination");
-    assert!(matches!(
-        count_err,
-        StorageError::Search(SearchError::InvalidComposite { .. })
-    ));
+        .expect("count supported composite under _contained=both");
+    assert_eq!(count, 1);
 }
 
 /// Fix 5 test gap: `:not` on a composite parameter must be rejected by
