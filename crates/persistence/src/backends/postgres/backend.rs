@@ -820,6 +820,7 @@ impl PostgresBackend {
     pub async fn get_client(&self) -> StorageResult<deadpool_postgres::Client> {
         use deadpool_postgres::{PoolError, TimeoutType};
 
+        let _checkout = crate::perf::span(crate::perf::Phase::PostgresPoolCheckout);
         self.pool.get().await.map_err(|e| match e {
             // Every connection is busy and the wait timeout elapsed. The database
             // is healthy — we are simply over capacity — so this is a retryable

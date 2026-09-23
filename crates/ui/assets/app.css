@@ -1679,8 +1679,8 @@ select.field__input {
 .spinner,
 .btn[aria-busy="true"]::after {
   /* Explicit border-box (#786): the `*` reset does not match pseudo-elements,
-     and content-box would render the ::after ring at 18px — off center against
-     the -7px offsets below. */
+     and content-box would render the ::after ring at 18px instead of the
+     14px glyph the standalone .spinner draws. */
   box-sizing: border-box;
   width: 14px;
   height: 14px;
@@ -1697,26 +1697,40 @@ select.field__input {
   .btn[aria-busy="true"]::after { animation: none; }
 }
 
-/* The busy button (#679), driven by busy.js: the label yields its space to
-   the ring — width stays put, the accessible name stays in the tree. Under
-   reduced motion the ring remains as a static glyph (the animation stops
-   above); a merely-dimmed label would read as disabled, not working. */
+/* The busy button (#679), driven by busy.js: the label stays and the ring
+   joins it as a trailing flex item, spaced by .btn's own gap (#1253). A
+   blanked label left an empty pill that read as "the action vanished", not
+   "working". Under reduced motion the ring remains as a static glyph (the
+   animation stops above). */
 .btn[aria-busy="true"] {
-  position: relative;
-  color: transparent;
   cursor: progress;
 }
 
 .btn[aria-busy="true"]::after {
   content: "";
-  position: absolute;
-  top: calc(50% - 7px);
-  left: calc(50% - 7px);
+  flex: none;
+}
+
+/* A button busy.js can mark busy carries .btn--busy-slot, so the ring's
+   room (14px ring + 6px gap) is there before the click and the button never
+   changes width (#1253 review). At rest the room is split into two empty
+   4px boxes, one each side (4 + 6 gap on both sides = 20), which keeps the
+   label centered; busy drops the leading box and the trailing one becomes
+   the ring. Without the class a busy button still works, it just grows. */
+.btn--busy-slot::before,
+.btn--busy-slot::after {
+  content: "";
+  flex: none;
+  width: 4px;
+}
+
+.btn--busy-slot[aria-busy="true"]::before {
+  display: none;
 }
 
 /* The ring must not inherit accent-on-accent on the filled button — the
-   track all but vanishes in dark theme. Explicit white, not currentColor:
-   the button's color is transparent while busy. */
+   track all but vanishes in dark theme. Explicit white, not currentColor,
+   so the ring does not follow the label's color. */
 .btn--primary[aria-busy="true"]::after {
   border-color: rgb(255 255 255 / 45%);
   border-top-color: #ffffff;

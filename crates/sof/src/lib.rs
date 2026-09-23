@@ -1156,22 +1156,72 @@ pub fn create_bundle_from_resources_for_version(
 ///
 /// Separates the one-time setup (absent-target validation, group member
 /// resolution, patient-set construction) from the per-resource membership
-/// test so the streaming path can validate once — against the eagerly-loaded
-/// Patient/Group documents — then apply the filter one document at a time
-/// without materialising the full corpus.
+/// test so the streaming path can validate once — against just the
+/// Patient/Group documents the references name — then apply the filter one
+/// document at a time without materialising the full corpus.
 pub struct CompartmentFilter {
     targets: std::collections::HashSet<String>,
     group_refs: Vec<String>,
     fhir_version: FhirVersion,
 }
 
+/// Splits a compartment `patient=` / `group=` reference into its canonical
+/// `Type/id` form and the bare resource id it names.
+///
+/// References arrive either fully qualified (`Patient/p1`) or as a bare id
+/// (`p1`); a versioned reference (`Patient/p1/_history/2`) names the same
+/// resource. The id is `None` only for a reference that names no id at all
+/// (`""` / `"Patient/"`), which cannot resolve and is reported as absent.
+fn canonical_compartment_ref(reference: &str, resource_type: &str) -> (String, Option<String>) {
+    let prefix = format!("{}/", resource_type);
+    let canonical = if reference.starts_with(&prefix) {
+        reference.to_string()
+    } else {
+        format!("{}{}", prefix, reference)
+    };
+    let id = canonical
+        .strip_prefix(&prefix)
+        .and_then(|rest| rest.split('/').next())
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+    (canonical, id)
+}
+
+/// Returns the distinct resource ids named by a set of compartment references,
+/// in first-seen order.
+///
+/// Lets a caller fetch exactly the `resource_type` documents that
+/// [`CompartmentFilter::build`] needs — by id, rather than by scanning the
+/// type — so filter setup stays proportional to the number of references
+/// instead of to the corpus.
+pub fn compartment_reference_ids(refs: &[String], resource_type: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut ids = Vec::new();
+    for reference in refs {
+        if let (_, Some(id)) = canonical_compartment_ref(reference, resource_type)
+            && seen.insert(id.clone())
+        {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
 impl CompartmentFilter {
-    /// Builds the filter from pre-loaded supporting resources (all Patient and
-    /// Group documents that the compartment references require).
+    /// Builds the filter from the supporting Patient/Group resources.
     ///
     /// Validates that every patient and group reference resolves to a resource
     /// in `supporting`, then constructs the effective `Patient/{id}` target set.
     /// Errors identically to [`filter_resources_by_patient_and_group`].
+    ///
+    /// `supporting` need only contain the Patient and Group documents that
+    /// `patient_refs` / `group_refs` actually name — validation is a point
+    /// lookup per reference and a Group's members are read off that Group, so
+    /// nothing here consumes the rest of either collection. Callers that can
+    /// fetch by id should use [`compartment_reference_ids`] and pass just those
+    /// documents; the whole-collection slice that
+    /// [`filter_resources_by_patient_and_group`] passes is a superset, not a
+    /// requirement.
     pub fn build(
         patient_refs: &[String],
         group_refs: &[String],
@@ -1181,46 +1231,20 @@ impl CompartmentFilter {
         use std::collections::HashSet;
 
         let mut absent: Vec<String> = Vec::new();
-        for r in patient_refs {
-            let canonical = if r.starts_with("Patient/") {
-                r.clone()
-            } else {
-                format!("Patient/{}", r)
-            };
-            let id = canonical
-                .strip_prefix("Patient/")
-                .and_then(|s| s.split('/').next());
-            let found = id
-                .map(|id| {
-                    supporting.iter().any(|res| {
-                        res.get("resourceType").and_then(|v| v.as_str()) == Some("Patient")
-                            && res.get("id").and_then(|v| v.as_str()) == Some(id)
+        for (refs, resource_type) in [(patient_refs, "Patient"), (group_refs, "Group")] {
+            for reference in refs {
+                let (canonical, id) = canonical_compartment_ref(reference, resource_type);
+                let found = id
+                    .map(|id| {
+                        supporting.iter().any(|res| {
+                            res.get("resourceType").and_then(|v| v.as_str()) == Some(resource_type)
+                                && res.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
+                        })
                     })
-                })
-                .unwrap_or(false);
-            if !found {
-                absent.push(canonical);
-            }
-        }
-        for g in group_refs {
-            let canonical = if g.starts_with("Group/") {
-                g.clone()
-            } else {
-                format!("Group/{}", g)
-            };
-            let id = canonical
-                .strip_prefix("Group/")
-                .and_then(|s| s.split('/').next());
-            let found = id
-                .map(|id| {
-                    supporting.iter().any(|res| {
-                        res.get("resourceType").and_then(|v| v.as_str()) == Some("Group")
-                            && res.get("id").and_then(|v| v.as_str()) == Some(id)
-                    })
-                })
-                .unwrap_or(false);
-            if !found {
-                absent.push(canonical);
+                    .unwrap_or(false);
+                if !found {
+                    absent.push(canonical);
+                }
             }
         }
         if !absent.is_empty() {
@@ -1232,13 +1256,7 @@ impl CompartmentFilter {
 
         let mut targets: HashSet<String> = patient_refs
             .iter()
-            .map(|r| {
-                if r.starts_with("Patient/") {
-                    r.clone()
-                } else {
-                    format!("Patient/{}", r)
-                }
-            })
+            .map(|r| canonical_compartment_ref(r, "Patient").0)
             .collect();
 
         if !group_refs.is_empty() {
@@ -4557,6 +4575,27 @@ pub fn format_parquet_multi_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `compartment_reference_ids` accepts both reference forms the SoF spec
+    /// allows, ignores a version suffix, drops an id-less reference, and
+    /// de-duplicates — so a caller can turn the filter's references straight
+    /// into a by-id fetch (#1453).
+    #[test]
+    fn compartment_reference_ids_normalises_and_dedups() {
+        let refs = [
+            "Patient/p1",
+            "p2",
+            "Patient/p1/_history/2",
+            "p1",
+            "Patient/",
+            "",
+        ]
+        .map(str::to_string);
+        assert_eq!(
+            compartment_reference_ids(&refs, "Patient"),
+            vec!["p1".to_string(), "p2".to_string()]
+        );
+    }
 
     /// A typed R4 ViewDefinition built from `json`, for exercising
     /// `validate_view_definition` (#821) the same way a real caller of this

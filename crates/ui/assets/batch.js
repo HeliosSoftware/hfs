@@ -331,8 +331,8 @@
       show("upload");
       return;
     }
-    /* The whole footer goes inert (#679): both Execute copies spin, and the
-       Cancels disable with them — a mid-flight Cancel nulled `bundle` and
+    /* The whole footer goes inert (#679): Execute spins, and Cancel
+       disables with it — a mid-flight Cancel nulled `bundle` and
        crashed the settling renderResponse. Busy holds until the outcome is
        rendered, not merely until response headers arrive. */
     hfsBusy.during(

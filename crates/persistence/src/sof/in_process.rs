@@ -25,7 +25,8 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use helios_fhir::FhirVersion;
 use helios_sof::{
-    CompartmentFilter, PreparedViewDefinition, ResourceChunk, parse_view_definition_for_version,
+    CompartmentFilter, PreparedViewDefinition, ResourceChunk, compartment_reference_ids,
+    parse_view_definition_for_version,
 };
 use serde_json::{Map, Value};
 use tokio_stream::wrappers::ReceiverStream;
@@ -77,6 +78,22 @@ pub trait ResourceScan: Send + Sync {
         tenant: &TenantContext,
         resource_type: &str,
     ) -> Result<ResourceStream, SofError>;
+
+    /// Reads the named resources of `resource_type` by id, as raw FHIR JSON
+    /// in the same shape [`scan_resources`](Self::scan_resources) yields.
+    ///
+    /// Ids that name no live resource (absent or soft-deleted) are omitted
+    /// rather than erroring, so the result holds at most `ids.len()` items in
+    /// unspecified order. Implementations MUST fetch by id — the point of this
+    /// method is to let the runner build a compartment filter without scanning
+    /// the Patient/Group collections (#1453), so a scan-and-search fallback
+    /// would defeat it.
+    async fn read_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[String],
+    ) -> Result<Vec<Value>, SofError>;
 }
 
 /// In-process SQL-on-FHIR runner backed by an arbitrary [`ResourceScan`].
@@ -188,25 +205,26 @@ impl SofRunner for InProcessSofRunner {
             "executing in-process ViewDefinition"
         );
 
-        // Pre-fetch the Patient/Group supporting resources a compartment filter
-        // needs: absent-target validation and Group member resolution both want
-        // them resident. The large target type (e.g. Observation) is streamed
-        // below, so this is bounded by the Patient/Group collections rather than
-        // by the corpus — but it is still a full materialisation, and for a view
-        // whose target type *is* Patient it is the corpus. Tracked in #1453.
+        // Fetch the Patient/Group documents the compartment filter needs, by id.
+        // `build` only ever looks at the resources its own references name —
+        // absent-target validation is a point lookup per reference, and a
+        // Group's members are read off that Group — so setup is proportional to
+        // the number of filter references, not to the corpus. Scanning the two
+        // types instead would be unbounded for a Patient-target view and would
+        // read the target type twice (#1453).
         let compartment_filter: Option<CompartmentFilter> =
             if !filters.patient.is_empty() || !filters.group.is_empty() {
                 let mut supporting: Vec<Value> = Vec::new();
-                for supporting_type in ["Patient", "Group"] {
-                    let needed = match supporting_type {
-                        "Patient" => !filters.patient.is_empty() || !filters.group.is_empty(),
-                        _ => !filters.group.is_empty(),
-                    };
-                    if needed {
-                        let mut stream = self.scan.scan_resources(tenant, supporting_type).await?;
-                        while let Some(item) = stream.next().await {
-                            supporting.push(item?);
-                        }
+                for (refs, supporting_type) in
+                    [(&filters.patient, "Patient"), (&filters.group, "Group")]
+                {
+                    let ids = compartment_reference_ids(refs, supporting_type);
+                    if !ids.is_empty() {
+                        supporting.extend(
+                            self.scan
+                                .read_resources(tenant, supporting_type, &ids)
+                                .await?,
+                        );
                     }
                 }
                 Some(
@@ -392,11 +410,33 @@ mod tests {
     use crate::sof::reference_resolver::StorageReferenceResolver;
     use crate::tenant::{TenantId, TenantPermissions};
     use serde_json::json;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio_stream::StreamExt;
 
-    /// A `ResourceScan` that streams a fixed set of resources, filtered by type.
+    /// A `ResourceScan` that streams a fixed set of resources, filtered by
+    /// type, counting how often each access path is taken.
+    #[derive(Default)]
     struct StaticScan {
         resources: Vec<Value>,
+        /// The resource type of every `scan_resources` call, in call order.
+        scans: Mutex<Vec<String>>,
+        /// Number of `read_resources` calls.
+        reads: AtomicUsize,
+    }
+
+    impl StaticScan {
+        fn of(resources: Vec<Value>) -> Arc<Self> {
+            Arc::new(Self {
+                resources,
+                ..Default::default()
+            })
+        }
+
+        /// The resource types handed to `scan_resources`, in call order.
+        fn scanned_types(&self) -> Vec<String> {
+            self.scans.lock().unwrap().clone()
+        }
     }
 
     #[async_trait]
@@ -406,6 +446,7 @@ mod tests {
             _tenant: &TenantContext,
             resource_type: &str,
         ) -> Result<ResourceStream, SofError> {
+            self.scans.lock().unwrap().push(resource_type.to_string());
             let items: Vec<Value> = self
                 .resources
                 .iter()
@@ -413,6 +454,26 @@ mod tests {
                 .cloned()
                 .collect();
             Ok(Box::pin(futures::stream::iter(items.into_iter().map(Ok))))
+        }
+
+        async fn read_resources(
+            &self,
+            _tenant: &TenantContext,
+            resource_type: &str,
+            ids: &[String],
+        ) -> Result<Vec<Value>, SofError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Ok(self
+                .resources
+                .iter()
+                .filter(|r| {
+                    r.get("resourceType").and_then(Value::as_str) == Some(resource_type)
+                        && r.get("id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| ids.iter().any(|want| want == id))
+                })
+                .cloned()
+                .collect())
         }
     }
 
@@ -494,9 +555,7 @@ mod tests {
     /// view column projects its family name.
     #[tokio::test]
     async fn resolves_stored_reference_during_view_run() {
-        let scan = Arc::new(StaticScan {
-            resources: vec![observation()],
-        });
+        let scan = StaticScan::of(vec![observation()]);
         let resolver = Arc::new(StaticResolver {
             pool: vec![patient()],
         });
@@ -517,9 +576,7 @@ mod tests {
     /// stub (no `name`), so the projected family is null.
     #[tokio::test]
     async fn without_resolver_reference_is_not_dereferenced() {
-        let scan = Arc::new(StaticScan {
-            resources: vec![observation()],
-        });
+        let scan = StaticScan::of(vec![observation()]);
         let runner = InProcessSofRunner::new(scan, FhirVersion::R4, "test");
 
         let rows = collect_rows(&runner).await;
@@ -585,13 +642,12 @@ mod tests {
 
     /// A `patient` filter on a view whose target type is not Patient: the
     /// scan only yields Observations, so the referenced Patients have to be
-    /// pulled in for the compartment filter to recognise them.
+    /// pulled in for the compartment filter to recognise them — by id, not by
+    /// scanning the Patient collection (#1453).
     #[tokio::test]
-    async fn patient_filter_scans_the_referenced_patients() {
-        let scan = Arc::new(StaticScan {
-            resources: compartment_pool(),
-        });
-        let runner = InProcessSofRunner::new(scan, FhirVersion::R4, "test");
+    async fn patient_filter_reads_the_referenced_patients_by_id() {
+        let scan = StaticScan::of(compartment_pool());
+        let runner = InProcessSofRunner::new(scan.clone(), FhirVersion::R4, "test");
 
         let ids = observation_ids(
             &runner,
@@ -602,17 +658,22 @@ mod tests {
         )
         .await;
         assert_eq!(ids, vec!["o2"]);
+        assert_eq!(
+            scan.scanned_types(),
+            vec!["Observation"],
+            "only the target type may be scanned; supporting resources are read by id"
+        );
+        assert_eq!(scan.reads.load(Ordering::SeqCst), 1);
     }
 
-    /// A `group` filter: the Group and its member Patients ride along with
-    /// the scan, the members' compartment decides the rows, and neither the
-    /// Group nor the Patients leak into the view's output.
+    /// A `group` filter: the Group named by the filter is read by id, its
+    /// members' compartment decides the rows, and neither the Group nor the
+    /// Patients leak into the view's output. A group-only filter needs no
+    /// Patient documents at all — members are read off the Group.
     #[tokio::test]
-    async fn group_filter_scans_the_group_and_its_members() {
-        let scan = Arc::new(StaticScan {
-            resources: compartment_pool(),
-        });
-        let runner = InProcessSofRunner::new(scan, FhirVersion::R4, "test");
+    async fn group_filter_reads_the_group_by_id() {
+        let scan = StaticScan::of(compartment_pool());
+        let runner = InProcessSofRunner::new(scan.clone(), FhirVersion::R4, "test");
 
         let ids = observation_ids(
             &runner,
@@ -623,15 +684,60 @@ mod tests {
         )
         .await;
         assert_eq!(ids, vec!["o1"]);
+        assert_eq!(
+            scan.scanned_types(),
+            vec!["Observation"],
+            "a group filter must not scan the Patient or Group collections"
+        );
+        assert_eq!(
+            scan.reads.load(Ordering::SeqCst),
+            1,
+            "only the Group is fetched; nothing in the filter consumes Patient documents"
+        );
+    }
+
+    /// A `Patient`-target view under a `patient` filter: the Patient
+    /// collection is the corpus, so it must be streamed exactly once as the
+    /// target type and never materialised as a supporting prefetch (#1453).
+    #[tokio::test]
+    async fn patient_target_view_scans_the_patient_collection_once() {
+        let scan = StaticScan::of(compartment_pool());
+        let runner = InProcessSofRunner::new(scan.clone(), FhirVersion::R4, "test");
+
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{ "column": [{ "path": "id", "name": "pid" }] }]
+        });
+        let mut stream = runner
+            .run_view(
+                &tenant(),
+                view,
+                ViewFilters {
+                    patient: vec!["Patient/p2".to_string()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("run_view");
+        let mut ids = Vec::new();
+        while let Some(row) = stream.next().await {
+            ids.push(row.expect("row")["pid"].as_str().unwrap().to_string());
+        }
+        assert_eq!(ids, vec!["p2"]);
+        assert_eq!(
+            scan.scanned_types(),
+            vec!["Patient"],
+            "the target type must be scanned exactly once, with no second pass for the filter"
+        );
     }
 
     /// A `group` reference that resolves to no stored Group is still the
     /// spec's absent-target error, not an empty result.
     #[tokio::test]
     async fn absent_group_is_an_error() {
-        let scan = Arc::new(StaticScan {
-            resources: compartment_pool(),
-        });
+        let scan = StaticScan::of(compartment_pool());
         let runner = InProcessSofRunner::new(scan, FhirVersion::R4, "test");
 
         let err = runner

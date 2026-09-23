@@ -719,6 +719,8 @@ mod es_integration {
     use testcontainers::ImageExt;
     use testcontainers::runners::AsyncRunner;
     use testcontainers_modules::elastic_search::ElasticSearch;
+    #[cfg(feature = "postgres")]
+    use testcontainers_modules::postgres::Postgres;
     use tokio::sync::OnceCell;
 
     /// Shared Elasticsearch container reused across all tests in this module.
@@ -735,7 +737,7 @@ mod es_integration {
     struct SharedPg {
         host: String,
         port: u16,
-        _container: testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>,
+        _container: testcontainers::ContainerAsync<Postgres>,
     }
 
     #[cfg(feature = "postgres")]
@@ -745,8 +747,6 @@ mod es_integration {
     async fn shared_pg() -> &'static SharedPg {
         SHARED_PG
             .get_or_init(|| async {
-                use testcontainers_modules::postgres::Postgres;
-
                 let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
                 let container = super::container_cleanup::with_cleanup_label(
                     Postgres::default()
@@ -755,10 +755,12 @@ mod es_integration {
                 )
                 .start()
                 .await
-                .expect("start PostgreSQL container for pg-es retry");
+                .expect("start PostgreSQL for pg-es reindex");
+                let host = container.get_host().await.unwrap().to_string();
+                let port = container.get_host_port_ipv4(5432).await.unwrap();
                 SharedPg {
-                    host: container.get_host().await.unwrap().to_string(),
-                    port: container.get_host_port_ipv4(5432).await.unwrap(),
+                    host,
+                    port,
                     _container: container,
                 }
             })
@@ -2592,6 +2594,181 @@ mod es_integration {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn es_integration_pg_source_capped_reindex_coverage() {
+        use helios_persistence::backends::postgres::{PostgresBackend, PostgresConfig};
+        use helios_persistence::search::{ReindexOperation, ReindexRequest, ReindexStatus};
+        use helios_persistence::types::SearchParamType;
+
+        let pg_fixture = shared_pg().await;
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|path| path.parent())
+            .unwrap()
+            .join("data");
+        let mut pg = PostgresBackend::new(PostgresConfig {
+            host: pg_fixture.host.clone(),
+            port: pg_fixture.port,
+            user: "postgres".to_string(),
+            password: Some("postgres".to_string()),
+            dbname: "postgres".to_string(),
+            data_dir: Some(data_dir),
+            search_offloaded: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        pg.init_schema().await.unwrap();
+        pg.set_search_offloaded(true);
+        let pg = Arc::new(pg);
+
+        let es_fixture = shared_es().await;
+        let make_es = || {
+            ElasticsearchBackend::with_shared_registry(
+                ElasticsearchConfig {
+                    nodes: vec![format!("http://{}:{}", es_fixture.host, es_fixture.port)],
+                    index_prefix: format!("hfs_{}", uuid::Uuid::new_v4().simple()),
+                    number_of_replicas: 0,
+                    refresh_interval: "1ms".to_string(),
+                    write_refresh: WriteRefreshPolicy::WaitFor,
+                    ..Default::default()
+                },
+                pg.tenant_registries().clone(),
+            )
+            .unwrap()
+        };
+        let capped_es = Arc::new(make_es());
+        let uncapped_es = Arc::new(make_es());
+        capped_es.initialize().await.unwrap();
+        uncapped_es.initialize().await.unwrap();
+        let capped_tenant = create_tenant(&format!("pg-es-cap-{}", uuid::Uuid::new_v4()));
+        let uncapped_tenant = create_tenant(&format!("pg-es-base-{}", uuid::Uuid::new_v4()));
+        for tenant in [&capped_tenant, &uncapped_tenant] {
+            for n in 0..5 {
+                let id = format!("pg-es-{n}");
+                pg.create(
+                    tenant,
+                    "Patient",
+                    json!({
+                        "resourceType":"Patient",
+                        "id":id,
+                        "name":[{"family":format!("Family{n}")}],
+                        "text":{"status":"generated","div":format!("<div>{}</div>", "x".repeat(if n == 2 { 4000 } else { 10 }))}
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            }
+        }
+        let client = pg.get_client().await.unwrap();
+        let sizes: Vec<i64> = client
+            .query(
+                "SELECT octet_length(data::text)::bigint FROM resources
+                 WHERE tenant_id = $1 AND resource_type = 'Patient'
+                 ORDER BY last_updated, id",
+                &[&capped_tenant.tenant_id().as_str()],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(sizes.len(), 5);
+        let cap = (sizes[0] + sizes[1]) as u64;
+        assert!(sizes.iter().sum::<i64>() as u64 > cap);
+        assert!(sizes.iter().any(|size| *size as u64 > cap));
+        drop(client);
+
+        for (tenant, es, bytes) in [
+            (&capped_tenant, &capped_es, cap),
+            (&uncapped_tenant, &uncapped_es, 0),
+        ] {
+            let started = std::time::Instant::now();
+            let op = ReindexOperation::with_parts(
+                pg.clone(),
+                vec![pg.clone(), es.clone()],
+                pg.tenant_registries().clone(),
+            );
+            let job = op
+                .start(
+                    tenant.clone(),
+                    ReindexRequest::for_types(vec!["Patient"])
+                        .with_batch_size(5)
+                        .with_batch_bytes(bytes),
+                    None,
+                )
+                .await
+                .unwrap();
+            let mut completed = None;
+            for _ in 0..600 {
+                let progress = op.get_progress(&job).await.unwrap();
+                if progress.status.is_finished() {
+                    completed = Some(progress);
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            }
+            let progress = completed.expect("pg-es reindex timed out");
+            assert_eq!(
+                progress.status,
+                ReindexStatus::Completed,
+                "{:?}",
+                progress.error_message
+            );
+            assert!(progress.errors.is_empty(), "{:?}", progress.errors);
+            assert_eq!(progress.processed_resources, 5);
+            let terminal_ms = started.elapsed().as_millis();
+            await_es_count(es, tenant, "Patient", 5).await;
+            for n in 0..5 {
+                let id = format!("pg-es-{n}");
+                assert!(es.read(tenant, "Patient", &id).await.unwrap().is_some());
+                let family = format!("Family{n}");
+                let found = found_ids(
+                    es.as_ref(),
+                    tenant,
+                    &param_query("Patient", &[("name", SearchParamType::String, &family)]),
+                )
+                .await;
+                assert!(found.contains(&id), "{family} did not find {id}");
+            }
+            if std::env::var_os("HFS_1459_MEASURE").is_some() {
+                println!(
+                    "pg-es measurement: byte_cap={bytes} terminal_ms={terminal_ms} search_ready_ms={}",
+                    started.elapsed().as_millis()
+                );
+            }
+        }
+        let client = pg.get_client().await.unwrap();
+        let mut snapshots = Vec::new();
+        for tenant in [&capped_tenant, &uncapped_tenant] {
+            let index: i64 = client
+                .query_one(
+                    "SELECT count(*) FROM search_index WHERE tenant_id = $1",
+                    &[&tenant.tenant_id().as_str()],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            let fts: i64 = client
+                .query_one(
+                    "SELECT count(*) FROM resource_fts WHERE tenant_id = $1",
+                    &[&tenant.tenant_id().as_str()],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            snapshots.push((index, fts));
+        }
+        assert!(
+            snapshots[0].0 > 0,
+            "PostgreSQL target wrote no search entries"
+        );
+        assert!(snapshots[0].1 > 0, "PostgreSQL target wrote no FTS entries");
+        assert_eq!(snapshots[0], snapshots[1]);
     }
 
     /// What the #1161 tests share: an offloaded SQLite primary and a real

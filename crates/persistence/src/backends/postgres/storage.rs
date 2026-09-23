@@ -3704,7 +3704,77 @@ fn resolve_bundle_references(
 /// Maximum number of distinct resource IDs bound in one reindex lookup.
 const REINDEX_IDS_QUERY_SIZE: usize = 1000;
 
-fn decode_reindex_resource_row(
+// Size only the count-limited keys, then fetch bodies only for the admitted
+// prefix. MATERIALIZED keeps the count-limited keys and the ranked window
+// result fixed before the byte filter; without the ranked fence PostgreSQL 16
+// can return a row whose ordinal exceeds the count limit. The lookahead key
+// makes end-of-type exact.
+const REINDEX_CAPPED_INITIAL_SQL: &str = r#"
+/* hfs_reindex_capped_initial */
+WITH keys AS MATERIALIZED (
+    SELECT id, last_updated FROM resources
+    WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE
+    ORDER BY last_updated ASC, id ASC LIMIT $3
+),
+sizes AS MATERIALIZED (
+    SELECT k.id, k.last_updated, octet_length(r.data::text)::bigint AS content_bytes
+    FROM keys k
+    JOIN resources r ON r.tenant_id = $1 AND r.resource_type = $2 AND r.id = k.id
+),
+ranked AS MATERIALIZED (
+    SELECT id, last_updated, content_bytes,
+           row_number() OVER (ORDER BY last_updated, id) AS ordinal,
+           sum(content_bytes) OVER (
+               ORDER BY last_updated, id ROWS UNBOUNDED PRECEDING
+           ) AS running_bytes
+    FROM sizes
+),
+admitted AS MATERIALIZED (
+    SELECT id, last_updated, content_bytes FROM ranked
+    WHERE ordinal <= $4 AND (ordinal = 1 OR running_bytes <= $5::text::numeric)
+)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
+       a.content_bytes,
+       (SELECT count(*) FROM sizes) > (SELECT count(*) FROM admitted) AS has_more
+FROM admitted a
+JOIN resources r ON r.tenant_id = $1 AND r.resource_type = $2 AND r.id = a.id
+ORDER BY a.last_updated ASC, a.id ASC
+"#;
+
+const REINDEX_CAPPED_CONTINUATION_SQL: &str = r#"
+/* hfs_reindex_capped_continuation */
+WITH keys AS MATERIALIZED (
+    SELECT id, last_updated FROM resources
+    WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE
+      AND (last_updated > $3 OR (last_updated = $3 AND id > $4))
+    ORDER BY last_updated ASC, id ASC LIMIT $5
+),
+sizes AS MATERIALIZED (
+    SELECT k.id, k.last_updated, octet_length(r.data::text)::bigint AS content_bytes
+    FROM keys k
+    JOIN resources r ON r.tenant_id = $1 AND r.resource_type = $2 AND r.id = k.id
+),
+ranked AS MATERIALIZED (
+    SELECT id, last_updated, content_bytes,
+           row_number() OVER (ORDER BY last_updated, id) AS ordinal,
+           sum(content_bytes) OVER (
+               ORDER BY last_updated, id ROWS UNBOUNDED PRECEDING
+           ) AS running_bytes
+    FROM sizes
+),
+admitted AS MATERIALIZED (
+    SELECT id, last_updated, content_bytes FROM ranked
+    WHERE ordinal <= $6 AND (ordinal = 1 OR running_bytes <= $7::text::numeric)
+)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
+       a.content_bytes,
+       (SELECT count(*) FROM sizes) > (SELECT count(*) FROM admitted) AS has_more
+FROM admitted a
+JOIN resources r ON r.tenant_id = $1 AND r.resource_type = $2 AND r.id = a.id
+ORDER BY a.last_updated ASC, a.id ASC
+"#;
+
+fn decode_reindex_page_row(
     row: &tokio_postgres::Row,
     tenant: &TenantContext,
     resource_type: &str,
@@ -3812,7 +3882,7 @@ impl ReindexSource for PostgresBackend {
 
         let resources: Vec<StoredResource> = rows
             .iter()
-            .map(|row| decode_reindex_resource_row(row, tenant, resource_type))
+            .map(|row| decode_reindex_page_row(row, tenant, resource_type))
             .collect();
 
         // Determine next cursor
@@ -3861,10 +3931,102 @@ impl ReindexSource for PostgresBackend {
             .map_err(|e| internal_error(format!("Failed to fetch resources by IDs: {e}")))?;
             found.extend(
                 rows.iter()
-                    .map(|row| decode_reindex_resource_row(row, tenant, resource_type)),
+                    .map(|row| decode_reindex_page_row(row, tenant, resource_type)),
             );
         }
         Ok(found)
+    }
+
+    async fn fetch_resources_page_capped(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<ResourcePage> {
+        if limit == 0 {
+            return Ok(ResourcePage {
+                resources: Vec::new(),
+                next_cursor: None,
+                skipped: Vec::new(),
+            });
+        }
+        if max_bytes == 0 {
+            return self
+                .fetch_resources_page(tenant, resource_type, cursor, limit)
+                .await;
+        }
+
+        // Keep the uncapped PostgreSQL cursor parser's behavior, including
+        // restarting for a token with a component count other than two.
+        let (cursor_ts, cursor_id) = if let Some(c) = cursor {
+            let parts: Vec<&str> = c.split('|').collect();
+            if parts.len() == 2 {
+                let ts = DateTime::parse_from_rfc3339(parts[0])
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .map_err(|e| internal_error(format!("Invalid cursor timestamp: {}", e)))?;
+                (Some(ts), Some(parts[1].to_string()))
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let lookahead = i64::from(limit) + 1;
+        let count_limit = i64::from(limit);
+        let byte_cap = max_bytes.to_string();
+        let rows = if let (Some(ts), Some(id)) = (&cursor_ts, &cursor_id) {
+            query_cached(
+                &client,
+                REINDEX_CAPPED_CONTINUATION_SQL,
+                &[
+                    &tenant_id,
+                    &resource_type,
+                    ts,
+                    &id.as_str(),
+                    &lookahead,
+                    &count_limit,
+                    &byte_cap,
+                ],
+            )
+            .await
+        } else {
+            query_cached(
+                &client,
+                REINDEX_CAPPED_INITIAL_SQL,
+                &[
+                    &tenant_id,
+                    &resource_type,
+                    &lookahead,
+                    &count_limit,
+                    &byte_cap,
+                ],
+            )
+            .await
+        }
+        .map_err(|e| internal_error(format!("Failed to fetch resources page: {}", e)))?;
+
+        let has_more = rows.first().is_some_and(|row| row.get::<_, bool>(6));
+        let resources: Vec<StoredResource> = rows
+            .iter()
+            .map(|row| decode_reindex_page_row(row, tenant, resource_type))
+            .collect();
+        let next_cursor = if has_more {
+            resources
+                .last()
+                .map(|r| format!("{}|{}", r.last_modified().to_rfc3339(), r.id()))
+        } else {
+            None
+        };
+        Ok(ResourcePage {
+            resources,
+            next_cursor,
+            skipped: Vec::new(),
+        })
     }
 }
 
