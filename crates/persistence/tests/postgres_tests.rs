@@ -11773,6 +11773,333 @@ mod postgres_integration {
         assert!(page3.resources.is_empty() || page3.next_cursor.is_none());
     }
 
+    /// The marked lookup is cached on one physical connection. Observe only
+    /// its executions, excluding the warmup and the observation queries.
+    async fn reindex_ids_statement(backend: &PostgresBackend) -> (i32, String, String, i64) {
+        let client = backend.get_client().await.unwrap();
+        let pid: i32 = client
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        let rows = client
+            .query(
+                "SELECT name, statement, custom_plans + generic_plans AS executions
+                 FROM pg_prepared_statements
+                 WHERE statement LIKE $1",
+                &[&"%/* hfs_reindex_by_ids */%"],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "expected one marked prepared statement");
+        let row = &rows[0];
+        (pid, row.get(0), row.get(1), row.get(2))
+    }
+
+    async fn warm_reindex_ids_statement(backend: &PostgresBackend, tenant: &TenantContext) {
+        use helios_persistence::search::ReindexSource;
+
+        assert!(
+            backend
+                .fetch_resources_by_ids(tenant, "Patient", &["absent-warmup".into()])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_reindex_fetch_ids_scope() {
+        use helios_persistence::search::ReindexSource;
+
+        let (backend, _dbname) = isolated_reindex_backend().await;
+        let tenant = create_tenant("reindex-ids-scope");
+        let other_tenant = create_tenant("reindex-ids-other");
+        let original = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"changed","name":[{"family":"Old"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let current = backend
+            .update(
+                &tenant,
+                &original,
+                json!({"resourceType":"Patient","id":"changed","name":[{"family":"New"}]}),
+            )
+            .await
+            .unwrap();
+        let persisted = backend
+            .read(&tenant, "Patient", "changed")
+            .await
+            .unwrap()
+            .unwrap();
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({"resourceType":"Observation","id":"changed"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &other_tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"changed"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"deleted"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend.delete(&tenant, "Patient", "deleted").await.unwrap();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"unrelated"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let resources = backend
+            .fetch_resources_by_ids(
+                &tenant,
+                "Patient",
+                &["changed".into(), "deleted".into(), "missing".into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(resources.len(), 1);
+        let fetched = &resources[0];
+        assert_eq!(fetched.id(), "changed");
+        assert_eq!(fetched.resource_type(), "Patient");
+        assert_eq!(fetched.tenant_id(), tenant.tenant_id());
+        assert_eq!(fetched.version_id(), current.version_id());
+        assert_eq!(fetched.content(), current.content());
+        assert_eq!(fetched.content()["name"][0]["family"], "New");
+        assert_eq!(fetched.fhir_version(), current.fhir_version());
+        assert_eq!(fetched.created_at(), persisted.last_modified());
+        assert_eq!(fetched.last_modified(), persisted.last_modified());
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_reindex_fetch_ids_empty_and_duplicate() {
+        use helios_persistence::search::ReindexSource;
+
+        let (backend, _dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenant = create_tenant("reindex-ids-empty-duplicate");
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"wanted"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"unrelated"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"deleted"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend.delete(&tenant, "Patient", "deleted").await.unwrap();
+
+        warm_reindex_ids_statement(&backend, &tenant).await;
+        let before = reindex_ids_statement(&backend).await;
+        assert!(
+            backend
+                .fetch_resources_by_ids(&tenant, "Patient", &[])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let after_empty = reindex_ids_statement(&backend).await;
+        assert_eq!(
+            (&after_empty.0, &after_empty.1, &after_empty.2),
+            (&before.0, &before.1, &before.2)
+        );
+        assert_eq!(after_empty.3 - before.3, 0);
+
+        let resources = backend
+            .fetch_resources_by_ids(
+                &tenant,
+                "Patient",
+                &[
+                    "wanted".into(),
+                    "wanted".into(),
+                    "missing".into(),
+                    "deleted".into(),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].id(), "wanted");
+        let after_found = reindex_ids_statement(&backend).await;
+        assert_eq!(
+            (&after_found.0, &after_found.1, &after_found.2),
+            (&before.0, &before.1, &before.2)
+        );
+        assert_eq!(after_found.3 - after_empty.3, 1);
+
+        assert!(
+            backend
+                .fetch_resources_by_ids(&tenant, "Patient", &["missing".into(), "deleted".into()])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let after_missing = reindex_ids_statement(&backend).await;
+        assert_eq!(after_missing.3 - after_found.3, 1);
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_reindex_fetch_ids_chunking() {
+        use helios_persistence::search::ReindexSource;
+
+        let (backend, _dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenant = create_tenant("reindex-ids-chunking");
+        for id in ["id-0000", "id-1000", "id-2000"] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType":"Patient","id":id}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        warm_reindex_ids_statement(&backend, &tenant).await;
+        let before = reindex_ids_statement(&backend).await;
+        let mut ids: Vec<String> = (0..2001).map(|n| format!("id-{n:04}")).collect();
+        ids.extend(["id-0000".into(), "id-1000".into(), "id-2000".into()]);
+        let resources = backend
+            .fetch_resources_by_ids(&tenant, "Patient", &ids)
+            .await
+            .unwrap();
+        let after = reindex_ids_statement(&backend).await;
+        assert_eq!(
+            (&after.0, &after.1, &after.2),
+            (&before.0, &before.1, &before.2)
+        );
+        assert_eq!(after.3 - before.3, 3);
+        let mut found: Vec<&str> = resources.iter().map(|resource| resource.id()).collect();
+        found.sort_unstable();
+        assert_eq!(found, ["id-0000", "id-1000", "id-2000"]);
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_reindex_fetch_ids_all_missing_progress() {
+        use helios_persistence::search::{
+            ReindexOperation, ReindexRequest, ReindexStatus, ReindexTarget, ResourceRef,
+        };
+        use helios_persistence::types::StoredResource;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingTarget(AtomicUsize);
+
+        #[async_trait::async_trait]
+        impl ReindexTarget for CountingTarget {
+            async fn delete_search_entries(
+                &self,
+                _: &TenantContext,
+                _: &str,
+                _: &str,
+            ) -> helios_persistence::error::StorageResult<u64> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(0)
+            }
+
+            async fn write_search_entries(
+                &self,
+                _: &TenantContext,
+                _: &StoredResource,
+            ) -> helios_persistence::error::StorageResult<usize> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(0)
+            }
+
+            async fn clear_search_index(
+                &self,
+                _: &TenantContext,
+            ) -> helios_persistence::error::StorageResult<u64> {
+                Ok(0)
+            }
+        }
+
+        let (backend, _dbname) = isolated_reindex_backend().await;
+        let backend = Arc::new(backend);
+        let tenant = create_tenant("reindex-ids-all-missing");
+        for id in ["gone-a", "gone-b"] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType":"Patient","id":id}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            backend.delete(&tenant, "Patient", id).await.unwrap();
+        }
+
+        let target = Arc::new(CountingTarget(AtomicUsize::new(0)));
+        let operation = ReindexOperation::with_parts(
+            backend.clone(),
+            vec![target.clone()],
+            backend.tenant_registries().clone(),
+        );
+        let request = ReindexRequest::for_resources([
+            ResourceRef::new("Patient", "gone-a"),
+            ResourceRef::new("Patient", "gone-b"),
+        ]);
+        let job_id = operation.start(tenant, request, None).await.unwrap();
+        let progress = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let progress = operation.get_progress(&job_id).await.unwrap();
+                if progress.status.is_finished() {
+                    break progress;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("named reindex did not finish");
+        assert_eq!(progress.status, ReindexStatus::Completed);
+        assert_eq!(progress.total_resources, 2);
+        assert_eq!(progress.processed_resources, 2);
+        assert_eq!(target.0.load(Ordering::SeqCst), 0);
+    }
+
     /// Inserts a row directly into the search_index table. Mirrors what the
     /// SQLite chain tests do for the same purpose — exercises the chain SQL
     /// without depending on the FHIRPath extractor's full coverage. Connects

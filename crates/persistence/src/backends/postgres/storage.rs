@@ -33,7 +33,7 @@ use crate::types::SearchQuery;
 use crate::types::{CursorValue, Page, PageCursor, PageInfo, StoredResource};
 
 use super::PostgresBackend;
-use super::cached::{execute_cached, query_opt_cached};
+use super::cached::{execute_cached, query_cached, query_opt_cached};
 use super::search::writer::{IndexRow, PostgresSearchIndexWriter};
 
 /// Whether a resource being indexed can already have `search_index` rows.
@@ -3701,6 +3701,35 @@ fn resolve_bundle_references(
 // resources are read from during a reindex.
 // ============================================================================
 
+/// Maximum number of distinct resource IDs bound in one reindex lookup.
+const REINDEX_IDS_QUERY_SIZE: usize = 1000;
+
+fn decode_reindex_resource_row(
+    row: &tokio_postgres::Row,
+    tenant: &TenantContext,
+    resource_type: &str,
+) -> StoredResource {
+    let id: String = row.get(0);
+    let version_id: String = row.get(1);
+    let data: Value = row.get(2);
+    let last_updated: DateTime<Utc> = row.get(3);
+    let fhir_version_str: String = row.get(4);
+    let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+        .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
+
+    StoredResource::from_storage(
+        resource_type,
+        id,
+        version_id,
+        tenant.tenant_id().clone(),
+        data,
+        last_updated,
+        last_updated,
+        None,
+        fhir_version,
+    )
+}
+
 #[async_trait]
 impl ReindexSource for PostgresBackend {
     async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
@@ -3783,27 +3812,7 @@ impl ReindexSource for PostgresBackend {
 
         let resources: Vec<StoredResource> = rows
             .iter()
-            .map(|row| {
-                let id: String = row.get(0);
-                let version_id: String = row.get(1);
-                let data: Value = row.get(2);
-                let last_updated: DateTime<Utc> = row.get(3);
-                let fhir_version_str: String = row.get(4);
-                let fhir_version = FhirVersion::from_storage(&fhir_version_str)
-                    .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
-
-                StoredResource::from_storage(
-                    resource_type,
-                    id,
-                    version_id,
-                    tenant.tenant_id().clone(),
-                    data,
-                    last_updated,
-                    last_updated,
-                    None,
-                    fhir_version,
-                )
-            })
+            .map(|row| decode_reindex_resource_row(row, tenant, resource_type))
             .collect();
 
         // Determine next cursor
@@ -3820,6 +3829,42 @@ impl ReindexSource for PostgresBackend {
             next_cursor,
             skipped: Vec::new(),
         })
+    }
+
+    async fn fetch_resources_by_ids(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[String],
+    ) -> StorageResult<Vec<StoredResource>> {
+        let unique: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
+        if unique.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut unique: Vec<&str> = unique.into_iter().collect();
+        unique.sort_unstable();
+
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let mut found = Vec::with_capacity(unique.len());
+        for batch in unique.chunks(REINDEX_IDS_QUERY_SIZE) {
+            let rows = query_cached(
+                &client,
+                "/* hfs_reindex_by_ids */
+                 SELECT id, version_id, data, last_updated, fhir_version
+                 FROM resources
+                 WHERE tenant_id = $1 AND resource_type = $2
+                   AND is_deleted = FALSE AND id = ANY($3::text[])",
+                &[&tenant_id, &resource_type, &batch],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to fetch resources by IDs: {e}")))?;
+            found.extend(
+                rows.iter()
+                    .map(|row| decode_reindex_resource_row(row, tenant, resource_type)),
+            );
+        }
+        Ok(found)
     }
 }
 
