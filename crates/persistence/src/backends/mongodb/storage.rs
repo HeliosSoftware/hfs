@@ -3752,7 +3752,7 @@ impl MongoBackend {
                 .await
                 {
                     Ok(candidate) => candidate,
-                    Err(failure) => return Ok(failure),
+                    Err(failure) => return Ok(*failure),
                 };
                 let update_result = self
                     .update_resource_in_bundle_transaction(

@@ -3709,7 +3709,7 @@ impl SqliteBackend {
                 .await
                 {
                     Ok(candidate) => candidate,
-                    Err(failure) => return Ok(failure),
+                    Err(failure) => return Ok(*failure),
                 };
                 patch_update_result(tx.update(&existing, candidate).await)
             }

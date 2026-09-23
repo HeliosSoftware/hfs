@@ -34,13 +34,13 @@ pub trait PatchCandidateValidator: Send + Sync {
 /// Render an unapplied Bundle PATCH as a typed entry refusal. The transaction
 /// executors use its status and outcome after rolling back every sibling.
 #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
-pub(crate) fn patch_failure_entry(error: PatchError) -> BundleEntryResult {
+pub(crate) fn patch_failure_entry(error: PatchError) -> Box<BundleEntryResult> {
     let (status, code) = match error {
         PatchError::TestFailed { .. } => (422, "processing"),
         PatchError::UnsupportedFormat { .. } => (501, "not-supported"),
         _ => (400, "invalid"),
     };
-    BundleEntryResult::error(
+    Box::new(BundleEntryResult::error(
         status,
         serde_json::json!({
             "resourceType": "OperationOutcome",
@@ -50,7 +50,7 @@ pub(crate) fn patch_failure_entry(error: PatchError) -> BundleEntryResult {
                 "details": {"text": error.to_string()}
             }]
         }),
-    )
+    ))
 }
 
 /// Keep a PATCH update's concurrency refusal attached to its Bundle entry so
@@ -94,7 +94,7 @@ pub(crate) async fn prepare_bundle_patch(
     document: Option<&Value>,
     bundle_version: helios_fhir::FhirVersion,
     validator: Option<&dyn PatchCandidateValidator>,
-) -> Result<Value, BundleEntryResult> {
+) -> Result<Value, Box<BundleEntryResult>> {
     let document = document.ok_or_else(|| {
         patch_failure_entry(PatchError::MalformedDocument {
             format: "Bundle PATCH",
@@ -110,7 +110,7 @@ pub(crate) async fn prepare_bundle_patch(
         validator
             .validate_patch_candidate(tenant, current.fhir_version(), resource_type, &candidate)
             .await
-            .map_err(|outcome| BundleEntryResult::error(422, outcome))?;
+            .map_err(|outcome| Box::new(BundleEntryResult::error(422, outcome)))?;
     }
     Ok(candidate)
 }
