@@ -15877,6 +15877,605 @@ async fn mongodb_integration_composite_multi_batch_driver_paging() {
     assert_eq!(count as usize, MATCHING);
 }
 
+/// #1394: `ifNoneExist` inside a MongoDB transaction with search offloaded
+/// goes through the shared conditional builder, exactly like `If-None-Exist`
+/// on the resource endpoint. The scan only evaluates `_id`, `_lastUpdated`
+/// and plain `identifier` values against the raw `resources` documents; every
+/// other shape is rejected, never silently ignored or silently unmatched.
+///
+/// All tests below run on an offloaded backend against the harness's own
+/// single-node replica-set container, so multi-document transactions really
+/// execute (see [`process_transaction_or_skip`]).
+/// Builds an offloaded backend: no `search_index` rows, so the in-transaction
+/// resolver takes the raw-document scan.
+async fn i1394r1_offloaded_backend(test_name: &str) -> Option<MongoBackend> {
+    create_backend_with_search_offloaded(test_name, true).await
+}
+
+fn i1394r1_tenant(label: &str) -> TenantContext {
+    create_tenant(&format!("i1394r1-{label}"))
+}
+
+fn i1394r1_patient(family: &str, identifier_value: &str) -> serde_json::Value {
+    json!({
+        "resourceType": "Patient",
+        "identifier": [{"system": "http://example.org/mrn", "value": identifier_value}],
+        "name": [{"family": family}]
+    })
+}
+
+fn i1394r1_create_entry(family: &str, identifier_value: &str, criteria: &str) -> BundleEntry {
+    BundleEntry {
+        method: BundleMethod::Post,
+        url: "Patient".to_string(),
+        resource: Some(i1394r1_patient(family, identifier_value)),
+        if_match: None,
+        if_none_match: None,
+        if_none_exist: Some(criteria.to_string()),
+        full_url: Some(format!("urn:uuid:i1394r1-{family}")),
+    }
+}
+
+async fn i1394r1_seed(
+    backend: &MongoBackend,
+    tenant: &TenantContext,
+    family: &str,
+    identifier_value: &str,
+) {
+    backend
+        .create(
+            tenant,
+            "Patient",
+            i1394r1_patient(family, identifier_value),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed patient");
+}
+
+async fn i1394r1_patient_count(backend: &MongoBackend, tenant: &TenantContext) -> u64 {
+    // `count` reads the raw `resources` documents; `search` would consult the
+    // local `search_index`, which stays empty when search is offloaded.
+    backend
+        .count(tenant, Some("Patient"))
+        .await
+        .expect("count patients")
+}
+
+/// A `_lastUpdated` criterion with a future prefix matches nothing, so the
+/// entry is created. Before the fix the scan silently ignored `_lastUpdated`,
+/// matched the whole type and answered 200 without creating.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_prefixed_last_updated_creates() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_last_updated").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_prefixed_last_updated_creates (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("last-updated");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![i1394r1_create_entry(
+            "New",
+            "MRN-NEW-1",
+            "_lastUpdated=ge9999-01-01",
+        )],
+        "i1394r1_offloaded_if_none_exist_prefixed_last_updated_creates",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 201);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 2);
+}
+
+/// An OR-list over `identifier` matches when any alternative does, so the
+/// entry is answered from the match. Before the fix the raw comma string
+/// matched nothing and the entry was duplicated.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_identifier_or_list_matches() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_or_list").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_identifier_or_list_matches (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("or-list");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![i1394r1_create_entry(
+            "Duplicate",
+            "MRN-OTHER",
+            "identifier=MRN-BASE-1,OTHER",
+        )],
+        "i1394r1_offloaded_if_none_exist_identifier_or_list_matches",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 200);
+    assert_eq!(result.entries[0].effect, BundleEntryEffect::NoOp);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// A system-less `|code` criterion matches an identifier carrying any system,
+/// so the entry is answered from the seeded match instead of being created.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_identifier_any_system_matches() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_any_system").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_identifier_any_system_matches (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("any-system");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![i1394r1_create_entry(
+            "Duplicate",
+            "MRN-OTHER",
+            "identifier=|MRN-BASE-1",
+        )],
+        "i1394r1_offloaded_if_none_exist_identifier_any_system_matches",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 200);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// An unknown parameter rolls the bundle back instead of being ignored.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_unknown_parameter_fails() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_unknown").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_unknown_parameter_fails (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("unknown");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let err = backend
+        .process_transaction(
+            &tenant,
+            vec![i1394r1_create_entry("New", "MRN-NEW-1", "nickname=Seeded")],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("an unknown ifNoneExist parameter must fail the bundle");
+    assert!(
+        matches!(err, TransactionError::BundleError { index: 0, .. }),
+        "the failure must surface as a BundleError at entry 0, got: {err}"
+    );
+    assert!(
+        err.to_string().contains("'nickname'"),
+        "the error must name the parameter, got: {err}"
+    );
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// A modifier the raw scan cannot evaluate rolls the bundle back. A bare
+/// modifier on `identifier` is rejected by the shared builder with the same
+/// rule direct search applies.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_modifier_fails() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_modifier").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_modifier_fails (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("modifier");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let err = backend
+        .process_transaction(
+            &tenant,
+            vec![i1394r1_create_entry(
+                "New",
+                "MRN-NEW-1",
+                "identifier:missing=true",
+            )],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("an unscoped :missing modifier must fail the bundle");
+    assert!(
+        matches!(err, TransactionError::BundleError { index: 0, .. }),
+        "the failure must surface as a BundleError at entry 0, got: {err}"
+    );
+    assert!(
+        err.to_string()
+            .contains("unsupported modifier 'missing' for parameter type 'token'"),
+        "the error must name the modifier and parameter type, got: {err}"
+    );
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// An empty criterion value rolls the bundle back instead of widening the
+/// match to the whole type.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_empty_value_fails() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_empty").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_empty_value_fails (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("empty");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let err = backend
+        .process_transaction(
+            &tenant,
+            vec![i1394r1_create_entry("New", "MRN-NEW-1", "identifier=")],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("an empty ifNoneExist value must fail the bundle");
+    assert!(
+        matches!(err, TransactionError::BundleError { index: 0, .. }),
+        "the failure must surface as a BundleError at entry 0, got: {err}"
+    );
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// Result-shaping parameters are not criteria: with nothing else left, the
+/// entry is created (no match), exactly as on the endpoint path.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_result_only_creates() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_result_only").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_result_only_creates (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("result-only");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![i1394r1_create_entry("New", "MRN-NEW-1", "_format=json")],
+        "i1394r1_offloaded_if_none_exist_result_only_creates",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 201);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 2);
+}
+
+/// Repeated parameters AND: both must hold for a match, so a half-matching
+/// entry is created.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_repeated_params_and() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_and").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_repeated_params_and (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("and");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![i1394r1_create_entry(
+            "New",
+            "MRN-NEW-1",
+            "identifier=MRN-BASE-1&identifier=MRN-ABSENT",
+        )],
+        "i1394r1_offloaded_if_none_exist_repeated_params_and",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 201);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 2);
+}
+
+/// Positive control: a supported `system|code` identifier criterion matches
+/// and the entry is answered from the existing resource.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_identifier_matches() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_identifier").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_identifier_matches (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("identifier");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![i1394r1_create_entry(
+            "Duplicate",
+            "MRN-OTHER",
+            "identifier=http://example.org/mrn|MRN-BASE-1",
+        )],
+        "i1394r1_offloaded_if_none_exist_identifier_matches",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 200);
+    assert_eq!(result.entries[0].effect, BundleEntryEffect::NoOp);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// An invalid `_lastUpdated` value rolls the bundle back with a
+/// `BundleError` instead of matching or creating: the date parses nowhere,
+/// so nothing is written.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_invalid_last_updated_fails() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_bad_date").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_invalid_last_updated_fails (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("bad-date");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let err = backend
+        .process_transaction(
+            &tenant,
+            vec![i1394r1_create_entry(
+                "New",
+                "MRN-NEW-1",
+                "_lastUpdated=not-a-date",
+            )],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("an invalid _lastUpdated value must fail the bundle");
+    assert!(
+        matches!(err, TransactionError::BundleError { index: 0, .. }),
+        "the failure must surface as a BundleError at entry 0, got: {err}"
+    );
+    assert!(
+        err.to_string().contains("_lastUpdated"),
+        "the error must name the parameter, got: {err}"
+    );
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// A registered but unevaluatable parameter rolls the bundle back instead of
+/// being ignored: `family` never widens into a whole-type match.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_registered_string_fails() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_family").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_registered_string_fails (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("family");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let err = backend
+        .process_transaction(
+            &tenant,
+            vec![i1394r1_create_entry("New", "MRN-NEW-1", "family=Seeded")],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("a registered but unevaluatable parameter must fail the bundle");
+    assert!(
+        matches!(err, TransactionError::BundleError { index: 0, .. }),
+        "the failure must surface as a BundleError at entry 0, got: {err}"
+    );
+    assert!(
+        err.to_string().contains("'family'"),
+        "the error must name the parameter, got: {err}"
+    );
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// A `system|` value with an empty code is not a usable identifier criterion,
+/// so the bundle rolls back instead of matching or creating.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_identifier_empty_code_fails() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_empty_code").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_identifier_empty_code_fails (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("empty-code");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let err = backend
+        .process_transaction(
+            &tenant,
+            vec![i1394r1_create_entry(
+                "New",
+                "MRN-NEW-1",
+                "identifier=http://example.org/mrn|",
+            )],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("an identifier with an empty code must fail the bundle");
+    assert!(
+        matches!(err, TransactionError::BundleError { index: 0, .. }),
+        "the failure must surface as a BundleError at entry 0, got: {err}"
+    );
+    assert!(
+        err.to_string().contains("'identifier'"),
+        "the error must name the parameter, got: {err}"
+    );
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// A value with more than one pipe is not a `system|code` pair the raw scan
+/// can evaluate, so the bundle rolls back.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_identifier_multi_pipe_fails() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_multi_pipe").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_identifier_multi_pipe_fails (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("multi-pipe");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let err = backend
+        .process_transaction(
+            &tenant,
+            vec![i1394r1_create_entry("New", "MRN-NEW-1", "identifier=a|b|c")],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("an identifier with more than one pipe must fail the bundle");
+    assert!(
+        matches!(err, TransactionError::BundleError { index: 0, .. }),
+        "the failure must surface as a BundleError at entry 0, got: {err}"
+    );
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// Tenant isolation: an identifier living in another tenant must not
+/// suppress a create. The scan filters on `tenant_id`, so the entry in
+/// tenant B is created even though tenant A holds the same identifier.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_tenant_isolation_creates() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_tenant_iso").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_tenant_isolation_creates (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant_a = i1394r1_tenant("iso-a");
+    let tenant_b = i1394r1_tenant("iso-b");
+    i1394r1_seed(&backend, &tenant_a, "Seeded", "MRN-BASE-1").await;
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant_b,
+        vec![i1394r1_create_entry(
+            "New",
+            "MRN-NEW-1",
+            "identifier=MRN-BASE-1",
+        )],
+        "i1394r1_offloaded_if_none_exist_tenant_isolation_creates",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 201);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant_b).await, 1);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant_a).await, 1);
+}
+
+/// Read-your-writes: two entries in one bundle, where the second entry's
+/// `ifNoneExist` matches the resource the first entry created. The scan
+/// runs inside the transaction session, so it sees the pending write and
+/// answers the second entry from it instead of creating a duplicate.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_read_your_writes_matches() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_ryw").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_read_your_writes_matches (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("ryw");
+
+    let create = BundleEntry {
+        method: BundleMethod::Post,
+        url: "Patient".to_string(),
+        resource: Some(i1394r1_patient("First", "MRN-NEW-1")),
+        if_match: None,
+        if_none_match: None,
+        if_none_exist: None,
+        full_url: Some("urn:uuid:i1394r1-ryw-first".to_string()),
+    };
+    let conditional = i1394r1_create_entry("Second", "MRN-OTHER", "identifier=MRN-NEW-1");
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![create, conditional],
+        "i1394r1_offloaded_if_none_exist_read_your_writes_matches",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 201);
+    assert_eq!(result.entries[1].status, 200);
+    assert_eq!(result.entries[1].effect, BundleEntryEffect::NoOp);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// A comma-separated `_id` list matches when any alternative does: the
+/// seeded id is present, so the entry is answered from the match instead
+/// of creating a duplicate. `_id` reuses the resource-level predicate
+/// direct search builds (`$in`), evaluated against the raw documents.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_id_or_list_matches() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_id_list").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_id_or_list_matches (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("id-list");
+    let seeded = backend
+        .create(
+            &tenant,
+            "Patient",
+            i1394r1_patient("Seeded", "MRN-BASE-1"),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed patient");
+    let real_id = seeded.id().to_string();
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![i1394r1_create_entry(
+            "Duplicate",
+            "MRN-OTHER",
+            &format!("_id=absent,{real_id}"),
+        )],
+        "i1394r1_offloaded_if_none_exist_id_or_list_matches",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 200);
+    assert_eq!(result.entries[0].effect, BundleEntryEffect::NoOp);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
 /// The backend-agnostic contract of the secondary sync failure ledger
 /// (#1334). Same `#[path]` arrangement as the search suites.
 #[path = "common/sync_failure_ledger_suite.rs"]
