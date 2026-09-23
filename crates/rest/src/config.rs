@@ -626,9 +626,14 @@ pub struct BulkSubmitConfig {
     /// Maximum manifests this pod ingests concurrently.
     pub worker_concurrency: u32,
     /// How many of a single manifest's `output` files a worker ingests at once
-    /// (fan-out). `1` keeps the historical sequential behavior. Higher values
-    /// overlap per-file fetch, parse, and write, which a concurrent-writer
-    /// backend (PostgreSQL) turns into near-linear throughput. Set with
+    /// (fan-out). `1` keeps sequential inline scheduling. On standalone
+    /// PostgreSQL, an effective value above `1` runs each admitted output file
+    /// in an independent Tokio task. This changes scheduling for existing
+    /// standalone PostgreSQL deployments configured above `1`; setting `1`
+    /// restores inline scheduling and reduces file concurrency to one. There is
+    /// no switch that retains inline scheduling above `1`. Every other storage
+    /// mode, including PostgreSQL plus Elasticsearch, keeps inline scheduling
+    /// at its current effective concurrency. Set with
     /// `HFS_BULK_SUBMIT_FILE_CONCURRENCY`.
     ///
     /// This is the *configured* value. SQLite ignores it and always ingests one
@@ -3165,5 +3170,10 @@ mod tests {
         };
         assert_eq!(cfg.effective_file_concurrency(BackendKind::Sqlite), 1);
         assert_eq!(cfg.effective_file_concurrency(BackendKind::Postgres), 1);
+    }
+
+    #[test]
+    fn bulk_submit_file_concurrency_default_is_one() {
+        assert_eq!(BulkSubmitConfig::default().file_concurrency, 1);
     }
 }

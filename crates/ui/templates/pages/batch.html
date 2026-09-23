@@ -50,12 +50,11 @@
        on <body> (#679). Not the Execute button: focusing the destructive
        primary would arm it for a stray Enter. -->
   <section id="batch-preflight" tabindex="-1" hidden>
-    <!-- Cancel/Execute at the top as well as the bottom (#675): a large
-         bundle must not push the only actions below the fold. Both copies
-         drive the same handlers. -->
+    <!-- Cancel/Execute sit once, above the plan (#675): a large bundle
+         must not push the only actions below the fold. -->
     <div class="batch-footer batch-footer--top">
       <button type="button" class="btn" id="batch-cancel-top">{{ i18n.t("batch-cancel") }}</button>
-      <button type="button" class="btn btn--primary" id="batch-execute-top">{{ i18n.t("batch-execute") }}</button>
+      <button type="button" class="btn btn--primary btn--busy-slot" id="batch-execute-top">{{ i18n.t("batch-execute") }}</button>
     </div>
 
     <div class="request-strip">

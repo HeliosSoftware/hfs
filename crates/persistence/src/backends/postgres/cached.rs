@@ -147,6 +147,16 @@ pub(crate) async fn query_cached(
     client.query(&statement, params).await
 }
 
+/// `Client::query_one` against the connection's cached prepared statement.
+pub(crate) async fn query_one_cached(
+    client: &Client,
+    sql: &str,
+    params: &[&(dyn ToSql + Sync)],
+) -> Result<Row, Error> {
+    let statement = client.prepare_cached(sql).await?;
+    client.query_one(&statement, params).await
+}
+
 /// Upper bound on how many statements one connection may keep prepared.
 ///
 /// `deadpool_postgres`' `StatementCache` is a plain `HashMap` keyed by the query
