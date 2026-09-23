@@ -11773,6 +11773,429 @@ mod postgres_integration {
         assert!(page3.resources.is_empty() || page3.next_cursor.is_none());
     }
 
+    async fn capped_reindex_fixture(
+        backend: &PostgresBackend,
+        dbname: &str,
+        tenant: &TenantContext,
+    ) -> Vec<(String, i64)> {
+        for (id, size) in [("p01", 1), ("p02", 2), ("p03", 2000), ("p04", 3)] {
+            backend
+                .create(
+                    tenant,
+                    "Patient",
+                    json!({"resourceType":"Patient","id":id,"note":"x".repeat(size)}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let client = reindex_test_client_for(dbname).await;
+        client
+            .execute(
+                "UPDATE resources SET last_updated = '2026-01-01T00:00:00Z'
+                 WHERE tenant_id = $1 AND resource_type = 'Patient'",
+                &[&tenant.tenant_id().as_str()],
+            )
+            .await
+            .unwrap();
+        client
+            .query(
+                "SELECT id, octet_length(data::text)::bigint FROM resources
+                 WHERE tenant_id = $1 AND resource_type = 'Patient'
+                 ORDER BY last_updated, id",
+                &[&tenant.tenant_id().as_str()],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_reindex_fetch_capped_boundaries() {
+        use helios_persistence::search::ReindexSource;
+
+        let (backend, dbname) = isolated_reindex_backend().await;
+        let tenant = create_tenant("capped-boundaries");
+        let sizes = capped_reindex_fixture(&backend, &dbname, &tenant).await;
+        let ids: Vec<_> = sizes.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["p01", "p02", "p03", "p04"]);
+        let first = sizes[0].1 as u64;
+        let two = (sizes[0].1 + sizes[1].1) as u64;
+
+        for (cap, expected_first) in [
+            (two, vec!["p01", "p02"]),
+            (two - 1, vec!["p01"]),
+            (first - 1, vec!["p01"]),
+            (two + 1, vec!["p01", "p02"]),
+        ] {
+            let mut cursor = None;
+            let mut pages = Vec::new();
+            let mut seen = Vec::new();
+            for _ in 0..5 {
+                let page = backend
+                    .fetch_resources_page_capped(&tenant, "Patient", cursor.as_deref(), 4, cap)
+                    .await
+                    .unwrap();
+                let page_ids: Vec<_> = page.resources.iter().map(|r| r.id().to_string()).collect();
+                let page_bytes: u64 = page_ids
+                    .iter()
+                    .map(|id| sizes.iter().find(|(key, _)| key == id).unwrap().1 as u64)
+                    .sum();
+                assert!(page_ids.len() <= 4);
+                assert!(
+                    page_bytes <= cap || (page_ids.len() == 1 && page_bytes > cap),
+                    "cap {cap}, page {page_ids:?}, bytes {page_bytes}"
+                );
+                if pages.is_empty() {
+                    assert_eq!(page_ids, expected_first);
+                    assert!(page.next_cursor.is_some());
+                }
+                seen.extend(page_ids.clone());
+                pages.push(page_ids);
+                cursor = page.next_cursor;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            assert_eq!(seen, ["p01", "p02", "p03", "p04"], "cap {cap}: {pages:?}");
+            assert!(cursor.is_none(), "pagination did not exhaust");
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_reindex_fetch_capped_exhaustion() {
+        use helios_persistence::search::ReindexSource;
+
+        let (backend, dbname) = isolated_reindex_backend().await;
+        let tenant = create_tenant("capped-exhaustion");
+        let empty = backend
+            .fetch_resources_page_capped(&tenant, "Observation", None, 2, 1)
+            .await
+            .unwrap();
+        assert!(empty.resources.is_empty());
+        assert!(empty.next_cursor.is_none());
+        let sizes = capped_reindex_fixture(&backend, &dbname, &tenant).await;
+        let cap = (sizes[0].1 + sizes[1].1) as u64;
+        let mut cursor = None;
+        let mut seen = Vec::new();
+        for expected_more in [true, true, false] {
+            let page = backend
+                .fetch_resources_page_capped(&tenant, "Patient", cursor.as_deref(), 2, cap)
+                .await
+                .unwrap();
+            seen.extend(page.resources.iter().map(|r| r.id().to_string()));
+            assert_eq!(page.next_cursor.is_some(), expected_more);
+            cursor = page.next_cursor;
+        }
+        assert_eq!(seen, ["p01", "p02", "p03", "p04"]);
+
+        // A full count page can be final when the lookahead sees no next key.
+        let page = backend
+            .fetch_resources_page_capped(&tenant, "Patient", None, 4, u64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(page.resources.len(), 4);
+        assert!(page.next_cursor.is_none());
+        let page = backend
+            .fetch_resources_page_capped(&tenant, "Patient", None, 3, u64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(page.resources.len(), 3);
+        assert!(page.next_cursor.is_some());
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_reindex_fetch_capped_disabled_and_zero() {
+        use helios_persistence::search::ReindexSource;
+
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenant = create_tenant("capped-zero");
+        let sizes = capped_reindex_fixture(&backend, &dbname, &tenant).await;
+        let held = backend.get_client().await.unwrap();
+        for max_bytes in [0, 1] {
+            let page = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                backend.fetch_resources_page_capped(&tenant, "Patient", None, 0, max_bytes),
+            )
+            .await
+            .expect("limit zero must not acquire a connection")
+            .unwrap();
+            assert!(page.resources.is_empty());
+            assert!(page.next_cursor.is_none());
+            assert!(page.skipped.is_empty());
+        }
+        drop(held);
+        let old = backend
+            .fetch_resources_page(&tenant, "Patient", None, 2)
+            .await
+            .unwrap();
+        let disabled = backend
+            .fetch_resources_page_capped(&tenant, "Patient", None, 2, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            old.resources.iter().map(|r| r.id()).collect::<Vec<_>>(),
+            disabled
+                .resources
+                .iter()
+                .map(|r| r.id())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(old.next_cursor, disabled.next_cursor);
+        let huge = backend
+            .fetch_resources_page_capped(&tenant, "Patient", None, 4, u64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(huge.resources.len(), sizes.len());
+        assert!(huge.next_cursor.is_none());
+        let restarted = backend
+            .fetch_resources_page_capped(&tenant, "Patient", Some("bad-token"), 2, 1)
+            .await
+            .unwrap();
+        assert_eq!(restarted.resources[0].id(), "p01");
+        let invalid = backend
+            .fetch_resources_page_capped(&tenant, "Patient", Some("bad-time|p01"), 2, 1)
+            .await;
+        assert!(
+            invalid
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid cursor timestamp")
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_reindex_fetch_capped_scope_and_decode() {
+        use helios_persistence::search::ReindexSource;
+
+        let (backend, dbname) = isolated_reindex_backend().await;
+        let tenant = create_tenant("capped-scope");
+        let other = create_tenant("capped-scope-other");
+        let versions = [
+            #[cfg(feature = "R4")]
+            FhirVersion::R4,
+            #[cfg(feature = "R4B")]
+            FhirVersion::R4B,
+            #[cfg(feature = "R5")]
+            FhirVersion::R5,
+            #[cfg(feature = "R6")]
+            FhirVersion::R6,
+        ];
+        for version in versions.iter().copied() {
+            let id = format!("same-{}", version.as_str());
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({
+                        "resourceType":"Patient",
+                        "id":id,
+                        "contained":[{"resourceType":"Organization","id":"inside"}]
+                    }),
+                    version,
+                )
+                .await
+                .unwrap();
+        }
+        for (scope_tenant, resource_type) in [(&other, "Patient"), (&tenant, "Observation")] {
+            backend
+                .create(
+                    scope_tenant,
+                    resource_type,
+                    json!({"resourceType":resource_type,"id":"same-R4"}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"deleted"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let client = reindex_test_client_for(&dbname).await;
+        client
+            .execute(
+                "UPDATE resources SET is_deleted = TRUE
+                 WHERE tenant_id = $1 AND resource_type = 'Patient' AND id = 'deleted'",
+                &[&tenant.tenant_id().as_str()],
+            )
+            .await
+            .unwrap();
+        let page = backend
+            .fetch_resources_page_capped(&tenant, "Patient", None, 100, u64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(page.resources.len(), versions.len());
+        assert!(page.next_cursor.is_none());
+        assert!(page.skipped.is_empty());
+        for resource in page.resources {
+            let version = versions
+                .iter()
+                .find(|version| resource.id() == format!("same-{}", version.as_str()))
+                .unwrap();
+            assert_eq!(resource.fhir_version(), *version);
+            assert_eq!(resource.tenant_id(), tenant.tenant_id());
+            assert_eq!(resource.version_id(), "1");
+            assert_eq!(resource.content()["contained"][0]["id"], "inside");
+            assert_eq!(resource.created_at(), resource.last_modified());
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_reindex_fetch_capped_server_prefix() {
+        use helios_persistence::search::ReindexSource;
+
+        fn keys_actual_rows(plan: &serde_json::Value) -> Option<f64> {
+            match plan {
+                serde_json::Value::Object(fields) => {
+                    if fields.get("Subplan Name").and_then(|v| v.as_str()) == Some("CTE keys") {
+                        return fields.get("Actual Rows").and_then(|v| v.as_f64());
+                    }
+                    fields.values().find_map(keys_actual_rows)
+                }
+                serde_json::Value::Array(items) => items.iter().find_map(keys_actual_rows),
+                _ => None,
+            }
+        }
+
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenant = create_tenant("capped-server-prefix");
+        let sizes = capped_reindex_fixture(&backend, &dbname, &tenant).await;
+        let cap = (sizes[0].1 + sizes[1].1) as u64;
+        let tenant_id = tenant.tenant_id().as_str();
+        let lookahead = 5_i64;
+        let limit = 4_i64;
+        let cap_text = cap.to_string();
+        let first = backend
+            .fetch_resources_page_capped(&tenant, "Patient", None, 4, cap)
+            .await
+            .unwrap();
+        assert_eq!(
+            first.resources.iter().map(|r| r.id()).collect::<Vec<_>>(),
+            ["p01", "p02"]
+        );
+        let cursor = first.next_cursor.unwrap();
+
+        let client = backend.get_client().await.unwrap();
+        let pid: i32 = client
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        let matches = client
+            .query(
+                "SELECT statement FROM pg_prepared_statements WHERE statement LIKE $1",
+                &[&"%/* hfs_reindex_capped_initial */%"],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected the actual cached initial statement"
+        );
+        let sql: String = matches[0].get(0);
+        let binds: [&(dyn tokio_postgres::types::ToSql + Sync); 5] =
+            [&tenant_id, &"Patient", &lookahead, &limit, &cap_text];
+        let rows = client.query(&sql, &binds).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter()
+                .map(|r| r.get::<_, String>(0))
+                .collect::<Vec<_>>(),
+            ["p01", "p02"]
+        );
+        assert_eq!(
+            rows.iter().map(|r| r.get::<_, i64>(5)).sum::<i64>() as u64,
+            cap
+        );
+        assert!(rows.iter().all(|r| r.get::<_, bool>(6)));
+        let explain = client
+            .query_one(
+                &format!("EXPLAIN (ANALYZE, BUFFERS, VERBOSE, FORMAT JSON) {sql}"),
+                &binds,
+            )
+            .await
+            .unwrap();
+        let plan: serde_json::Value = explain.get(0);
+        let keys = keys_actual_rows(&plan).expect("EXPLAIN must report the materialized keys");
+        assert!(keys <= f64::from(lookahead as u32), "keys produced: {keys}");
+        assert_eq!(
+            client
+                .query_one("SELECT pg_backend_pid()", &[])
+                .await
+                .unwrap()
+                .get::<_, i32>(0),
+            pid
+        );
+        drop(client);
+
+        let next = backend
+            .fetch_resources_page_capped(&tenant, "Patient", Some(&cursor), 4, cap)
+            .await
+            .unwrap();
+        assert_eq!(next.resources[0].id(), "p03");
+        let (cursor_ts, cursor_id) = cursor.split_once('|').unwrap();
+        let ts = chrono::DateTime::parse_from_rfc3339(cursor_ts)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let client = backend.get_client().await.unwrap();
+        assert_eq!(
+            client
+                .query_one("SELECT pg_backend_pid()", &[])
+                .await
+                .unwrap()
+                .get::<_, i32>(0),
+            pid
+        );
+        let matches = client
+            .query(
+                "SELECT statement FROM pg_prepared_statements WHERE statement LIKE $1",
+                &[&"%/* hfs_reindex_capped_continuation */%"],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected the actual cached continuation statement"
+        );
+        let sql: String = matches[0].get(0);
+        let binds: [&(dyn tokio_postgres::types::ToSql + Sync); 7] = [
+            &tenant_id, &"Patient", &ts, &cursor_id, &lookahead, &limit, &cap_text,
+        ];
+        let rows = client.query(&sql, &binds).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get::<_, String>(0), "p03");
+        assert_eq!(rows[0].get::<_, i64>(5), sizes[2].1);
+        assert!(rows[0].get::<_, bool>(6));
+        let explain = client
+            .query_one(
+                &format!("EXPLAIN (ANALYZE, BUFFERS, VERBOSE, FORMAT JSON) {sql}"),
+                &binds,
+            )
+            .await
+            .unwrap();
+        let plan: serde_json::Value = explain.get(0);
+        let keys = keys_actual_rows(&plan).expect("EXPLAIN must report the materialized keys");
+        assert!(keys <= f64::from(lookahead as u32), "keys produced: {keys}");
+        assert_eq!(
+            client
+                .query_one("SELECT pg_backend_pid()", &[])
+                .await
+                .unwrap()
+                .get::<_, i32>(0),
+            pid
+        );
+    }
+
     /// Inserts a row directly into the search_index table. Mirrors what the
     /// SQLite chain tests do for the same purpose — exercises the chain SQL
     /// without depending on the FHIRPath extractor's full coverage. Connects
