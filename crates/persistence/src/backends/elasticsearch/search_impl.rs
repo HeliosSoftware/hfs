@@ -1678,4 +1678,26 @@ mod tests {
         assert!(matches!(cursor_values[2], CursorValue::Boolean(true)));
         assert!(matches!(cursor_values[3], CursorValue::Null));
     }
+
+    #[test]
+    fn default_sort_cursor_round_trips_into_search_after() {
+        let resource = StoredResource::new(
+            "Patient",
+            "p-5",
+            crate::tenant::TenantId::new("t"),
+            json!({ "resourceType": "Patient", "id": "p-5" }),
+            helios_fhir::FhirVersion::default_enabled(),
+        );
+        let hit_sort = vec![json!(1_700_000_000_000_i64), json!("p-5")];
+        let cursor = page_cursor_for(&resource, Some(&hit_sort), CursorDirection::Next).unwrap();
+        let query = SearchQuery::new("Patient")
+            .with_count(1000)
+            .with_cursor(cursor);
+        let builder = EsQueryBuilder::new("t", "Patient", "hfs_t_patient".to_string());
+        let body = builder.build(&query).body;
+
+        assert_eq!(body["search_after"], json!(hit_sort));
+        assert_eq!(body["size"], json!(1001));
+        assert!(body.get("from").is_none());
+    }
 }

@@ -237,23 +237,128 @@ const CHAIN_VALUE_CHUNK: usize = 250;
 async fn search_all_pages<S>(
     storage: &S,
     tenant: &TenantContext,
-    query: SearchQuery,
+    mut query: SearchQuery,
 ) -> StorageResult<Vec<crate::types::StoredResource>>
 where
     S: SearchProvider + ?Sized,
 {
     let mut items = Vec::new();
     let mut offset: u32 = 0;
+    let mut seen_cursors = HashSet::new();
+    // These are fresh internal queries. Leave their default sort in place so
+    // each backend's cursor encodes the same order it used for the first page.
+    query.offset = None;
+    query.cursor = None;
     loop {
         let mut page = query.clone().with_count(RESOLVER_PAGE);
-        page.offset = Some(offset);
+        // Cursor pages never carry an offset. The offset below is used only if
+        // a provider reports more rows without supplying a cursor.
+        if page.cursor.is_none() && offset > 0 {
+            page.offset = Some(offset);
+        }
         let result = storage.search(tenant, &page).await?;
         let got = result.resources.items.len();
+        let has_next = result.has_next();
+        let next_cursor = result.next_cursor().cloned();
         items.extend(result.resources.items);
-        if got < RESOLVER_PAGE as usize {
+        if !has_next {
             return Ok(items);
         }
-        offset += RESOLVER_PAGE;
+        if got == 0 {
+            return Err(StorageError::Backend(
+                crate::error::BackendError::Internal {
+                    backend_name: "chain_resolver".to_string(),
+                    message: "chain search provider returned an empty page with more results"
+                        .to_string(),
+                    source: None,
+                },
+            ));
+        }
+        offset = offset.checked_add(got as u32).ok_or_else(|| {
+            StorageError::Backend(crate::error::BackendError::Internal {
+                backend_name: "chain_resolver".to_string(),
+                message: "chain search result offset overflowed".to_string(),
+                source: None,
+            })
+        })?;
+        if let Some(cursor) = next_cursor {
+            if !seen_cursors.insert(cursor.clone()) {
+                return Err(StorageError::Backend(
+                    crate::error::BackendError::Internal {
+                        backend_name: "chain_resolver".to_string(),
+                        message: "chain search provider repeated a page cursor".to_string(),
+                        source: None,
+                    },
+                ));
+            }
+            query.cursor = Some(cursor);
+            query.offset = None;
+        } else {
+            query.cursor = None;
+        }
+    }
+}
+
+/// Drains a forward hop without materializing resource bodies when the search
+/// provider has an id-only path. Every id belongs to `query.resource_type`.
+async fn search_all_ids<S>(
+    storage: &S,
+    tenant: &TenantContext,
+    mut query: SearchQuery,
+) -> StorageResult<Vec<String>>
+where
+    S: SearchProvider + ?Sized,
+{
+    let mut ids = Vec::new();
+    let mut offset: u32 = 0;
+    let mut seen_cursors = HashSet::new();
+    query.offset = None;
+    query.cursor = None;
+    loop {
+        let mut page = query.clone().with_count(RESOLVER_PAGE);
+        if page.cursor.is_none() && offset > 0 {
+            page.offset = Some(offset);
+        }
+        let result = storage.search_ids(tenant, &page).await?;
+        let got = result.items.len();
+        let has_next = result.page_info.has_next;
+        let next_cursor = result.page_info.next_cursor.clone();
+        ids.extend(result.items);
+        if !has_next {
+            return Ok(ids);
+        }
+        if got == 0 {
+            return Err(StorageError::Backend(
+                crate::error::BackendError::Internal {
+                    backend_name: "chain_resolver".to_string(),
+                    message: "chain search provider returned an empty id page with more results"
+                        .to_string(),
+                    source: None,
+                },
+            ));
+        }
+        offset = offset.checked_add(got as u32).ok_or_else(|| {
+            StorageError::Backend(crate::error::BackendError::Internal {
+                backend_name: "chain_resolver".to_string(),
+                message: "chain search id offset overflowed".to_string(),
+                source: None,
+            })
+        })?;
+        if let Some(cursor) = next_cursor {
+            if !seen_cursors.insert(cursor.clone()) {
+                return Err(StorageError::Backend(
+                    crate::error::BackendError::Internal {
+                        backend_name: "chain_resolver".to_string(),
+                        message: "chain search provider repeated an id page cursor".to_string(),
+                        source: None,
+                    },
+                ));
+            }
+            query.cursor = Some(cursor);
+            query.offset = None;
+        } else {
+            query.cursor = None;
+        }
     }
 }
 
@@ -447,12 +552,8 @@ where
             chain: vec![],
             components: vec![],
         });
-        let items = search_all_pages(storage, tenant, terminal_query).await?;
-        current_refs.extend(
-            items
-                .into_iter()
-                .map(|r| format!("{}/{}", r.resource_type(), r.id())),
-        );
+        let ids = search_all_ids(storage, tenant, terminal_query).await?;
+        current_refs.extend(ids.into_iter().map(|id| format!("{terminal_target}/{id}")));
     }
     if current_refs.is_empty() {
         return Ok(Some(Vec::new()));
@@ -482,12 +583,12 @@ where
                     chain: vec![],
                     components: vec![],
                 });
-                let items = search_all_pages(storage, tenant, query).await?;
-                for res in items {
+                let ids = search_all_ids(storage, tenant, query).await?;
+                for id in ids {
                     let r = if i == 0 {
-                        res.id().to_string()
+                        id
                     } else {
-                        format!("{}/{}", res.resource_type(), res.id())
+                        format!("{parent_type}/{id}")
                     };
                     if seen.insert(r.clone()) {
                         next_refs.push(r);
@@ -2084,6 +2185,40 @@ mod tests {
             N,
             "every observation whose encounter's patient is female matches"
         );
+    }
+
+    #[tokio::test]
+    async fn drains_more_than_two_internal_pages_without_skipping_ids() {
+        let b = backend();
+        let t = tenant();
+        const N: usize = 2101;
+        for i in 0..N {
+            let id = format!("paged-{i:04}");
+            b.create(
+                &t,
+                "Patient",
+                json!({ "resourceType": "Patient", "id": id }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let items = search_all_pages(&b, &t, SearchQuery::new("Patient"))
+            .await
+            .unwrap();
+        assert_eq!(items.len(), N);
+        let ids: HashSet<_> = items.iter().map(|r| r.id()).collect();
+        assert_eq!(ids.len(), N, "a cursor boundary must not repeat a row");
+        assert!(ids.contains("paged-0000"));
+        assert!(ids.contains("paged-2100"));
+
+        let id_pages = search_all_ids(&b, &t, SearchQuery::new("Patient"))
+            .await
+            .unwrap();
+        let id_page_set: HashSet<_> = id_pages.iter().map(String::as_str).collect();
+        assert_eq!(id_pages.len(), N);
+        assert_eq!(id_page_set, ids, "id-only pages must match full pages");
     }
 }
 

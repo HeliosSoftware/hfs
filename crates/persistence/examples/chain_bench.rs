@@ -73,7 +73,7 @@ use helios_persistence::error::StorageResult;
 use helios_persistence::search::{SearchParameterRegistry, parse_typed_values, resolve_chains};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{
-    ChainedParameter, ReverseChainedParameter, SearchParameter, SearchQuery, SearchValue,
+    ChainedParameter, Page, ReverseChainedParameter, SearchParameter, SearchQuery, SearchValue,
     StoredResource,
 };
 use parking_lot::RwLock;
@@ -905,8 +905,8 @@ fn forward_parameter(
 // ───────────────────────────── instrumentation ─────────────────────────────
 
 /// Counts what the shared resolver asks of a backend: searches issued, rows
-/// returned, and the JSON bytes of those rows — the resolver receives whole
-/// resources and keeps only `Type/id`.
+/// returned, and payload bytes. Full searches count JSON content; id-only
+/// searches count the ids returned by the SQL projection.
 struct Counting<S> {
     inner: Arc<S>,
     searches: AtomicU64,
@@ -1003,6 +1003,19 @@ impl<S: SearchProvider> SearchProvider for Counting<S> {
             .iter()
             .map(|r| serde_json::to_vec(r.content()).map_or(0, |v| v.len()))
             .sum();
+        self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        Ok(result)
+    }
+    async fn search_ids(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<Page<String>> {
+        let result = self.inner.search_ids(tenant, query).await?;
+        self.searches.fetch_add(1, Ordering::Relaxed);
+        self.rows
+            .fetch_add(result.items.len() as u64, Ordering::Relaxed);
+        let bytes: usize = result.items.iter().map(String::len).sum();
         self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
         Ok(result)
     }

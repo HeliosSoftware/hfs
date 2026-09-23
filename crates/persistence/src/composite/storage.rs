@@ -56,7 +56,7 @@ use crate::error::{BackendError, ResourceError, StorageError, StorageResult, Tra
 use crate::search::ChainResolveOptions;
 use crate::tenant::TenantContext;
 use crate::types::{
-    IncludeDirective, Pagination, ReverseChainedParameter, SearchParamType, SearchParameter,
+    IncludeDirective, Page, Pagination, ReverseChainedParameter, SearchParamType, SearchParameter,
     SearchQuery, SearchValue, StoredResource,
 };
 
@@ -1335,6 +1335,51 @@ impl SearchProvider for CompositeStorage {
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
         self.execute_routed_search(tenant, query).await
+    }
+
+    async fn search_ids(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<Page<String>> {
+        // A merged search needs resource-level ordering and page information.
+        // Delegate id pages only when the normal route has one search provider.
+        if !self.has_dedicated_search_backend() {
+            let decision = self
+                .router
+                .route(query)
+                .map_err(|error| self.routing_error_to_storage_error(error))?;
+            if !decision.auxiliary_targets.is_empty() {
+                return Ok(self
+                    .search(tenant, query)
+                    .await?
+                    .resources
+                    .map(|resource| resource.id().to_string()));
+            }
+        }
+
+        let preferred_id = self
+            .config
+            .backends_with_role(super::config::BackendRole::Search)
+            .next()
+            .map(|backend| backend.id.as_str());
+        let primary_id = self.config.primary_id().unwrap_or("primary");
+        let backend_id = preferred_id
+            .filter(|id| self.search_providers.contains_key(*id))
+            .unwrap_or(primary_id);
+        let provider = self.search_providers.get(backend_id).ok_or_else(|| {
+            StorageError::Backend(BackendError::UnsupportedCapability {
+                backend_name: backend_id.to_string(),
+                capability: "SearchProvider".to_string(),
+            })
+        })?;
+        let result = provider.search_ids(tenant, query).await;
+        self.update_health(
+            backend_id,
+            result.is_ok(),
+            result.as_ref().err().map(|error| error.to_string()),
+        );
+        result
     }
 
     async fn search_count(
