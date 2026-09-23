@@ -1822,10 +1822,9 @@ mod entry_methods {
         json!({ "resourceType": "Bundle", "type": "batch", "entry": entries })
     }
 
-    /// PATCH is declined at 501 — the status all three backends already return
-    /// from inside a transaction, and the one both READMEs already claimed.
+    /// A malformed PATCH payload fails only its batch entry and changes nothing.
     #[tokio::test]
-    async fn batch_patch_is_declined_at_501_and_changes_nothing() {
+    async fn malformed_batch_patch_is_400_and_changes_nothing() {
         let (server, backend) = create_test_server().await;
         seed_patient(&backend, "p1", "Nguyen").await;
 
@@ -1838,10 +1837,7 @@ mod entry_methods {
         )
         .await;
 
-        assert_eq!(
-            body["entry"][0]["response"]["status"],
-            "501 Not Implemented"
-        );
+        assert_eq!(body["entry"][0]["response"]["status"], "400 Bad Request");
         let stored = backend
             .read(&test_tenant(), "Patient", "p1")
             .await
@@ -1920,11 +1916,11 @@ mod entry_methods {
         );
     }
 
-    /// A PATCH transaction is declined before anything executes, so a sibling
-    /// create in the same bundle must not have landed.
+    /// A malformed PATCH rolls back a preceding create in the transaction.
     #[tokio::test]
-    async fn a_transaction_patch_is_declined_intact_at_501() {
+    async fn a_malformed_transaction_patch_rolls_back_at_400() {
         let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Nguyen").await;
         let before = patient_count(&backend).await;
 
         let response = post_bundle(
@@ -1946,10 +1942,10 @@ mod entry_methods {
         )
         .await;
 
-        response.assert_status(StatusCode::NOT_IMPLEMENTED);
+        response.assert_status(StatusCode::BAD_REQUEST);
         let body: Value = response.json();
         assert_eq!(body["resourceType"], "OperationOutcome");
-        assert_eq!(body["issue"][0]["code"], "not-supported");
+        assert_eq!(body["issue"][0]["code"], "invalid");
         assert!(
             body["issue"][0]["details"]["text"]
                 .as_str()
