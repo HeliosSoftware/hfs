@@ -134,7 +134,7 @@
         <button type="submit" class="btn" form="lib-editor-form" name="action" value="duplicate">
           <span class="icon">{% include "icons/copy.svg" %}</span> {{ i18n.t("vd-duplicate") }}
         </button>
-        <button type="button" class="btn btn--danger" data-crud-delete
+        <button type="button" class="btn btn--danger btn--busy-slot" data-crud-delete
                 data-type="Library" data-id="{{ sel.id }}"
                 data-confirm="{{ i18n.t_arg("lib-delete-confirm", "name", sel.name.to_string()) }}"
                 data-failed="{{ i18n.t("lib-delete-failed") }}"
