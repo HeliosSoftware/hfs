@@ -1193,7 +1193,7 @@ async fn init_login_sessions(
 /// restart. Called from a backend's `start_*` once its Arc exists: the store
 /// itself is built with the auth state, before any backend is. Nothing to
 /// attach when interactive login is off.
-#[cfg(feature = "sqlite")]
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 fn attach_login_sessions(
     auth_state: Option<&Arc<AuthMiddlewareState>>,
     persistence: Arc<dyn helios_auth::SessionPersistence>,
@@ -1387,11 +1387,9 @@ async fn main() -> anyhow::Result<()> {
             start_sqlite_elasticsearch(config, auth_config, auth_state, audit_state).await?;
         }
         StorageBackendMode::Postgres => {
-            warn_login_sessions_in_process(auth_state.as_ref());
             start_postgres(config, auth_config, auth_state, audit_state).await?;
         }
         StorageBackendMode::PostgresElasticsearch => {
-            warn_login_sessions_in_process(auth_state.as_ref());
             start_postgres_elasticsearch(config, auth_config, auth_state, audit_state).await?;
         }
         StorageBackendMode::MongoDB => {
@@ -2786,6 +2784,7 @@ async fn start_postgres(
 
     backend.init_schema().await?;
     let backend = Arc::new(backend);
+    attach_login_sessions(auth_state.as_ref(), backend.clone());
     let observability = helios_rest::WriteObservability::new();
     seed_conformance_resources(&*backend, &config, Some(observability.observers.as_ref())).await;
     spawn_postgres_search_param_refresh(backend.clone(), &config);
@@ -2879,6 +2878,7 @@ async fn start_postgres_elasticsearch(
     let mut backend = backend;
     backend.set_search_offloaded(true);
     let pg = Arc::new(backend);
+    attach_login_sessions(auth_state.as_ref(), pg.clone());
     info!("PostgreSQL search indexing disabled (offloaded to Elasticsearch)");
     // Refresh reads from the primary; the ES backend shares its registry Arc.
     // Seeding waits for the composite below, so the writes also index into ES.

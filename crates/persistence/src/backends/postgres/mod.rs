@@ -77,6 +77,7 @@ mod bulk_export;
 mod bulk_provider;
 mod bulk_submit;
 pub(crate) mod cached;
+mod login_sessions;
 pub(crate) mod schema;
 pub mod search;
 mod search_impl;

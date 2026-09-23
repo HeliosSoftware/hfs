@@ -12,7 +12,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 42;
+pub const SCHEMA_VERSION: i32 = 43;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -403,6 +403,7 @@ async fn migrate_schema(
                 version += 1;
                 continue;
             }
+            42 => migrate_v42_to_v43(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -3863,6 +3864,32 @@ async fn analyze_search_index_with_timeout(
     tx.commit()
         .await
         .map_err(|e| pg_error(format!("commit v42 analyze: {e}")))
+}
+
+/// v42 -> v43: add `login_sessions`, the web UI's interactive login sessions
+/// and the logins still pending at the identity provider (#1481). One JSONB
+/// document per opaque id with a monotonic `version` for conditional writes,
+/// so a session established on one node resolves on every other and outlives
+/// a restart. `kind` keeps sessions and pending logins apart; `expires_at`
+/// drives the sweep. Independent of the FHIR `resources` table, like
+/// `user_settings`.
+async fn migrate_v42_to_v43(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS login_sessions (
+                id         TEXT PRIMARY KEY,
+                kind       TEXT NOT NULL,
+                data       JSONB NOT NULL,
+                version    BIGINT NOT NULL DEFAULT 1,
+                expires_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_login_sessions_expires
+                ON login_sessions (expires_at);",
+        )
+        .await
+        .map_err(|e| pg_error(format!("Migration v42->v43 failed: {e}")))?;
+    Ok(())
 }
 
 /// v23 -> v24: drop `fk_search_resource`.
