@@ -913,18 +913,29 @@ button.menu__option {
   box-shadow: var(--surface-shadow);
 }
 
+/* Sign out is a POST form (#1449, #738): a `<button>` styled as the row the
+   anchor used to draw, so the resets below keep it looking identical. */
+.user-menu__out-form {
+  display: block;
+  margin: 0;
+}
+
 .user-menu__out {
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 8px;
+  width: calc(100% - 4px);
   margin: 4px 2px 2px;
   padding: 8px 0;
   border: 1px solid var(--surface-border);
   border-radius: 10px;
+  background: none;
+  font: inherit;
   font-weight: 500;
   color: var(--text);
   text-decoration: none;
+  cursor: pointer;
 }
 
 .user-menu__out:hover {
