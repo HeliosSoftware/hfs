@@ -12,7 +12,7 @@ by the bounded #1086 protocol. See ``MEMORY_MEASUREMENT.md`` beside this file
 for #995 and ``docs/postgres-reindex-benchmark.md`` for #1086.
 
 A successful attempt requires the deferred reindex to be positively verified:
-the ``deferred-index rebuild started job_id=...`` log line, ``$reindex-status``
+a supported deferred-reindex start log line with ``job_id=...``, ``$reindex-status``
 reporting ``completed`` with ``errorCount == 0`` and ``processed == total``,
 and a SQL coverage probe of zero unindexed Patients.  Anything less marks the
 attempt unverified, keeps its raw timings labelled incomplete, and stops the
@@ -52,9 +52,16 @@ from typing import Any, Callable, Iterable, Optional
 SCHEMA_VERSION = 2
 ISSUE_1086_DEFAULT_RESOURCES = 2000
 ISSUE_1086_MAX_RESOURCES = 10_000
+GROUPED_CREATE_DEFAULT_RESOURCES = 10_000
+GROUPED_CREATE_CONTENT_LIMIT_BYTES = 8 * 1024 * 1024
+GROUPED_CREATE_OVERSIZED_RESOURCES = 203
 TENANT = "default"
 FAMILY = "Pilot995"
 MRN_SYSTEM = "http://helios.example/mrn"
+REINDEX_START_MARKERS = (
+    "deferred reindex generation started",
+    "deferred-index rebuild started",
+)
 SUBMITTER_SYSTEM = "http://helios.example/bench"
 SUBMITTER_VALUE = "mem995"
 FIXTURE_FILE_COUNT = 4
@@ -76,7 +83,9 @@ HFS_ENV_BASE = {
     # terminal marker to 6 s; it throttles nothing on the ingest path.
     "HFS_BULK_SUBMIT_POLL_RATE_LIMIT": "1000000",
     "HFS_PG_MAX_CONNECTIONS": "4",
+    "HFS_PG_STATEMENT_TIMEOUT_MS": "300000",
     "HFS_MAX_PAGE_SIZE": "1000",
+    "HFS_REQUEST_TIMEOUT": "300",
     "HFS_AUTH_ENABLED": "false",
     "HFS_AUDIT_BACKEND": "none",
 }
@@ -97,6 +106,8 @@ def effective_hfs_env(
     )
     env["HFS_BULK_SUBMIT_OUTPUT_BACKEND"] = "local-fs"
     env["HFS_BULK_SUBMIT_OUTPUT_DIR"] = str(output_dir / "artifacts")
+    if args.batch_size is not None:
+        env["HFS_BULK_SUBMIT_BATCH_SIZE"] = str(args.batch_size)
     if args.postgres_reindex_evidence:
         env["HFS_PERF_PHASES"] = "1"
         # EnvFilter target directives match prefixes. Without the more-specific
@@ -117,9 +128,13 @@ def iso_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
+def reindex_start_marker(line: str) -> Optional[str]:
+    return next((marker for marker in REINDEX_START_MARKERS if marker in line), None)
+
+
 def parse_reindex_start_log_timestamp(line: str) -> Optional[datetime]:
     """Parse the RFC3339 prefix from a deferred-reindex start log line."""
-    if "deferred-index rebuild started" not in line:
+    if reindex_start_marker(line) is None:
         return None
     match = re.match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\s", line)
     if not match:
@@ -397,6 +412,50 @@ def numeric_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str, An
     return delta
 
 
+def statement_counter_delta(
+    before: dict[str, Any], after: dict[str, Any]
+) -> dict[str, Any]:
+    """Subtract scoped pg_stat_statements call counters."""
+    result: dict[str, Any] = {}
+    for kind in ("resource_insert", "savepoint"):
+        old = before.get(kind) or {}
+        new = after.get(kind) or {}
+        old_calls, new_calls = old.get("calls"), new.get("calls")
+        calls = (
+            new_calls - old_calls
+            if isinstance(old_calls, int) and isinstance(new_calls, int)
+            else None
+        )
+        result[kind] = {
+            "calls": calls,
+            "matching_queryids": new.get("matching_queryids") if calls else 0,
+        }
+    return result
+
+
+def statement_counter_intervals(
+    before_kickoff: dict[str, Any],
+    polling_observed_terminal: dict[str, Any],
+    verified_search_ready: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "before": before_kickoff,
+        "polling_observed_terminal": polling_observed_terminal,
+        "after": verified_search_ready,
+        "interval_deltas": {
+            "kickoff_to_terminal": statement_counter_delta(
+                before_kickoff, polling_observed_terminal
+            ),
+            "observed_terminal_to_search_ready": statement_counter_delta(
+                polling_observed_terminal, verified_search_ready
+            ),
+            "kickoff_to_search_ready": statement_counter_delta(
+                before_kickoff, verified_search_ready
+            ),
+        },
+    }
+
+
 def postgres_activity_intervals(
     before_kickoff: dict[str, Any],
     polling_observed_terminal: dict[str, Any],
@@ -492,6 +551,80 @@ def postgres_reindex_comparability_reasons(
         reasons.append("expected three parsed cursor plans")
     if require_phase_summary and not reindex.get("phase_summary_available"):
         reasons.append("required correlated phase summary is missing")
+    if hfs_samples < 1:
+        reasons.append("missing HFS memory sample between kickoff and search readiness")
+    if postgres_samples < 1:
+        reasons.append("missing PostgreSQL memory sample between kickoff and search readiness")
+    return reasons
+
+
+def postgres_grouped_create_comparability_reasons(
+    attempt: dict[str, Any],
+    preflight: dict[str, Any],
+    fixture: dict[str, Any],
+    hfs_samples: int,
+    postgres_samples: int,
+    expected_resource_inserts: int,
+    expected_savepoints: int,
+) -> list[str]:
+    """Return missing or contradictory #1455 benchmark evidence."""
+    reasons: list[str] = []
+    git = preflight.get("git") or {}
+    postgres = preflight.get("postgres") or {}
+    tracking = preflight.get("pg_stat_statements") or {}
+    work = attempt.get("postgres_work") or {}
+    sql = attempt.get("grouped_create_sql") or {}
+    intervals = work.get("interval_deltas") or {}
+    if not (preflight.get("binary") or {}).get("sha256"):
+        reasons.append("missing binary fingerprint")
+    if not (preflight.get("controller") or {}).get("sha256"):
+        reasons.append("missing controller fingerprint")
+    if not git.get("fingerprint_sha256"):
+        reasons.append("missing full source fingerprint")
+    if not git.get("fingerprint_verified"):
+        reasons.append("source fingerprint was not bound to the expected value")
+    if not postgres.get("image_id"):
+        reasons.append("missing immutable PostgreSQL image ID")
+    if not (postgres.get("server") or {}).get("version"):
+        reasons.append("missing PostgreSQL server version")
+    if not fixture.get("corpus_sha256"):
+        reasons.append("missing corpus fingerprint")
+    if not tracking.get("available"):
+        reasons.append("pg_stat_statements is unavailable")
+    if not tracking.get("track_utility"):
+        reasons.append("pg_stat_statements.track_utility is off")
+    if not tracking.get("savepoint_pilot_observed"):
+        reasons.append("SAVEPOINT bulk_entry utility pilot was not observed")
+    if not all(
+        key in intervals
+        for key in (
+            "kickoff_to_terminal",
+            "observed_terminal_to_search_ready",
+            "kickoff_to_search_ready",
+        )
+    ):
+        reasons.append("missing PostgreSQL activity interval deltas")
+    terminal = (sql.get("interval_deltas") or {}).get("kickoff_to_terminal") or {}
+    ready = (sql.get("interval_deltas") or {}).get("kickoff_to_search_ready") or {}
+    for label, snapshot in (("terminal", terminal), ("search-ready", ready)):
+        inserts = (snapshot.get("resource_insert") or {}).get("calls")
+        savepoints = (snapshot.get("savepoint") or {}).get("calls")
+        if inserts != expected_resource_inserts:
+            reasons.append(
+                f"{label} resource INSERT calls {inserts!r} != expected {expected_resource_inserts}"
+            )
+        if savepoints != expected_savepoints:
+            reasons.append(
+                f"{label} SAVEPOINT bulk_entry calls {savepoints!r} != expected {expected_savepoints}"
+            )
+        for kind in ("resource_insert", "savepoint"):
+            matches = (snapshot.get(kind) or {}).get("matching_queryids")
+            calls = (snapshot.get(kind) or {}).get("calls")
+            expected_matches = 1 if calls else 0
+            if matches != expected_matches:
+                reasons.append(
+                    f"{label} {kind} counter is ambiguous: {matches!r} matching queryids"
+                )
     if hfs_samples < 1:
         reasons.append("missing HFS memory sample between kickoff and search readiness")
     if postgres_samples < 1:
@@ -745,6 +878,32 @@ class PgClient:
                 f"SELECT 'search_index_patient', count(*)::text FROM search_index "
                 f"WHERE tenant_id = '{TENANT}' AND resource_type = 'Patient'"
             )
+            parts.append(
+                "SELECT 'family_exact_patients', count(DISTINCT resource_id)::text "
+                f"FROM search_index WHERE tenant_id = '{TENANT}' "
+                "AND resource_type = 'Patient' AND param_name = 'family' "
+                f"AND value_string = '{FAMILY}'"
+            )
+            parts.append(
+                "SELECT 'active_true_patients', count(DISTINCT resource_id)::text "
+                f"FROM search_index WHERE tenant_id = '{TENANT}' "
+                "AND resource_type = 'Patient' AND param_name = 'active' "
+                "AND value_token_system IS NULL AND value_token_code = 'true'"
+            )
+        if "resources" in tables and "resource_fts" in tables:
+            # Match the production `_content` predicate exactly, while the
+            # resources join keeps tenant, type, and deletion semantics explicit.
+            parts.append(
+                "SELECT 'fts_content_pilot995_patients', "
+                "count(DISTINCT fts.resource_id)::text "
+                "FROM resource_fts fts INNER JOIN resources r "
+                "ON r.tenant_id = fts.tenant_id "
+                "AND r.resource_type = fts.resource_type "
+                "AND r.id = fts.resource_id "
+                f"WHERE r.tenant_id = '{TENANT}' AND r.resource_type = 'Patient' "
+                "AND r.is_deleted = FALSE "
+                f"AND fts.content_tsvector @@ plainto_tsquery('english', '{FAMILY}')"
+            )
         rows = self.require("\nUNION ALL\n".join(parts) + ";") if parts else []
         flat: dict[str, Any] = {}
         version_spread: dict[str, int] = {}
@@ -798,6 +957,71 @@ class PgClient:
             except ValueError:
                 values[name] = float(raw)
         return values
+
+    def statement_tracking_info(self) -> dict[str, Any]:
+        result = self.psql(
+            "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements')::text, "
+            "coalesce(current_setting('pg_stat_statements.track_utility', true), '')::text;"
+        )
+        if not result["ok"] or not result["rows"]:
+            return {
+                "available": False,
+                "track_utility": False,
+                "error": result.get("error") or "pg_stat_statements probe returned no row",
+            }
+        installed, utility = result["rows"][0][:2]
+        true_values = {"true", "t", "on", "1"}
+        return {
+            "available": installed.strip().lower() in true_values,
+            "track_utility": utility.strip().lower() in true_values,
+            "setting": utility,
+            "database": self.database,
+            "user": self.user,
+        }
+
+    def statement_snapshot(self) -> dict[str, Any]:
+        rows = self.require(
+            "WITH classified AS ("
+            " SELECT queryid, calls, CASE"
+            "   WHEN btrim(query) = 'SAVEPOINT bulk_entry' THEN 'savepoint'"
+            "   WHEN position('WITH input (resource_type, id, version_id, data, last_updated, fhir_version) AS' in query) > 0"
+            "    AND position('INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)' in query) > 0"
+            "   THEN 'resource_insert' ELSE NULL END AS kind"
+            " FROM pg_stat_statements"
+            " WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())"
+            "   AND userid = (SELECT usesysid FROM pg_user WHERE usename = current_user)"
+            ")"
+            " SELECT kind, count(DISTINCT queryid)::text, coalesce(sum(calls), 0)::bigint::text"
+            " FROM classified WHERE kind IS NOT NULL GROUP BY kind ORDER BY kind;"
+        )
+        snapshot = {
+            "database": self.database,
+            "user": self.user,
+            "resource_insert": {"matching_queryids": 0, "calls": 0},
+            "savepoint": {"matching_queryids": 0, "calls": 0},
+        }
+        for row in rows:
+            if len(row) != 3 or row[0] not in snapshot:
+                continue
+            snapshot[row[0]] = {
+                "matching_queryids": int(row[1]),
+                "calls": int(row[2]),
+            }
+        return snapshot
+
+    def statement_tracking_pilot(self) -> dict[str, Any]:
+        before = self.statement_snapshot()
+        self.require(
+            "BEGIN; SAVEPOINT bulk_entry; RELEASE SAVEPOINT bulk_entry; ROLLBACK;"
+        )
+        after = self.statement_snapshot()
+        delta = statement_counter_delta(before, after)
+        return {
+            "before": before,
+            "after": after,
+            "delta": delta,
+            "observed": (delta.get("savepoint") or {}).get("calls") == 1,
+        }
 
     def reindex_cursor_plans(self, total: int, analyze: bool = False) -> list[dict[str, Any]]:
         offsets = [("early", None), ("middle", max(0, total // 2 - 1)), ("late", max(0, total - 101))]
@@ -1209,7 +1433,7 @@ class Controller:
         return f"p995-{file_index}-{offset}"
 
     def patient_resource(self, file_index: int, offset: int) -> dict[str, Any]:
-        return {
+        resource = {
             "resourceType": "Patient",
             "id": self.patient_id(file_index, offset),
             "identifier": [
@@ -1236,13 +1460,38 @@ class Controller:
                 }
             ],
         }
+        if (
+            self.args.fixture_mode == "oversized"
+            and file_index == 0
+            and offset == self.oversized_offset()
+        ):
+            resource["photo"] = [
+                {"contentType": "application/octet-stream", "data": ""}
+            ]
+            compact = json.dumps(
+                resource, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")
+            padding = GROUPED_CREATE_CONTENT_LIMIT_BYTES + 1 - len(compact)
+            if padding < 1:
+                raise ConfigError("oversized fixture base unexpectedly exceeds 8 MiB")
+            resource["photo"][0]["data"] = "A" * padding
+        return resource
+
+    def fixture_file_count(self) -> int:
+        return 1 if self.args.postgres_grouped_create_evidence else FIXTURE_FILE_COUNT
+
+    def oversized_offset(self) -> int:
+        if self.args.resources >= GROUPED_CREATE_OVERSIZED_RESOURCES:
+            return 100
+        return self.args.resources // 2
 
     def file_offsets(self) -> list[list[int]]:
         """Local offsets per file, so ids read `p995-<file>-<offset>`."""
         total = self.args.resources
-        per_file = total // FIXTURE_FILE_COUNT
-        layout = [list(range(per_file)) for _ in range(FIXTURE_FILE_COUNT)]
-        remainder = total - per_file * FIXTURE_FILE_COUNT
+        file_count = self.fixture_file_count()
+        per_file = total // file_count
+        layout = [list(range(per_file)) for _ in range(file_count)]
+        remainder = total - per_file * file_count
         if remainder:
             layout[-1].extend(range(per_file, per_file + remainder))
         return layout
@@ -1276,14 +1525,32 @@ class Controller:
             self.fixture_info = {
                 "family": FAMILY,
                 "mrn_system": MRN_SYSTEM,
+                "mode": self.args.fixture_mode,
+                "file_count": self.fixture_file_count(),
                 "files": files,
                 "total": sum(entry["count"] for entry in files),
                 "total_bytes": sum(entry["bytes"] for entry in files),
                 "corpus_sha256": hashlib.sha256(
                     "".join(entry["sha256"] for entry in files).encode("ascii")
                 ).hexdigest(),
-                "scheme": "identical resources re-submitted with stable ids (reimports)",
+                "scheme": (
+                    "one-file deterministic all-new Patients"
+                    if self.args.postgres_grouped_create_evidence
+                    else "identical resources re-submitted with stable ids (reimports)"
+                ),
             }
+            if self.args.fixture_mode == "oversized":
+                oversized = self.patient_resource(0, self.oversized_offset())
+                self.fixture_info["oversized"] = {
+                    "id": oversized["id"],
+                    "offset": self.oversized_offset(),
+                    "compact_bytes": len(
+                        json.dumps(
+                            oversized, separators=(",", ":"), ensure_ascii=False
+                        ).encode("utf-8")
+                    ),
+                    "content_limit_bytes": GROUPED_CREATE_CONTENT_LIMIT_BYTES,
+                }
         manifest_path = self.fixtures_dir / f"manifest-{job:02d}.json"
         manifest = {
             "transactionTime": "2024-01-01T00:00:00Z",
@@ -1623,6 +1890,19 @@ class Controller:
                 "the deferred-reindex verdict requires SQL coverage probes"
             )
         info["postgres"]["server"] = self.pg.server_info()
+        if self.args.postgres_grouped_create_evidence:
+            tracking = self.pg.statement_tracking_info()
+            if tracking.get("available") and tracking.get("track_utility"):
+                try:
+                    pilot = self.pg.statement_tracking_pilot()
+                    tracking["savepoint_pilot"] = pilot
+                    tracking["savepoint_pilot_observed"] = pilot["observed"]
+                except Exception as error:
+                    tracking["savepoint_pilot_observed"] = False
+                    tracking["pilot_error"] = str(error)
+            else:
+                tracking["savepoint_pilot_observed"] = False
+            info["pg_stat_statements"] = tracking
         info["db_before"] = self.pg.counts()
 
         samples = []
@@ -1665,6 +1945,14 @@ class Controller:
         }
         if stale and not self.args.allow_nonempty_db:
             blocked.append("database is not fresh: " + ", ".join(f"{k}={v}" for k, v in stale.items()))
+        if self.args.postgres_grouped_create_evidence:
+            tracking = info.get("pg_stat_statements") or {}
+            if not tracking.get("available"):
+                blocked.append("pg_stat_statements extension is unavailable")
+            if not tracking.get("track_utility"):
+                blocked.append("pg_stat_statements.track_utility must be on")
+            if not tracking.get("savepoint_pilot_observed"):
+                blocked.append("pg_stat_statements did not observe the SAVEPOINT bulk_entry pilot")
         if info["foreign_processes"]["hfs"]:
             blocked.append(f"another hfs process is running ({info['foreign_processes']['hfs']})")
         if info["foreign_processes"]["rustc"]:
@@ -1797,7 +2085,11 @@ class Controller:
     def search_count(self, query: str) -> Optional[int]:
         """Parameterised searches go through the index; the bare one does not."""
         suffix = f"?{query}&_summary=count&_count=1" if query else "?_summary=count&_count=1"
-        result = http_json("GET", f"{self.base_url}/Patient{suffix}")
+        result = http_json(
+            "GET",
+            f"{self.base_url}/Patient{suffix}",
+            timeout=self.args.request_timeout,
+        )
         with (self.out / "search-checks.jsonl").open("a") as evidence:
             evidence.write(json.dumps({"wall_iso": iso_now(), "query": query,
                 "status": result["status"], "error": result["error"],
@@ -1999,6 +2291,7 @@ class Controller:
             deadline = mono() + self.args.reindex_timeout
             job_id = None
             start_log_timestamp = None
+            start_log_marker = None
             lines: list[str] = []
             while job_id is None:
                 self.raise_if_aborted()
@@ -2015,7 +2308,9 @@ class Controller:
                     and submission_id in line
                 ]
                 started = [
-                    line for line in lines if "deferred-index rebuild started" in line
+                    line
+                    for line in lines
+                    if reindex_start_marker(line) is not None
                 ]
                 ids = {
                     match.group(1)
@@ -2035,12 +2330,17 @@ class Controller:
                     correlated_start_lines = [
                         line for line in started if job_id in line
                     ]
+                    correlated_start_line = correlated_start_lines[-1]
                     start_log_timestamp = parse_reindex_start_log_timestamp(
-                        correlated_start_lines[-1]
+                        correlated_start_line
                     )
+                    start_log_marker = reindex_start_marker(correlated_start_line)
                 time.sleep(min(1.0, self.args.endpoint_poll_interval))
             evidence["job_id"] = job_id
-            evidence["job_id_source"] = "hfs log line 'deferred-index rebuild started' after kickoff"
+            evidence["job_id_source"] = (
+                f"hfs log line containing {start_log_marker!r} after kickoff"
+            )
+            evidence["start_log_marker"] = start_log_marker
             evidence["start_log_timestamp"] = (
                 start_log_timestamp.isoformat().replace("+00:00", "Z")
                 if start_log_timestamp
@@ -2097,17 +2397,24 @@ class Controller:
         counts = self.pg.counts()
         evidence["db_counts"] = counts["counts"]
         unindexed = counts["counts"].get("unindexed_patients")
-        indexed_total = self.search_count(f"family={FAMILY}")
-        evidence["search_total_family"] = indexed_total
+        family_exact = counts["counts"].get("family_exact_patients")
+        fts_content = counts["counts"].get("fts_content_pilot995_patients")
+        evidence["family_exact_patients"] = family_exact
+        evidence["fts_content_pilot995_patients"] = fts_content
         evidence["unindexed_patients"] = unindexed
         if unindexed != 0:
             raise Aborted("reindex_coverage_incomplete", {"evidence": evidence})
-        if indexed_total != total:
-            raise Aborted("search_index_count_mismatch", {"evidence": evidence})
+        if family_exact != total:
+            raise Aborted("family_index_count_mismatch", {"evidence": evidence})
+        if fts_content != total:
+            raise Aborted("fts_content_count_mismatch", {"evidence": evidence})
         ready_mono = mono()
         evidence["reindex_s"] = round(ready_mono - kickoff_mono, 3)
         evidence["search_ready_observed_mono"] = ready_mono
-        if self.args.postgres_reindex_evidence:
+        if (
+            self.args.postgres_reindex_evidence
+            or self.args.postgres_grouped_create_evidence
+        ):
             try:
                 evidence["postgres_activity_at_search_ready"] = self.pg.activity_snapshot()
             except Exception as error:
@@ -2161,10 +2468,15 @@ class Controller:
         started = mono()
         total = self.expected_total()
         layout = self.file_offsets()
+        all_points = [
+            (file_index, offset)
+            for file_index, offsets in enumerate(layout)
+            for offset in offsets
+        ]
         sample_points = [
-            (0, layout[0][0]),
-            (FIXTURE_FILE_COUNT // 2, layout[FIXTURE_FILE_COUNT // 2][0]),
-            (FIXTURE_FILE_COUNT - 1, layout[-1][-1]),
+            all_points[0],
+            all_points[len(all_points) // 2],
+            all_points[-1],
         ]
         sampled = [self.patient_id(file_index, offset) for file_index, offset in sample_points]
         expected = {
@@ -2262,21 +2574,25 @@ class Controller:
             total, counts["counts"].get("resources_patient"))
         add("pg_unindexed_patients", "hard", counts["counts"].get("unindexed_patients") == 0,
             0, counts["counts"].get("unindexed_patients"))
+        add("pg_family_exact_patients", "hard",
+            counts["counts"].get("family_exact_patients") == total,
+            total, counts["counts"].get("family_exact_patients"))
+        add("pg_active_true_patients", "hard",
+            counts["counts"].get("active_true_patients") == self.expected_active(),
+            self.expected_active(), counts["counts"].get("active_true_patients"))
+        add("pg_fts_content_pilot995_patients", "hard",
+            counts["counts"].get("fts_content_pilot995_patients") == total,
+            total, counts["counts"].get("fts_content_pilot995_patients"))
 
-        # HTTP exactness (the bare count is storage-only; the family search is indexed)
+        # Keep one bounded end-to-end search API check. `_id` uses the direct
+        # resources-backed route and avoids an unbounded structured COUNT query.
         add("http_storage_total", "hard", self.search_count("") == total, total, self.search_count(""))
-        family_total = self.search_count(f"family={FAMILY}")
-        add("http_family_search", "hard", family_total == total, total, family_total)
-        active_total = self.search_count("active=true")
-        add("http_active_search", "hard", active_total == self.expected_active(),
-            self.expected_active(), active_total)
         middle_file, middle_offset = sample_points[1]
-        identifier_total = self.search_count(
-            "identifier="
-            + urllib.parse.quote(f"{MRN_SYSTEM}|MRN-{middle_file}-{middle_offset}", safe="")
+        middle_id = self.patient_id(middle_file, middle_offset)
+        id_total = self.search_count(
+            "_id=" + urllib.parse.quote(middle_id, safe="")
         )
-        add("http_identifier_search", "hard", identifier_total == 1, 1, identifier_total)
-
+        add("http_id_search", "hard", id_total == 1, 1, id_total)
         # Supplemental: three sampled resources over HTTP, including meta version.
         for resource_id in sampled:
             response = http_json("GET", f"{self.base_url}/Patient/{resource_id}")
@@ -2385,7 +2701,10 @@ class Controller:
                 "manifest": str(Path(manifest_url).name),
             },
         )
-        if self.args.postgres_reindex_evidence:
+        if (
+            self.args.postgres_reindex_evidence
+            or self.args.postgres_grouped_create_evidence
+        ):
             attempt["postgres_work"] = {
                 "before_kickoff": None,
                 "measurement_errors": [],
@@ -2394,6 +2713,19 @@ class Controller:
                 attempt["postgres_work"]["before_kickoff"] = self.pg.activity_snapshot()
             except Exception as error:
                 attempt["postgres_work"]["measurement_errors"].append(
+                    {"boundary": "before_kickoff", "error": str(error)}
+                )
+        if self.args.postgres_grouped_create_evidence:
+            attempt["grouped_create_sql"] = {
+                "before_kickoff": None,
+                "measurement_errors": [],
+            }
+            try:
+                attempt["grouped_create_sql"]["before_kickoff"] = (
+                    self.pg.statement_snapshot()
+                )
+            except Exception as error:
+                attempt["grouped_create_sql"]["measurement_errors"].append(
                     {"boundary": "before_kickoff", "error": str(error)}
                 )
         log_offset = self.follower.seek_end()
@@ -2451,7 +2783,10 @@ class Controller:
             "transaction_time": (terminal["manifest"] or {}).get("transactionTime"),
             "requires_access_token": (terminal["manifest"] or {}).get("requiresAccessToken"),
         }
-        if self.args.postgres_reindex_evidence:
+        if (
+            self.args.postgres_reindex_evidence
+            or self.args.postgres_grouped_create_evidence
+        ):
             # This is the earliest safe boundary after the polled terminal
             # manifest and its hard invariants have been validated.
             try:
@@ -2461,6 +2796,16 @@ class Controller:
             except Exception as error:
                 attempt["postgres_work"]["polling_observed_terminal"] = None
                 attempt["postgres_work"]["measurement_errors"].append(
+                    {"boundary": "polling_observed_terminal", "error": str(error)}
+                )
+        if self.args.postgres_grouped_create_evidence:
+            try:
+                attempt["grouped_create_sql"]["polling_observed_terminal"] = (
+                    self.pg.statement_snapshot()
+                )
+            except Exception as error:
+                attempt["grouped_create_sql"]["polling_observed_terminal"] = None
+                attempt["grouped_create_sql"]["measurement_errors"].append(
                     {"boundary": "polling_observed_terminal", "error": str(error)}
                 )
         reindex = self.verify_reindex(job, submission_id, log_offset, kickoff_mono)
@@ -2479,7 +2824,20 @@ class Controller:
         attempt["timings"]["kickoff_to_verified_search_ready_s"] = reindex[
             "reindex_s"
         ]
-        if self.args.postgres_reindex_evidence:
+        if self.args.postgres_grouped_create_evidence:
+            try:
+                attempt["grouped_create_sql"]["verified_search_ready"] = (
+                    self.pg.statement_snapshot()
+                )
+            except Exception as error:
+                attempt["grouped_create_sql"]["verified_search_ready"] = None
+                attempt["grouped_create_sql"]["measurement_errors"].append(
+                    {"boundary": "verified_search_ready", "error": str(error)}
+                )
+        if (
+            self.args.postgres_reindex_evidence
+            or self.args.postgres_grouped_create_evidence
+        ):
             work = attempt["postgres_work"]
             ready_snapshot = reindex.get("postgres_activity_at_search_ready")
             if ready_snapshot is None:
@@ -2516,21 +2874,49 @@ class Controller:
                     "interval_deltas": {},
                     "measurement_errors": work["measurement_errors"],
                 }
-            try:
-                attempt["cursor_plans"] = self.pg.reindex_cursor_plans(
-                    total, analyze=self.args.explain_analyze
+            if self.args.postgres_reindex_evidence:
+                try:
+                    attempt["cursor_plans"] = self.pg.reindex_cursor_plans(
+                        total, analyze=self.args.explain_analyze
+                    )
+                except Exception as error:
+                    attempt["cursor_plans"] = []
+                    attempt["cursor_plan_error"] = str(error)
+                self.write_json(
+                    f"jobs/job{job:02d}/postgres-reindex-evidence.json",
+                    {
+                        "postgres_work": attempt["postgres_work"],
+                        "cursor_plans": attempt["cursor_plans"],
+                        "phase_summary_lines": reindex.get("phase_summary_lines", []),
+                    },
                 )
-            except Exception as error:
-                attempt["cursor_plans"] = []
-                attempt["cursor_plan_error"] = str(error)
-            self.write_json(
-                f"jobs/job{job:02d}/postgres-reindex-evidence.json",
-                {
-                    "postgres_work": attempt["postgres_work"],
-                    "cursor_plans": attempt["cursor_plans"],
-                    "phase_summary_lines": reindex.get("phase_summary_lines", []),
-                },
-            )
+        if self.args.postgres_grouped_create_evidence:
+            sql = attempt["grouped_create_sql"]
+            if all(
+                isinstance(snapshot, dict)
+                for snapshot in (
+                    sql.get("before_kickoff"),
+                    sql.get("polling_observed_terminal"),
+                    sql.get("verified_search_ready"),
+                )
+            ):
+                completed_sql = statement_counter_intervals(
+                    sql["before_kickoff"],
+                    sql["polling_observed_terminal"],
+                    sql["verified_search_ready"],
+                )
+                completed_sql["measurement_errors"] = sql["measurement_errors"]
+                attempt["grouped_create_sql"] = completed_sql
+            else:
+                attempt["grouped_create_sql"] = {
+                    "before": sql.get("before_kickoff"),
+                    "polling_observed_terminal": sql.get(
+                        "polling_observed_terminal"
+                    ),
+                    "after": sql.get("verified_search_ready"),
+                    "interval_deltas": {},
+                    "measurement_errors": sql["measurement_errors"],
+                }
         self.write_json(f"jobs/job{job:02d}/reindex.json", reindex)
         idle_end = self.idle(job)
         validation = self.validate_job(job, submission_id, terminal["output"])
@@ -2540,6 +2926,22 @@ class Controller:
             "failed_soft": [c["name"] for c in validation["checks"] if c["kind"] == "soft" and not c["ok"]],
             "version_distribution": validation["version_distribution"],
             "history_ids": validation["history_ids"],
+            "index_coverage": {
+                "unindexed_patients": validation["pg_counts"]["counts"].get(
+                    "unindexed_patients"
+                ),
+                "family_exact_patients": validation["pg_counts"]["counts"].get(
+                    "family_exact_patients"
+                ),
+                "active_true_patients": validation["pg_counts"]["counts"].get(
+                    "active_true_patients"
+                ),
+                "expected_active_true_patients": self.expected_active(),
+                "fts_content_pilot995_patients": validation["pg_counts"]["counts"].get(
+                    "fts_content_pilot995_patients"
+                ),
+                "expected_fts_content_pilot995_patients": self.expected_total(),
+            },
         }
         attempt["receipts"] = {
             "ok": validation["receipts"]["ok"],
@@ -2588,8 +2990,18 @@ class Controller:
             "samples": postgres_samples,
             "peak_mib": max(postgres_memory_values) if postgres_memory_values else None,
         }
-        comparison_reasons = (
-            postgres_reindex_comparability_reasons(
+        if self.args.postgres_grouped_create_evidence:
+            comparison_reasons = postgres_grouped_create_comparability_reasons(
+                attempt,
+                self.preflight_info,
+                self.fixture_info,
+                hfs_samples,
+                postgres_samples,
+                self.args.expected_resource_inserts,
+                self.args.expected_bulk_entry_savepoints,
+            )
+        elif self.args.postgres_reindex_evidence:
+            comparison_reasons = postgres_reindex_comparability_reasons(
                 attempt,
                 self.preflight_info,
                 self.fixture_info,
@@ -2597,9 +3009,8 @@ class Controller:
                 postgres_samples,
                 self.args.require_phase_summary,
             )
-            if self.args.postgres_reindex_evidence
-            else []
-        )
+        else:
+            comparison_reasons = []
         attempt["timings"].update(
             {
                 "label": "complete",
@@ -2622,6 +3033,30 @@ class Controller:
                     "postgres_work": attempt["postgres_work"],
                     "cursor_plans": attempt["cursor_plans"],
                     "phase_summary_lines": reindex.get("phase_summary_lines", []),
+                    "memory": {
+                        "hfs": attempt["hfs_memory_kickoff_to_search_ready"],
+                        "postgres": attempt[
+                            "postgres_memory_kickoff_to_search_ready"
+                        ],
+                    },
+                    "comparability": {
+                        "comparable": not comparison_reasons,
+                        "reasons": comparison_reasons,
+                    },
+                },
+            )
+        if self.args.postgres_grouped_create_evidence:
+            self.write_json(
+                f"jobs/job{job:02d}/postgres-grouped-create-evidence.json",
+                {
+                    "batch_size": self.args.batch_size,
+                    "fixture_mode": self.args.fixture_mode,
+                    "expected": {
+                        "resource_insert_calls": self.args.expected_resource_inserts,
+                        "bulk_entry_savepoint_calls": self.args.expected_bulk_entry_savepoints,
+                    },
+                    "postgres_work": attempt["postgres_work"],
+                    "statement_counts": attempt["grouped_create_sql"],
                     "memory": {
                         "hfs": attempt["hfs_memory_kickoff_to_search_ready"],
                         "postgres": attempt[
@@ -2726,8 +3161,17 @@ class Controller:
                 "resources": self.args.resources,
                 "jobs": self.args.jobs,
                 "mode": self.args.mode,
+                "batch_size": self.args.batch_size,
+                "fixture_mode": self.args.fixture_mode,
                 "defer_indexing": bool(self.args.defer_indexing),
                 "postgres_reindex_evidence": bool(self.args.postgres_reindex_evidence),
+                "postgres_grouped_create_evidence": bool(
+                    self.args.postgres_grouped_create_evidence
+                ),
+                "expected_resource_inserts": self.args.expected_resource_inserts,
+                "expected_bulk_entry_savepoints": (
+                    self.args.expected_bulk_entry_savepoints
+                ),
                 "explain_analyze": bool(self.args.explain_analyze),
                 "require_phase_summary": bool(self.args.require_phase_summary),
                 "expected_source_fingerprint": self.args.expected_source_fingerprint,
@@ -2747,6 +3191,7 @@ class Controller:
                     "deadline_s": self.args.deadline,
                 },
                 "timers": {
+                    "request_timeout_s": self.args.request_timeout,
                     "startup_timeout_s": self.args.startup_timeout,
                     "terminal_timeout_s": self.args.terminal_timeout,
                     "reindex_timeout_s": self.args.reindex_timeout,
@@ -2814,6 +3259,7 @@ class Controller:
                     for index, offsets in enumerate(self.file_offsets())
                 ],
                 "total": self.expected_total(),
+                "mode": self.args.fixture_mode,
             }
             self.log.line("fixture_plan", plan=json.dumps(fixture_plan))
             self.provider = FixtureProvider(
@@ -2904,10 +3350,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--resources",
         type=int,
-        help="Patients per submission (1000 normally, 2000 with --postgres-reindex-evidence)",
+        help=(
+            "Patients per submission (1000 normally, 2000 for #1086, "
+            "10000 for #1455 normal, 203 for #1455 oversized)"
+        ),
     )
     parser.add_argument("--jobs", type=int, default=1, help="submissions in this run")
     parser.add_argument("--mode", choices=("consecutive", "restart"), default="consecutive")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        help=(
+            "set HFS_BULK_SUBMIT_BATCH_SIZE explicitly; omitted preserves the "
+            "server default outside an opt-in evidence profile"
+        ),
+    )
+    parser.add_argument(
+        "--fixture-mode", choices=("normal", "oversized"), default="normal"
+    )
     parser.add_argument(
         "--defer-indexing", type=parse_bool, default=True,
         help="HFS_BULK_SUBMIT_DEFER_INDEXING for the measured server",
@@ -2960,6 +3420,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="capture the bounded #1086 phase, PostgreSQL delta, and cursor-plan evidence",
     )
     parser.add_argument(
+        "--postgres-grouped-create-evidence",
+        action="store_true",
+        help=(
+            "capture #1455 one-file grouped-create SQL, WAL, RSS, fixture, and "
+            "search-readiness evidence"
+        ),
+    )
+    parser.add_argument("--expected-resource-inserts", type=int)
+    parser.add_argument("--expected-bulk-entry-savepoints", type=int)
+    parser.add_argument(
         "--explain-analyze",
         action="store_true",
         help="execute the bounded SELECT cursor probes while collecting EXPLAIN plans",
@@ -2980,9 +3450,10 @@ def dry_run_plan(args: argparse.Namespace) -> dict[str, Any]:
         if args.repo_root
         else Path(__file__).resolve().parents[4]
     )
-    per_file = args.resources // FIXTURE_FILE_COUNT
-    layout = [per_file] * FIXTURE_FILE_COUNT
-    for _ in range(per_file * FIXTURE_FILE_COUNT, args.resources):
+    file_count = 1 if args.postgres_grouped_create_evidence else FIXTURE_FILE_COUNT
+    per_file = args.resources // file_count
+    layout = [per_file] * file_count
+    for _ in range(per_file * file_count, args.resources):
         layout[-1] += 1
     output_dir = Path(args.output_dir).expanduser().resolve()
     base_url = f"http://{args.host}:{args.hfs_port}"
@@ -3001,13 +3472,36 @@ def dry_run_plan(args: argparse.Namespace) -> dict[str, Any]:
                 for index, count in enumerate(layout)
             ],
             "total": args.resources,
+            "expected_active_true": sum((count + 1) // 2 for count in layout),
+            "expected_fts_content_pilot995": args.resources,
+            "mode": args.fixture_mode,
+            "file_count": file_count,
             "family": FAMILY,
             "mrn_system": MRN_SYSTEM,
-        },
+        }
+        | (
+            {
+                "oversized": {
+                    "offset": 100 if args.resources >= GROUPED_CREATE_OVERSIZED_RESOURCES else args.resources // 2,
+                    "compact_bytes": GROUPED_CREATE_CONTENT_LIMIT_BYTES + 1,
+                    "content_limit_bytes": GROUPED_CREATE_CONTENT_LIMIT_BYTES,
+                }
+            }
+            if args.fixture_mode == "oversized"
+            else {}
+        ),
         "jobs": args.jobs,
         "mode": args.mode,
+        "batch_size": args.batch_size,
         "defer_indexing": bool(args.defer_indexing),
         "postgres_reindex_evidence": bool(args.postgres_reindex_evidence),
+        "postgres_grouped_create_evidence": bool(
+            args.postgres_grouped_create_evidence
+        ),
+        "expected_statement_counts": {
+            "resource_insert_calls": args.expected_resource_inserts,
+            "bulk_entry_savepoint_calls": args.expected_bulk_entry_savepoints,
+        },
         "explain_analyze": bool(args.explain_analyze),
         "require_phase_summary": bool(args.require_phase_summary),
         "hfs_env": effective_hfs_env(args, base_url, output_dir),
@@ -3016,6 +3510,12 @@ def dry_run_plan(args: argparse.Namespace) -> dict[str, Any]:
         "sampling": {
             "docker_stats_interval_s": args.docker_stats_interval,
             "endpoint_poll_interval_s": args.endpoint_poll_interval,
+        },
+        "timeouts": {
+            "request_s": args.request_timeout,
+            "startup_s": args.startup_timeout,
+            "terminal_s": args.terminal_timeout,
+            "reindex_s": args.reindex_timeout,
         },
         "watchdog": {
             "operational_max_rss_mib": args.operational_max_rss_mib,
@@ -3028,9 +3528,11 @@ def dry_run_plan(args: argparse.Namespace) -> dict[str, Any]:
             "submit terminal 200 for every manifest page, outcome/deleted empty, declared counts match",
             "receipt artifact download: exact aggregate Patient id set (one receipt per resource type)",
             "deferred reindex job id from the hfs log line, $reindex-status completed with errorCount=0 and processed=total",
-            "SQL coverage: zero unindexed Patients, parameterised family search equals the expected total",
+            "SQL coverage: zero unindexed Patients plus exact family, active=true, and FTS content Patient counts",
+            "bounded HTTP search API coverage: _id resolves the deterministic middle Patient",
             "post-idle: version/history spread, content, entry_results receipts, submission changes",
             "#1086 profile: PostgreSQL work interval deltas, early/middle/late cursor plans, opt-in phase summary",
+            "#1455 profile: one-file fixture, pg_stat_statements INSERT/savepoint oracles, WAL and RSS intervals",
         ],
     }
 
@@ -3039,15 +3541,33 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.resources is None:
-        args.resources = (
-            ISSUE_1086_DEFAULT_RESOURCES if args.postgres_reindex_evidence else 1000
-        )
+        if args.postgres_grouped_create_evidence:
+            args.resources = (
+                GROUPED_CREATE_OVERSIZED_RESOURCES
+                if args.fixture_mode == "oversized"
+                else GROUPED_CREATE_DEFAULT_RESOURCES
+            )
+        else:
+            args.resources = (
+                ISSUE_1086_DEFAULT_RESOURCES if args.postgres_reindex_evidence else 1000
+            )
     if args.docker_stats_interval is None:
-        args.docker_stats_interval = 1.0 if args.postgres_reindex_evidence else 60.0
+        args.docker_stats_interval = (
+            1.0
+            if args.postgres_reindex_evidence
+            or args.postgres_grouped_create_evidence
+            else 60.0
+        )
     if args.endpoint_poll_interval is None:
-        args.endpoint_poll_interval = 0.25 if args.postgres_reindex_evidence else 1.0
-    if args.resources < FIXTURE_FILE_COUNT:
-        parser.error(f"--resources must be >= {FIXTURE_FILE_COUNT}")
+        args.endpoint_poll_interval = (
+            0.25
+            if args.postgres_reindex_evidence
+            or args.postgres_grouped_create_evidence
+            else 1.0
+        )
+    minimum_resources = 3 if args.postgres_grouped_create_evidence else FIXTURE_FILE_COUNT
+    if args.resources < minimum_resources:
+        parser.error(f"--resources must be >= {minimum_resources}")
     if args.postgres_reindex_evidence and args.resources > ISSUE_1086_MAX_RESOURCES:
         parser.error(
             f"--resources must be <= {ISSUE_1086_MAX_RESOURCES} "
@@ -3055,6 +3575,27 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
     if args.postgres_reindex_evidence and not args.defer_indexing:
         parser.error("--postgres-reindex-evidence requires --defer-indexing=true")
+    if args.postgres_reindex_evidence and args.postgres_grouped_create_evidence:
+        parser.error("the #1086 and #1455 evidence profiles are mutually exclusive")
+    if args.fixture_mode == "oversized" and not args.postgres_grouped_create_evidence:
+        parser.error("--fixture-mode=oversized requires --postgres-grouped-create-evidence")
+    if args.postgres_grouped_create_evidence:
+        if not args.defer_indexing:
+            parser.error("--postgres-grouped-create-evidence requires --defer-indexing=true")
+        if args.jobs != 1:
+            parser.error("--postgres-grouped-create-evidence requires --jobs=1")
+        if args.file_concurrency != 1:
+            parser.error("--postgres-grouped-create-evidence requires --file-concurrency=1")
+        if args.batch_size is None:
+            parser.error("--postgres-grouped-create-evidence requires --batch-size")
+        if args.expected_resource_inserts is None:
+            parser.error(
+                "--postgres-grouped-create-evidence requires --expected-resource-inserts"
+            )
+        if args.expected_bulk_entry_savepoints is None:
+            parser.error(
+                "--postgres-grouped-create-evidence requires --expected-bulk-entry-savepoints"
+            )
     if args.require_phase_summary and not args.postgres_reindex_evidence:
         parser.error("--require-phase-summary requires --postgres-reindex-evidence")
     if args.expected_source_fingerprint and not re.fullmatch(
@@ -3063,6 +3604,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         parser.error("--expected-source-fingerprint must be 64 lowercase hexadecimal characters")
     if args.jobs < 1:
         parser.error("--jobs must be >= 1")
+    if args.batch_size is not None and args.batch_size < 1:
+        parser.error("--batch-size must be >= 1")
+    if args.expected_resource_inserts is not None and args.expected_resource_inserts < 0:
+        parser.error("--expected-resource-inserts must be >= 0")
+    if (
+        args.expected_bulk_entry_savepoints is not None
+        and args.expected_bulk_entry_savepoints < 0
+    ):
+        parser.error("--expected-bulk-entry-savepoints must be >= 0")
     if args.file_concurrency < 1:
         parser.error("--file-concurrency must be >= 1")
     if args.sample_interval <= 0 or args.host_interval <= 0:

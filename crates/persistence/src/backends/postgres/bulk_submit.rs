@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use helios_fhir::FhirVersion;
 use serde_json::Value;
 use std::collections::HashSet;
+use std::sync::LazyLock;
 use std::time::Duration as StdDuration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use uuid::Uuid;
@@ -31,17 +32,17 @@ use crate::error::{BackendError, BulkSubmitError, StorageError, StorageResult};
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 
 use super::PostgresBackend;
-use super::cached::query_opt_cached;
+use super::cached::{execute_cached, query_cached, query_one_cached, query_opt_cached};
 
 const MAX_GROUPED_FRESH_CREATES: usize = 100;
+const MAX_GROUPED_FRESH_CREATE_CONTENT_BYTES: usize = 8 * 1024 * 1024;
 
 const FRESH_CREATE_CANDIDATES_SQL: &str = "\
-SELECT 1
+SELECT resource.resource_type, resource.id
 FROM resources AS resource
 JOIN unnest($2::text[], $3::text[]) AS candidate(resource_type, id)
   ON resource.resource_type = candidate.resource_type AND resource.id = candidate.id
-WHERE resource.tenant_id = $1
-LIMIT 1";
+WHERE resource.tenant_id = $1";
 
 struct ProcessedEntryBatch {
     results: Vec<BulkEntryResult>,
@@ -49,6 +50,16 @@ struct ProcessedEntryBatch {
     /// The resources as committed, for observers that index them (#1127);
     /// collected only when one asked, so counting-only runs hold nothing.
     committed_resources: Vec<crate::types::StoredResource>,
+}
+
+struct MixedEntryBatch {
+    results: Vec<BulkEntryResult>,
+    changes: Vec<SubmissionChange>,
+}
+
+enum MixedAttemptError {
+    ReplayWholeBatch(StorageError),
+    Fatal(StorageError),
 }
 
 /// One ingested entry: its receipt, the rollback record its write warrants,
@@ -69,13 +80,88 @@ fn internal_error(message: String) -> StorageError {
     })
 }
 
+#[derive(Default)]
+struct JsonByteCounter {
+    bytes: usize,
+}
+
+impl std::io::Write for JsonByteCounter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .checked_add(buffer.len())
+            .ok_or_else(|| std::io::Error::other("compact JSON byte count overflowed usize"))?;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn compact_json_bytes(resource: &Value) -> StorageResult<usize> {
+    let mut counter = JsonByteCounter::default();
+    serde_json::to_writer(&mut counter, resource).map_err(|error| {
+        internal_error(format!("Failed to count compact resource JSON: {error}"))
+    })?;
+    Ok(counter.bytes)
+}
+
+/// Partitions one fresh run into ordered resource-write groups. The ranges
+/// retain no serialized payload and each non-oversized group fits both the SQL
+/// row limit and the compact input-JSON content budget. An oversized resource
+/// is deliberately returned as a singleton.
+fn grouped_fresh_create_ranges(
+    entries: &[NdjsonEntry],
+) -> StorageResult<Vec<std::ops::Range<usize>>> {
+    let mut ranges = Vec::new();
+    let mut group_start = 0;
+    let mut group_count = 0;
+    let mut group_bytes = 0usize;
+
+    for (index, entry) in entries.iter().enumerate() {
+        let entry_bytes = compact_json_bytes(&entry.resource)?;
+        let combined_bytes = group_bytes.checked_add(entry_bytes).ok_or_else(|| {
+            internal_error("Grouped fresh-create content byte count overflowed usize".to_string())
+        })?;
+
+        if group_count > 0
+            && (group_count == MAX_GROUPED_FRESH_CREATES
+                || combined_bytes > MAX_GROUPED_FRESH_CREATE_CONTENT_BYTES)
+        {
+            ranges.push(group_start..index);
+            group_start = index;
+            group_count = 0;
+            group_bytes = 0;
+        }
+
+        group_count += 1;
+        group_bytes = group_bytes.checked_add(entry_bytes).ok_or_else(|| {
+            internal_error("Grouped fresh-create content byte count overflowed usize".to_string())
+        })?;
+
+        if entry_bytes > MAX_GROUPED_FRESH_CREATE_CONTENT_BYTES {
+            debug_assert_eq!(group_count, 1);
+            ranges.push(group_start..index + 1);
+            group_start = index + 1;
+            group_count = 0;
+            group_bytes = 0;
+        }
+    }
+
+    if group_count > 0 {
+        ranges.push(group_start..entries.len());
+    }
+
+    Ok(ranges)
+}
+
 fn is_grouped_fresh_create_eligible(
     entries: &[NdjsonEntry],
     options: &BulkProcessingOptions,
     search_offloaded: bool,
 ) -> bool {
     if entries.is_empty()
-        || entries.len() > MAX_GROUPED_FRESH_CREATES
         || search_offloaded
         // Grouped creates yield receipts and rollback records, not the
         // resources as committed, so an observer that indexes them (#1127)
@@ -149,6 +235,14 @@ const SUBMISSION_MANIFEST_COLUMNS: &str = "\
 manifest_id, manifest_url, replaces_manifest_url, status, added_at, total_entries, \
 processed_entries, failed_entries, lease_expiry, bytes_processed, bytes_total, phase, \
 files_done, files_total";
+
+static GET_MANIFEST_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT {SUBMISSION_MANIFEST_COLUMNS}
+         FROM bulk_manifests
+         WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4"
+    )
+});
 
 /// Decodes one `bulk_manifests` row selected with
 /// [`SUBMISSION_MANIFEST_COLUMNS`], reading every field by column name.
@@ -676,22 +770,18 @@ impl BulkSubmitProvider for PostgresBackend {
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
 
-        let rows = client
-            .query(
-                &format!(
-                    "SELECT {SUBMISSION_MANIFEST_COLUMNS}
-                     FROM bulk_manifests
-                     WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4"
-                ),
-                &[
-                    &tenant_id,
-                    &submission_id.submitter.as_str(),
-                    &submission_id.submission_id.as_str(),
-                    &manifest_id,
-                ],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to get manifest: {}", e)))?;
+        let rows = query_cached(
+            &client,
+            &GET_MANIFEST_SQL,
+            &[
+                &tenant_id,
+                &submission_id.submitter.as_str(),
+                &submission_id.submission_id.as_str(),
+                &manifest_id,
+            ],
+        )
+        .await
+        .map_err(|e| internal_error(format!("Failed to get manifest: {}", e)))?;
 
         if rows.is_empty() {
             return Ok(None);
@@ -775,8 +865,8 @@ impl BulkSubmitProvider for PostgresBackend {
         // cannot read as if it had never happened (#968).
         {
             let client = self.get_client().await?;
-            client
-                .execute(
+            execute_cached(
+                &client,
                     "UPDATE bulk_manifests SET status = 'processing'
                      WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4
                        AND status = 'pending'",
@@ -786,9 +876,9 @@ impl BulkSubmitProvider for PostgresBackend {
                         &submission_id.submission_id.as_str(),
                         &manifest_id,
                     ],
-                )
-                .await
-                .map_err(|e| internal_error(format!("Failed to update manifest status: {}", e)))?;
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to update manifest status: {}", e)))?;
         }
 
         let file_url = options.file_url.as_deref().unwrap_or("");
@@ -798,9 +888,11 @@ impl BulkSubmitProvider for PostgresBackend {
         // records, and per-line receipts commit together — one WAL flush per
         // batch instead of four-plus autocommit round trips per resource, and
         // the rollback log can never diverge from what was actually written.
-        // Each entry runs under a savepoint: on Postgres a failed statement
-        // aborts the whole transaction, and the savepoint contains a failure
-        // to its one entry the way SQLite's per-statement independence does.
+        // Existing and legacy-path entries run under savepoints: on Postgres a
+        // failed statement aborts the whole transaction, and the savepoint
+        // contains a failure to its one entry the way SQLite's per-statement
+        // independence does. Eligible fresh runs flush together before the
+        // next savepoint opens.
         let transaction_options = crate::core::TransactionOptions {
             fhir_version: Some(FhirVersion::default_enabled()),
             defer_search_indexing: options.defer_indexing,
@@ -817,46 +909,25 @@ impl BulkSubmitProvider for PostgresBackend {
             options,
             self.is_search_offloaded(),
         ) {
-            match self
-                .try_grouped_fresh_creates(&mut txn, manifest_id, &entries)
-                .await
-            {
-                Ok(Some(provisional)) => {
-                    // Resource and history rows are durable within the
-                    // transaction now. Only at this point may their receipts
-                    // and rollback records be staged: a grouped-write failure
-                    // must leave no bookkeeping that could be replayed.
-                    let (results, changes): (Vec<BulkEntryResult>, Vec<SubmissionChange>) =
-                        provisional.into_iter().unzip();
-                    Self::flush_entry_rows_tx(
-                        &txn,
-                        submission_id,
-                        manifest_id,
-                        file_url,
-                        &results,
-                        &changes,
-                    )
-                    .await?;
-                    ProcessedEntryBatch {
-                        results,
-                        aborted_on_max_errors: false,
-                        // Grouped creates never run while an observer wants
-                        // the committed resources; see
-                        // `is_grouped_fresh_create_eligible`.
-                        committed_resources: Vec::new(),
-                    }
-                }
-                Ok(None) => {
-                    self.process_entries_individually(
+            let existing_keys = self.classify_existing_keys(&txn, &entries).await;
+            let attempt = match existing_keys {
+                Ok(existing_keys) if existing_keys.len() == entries.len() => Ok(None),
+                Ok(existing_keys) => self
+                    .process_mixed_entries_in_tx(
                         &mut txn,
-                        submission_id,
                         manifest_id,
                         &entries,
+                        &existing_keys,
                         options,
                     )
-                    .await?
-                }
-                Err(grouped_error) => {
+                    .await
+                    .map(Some),
+                Err(error) => Err(error),
+            };
+
+            let mixed = match attempt {
+                Ok(mixed) => mixed,
+                Err(MixedAttemptError::ReplayWholeBatch(grouped_error)) => {
                     // The tentative transaction may contain buffered creates
                     // or a partially executed grouped statement. Await its
                     // rollback before trying to acquire the replacement
@@ -877,15 +948,56 @@ impl BulkSubmitProvider for PostgresBackend {
                         transaction_options,
                     )
                     .await?;
-                    self.process_entries_individually(
-                        &mut txn,
+                    None
+                }
+                Err(MixedAttemptError::Fatal(error)) => return Err(error),
+            };
+
+            if let Some(mixed) = mixed {
+                // Only stage receipts and rollback records after every fresh
+                // run has flushed successfully. Bookkeeping failures are not
+                // eligible for whole-batch replay.
+                // A batch may now be far larger than `MAX_GROUPED_FRESH_CREATES`
+                // (#1455), so bookkeeping is staged in bounded slices rather
+                // than one statement per column array. Receipts and rollback
+                // records are independent inserts and an existing entry that
+                // failed contributes a receipt without a change, so the two
+                // sequences are advanced separately instead of zipped.
+                let mut result_offset = 0;
+                let mut change_offset = 0;
+                while result_offset < mixed.results.len() || change_offset < mixed.changes.len() {
+                    let result_end =
+                        (result_offset + BOOKKEEPING_FLUSH_SIZE).min(mixed.results.len());
+                    let change_end =
+                        (change_offset + BOOKKEEPING_FLUSH_SIZE).min(mixed.changes.len());
+                    Self::flush_entry_rows_tx(
+                        &txn,
                         submission_id,
                         manifest_id,
-                        &entries,
-                        options,
+                        file_url,
+                        &mixed.results[result_offset..result_end],
+                        &mixed.changes[change_offset..change_end],
                     )
-                    .await?
+                    .await?;
+                    result_offset = result_end;
+                    change_offset = change_end;
                 }
+                ProcessedEntryBatch {
+                    results: mixed.results,
+                    aborted_on_max_errors: false,
+                    // This path is excluded whenever an observer wants the
+                    // committed resources; see `is_grouped_fresh_create_eligible`.
+                    committed_resources: Vec::new(),
+                }
+            } else {
+                self.process_entries_individually(
+                    &mut txn,
+                    submission_id,
+                    manifest_id,
+                    &entries,
+                    options,
+                )
+                .await?
             }
         } else {
             self.process_entries_individually(
@@ -927,8 +1039,8 @@ impl BulkSubmitProvider for PostgresBackend {
                 Some(url) => {
                     // Creates the file's row or locks the existing one, and
                     // returns what earlier passes already counted.
-                    let row = client
-                        .query_one(
+                    let row = query_one_cached(
+                        client,
                             "INSERT INTO bulk_manifest_file_progress
                                 (tenant_id, submitter, submission_id, manifest_id, file_url)
                              VALUES ($1, $2, $3, $4, $5)
@@ -936,16 +1048,16 @@ impl BulkSubmitProvider for PostgresBackend {
                              DO UPDATE SET max_line = bulk_manifest_file_progress.max_line
                              RETURNING max_line",
                             &[&tenant_id, &submitter, &sub_id_str, &manifest_id, &url],
-                        )
-                        .await
-                        .map_err(|e| {
-                            internal_error(format!("Failed to lock file progress: {}", e))
-                        })?;
+                    )
+                    .await
+                    .map_err(|e| {
+                        internal_error(format!("Failed to lock file progress: {}", e))
+                    })?;
                     let counted: i64 = row.get(0);
                     let tally = BatchTally::beyond(&results, Some(counted.max(0) as u64));
-                    client
-                        .execute(
-                            "UPDATE bulk_manifest_file_progress SET
+                    execute_cached(
+                        client,
+                        "UPDATE bulk_manifest_file_progress SET
                                 max_line = GREATEST(max_line, $1::BIGINT),
                                 total_entries = total_entries + $2::BIGINT,
                                 processed_entries = processed_entries + $3::BIGINT,
@@ -953,23 +1065,23 @@ impl BulkSubmitProvider for PostgresBackend {
                                 skipped_entries = skipped_entries + $5::BIGINT
                              WHERE tenant_id = $6 AND submitter = $7 AND submission_id = $8
                                AND manifest_id = $9 AND file_url = $10",
-                            &[
-                                &tally.last_line,
-                                &tally.entries,
-                                &tally.succeeded,
-                                &tally.failed,
-                                &tally.skipped,
-                                &tenant_id,
-                                &submitter,
-                                &sub_id_str,
-                                &manifest_id,
-                                &url,
-                            ],
-                        )
-                        .await
-                        .map_err(|e| {
-                            internal_error(format!("Failed to update file progress: {}", e))
-                        })?;
+                        &[
+                            &tally.last_line,
+                            &tally.entries,
+                            &tally.succeeded,
+                            &tally.failed,
+                            &tally.skipped,
+                            &tenant_id,
+                            &submitter,
+                            &sub_id_str,
+                            &manifest_id,
+                            &url,
+                        ],
+                    )
+                    .await
+                    .map_err(|e| {
+                        internal_error(format!("Failed to update file progress: {}", e))
+                    })?;
                     tally
                 }
                 None => BatchTally::beyond(&results, None),
@@ -977,8 +1089,8 @@ impl BulkSubmitProvider for PostgresBackend {
             // `processed_entries` counts successes, `skipped_entries` the
             // deliberate skips, and `last_processed_line` advances by the
             // entries newly charged (#969, #954).
-            client
-                .execute(
+            execute_cached(
+                client,
                     "UPDATE bulk_manifests SET
                         total_entries = total_entries + $1,
                         processed_entries = processed_entries + $2,
@@ -997,9 +1109,9 @@ impl BulkSubmitProvider for PostgresBackend {
                         &sub_id_str,
                         &manifest_id,
                     ],
-                )
-                .await
-                .map_err(|e| internal_error(format!("Failed to update manifest counts: {}", e)))?;
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to update manifest counts: {}", e)))?;
         }
 
         crate::core::Transaction::commit(Box::new(txn)).await?;
@@ -1027,19 +1139,19 @@ impl BulkSubmitProvider for PostgresBackend {
         let now = Utc::now();
         let client = self.get_client().await?;
         // Update submission updated_at
-        client
-            .execute(
-                "UPDATE bulk_submissions SET updated_at = $1
+        execute_cached(
+            &client,
+            "UPDATE bulk_submissions SET updated_at = $1
                  WHERE tenant_id = $2 AND submitter = $3 AND submission_id = $4",
-                &[
-                    &now,
-                    &tenant_id,
-                    &submission_id.submitter.as_str(),
-                    &submission_id.submission_id.as_str(),
-                ],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to update submission: {}", e)))?;
+            &[
+                &now,
+                &tenant_id,
+                &submission_id.submitter.as_str(),
+                &submission_id.submission_id.as_str(),
+            ],
+        )
+        .await
+        .map_err(|e| internal_error(format!("Failed to update submission: {}", e)))?;
 
         Ok(results)
     }
@@ -1248,71 +1360,205 @@ impl BulkSubmitProvider for PostgresBackend {
 }
 
 impl PostgresBackend {
-    /// Attempts the fast path for a batch whose payload shape guarantees only
-    /// explicit, unique creates. `Ok(None)` means one of those keys already
-    /// exists and the caller should use the individual path in this untouched
-    /// transaction. Errors are limited to the candidate query, `create`, and
-    /// grouped `flush`, so the caller may roll the whole attempt back and replay
-    /// once. Bookkeeping deliberately happens after this helper returns.
-    async fn try_grouped_fresh_creates(
+    /// Classifies the keys already present for this tenant, including
+    /// tombstones. This is only a routing snapshot: absent keys are not
+    /// reserved, so a later fresh-run conflict still requires replay.
+    async fn classify_existing_keys(
+        &self,
+        txn: &super::transaction::PostgresTransaction,
+        entries: &[NdjsonEntry],
+    ) -> Result<HashSet<(String, String)>, MixedAttemptError> {
+        use crate::core::Transaction;
+
+        let tenant_id = txn.tenant().tenant_id().as_str();
+        let client = txn
+            .raw_client()
+            .map_err(MixedAttemptError::ReplayWholeBatch)?;
+        let mut existing_keys = HashSet::new();
+        // A batch is no longer capped at `MAX_GROUPED_FRESH_CREATES` entries
+        // (#1455), so the unnest arrays are chunked to keep one lookup's
+        // parameter payload bounded. Every chunk must run: this snapshot has
+        // to name each existing key, not merely prove that one exists.
+        for chunk in entries.chunks(MAX_GROUPED_FRESH_CREATES) {
+            let resource_types: Vec<&str> = chunk
+                .iter()
+                .map(|entry| entry.resource_type.as_str())
+                .collect();
+            let resource_ids: Vec<&str> = chunk
+                .iter()
+                .map(|entry| {
+                    entry
+                        .resource_id
+                        .as_deref()
+                        .expect("grouped-create eligibility requires an explicit id")
+                })
+                .collect();
+            let rows = query_cached(
+                client,
+                FRESH_CREATE_CANDIDATES_SQL,
+                &[&tenant_id, &resource_types, &resource_ids],
+            )
+            .await
+            .map_err(|error| {
+                MixedAttemptError::ReplayWholeBatch(internal_error(format!(
+                    "Failed to query grouped fresh-create candidates: {error}"
+                )))
+            })?;
+
+            existing_keys.reserve(rows.len());
+            for row in rows {
+                existing_keys.insert((row.get(0), row.get(1)));
+            }
+        }
+        Ok(existing_keys)
+    }
+
+    /// Processes an eligible batch in input order. Existing keys retain the
+    /// original savepoint behavior; each maximal fresh run is flushed as one
+    /// grouped create before the next existing entry opens its savepoint.
+    async fn process_mixed_entries_in_tx(
         &self,
         txn: &mut super::transaction::PostgresTransaction,
         manifest_id: &str,
         entries: &[NdjsonEntry],
-    ) -> StorageResult<Option<Vec<(BulkEntryResult, SubmissionChange)>>> {
-        use crate::core::Transaction;
-
-        let resource_types: Vec<&str> = entries
-            .iter()
-            .map(|entry| entry.resource_type.as_str())
-            .collect();
-        let resource_ids: Vec<&str> = entries
+        existing_keys: &HashSet<(String, String)>,
+        options: &BulkProcessingOptions,
+    ) -> Result<MixedEntryBatch, MixedAttemptError> {
+        let existing_by_position: Vec<bool> = entries
             .iter()
             .map(|entry| {
-                entry
+                let id = entry
                     .resource_id
                     .as_deref()
-                    .expect("grouped-create eligibility requires an explicit id")
+                    .expect("mixed-create eligibility requires an explicit id");
+                existing_keys.contains(&(entry.resource_type.clone(), id.to_string()))
             })
             .collect();
-        let tenant_id = txn.tenant().tenant_id().as_str();
-        let candidate = query_opt_cached(
-            txn.raw_client()?,
-            FRESH_CREATE_CANDIDATES_SQL,
-            &[&tenant_id, &resource_types, &resource_ids],
-        )
-        .await
-        .map_err(|error| {
-            internal_error(format!(
-                "Failed to query grouped fresh-create candidates: {error}"
-            ))
-        })?;
-        if candidate.is_some() {
-            return Ok(None);
-        }
 
-        let mut provisional = Vec::with_capacity(entries.len());
-        for entry in entries {
-            let created = txn
-                .create(&entry.resource_type, entry.resource.clone())
+        let mut results = Vec::with_capacity(entries.len());
+        let mut changes = Vec::with_capacity(entries.len());
+        let mut position = 0;
+
+        while position < entries.len() {
+            if existing_by_position[position] {
+                let (result, change, _) = self
+                    .ingest_entry_with_savepoint(txn, manifest_id, &entries[position], options)
+                    .await
+                    .map_err(MixedAttemptError::Fatal)?;
+                results.push(result);
+                if let Some(change) = change {
+                    changes.push(change);
+                }
+                position += 1;
+                continue;
+            }
+
+            let start = position;
+            position += 1;
+            while position < entries.len() && !existing_by_position[position] {
+                position += 1;
+            }
+            let fresh = self
+                .create_fresh_run(txn, manifest_id, &entries[start..position])
                 .await?;
-            let result = BulkEntryResult::success(
-                entry.line_number,
-                &entry.resource_type,
-                created.id(),
-                true,
-            );
-            let change = SubmissionChange::create(
-                manifest_id,
-                &entry.resource_type,
-                created.id(),
-                created.version_id(),
-            );
-            provisional.push((result, change));
+            results.extend(fresh.results);
+            changes.extend(fresh.changes);
         }
 
-        txn.flush().await?;
-        Ok(Some(provisional))
+        Ok(MixedEntryBatch { results, changes })
+    }
+
+    /// Stages one maximal fresh run, then flushes it before control can move
+    /// to an existing entry's savepoint. A run longer than one grouped write
+    /// may hold (#1455) is partitioned by `grouped_fresh_create_ranges` and
+    /// flushed a group at a time, still ahead of the next savepoint. Any error
+    /// here invalidates the routing snapshot and replays the whole batch
+    /// through the individual path.
+    async fn create_fresh_run(
+        &self,
+        txn: &mut super::transaction::PostgresTransaction,
+        manifest_id: &str,
+        entries: &[NdjsonEntry],
+    ) -> Result<MixedEntryBatch, MixedAttemptError> {
+        use crate::core::Transaction;
+
+        let ranges =
+            grouped_fresh_create_ranges(entries).map_err(MixedAttemptError::ReplayWholeBatch)?;
+        let mut results = Vec::with_capacity(entries.len());
+        let mut changes = Vec::with_capacity(entries.len());
+        for range in ranges {
+            for entry in &entries[range] {
+                let created = txn
+                    .create(&entry.resource_type, entry.resource.clone())
+                    .await
+                    .map_err(MixedAttemptError::ReplayWholeBatch)?;
+                results.push(BulkEntryResult::success(
+                    entry.line_number,
+                    &entry.resource_type,
+                    created.id(),
+                    true,
+                ));
+                changes.push(SubmissionChange::create(
+                    manifest_id,
+                    &entry.resource_type,
+                    created.id(),
+                    created.version_id(),
+                ));
+            }
+
+            txn.flush()
+                .await
+                .map_err(MixedAttemptError::ReplayWholeBatch)?;
+        }
+
+        Ok(MixedEntryBatch { results, changes })
+    }
+
+    /// Runs one entry under the original savepoint boundary. An ingestion or
+    /// release error becomes a processing-error receipt after a successful
+    /// rollback; failure to create or roll back the savepoint remains fatal.
+    async fn ingest_entry_with_savepoint(
+        &self,
+        txn: &mut super::transaction::PostgresTransaction,
+        manifest_id: &str,
+        entry: &NdjsonEntry,
+        options: &BulkProcessingOptions,
+    ) -> StorageResult<IngestedEntry> {
+        txn.savepoint("bulk_entry").await?;
+        let outcome = match self
+            .ingest_entry_in_tx(txn, manifest_id, entry, options)
+            .await
+        {
+            Ok(ingested) => txn.release_savepoint("bulk_entry").await.map(|_| ingested),
+            Err(error) => Err(error),
+        };
+
+        match outcome {
+            Ok(ingested) => Ok(ingested),
+            Err(error) => {
+                txn.rollback_to_savepoint("bulk_entry")
+                    .await
+                    .map_err(|savepoint_error| {
+                        internal_error(format!("{savepoint_error} after '{error}'"))
+                    })?;
+                Ok((
+                    BulkEntryResult::processing_error(
+                        entry.line_number,
+                        &entry.resource_type,
+                        serde_json::json!({
+                            "resourceType": "OperationOutcome",
+                            "issue": [{
+                                "severity": "error",
+                                "code": "exception",
+                                "diagnostics": error.to_string()
+                            }]
+                        }),
+                    ),
+                    None,
+                    None,
+                ))
+            }
+        }
     }
 
     /// Runs the original per-entry path inside one batch transaction. Each
@@ -1369,37 +1615,9 @@ impl PostgresBackend {
             // The savepoint methods flush at the savepoint boundaries: the
             // release raises this entry's conflict inside its own savepoint,
             // and the rollback undoes only this entry's rows.
-            txn.savepoint("bulk_entry").await?;
-            let outcome = match self
-                .ingest_entry_in_tx(txn, manifest_id, entry, options)
-                .await
-            {
-                Ok(pair) => txn.release_savepoint("bulk_entry").await.map(|_| pair),
-                Err(error) => Err(error),
-            };
-            let (entry_result, change, stored) = match outcome {
-                Ok(ingested) => ingested,
-                Err(error) => {
-                    txn.rollback_to_savepoint("bulk_entry")
-                        .await
-                        .map_err(|savepoint_error| {
-                            internal_error(format!("{savepoint_error} after '{error}'"))
-                        })?;
-                    let failed = BulkEntryResult::processing_error(
-                        entry.line_number,
-                        &entry.resource_type,
-                        serde_json::json!({
-                            "resourceType": "OperationOutcome",
-                            "issue": [{
-                                "severity": "error",
-                                "code": "exception",
-                                "diagnostics": error.to_string()
-                            }]
-                        }),
-                    );
-                    (failed, None, None)
-                }
-            };
+            let (entry_result, change, stored) = self
+                .ingest_entry_with_savepoint(txn, manifest_id, entry, options)
+                .await?;
 
             if entry_result.is_error() {
                 error_count += 1;
@@ -3450,11 +3668,16 @@ mod tests {
         let hundred_and_one: Vec<_> = (1..=101)
             .map(|line| entry(line, "Patient", &format!("p-{line}")))
             .collect();
-        assert!(!is_grouped_fresh_create_eligible(
+        assert!(is_grouped_fresh_create_eligible(
             &hundred_and_one,
             &options,
             false
         ));
+
+        let thousand: Vec<_> = (1..=1000)
+            .map(|line| entry(line, "Patient", &format!("p-{line}")))
+            .collect();
+        assert!(is_grouped_fresh_create_eligible(&thousand, &options, false));
     }
 
     #[test]
@@ -3547,6 +3770,121 @@ mod tests {
             &options,
             false
         ));
+    }
+
+    #[test]
+    fn grouped_fresh_create_eligibility_detects_duplicates_across_lookup_chunks() {
+        let options = eligible_options();
+        let mut across_chunks: Vec<_> = (1..=101)
+            .map(|line| entry(line, "Patient", &format!("p-{line}")))
+            .collect();
+        across_chunks[100] = entry(101, "Patient", "p-1");
+        assert!(!is_grouped_fresh_create_eligible(
+            &across_chunks,
+            &options,
+            false
+        ));
+    }
+
+    fn entry_with_compact_size(line_number: u64, target_bytes: usize) -> NdjsonEntry {
+        let id = format!("sized-{line_number}");
+        let mut resource = json!({
+            "resourceType": "Patient",
+            "id": id,
+            "payload": ""
+        });
+        let base_bytes = compact_json_bytes(&resource).unwrap();
+        assert!(
+            target_bytes >= base_bytes,
+            "target {target_bytes} is smaller than fixture overhead {base_bytes}"
+        );
+        resource["payload"] = json!("x".repeat(target_bytes - base_bytes));
+        assert_eq!(compact_json_bytes(&resource).unwrap(), target_bytes);
+        NdjsonEntry::new(line_number, "Patient", resource)
+    }
+
+    fn range_bytes(entries: &[NdjsonEntry], range: std::ops::Range<usize>) -> usize {
+        entries[range]
+            .iter()
+            .map(|entry| compact_json_bytes(&entry.resource).unwrap())
+            .sum()
+    }
+
+    #[test]
+    fn grouped_fresh_create_ranges_split_on_the_row_limit() {
+        let entries: Vec<_> = (1..=250)
+            .map(|line| entry(line, "Patient", &format!("p-{line}")))
+            .collect();
+        let ranges = grouped_fresh_create_ranges(&entries).unwrap();
+        assert_eq!(ranges, vec![0..100, 100..200, 200..250]);
+    }
+
+    #[test]
+    fn grouped_fresh_create_content_budget_admits_exactly_eight_mibibytes() {
+        let entries = vec![
+            entry_with_compact_size(1, MAX_GROUPED_FRESH_CREATE_CONTENT_BYTES),
+            entry_with_compact_size(2, 256),
+        ];
+        let ranges = grouped_fresh_create_ranges(&entries).unwrap();
+        assert_eq!(ranges, vec![0..1, 1..2]);
+        assert_eq!(
+            range_bytes(&entries, ranges[0].clone()),
+            MAX_GROUPED_FRESH_CREATE_CONTENT_BYTES
+        );
+    }
+
+    #[test]
+    fn grouped_fresh_create_content_budget_flushes_before_crossing_entry() {
+        let entries = vec![
+            entry_with_compact_size(1, MAX_GROUPED_FRESH_CREATE_CONTENT_BYTES / 2),
+            entry_with_compact_size(2, MAX_GROUPED_FRESH_CREATE_CONTENT_BYTES / 2 + 1),
+        ];
+        let ranges = grouped_fresh_create_ranges(&entries).unwrap();
+        assert_eq!(ranges, vec![0..1, 1..2]);
+        assert!(
+            ranges
+                .iter()
+                .all(|range| range_bytes(&entries, range.clone())
+                    <= MAX_GROUPED_FRESH_CREATE_CONTENT_BYTES)
+        );
+    }
+
+    #[test]
+    fn grouped_fresh_create_content_budget_flushes_oversized_entry_alone() {
+        let entries = vec![
+            entry_with_compact_size(1, 256),
+            entry_with_compact_size(2, MAX_GROUPED_FRESH_CREATE_CONTENT_BYTES + 1),
+            entry_with_compact_size(3, 256),
+        ];
+        let ranges = grouped_fresh_create_ranges(&entries).unwrap();
+        assert_eq!(ranges, vec![0..1, 1..2, 2..3]);
+        assert_eq!(
+            range_bytes(&entries, ranges[1].clone()),
+            MAX_GROUPED_FRESH_CREATE_CONTENT_BYTES + 1
+        );
+    }
+
+    #[test]
+    fn grouped_fresh_create_content_budget_count_and_bytes_meet_on_same_entry() {
+        let mut entries: Vec<_> = (1..=99)
+            .map(|line| entry_with_compact_size(line, 256))
+            .collect();
+        let prefix_bytes: usize = entries
+            .iter()
+            .map(|entry| compact_json_bytes(&entry.resource).unwrap())
+            .sum();
+        entries.push(entry_with_compact_size(
+            100,
+            MAX_GROUPED_FRESH_CREATE_CONTENT_BYTES - prefix_bytes,
+        ));
+        entries.push(entry_with_compact_size(101, 256));
+
+        let ranges = grouped_fresh_create_ranges(&entries).unwrap();
+        assert_eq!(ranges, vec![0..100, 100..101]);
+        assert_eq!(
+            range_bytes(&entries, ranges[0].clone()),
+            MAX_GROUPED_FRESH_CREATE_CONTENT_BYTES
+        );
     }
 
     #[test]

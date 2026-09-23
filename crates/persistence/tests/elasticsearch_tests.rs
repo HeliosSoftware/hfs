@@ -719,6 +719,8 @@ mod es_integration {
     use testcontainers::ImageExt;
     use testcontainers::runners::AsyncRunner;
     use testcontainers_modules::elastic_search::ElasticSearch;
+    #[cfg(feature = "postgres")]
+    use testcontainers_modules::postgres::Postgres;
     use tokio::sync::OnceCell;
 
     /// Shared Elasticsearch container reused across all tests in this module.
@@ -730,6 +732,40 @@ mod es_integration {
     }
 
     static SHARED_ES: OnceCell<SharedEs> = OnceCell::const_new();
+
+    #[cfg(feature = "postgres")]
+    struct SharedPg {
+        host: String,
+        port: u16,
+        _container: testcontainers::ContainerAsync<Postgres>,
+    }
+
+    #[cfg(feature = "postgres")]
+    static SHARED_PG: OnceCell<SharedPg> = OnceCell::const_new();
+
+    #[cfg(feature = "postgres")]
+    async fn shared_pg() -> &'static SharedPg {
+        SHARED_PG
+            .get_or_init(|| async {
+                let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
+                let container = super::container_cleanup::with_cleanup_label(
+                    Postgres::default()
+                        .with_tag("16-alpine")
+                        .with_label("github.run_id", &run_id),
+                )
+                .start()
+                .await
+                .expect("start PostgreSQL for pg-es reindex");
+                let host = container.get_host().await.unwrap().to_string();
+                let port = container.get_host_port_ipv4(5432).await.unwrap();
+                SharedPg {
+                    host,
+                    port,
+                    _container: container,
+                }
+            })
+            .await
+    }
 
     /// Startup budget for one Elasticsearch container start attempt. See the
     /// matching constant in `s3_es_tests.rs`: 120s was not enough on the
@@ -1943,6 +1979,284 @@ mod es_integration {
         }
     }
 
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn es_integration_pg_source_retry_by_ids() {
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+
+        use helios_persistence::backends::postgres::{PostgresBackend, PostgresConfig};
+        use helios_persistence::core::{DeferredReindexHook, SearchProvider};
+        use helios_persistence::error::{BackendError, StorageResult};
+        use helios_persistence::search::{
+            ReindexOnFinish, ReindexOperation, ReindexSource, ReindexStatus, ReindexTarget,
+            ResourcePage,
+        };
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue, StoredResource,
+        };
+        use tokio::sync::oneshot;
+
+        struct ObservedPgSource {
+            pg: Arc<PostgresBackend>,
+            requested: Mutex<Vec<Vec<String>>>,
+            returned: Mutex<Vec<Vec<String>>>,
+            first_lookup: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+        }
+
+        #[async_trait::async_trait]
+        impl ReindexSource for ObservedPgSource {
+            async fn list_resource_types(
+                &self,
+                tenant: &TenantContext,
+            ) -> StorageResult<Vec<String>> {
+                self.pg.list_resource_types(tenant).await
+            }
+
+            async fn count_resources(
+                &self,
+                tenant: &TenantContext,
+                resource_type: &str,
+            ) -> StorageResult<u64> {
+                self.pg.count_resources(tenant, resource_type).await
+            }
+
+            async fn fetch_resources_page(
+                &self,
+                tenant: &TenantContext,
+                resource_type: &str,
+                cursor: Option<&str>,
+                limit: u32,
+            ) -> StorageResult<ResourcePage> {
+                self.pg
+                    .fetch_resources_page(tenant, resource_type, cursor, limit)
+                    .await
+            }
+
+            async fn fetch_resources_by_ids(
+                &self,
+                tenant: &TenantContext,
+                resource_type: &str,
+                ids: &[String],
+            ) -> StorageResult<Vec<StoredResource>> {
+                self.requested.lock().unwrap().push(ids.to_vec());
+                let barrier = self.first_lookup.lock().unwrap().take();
+                if let Some((entered, release)) = barrier {
+                    entered.send(()).expect("test receives retry lookup signal");
+                    release.await.expect("test releases retry lookup");
+                }
+                let resources = self
+                    .pg
+                    .fetch_resources_by_ids(tenant, resource_type, ids)
+                    .await?;
+                self.returned.lock().unwrap().push(
+                    resources
+                        .iter()
+                        .map(|resource| resource.id().to_string())
+                        .collect(),
+                );
+                Ok(resources)
+            }
+        }
+
+        struct FailingEsTarget {
+            es: Arc<ElasticsearchBackend>,
+            fail_once: Mutex<HashSet<String>>,
+            attempts: Mutex<Vec<String>>,
+        }
+
+        #[async_trait::async_trait]
+        impl ReindexTarget for FailingEsTarget {
+            async fn delete_search_entries(
+                &self,
+                tenant: &TenantContext,
+                resource_type: &str,
+                id: &str,
+            ) -> StorageResult<u64> {
+                self.es
+                    .delete_search_entries(tenant, resource_type, id)
+                    .await
+            }
+
+            async fn write_search_entries(
+                &self,
+                tenant: &TenantContext,
+                resource: &StoredResource,
+            ) -> StorageResult<usize> {
+                let id = resource.id().to_string();
+                self.attempts.lock().unwrap().push(id.clone());
+                if self.fail_once.lock().unwrap().remove(&id) {
+                    return Err(BackendError::Unavailable {
+                        backend_name: "elasticsearch".into(),
+                        message: "injected initial write failure".into(),
+                    }
+                    .into());
+                }
+                self.es.write_search_entries(tenant, resource).await
+            }
+
+            async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64> {
+                self.es.clear_search_index(tenant).await
+            }
+        }
+
+        let pg_fixture = shared_pg().await;
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|path| path.parent())
+            .unwrap()
+            .join("data");
+        let mut pg = PostgresBackend::new(PostgresConfig {
+            host: pg_fixture.host.clone(),
+            port: pg_fixture.port,
+            dbname: "postgres".into(),
+            user: "postgres".into(),
+            password: Some("postgres".into()),
+            data_dir: Some(data_dir),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        pg.init_schema().await.unwrap();
+        pg.set_search_offloaded(true);
+        let pg = Arc::new(pg);
+
+        let es_fixture = shared_es().await;
+        let es = Arc::new(
+            ElasticsearchBackend::with_shared_registry(
+                ElasticsearchConfig {
+                    nodes: vec![format!("http://{}:{}", es_fixture.host, es_fixture.port)],
+                    index_prefix: format!("hfs_pg_retry_{}", uuid::Uuid::new_v4().simple()),
+                    number_of_replicas: 0,
+                    refresh_interval: "1ms".into(),
+                    write_refresh: WriteRefreshPolicy::WaitFor,
+                    ..Default::default()
+                },
+                pg.tenant_registries().clone(),
+            )
+            .unwrap(),
+        );
+        es.initialize().await.unwrap();
+
+        let tenant = create_tenant(&format!("pg-es-retry-{}", uuid::Uuid::new_v4().simple()));
+        for id in ["retry-update", "retry-delete", "unrelated"] {
+            pg.create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":id,"name":[{"family":"Before"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let source = Arc::new(ObservedPgSource {
+            pg: pg.clone(),
+            requested: Mutex::new(Vec::new()),
+            returned: Mutex::new(Vec::new()),
+            first_lookup: Mutex::new(Some((entered_tx, release_rx))),
+        });
+        let target = Arc::new(FailingEsTarget {
+            es: es.clone(),
+            fail_once: Mutex::new(HashSet::from([
+                "retry-update".into(),
+                "retry-delete".into(),
+            ])),
+            attempts: Mutex::new(Vec::new()),
+        });
+        let operation = Arc::new(ReindexOperation::with_parts(
+            source.clone(),
+            vec![pg.clone(), target.clone()],
+            pg.tenant_registries().clone(),
+        ));
+        ReindexOnFinish::new(operation.clone())
+            .with_batch_size(10)
+            .reindex_types(&tenant, vec!["Patient".into()])
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx)
+            .await
+            .expect("automatic retry did not fetch by ID")
+            .expect("retry lookup signal dropped");
+
+        let original = pg
+            .read(&tenant, "Patient", "retry-update")
+            .await
+            .unwrap()
+            .unwrap();
+        pg.update(
+            &tenant,
+            &original,
+            json!({"resourceType":"Patient","id":"retry-update","name":[{"family":"After"}]}),
+        )
+        .await
+        .unwrap();
+        pg.delete(&tenant, "Patient", "retry-delete").await.unwrap();
+        release_tx.send(()).unwrap();
+
+        let jobs = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let jobs = operation.list_jobs();
+                if jobs.len() >= 2 && jobs.iter().all(|job| job.status.is_finished()) {
+                    break jobs;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("pg-es automatic retry did not finish");
+        assert_eq!(jobs.len(), 2);
+        let retry = jobs.iter().find(|job| job.resource_scoped).unwrap();
+        assert_eq!(retry.status, ReindexStatus::Completed);
+        assert_eq!(retry.total_resources, 2);
+        assert_eq!(retry.processed_resources, 2);
+
+        let requested = source.requested.lock().unwrap().clone();
+        assert_eq!(requested.len(), 1);
+        let mut ids = requested[0].clone();
+        ids.sort();
+        assert_eq!(ids, ["retry-delete", "retry-update"]);
+        assert_eq!(
+            *source.returned.lock().unwrap(),
+            vec![vec!["retry-update".to_string()]]
+        );
+        let attempts = target.attempts.lock().unwrap().clone();
+        assert_eq!(
+            attempts.iter().filter(|id| *id == "retry-update").count(),
+            2
+        );
+        assert_eq!(
+            attempts.iter().filter(|id| *id == "retry-delete").count(),
+            1
+        );
+        assert_eq!(attempts.iter().filter(|id| *id == "unrelated").count(), 1);
+
+        let updated = es
+            .read(&tenant, "Patient", "retry-update")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.content()["name"][0]["family"], "After");
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "name".into(),
+            param_type: SearchParamType::String,
+            modifier: None,
+            values: vec![SearchValue::eq("After")],
+            chain: vec![],
+            components: vec![],
+        });
+        let search = es.search(&tenant, &query).await.unwrap();
+        assert_eq!(search.resources.items.len(), 1);
+        assert_eq!(search.resources.items[0].id(), "retry-update");
+        assert!(
+            es.read(&tenant, "Patient", "retry-delete")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
     /// A resource contributes more than one document when it has `contained`
     /// entries, and the batched page writer has to flatten all of them into the
     /// one `_bulk` request while still reporting a single outcome per resource.
@@ -2280,6 +2594,181 @@ mod es_integration {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn es_integration_pg_source_capped_reindex_coverage() {
+        use helios_persistence::backends::postgres::{PostgresBackend, PostgresConfig};
+        use helios_persistence::search::{ReindexOperation, ReindexRequest, ReindexStatus};
+        use helios_persistence::types::SearchParamType;
+
+        let pg_fixture = shared_pg().await;
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|path| path.parent())
+            .unwrap()
+            .join("data");
+        let mut pg = PostgresBackend::new(PostgresConfig {
+            host: pg_fixture.host.clone(),
+            port: pg_fixture.port,
+            user: "postgres".to_string(),
+            password: Some("postgres".to_string()),
+            dbname: "postgres".to_string(),
+            data_dir: Some(data_dir),
+            search_offloaded: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        pg.init_schema().await.unwrap();
+        pg.set_search_offloaded(true);
+        let pg = Arc::new(pg);
+
+        let es_fixture = shared_es().await;
+        let make_es = || {
+            ElasticsearchBackend::with_shared_registry(
+                ElasticsearchConfig {
+                    nodes: vec![format!("http://{}:{}", es_fixture.host, es_fixture.port)],
+                    index_prefix: format!("hfs_{}", uuid::Uuid::new_v4().simple()),
+                    number_of_replicas: 0,
+                    refresh_interval: "1ms".to_string(),
+                    write_refresh: WriteRefreshPolicy::WaitFor,
+                    ..Default::default()
+                },
+                pg.tenant_registries().clone(),
+            )
+            .unwrap()
+        };
+        let capped_es = Arc::new(make_es());
+        let uncapped_es = Arc::new(make_es());
+        capped_es.initialize().await.unwrap();
+        uncapped_es.initialize().await.unwrap();
+        let capped_tenant = create_tenant(&format!("pg-es-cap-{}", uuid::Uuid::new_v4()));
+        let uncapped_tenant = create_tenant(&format!("pg-es-base-{}", uuid::Uuid::new_v4()));
+        for tenant in [&capped_tenant, &uncapped_tenant] {
+            for n in 0..5 {
+                let id = format!("pg-es-{n}");
+                pg.create(
+                    tenant,
+                    "Patient",
+                    json!({
+                        "resourceType":"Patient",
+                        "id":id,
+                        "name":[{"family":format!("Family{n}")}],
+                        "text":{"status":"generated","div":format!("<div>{}</div>", "x".repeat(if n == 2 { 4000 } else { 10 }))}
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            }
+        }
+        let client = pg.get_client().await.unwrap();
+        let sizes: Vec<i64> = client
+            .query(
+                "SELECT octet_length(data::text)::bigint FROM resources
+                 WHERE tenant_id = $1 AND resource_type = 'Patient'
+                 ORDER BY last_updated, id",
+                &[&capped_tenant.tenant_id().as_str()],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(sizes.len(), 5);
+        let cap = (sizes[0] + sizes[1]) as u64;
+        assert!(sizes.iter().sum::<i64>() as u64 > cap);
+        assert!(sizes.iter().any(|size| *size as u64 > cap));
+        drop(client);
+
+        for (tenant, es, bytes) in [
+            (&capped_tenant, &capped_es, cap),
+            (&uncapped_tenant, &uncapped_es, 0),
+        ] {
+            let started = std::time::Instant::now();
+            let op = ReindexOperation::with_parts(
+                pg.clone(),
+                vec![pg.clone(), es.clone()],
+                pg.tenant_registries().clone(),
+            );
+            let job = op
+                .start(
+                    tenant.clone(),
+                    ReindexRequest::for_types(vec!["Patient"])
+                        .with_batch_size(5)
+                        .with_batch_bytes(bytes),
+                    None,
+                )
+                .await
+                .unwrap();
+            let mut completed = None;
+            for _ in 0..600 {
+                let progress = op.get_progress(&job).await.unwrap();
+                if progress.status.is_finished() {
+                    completed = Some(progress);
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            }
+            let progress = completed.expect("pg-es reindex timed out");
+            assert_eq!(
+                progress.status,
+                ReindexStatus::Completed,
+                "{:?}",
+                progress.error_message
+            );
+            assert!(progress.errors.is_empty(), "{:?}", progress.errors);
+            assert_eq!(progress.processed_resources, 5);
+            let terminal_ms = started.elapsed().as_millis();
+            await_es_count(es, tenant, "Patient", 5).await;
+            for n in 0..5 {
+                let id = format!("pg-es-{n}");
+                assert!(es.read(tenant, "Patient", &id).await.unwrap().is_some());
+                let family = format!("Family{n}");
+                let found = found_ids(
+                    es.as_ref(),
+                    tenant,
+                    &param_query("Patient", &[("name", SearchParamType::String, &family)]),
+                )
+                .await;
+                assert!(found.contains(&id), "{family} did not find {id}");
+            }
+            if std::env::var_os("HFS_1459_MEASURE").is_some() {
+                println!(
+                    "pg-es measurement: byte_cap={bytes} terminal_ms={terminal_ms} search_ready_ms={}",
+                    started.elapsed().as_millis()
+                );
+            }
+        }
+        let client = pg.get_client().await.unwrap();
+        let mut snapshots = Vec::new();
+        for tenant in [&capped_tenant, &uncapped_tenant] {
+            let index: i64 = client
+                .query_one(
+                    "SELECT count(*) FROM search_index WHERE tenant_id = $1",
+                    &[&tenant.tenant_id().as_str()],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            let fts: i64 = client
+                .query_one(
+                    "SELECT count(*) FROM resource_fts WHERE tenant_id = $1",
+                    &[&tenant.tenant_id().as_str()],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            snapshots.push((index, fts));
+        }
+        assert!(
+            snapshots[0].0 > 0,
+            "PostgreSQL target wrote no search entries"
+        );
+        assert!(snapshots[0].1 > 0, "PostgreSQL target wrote no FTS entries");
+        assert_eq!(snapshots[0], snapshots[1]);
     }
 
     /// What the #1161 tests share: an offloaded SQLite primary and a real

@@ -173,6 +173,11 @@ required-features = ["sqlite"]
 name = "bulk_submit_mongo_bench"
 required-features = ["mongodb"]
 
+# Shared chain resolver vs. native SQL chain builders (#1341).
+[[example]]
+name = "chain_bench"
+required-features = ["sqlite", "postgres"]
+
 # Benchmarks will be added later
 # [[bench]]
 # name = "crud_benchmark"
