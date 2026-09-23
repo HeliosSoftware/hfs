@@ -16354,6 +16354,163 @@ mod postgres_integration {
         }
     }
 
+    /// A failure while updating a cached file-progress statement rolls back
+    /// the resource batch and leaves the file available for a later retry.
+    #[tokio::test]
+    async fn postgres_bulk_submit_cached_file_progress_error_rolls_back_batch() {
+        use helios_persistence::core::{BulkProcessingOptions, BulkSubmitProvider, ManifestStatus};
+
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenant = create_tenant("fixed-cache-progress-error");
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        let (submission, manifest) =
+            new_bulk_submit_manifest(&backend, &tenant, "fixed-cache-progress-error").await;
+        let admin = reindex_test_client_for(&dbname).await;
+        let observer = std::sync::Arc::new(RecordingBulkSubmitBatches::default());
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let function = format!("fail_fixed_cache_progress_{suffix}");
+        let trigger = format!("fail_fixed_cache_progress_{suffix}");
+        admin
+            .batch_execute(&format!(
+                "CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   IF NEW.tenant_id = '{tenant_id}' THEN
+                     RAISE EXCEPTION 'forced file progress failure';
+                   END IF;
+                   RETURN NEW;
+                 END $$;
+                 CREATE TRIGGER {trigger}
+                 BEFORE UPDATE ON bulk_manifest_file_progress
+                 FOR EACH ROW EXECUTE FUNCTION {function}();"
+            ))
+            .await
+            .unwrap();
+
+        let options = BulkProcessingOptions::new()
+            .with_defer_indexing(true)
+            .with_file_url("fixed-cache-progress-error.ndjson")
+            .with_batch_observer(observer.clone());
+        let error = backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest.manifest_id,
+                vec![one_patient_entry(1, "fixed-cache-progress-error")],
+                &options,
+            )
+            .await
+            .expect_err("the failed file-progress update must reject the batch");
+        assert!(
+            error.to_string().contains("Failed to update file progress"),
+            "unexpected file-progress error: {error}"
+        );
+        assert!(observer.0.lock().unwrap().is_empty());
+        for table in [
+            "resources",
+            "resource_history",
+            "bulk_entry_results",
+            "bulk_submission_changes",
+            "bulk_manifest_file_progress",
+        ] {
+            assert_bulk_submit_table_count(&admin, table, &tenant_id, 0).await;
+        }
+        let current = backend
+            .get_manifest(&tenant, &submission, &manifest.manifest_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.status, ManifestStatus::Processing);
+        assert_eq!((current.total_entries, current.processed_entries), (0, 0));
+
+        admin
+            .batch_execute(&format!(
+                "DROP TRIGGER {trigger} ON bulk_manifest_file_progress;
+                 DROP FUNCTION {function}();"
+            ))
+            .await
+            .unwrap();
+        let results = backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest.manifest_id,
+                vec![one_patient_entry(1, "fixed-cache-progress-error")],
+                &options,
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_success());
+        assert_eq!(observer.0.lock().unwrap().len(), 1);
+    }
+
+    /// The submission timestamp is updated after the batch commits, so a
+    /// cached-statement error at that point must retain the committed batch.
+    #[tokio::test]
+    async fn postgres_bulk_submit_cached_submission_touch_error_keeps_committed_batch() {
+        use helios_persistence::core::{BulkProcessingOptions, BulkSubmitProvider};
+
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenant = create_tenant("fixed-cache-touch-error");
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        let (submission, manifest) =
+            new_bulk_submit_manifest(&backend, &tenant, "fixed-cache-touch-error").await;
+        let admin = reindex_test_client_for(&dbname).await;
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let function = format!("fail_fixed_cache_touch_{suffix}");
+        let trigger = format!("fail_fixed_cache_touch_{suffix}");
+        admin
+            .batch_execute(&format!(
+                "CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   IF NEW.tenant_id = '{tenant_id}' THEN
+                     RAISE EXCEPTION 'forced submission touch failure';
+                   END IF;
+                   RETURN NEW;
+                 END $$;
+                 CREATE TRIGGER {trigger}
+                 BEFORE UPDATE OF updated_at ON bulk_submissions
+                 FOR EACH ROW EXECUTE FUNCTION {function}();"
+            ))
+            .await
+            .unwrap();
+
+        let observer = std::sync::Arc::new(RecordingBulkSubmitBatches::default());
+        let error = backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest.manifest_id,
+                vec![one_patient_entry(1, "fixed-cache-touch-error")],
+                &BulkProcessingOptions::new()
+                    .with_defer_indexing(true)
+                    .with_file_url("fixed-cache-touch-error.ndjson")
+                    .with_batch_observer(observer.clone()),
+            )
+            .await
+            .expect_err("the failed submission update must report an error");
+        assert!(
+            error.to_string().contains("Failed to update submission"),
+            "unexpected submission update error: {error}"
+        );
+        assert_eq!(observer.0.lock().unwrap().len(), 1);
+        for table in [
+            "resources",
+            "resource_history",
+            "bulk_entry_results",
+            "bulk_submission_changes",
+            "bulk_manifest_file_progress",
+        ] {
+            assert_bulk_submit_table_count(&admin, table, &tenant_id, 1).await;
+        }
+        let current = backend
+            .get_manifest(&tenant, &submission, &manifest.manifest_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((current.total_entries, current.processed_entries), (1, 1));
+    }
+
     /// Selects the PostgreSQL deployment used by the ignored measurement.
     ///
     /// When `HFS_1458_MEASUREMENT_PG_PORT` is set, it must name a PostgreSQL
