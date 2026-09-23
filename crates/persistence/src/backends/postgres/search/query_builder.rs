@@ -19,6 +19,9 @@ use crate::types::{
     SearchPrefix, SearchQuery, SearchValue, strip_reference_version,
 };
 
+// Keep generated SQL and bind counts small well before PostgreSQL's 65,535-parameter limit.
+const LARGE_ID_SET_THRESHOLD: usize = 1_000;
+
 /// Returns the implicit precision of a decimal search value from its string form
 /// (e.g. `"100"` → 1.0, `"100.0"` → 0.1), used to build `eq` ranges.
 fn quantity_implicit_precision(num_str: &str) -> f64 {
@@ -538,6 +541,8 @@ pub struct SqlFragment {
 pub enum SqlParam {
     /// Text parameter.
     Text(String),
+    /// Array of text values for large id sets.
+    TextArray(Vec<String>),
     /// Floating point parameter.
     Float(f64),
     /// Integer parameter.
@@ -1466,11 +1471,30 @@ impl PostgresQueryBuilder {
     ///
     /// A single value composes to `id = $n` (or `id <> $n` when negated).
     /// Several values compose to the flat predicates `id IN ($n, $m, ...)`
-    /// or `id NOT IN ($n, $m, ...)`, avoiding a left-deep `OR` tree that can
-    /// exhaust PostgreSQL's parser memory for wide chain-resolution rewrites.
+    /// or `id NOT IN ($n, $m, ...)`, avoiding a left-deep `OR` tree. Wide sets
+    /// use one `text[]` bind to stay within PostgreSQL's parameter limit.
     fn build_id_condition(param: &SearchParameter, offset: usize) -> Option<SqlFragment> {
         if param.values.is_empty() {
             return None;
+        }
+
+        // PostgreSQL limits bind parameters to 65,535. A resolved chain may
+        // contain more ids, so send wide sets in one typed array parameter.
+        if param.values.len() > LARGE_ID_SET_THRESHOLD {
+            let ids = param
+                .values
+                .iter()
+                .map(|value| value.value.clone())
+                .collect();
+            let sql = if matches!(param.modifier, Some(SearchModifier::Not)) {
+                format!("id <> ALL(${}::text[])", offset + 1)
+            } else {
+                format!("id = ANY(${}::text[])", offset + 1)
+            };
+            return Some(SqlFragment::with_params(
+                sql,
+                vec![SqlParam::TextArray(ids)],
+            ));
         }
 
         if matches!(param.modifier, Some(SearchModifier::Not)) {
@@ -6694,6 +6718,30 @@ mod tests {
         assert_eq!(fragment.sql, "id = $3");
         assert_eq!(fragment.params.len(), 1);
         assert_eq!(id_param_text(&fragment.params[0]), "a");
+    }
+
+    #[test]
+    fn large_id_set_uses_one_array_bind() {
+        let values: Vec<SearchValue> = (0..65_536)
+            .map(|i| SearchValue::eq(format!("id-{i}")))
+            .collect();
+        for (modifier, expected_sql) in [
+            (None, "id = ANY($3::text[])"),
+            (Some(SearchModifier::Not), "id <> ALL($3::text[])"),
+        ] {
+            let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+                name: "_id".to_string(),
+                param_type: SearchParamType::Token,
+                modifier,
+                values: values.clone(),
+                ..Default::default()
+            });
+            let fragment = PostgresQueryBuilder::build_search_query(&query, 2).unwrap();
+            assert_eq!(fragment.sql, expected_sql);
+            assert!(
+                matches!(fragment.params.as_slice(), [SqlParam::TextArray(ids)] if ids.len() == 65_536 && ids[65_535] == "id-65535")
+            );
+        }
     }
 
     #[test]

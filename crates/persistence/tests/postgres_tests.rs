@@ -83,6 +83,9 @@ mod number_exponent_suite;
 #[path = "search/conditional_criteria_suite.rs"]
 mod conditional_criteria_suite;
 
+#[path = "search/large_id_set_suite.rs"]
+mod large_id_set_suite;
+
 /// The backend-agnostic `_contained` suite (#1336, #1362, #1363). Same
 /// `#[path]` arrangement.
 #[path = "search/contained_suite.rs"]
@@ -900,6 +903,22 @@ mod postgres_integration {
     use testcontainers::runners::AsyncRunner;
     use testcontainers_modules::postgres::Postgres;
     use tokio::sync::{Mutex, OnceCell};
+
+    #[tokio::test]
+    async fn postgres_large_id_set_search_count_cursor_not_and_tenant() {
+        let backend = create_backend().await;
+        let tenant = create_tenant("large-id-set-postgres");
+        super::large_id_set_suite::large_id_set_search_count_cursor_not_and_tenant(
+            &backend,
+            tenant.tenant_id().as_str(),
+        )
+        .await;
+        super::large_id_set_suite::wide_chain_and_nested_has(
+            &backend,
+            &format!("{}-wide-chain", tenant.tenant_id().as_str()),
+        )
+        .await;
+    }
 
     #[tokio::test]
     async fn postgres_publication_exact_contract() {

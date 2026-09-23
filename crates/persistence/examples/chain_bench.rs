@@ -1547,6 +1547,7 @@ async fn explain_postgres(backend: &PostgresBackend, tenant: &TenantContext, cas
     for p in &fragment.params {
         match p {
             SqlParam::Text(s) => params.push(Box::new(s.clone())),
+            SqlParam::TextArray(ids) => params.push(Box::new(ids.clone())),
             SqlParam::Float(f) => params.push(Box::new(*f)),
             SqlParam::Integer(i) => params.push(Box::new(*i)),
             SqlParam::Bool(b) => params.push(Box::new(*b)),
