@@ -1037,6 +1037,11 @@ impl PostgresSearchIndexWriter {
     /// a grouped aggregate over one row per component.
     ///
     /// Returns the number of rows written.
+    /// This low-level API accepts arbitrary extracted values and a raw client.
+    /// Callers must provide their own transaction, tenant/resource advisory
+    /// locks, current-row freshness check, and atomic replacement of stale
+    /// search and FTS rows. Supported CRUD and reindex paths use guarded
+    /// internal writers instead.
     pub async fn write_values(
         client: &deadpool_postgres::Client,
         tenant_id: &str,
@@ -1186,13 +1191,16 @@ impl PostgresSearchIndexWriter {
     /// of one write, so they are bound once per statement instead of once per
     /// row — 3 fewer values on the wire for each of the ~39.5M index rows an
     /// import writes.
-    pub(crate) async fn insert_rows(
-        client: &deadpool_postgres::Client,
+    pub(crate) async fn insert_rows<C>(
+        client: &C,
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
         rows: &[IndexRow],
-    ) -> StorageResult<()> {
+    ) -> StorageResult<()>
+    where
+        C: deadpool_postgres::GenericClient + ?Sized,
+    {
         Self::write_rows(client, tenant_id, resource_type, resource_id, rows, false).await
     }
 
@@ -1202,24 +1210,30 @@ impl PostgresSearchIndexWriter {
     /// rather than being one of its own. Only the *first* chunk carries it: a
     /// resource whose rows exceed [`BATCH_ROWS`] must not have chunk 2 delete
     /// what chunk 1 just wrote.
-    pub(crate) async fn replace_rows(
-        client: &deadpool_postgres::Client,
+    pub(crate) async fn replace_rows<C>(
+        client: &C,
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
         rows: &[IndexRow],
-    ) -> StorageResult<()> {
+    ) -> StorageResult<()>
+    where
+        C: deadpool_postgres::GenericClient + ?Sized,
+    {
         Self::write_rows(client, tenant_id, resource_type, resource_id, rows, true).await
     }
 
-    async fn write_rows(
-        client: &deadpool_postgres::Client,
+    async fn write_rows<C>(
+        client: &C,
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
         rows: &[IndexRow],
         clear_first: bool,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<()>
+    where
+        C: deadpool_postgres::GenericClient + ?Sized,
+    {
         if clear_first && rows.is_empty() {
             // Nothing to fold the `DELETE` into, and it still has to happen.
             execute_cached(
@@ -1343,6 +1357,8 @@ impl PostgresSearchIndexWriter {
     ///
     /// Shares [`IndexRow`] with the batched path so both agree on which column
     /// each `IndexValue` variant populates.
+    /// Like [`Self::write_values`], this raw-client API requires the caller to
+    /// enforce transaction, lock, and current-row freshness obligations.
     pub async fn write_entry(
         client: &deadpool_postgres::Client,
         tenant_id: &str,

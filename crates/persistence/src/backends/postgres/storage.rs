@@ -1,7 +1,8 @@
 //! ResourceStorage and VersionedStorage implementations for PostgreSQL.
 
-use std::sync::OnceLock;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -26,6 +27,7 @@ use crate::error::TransactionError;
 use crate::error::{
     BackendError, ConcurrencyError, QueryErrorExt, ResourceError, StorageError, StorageResult,
 };
+use crate::search::SearchParameterExtractor;
 use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
 use crate::tenant::{Operation, TenantContext};
 use crate::types::Pagination;
@@ -34,7 +36,17 @@ use crate::types::{CursorValue, Page, PageCursor, PageInfo, StoredResource};
 
 use super::PostgresBackend;
 use super::cached::{execute_cached, query_cached, query_opt_cached};
+use super::cleanup::{GuardedClient, ReindexAdmission};
+use super::lock_protocol::{acquire_exclusive_write_gate, acquire_shared_write_locks};
 use super::search::writer::{IndexRow, PostgresSearchIndexWriter};
+
+#[cfg(test)]
+pub(super) struct ReindexTestHook {
+    tenant_id: String,
+    panic_first_id: String,
+    entered: std::sync::atomic::AtomicUsize,
+    barrier: tokio::sync::Barrier,
+}
 
 /// Whether a resource being indexed can already have `search_index` rows.
 ///
@@ -64,6 +76,539 @@ pub(crate) enum IndexWrite {
     Replace,
 }
 
+#[cfg(test)]
+mod reindex_groups_tests {
+    use super::*;
+    use crate::backends::postgres::PostgresConfig;
+    use crate::backends::postgres::lock_protocol::{
+        RESOURCE_LOCK_NAMESPACE, resource_key, sorted_resource_keys,
+    };
+    use crate::tenant::{TenantId, TenantPermissions};
+    use futures::FutureExt;
+    use serde_json::json;
+    use testcontainers::ImageExt;
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::postgres::Postgres;
+    use tokio::sync::OnceCell;
+    use tokio::time::{Duration, timeout};
+
+    struct SharedPg {
+        host: String,
+        port: u16,
+        _container: testcontainers::ContainerAsync<Postgres>,
+    }
+
+    static SHARED_PG: OnceCell<SharedPg> = OnceCell::const_new();
+
+    async fn backend(pool_size: usize) -> PostgresBackend {
+        let pg = SHARED_PG
+            .get_or_init(|| async {
+                let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
+                let container = super::super::schema::container_cleanup::with_cleanup_label(
+                    Postgres::default()
+                        .with_tag("16-alpine")
+                        .with_label("github.run_id", &run_id),
+                )
+                .start()
+                .await
+                .expect("start PostgreSQL 16 testcontainer");
+                SharedPg {
+                    host: container.get_host().await.expect("host").to_string(),
+                    port: container.get_host_port_ipv4(5432).await.expect("port"),
+                    _container: container,
+                }
+            })
+            .await;
+        PostgresBackend::new(PostgresConfig {
+            host: pg.host.clone(),
+            port: pg.port,
+            dbname: "postgres".into(),
+            user: "postgres".into(),
+            password: Some("postgres".into()),
+            max_connections: pool_size,
+            ..Default::default()
+        })
+        .await
+        .expect("backend")
+    }
+
+    #[tokio::test]
+    async fn single_connection_cleanup() {
+        let backend = backend(1).await;
+        let mut client = backend.guarded_client().await.expect("client");
+        let transaction = client.transaction().await.expect("begin");
+        acquire_shared_write_locks(&transaction, "cleanup-one", &[("Patient", "one")])
+            .await
+            .expect("lock resource");
+        drop(transaction);
+        drop(client);
+        timeout(Duration::from_secs(10), backend.wait_postgres_cleanup())
+            .await
+            .expect("tracked rollback or discard");
+        let client = timeout(Duration::from_secs(10), backend.get_client())
+            .await
+            .expect("one-connection pool returned")
+            .expect("connection usable");
+        let value: i32 = client
+            .query_one("SELECT 1", &[])
+            .await
+            .expect("query")
+            .get(0);
+        assert_eq!(value, 1);
+        let observer = self::backend(2).await;
+        let observer_client = observer.get_client().await.expect("observer connection");
+        let acquired: bool = observer_client
+            .query_one(
+                "SELECT pg_try_advisory_xact_lock($1, $2)",
+                &[
+                    &RESOURCE_LOCK_NAMESPACE,
+                    &resource_key("cleanup-one", "Patient", "one").unwrap(),
+                ],
+            )
+            .await
+            .expect("observe released lock")
+            .get(0);
+        assert!(acquired, "tracked cleanup must release the server lock");
+    }
+
+    #[tokio::test]
+    async fn begin_commit_drop_settlement() {
+        let backend = backend(1).await;
+        let mut client = backend.guarded_client().await.expect("client");
+        let transaction = client.transaction().await.expect("begin");
+        transaction
+            .query_one(
+                "SELECT pg_advisory_xact_lock($1, $2)",
+                &[
+                    &RESOURCE_LOCK_NAMESPACE,
+                    &resource_key("commit-one", "Patient", "one").unwrap(),
+                ],
+            )
+            .await
+            .expect("lock");
+        transaction.commit().await.expect("commit");
+        client.mark_settled();
+        drop(client);
+        timeout(Duration::from_secs(10), backend.wait_postgres_cleanup())
+            .await
+            .expect("no cleanup pending");
+        let second = self::backend(2).await;
+        let client = second.get_client().await.expect("independent client");
+        let acquired: bool = client
+            .query_one(
+                "SELECT pg_try_advisory_xact_lock($1, $2)",
+                &[
+                    &RESOURCE_LOCK_NAMESPACE,
+                    &resource_key("commit-one", "Patient", "one").unwrap(),
+                ],
+            )
+            .await
+            .expect("try lock")
+            .get(0);
+        assert!(
+            acquired,
+            "committed lock must be released to another session"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_flight_commit_drop_settles_before_reuse() {
+        let backend = backend(2).await;
+        let setup = backend.get_client().await.expect("setup connection");
+        setup
+            .batch_execute(
+                "CREATE TABLE pgi1461_commit_probe (id integer PRIMARY KEY);
+                 CREATE FUNCTION pgi1461_commit_delay() RETURNS trigger
+                 LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$;
+                 CREATE CONSTRAINT TRIGGER pgi1461_commit_delay_trigger
+                 AFTER INSERT ON pgi1461_commit_probe
+                 DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
+                 EXECUTE FUNCTION pgi1461_commit_delay();",
+            )
+            .await
+            .expect("install commit barrier");
+        drop(setup);
+        let (pid_tx, pid_rx) = tokio::sync::oneshot::channel();
+        let writer = backend.clone();
+        let task = tokio::spawn(async move {
+            let mut client = writer.guarded_client().await.expect("writer connection");
+            let transaction = client.transaction().await.expect("begin");
+            acquire_shared_write_locks(&transaction, "commit-drop", &[("Patient", "commit-drop")])
+                .await
+                .expect("writer lock");
+            transaction
+                .execute("INSERT INTO pgi1461_commit_probe VALUES (1)", &[])
+                .await
+                .expect("deferred trigger insert");
+            let pid: i32 = transaction
+                .query_one("SELECT pg_backend_pid()", &[])
+                .await
+                .expect("backend pid")
+                .get(0);
+            pid_tx.send(pid).expect("observer awaits pid");
+            transaction.commit().await.expect("commit response");
+            client.mark_settled();
+        });
+        let pid = timeout(Duration::from_secs(10), pid_rx)
+            .await
+            .expect("writer reached commit")
+            .expect("writer pid");
+        let observer = self::backend(2).await;
+        let client = observer.get_client().await.expect("observer connection");
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let in_commit: bool = client
+                    .query_one(
+                        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+                         WHERE pid = $1 AND state = 'active' AND query LIKE 'COMMIT%')",
+                        &[&pid],
+                    )
+                    .await
+                    .expect("inspect commit")
+                    .get(0);
+                if in_commit {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("commit entered deferred trigger");
+        task.abort();
+        let _ = task.await;
+        timeout(Duration::from_secs(15), backend.wait_postgres_cleanup())
+            .await
+            .expect("uncertain commit session discarded");
+        let acquired: bool = client
+            .query_one(
+                "SELECT pg_try_advisory_xact_lock($1, $2)",
+                &[
+                    &RESOURCE_LOCK_NAMESPACE,
+                    &resource_key("commit-drop", "Patient", "commit-drop").unwrap(),
+                ],
+            )
+            .await
+            .expect("observe released server lock")
+            .get(0);
+        assert!(acquired, "server still holds lock after tracked cleanup");
+        drop(client);
+        let usable = timeout(Duration::from_secs(10), backend.get_client())
+            .await
+            .expect("pool checkout")
+            .expect("usable connection after discard");
+        usable
+            .query_one("SELECT 1", &[])
+            .await
+            .expect("usable query");
+    }
+
+    #[tokio::test]
+    async fn failed_cleanup_discards_broken_session() {
+        let backend = backend(1).await;
+        let mut client = backend.guarded_client().await.expect("writer connection");
+        let transaction = client.transaction().await.expect("begin");
+        acquire_shared_write_locks(&transaction, "broken-cleanup", &[("Patient", "broken")])
+            .await
+            .expect("writer lock");
+        let pid: i32 = transaction
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .expect("backend pid")
+            .get(0);
+        let observer = self::backend(2).await;
+        let other = observer.get_client().await.expect("observer connection");
+        let terminated: bool = other
+            .query_one("SELECT pg_terminate_backend($1)", &[&pid])
+            .await
+            .expect("terminate broken session")
+            .get(0);
+        assert!(terminated);
+        drop(transaction);
+        drop(client);
+        timeout(Duration::from_secs(10), backend.wait_postgres_cleanup())
+            .await
+            .expect("failed rollback discarded the client");
+        let acquired: bool = other
+            .query_one(
+                "SELECT pg_try_advisory_xact_lock($1, $2)",
+                &[
+                    &RESOURCE_LOCK_NAMESPACE,
+                    &resource_key("broken-cleanup", "Patient", "broken").unwrap(),
+                ],
+            )
+            .await
+            .expect("observe server lock released")
+            .get(0);
+        assert!(acquired);
+        let replacement = timeout(Duration::from_secs(10), backend.get_client())
+            .await
+            .expect("pool checkout")
+            .expect("replacement connection");
+        replacement
+            .query_one("SELECT 1", &[])
+            .await
+            .expect("replacement usable");
+    }
+
+    #[tokio::test]
+    async fn buffer_and_oversized_admission() {
+        let backend = backend(2).await.with_reindex_concurrency(4);
+        assert_eq!(backend.reindex_width, 2, "pool caps admission");
+        let clone = backend.clone();
+        let ordinary = backend
+            .reindex_admission
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        assert_eq!(clone.reindex_admission.available_permits(), 1);
+        let exclusive = clone.reindex_admission.clone().acquire_many_owned(2);
+        tokio::pin!(exclusive);
+        assert!(
+            timeout(Duration::from_millis(30), &mut exclusive)
+                .await
+                .is_err()
+        );
+        drop(ordinary);
+        let exclusive = timeout(Duration::from_secs(2), exclusive)
+            .await
+            .expect("oversized lane admitted after ordinary settlement")
+            .expect("semaphore open");
+        assert_eq!(backend.reindex_admission.available_permits(), 0);
+        drop(exclusive);
+        assert_eq!(backend.reindex_admission.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn panic_stops_admission_and_drains() {
+        let mut backend = backend(2).await.with_reindex_concurrency(2);
+        let tenant = TenantContext::new(
+            TenantId::new("panic-reindex-groups"),
+            TenantPermissions::full_access(),
+        );
+        let hook = Arc::new(ReindexTestHook {
+            tenant_id: tenant.tenant_id().as_str().to_string(),
+            panic_first_id: "p000".to_string(),
+            entered: std::sync::atomic::AtomicUsize::new(0),
+            barrier: tokio::sync::Barrier::new(2),
+        });
+        backend.reindex_test_hook = Some(hook.clone());
+        let resources: Vec<_> = (0..257)
+            .map(|index| {
+                StoredResource::new(
+                    "Patient",
+                    format!("p{index:03}"),
+                    tenant.tenant_id().clone(),
+                    json!({"resourceType":"Patient","id":format!("p{index:03}")}),
+                    FhirVersion::default(),
+                )
+            })
+            .collect();
+
+        let outcome = timeout(
+            Duration::from_secs(15),
+            std::panic::AssertUnwindSafe(backend.write_search_entries_page(&tenant, &resources))
+                .catch_unwind(),
+        )
+        .await
+        .expect("page panic and sibling drain finish");
+        assert!(outcome.is_err(), "group panic must unwind the page");
+        assert_eq!(
+            hook.entered.load(Ordering::SeqCst),
+            2,
+            "the third group must not be admitted after the panic"
+        );
+        timeout(Duration::from_secs(10), backend.wait_postgres_cleanup())
+            .await
+            .expect("all dropped sessions settle");
+        assert_eq!(backend.reindex_admission.available_permits(), 2);
+
+        let observer = self::backend(2).await;
+        let client = observer.get_client().await.expect("observer connection");
+        for id in ["p000", "p128"] {
+            let acquired: bool = client
+                .query_one(
+                    "SELECT pg_try_advisory_xact_lock($1, $2)",
+                    &[
+                        &RESOURCE_LOCK_NAMESPACE,
+                        &resource_key(tenant.tenant_id().as_str(), "Patient", id).unwrap(),
+                    ],
+                )
+                .await
+                .expect("observe settled group lock")
+                .get(0);
+            assert!(acquired, "resource {id} remained locked after page unwind");
+        }
+    }
+
+    #[tokio::test]
+    async fn parent_page_drop_settles_active_group() {
+        let mut backend = backend(1).await.with_reindex_concurrency(1);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        backend.reindex_test_entered = Some(entered.clone());
+        backend.reindex_test_pause = Some(Arc::new(tokio::sync::Notify::new()));
+        let tenant = TenantContext::new(
+            TenantId::new("page-drop-group"),
+            TenantPermissions::full_access(),
+        );
+        let writer = backend.clone();
+        let tenant_for_task = tenant.clone();
+        let task = tokio::spawn(async move {
+            let resource = StoredResource::new(
+                "Patient",
+                "held",
+                tenant_for_task.tenant_id().clone(),
+                json!({"resourceType":"Patient","id":"held"}),
+                FhirVersion::default(),
+            );
+            writer
+                .write_search_entries_page(&tenant_for_task, &[resource])
+                .await
+        });
+        timeout(Duration::from_secs(10), entered.notified())
+            .await
+            .expect("group acquired its lock");
+        assert_eq!(backend.reindex_admission.available_permits(), 0);
+        task.abort();
+        let _ = task.await;
+        timeout(Duration::from_secs(10), backend.wait_postgres_cleanup())
+            .await
+            .expect("dropped page cleanup completed");
+        assert_eq!(backend.reindex_admission.available_permits(), 1);
+
+        let observer = self::backend(2).await;
+        let client = observer.get_client().await.expect("observer connection");
+        let acquired: bool = client
+            .query_one(
+                "SELECT pg_try_advisory_xact_lock($1, $2)",
+                &[
+                    &RESOURCE_LOCK_NAMESPACE,
+                    &resource_key(tenant.tenant_id().as_str(), "Patient", "held").unwrap(),
+                ],
+            )
+            .await
+            .expect("observe released server lock")
+            .get(0);
+        assert!(acquired);
+        drop(client);
+        let usable = timeout(Duration::from_secs(10), backend.get_client())
+            .await
+            .expect("pool checkout")
+            .expect("usable pool connection");
+        usable
+            .query_one("SELECT 1", &[])
+            .await
+            .expect("usable query");
+    }
+
+    #[tokio::test]
+    async fn oversized_body_releases_ordinary_group_before_replay() {
+        let backend = backend(2).await.with_reindex_concurrency(4);
+        backend
+            .init_schema()
+            .await
+            .expect("initialize resource tables");
+        let tenant = TenantContext::new(
+            TenantId::new("oversized-body-group"),
+            TenantPermissions::full_access(),
+        );
+        let body = json!({
+            "resourceType": "Patient",
+            "id": "large",
+            "name": [{"family": "Large"}],
+            "text": {"status": "generated",
+                     "div": format!("<div xmlns=\"http://www.w3.org/1999/xhtml\">{}</div>",
+                                    "large content ".repeat(600_000))}
+        });
+        let setup = backend.get_client().await.expect("setup connection");
+        setup
+            .execute(
+                "INSERT INTO resources
+                 (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted)
+                 VALUES ($1, 'Patient', 'large', '1', $2, statement_timestamp(), FALSE)",
+                &[&tenant.tenant_id().as_str(), &body],
+            )
+            .await
+            .expect("persist oversized current row");
+        drop(setup);
+        let stored = StoredResource::new(
+            "Patient",
+            "large",
+            tenant.tenant_id().clone(),
+            body,
+            FhirVersion::default(),
+        );
+        let mut client = backend.guarded_client().await.expect("client");
+        let transaction = client.transaction().await.expect("begin");
+        acquire_shared_write_locks(
+            &transaction,
+            tenant.tenant_id().as_str(),
+            &[("Patient", "large")],
+        )
+        .await
+        .expect("lock current resource");
+        let ordinary = backend
+            .current_reindex_resources(&transaction, &tenant, &[&stored], false)
+            .await
+            .expect("inspect ordinary body budget");
+        assert!(
+            ordinary.is_none(),
+            "a body above 8 MiB needs exclusive admission"
+        );
+        let exclusive = backend
+            .current_reindex_resources(&transaction, &tenant, &[&stored], true)
+            .await
+            .expect("reread in exclusive lane");
+        assert!(exclusive.is_some());
+        transaction.rollback().await.expect("rollback inspection");
+        client.mark_settled();
+        drop(client);
+
+        timeout(
+            Duration::from_secs(30),
+            backend.write_search_entries(&tenant, &stored),
+        )
+        .await
+        .expect("oversized replay must not wait on its own permit")
+        .expect("oversized replacement");
+        assert_eq!(backend.reindex_admission.available_permits(), 2);
+        timeout(Duration::from_secs(10), backend.wait_postgres_cleanup())
+            .await
+            .expect("oversized session settled");
+    }
+
+    #[test]
+    fn sorted_signed_keys_deduplicate_opposing_orders() {
+        let a = sorted_resource_keys(
+            "lock-order",
+            &[("Patient", "a"), ("Patient", "b"), ("Patient", "a")],
+        )
+        .unwrap();
+        let b = sorted_resource_keys("lock-order", &[("Patient", "b"), ("Patient", "a")]).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 2);
+        assert!(a[0] < a[1]);
+    }
+
+    #[test]
+    fn colliding_resource_ids_share_one_advisory_key() {
+        let first = "99ec5c4e5859bc35";
+        let second = "0f395d8816855ccc";
+        assert_ne!(first, second);
+        assert_eq!(
+            resource_key("collision", "Patient", first).unwrap(),
+            resource_key("collision", "Patient", second).unwrap()
+        );
+        let keys =
+            sorted_resource_keys("collision", &[("Patient", first), ("Patient", second)]).unwrap();
+        assert_eq!(
+            keys.len(),
+            1,
+            "collisions serialize the two full identities"
+        );
+    }
+}
+
 /// The full-text upsert, shared by the first attempt and the truncating retry.
 ///
 /// `ON CONFLICT` names the columns of the UNIQUE `idx_fts_lookup` created in
@@ -74,7 +619,7 @@ pub(crate) enum IndexWrite {
 /// Without it, every rewrite of a resource replaces this row unconditionally:
 /// a new heap tuple, a dead one left behind for autovacuum, and a fresh entry
 /// in **both** GIN indexes — whether or not a single lexeme changed. The
-/// decomposition on the docstring of `index_fts_content` puts that at 24% (GIN)
+/// decomposition on the docstring of the retired single-resource FTS writer puts that at 24% (GIN)
 /// plus 12% (heap and unique index) of the statement, i.e. **36% of every
 /// update's full-text cost is spent writing the row it already had**.
 ///
@@ -126,21 +671,9 @@ WHERE resource_fts.content_tsvector IS DISTINCT FROM EXCLUDED.content_tsvector \
 /// prepared statement per connection under `execute_cached`, rather than one
 /// prepare per resource.
 ///
-/// # Duplicates are not coalesced
-///
-/// Postgres refuses an `ON CONFLICT DO UPDATE` that proposes the same key
-/// twice in one statement: `ON CONFLICT DO UPDATE command cannot affect row a
-/// second time`. That is left to happen rather than pre-empted with a `WHERE`.
-/// The page comes from `fetch_resources_page`, which reads `resources` by
-/// primary key, so a resource id cannot legitimately appear twice, and a
-/// statement that quietly dropped one copy of a duplicated id would hide the
-/// caller defect that produced it. A duplicate aborts the page, and the
-/// per-resource fallback (`write_reindex_page_individually` →
-/// `index_fts_content`) writes the page one row at a time instead.
-///
 /// # No truncating retry here
 ///
-/// `index_fts_content` retries an oversized input against
+/// The single-resource FTS writer retries an oversized input against
 /// `FTS_MAX_INPUT_BYTES`, which assumes the session is still usable: true for
 /// an ordinary write, which runs without an explicit transaction. This
 /// statement runs inside the page's managed transaction, where a
@@ -256,7 +789,7 @@ impl ResourceStorage for PostgresBackend {
     ) -> StorageResult<StoredResource> {
         tenant.check_permission(Operation::Create, resource_type)?;
 
-        let client = self.get_client().await?;
+        let mut client = self.guarded_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
 
         // Extract or generate ID
@@ -293,8 +826,23 @@ impl ResourceStorage for PostgresBackend {
         // nothing and the statement reports zero rows affected — one signal for
         // both writes. A soft-deleted resource still occupies its primary key, so
         // it conflicts too, exactly as the old check treated it.
-        let inserted = execute_cached(
-                &client,
+        // Guarded foreground create: one transaction holds the advisory write
+        // lock, the resource/history insert, and the search/FTS index writes.
+        // `SearchParameter` takes the exclusive tenant gate; every other type
+        // takes the shared gate plus its own resource key.
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|e| internal_error(format!("Failed to begin create: {e}")))?;
+        let write_result: StorageResult<()> = async {
+            if resource_type == "SearchParameter" {
+                acquire_exclusive_write_gate(&transaction, tenant_id).await?;
+            } else {
+                acquire_shared_write_locks(&transaction, tenant_id, &[(resource_type, id.as_str())])
+                    .await?;
+            }
+            let inserted = execute_cached(
+                &transaction,
                 "WITH ins AS (
                      INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -308,24 +856,45 @@ impl ResourceStorage for PostgresBackend {
             .await
             .map_err(|e| internal_error(format!("Failed to insert resource: {}", e)))?;
 
-        if inserted == 0 {
-            return Err(StorageError::Resource(ResourceError::AlreadyExists {
-                resource_type: resource_type.to_string(),
-                id: id.clone(),
-            }));
-        }
+            if inserted == 0 {
+                return Err(StorageError::Resource(ResourceError::AlreadyExists {
+                    resource_type: resource_type.to_string(),
+                    id: id.clone(),
+                }));
+            }
 
-        // Index the resource for search
-        self.index_resource(
-            &client,
-            tenant_id,
-            resource_type,
-            &id,
-            now,
-            IndexWrite::Fresh,
-            &resource,
-        )
-        .await?;
+            let extractor = self.authoritative_extractor(&transaction, tenant_id).await?;
+            self.index_resource_guarded(
+                &transaction,
+                &extractor,
+                tenant_id,
+                resource_type,
+                &id,
+                now,
+                IndexWrite::Fresh,
+                &resource,
+            )
+            .await
+        }
+        .await;
+        match write_result {
+            Ok(()) => {
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|e| internal_error(format!("Failed to commit create: {e}")))?;
+                client.mark_settled();
+            }
+            Err(error) => {
+                transaction
+                    .rollback()
+                    .await
+                    .map_err(|e| internal_error(format!("Failed to rollback create: {e}")))?;
+                client.mark_settled();
+                return Err(error);
+            }
+        }
+        drop(client);
 
         // An overlay-affecting SearchParameter write: reload the stored cache
         // and drop the per-tenant registries so they rebuild. Seeded spec
@@ -457,7 +1026,7 @@ impl ResourceStorage for PostgresBackend {
         let resource_type = current.resource_type();
         tenant.check_permission(Operation::Update, resource_type)?;
 
-        let client = self.get_client().await?;
+        let mut client = self.guarded_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
         let id = current.id();
 
@@ -489,8 +1058,23 @@ impl ResourceStorage for PostgresBackend {
         //
         // Zero rows means the update matched nothing; which of the two reasons it
         // was costs a query, but only on the path that is already failing.
-        let updated = execute_cached(
-                &client,
+        //
+        // Guarded foreground update: one transaction holds the advisory write
+        // lock, the resource/history write, and the search/FTS index writes.
+        // `SearchParameter` takes the exclusive tenant gate; every other type
+        // takes the shared gate plus its own resource key.
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|e| internal_error(format!("Failed to begin update: {e}")))?;
+        let write_result: StorageResult<()> = async {
+            if resource_type == "SearchParameter" {
+                acquire_exclusive_write_gate(&transaction, tenant_id).await?;
+            } else {
+                acquire_shared_write_locks(&transaction, tenant_id, &[(resource_type, id)]).await?;
+            }
+            let updated = execute_cached(
+                &transaction,
                 "WITH upd AS (
                      UPDATE resources SET version_id = $1, data = $2, last_updated = $3
                      WHERE tenant_id = $4 AND resource_type = $5 AND id = $6
@@ -513,49 +1097,70 @@ impl ResourceStorage for PostgresBackend {
             .await
             .map_err(|e| internal_error(format!("Failed to update resource: {}", e)))?;
 
-        if updated == 0 {
-            let actual = client
-                .query_opt(
-                    "SELECT version_id FROM resources
+            if updated == 0 {
+                let actual = transaction
+                    .query_opt(
+                        "SELECT version_id FROM resources
                      WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = FALSE",
-                    &[&tenant_id, &resource_type, &id],
-                )
-                .await
-                .map_err(|e| internal_error(format!("Failed to get current version: {}", e)))?;
+                        &[&tenant_id, &resource_type, &id],
+                    )
+                    .await
+                    .map_err(|e| internal_error(format!("Failed to get current version: {}", e)))?;
 
-            return match actual {
-                Some(row) => Err(StorageError::Concurrency(
-                    ConcurrencyError::VersionConflict {
+                return match actual {
+                    Some(row) => Err(StorageError::Concurrency(
+                        ConcurrencyError::VersionConflict {
+                            resource_type: resource_type.to_string(),
+                            id: id.to_string(),
+                            expected_version,
+                            actual_version: row.get::<_, String>(0),
+                        },
+                    )),
+                    None => Err(StorageError::Resource(ResourceError::NotFound {
                         resource_type: resource_type.to_string(),
                         id: id.to_string(),
-                        expected_version,
-                        actual_version: row.get::<_, String>(0),
-                    },
-                )),
-                None => Err(StorageError::Resource(ResourceError::NotFound {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                })),
-            };
-        }
+                    })),
+                };
+            }
 
-        // Re-index the resource. `Replace` clears the old `search_index` rows
-        // inside the same statement that writes the new ones — the clearing
-        // `DELETE` used to be a `delete_search_index` call of its own here, i.e.
-        // a second statement and a second round trip binding the same three
-        // parameters. The `resource_fts` row stays either way:
-        // `index_fts_content` upserts over it, which is one more statement and
-        // round trip saved per update.
-        self.index_resource(
-            &client,
-            tenant_id,
-            resource_type,
-            id,
-            now,
-            IndexWrite::Replace,
-            &resource,
-        )
-        .await?;
+            // Re-index the resource. `Replace` clears the old `search_index` rows
+            // inside the same statement that writes the new ones — the clearing
+            // `DELETE` used to be a `delete_search_index` call of its own here, i.e.
+            // a second statement and a second round trip binding the same three
+            // parameters. The `resource_fts` row stays either way:
+            // `index_fts_content_guarded` upserts over it on the same connection.
+            let extractor = self.authoritative_extractor(&transaction, tenant_id).await?;
+            self.index_resource_guarded(
+                &transaction,
+                &extractor,
+                tenant_id,
+                resource_type,
+                id,
+                now,
+                IndexWrite::Replace,
+                &resource,
+            )
+            .await
+        }
+        .await;
+        match write_result {
+            Ok(()) => {
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|e| internal_error(format!("Failed to commit update: {e}")))?;
+                client.mark_settled();
+            }
+            Err(error) => {
+                transaction
+                    .rollback()
+                    .await
+                    .map_err(|e| internal_error(format!("Failed to rollback update: {e}")))?;
+                client.mark_settled();
+                return Err(error);
+            }
+        }
+        drop(client);
 
         // A SearchParameter write invalidates the tenant overlays.
         if resource_type == "SearchParameter" {
@@ -1055,8 +1660,9 @@ impl ResourceStorage for PostgresBackend {
 
     async fn purge_tenant_data(&self, id: &str) -> StorageResult<u64> {
         crate::tenant::ensure_mutable_tenant(id)?;
-        let mut client = self.get_client().await?;
+        let mut client = self.guarded_client().await?;
         let tx = client.transaction().await.or_query_error("purge begin")?;
+        acquire_exclusive_write_gate(&tx, id).await?;
         // Count current-version rows first (soft-deleted included) so we can
         // report what was removed.
         let removed: i64 = tx
@@ -1093,6 +1699,11 @@ impl ResourceStorage for PostgresBackend {
         .or_query_error("purge provider submissions")?;
         let settings = PostgresBackend::purge_tenant_settings_in_txn(&tx, id).await?;
         tx.commit().await.or_query_error("purge commit")?;
+        client.mark_settled();
+        drop(client);
+        if let Err(error) = self.reload_stored_cache().await {
+            tracing::warn!("SearchParameter cache reload after tenant purge failed: {error}");
+        }
         if settings > 0 {
             tracing::info!(
                 tenant = %id,
@@ -1120,7 +1731,7 @@ impl PostgresBackend {
     ) -> StorageResult<()> {
         tenant.check_permission(Operation::Delete, resource_type)?;
 
-        let client = self.get_client().await?;
+        let mut client = self.guarded_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
 
         let now = Utc::now();
@@ -1236,8 +1847,18 @@ impl PostgresBackend {
         // Rows written by an older build keep their bodies and are read back
         // exactly as before; nothing needs backfilling, because the only reader
         // was already dropping the value on the floor.
-        let updated = execute_cached(
-                &client,
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|e| internal_error(format!("Failed to begin delete: {e}")))?;
+        let write_result: StorageResult<()> = async {
+            if resource_type == "SearchParameter" {
+                acquire_exclusive_write_gate(&transaction, tenant_id).await?;
+            } else {
+                acquire_shared_write_locks(&transaction, tenant_id, &[(resource_type, id)]).await?;
+            }
+            let updated = execute_cached(
+                &transaction,
                 "WITH del AS (
                      UPDATE resources
                      SET is_deleted = TRUE,
@@ -1256,12 +1877,12 @@ impl PostgresBackend {
             .await
             .map_err(|e| internal_error(format!("Failed to delete resource: {}", e)))?;
 
-        if updated == 0 {
+            if updated == 0 {
             // Matched nothing. For a versioned delete that is either "nothing
             // live" or "live at another version"; telling them apart costs a
             // query, but only on the path that is already failing.
             if let Some(expected) = expected_version {
-                let actual = client
+                let actual = transaction
                     .query_opt(
                         "SELECT version_id FROM resources
                          WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = FALSE",
@@ -1280,22 +1901,50 @@ impl PostgresBackend {
                     ));
                 }
             }
-            return Err(StorageError::Resource(ResourceError::NotFound {
+                return Err(StorageError::Resource(ResourceError::NotFound {
                 resource_type: resource_type.to_string(),
                 id: id.to_string(),
-            }));
-        }
+                }));
+            }
 
         // Delete search index entries (skip when search is offloaded)
-        if !self.is_search_offloaded() {
-            execute_cached(
-                    &client,
+            if !self.is_search_offloaded() {
+                execute_cached(
+                    &transaction,
                     "DELETE FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
                     &[&tenant_id, &resource_type, &id],
                 )
                 .await
                 .map_err(|e| internal_error(format!("Failed to delete search index: {}", e)))?;
+                execute_cached(
+                    &transaction,
+                    "DELETE FROM resource_fts WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
+                    &[&tenant_id, &resource_type, &id],
+                )
+                .await
+                .map_err(|e| internal_error(format!("Failed to delete FTS index: {e}")))?;
+            }
+            Ok(())
         }
+        .await;
+        match write_result {
+            Ok(()) => {
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|e| internal_error(format!("Failed to commit delete: {e}")))?;
+                client.mark_settled();
+            }
+            Err(error) => {
+                transaction
+                    .rollback()
+                    .await
+                    .map_err(|e| internal_error(format!("Failed to rollback delete: {e}")))?;
+                client.mark_settled();
+                return Err(error);
+            }
+        }
+        drop(client);
 
         // A SearchParameter delete invalidates the tenant overlays.
         if resource_type == "SearchParameter" {
@@ -1326,33 +1975,8 @@ impl PostgresBackend {
         resource: Value,
     ) -> StorageResult<StoredResource> {
         tenant.check_permission(Operation::Update, resource_type)?;
-
-        let client = self.get_client().await?;
+        let mut client = self.guarded_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
-
-        let row = client
-            .query_opt(
-                "SELECT version_id, fhir_version FROM resources
-                 WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = TRUE",
-                &[&tenant_id, &resource_type, &id],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to read deleted resource: {}", e)))?;
-
-        let (deleted_version, fhir_version_str) = match row {
-            Some(row) => (row.get::<_, String>(0), row.get::<_, String>(1)),
-            None => {
-                return Err(StorageError::Resource(ResourceError::NotFound {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                }));
-            }
-        };
-
-        let new_version: u64 = deleted_version.parse().unwrap_or(0) + 1;
-        let new_version_str = new_version.to_string();
-
-        // Ensure the resource has correct type and id
         let mut resource = resource;
         if let Some(obj) = resource.as_object_mut() {
             obj.insert(
@@ -1363,51 +1987,85 @@ impl PostgresBackend {
         }
 
         let now = Utc::now();
-        let is_deleted = false;
-
-        execute_cached(
-                &client,
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|e| internal_error(format!("Failed to begin restore: {e}")))?;
+        let write_result: StorageResult<(String, String)> = async {
+            if resource_type == "SearchParameter" {
+                acquire_exclusive_write_gate(&transaction, tenant_id).await?;
+            } else {
+                acquire_shared_write_locks(&transaction, tenant_id, &[(resource_type, id)]).await?;
+            }
+            let row = transaction
+                .query_opt(
+                    "SELECT version_id, fhir_version FROM resources
+                     WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = TRUE",
+                    &[&tenant_id, &resource_type, &id],
+                )
+                .await
+                .map_err(|e| internal_error(format!("Failed to read deleted resource: {e}")))?;
+            let Some(row) = row else {
+                return Err(StorageError::Resource(ResourceError::NotFound {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                }));
+            };
+            let deleted_version: String = row.get(0);
+            let fhir_version_str: String = row.get(1);
+            let new_version_str = (deleted_version.parse::<u64>().unwrap_or(0) + 1).to_string();
+            let is_deleted = false;
+            execute_cached(
+                &transaction,
                 "UPDATE resources
                  SET version_id = $1, data = $2, last_updated = $3, is_deleted = FALSE, deleted_at = NULL
                  WHERE tenant_id = $4 AND resource_type = $5 AND id = $6",
-                &[
-                    &new_version_str,
-                    &resource,
-                    &now,
-                    &tenant_id,
-                    &resource_type,
-                    &id,
-                ],
+                &[&new_version_str, &resource, &now, &tenant_id, &resource_type, &id],
             )
             .await
-            .map_err(|e| internal_error(format!("Failed to restore resource: {}", e)))?;
-
-        execute_cached(
-                &client,
+            .map_err(|e| internal_error(format!("Failed to restore resource: {e}")))?;
+            execute_cached(
+                &transaction,
                 "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
                 &[&tenant_id, &resource_type, &id, &new_version_str, &resource, &now, &is_deleted, &fhir_version_str],
             )
             .await
-            .map_err(|e| internal_error(format!("Failed to insert restore history: {}", e)))?;
-
-        // The delete dropped the search index entries; rebuild them for the
-        // resource that is live again. As in `update`, `Replace` folds the
-        // clearing `DELETE` into the insert rather than sending it separately —
-        // and it must stay a `Replace`, not a `Fresh`: a resource can be
-        // soft-deleted by a path that leaves its rows in place, so this cannot
-        // assert that nothing is indexed under the id. The full-text row is
-        // upserted over.
-        self.index_resource(
-            &client,
-            tenant_id,
-            resource_type,
-            id,
-            now,
-            IndexWrite::Replace,
-            &resource,
-        )
-        .await?;
+            .map_err(|e| internal_error(format!("Failed to insert restore history: {e}")))?;
+            let extractor = self.authoritative_extractor(&transaction, tenant_id).await?;
+            self.index_resource_guarded(
+                &transaction,
+                &extractor,
+                tenant_id,
+                resource_type,
+                id,
+                now,
+                IndexWrite::Replace,
+                &resource,
+            )
+            .await?;
+            Ok((new_version_str, fhir_version_str))
+        }
+        .await;
+        let (new_version_str, fhir_version_str) = match write_result {
+            Ok(result) => {
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|e| internal_error(format!("Failed to commit restore: {e}")))?;
+                client.mark_settled();
+                result
+            }
+            Err(error) => {
+                transaction
+                    .rollback()
+                    .await
+                    .map_err(|e| internal_error(format!("Failed to rollback restore: {e}")))?;
+                client.mark_settled();
+                return Err(error);
+            }
+        };
+        drop(client);
 
         // A restored SearchParameter re-enters the tenant overlays.
         if resource_type == "SearchParameter" {
@@ -1440,31 +2098,33 @@ impl PostgresBackend {
     // write path already has in hand; bundling them into a struct would add a
     // move on the hottest indexing path without removing a single argument.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn index_resource(
+    /// Indexes a mutation on its already guarded transaction connection.
+    ///
+    /// The caller holds the advisory write lock and an open transaction on
+    /// `client`, and passes an [`SearchParameterExtractor`] read from the
+    /// persisted overlay inside that same transaction (see
+    /// [`PostgresBackend::authoritative_extractor`]). `index_fts_content_guarded`
+    /// finishes the write on the same connection.
+    #[allow(clippy::too_many_arguments)]
+    async fn index_resource_guarded<C>(
         &self,
-        client: &deadpool_postgres::Client,
+        client: &C,
+        extractor: &SearchParameterExtractor,
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
         last_updated: DateTime<Utc>,
         mode: IndexWrite,
         resource: &Value,
-    ) -> StorageResult<()> {
-        // When search is offloaded to a secondary backend, skip local indexing
+    ) -> StorageResult<()>
+    where
+        C: GenericClient + Sync + ?Sized,
+    {
         if self.is_search_offloaded() {
             return Ok(());
         }
 
-        // `Replace` no longer sends a `DELETE` of its own: the clearing delete
-        // rides inside the first insert statement (`INSERT_SQL_REPLACE`), which
-        // is one statement and one round trip instead of two, binding the same
-        // three parameters once instead of twice. See `replace_rows`.
-
-        // Extract values using the registry-driven extractor
-        let mut rows: Vec<IndexRow> = match self
-            .tenant_extractor(tenant_id)
-            .extract(resource, resource_type)
-        {
+        let mut rows = match extractor.extract(resource, resource_type) {
             Ok(values) => PostgresSearchIndexWriter::build_rows(
                 resource_type,
                 resource_id,
@@ -1472,38 +2132,23 @@ impl PostgresBackend {
                 self.index_layout(),
                 values,
             ),
-            Err(e) => {
-                // There used to be a fallback here that indexed `_id` and
-                // `_lastUpdated`. Both are now answered from the `resources`
-                // columns they restate (see `PARAMS_ANSWERED_FROM_RESOURCES`),
-                // so they keep working with no index rows at all and the
-                // fallback had nothing left to write. Every other parameter of
-                // this resource is unindexed either way — that is what the
-                // extraction failure means — so the warning is the whole
-                // remaining behaviour.
+            Err(error) => {
+                // Ordinary CRUD has always kept the resource when top-level
+                // extraction fails. Replace clears its old top-level rows.
                 tracing::warn!(
-                    "Dynamic extraction failed for {}/{}: {}. Resource is stored but not indexed; \
-                     `_id` and `_lastUpdated` still resolve from the resources table.",
-                    resource_type,
-                    resource_id,
-                    e
+                    "Dynamic extraction failed for {resource_type}/{resource_id}: {error}"
                 );
-                // No minimal fallback any more: it only ever wrote `_id` and
-                // `_lastUpdated`, and both are now answered from the
-                // `resources` columns they restate, so there is nothing left
-                // for it to write.
                 Vec::new()
             }
         };
+        for contained in extractor.extract_contained(resource) {
+            rows.extend(PostgresSearchIndexWriter::build_contained_rows(
+                (resource_type, resource_id),
+                (&contained.contained_type, &contained.local_id),
+                &contained.values,
+            ));
+        }
 
-        // Rows for any `contained[]` entries ride along in the same statement.
-        // They used to be one single-row `INSERT` per extracted value — 311,630
-        // statements and 311,630 round trips in one 5-minute crud run, 6% of
-        // that run's Postgres execution time — even though they are written
-        // under the same tenant, type and id as the rows above.
-        rows.extend(self.contained_index_rows(tenant_id, resource_type, resource_id, resource));
-
-        let count = rows.len();
         match mode {
             IndexWrite::Fresh => {
                 PostgresSearchIndexWriter::insert_rows(
@@ -1513,7 +2158,7 @@ impl PostgresBackend {
                     resource_id,
                     &rows,
                 )
-                .await?
+                .await?;
             }
             IndexWrite::Replace => {
                 PostgresSearchIndexWriter::replace_rows(
@@ -1523,49 +2168,56 @@ impl PostgresBackend {
                     resource_id,
                     &rows,
                 )
-                .await?
+                .await?;
             }
         }
-        tracing::debug!(
-            "Dynamically indexed {} values for {}/{}",
-            count,
-            resource_type,
-            resource_id
-        );
-
-        // Index FTS content for _text and _content searches
-        self.index_fts_content(client, tenant_id, resource_type, resource_id, resource)
-            .await?;
-
-        Ok(())
+        self.index_fts_content_guarded(client, tenant_id, resource_type, resource_id, resource)
+            .await
     }
 
-    /// Flattens a container's `contained[]` resources into `is_contained = TRUE`
-    /// index rows, whose `resource_type` / `resource_id` identify the container.
-    ///
-    /// Builds rows rather than writing them, so the caller can send them in the
-    /// same statement as the container's own rows. A value whose date does not
-    /// parse yields no row, exactly as the single-row insert refused to store
-    /// one (#494) — so the caller's `$reindex` count now reports rows written
-    /// rather than values visited, which is what the container's own rows have
-    /// always reported.
-    fn contained_index_rows(
+    /// A failed `to_tsvector` statement aborts its savepoint, not the mutation.
+    pub(super) async fn index_fts_content_guarded<C>(
         &self,
+        client: &C,
         tenant_id: &str,
-        container_type: &str,
-        container_id: &str,
+        resource_type: &str,
+        resource_id: &str,
         resource: &Value,
-    ) -> Vec<IndexRow> {
-        let container = (container_type, container_id);
-        let mut rows = Vec::new();
-        for contained in self.tenant_extractor(tenant_id).extract_contained(resource) {
-            rows.extend(PostgresSearchIndexWriter::build_contained_rows(
-                container,
-                (&contained.contained_type, &contained.local_id),
-                &contained.values,
-            ));
+    ) -> StorageResult<()>
+    where
+        C: deadpool_postgres::GenericClient + ?Sized,
+    {
+        if !self.fts_table_exists(client).await? {
+            return Ok(());
         }
-        rows
+        client
+            .batch_execute("SAVEPOINT guarded_fts")
+            .await
+            .map_err(|e| internal_error(format!("Failed to create FTS savepoint: {e}")))?;
+        let result = self
+            .index_fts_content_page(client, tenant_id, resource_type, resource_id, resource)
+            .await;
+        let result = match result {
+            Ok(()) => Ok(()),
+            Err(PageFtsError::ProgramLimitExceeded { content, .. }) => {
+                client
+                    .batch_execute("ROLLBACK TO SAVEPOINT guarded_fts")
+                    .await
+                    .map_err(|e| {
+                        internal_error(format!("Failed to rollback FTS savepoint: {e}"))
+                    })?;
+                Self::retry_truncated_fts(client, tenant_id, resource_type, resource_id, &content)
+                    .await
+            }
+            Err(PageFtsError::Other(error)) => Err(error),
+        };
+        if result.is_ok() {
+            client
+                .batch_execute("RELEASE SAVEPOINT guarded_fts")
+                .await
+                .map_err(|e| internal_error(format!("Failed to release FTS savepoint: {e}")))?;
+        }
+        result
     }
 
     /// Whether `resource_fts` exists, asked of the catalog at most once.
@@ -1763,76 +2415,6 @@ impl PostgresBackend {
                 error
             )))),
         }
-    }
-
-    async fn index_fts_content<C>(
-        &self,
-        client: &C,
-        tenant_id: &str,
-        resource_type: &str,
-        resource_id: &str,
-        resource: &Value,
-    ) -> StorageResult<()>
-    where
-        C: deadpool_postgres::GenericClient + ?Sized,
-    {
-        if !self.fts_table_exists(client).await? {
-            return Ok(());
-        }
-
-        // Extract searchable content
-        let content = extract_searchable_content(resource);
-
-        // Store the vectors, not their input. `narrative_text` and
-        // `full_content` are write-only columns — `_text` and `_content` query
-        // `narrative_tsvector` / `content_tsvector` and nothing reads the raw
-        // text — so binding them stored the resource's text a second time, with
-        // its TOAST compression and WAL, for no reader. Tokenising happens here
-        // instead of in a `BEFORE INSERT` trigger; the trigger is dropped in
-        // schema v26 because it would otherwise overwrite these vectors with
-        // the tsvector of an empty string.
-        let result =
-            Self::execute_fts_statement(client, tenant_id, resource_type, resource_id, &content)
-                .await;
-
-        if content.is_empty() {
-            result
-                .map_err(|e| internal_error(format!("Failed to delete empty FTS index: {}", e)))?;
-            return Ok(());
-        }
-
-        let err = match result {
-            Ok(_) => return Ok(()),
-            Err(e) => e,
-        };
-
-        // `to_tsvector` refuses to build a vector larger than 1 MB and raises
-        // `program_limit_exceeded` when the input demands one. That is not
-        // hypothetical: a Synthea `Provenance` lists every resource in the
-        // patient's bundle, and two of the 177,612 resources in 150 of the
-        // benchmark corpus's patients exceed the limit — 751,802 bytes of
-        // content becoming a 1,308,960-byte vector. Before this branch the
-        // error surfaced as a 500 and the whole `POST` failed, so an entirely
-        // valid resource could not be created at all.
-        //
-        // Retry once against a truncated input instead. Ordinary resource
-        // writes run without an explicit transaction, so their session remains
-        // usable. A page reindex handles oversized vectors inside its managed
-        // transaction by rolling back and replaying only the failing group.
-        // It does not call this function there. This function is reached from
-        // the whole-page fallback outside any transaction, where the truncated
-        // retry can succeed. The bundle path (`PostgresTransaction`) does not
-        // write `resource_fts` at all.
-        if err.code() != Some(&tokio_postgres::error::SqlState::PROGRAM_LIMIT_EXCEEDED) {
-            return Err(internal_error(format!(
-                "Failed to insert FTS content: {}",
-                err
-            )));
-        }
-
-        Self::retry_truncated_fts(client, tenant_id, resource_type, resource_id, &content).await?;
-
-        Ok(())
     }
 
     /// Writes one FTS group. Its arrays are dropped before the caller replays
@@ -2047,13 +2629,16 @@ impl PostgresBackend {
     /// caller that removes `search_index` rows and does *not* rewrite them must
     /// take the `resource_fts` row too, or the resource stays matchable by
     /// `_text` / `_content` after it has stopped matching everything else.
-    pub(crate) async fn delete_search_index(
+    pub(crate) async fn delete_search_index<C>(
         &self,
-        client: &deadpool_postgres::Client,
+        client: &C,
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
-    ) -> StorageResult<u64> {
+    ) -> StorageResult<u64>
+    where
+        C: GenericClient + ?Sized,
+    {
         // When search is offloaded to a secondary backend, skip local index cleanup
         if self.is_search_offloaded() {
             return Ok(0);
@@ -2080,6 +2665,120 @@ impl PostgresBackend {
         Ok(deleted)
     }
 
+    async fn current_reindex_resources<C>(
+        &self,
+        client: &C,
+        tenant: &TenantContext,
+        resources: &[&StoredResource],
+        exclusive_lane: bool,
+    ) -> StorageResult<Option<(Vec<StoredResource>, Vec<bool>)>>
+    where
+        C: GenericClient + Sync,
+    {
+        let tenant_id = tenant.tenant_id().as_str();
+        let resource_types: Vec<&str> = resources
+            .iter()
+            .map(|resource| resource.resource_type())
+            .collect();
+        let resource_ids: Vec<&str> = resources.iter().map(|resource| resource.id()).collect();
+        let metadata = client
+            .query(
+                "SELECT resource_type, id, is_deleted, octet_length(data::text)::bigint
+                 FROM resources WHERE tenant_id = $1 AND (resource_type, id) IN
+                 (SELECT * FROM unnest($2::text[], $3::text[]))",
+                &[&tenant_id, &resource_types, &resource_ids],
+            )
+            .await
+            .or_query_error("Failed to inspect current reindex rows")?;
+        let mut sizes = HashMap::with_capacity(metadata.len());
+        for row in metadata {
+            let key = (row.get::<_, String>(0), row.get::<_, String>(1));
+            sizes.insert(key, (row.get::<_, bool>(2), row.get::<_, i64>(3)));
+        }
+        let body_bytes: u64 = sizes
+            .values()
+            .filter(|(deleted, _)| !deleted)
+            .map(|(_, bytes)| (*bytes).max(0) as u64)
+            .sum();
+        if body_bytes > 8 * 1024 * 1024 && !exclusive_lane {
+            return Ok(None);
+        }
+        let mut live_types = Vec::new();
+        let mut live_ids = Vec::new();
+        for resource in resources {
+            let key = (
+                resource.resource_type().to_string(),
+                resource.id().to_string(),
+            );
+            if matches!(sizes.get(&key), Some((false, _))) {
+                live_types.push(resource.resource_type());
+                live_ids.push(resource.id());
+            }
+        }
+        let rows = client
+            .query(
+                "SELECT resource_type, id, version_id, data, last_updated, fhir_version
+                 FROM resources WHERE tenant_id = $1 AND is_deleted = FALSE
+                   AND (resource_type, id) IN
+                   (SELECT * FROM unnest($2::text[], $3::text[]))",
+                &[&tenant_id, &live_types, &live_ids],
+            )
+            .await
+            .or_query_error("Failed to load current reindex bodies")?;
+        let mut current = HashMap::with_capacity(rows.len());
+        for row in &rows {
+            let resource_type: String = row.get(0);
+            let id: String = row.get(1);
+            let version_id: String = row.get(2);
+            let data: Value = row.get(3);
+            let last_updated: DateTime<Utc> = row.get(4);
+            let version: String = row.get(5);
+            let fhir_version =
+                FhirVersion::from_storage(&version).unwrap_or_else(FhirVersion::default_enabled);
+            current.insert(
+                (resource_type.clone(), id.clone()),
+                StoredResource::from_storage(
+                    &resource_type,
+                    &id,
+                    version_id,
+                    tenant.tenant_id().clone(),
+                    data,
+                    last_updated,
+                    last_updated,
+                    None,
+                    fhir_version,
+                ),
+            );
+        }
+        drop(rows);
+        let mut resolved = Vec::with_capacity(resources.len());
+        let mut live = Vec::with_capacity(resources.len());
+        for supplied in resources {
+            let key = (
+                supplied.resource_type().to_string(),
+                supplied.id().to_string(),
+            );
+            match current.remove(&key) {
+                Some(resource) => {
+                    resolved.push(resource);
+                    live.push(true);
+                }
+                None => {
+                    resolved.push(StoredResource::new(
+                        supplied.resource_type(),
+                        supplied.id().to_string(),
+                        tenant.tenant_id().clone(),
+                        Value::Null,
+                        supplied.fhir_version(),
+                    ));
+                    live.push(false);
+                }
+            }
+        }
+        Ok(Some((resolved, live)))
+    }
+
+    #[cfg(test)]
     async fn write_reindex_page_individually(
         &self,
         tenant: &TenantContext,
@@ -2095,6 +2794,32 @@ impl PostgresBackend {
                 Ok(_) => results.push(self.write_search_entries(tenant, resource).await),
                 Err(error) => results.push(Err(error)),
             }
+        }
+        results
+    }
+
+    async fn write_reindex_group_individually(
+        &self,
+        tenant: &TenantContext,
+        resources: &[&StoredResource],
+        permit: Option<Arc<ReindexAdmission>>,
+    ) -> Vec<StorageResult<usize>> {
+        let _fallback_span = crate::perf::span(crate::perf::Phase::ReindexFallback);
+        let mut results = Vec::with_capacity(resources.len());
+        for resource in resources {
+            results.push(
+                Box::pin(self.write_reindex_group(
+                    tenant,
+                    &[*resource],
+                    false,
+                    false,
+                    permit.clone(),
+                ))
+                .await
+                .into_iter()
+                .next()
+                .expect("one reindex input has one result"),
+            );
         }
         results
     }
@@ -2233,6 +2958,7 @@ impl VersionedStorage for PostgresBackend {
             ));
         }
 
+        drop(client);
         // Delete exactly the version the precondition was evaluated against.
         // A plain `delete` here was check-then-act: a writer landing after the
         // read above was deleted along with the version the client named
@@ -2438,11 +3164,17 @@ impl InstanceHistoryProvider for PostgresBackend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<u64> {
-        let client = self.get_client().await?;
+        let mut client = self.guarded_client().await?;
+        let transaction = client
+            .transaction()
+            .await
+            .or_query_error("Failed to begin guarded history delete")?;
         let tenant_id = tenant.tenant_id().as_str();
+        let result: StorageResult<u64> = async {
+            acquire_shared_write_locks(&transaction, tenant_id, &[(resource_type, id)]).await?;
 
-        // First, verify the resource exists
-        let exists = client
+            // First, verify the resource exists
+            let exists = transaction
             .query_opt(
                 "SELECT 1 FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND id = $3",
                 &[&tenant_id, &resource_type, &id],
@@ -2450,36 +3182,56 @@ impl InstanceHistoryProvider for PostgresBackend {
             .await
             .map_err(|e| internal_error(format!("Failed to check resource existence: {}", e)))?;
 
-        if exists.is_none() {
-            return Err(StorageError::Resource(ResourceError::NotFound {
-                resource_type: resource_type.to_string(),
-                id: id.to_string(),
-            }));
-        }
+            if exists.is_none() {
+                return Err(StorageError::Resource(ResourceError::NotFound {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                }));
+            }
 
-        // Get the current version from resources table (to preserve it)
-        let current_row = client
-            .query_one(
-                "SELECT version_id FROM resources
+            // Get the current version from resources table (to preserve it)
+            let current_row = transaction
+                .query_one(
+                    "SELECT version_id FROM resources
                  WHERE tenant_id = $1 AND resource_type = $2 AND id = $3",
-                &[&tenant_id, &resource_type, &id],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to get current version: {}", e)))?;
+                    &[&tenant_id, &resource_type, &id],
+                )
+                .await
+                .map_err(|e| internal_error(format!("Failed to get current version: {}", e)))?;
 
-        let current_version: String = current_row.get(0);
+            let current_version: String = current_row.get(0);
 
-        // Delete all history entries EXCEPT the current version
-        let deleted = client
-            .execute(
-                "DELETE FROM resource_history
+            // Delete all history entries EXCEPT the current version
+            let deleted = transaction
+                .execute(
+                    "DELETE FROM resource_history
                  WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND version_id != $4",
-                &[&tenant_id, &resource_type, &id, &current_version],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to delete history: {}", e)))?;
+                    &[&tenant_id, &resource_type, &id, &current_version],
+                )
+                .await
+                .map_err(|e| internal_error(format!("Failed to delete history: {}", e)))?;
 
-        Ok(deleted)
+            Ok(deleted)
+        }
+        .await;
+        match result {
+            Ok(deleted) => {
+                transaction
+                    .commit()
+                    .await
+                    .or_query_error("Failed to commit history delete")?;
+                client.mark_settled();
+                Ok(deleted)
+            }
+            Err(error) => {
+                transaction
+                    .rollback()
+                    .await
+                    .or_query_error("Failed to rollback history delete")?;
+                client.mark_settled();
+                Err(error)
+            }
+        }
     }
 
     async fn delete_version(
@@ -2489,11 +3241,17 @@ impl InstanceHistoryProvider for PostgresBackend {
         id: &str,
         version_id: &str,
     ) -> StorageResult<()> {
-        let client = self.get_client().await?;
+        let mut client = self.guarded_client().await?;
+        let transaction = client
+            .transaction()
+            .await
+            .or_query_error("Failed to begin guarded version delete")?;
         let tenant_id = tenant.tenant_id().as_str();
+        let result: StorageResult<()> = async {
+        acquire_shared_write_locks(&transaction, tenant_id, &[(resource_type, id)]).await?;
 
         // First, get the current version to ensure we're not deleting it
-        let current_row = client
+        let current_row = transaction
             .query_opt(
                 "SELECT version_id FROM resources
                  WHERE tenant_id = $1 AND resource_type = $2 AND id = $3",
@@ -2526,7 +3284,7 @@ impl InstanceHistoryProvider for PostgresBackend {
         }
 
         // Check if the version exists in history
-        let version_exists = client
+        let version_exists = transaction
             .query_opt(
                 "SELECT 1 FROM resource_history
                  WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND version_id = $4",
@@ -2544,7 +3302,7 @@ impl InstanceHistoryProvider for PostgresBackend {
         }
 
         // Delete the specific version
-        client
+        transaction
             .execute(
                 "DELETE FROM resource_history
                  WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND version_id = $4",
@@ -2554,6 +3312,25 @@ impl InstanceHistoryProvider for PostgresBackend {
             .map_err(|e| internal_error(format!("Failed to delete version: {}", e)))?;
 
         Ok(())
+        }.await;
+        match result {
+            Ok(()) => {
+                transaction
+                    .commit()
+                    .await
+                    .or_query_error("Failed to commit version delete")?;
+                client.mark_settled();
+                Ok(())
+            }
+            Err(error) => {
+                transaction
+                    .rollback()
+                    .await
+                    .or_query_error("Failed to rollback version delete")?;
+                client.mark_settled();
+                Err(error)
+            }
+        }
     }
 }
 
@@ -3030,11 +3807,20 @@ impl PurgableStorage for PostgresBackend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<()> {
-        let client = self.get_client().await?;
+        let mut client = self.guarded_client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .or_query_error("Failed to begin guarded operation")?;
         let tenant_id = tenant.tenant_id().as_str();
+        if resource_type == "SearchParameter" {
+            acquire_exclusive_write_gate(&tx, tenant_id).await?;
+        } else {
+            acquire_shared_write_locks(&tx, tenant_id, &[(resource_type, id)]).await?;
+        }
 
         // Check if resource exists (in any state)
-        let exists = client
+        let exists = tx
             .query_opt(
                 "SELECT 1 FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND id = $3",
                 &[&tenant_id, &resource_type, &id],
@@ -3044,7 +3830,7 @@ impl PurgableStorage for PostgresBackend {
 
         if exists.is_none() {
             // Also check history in case it was already purged from main table
-            let history_exists = client
+            let history_exists = tx
                 .query_opt(
                     "SELECT 1 FROM resource_history WHERE tenant_id = $1 AND resource_type = $2 AND id = $3",
                     &[&tenant_id, &resource_type, &id],
@@ -3062,16 +3848,15 @@ impl PurgableStorage for PostgresBackend {
 
         // Removing the index rows is REQUIRED, not just ordering: `search_index`
         // has no foreign key to `resources` (schema v24), so nothing cascades.
-        client
-            .execute(
-                "DELETE FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
-                &[&tenant_id, &resource_type, &id],
-            )
-            .await
-            .or_query_error("Failed to purge search index")?;
+        tx.execute(
+            "DELETE FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
+            &[&tenant_id, &resource_type, &id],
+        )
+        .await
+        .or_query_error("Failed to purge search index")?;
 
         // Delete from FTS table
-        let _ = client
+        let _ = tx
             .execute(
                 "DELETE FROM resource_fts WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
                 &[&tenant_id, &resource_type, &id],
@@ -3079,32 +3864,43 @@ impl PurgableStorage for PostgresBackend {
             .await;
 
         // Delete from history table (before resources due to FK)
-        client
-            .execute(
-                "DELETE FROM resource_history WHERE tenant_id = $1 AND resource_type = $2 AND id = $3",
-                &[&tenant_id, &resource_type, &id],
-            )
-            .await
-            .or_query_error("Failed to purge resource history")?;
+        tx.execute(
+            "DELETE FROM resource_history WHERE tenant_id = $1 AND resource_type = $2 AND id = $3",
+            &[&tenant_id, &resource_type, &id],
+        )
+        .await
+        .or_query_error("Failed to purge resource history")?;
 
         // Delete from resources table
-        client
-            .execute(
-                "DELETE FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND id = $3",
-                &[&tenant_id, &resource_type, &id],
-            )
-            .await
-            .or_query_error("Failed to purge resource")?;
+        tx.execute(
+            "DELETE FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND id = $3",
+            &[&tenant_id, &resource_type, &id],
+        )
+        .await
+        .or_query_error("Failed to purge resource")?;
 
+        tx.commit().await.or_query_error("Failed to commit purge")?;
+        client.mark_settled();
+        drop(client);
+        if resource_type == "SearchParameter" {
+            if let Err(error) = self.reload_stored_cache().await {
+                tracing::warn!("SearchParameter cache reload after purge failed: {error}");
+            }
+        }
         Ok(())
     }
 
     async fn purge_all(&self, tenant: &TenantContext, resource_type: &str) -> StorageResult<u64> {
-        let client = self.get_client().await?;
+        let mut client = self.guarded_client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .or_query_error("Failed to begin guarded operation")?;
         let tenant_id = tenant.tenant_id().as_str();
+        acquire_exclusive_write_gate(&tx, tenant_id).await?;
 
         // Count how many we're about to delete
-        let row = client
+        let row = tx
             .query_one(
                 "SELECT COUNT(DISTINCT id) FROM resources WHERE tenant_id = $1 AND resource_type = $2",
                 &[&tenant_id, &resource_type],
@@ -3115,16 +3911,15 @@ impl PurgableStorage for PostgresBackend {
 
         // Removing the index rows is REQUIRED, not just ordering: `search_index`
         // has no foreign key to `resources` (schema v24), so nothing cascades.
-        client
-            .execute(
-                "DELETE FROM search_index WHERE tenant_id = $1 AND resource_type = $2",
-                &[&tenant_id, &resource_type],
-            )
-            .await
-            .or_query_error("Failed to purge search index")?;
+        tx.execute(
+            "DELETE FROM search_index WHERE tenant_id = $1 AND resource_type = $2",
+            &[&tenant_id, &resource_type],
+        )
+        .await
+        .or_query_error("Failed to purge search index")?;
 
         // Delete from FTS table
-        let _ = client
+        let _ = tx
             .execute(
                 "DELETE FROM resource_fts WHERE tenant_id = $1 AND resource_type = $2",
                 &[&tenant_id, &resource_type],
@@ -3132,23 +3927,31 @@ impl PurgableStorage for PostgresBackend {
             .await;
 
         // Delete from history table
-        client
-            .execute(
-                "DELETE FROM resource_history WHERE tenant_id = $1 AND resource_type = $2",
-                &[&tenant_id, &resource_type],
-            )
-            .await
-            .or_query_error("Failed to purge resource history")?;
+        tx.execute(
+            "DELETE FROM resource_history WHERE tenant_id = $1 AND resource_type = $2",
+            &[&tenant_id, &resource_type],
+        )
+        .await
+        .or_query_error("Failed to purge resource history")?;
 
         // Delete from resources table
-        client
-            .execute(
-                "DELETE FROM resources WHERE tenant_id = $1 AND resource_type = $2",
-                &[&tenant_id, &resource_type],
-            )
-            .await
-            .or_query_error("Failed to purge resources")?;
+        tx.execute(
+            "DELETE FROM resources WHERE tenant_id = $1 AND resource_type = $2",
+            &[&tenant_id, &resource_type],
+        )
+        .await
+        .or_query_error("Failed to purge resources")?;
 
+        tx.commit()
+            .await
+            .or_query_error("Failed to commit purge all")?;
+        client.mark_settled();
+        drop(client);
+        if resource_type == "SearchParameter" {
+            if let Err(error) = self.reload_stored_cache().await {
+                tracing::warn!("SearchParameter cache reload after purge all failed: {error}");
+            }
+        }
         Ok(count as u64)
     }
 }
@@ -4420,27 +5223,27 @@ fn note_reindex_prepare_mode(page_len: usize, mode: ReindexPrepareMode) {
 }
 
 impl PostgresBackend {
-    /// The database-free half of one reindex page item: the resource's own
-    /// `search_index` rows followed by its contained resources' rows, or the
-    /// extraction error that sends the resource down the written fallback.
+    /// The database-free half of one current-snapshot reindex page item: the
+    /// resource's own `search_index` rows followed by its contained resources'
+    /// rows, or the extraction error that sends the resource down the written
+    /// fallback.
     ///
-    /// A fresh extractor per item, from the tenant's registry — the extractor
-    /// is cheap and tenant-scoped, and building one per item is what keeps a
-    /// page from pinning a registry across the resources it holds.
-    fn prepare_reindex_item(
+    /// Unlike the retired per-item preparation, which built a fresh extractor
+    /// per item from the cached tenant registry, this takes the authoritative
+    /// extractor the caller read from the persisted overlay inside the page's
+    /// guarded transaction, so reindex rows reflect the overlay snapshot the
+    /// resolved bodies were read under.
+    fn prepare_current_reindex_item(
         &self,
-        tenant_id: &str,
+        extractor: &SearchParameterExtractor,
         resource: &StoredResource,
     ) -> Result<Vec<IndexRow>, StorageError> {
         let resource_type = resource.resource_type();
         let resource_id = resource.id();
         let content = resource.content();
-        let values = self
-            .tenant_extractor(tenant_id)
-            .extract(content, resource_type)
-            .map_err(|error| {
-                internal_error(format!("Search parameter extraction failed: {}", error))
-            })?;
+        let values = extractor.extract(content, resource_type).map_err(|error| {
+            internal_error(format!("Search parameter extraction failed: {error}"))
+        })?;
         let mut rows = PostgresSearchIndexWriter::build_rows(
             resource_type,
             resource_id,
@@ -4448,186 +5251,275 @@ impl PostgresBackend {
             self.index_layout(),
             values,
         );
-        rows.extend(self.contained_index_rows(tenant_id, resource_type, resource_id, content));
+        for contained in extractor.extract_contained(content) {
+            rows.extend(PostgresSearchIndexWriter::build_contained_rows(
+                (resource_type, resource_id),
+                (&contained.contained_type, &contained.local_id),
+                &contained.values,
+            ));
+        }
         Ok(rows)
     }
 
-    /// Prepares a whole page without touching the database, in the page's
-    /// input order.
+    /// Prepares a whole current-snapshot page without touching the database,
+    /// in the page's input order.
     ///
-    /// The single `ReindexExtract` span covers the decision, the admission and
-    /// every item — the same stage the inline loop measured before. Full-text
-    /// preparation is *not* part of this: `index_fts_content` runs inside the
-    /// page's transaction, where its oversize retry can still roll the page
-    /// back and repeat it per resource.
-    fn prepare_reindex_page(
+    /// `live` is the mask from the guarded metadata pass: only live resources
+    /// are prepared, and deleted or missing slots stay `None` so the caller
+    /// can skip them without shifting positions. Full-text preparation is
+    /// *not* part of this: the FTS writer runs inside the page's
+    /// transaction, where its oversize retry can still roll the page back and
+    /// repeat it per resource.
+    fn prepare_current_reindex_page(
         &self,
-        tenant_id: &str,
+        extractor: &SearchParameterExtractor,
         resources: &[StoredResource],
-    ) -> Vec<Result<Vec<IndexRow>, StorageError>> {
+        live: &[bool],
+    ) -> Vec<Option<Result<Vec<IndexRow>, StorageError>>> {
         let _span = crate::perf::span(crate::perf::Phase::ReindexExtract);
         let (mode, prepared) =
             prepare_reindex_items(&ReindexPrepareEnv::process(), resources.len(), |index| {
-                self.prepare_reindex_item(tenant_id, &resources[index])
+                live[index].then(|| self.prepare_current_reindex_item(extractor, &resources[index]))
             });
         note_reindex_prepare_mode(resources.len(), mode);
         prepared
     }
 }
 
-// ============================================================================
-// ReindexTarget Implementation — PostgreSQL keeps search entries in its own
-// `search_index` table, so it is also a writer and can reindex itself.
-// ============================================================================
-
-#[async_trait]
-impl ReindexTarget for PostgresBackend {
-    async fn delete_search_entries(
+impl PostgresBackend {
+    async fn write_reindex_group(
         &self,
         tenant: &TenantContext,
-        resource_type: &str,
-        resource_id: &str,
-    ) -> StorageResult<u64> {
-        let client = self.get_client().await?;
-        // `$reindex` may clear without rewriting, so the full-text row goes
-        // too; `write_search_entries` puts it back when the rewrite follows.
-        self.delete_search_index(
-            &client,
-            tenant.tenant_id().as_str(),
-            resource_type,
-            resource_id,
-        )
-        .await
-    }
-
-    async fn write_search_entries(
-        &self,
-        tenant: &TenantContext,
-        resource: &StoredResource,
-    ) -> StorageResult<usize> {
-        let client = self.get_client().await?;
-        let tenant_id = tenant.tenant_id().as_str();
-        let resource_type = resource.resource_type();
-        let resource_id = resource.id();
-        let content = resource.content();
-
-        // Use the dynamic extraction over the tenant's registry
-        let values = self
-            .tenant_extractor(tenant_id)
-            .extract(content, resource_type)
-            .map_err(|e| internal_error(format!("Search parameter extraction failed: {}", e)))?;
-
-        let mut rows = PostgresSearchIndexWriter::build_rows(
-            resource_type,
-            resource_id,
-            resource.last_modified(),
-            self.index_layout(),
-            values,
-        );
-
-        // Re-index contained resources too, so `$reindex` rebuilds `_contained`
-        // search entries — in the same statement as the resource's own rows.
-        rows.extend(self.contained_index_rows(tenant_id, resource_type, resource_id, content));
-
-        let count = rows.len();
-        PostgresSearchIndexWriter::insert_rows(
-            &client,
-            tenant_id,
-            resource_type,
-            resource_id,
-            &rows,
-        )
-        .await?;
-
-        // Rebuild the full-text row as well. `run_reindex` deletes each
-        // resource's search entries first (`delete_search_entries` ->
-        // `delete_search_index`), and that drops the `resource_fts` row; without
-        // this call nothing put it back, so `$reindex` silently disabled
-        // `_text`/`_content` on every reindex, with or without `clear_existing`.
-        // Same defect as the SQLite side — this is not PostgreSQL-specific.
-        //
-        // Not counted in `count`, which reports `search_index` entries only.
-        // The write is an upsert, so it is idempotent regardless of what ran
-        // before it — a reindex can find a row present.
-        self.index_fts_content(&client, tenant_id, resource_type, resource_id, content)
-            .await?;
-
-        Ok(count)
-    }
-
-    async fn write_search_entries_page(
-        &self,
-        tenant: &TenantContext,
-        resources: &[StoredResource],
+        resources: &[&StoredResource],
+        allow_replay: bool,
+        exclusive_lane: bool,
+        existing_permit: Option<Arc<ReindexAdmission>>,
     ) -> Vec<StorageResult<usize>> {
         if resources.is_empty() {
             return Vec::new();
         }
         let _page_span = crate::perf::span(crate::perf::Phase::ReindexPage);
 
-        // Composite deployments historically run the PostgreSQL per-resource
-        // writer even when reads are offloaded. Keep that behavior outside the
-        // new batched path so this optimization does not change pg-es.
-        if self.is_search_offloaded() {
-            return self
-                .write_reindex_page_individually(tenant, resources)
-                .await;
-        }
-
-        let tenant_id = tenant.tenant_id().as_str();
-        let mut rows_by_resource = Vec::with_capacity(resources.len());
-        let mut extraction_errors = Vec::with_capacity(resources.len());
-
-        // The database-free preparation stage: one `ReindexExtract` span,
-        // covering the pool decision, admission and every item, and no
-        // statement or connection inside it.
-        for prepared in self.prepare_reindex_page(tenant_id, resources) {
-            match prepared {
-                Ok(rows) => {
-                    rows_by_resource.push(rows);
-                    extraction_errors.push(None);
-                }
+        let permit = if let Some(existing) = existing_permit {
+            if !existing.is_active() {
+                let acquired = match self.reindex_admission.clone().acquire_owned().await {
+                    Ok(acquired) => acquired,
+                    Err(error) => {
+                        return resources
+                            .iter()
+                            .map(|_| {
+                                Err(internal_error(format!("Reindex admission closed: {error}")))
+                            })
+                            .collect();
+                    }
+                };
+                existing.install(acquired);
+            }
+            existing
+        } else {
+            let admission = if exclusive_lane {
+                self.reindex_admission
+                    .clone()
+                    .acquire_many_owned(self.reindex_width as u32)
+                    .await
+            } else {
+                self.reindex_admission.clone().acquire_owned().await
+            };
+            match admission {
+                Ok(acquired) => ReindexAdmission::new(acquired),
                 Err(error) => {
-                    rows_by_resource.push(Vec::new());
-                    extraction_errors.push(Some(error));
+                    return resources
+                        .iter()
+                        .map(|_| Err(internal_error(format!("Reindex admission closed: {error}"))))
+                        .collect();
                 }
             }
-        }
-
+        };
+        let tenant_id = tenant.tenant_id().as_str();
         let resource_types: Vec<&str> = resources
             .iter()
-            .map(StoredResource::resource_type)
+            .map(|resource| resource.resource_type())
             .collect();
-        let resource_ids: Vec<&str> = resources.iter().map(StoredResource::id).collect();
+        let resource_ids: Vec<&str> = resources.iter().map(|resource| resource.id()).collect();
 
         let connection_span = crate::perf::span(crate::perf::Phase::ReindexConnection);
         let connection = self.get_client().await;
         drop(connection_span);
-        let mut client = match connection {
+        let raw_client = match connection {
             Ok(client) => client,
             Err(error) => {
+                if !allow_replay {
+                    return vec![Err(error)];
+                }
                 tracing::warn!(
                     "Failed to acquire a connection for batched PostgreSQL reindex; retrying the page per resource: {error}"
                 );
                 return self
-                    .write_reindex_page_individually(tenant, resources)
+                    .write_reindex_group_individually(tenant, resources, Some(permit))
                     .await;
             }
         };
+        let mut client = GuardedClient::new(
+            raw_client,
+            self.cleanup_tracker.clone(),
+            Some(permit.clone()),
+        );
 
         let transaction_result = client.transaction().await;
         if let Err(error) = &transaction_result {
             let error = error.to_string();
             drop(transaction_result);
             drop(client);
+            self.cleanup_tracker.wait().await;
+            if !allow_replay {
+                return vec![Err(internal_error(format!(
+                    "Failed to begin reindex replacement: {error}"
+                )))];
+            }
             tracing::warn!(
                 "Failed to begin batched PostgreSQL reindex; retrying the page per resource: {error}"
             );
             return self
-                .write_reindex_page_individually(tenant, resources)
+                .write_reindex_group_individually(tenant, resources, Some(permit))
                 .await;
         }
         let transaction = transaction_result.expect("transaction error handled above");
+        let guarded = async {
+            acquire_shared_write_locks(
+                &transaction,
+                tenant_id,
+                &resources
+                    .iter()
+                    .map(|resource| (resource.resource_type(), resource.id()))
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
+            #[cfg(test)]
+            if let Some(hook) = &self.reindex_test_hook {
+                if allow_replay && hook.tenant_id == tenant_id {
+                    hook.entered.fetch_add(1, Ordering::SeqCst);
+                    hook.barrier.wait().await;
+                    if resources[0].id() == hook.panic_first_id {
+                        panic!("injected reindex group panic");
+                    }
+                }
+            }
+            #[cfg(test)]
+            if let (Some(entered), Some(pause)) =
+                (&self.reindex_test_entered, &self.reindex_test_pause)
+            {
+                entered.notify_one();
+                pause.notified().await;
+            }
+            let current = self
+                .current_reindex_resources(&transaction, tenant, resources, exclusive_lane)
+                .await?;
+            let Some((resolved, live)) = current else {
+                return Ok::<_, StorageError>(None);
+            };
+            let extractor = self
+                .authoritative_extractor(&transaction, tenant_id)
+                .await?;
+            Ok::<_, StorageError>(Some((resolved, live, extractor)))
+        }
+        .await;
+        let (current_resources, live, extractor) = match guarded {
+            Ok(Some(guarded)) => guarded,
+            Ok(None) => {
+                let rolled_back = transaction.rollback().await.is_ok();
+                if rolled_back {
+                    client.mark_settled();
+                }
+                drop(client);
+                self.cleanup_tracker.wait().await;
+                permit.release();
+                if resources.len() == 1 {
+                    return Box::pin(
+                        self.write_reindex_group(tenant, resources, false, true, None),
+                    )
+                    .await;
+                }
+                return self
+                    .write_reindex_group_individually(tenant, resources, Some(permit))
+                    .await;
+            }
+            Err(error) => {
+                let rolled_back = transaction.rollback().await.is_ok();
+                if rolled_back {
+                    client.mark_settled();
+                }
+                drop(client);
+                self.cleanup_tracker.wait().await;
+                if !allow_replay {
+                    return vec![Err(error)];
+                }
+                tracing::warn!(
+                    "Failed to prepare guarded reindex group; replaying individually: {error}"
+                );
+                return self
+                    .write_reindex_group_individually(tenant, resources, Some(permit))
+                    .await;
+            }
+        };
+        let supplied_resources = resources;
+        let resources = current_resources.as_slice();
+        let mut rows_by_resource = Vec::with_capacity(resources.len());
+        let mut extraction_errors = Vec::with_capacity(resources.len());
+        let mut retained_rows = 0usize;
+        let mut oversized_output = false;
+        for (resource_chunk, live_chunk) in resources.chunks(16).zip(live.chunks(16)) {
+            for prepared in
+                self.prepare_current_reindex_page(&extractor, resource_chunk, live_chunk)
+            {
+                match prepared {
+                    None => {
+                        rows_by_resource.push(Vec::new());
+                        extraction_errors.push(None);
+                    }
+                    Some(Ok(rows)) => {
+                        if !exclusive_lane && retained_rows.saturating_add(rows.len()) > 4096 {
+                            oversized_output = true;
+                            break;
+                        }
+                        retained_rows += rows.len();
+                        rows_by_resource.push(rows);
+                        extraction_errors.push(None);
+                    }
+                    Some(Err(error)) => {
+                        rows_by_resource.push(Vec::new());
+                        extraction_errors.push(Some(error));
+                    }
+                }
+            }
+            if oversized_output {
+                break;
+            }
+        }
+        if oversized_output {
+            drop(rows_by_resource);
+            drop(extraction_errors);
+            drop(current_resources);
+            let rolled_back = transaction.rollback().await.is_ok();
+            if rolled_back {
+                client.mark_settled();
+            }
+            drop(client);
+            self.cleanup_tracker.wait().await;
+            permit.release();
+            if supplied_resources.len() == 1 {
+                return Box::pin(self.write_reindex_group(
+                    tenant,
+                    supplied_resources,
+                    false,
+                    true,
+                    None,
+                ))
+                .await;
+            }
+            return self
+                .write_reindex_group_individually(tenant, supplied_resources, Some(permit))
+                .await;
+        }
 
         let batch_result: StorageResult<()> = async {
             let search_delete_span = crate::perf::span(crate::perf::Phase::ReindexSearchDelete);
@@ -4661,9 +5553,11 @@ impl ReindexTarget for PostgresBackend {
             let failed_pairs: Vec<(&str, &str)> = resources
                 .iter()
                 .zip(&extraction_errors)
-                .filter(|(_, error)| error.is_some())
-                .map(|(resource, _)| (resource.resource_type(), resource.id()))
+                .zip(&live)
+                .filter(|((_, error), live)| error.is_some() || !**live)
+                .map(|((resource, _), _)| (resource.resource_type(), resource.id()))
                 .collect();
+
             if !failed_pairs.is_empty() {
                 let failed_types: Vec<&str> = failed_pairs
                     .iter()
@@ -4694,8 +5588,9 @@ impl ReindexTarget for PostgresBackend {
                 .iter()
                 .zip(&rows_by_resource)
                 .zip(&extraction_errors)
-                .filter_map(|((resource, rows), error)| {
-                    error.is_none().then_some((
+                .zip(&live)
+                .filter_map(|(((resource, rows), error), live)| {
+                    (error.is_none() && *live).then_some((
                         resource.resource_type(),
                         resource.id(),
                         rows.as_slice(),
@@ -4720,21 +5615,20 @@ impl ReindexTarget for PostgresBackend {
             );
 
             let fts_span = crate::perf::span(crate::perf::Phase::ReindexFts);
-            // Resources are unique in a fetched page, as required by the
+            // Resources are unique in a resolved page, as required by the
             // grouped upsert's ON CONFLICT. Search-index writes above each
             // group savepoint survive a group rollback. A non-size FTS failure
             // still abandons this transaction for the whole-page individual path.
             let fts_batch: Vec<&StoredResource> = resources
                 .iter()
                 .zip(&extraction_errors)
-                .filter(|(_, error)| error.is_none())
-                .map(|(resource, _)| resource)
+                .zip(&live)
+                .filter(|((_, error), live)| error.is_none() && **live)
+                .map(|((resource, _), _)| resource)
                 .collect();
-            let fts_result = self
-                .index_reindex_fts_groups(&transaction, tenant_id, &fts_batch)
-                .await;
+            self.index_reindex_fts_groups(&transaction, tenant_id, &fts_batch)
+                .await?;
             drop(fts_span);
-            fts_result?;
             Ok(())
         }
         .await;
@@ -4747,17 +5641,30 @@ impl ReindexTarget for PostgresBackend {
             tracing::warn!(
                 "Batched PostgreSQL reindex failed; retrying the page per resource: {error}"
             );
-            drop(transaction);
+            let rolled_back = transaction.rollback().await.is_ok();
+            if rolled_back {
+                client.mark_settled();
+            }
             drop(client);
+            self.cleanup_tracker.wait().await;
+            if !allow_replay {
+                return vec![Err(error)];
+            }
             return self
-                .write_reindex_page_individually(tenant, resources)
+                .write_reindex_group_individually(tenant, supplied_resources, Some(permit))
                 .await;
         }
 
         let commit_span = crate::perf::span(crate::perf::Phase::ReindexCommit);
         let committed = transaction.commit().await;
         drop(commit_span);
+        if committed.is_ok() {
+            client.mark_settled();
+        }
         drop(client);
+        if committed.is_err() {
+            self.cleanup_tracker.wait().await;
+        }
         if let Err(error) = committed {
             // Commit consumes the transaction, so its result can be uncertain.
             // The fallback remains idempotent because it deletes every
@@ -4765,28 +5672,201 @@ impl ReindexTarget for PostgresBackend {
             tracing::warn!(
                 "Failed to commit batched PostgreSQL reindex; retrying the page per resource: {error}"
             );
+            if !allow_replay {
+                return vec![Err(internal_error(format!(
+                    "Failed to commit reindex replacement: {error}"
+                )))];
+            }
             return self
-                .write_reindex_page_individually(tenant, resources)
+                .write_reindex_group_individually(tenant, supplied_resources, Some(permit))
                 .await;
         }
 
         rows_by_resource
             .into_iter()
             .zip(extraction_errors)
-            .map(|(rows, error)| match error {
+            .zip(live)
+            .map(|((rows, error), is_live)| match error {
                 Some(error) => Err(error),
-                None => Ok(rows.len()),
+                None => Ok(if is_live { rows.len() } else { 0 }),
             })
+            .collect()
+    }
+}
+
+// ============================================================================
+// ReindexTarget Implementation — PostgreSQL keeps search entries in its own
+// `search_index` table, so it is also a writer and can reindex itself.
+// ============================================================================
+
+#[async_trait]
+impl ReindexTarget for PostgresBackend {
+    async fn delete_search_entries(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> StorageResult<u64> {
+        let mut client = self.guarded_client().await?;
+        let transaction = client
+            .transaction()
+            .await
+            .or_query_error("Failed to begin index clear")?;
+        acquire_shared_write_locks(
+            &transaction,
+            tenant.tenant_id().as_str(),
+            &[(resource_type, resource_id)],
+        )
+        .await?;
+        let deleted = self
+            .delete_search_index(
+                &transaction,
+                tenant.tenant_id().as_str(),
+                resource_type,
+                resource_id,
+            )
+            .await;
+        match deleted {
+            Ok(count) => {
+                transaction
+                    .commit()
+                    .await
+                    .or_query_error("Failed to commit index clear")?;
+                client.mark_settled();
+                Ok(count)
+            }
+            Err(error) => {
+                if transaction.rollback().await.is_ok() {
+                    client.mark_settled();
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Rebuilds one identity from this backend's current resource row. The
+    /// supplied body and version are ignored; a missing row clears stale index
+    /// entries and returns zero.
+    async fn write_search_entries(
+        &self,
+        tenant: &TenantContext,
+        resource: &StoredResource,
+    ) -> StorageResult<usize> {
+        if resource.tenant_id() != tenant.tenant_id() {
+            return Err(internal_error(format!(
+                "Reindex resource {}/{} belongs to another tenant",
+                resource.resource_type(),
+                resource.id()
+            )));
+        }
+        self.write_reindex_group(tenant, &[resource], false, false, None)
+            .await
+            .into_iter()
+            .next()
+            .expect("one reindex input has one result")
+    }
+
+    async fn write_search_entries_page(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+    ) -> Vec<StorageResult<usize>> {
+        use futures::{FutureExt, StreamExt};
+        let mut slots: Vec<Option<StorageResult<usize>>> = std::iter::repeat_with(|| None)
+            .take(resources.len())
+            .collect();
+        let mut unique: Vec<&StoredResource> = Vec::new();
+        let mut positions: Vec<Vec<usize>> = Vec::new();
+        let mut seen: HashMap<(&str, &str), usize> = HashMap::new();
+        for (slot, resource) in resources.iter().enumerate() {
+            if resource.tenant_id() != tenant.tenant_id() {
+                slots[slot] = Some(Err(internal_error(format!(
+                    "Reindex resource {}/{} belongs to another tenant",
+                    resource.resource_type(),
+                    resource.id()
+                ))));
+                continue;
+            }
+            let key = (resource.resource_type(), resource.id());
+            if let Some(&index) = seen.get(&key) {
+                positions[index].push(slot);
+            } else {
+                seen.insert(key, unique.len());
+                unique.push(resource);
+                positions.push(vec![slot]);
+            }
+        }
+        let mut groups = unique.chunks(128).enumerate();
+        let mut active = futures::stream::FuturesUnordered::new();
+        let mut panic_payload = None;
+        loop {
+            while panic_payload.is_none() && active.len() < self.reindex_width {
+                let Some((group_index, group)) = groups.next() else {
+                    break;
+                };
+                active.push(
+                    std::panic::AssertUnwindSafe(async move {
+                        (
+                            group_index * 128,
+                            self.write_reindex_group(tenant, group, true, false, None)
+                                .await,
+                        )
+                    })
+                    .catch_unwind(),
+                );
+            }
+            let Some(completed) = active.next().await else {
+                break;
+            };
+            let (start, outcomes) = match completed {
+                Ok(completed) => completed,
+                Err(payload) => {
+                    panic_payload.get_or_insert(payload);
+                    continue;
+                }
+            };
+            for (offset, outcome) in outcomes.into_iter().enumerate() {
+                let input_slots = &positions[start + offset];
+                match outcome {
+                    Ok(count) => {
+                        for &slot in input_slots {
+                            slots[slot] = Some(Ok(count));
+                        }
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        let mut input_slots = input_slots.iter().copied();
+                        if let Some(first) = input_slots.next() {
+                            slots[first] = Some(Err(error));
+                        }
+                        for slot in input_slots {
+                            slots[slot] = Some(Err(internal_error(message.clone())));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(payload) = panic_payload {
+            // A panicking group drops its connection guard. Its rollback or
+            // discard remains tracked after the future exits. Drain siblings
+            // first, then wait for those guards before unwinding the page.
+            self.cleanup_tracker.wait().await;
+            std::panic::resume_unwind(payload);
+        }
+        slots
+            .into_iter()
+            .map(|slot| slot.expect("every input slot has one outcome"))
             .collect()
     }
 
     async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64> {
-        let mut client = self.get_client().await?;
+        let mut client = self.guarded_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
         let transaction = client
             .transaction()
             .await
             .or_query_error("Failed to begin clearing search index")?;
+        acquire_exclusive_write_gate(&transaction, tenant_id).await?;
         let deleted = transaction
             .execute(
                 "DELETE FROM search_index WHERE tenant_id = $1",
@@ -4805,6 +5885,7 @@ impl ReindexTarget for PostgresBackend {
             .commit()
             .await
             .or_query_error("Failed to commit clearing search index")?;
+        client.mark_settled();
         Ok(deleted)
     }
 }
@@ -5221,7 +6302,7 @@ mod fts_extraction_tests {
 
     #[test]
     fn narrative_only_resource_is_not_empty() {
-        // `index_fts_content` returns early on `is_empty()`; a resource whose
+        // the guarded FTS writer returns early on `is_empty()`; a resource whose
         // only text is its narrative must still be indexed.
         let content = extract_searchable_content(&json!({
             "resourceType": "Binary",
