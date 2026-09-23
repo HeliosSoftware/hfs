@@ -12811,7 +12811,7 @@ mod postgres_integration {
                     .sum();
                 assert!(page_ids.len() <= 4);
                 assert!(
-                    page_bytes <= cap || (page_ids.len() == 1 && page_bytes > cap),
+                    page_bytes <= cap || page_ids.len() == 1,
                     "cap {cap}, page {page_ids:?}, bytes {page_bytes}"
                 );
                 if pages.is_empty() {
