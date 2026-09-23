@@ -35,6 +35,7 @@ use super::PostgresBackend;
 use super::cached::{execute_cached, query_cached, query_one_cached, query_opt_cached};
 
 const MAX_GROUPED_FRESH_CREATES: usize = 100;
+const MAX_GROUPED_FRESH_CREATE_CONTENT_BYTES: usize = 8 * 1024 * 1024;
 
 const FRESH_CREATE_CANDIDATES_SQL: &str = "\
 SELECT resource.resource_type, resource.id
@@ -79,13 +80,88 @@ fn internal_error(message: String) -> StorageError {
     })
 }
 
+#[derive(Default)]
+struct JsonByteCounter {
+    bytes: usize,
+}
+
+impl std::io::Write for JsonByteCounter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .checked_add(buffer.len())
+            .ok_or_else(|| std::io::Error::other("compact JSON byte count overflowed usize"))?;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn compact_json_bytes(resource: &Value) -> StorageResult<usize> {
+    let mut counter = JsonByteCounter::default();
+    serde_json::to_writer(&mut counter, resource).map_err(|error| {
+        internal_error(format!("Failed to count compact resource JSON: {error}"))
+    })?;
+    Ok(counter.bytes)
+}
+
+/// Partitions one fresh run into ordered resource-write groups. The ranges
+/// retain no serialized payload and each non-oversized group fits both the SQL
+/// row limit and the compact input-JSON content budget. An oversized resource
+/// is deliberately returned as a singleton.
+fn grouped_fresh_create_ranges(
+    entries: &[NdjsonEntry],
+) -> StorageResult<Vec<std::ops::Range<usize>>> {
+    let mut ranges = Vec::new();
+    let mut group_start = 0;
+    let mut group_count = 0;
+    let mut group_bytes = 0usize;
+
+    for (index, entry) in entries.iter().enumerate() {
+        let entry_bytes = compact_json_bytes(&entry.resource)?;
+        let combined_bytes = group_bytes.checked_add(entry_bytes).ok_or_else(|| {
+            internal_error("Grouped fresh-create content byte count overflowed usize".to_string())
+        })?;
+
+        if group_count > 0
+            && (group_count == MAX_GROUPED_FRESH_CREATES
+                || combined_bytes > MAX_GROUPED_FRESH_CREATE_CONTENT_BYTES)
+        {
+            ranges.push(group_start..index);
+            group_start = index;
+            group_count = 0;
+            group_bytes = 0;
+        }
+
+        group_count += 1;
+        group_bytes = group_bytes.checked_add(entry_bytes).ok_or_else(|| {
+            internal_error("Grouped fresh-create content byte count overflowed usize".to_string())
+        })?;
+
+        if entry_bytes > MAX_GROUPED_FRESH_CREATE_CONTENT_BYTES {
+            debug_assert_eq!(group_count, 1);
+            ranges.push(group_start..index + 1);
+            group_start = index + 1;
+            group_count = 0;
+            group_bytes = 0;
+        }
+    }
+
+    if group_count > 0 {
+        ranges.push(group_start..entries.len());
+    }
+
+    Ok(ranges)
+}
+
 fn is_grouped_fresh_create_eligible(
     entries: &[NdjsonEntry],
     options: &BulkProcessingOptions,
     search_offloaded: bool,
 ) -> bool {
     if entries.is_empty()
-        || entries.len() > MAX_GROUPED_FRESH_CREATES
         || search_offloaded
         // Grouped creates yield receipts and rollback records, not the
         // resources as committed, so an observer that indexes them (#1127)
@@ -881,15 +957,31 @@ impl BulkSubmitProvider for PostgresBackend {
                 // Only stage receipts and rollback records after every fresh
                 // run has flushed successfully. Bookkeeping failures are not
                 // eligible for whole-batch replay.
-                Self::flush_entry_rows_tx(
-                    &txn,
-                    submission_id,
-                    manifest_id,
-                    file_url,
-                    &mixed.results,
-                    &mixed.changes,
-                )
-                .await?;
+                // A batch may now be far larger than `MAX_GROUPED_FRESH_CREATES`
+                // (#1455), so bookkeeping is staged in bounded slices rather
+                // than one statement per column array. Receipts and rollback
+                // records are independent inserts and an existing entry that
+                // failed contributes a receipt without a change, so the two
+                // sequences are advanced separately instead of zipped.
+                let mut result_offset = 0;
+                let mut change_offset = 0;
+                while result_offset < mixed.results.len() || change_offset < mixed.changes.len() {
+                    let result_end =
+                        (result_offset + BOOKKEEPING_FLUSH_SIZE).min(mixed.results.len());
+                    let change_end =
+                        (change_offset + BOOKKEEPING_FLUSH_SIZE).min(mixed.changes.len());
+                    Self::flush_entry_rows_tx(
+                        &txn,
+                        submission_id,
+                        manifest_id,
+                        file_url,
+                        &mixed.results[result_offset..result_end],
+                        &mixed.changes[change_offset..change_end],
+                    )
+                    .await?;
+                    result_offset = result_end;
+                    change_offset = change_end;
+                }
                 ProcessedEntryBatch {
                     results: mixed.results,
                     aborted_on_max_errors: false,
@@ -1278,38 +1370,45 @@ impl PostgresBackend {
     ) -> Result<HashSet<(String, String)>, MixedAttemptError> {
         use crate::core::Transaction;
 
-        let resource_types: Vec<&str> = entries
-            .iter()
-            .map(|entry| entry.resource_type.as_str())
-            .collect();
-        let resource_ids: Vec<&str> = entries
-            .iter()
-            .map(|entry| {
-                entry
-                    .resource_id
-                    .as_deref()
-                    .expect("grouped-create eligibility requires an explicit id")
-            })
-            .collect();
         let tenant_id = txn.tenant().tenant_id().as_str();
         let client = txn
             .raw_client()
             .map_err(MixedAttemptError::ReplayWholeBatch)?;
-        let rows = query_cached(
-            client,
-            FRESH_CREATE_CANDIDATES_SQL,
-            &[&tenant_id, &resource_types, &resource_ids],
-        )
-        .await
-        .map_err(|error| {
-            MixedAttemptError::ReplayWholeBatch(internal_error(format!(
-                "Failed to query grouped fresh-create candidates: {error}"
-            )))
-        })?;
+        let mut existing_keys = HashSet::new();
+        // A batch is no longer capped at `MAX_GROUPED_FRESH_CREATES` entries
+        // (#1455), so the unnest arrays are chunked to keep one lookup's
+        // parameter payload bounded. Every chunk must run: this snapshot has
+        // to name each existing key, not merely prove that one exists.
+        for chunk in entries.chunks(MAX_GROUPED_FRESH_CREATES) {
+            let resource_types: Vec<&str> = chunk
+                .iter()
+                .map(|entry| entry.resource_type.as_str())
+                .collect();
+            let resource_ids: Vec<&str> = chunk
+                .iter()
+                .map(|entry| {
+                    entry
+                        .resource_id
+                        .as_deref()
+                        .expect("grouped-create eligibility requires an explicit id")
+                })
+                .collect();
+            let rows = query_cached(
+                client,
+                FRESH_CREATE_CANDIDATES_SQL,
+                &[&tenant_id, &resource_types, &resource_ids],
+            )
+            .await
+            .map_err(|error| {
+                MixedAttemptError::ReplayWholeBatch(internal_error(format!(
+                    "Failed to query grouped fresh-create candidates: {error}"
+                )))
+            })?;
 
-        let mut existing_keys = HashSet::with_capacity(rows.len());
-        for row in rows {
-            existing_keys.insert((row.get(0), row.get(1)));
+            existing_keys.reserve(rows.len());
+            for row in rows {
+                existing_keys.insert((row.get(0), row.get(1)));
+            }
         }
         Ok(existing_keys)
     }
@@ -1370,8 +1469,11 @@ impl PostgresBackend {
     }
 
     /// Stages one maximal fresh run, then flushes it before control can move
-    /// to an existing entry's savepoint. Any error here invalidates the routing
-    /// snapshot and replays the whole batch through the individual path.
+    /// to an existing entry's savepoint. A run longer than one grouped write
+    /// may hold (#1455) is partitioned by `grouped_fresh_create_ranges` and
+    /// flushed a group at a time, still ahead of the next savepoint. Any error
+    /// here invalidates the routing snapshot and replays the whole batch
+    /// through the individual path.
     async fn create_fresh_run(
         &self,
         txn: &mut super::transaction::PostgresTransaction,
@@ -1380,30 +1482,35 @@ impl PostgresBackend {
     ) -> Result<MixedEntryBatch, MixedAttemptError> {
         use crate::core::Transaction;
 
+        let ranges =
+            grouped_fresh_create_ranges(entries).map_err(MixedAttemptError::ReplayWholeBatch)?;
         let mut results = Vec::with_capacity(entries.len());
         let mut changes = Vec::with_capacity(entries.len());
-        for entry in entries {
-            let created = txn
-                .create(&entry.resource_type, entry.resource.clone())
+        for range in ranges {
+            for entry in &entries[range] {
+                let created = txn
+                    .create(&entry.resource_type, entry.resource.clone())
+                    .await
+                    .map_err(MixedAttemptError::ReplayWholeBatch)?;
+                results.push(BulkEntryResult::success(
+                    entry.line_number,
+                    &entry.resource_type,
+                    created.id(),
+                    true,
+                ));
+                changes.push(SubmissionChange::create(
+                    manifest_id,
+                    &entry.resource_type,
+                    created.id(),
+                    created.version_id(),
+                ));
+            }
+
+            txn.flush()
                 .await
                 .map_err(MixedAttemptError::ReplayWholeBatch)?;
-            results.push(BulkEntryResult::success(
-                entry.line_number,
-                &entry.resource_type,
-                created.id(),
-                true,
-            ));
-            changes.push(SubmissionChange::create(
-                manifest_id,
-                &entry.resource_type,
-                created.id(),
-                created.version_id(),
-            ));
         }
 
-        txn.flush()
-            .await
-            .map_err(MixedAttemptError::ReplayWholeBatch)?;
         Ok(MixedEntryBatch { results, changes })
     }
 
@@ -3561,11 +3668,16 @@ mod tests {
         let hundred_and_one: Vec<_> = (1..=101)
             .map(|line| entry(line, "Patient", &format!("p-{line}")))
             .collect();
-        assert!(!is_grouped_fresh_create_eligible(
+        assert!(is_grouped_fresh_create_eligible(
             &hundred_and_one,
             &options,
             false
         ));
+
+        let thousand: Vec<_> = (1..=1000)
+            .map(|line| entry(line, "Patient", &format!("p-{line}")))
+            .collect();
+        assert!(is_grouped_fresh_create_eligible(&thousand, &options, false));
     }
 
     #[test]
@@ -3658,6 +3770,121 @@ mod tests {
             &options,
             false
         ));
+    }
+
+    #[test]
+    fn grouped_fresh_create_eligibility_detects_duplicates_across_lookup_chunks() {
+        let options = eligible_options();
+        let mut across_chunks: Vec<_> = (1..=101)
+            .map(|line| entry(line, "Patient", &format!("p-{line}")))
+            .collect();
+        across_chunks[100] = entry(101, "Patient", "p-1");
+        assert!(!is_grouped_fresh_create_eligible(
+            &across_chunks,
+            &options,
+            false
+        ));
+    }
+
+    fn entry_with_compact_size(line_number: u64, target_bytes: usize) -> NdjsonEntry {
+        let id = format!("sized-{line_number}");
+        let mut resource = json!({
+            "resourceType": "Patient",
+            "id": id,
+            "payload": ""
+        });
+        let base_bytes = compact_json_bytes(&resource).unwrap();
+        assert!(
+            target_bytes >= base_bytes,
+            "target {target_bytes} is smaller than fixture overhead {base_bytes}"
+        );
+        resource["payload"] = json!("x".repeat(target_bytes - base_bytes));
+        assert_eq!(compact_json_bytes(&resource).unwrap(), target_bytes);
+        NdjsonEntry::new(line_number, "Patient", resource)
+    }
+
+    fn range_bytes(entries: &[NdjsonEntry], range: std::ops::Range<usize>) -> usize {
+        entries[range]
+            .iter()
+            .map(|entry| compact_json_bytes(&entry.resource).unwrap())
+            .sum()
+    }
+
+    #[test]
+    fn grouped_fresh_create_ranges_split_on_the_row_limit() {
+        let entries: Vec<_> = (1..=250)
+            .map(|line| entry(line, "Patient", &format!("p-{line}")))
+            .collect();
+        let ranges = grouped_fresh_create_ranges(&entries).unwrap();
+        assert_eq!(ranges, vec![0..100, 100..200, 200..250]);
+    }
+
+    #[test]
+    fn grouped_fresh_create_content_budget_admits_exactly_eight_mibibytes() {
+        let entries = vec![
+            entry_with_compact_size(1, MAX_GROUPED_FRESH_CREATE_CONTENT_BYTES),
+            entry_with_compact_size(2, 256),
+        ];
+        let ranges = grouped_fresh_create_ranges(&entries).unwrap();
+        assert_eq!(ranges, vec![0..1, 1..2]);
+        assert_eq!(
+            range_bytes(&entries, ranges[0].clone()),
+            MAX_GROUPED_FRESH_CREATE_CONTENT_BYTES
+        );
+    }
+
+    #[test]
+    fn grouped_fresh_create_content_budget_flushes_before_crossing_entry() {
+        let entries = vec![
+            entry_with_compact_size(1, MAX_GROUPED_FRESH_CREATE_CONTENT_BYTES / 2),
+            entry_with_compact_size(2, MAX_GROUPED_FRESH_CREATE_CONTENT_BYTES / 2 + 1),
+        ];
+        let ranges = grouped_fresh_create_ranges(&entries).unwrap();
+        assert_eq!(ranges, vec![0..1, 1..2]);
+        assert!(
+            ranges
+                .iter()
+                .all(|range| range_bytes(&entries, range.clone())
+                    <= MAX_GROUPED_FRESH_CREATE_CONTENT_BYTES)
+        );
+    }
+
+    #[test]
+    fn grouped_fresh_create_content_budget_flushes_oversized_entry_alone() {
+        let entries = vec![
+            entry_with_compact_size(1, 256),
+            entry_with_compact_size(2, MAX_GROUPED_FRESH_CREATE_CONTENT_BYTES + 1),
+            entry_with_compact_size(3, 256),
+        ];
+        let ranges = grouped_fresh_create_ranges(&entries).unwrap();
+        assert_eq!(ranges, vec![0..1, 1..2, 2..3]);
+        assert_eq!(
+            range_bytes(&entries, ranges[1].clone()),
+            MAX_GROUPED_FRESH_CREATE_CONTENT_BYTES + 1
+        );
+    }
+
+    #[test]
+    fn grouped_fresh_create_content_budget_count_and_bytes_meet_on_same_entry() {
+        let mut entries: Vec<_> = (1..=99)
+            .map(|line| entry_with_compact_size(line, 256))
+            .collect();
+        let prefix_bytes: usize = entries
+            .iter()
+            .map(|entry| compact_json_bytes(&entry.resource).unwrap())
+            .sum();
+        entries.push(entry_with_compact_size(
+            100,
+            MAX_GROUPED_FRESH_CREATE_CONTENT_BYTES - prefix_bytes,
+        ));
+        entries.push(entry_with_compact_size(101, 256));
+
+        let ranges = grouped_fresh_create_ranges(&entries).unwrap();
+        assert_eq!(ranges, vec![0..100, 100..101]);
+        assert_eq!(
+            range_bytes(&entries, ranges[0].clone()),
+            MAX_GROUPED_FRESH_CREATE_CONTENT_BYTES
+        );
     }
 
     #[test]
