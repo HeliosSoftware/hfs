@@ -394,15 +394,7 @@ impl BulkSubmitProvider for S3Backend {
             let outcomes: Vec<StorageResult<(BulkEntryResult, Option<SubmissionChange>)>> =
                 stream::iter(entries)
                     .map(|entry| {
-                        self.process_one_entry(
-                            &location,
-                            tenant,
-                            submission_id,
-                            manifest_id,
-                            file_url,
-                            entry,
-                            options,
-                        )
+                        self.process_one_entry(tenant, submission_id, manifest_id, entry, options)
                     })
                     .buffered(concurrency)
                     .collect()
@@ -443,20 +435,11 @@ impl BulkSubmitProvider for S3Backend {
                             ));
                         }
 
-                        let skipped = BulkEntryResult::skipped(
+                        results.push(BulkEntryResult::skipped(
                             entry.line_number,
                             &entry.resource_type,
                             "max errors exceeded",
-                        );
-                        self.persist_entry_result(
-                            &location,
-                            submission_id,
-                            manifest_id,
-                            file_url,
-                            &skipped,
-                        )
-                        .await?;
-                        results.push(skipped);
+                        ));
                         continue;
                     }
 
@@ -481,14 +464,6 @@ impl BulkSubmitProvider for S3Backend {
                         error_count += 1;
                     }
 
-                    self.persist_entry_result(
-                        &location,
-                        submission_id,
-                        manifest_id,
-                        file_url,
-                        &result,
-                    )
-                    .await?;
                     if let Some(change) = change {
                         changes.push(change);
                     }
@@ -519,6 +494,26 @@ impl BulkSubmitProvider for S3Backend {
             }
             None => Ok(()),
         };
+        // Then the batch's receipts, also as one object (#1429): every entry
+        // the walk produced a result for — successes, processing errors and
+        // max-errors skips alike — so the status counters and the output/error
+        // files derive from the same set the observer is told about. Same
+        // reporting order as the change batch: after the observer, yielding to
+        // the walk's error and then to the change batch's.
+        let receipt_write = match batch_first_line {
+            Some(first_line) => {
+                self.persist_result_batch(
+                    &location,
+                    submission_id,
+                    manifest_id,
+                    file_url,
+                    first_line,
+                    &results,
+                )
+                .await
+            }
+            None => Ok(()),
+        };
 
         // Entries are written one by one and not kept, so observers that need
         // the resources re-read the ids from the primary (#1127).
@@ -527,6 +522,7 @@ impl BulkSubmitProvider for S3Backend {
             .await;
         walked?;
         change_write?;
+        receipt_write?;
 
         let success_count = results.iter().filter(|r| r.is_success()).count() as u64;
         let failed_count = results.iter().filter(|r| r.is_error()).count() as u64;
@@ -887,21 +883,18 @@ impl BulkSubmitRollbackProvider for S3Backend {
 }
 
 impl S3Backend {
-    /// Processes one ingest entry end to end — runs it and writes its receipt —
-    /// returning the receipt together with the rollback change it produced (if
-    /// any) for the caller to coalesce. This is the unit the batch runs,
-    /// serially or concurrently. A per-entry *processing* failure becomes a
-    /// `processing-error` receipt (not an error) and no change; only a hard
-    /// store failure writing the receipt propagates. The raw line was archived
-    /// for the whole batch upfront (persist_raw_batch).
-    #[allow(clippy::too_many_arguments)]
+    /// Processes one ingest entry end to end, returning its receipt together
+    /// with the rollback change it produced (if any) for the caller to
+    /// coalesce — the receipt is written with the batch's, not here (#1429).
+    /// This is the unit the batch runs, serially or concurrently. A per-entry
+    /// *processing* failure becomes a `processing-error` receipt (not an
+    /// error) and no change. The raw line was archived for the whole batch
+    /// upfront (persist_raw_batch).
     async fn process_one_entry(
         &self,
-        location: &TenantLocation,
         tenant: &TenantContext,
         submission_id: &SubmissionId,
         manifest_id: &str,
-        file_url: Option<&str>,
         entry: NdjsonEntry,
         options: &BulkProcessingOptions,
     ) -> StorageResult<(BulkEntryResult, Option<SubmissionChange>)> {
@@ -919,8 +912,6 @@ impl S3Backend {
                 None,
             ),
         };
-        self.persist_entry_result(location, submission_id, manifest_id, file_url, &result)
-            .await?;
         Ok((result, change))
     }
 
@@ -1163,32 +1154,71 @@ impl S3Backend {
         Ok(())
     }
 
-    /// Persists the processing result for a single entry to S3.
+    /// Writes an ingest batch's receipts to S3 as a single object — the whole
+    /// batch's entry results in one array rather than one PUT per line
+    /// (#1429).
     ///
-    /// `file_url` is the manifest output file the line came from. It is part of
-    /// the key because line numbers restart in every file, so without it the
-    /// results of a multi-file manifest overwrite each other — the S3 shape of
-    /// issue #457, silent here because a `PutObject` has no primary key to
-    /// violate.
-    async fn persist_entry_result(
+    /// Stored under `results/<manifest>/<file>/batch-<first_line>.json` (see
+    /// [`crate::backends::s3::keyspace::S3Keyspace::submit_result_batch_key`]),
+    /// below the same `results/<manifest>/` prefix the readers sweep, so they
+    /// pick up this array form and any legacy per-line object alike. `file_url`
+    /// is part of the key because line numbers restart in every file; without
+    /// it the batches of a multi-file manifest would overwrite each other — the
+    /// S3 shape of #457, silent here because a `PutObject` has no primary key
+    /// to violate. An empty batch writes nothing.
+    async fn persist_result_batch(
         &self,
         location: &TenantLocation,
         submission_id: &SubmissionId,
         manifest_id: &str,
         file_url: Option<&str>,
-        result: &BulkEntryResult,
+        first_line: u64,
+        results: &[BulkEntryResult],
     ) -> StorageResult<()> {
-        let key = location.keyspace.submit_result_line_key(
+        if results.is_empty() {
+            return Ok(());
+        }
+        let key = location.keyspace.submit_result_batch_key(
             &submission_id.submitter,
             &submission_id.submission_id,
             manifest_id,
             file_url,
-            result.line_number,
+            first_line,
         );
-        let payload = self.serialize_json(result)?;
+        let payload = self.serialize_json(&results)?;
         self.put_json_object(&location.bucket, &key, &payload, None, None)
             .await?;
         Ok(())
+    }
+
+    /// Reads one object under `results/<manifest>/`, which holds either a
+    /// coalesced batch — a JSON array of receipts (#1429) — or a legacy
+    /// per-line receipt. Discriminated on the parsed JSON so both shapes are
+    /// read back.
+    async fn read_entry_result_object(
+        &self,
+        location: &TenantLocation,
+        key: &str,
+    ) -> StorageResult<Option<Vec<BulkEntryResult>>> {
+        let Some((value, _)) = self
+            .get_json_object::<serde_json::Value>(&location.bucket, key)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let results = match value {
+            serde_json::Value::Array(_) => serde_json::from_value(value).map_err(|e| {
+                StorageError::Backend(BackendError::SerializationError {
+                    message: format!("failed to deserialize entry result batch: {e}"),
+                })
+            })?,
+            _ => vec![serde_json::from_value(value).map_err(|e| {
+                StorageError::Backend(BackendError::SerializationError {
+                    message: format!("failed to deserialize entry result: {e}"),
+                })
+            })?],
+        };
+        Ok(Some(results))
     }
 
     /// Loads all entry results for a manifest from S3.
@@ -1212,11 +1242,8 @@ impl S3Backend {
                 continue;
             }
 
-            if let Some((result, _)) = self
-                .get_json_object::<BulkEntryResult>(&location.bucket, &object.key)
-                .await?
-            {
-                results.push(result);
+            if let Some(batch) = self.read_entry_result_object(location, &object.key).await? {
+                results.extend(batch);
             }
         }
 
@@ -1227,13 +1254,16 @@ impl S3Backend {
     /// (`resource_type` + `resource_id`) to `processing-error`, storing the
     /// given OperationOutcome, and returns how many objects changed.
     ///
-    /// Rewrites each matched object at its own key rather than through
-    /// [`Self::persist_entry_result`]: an entry result's key encodes the
-    /// manifest output file it came from (#457), which is not part of
-    /// [`BulkEntryResult`] itself, so re-deriving a key from `file_url: None`
-    /// would land on a different object than the one this scan just read —
-    /// creating a duplicate instead of overwriting it on a multi-file
-    /// manifest. Listing keeps the exact key each result already lives at.
+    /// Rewrites each object that held a match at its own key: an entry result's
+    /// key encodes the manifest output file it came from (#457), which is not
+    /// part of [`BulkEntryResult`] itself, so re-deriving a key from
+    /// `file_url: None` would land on a different object than the one this
+    /// scan just read — creating a duplicate instead of overwriting it on a
+    /// multi-file manifest. Listing keeps the exact key each result already
+    /// lives at. A coalesced batch object (#1429) is read, its matching
+    /// receipts flipped in place, and the whole array written back once; the
+    /// count is of receipts, not objects. This runs after the ingest, with no
+    /// writer on these objects, so the read-modify-write is not raced.
     async fn mark_entry_result_objects_unindexed(
         &self,
         location: &TenantLocation,
@@ -1254,27 +1284,51 @@ impl S3Backend {
             if !object.key.ends_with(".json") {
                 continue;
             }
-            let Some((mut result, _)) = self
-                .get_json_object::<BulkEntryResult>(&location.bucket, &object.key)
+            let Some((value, _)) = self
+                .get_json_object::<serde_json::Value>(&location.bucket, &object.key)
                 .await?
             else {
                 continue;
             };
-            let Some(resource_id) = result.resource_id.clone() else {
-                continue;
+            let is_batch = value.is_array();
+            let mut results: Vec<BulkEntryResult> = if is_batch {
+                serde_json::from_value(value).map_err(|e| {
+                    StorageError::Backend(BackendError::SerializationError {
+                        message: format!("failed to deserialize entry result batch: {e}"),
+                    })
+                })?
+            } else {
+                vec![serde_json::from_value(value).map_err(|e| {
+                    StorageError::Backend(BackendError::SerializationError {
+                        message: format!("failed to deserialize entry result: {e}"),
+                    })
+                })?]
             };
-            let Some(matched) = entries
-                .iter()
-                .find(|e| e.resource_type == result.resource_type && e.resource_id == resource_id)
-            else {
+            let mut flipped = 0u64;
+            for result in &mut results {
+                let Some(resource_id) = result.resource_id.as_deref() else {
+                    continue;
+                };
+                let Some(matched) = entries.iter().find(|e| {
+                    e.resource_type == result.resource_type && e.resource_id == resource_id
+                }) else {
+                    continue;
+                };
+                result.outcome = BulkEntryOutcome::ProcessingError;
+                result.operation_outcome = Some(matched.operation_outcome.clone());
+                flipped += 1;
+            }
+            if flipped == 0 {
                 continue;
+            }
+            let payload = if is_batch {
+                self.serialize_json(&results)?
+            } else {
+                self.serialize_json(&results[0])?
             };
-            result.outcome = BulkEntryOutcome::ProcessingError;
-            result.operation_outcome = Some(matched.operation_outcome.clone());
-            let payload = self.serialize_json(&result)?;
             self.put_json_object(&location.bucket, &object.key, &payload, None, None)
                 .await?;
-            affected += 1;
+            affected += flipped;
         }
         Ok(affected)
     }
