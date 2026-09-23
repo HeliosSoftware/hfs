@@ -839,12 +839,29 @@ struct AutomaticTenantState {
     pending_resources: BTreeSet<ResourceRef>,
     next_generation: u64,
     consecutive_failures: u8,
+    /// The most recent request merged into the pending generation. Only its
+    /// submission and manifest are logged; which markers a generation clears
+    /// is [`Self::owed_manifests`], because merged requests each owe one.
     context: DeferredReindexContext,
+    /// Every manifest whose "still owes a rebuild" marker the pending
+    /// generation clears when it ends (#1213). A merge adds to it, like
+    /// `pending_types`, instead of replacing it the way `context` is.
+    owed_manifests: BTreeSet<String>,
     options: AutomaticRunOptions,
     waiting_for_generation: bool,
     /// Where to clear the "still owes a rebuild" marker once a generation
     /// finishes (#1125).
     ledger: Option<Arc<dyn DeferredReindexLedger>>,
+}
+
+impl AutomaticTenantState {
+    /// Records that the pending generation owes `context`'s manifest its
+    /// rebuild. A request without a manifest owes no marker.
+    fn owe_manifest(&mut self, context: &DeferredReindexContext) {
+        if let Some(manifest_id) = &context.manifest_id {
+            self.owed_manifests.insert(manifest_id.clone());
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1492,6 +1509,7 @@ impl AutomaticReindexCoordinator {
             let mut tenants = self.tenants.lock().await;
             if let Some(state) = tenants.get_mut(&tenant_id) {
                 state.pending_types.extend(requested_types);
+                state.owe_manifest(&context);
                 state.context = context.clone();
                 state.options = options;
                 state.ledger = ledger.clone();
@@ -1516,6 +1534,7 @@ impl AutomaticReindexCoordinator {
                 let mut tenants = self.tenants.lock().await;
                 if let Some(state) = tenants.get_mut(&tenant_id) {
                     state.pending_types.extend(requested_types.clone());
+                    state.owe_manifest(&context);
                     state.context = context.clone();
                     state.options = options;
                     state.ledger = ledger.clone();
@@ -1544,6 +1563,7 @@ impl AutomaticReindexCoordinator {
             let mut tenants = self.tenants.lock().await;
             if let Some(state) = tenants.get_mut(&tenant_id) {
                 state.pending_types.extend(requested_types);
+                state.owe_manifest(&context);
                 state.context = context;
                 state.options = options;
                 state.ledger = ledger;
@@ -1553,6 +1573,7 @@ impl AutomaticReindexCoordinator {
                 tenant_id.clone(),
                 AutomaticTenantState {
                     pending_types: requested_types,
+                    owed_manifests: context.manifest_id.iter().cloned().collect(),
                     context,
                     options,
                     ledger,
@@ -1574,7 +1595,7 @@ impl AutomaticReindexCoordinator {
         _resident_permit: tokio::sync::OwnedSemaphorePermit,
     ) {
         loop {
-            let (scope, generation, context, options, ledger) = {
+            let (scope, generation, context, owed_manifests, options, ledger) = {
                 let mut tenants = self.tenants.lock().await;
                 let Some(state) = tenants.get_mut(&tenant_id) else {
                     return;
@@ -1604,6 +1625,9 @@ impl AutomaticReindexCoordinator {
                     scope,
                     generation,
                     state.context.clone(),
+                    // The generation covers every manifest merged into it, so
+                    // it takes all of their markers, as it takes their types.
+                    std::mem::take(&mut state.owed_manifests),
                     state.options,
                     state.ledger.clone(),
                 )
@@ -1638,6 +1662,7 @@ impl AutomaticReindexCoordinator {
                         job_id = %job_id,
                         submission = ?context.submission_id,
                         manifest = ?context.manifest_id,
+                        manifests = ?owed_manifests,
                         types = ?resource_types,
                         resources = ?resource_count,
                         "deferred reindex generation started"
@@ -1715,6 +1740,13 @@ impl AutomaticReindexCoordinator {
                         }
                     }
                 }
+                // A queued retry finishes this generation's work, so the markers
+                // it owed go with the retry and are cleared when that ends. A
+                // failure that is not retried leaves them set for a restart to
+                // resume, as does a cancellation.
+                if retry.is_some() {
+                    state.owed_manifests.extend(owed_manifests.iter().cloned());
+                }
                 if state.pending_types.is_empty() && state.pending_resources.is_empty() {
                     tenants.remove(&tenant_id);
                     false
@@ -1724,18 +1756,21 @@ impl AutomaticReindexCoordinator {
             };
             self.tenant_changed.notify_waiters();
 
-            // The rebuild this manifest owed has run — cleanly, or with
+            // The rebuild these manifests owed has run — cleanly, or with
             // resources the backend rejects on every attempt. Either way there
-            // is nothing left for a restart to resume, so the marker goes
-            // (#1125). A failure keeps it: the work is still outstanding.
+            // is nothing left for a restart to resume, so the markers go
+            // (#1125) — every one the generation covered, not only the last
+            // merged request's (#1213). A failure keeps them: the work is
+            // still outstanding.
             if matches!(
                 outcome,
                 AutomaticGenerationOutcome::Clean
                     | AutomaticGenerationOutcome::PermanentErrors { .. }
-            ) && let (Some(ledger), Some(manifest_id)) =
-                (&ledger, context.manifest_id.as_deref())
+            ) && let Some(ledger) = &ledger
             {
-                ledger.rebuild_finished(&tenant, manifest_id).await;
+                for manifest_id in &owed_manifests {
+                    ledger.rebuild_finished(&tenant, manifest_id).await;
+                }
             }
 
             #[cfg(test)]
@@ -3406,6 +3441,168 @@ mod tests {
 
         assert_eq!(backend.count_calls.load(Ordering::SeqCst), 1);
         assert_eq!(backend.write_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Records every marker the coordinator clears, in order (#1213).
+    #[derive(Default)]
+    struct RecordingLedger {
+        cleared: parking_lot::Mutex<Vec<(String, String)>>,
+    }
+
+    impl RecordingLedger {
+        /// The manifests cleared so far, sorted.
+        fn cleared(&self) -> Vec<String> {
+            let mut cleared: Vec<_> = self
+                .cleared
+                .lock()
+                .iter()
+                .map(|(_, manifest)| manifest.clone())
+                .collect();
+            cleared.sort();
+            cleared
+        }
+
+        /// Waits until `count` markers were cleared. The clear runs after the
+        /// tenant entry is gone, so an idle coordinator does not imply it.
+        async fn await_cleared(&self, count: usize) -> Vec<String> {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while self.cleared.lock().len() < count {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!("expected {count} cleared markers, got {:?}", self.cleared())
+            });
+            self.cleared()
+        }
+    }
+
+    #[async_trait]
+    impl DeferredReindexLedger for RecordingLedger {
+        async fn rebuild_finished(&self, tenant: &TenantContext, manifest_id: &str) {
+            self.cleared
+                .lock()
+                .push((tenant.tenant_id().to_string(), manifest_id.to_string()));
+        }
+    }
+
+    fn manifest_context(manifest_id: &str) -> DeferredReindexContext {
+        DeferredReindexContext {
+            submission_id: Some("submission-1213".to_string()),
+            manifest_id: Some(manifest_id.to_string()),
+        }
+    }
+
+    async fn await_write_calls(backend: &ControlledBackend, count: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while backend.write_calls.load(Ordering::SeqCst) < count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("controlled backend did not reach the expected writes");
+    }
+
+    /// #1213: manifests merged into one pending generation each owe a
+    /// rebuild, and that generation clears every one of their markers — not
+    /// only the marker of the last request merged into it.
+    #[tokio::test]
+    async fn merged_manifests_all_clear_their_markers() {
+        let (backend, mut events) = ControlledBackend::new(Vec::new(), 0);
+        let op = controlled_operation(backend.clone());
+        let ledger = Arc::new(RecordingLedger::default());
+        let hook = ReindexOnFinish::new(op.clone()).with_ledger(ledger.clone());
+        let tenant = named_tenant("ledger-merge");
+
+        hook.reindex_types_with_context(
+            &tenant,
+            vec!["Patient".to_string()],
+            manifest_context("m-1"),
+        )
+        .await;
+        await_controlled_write(&mut events, "ledger-merge", "Patient").await;
+        // Generation 0 is running, so these two merge into generation 1.
+        hook.reindex_types_with_context(
+            &tenant,
+            vec!["Observation".to_string()],
+            manifest_context("m-2"),
+        )
+        .await;
+        hook.reindex_types_with_context(
+            &tenant,
+            vec!["Condition".to_string()],
+            manifest_context("m-3"),
+        )
+        .await;
+        assert!(ledger.cleared().is_empty());
+
+        backend.write_gate.add_permits(1);
+        assert_eq!(ledger.await_cleared(1).await, vec!["m-1"]);
+        backend.write_gate.add_permits(2);
+        await_automatic_idle(&op).await;
+
+        assert_eq!(ledger.await_cleared(3).await, vec!["m-1", "m-2", "m-3"]);
+        assert_eq!(op.list_jobs().len(), 2, "m-2 and m-3 shared one generation");
+        assert!(
+            ledger
+                .cleared
+                .lock()
+                .iter()
+                .all(|(tenant, _)| tenant == "ledger-merge")
+        );
+    }
+
+    /// A generation that fails and queues a retry hands its markers to the
+    /// retry: none is cleared by the failure, and all are once the retry
+    /// ends clean.
+    #[tokio::test]
+    async fn owed_manifests_survive_a_retried_failure() {
+        let (backend, mut events) = ControlledBackend::new(Vec::new(), 0);
+        let op = controlled_operation(backend.clone());
+        let ledger = Arc::new(RecordingLedger::default());
+        let hook = ReindexOnFinish::new(op.clone()).with_ledger(ledger.clone());
+        let tenant = named_tenant("ledger-retry");
+
+        hook.reindex_types_with_context(
+            &tenant,
+            vec!["Patient".to_string()],
+            manifest_context("m-0"),
+        )
+        .await;
+        await_controlled_write(&mut events, "ledger-retry", "Patient").await;
+        hook.reindex_types_with_context(
+            &tenant,
+            vec!["Observation".to_string()],
+            manifest_context("m-1"),
+        )
+        .await;
+        hook.reindex_types_with_context(
+            &tenant,
+            vec!["Condition".to_string()],
+            manifest_context("m-2"),
+        )
+        .await;
+
+        backend.write_gate.add_permits(1);
+        assert_eq!(ledger.await_cleared(1).await, vec!["m-0"]);
+
+        // The merged generation's first write fails transiently, so it ends
+        // Failed and queues a retry of only that resource.
+        backend.failing_writes.store(1, Ordering::SeqCst);
+        backend.write_gate.add_permits(2);
+        await_write_calls(&backend, 4).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            ledger.cleared(),
+            vec!["m-0"],
+            "a failed generation must not clear the markers it owed"
+        );
+
+        backend.write_gate.add_permits(1);
+        await_automatic_idle(&op).await;
+        assert_eq!(ledger.await_cleared(3).await, vec!["m-0", "m-1", "m-2"]);
+        assert_eq!(op.list_jobs().len(), 3);
     }
 
     #[tokio::test]

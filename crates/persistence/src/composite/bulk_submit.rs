@@ -21,8 +21,11 @@
 //! resource and the `$reindex` repair, so the receipt reflects what is
 //! actually searchable instead of claiming `success` for it. `finish_manifest`
 //! and `fail_manifest` themselves only delegate to the primary now.
-//! `rollback_change` gets the mirror-image treatment so an aborted
-//! submission's reverts reach the secondary too.
+//! `rollback_change` gets the mirror-image treatment so a rolled-back
+//! change reaches the secondary too: a reverted create is deleted there, a
+//! reverted update is re-synced from the primary. Aborting a submission is
+//! not a rollback — `abort_submission` only moves state, the primary keeps
+//! what was ingested, and so does the secondary.
 //!
 //! Syncing before the receipt (rather than per entry or per file) keeps the
 //! ingest engine untouched and the cost linear: one read + one batched sync
@@ -52,6 +55,17 @@
 //! holding the manifest open indefinitely. Deployments that want search to be
 //! complete when the ingest ends, without this post-ingest pass, index during
 //! ingest instead ([`super::indexing_submit_jobs::IndexingSubmitJobs`]).
+//!
+//! With indexing deferred to a per-type rebuild after each manifest (#903),
+//! the post-ingest pass would only duplicate that rebuild, so it is switched
+//! off with [`CompositeSubmitJobs::with_ingest_sync`]`(false)` rather than by
+//! handing the worker the raw primary. The wrapper stays in the chain for
+//! everything that is not the ingest hot path — above all `rollback_change`,
+//! whose mirror to the secondaries a raw primary silently drops, leaving
+//! Elasticsearch documents for resources the primary no longer holds (#1161).
+//! The #1125 rebuild ledger (`mark_manifest_index_pending` and friends) is
+//! forwarded to the primary for the same reason: a wrapper that fell through
+//! to the trait's no-op defaults would lose the restart-resume marker.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -74,8 +88,8 @@ use crate::core::bulk_submit::{
 use crate::core::bulk_submit_publication::{ManifestPublicationResult, ManifestPublicationStatus};
 use crate::core::bulk_submit_worker::{
     BulkSubmitJobStore, IndexDrift, IngestSyncReport, ManifestFetchParams, ManifestLease,
-    ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy, SubmitFileRecord, SubmitFileRow,
-    SubmitWorkerStorage,
+    ManifestWorkerView, PendingReindex, PollTokenTarget, SubmitClaimStrategy, SubmitFileRecord,
+    SubmitFileRow, SubmitWorkerStorage,
 };
 use crate::core::storage::ResourceStorage;
 use crate::core::{ActivityCell, DailyResourceCount, ResourceCountDelta, SofRunner, TenantRecord};
@@ -96,6 +110,10 @@ pub struct CompositeSubmitJobs {
     primary: Arc<dyn BulkSubmitJobStore>,
     composite: Arc<CompositeStorage>,
     sync_page_timeout: Duration,
+    /// Whether [`SubmitWorkerStorage::sync_ingested`] pushes a finished
+    /// manifest's resources into the secondaries. Off when a deferred rebuild
+    /// indexes them instead; see [`Self::with_ingest_sync`].
+    ingest_sync: bool,
 }
 
 /// How long one page of [`SubmitWorkerStorage::sync_ingested`] may wait on the
@@ -111,7 +129,22 @@ impl CompositeSubmitJobs {
             primary,
             composite,
             sync_page_timeout: DEFAULT_SYNC_PAGE_TIMEOUT,
+            ingest_sync: true,
         }
+    }
+
+    /// Turns the post-ingest secondary sync on or off (on by default).
+    ///
+    /// Pass `false` when the worker defers indexing to a per-type rebuild
+    /// after each manifest (#903): that rebuild writes the secondaries, so
+    /// syncing every ingested resource one more time would only duplicate it.
+    /// `sync_ingested` then answers what the primary answers — an empty
+    /// report, so the rebuild still covers every type the manifest ingested.
+    /// Nothing else changes: rollbacks are still mirrored to the secondaries
+    /// (#1161), which is why this mode exists instead of using the raw primary.
+    pub fn with_ingest_sync(mut self, enabled: bool) -> Self {
+        self.ingest_sync = enabled;
+        self
     }
 
     /// Bounds each page of the post-ingest secondary sync (#1127); a page
@@ -865,7 +898,8 @@ impl BulkSubmitRollbackProvider for CompositeSubmitJobs {
                     resource_type = %change.resource_type,
                     resource_id = %change.resource_id,
                     error = %e,
-                    "secondary sync of a rollback failed; repair via $reindex"
+                    "secondary sync of a rollback failed; the secondary may still match this \
+                     resource, and $reindex cannot remove it from Elasticsearch"
                 );
             }
         }
@@ -984,6 +1018,11 @@ impl SubmitWorkerStorage for CompositeSubmitJobs {
     }
 
     async fn sync_ingested(&self, lease: &ManifestLease) -> Result<IngestSyncReport, LeaseError> {
+        if !self.ingest_sync {
+            // The deferred rebuild owns the secondaries' copy of this
+            // manifest; report whatever the primary reports on its own.
+            return self.primary.sync_ingested(lease).await;
+        }
         let pages = entry_result_pages(|continuation| async move {
             self.primary
                 .get_entry_results_page(
@@ -1096,6 +1135,30 @@ impl SubmitWorkerStorage for CompositeSubmitJobs {
         id: &SubmissionId,
     ) -> StorageResult<DateTime<Utc>> {
         self.primary.ensure_transaction_time(tenant, id).await
+    }
+
+    // #1125's rebuild ledger lives on the primary's manifest rows. Without
+    // these the trait's no-op defaults would apply: the marker would never be
+    // written and a restart would find nothing to resume.
+    async fn mark_manifest_index_pending(&self, lease: &ManifestLease) -> StorageResult<()> {
+        self.primary.mark_manifest_index_pending(lease).await
+    }
+
+    async fn clear_manifest_index_pending(
+        &self,
+        tenant: &TenantContext,
+        manifest_id: &str,
+    ) -> StorageResult<()> {
+        self.primary
+            .clear_manifest_index_pending(tenant, manifest_id)
+            .await
+    }
+
+    async fn list_manifests_awaiting_reindex(
+        &self,
+        limit: u32,
+    ) -> StorageResult<Vec<PendingReindex>> {
+        self.primary.list_manifests_awaiting_reindex(limit).await
     }
 }
 
@@ -1944,6 +2007,149 @@ mod tests {
         assert!(
             after < before,
             "the checkpoint must reach the primary: before={before} after={after}"
+        );
+    }
+
+    /// Ingests one Patient through `jobs` under a fresh claimed manifest and
+    /// returns the submission and its lease.
+    async fn ingest_one_patient(
+        sqlite: &SqliteBackend,
+        jobs: &CompositeSubmitJobs,
+        label: &str,
+        id: &str,
+    ) -> (SubmissionId, ManifestLease) {
+        let tenant = tenant();
+        let sub = SubmissionId::generate(label);
+        sqlite.create_submission(&tenant, &sub, None).await.unwrap();
+        sqlite
+            .add_manifest(&tenant, &sub, Some("http://provider/m.json"), None)
+            .await
+            .unwrap();
+        let lease = sqlite
+            .claim_next_manifest(
+                &WorkerId::new(format!("w-{label}")),
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .unwrap()
+            .expect("claimable manifest");
+        jobs.process_entries(
+            &tenant,
+            &sub,
+            &lease.manifest_id,
+            vec![NdjsonEntry::new(
+                1,
+                "Patient",
+                json!({"resourceType": "Patient", "id": id}),
+            )],
+            &BulkProcessingOptions::new(),
+        )
+        .await
+        .unwrap();
+        (sub, lease)
+    }
+
+    /// #1161: with the ingest sync off (deferred indexing), a finished
+    /// manifest pushes nothing to the secondary — the rebuild does that — and
+    /// the report is the primary's empty one, so every ingested type is still
+    /// rebuilt. A rollback is nonetheless mirrored: the rolled-back create is
+    /// deleted from the secondary, instead of surviving as an orphan.
+    #[tokio::test]
+    async fn deferred_mode_skips_the_ingest_sync_but_mirrors_a_rollback() {
+        let (sqlite, jobs, events) = harness(HashSet::new());
+        let jobs = jobs.with_ingest_sync(false);
+        let tenant = tenant();
+        let (sub, lease) = ingest_one_patient(&sqlite, &jobs, "deferred-rb", "p-def-1").await;
+
+        let report = jobs.sync_ingested(&lease).await.unwrap();
+        assert_eq!(report.synced, 0);
+        assert_eq!(report.unindexed, 0);
+        assert!(report.drift.is_empty());
+        assert!(report.rejected_types.is_empty());
+        assert!(!report.indexed_during_ingest);
+        jobs.finish_manifest(&lease).await.unwrap();
+        assert!(
+            events.lock().is_empty(),
+            "deferred mode must not sync ingested resources, got {:?}",
+            events.lock()
+        );
+
+        let changes = jobs.list_changes(&tenant, &sub, 10, 0).await.unwrap();
+        assert_eq!(changes.len(), 1);
+        assert!(
+            jobs.rollback_change(&tenant, &sub, &changes[0])
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            events.lock().clone(),
+            vec!["delete Patient/p-def-1".to_string()],
+            "a rolled-back create must be deleted from the secondary in deferred mode too"
+        );
+        // SQLite answers a read of a deleted resource with `Gone` (HTTP 410);
+        // either that or "not there" means the primary reverted the create.
+        let reread = ResourceStorage::read(sqlite.as_ref(), &tenant, "Patient", "p-def-1").await;
+        assert!(
+            matches!(
+                reread,
+                Ok(None)
+                    | Err(crate::error::StorageError::Resource(
+                        crate::error::ResourceError::Gone { .. }
+                    ))
+            ),
+            "the primary reverted the create, got {reread:?}"
+        );
+    }
+
+    /// The default mode is unchanged: the ingest sync still runs.
+    #[tokio::test]
+    async fn ingest_sync_is_on_by_default() {
+        let (sqlite, jobs, events) = harness(HashSet::new());
+        let (_sub, lease) = ingest_one_patient(&sqlite, &jobs, "default-sync", "p-on-1").await;
+        let report = jobs.sync_ingested(&lease).await.unwrap();
+        assert_eq!(report.synced, 1);
+        assert!(
+            events.lock().iter().any(|e| e.ends_with("Patient/p-on-1")),
+            "the default mode syncs ingested resources, got {:?}",
+            events.lock()
+        );
+    }
+
+    /// #1125: the rebuild ledger must reach the primary through the wrapper,
+    /// or the marker is never written and a restart has nothing to resume.
+    #[tokio::test]
+    async fn the_rebuild_ledger_reaches_the_primary() {
+        let (sqlite, jobs, _events) = harness(HashSet::new());
+        let jobs = jobs.with_ingest_sync(false);
+        let tenant = tenant();
+        let (_sub, lease) = ingest_one_patient(&sqlite, &jobs, "ledger", "p-led-1").await;
+        assert!(
+            jobs.list_manifests_awaiting_reindex(10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        jobs.mark_manifest_index_pending(&lease).await.unwrap();
+        let pending = jobs.list_manifests_awaiting_reindex(10).await.unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "the marker is on the primary's manifest row"
+        );
+        assert_eq!(pending[0].manifest_id, lease.manifest_id);
+        assert_eq!(pending[0].resource_types, vec!["Patient".to_string()]);
+        let direct = sqlite.list_manifests_awaiting_reindex(10).await.unwrap();
+        assert_eq!(direct.len(), 1, "the primary itself sees the marker");
+
+        jobs.clear_manifest_index_pending(&tenant, &lease.manifest_id)
+            .await
+            .unwrap();
+        assert!(
+            jobs.list_manifests_awaiting_reindex(10)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 }

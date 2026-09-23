@@ -10,8 +10,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use futures::StreamExt;
 use helios_fhir::FhirVersion;
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::io::BufReader;
 
 use crate::backends::s3::backend::S3Backend;
@@ -24,7 +25,8 @@ use crate::backends::s3::user_settings::settings_object_id;
 use crate::core::bulk_export::{ExportDataProvider, ExportRequest};
 use crate::core::bulk_submit::{
     BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider, CANCELLED_ABORT_REASON,
-    CancelToken, NdjsonEntry, StreamingBulkSubmitProvider, SubmissionId, SubmissionStatus,
+    CancelToken, NdjsonEntry, StreamingBulkSubmitProvider, SubmissionChange, SubmissionId,
+    SubmissionStatus,
 };
 use crate::core::history::{
     HistoryParams, InstanceHistoryProvider, SystemHistoryProvider, TypeHistoryProvider,
@@ -1013,6 +1015,249 @@ async fn bulk_submit_concurrent_ingest_preserves_order_and_writes_all() {
     }
 }
 
+/// The raw NDJSON archive is one object per batch holding every line (#1429),
+/// not one PUT per entry — the coalescing that drops a PUT per resource.
+#[tokio::test]
+async fn bulk_submit_raw_archive_is_one_object_per_batch() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+
+    let submission_id = SubmissionId::new("client-a", "sub-raw");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    let entries: Vec<NdjsonEntry> = (1..=3)
+        .map(|i| {
+            NdjsonEntry::new(
+                i,
+                "Patient",
+                json!({"resourceType": "Patient", "id": format!("r{i}")}),
+            )
+        })
+        .collect();
+    backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            entries,
+            &BulkProcessingOptions::new(),
+        )
+        .await
+        .unwrap();
+
+    let raw_puts = mock
+        .recorded_puts()
+        .into_iter()
+        .filter(|put| put.key.contains("/raw/"))
+        .count();
+    assert_eq!(
+        raw_puts, 1,
+        "the three-entry batch must archive its raw NDJSON in one object, not three"
+    );
+
+    // The resources themselves are still all stored.
+    for i in 1..=3 {
+        assert!(
+            backend
+                .read(&tenant, "Patient", &format!("r{i}"))
+                .await
+                .unwrap()
+                .is_some(),
+            "Patient/r{i} should be stored"
+        );
+    }
+}
+
+/// A batch records its rollback changes in one coalesced object, not one PUT
+/// per resource, and `list_changes` still reads every change back (#1429).
+#[tokio::test]
+async fn bulk_submit_change_log_is_one_object_per_batch() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+
+    let submission_id = SubmissionId::new("client-a", "sub-changes");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    let entries: Vec<NdjsonEntry> = (1..=3)
+        .map(|i| {
+            NdjsonEntry::new(
+                i,
+                "Patient",
+                json!({"resourceType": "Patient", "id": format!("c{i}")}),
+            )
+        })
+        .collect();
+    backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            entries,
+            &BulkProcessingOptions::new(),
+        )
+        .await
+        .unwrap();
+
+    let change_puts = mock
+        .recorded_puts()
+        .into_iter()
+        .filter(|put| put.key.contains("/changes/"))
+        .count();
+    assert_eq!(
+        change_puts, 1,
+        "the three-entry batch must record its changes in one object, not three"
+    );
+
+    let changes = backend
+        .list_changes(&tenant, &submission_id, 10, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        changes.len(),
+        3,
+        "all three changes must be readable back from the coalesced object"
+    );
+}
+
+/// `load_changes` reads both shapes under the `changes/` prefix: the coalesced
+/// batch array (#1429) and a legacy single-change object — such as one the
+/// rollback trait's `record_change` still writes for composite backends.
+#[tokio::test]
+async fn bulk_submit_change_log_reads_batch_and_legacy_objects() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+
+    let submission_id = SubmissionId::new("client-a", "sub-mixed");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    // A batch writes the coalesced array form.
+    let entries: Vec<NdjsonEntry> = (1..=2)
+        .map(|i| {
+            NdjsonEntry::new(
+                i,
+                "Patient",
+                json!({"resourceType": "Patient", "id": format!("m{i}")}),
+            )
+        })
+        .collect();
+    backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            entries,
+            &BulkProcessingOptions::new(),
+        )
+        .await
+        .unwrap();
+
+    // A single change written through the trait method takes the legacy shape.
+    let legacy = SubmissionChange::create(&manifest.manifest_id, "Observation", "legacy-1", "1");
+    backend
+        .record_change(&tenant, &submission_id, &legacy)
+        .await
+        .unwrap();
+
+    let changes = backend
+        .list_changes(&tenant, &submission_id, 10, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        changes.len(),
+        3,
+        "both the two-change batch object and the one legacy object must be read"
+    );
+    assert!(
+        changes.iter().any(|c| c.resource_id == "legacy-1"),
+        "the legacy single-change object must be read back"
+    );
+    assert!(
+        changes.iter().any(|c| c.resource_id == "m1"),
+        "the coalesced batch changes must be read back"
+    );
+}
+
+/// A batch with two entries for the same resource id is order-dependent
+/// (last write wins), so it ingests serially even with concurrency enabled —
+/// the concurrent path would race them to a non-deterministic result (#945).
+#[tokio::test]
+async fn bulk_submit_same_id_entries_stay_ordered() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+
+    let submission_id = SubmissionId::new("client-a", "sub-dup");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    // Same id, different content: the second entry must be the one that lands.
+    let entries = vec![
+        NdjsonEntry::new(
+            1,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "dup", "gender": "male"}),
+        ),
+        NdjsonEntry::new(
+            2,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "dup", "gender": "female"}),
+        ),
+    ];
+
+    let results = backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            entries,
+            &BulkProcessingOptions::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 2);
+
+    let stored = backend
+        .read(&tenant, "Patient", "dup")
+        .await
+        .unwrap()
+        .expect("the resource is stored");
+    assert_eq!(
+        stored.content()["gender"],
+        "female",
+        "the last write in the batch must win"
+    );
+}
+
 /// Two output files of one manifest, both starting at line 1, must each keep
 /// their own entry result and raw archive (issue #457).
 ///
@@ -1187,12 +1432,13 @@ async fn bulk_submit_entry_results_are_keyed_by_their_output_file() {
     );
 
     // The raw NDJSON archive is discriminated too, so the auditable copy of the
-    // first file's payload is not replaced by the second's.
+    // first file's payload is not replaced by the second's. Coalesced to one
+    // batch object per file (#1429), keyed by the batch's first line.
     let raw_keys: Vec<String> = mock
         .recorded_puts()
         .into_iter()
         .map(|put| put.key)
-        .filter(|key| key.contains("/raw/") && key.ends_with("line-1.ndjson"))
+        .filter(|key| key.contains("/raw/") && key.ends_with("batch-1.ndjson"))
         .collect();
     assert_eq!(raw_keys.len(), 2, "one raw archive put per file");
     assert_ne!(
@@ -1742,18 +1988,27 @@ async fn resource_scan_hook_returns_the_tenants_live_resources() {
     let scan = backend
         .resource_scan()
         .expect("standalone S3 resolves canonicals by scan");
-    let libraries = scan.scan_resources(&t, "Library").await.expect("scan");
+    let libraries: Vec<Value> = scan
+        .scan_resources(&t, "Library")
+        .await
+        .expect("scan")
+        .map(|r| r.expect("scanned resource"))
+        .collect()
+        .await;
     let urls: Vec<&str> = libraries
         .iter()
         .filter_map(|r| r.get("url").and_then(|u| u.as_str()))
         .collect();
     assert_eq!(urls, ["http://example.org/Library/lib-1"]);
-    assert!(
-        scan.scan_resources(&tenant("tenant-b"), "Library")
-            .await
-            .expect("scan")
-            .is_empty()
-    );
+
+    let other_tenant: Vec<Value> = scan
+        .scan_resources(&tenant("tenant-b"), "Library")
+        .await
+        .expect("scan")
+        .map(|r| r.expect("scanned resource"))
+        .collect()
+        .await;
+    assert!(other_tenant.is_empty());
 }
 
 #[tokio::test]

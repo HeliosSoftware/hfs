@@ -1152,6 +1152,150 @@ pub fn create_bundle_from_resources_for_version(
     }
 }
 
+/// Precomputed compartment filter built from patient and group references.
+///
+/// Separates the one-time setup (absent-target validation, group member
+/// resolution, patient-set construction) from the per-resource membership
+/// test so the streaming path can validate once — against the eagerly-loaded
+/// Patient/Group documents — then apply the filter one document at a time
+/// without materialising the full corpus.
+pub struct CompartmentFilter {
+    targets: std::collections::HashSet<String>,
+    group_refs: Vec<String>,
+    fhir_version: FhirVersion,
+}
+
+impl CompartmentFilter {
+    /// Builds the filter from pre-loaded supporting resources (all Patient and
+    /// Group documents that the compartment references require).
+    ///
+    /// Validates that every patient and group reference resolves to a resource
+    /// in `supporting`, then constructs the effective `Patient/{id}` target set.
+    /// Errors identically to [`filter_resources_by_patient_and_group`].
+    pub fn build(
+        patient_refs: &[String],
+        group_refs: &[String],
+        supporting: &[serde_json::Value],
+        fhir_version: FhirVersion,
+    ) -> Result<Self, SofError> {
+        use std::collections::HashSet;
+
+        let mut absent: Vec<String> = Vec::new();
+        for r in patient_refs {
+            let canonical = if r.starts_with("Patient/") {
+                r.clone()
+            } else {
+                format!("Patient/{}", r)
+            };
+            let id = canonical
+                .strip_prefix("Patient/")
+                .and_then(|s| s.split('/').next());
+            let found = id
+                .map(|id| {
+                    supporting.iter().any(|res| {
+                        res.get("resourceType").and_then(|v| v.as_str()) == Some("Patient")
+                            && res.get("id").and_then(|v| v.as_str()) == Some(id)
+                    })
+                })
+                .unwrap_or(false);
+            if !found {
+                absent.push(canonical);
+            }
+        }
+        for g in group_refs {
+            let canonical = if g.starts_with("Group/") {
+                g.clone()
+            } else {
+                format!("Group/{}", g)
+            };
+            let id = canonical
+                .strip_prefix("Group/")
+                .and_then(|s| s.split('/').next());
+            let found = id
+                .map(|id| {
+                    supporting.iter().any(|res| {
+                        res.get("resourceType").and_then(|v| v.as_str()) == Some("Group")
+                            && res.get("id").and_then(|v| v.as_str()) == Some(id)
+                    })
+                })
+                .unwrap_or(false);
+            if !found {
+                absent.push(canonical);
+            }
+        }
+        if !absent.is_empty() {
+            return Err(SofError::ReferencedResourceNotFound(format!(
+                "{} not found in supplied resources",
+                absent.join(", ")
+            )));
+        }
+
+        let mut targets: HashSet<String> = patient_refs
+            .iter()
+            .map(|r| {
+                if r.starts_with("Patient/") {
+                    r.clone()
+                } else {
+                    format!("Patient/{}", r)
+                }
+            })
+            .collect();
+
+        if !group_refs.is_empty() {
+            targets.extend(compartment::resolve_group_members_to_patient_refs(
+                group_refs, supporting,
+            ));
+        }
+
+        Ok(Self {
+            targets,
+            group_refs: group_refs.to_vec(),
+            fhir_version,
+        })
+    }
+
+    /// Returns `true` when the filter has no effective patient targets.
+    ///
+    /// This happens when all supplied groups resolved to zero Patient members.
+    /// The targets themselves were present (they passed absent-target validation),
+    /// so this is an empty-but-valid result: every resource fails the filter.
+    pub fn is_empty(&self) -> bool {
+        self.targets.is_empty()
+    }
+
+    /// Tests whether `resource` is in the effective patient compartment.
+    ///
+    /// A Group whose `Group/{id}` was requested directly is a first-class
+    /// compartment member and skips the FHIRPath scan. Every other resource —
+    /// *including* a Group that was not requested directly — goes through
+    /// [`compartment::resource_in_patient_compartment`]. That fall-through
+    /// matters for Group specifically: `Group` is in the patient
+    /// CompartmentDefinition via `member`, so a Group listing a target patient
+    /// as a member is in that patient's compartment even though it was never
+    /// named in `group_refs`.
+    pub fn apply(&self, resource: &serde_json::Value) -> Result<bool, SofError> {
+        if self.targets.is_empty() {
+            return Ok(false);
+        }
+
+        if resource.get("resourceType").and_then(|v| v.as_str()) == Some("Group")
+            && resource
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|id| {
+                    self.group_refs
+                        .iter()
+                        .any(|g| g == &format!("Group/{}", id) || g == id)
+                })
+                .unwrap_or(false)
+        {
+            return Ok(true);
+        }
+
+        compartment::resource_in_patient_compartment(resource, &self.targets, self.fhir_version)
+    }
+}
+
 /// Filters raw FHIR resource JSON by patient and/or group references using
 /// the FHIR `CompartmentDefinition-patient` spec data.
 ///
@@ -1184,119 +1328,21 @@ pub fn filter_resources_by_patient_and_group(
     group_refs: &[String],
     fhir_version: FhirVersion,
 ) -> Result<Vec<serde_json::Value>, SofError> {
-    use std::collections::HashSet;
-
     if patient_refs.is_empty() && group_refs.is_empty() {
         return Ok(resources);
     }
-
-    // Absent-target detection: any `patient` / `group` reference that
-    // isn't represented by a resource in the supplied bundle is a hard
-    // error per the SoF v2 spec error table.
-    let mut absent: Vec<String> = Vec::new();
-    for r in patient_refs {
-        let canonical = if r.starts_with("Patient/") {
-            r.clone()
-        } else {
-            format!("Patient/{}", r)
-        };
-        let id = canonical
-            .strip_prefix("Patient/")
-            .and_then(|s| s.split('/').next());
-        let found = id
-            .map(|id| {
-                resources.iter().any(|res| {
-                    res.get("resourceType").and_then(|v| v.as_str()) == Some("Patient")
-                        && res.get("id").and_then(|v| v.as_str()) == Some(id)
-                })
-            })
-            .unwrap_or(false);
-        if !found {
-            absent.push(canonical);
-        }
-    }
-    for g in group_refs {
-        let canonical = if g.starts_with("Group/") {
-            g.clone()
-        } else {
-            format!("Group/{}", g)
-        };
-        let id = canonical
-            .strip_prefix("Group/")
-            .and_then(|s| s.split('/').next());
-        let found = id
-            .map(|id| {
-                resources.iter().any(|res| {
-                    res.get("resourceType").and_then(|v| v.as_str()) == Some("Group")
-                        && res.get("id").and_then(|v| v.as_str()) == Some(id)
-                })
-            })
-            .unwrap_or(false);
-        if !found {
-            absent.push(canonical);
-        }
-    }
-    if !absent.is_empty() {
-        return Err(SofError::ReferencedResourceNotFound(format!(
-            "{} not found in supplied resources",
-            absent.join(", ")
-        )));
-    }
-
-    // Build the effective patient-compartment set: explicit patient refs +
-    // patient refs resolved from supplied groups. Both forms are
-    // canonicalised to `Patient/{id}` so downstream comparisons don't
-    // double-handle the prefix.
-    let mut targets: HashSet<String> = patient_refs
-        .iter()
-        .map(|r| {
-            if r.starts_with("Patient/") {
-                r.clone()
-            } else {
-                format!("Patient/{}", r)
-            }
-        })
-        .collect();
-
-    if !group_refs.is_empty() {
-        targets.extend(compartment::resolve_group_members_to_patient_refs(
-            group_refs, &resources,
-        ));
-    }
-
-    // No effective patient targets (e.g. supplied Group resolved to zero
-    // Patient members). The targets themselves are present (they got past
-    // the absent-target check above), so this is an empty-but-valid result.
-    if targets.is_empty() {
+    let filter = CompartmentFilter::build(patient_refs, group_refs, &resources, fhir_version)?;
+    if filter.is_empty() {
         return Ok(Vec::new());
     }
-
-    let mut filtered = Vec::with_capacity(resources.len());
-    for resource in resources.into_iter() {
-        // Group resources are first-class compartment members when their
-        // `Group/{id}` was requested directly (i.e. not via member
-        // resolution). Skip the FHIRPath scan for Group itself.
-        if resource.get("resourceType").and_then(|v| v.as_str()) == Some("Group")
-            && resource
-                .get("id")
-                .and_then(|v| v.as_str())
-                .map(|id| {
-                    group_refs
-                        .iter()
-                        .any(|g| g == &format!("Group/{}", id) || g == id)
-                })
-                .unwrap_or(false)
-        {
-            filtered.push(resource);
-            continue;
-        }
-
-        if compartment::resource_in_patient_compartment(&resource, &targets, fhir_version)? {
-            filtered.push(resource);
-        }
-    }
-
-    Ok(filtered)
+    resources
+        .into_iter()
+        .filter_map(|r| match filter.apply(&r) {
+            Ok(true) => Some(Ok(r)),
+            Ok(false) => None,
+            Err(e) => Some(Err(e)),
+        })
+        .collect()
 }
 
 /// Filters raw FHIR resource JSON by their `meta.lastUpdated` timestamp,

@@ -1562,6 +1562,29 @@ mod fast_path_tests {
         let q = SearchQuery::new("Encounter");
         assert!(fast_index_pred(&q, None, IndexLayout::Denormalized, false).is_none());
     }
+
+    /// A repeated parameter is now one membership test over the occurrences'
+    /// `INTERSECT` (#1416). A set operation is still not a single row predicate,
+    /// so the page keeps taking the general path — exactly as it did when the
+    /// same parameter was two ANDed semi-joins.
+    #[test]
+    fn refused_for_a_repeated_parameter() {
+        let q = date_query().with_parameter(SearchParameter {
+            name: "date".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: vec![SearchValue::new(SearchPrefix::Le, "2020-01-01")],
+            chain: vec![],
+            components: vec![],
+        });
+        let filter = filter_of(&q);
+
+        assert!(filter.contains(" INTERSECT "), "{filter}");
+        assert!(
+            fast_index_pred(&q, Some(&filter), IndexLayout::Denormalized, false).is_none(),
+            "{filter}"
+        );
+    }
 }
 
 #[cfg(test)]

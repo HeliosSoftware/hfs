@@ -48,6 +48,13 @@ pub struct AuthMiddlewareState {
     /// operation. In `header_only` mode this is `false` and the path is used
     /// verbatim.
     pub tenant_url_routing: bool,
+    /// Browser login sessions for the web UI (issue #1449). When set, a
+    /// request that carries the UI session cookie and **no** `Authorization`
+    /// header has the session's access token injected as its bearer before
+    /// validation, so the pages' own browser-originated FHIR calls are
+    /// authenticated with no change to the validation, scope or audit path.
+    /// `None` when the interactive login is not configured.
+    pub sessions: Option<Arc<helios_auth::SessionStore>>,
 }
 
 /// Paths that are exempt from authentication.
@@ -68,6 +75,25 @@ const EXEMPT_PATHS: &[&str] = &[
 fn is_exempt_path(path: &str) -> bool {
     let path = path.trim_end_matches('/');
     EXEMPT_PATHS.contains(&path)
+}
+
+/// The bearer a web-UI session stands for, when this request carries a valid
+/// session cookie, sessions are configured, and the request is not cross-site
+/// (issue #1449). `None` otherwise — including when the session's access
+/// token has expired and could not be refreshed, which drops the session.
+async fn session_bearer(
+    auth_state: &AuthMiddlewareState,
+    headers: &axum::http::HeaderMap,
+) -> Option<String> {
+    let sessions = auth_state.sessions.as_ref()?;
+    if helios_auth::is_cross_site(headers) {
+        return None;
+    }
+    let session_id = helios_auth::cookie_value(headers, helios_auth::SESSION_COOKIE)?;
+    match sessions.access_token(&session_id).await {
+        helios_auth::AccessOutcome::Token(token) => Some(format!("Bearer {token}")),
+        helios_auth::AccessOutcome::NoSession => None,
+    }
 }
 
 /// Authentication middleware.
@@ -95,10 +121,29 @@ pub async fn auth_middleware(
     let auth_header = request
         .headers()
         .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    // A browser signed in through the web UI carries a session cookie, not a
+    // bearer (#1449). Turn a valid session into the bearer it stands for and
+    // let the normal validation below run on it. Only when the request sent no
+    // `Authorization` of its own — an explicit bearer always wins — and never
+    // for a cross-site request, so another origin cannot ride the cookie.
+    let auth_header = match auth_header {
+        Some(h) => Some(h),
+        None => match session_bearer(&auth_state, request.headers()).await {
+            Some(bearer) => {
+                if let Ok(value) = bearer.parse() {
+                    request.headers_mut().insert(header::AUTHORIZATION, value);
+                }
+                Some(bearer)
+            }
+            None => None,
+        },
+    };
 
     let auth_header = match auth_header {
-        Some(h) => h.to_string(),
+        Some(h) => h,
         None => {
             if !auth_state
                 .audit_exclusion_filter

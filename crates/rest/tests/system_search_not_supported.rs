@@ -436,6 +436,7 @@ mod with_auth {
             audit_source_observer: "test".to_string(),
             audit_exclusion_filter: ExclusionFilter::new(Vec::new()),
             tenant_url_routing: false,
+            sessions: None,
         });
         let app = helios_rest::create_app_with_auth(
             sqlite_backend(),
