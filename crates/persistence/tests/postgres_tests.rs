@@ -21445,6 +21445,453 @@ mod postgres_integration {
         }
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum IndependentShutdown {
+        Cancel,
+        LeaseLoss,
+    }
+
+    struct IndependentShutdownFetcher {
+        manifest: helios_persistence::core::RemoteManifest,
+        readers: std::sync::Mutex<std::collections::HashMap<String, tokio::io::DuplexStream>>,
+    }
+
+    #[async_trait::async_trait]
+    impl helios_persistence::core::SubmitInputFetcher for IndependentShutdownFetcher {
+        async fn fetch_manifest(
+            &self,
+            _url: &str,
+            _request_headers: &[(String, String)],
+            _oauth_metadata_urls: &[String],
+            _encryption_key: Option<&serde_json::Value>,
+        ) -> helios_persistence::error::StorageResult<helios_persistence::core::RemoteManifest>
+        {
+            Ok(self.manifest.clone())
+        }
+
+        async fn open_file_stream(
+            &self,
+            url: &str,
+            _request_headers: &[(String, String)],
+            _requires_access_token: bool,
+            _oauth_metadata_urls: &[String],
+            _encryption_key: Option<&serde_json::Value>,
+        ) -> helios_persistence::error::StorageResult<(
+            Box<dyn tokio::io::AsyncBufRead + Send + Unpin>,
+            Option<u64>,
+        )> {
+            let reader = self
+                .readers
+                .lock()
+                .unwrap()
+                .remove(url)
+                .unwrap_or_else(|| panic!("unexpected or duplicate stream open: {url}"));
+            Ok((Box::new(tokio::io::BufReader::new(reader)), None))
+        }
+    }
+
+    struct IndependentCommitObserver {
+        committed: tokio::sync::mpsc::UnboundedSender<(String, u64, u64)>,
+    }
+
+    impl helios_persistence::core::WriteObserver for IndependentCommitObserver {
+        fn on_write(&self, event: &helios_persistence::core::WriteEvent) {
+            if let helios_persistence::core::WriteEvent::Counts {
+                resource_type,
+                created,
+                updated,
+                ..
+            } = event
+            {
+                let _ = self
+                    .committed
+                    .send((resource_type.clone(), *created, *updated));
+            }
+        }
+    }
+
+    async fn wait_for_resource_lock(observer: &tokio_postgres::Client, blocker_pid: i32) -> String {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            observer
+                .batch_execute("SELECT pg_stat_clear_snapshot()")
+                .await
+                .unwrap();
+            let rows = observer
+                .query(
+                    "SELECT query FROM pg_stat_activity
+                     WHERE datname = current_database()
+                       AND pid <> $1
+                       AND state = 'active'
+                       AND wait_event_type = 'Lock'",
+                    &[&blocker_pid],
+                )
+                .await
+                .unwrap();
+            let last: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
+            if let Some(query) = last
+                .iter()
+                .find(|query| query.to_ascii_lowercase().contains("resources"))
+            {
+                return query.clone();
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "worker query never waited on the resources blocker; last={last:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn assert_independent_shutdown_state(
+        observer: &tokio_postgres::Client,
+        tenant_id: &str,
+        submission: &helios_persistence::core::SubmissionId,
+        manifest_id: &str,
+        expected_ids: &[&str],
+    ) {
+        let resource_rows = observer
+            .query(
+                "SELECT id FROM resources WHERE tenant_id = $1 ORDER BY id",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap();
+        let actual_ids: Vec<String> = resource_rows.iter().map(|row| row.get(0)).collect();
+        assert_eq!(
+            actual_ids,
+            expected_ids
+                .iter()
+                .map(|id| (*id).to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_bulk_submit_table_count(
+            observer,
+            "resource_history",
+            tenant_id,
+            expected_ids.len() as i64,
+        )
+        .await;
+        assert_bulk_submit_table_count(
+            observer,
+            "bulk_entry_results",
+            tenant_id,
+            expected_ids.len() as i64,
+        )
+        .await;
+        assert_bulk_submit_table_count(
+            observer,
+            "bulk_submission_changes",
+            tenant_id,
+            expected_ids.len() as i64,
+        )
+        .await;
+
+        let rows = observer
+            .query(
+                "SELECT file_url, line_number, resource_id, created, outcome
+                   FROM bulk_entry_results
+                  WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
+                    AND manifest_id = $4
+                  ORDER BY resource_id",
+                &[
+                    &tenant_id,
+                    &submission.submitter.as_str(),
+                    &submission.submission_id.as_str(),
+                    &manifest_id,
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), expected_ids.len());
+        for row in rows {
+            let resource_id: String = row.get("resource_id");
+            assert!(expected_ids.contains(&resource_id.as_str()));
+            assert!(row.get::<_, String>("file_url").starts_with("test://"));
+            assert!(row.get::<_, i32>("line_number") >= 1);
+            assert_eq!(row.get::<_, Option<bool>>("created"), Some(true));
+            assert_eq!(row.get::<_, String>("outcome"), "success");
+        }
+
+        let counters = observer
+            .query_one(
+                "SELECT total_entries, processed_entries, failed_entries, skipped_entries
+                   FROM bulk_manifests
+                  WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
+                    AND manifest_id = $4",
+                &[
+                    &tenant_id,
+                    &submission.submitter.as_str(),
+                    &submission.submission_id.as_str(),
+                    &manifest_id,
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(counters.get::<_, i32>(0), expected_ids.len() as i32);
+        assert_eq!(counters.get::<_, i32>(1), expected_ids.len() as i32);
+        assert_eq!(counters.get::<_, i32>(2), 0);
+        assert_eq!(counters.get::<_, i32>(3), 0);
+    }
+
+    async fn run_independent_shutdown_case(case: IndependentShutdown) {
+        use helios_persistence::backends::local_fs::LocalFsOutputStore;
+        use helios_persistence::core::{
+            BulkSubmitProvider, DefaultSubmitWorker, RemoteFile, RemoteManifest,
+            SubmitClaimStrategy, WorkerId,
+        };
+        use tokio::io::AsyncWriteExt;
+
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let backend = std::sync::Arc::new(backend);
+        let control = PostgresBackend::new(PostgresConfig {
+            max_connections: 3,
+            ..backend.config().clone()
+        })
+        .await
+        .unwrap();
+        let observer = reindex_test_client_for(&dbname).await;
+        let blocker = reindex_test_client_for(&dbname).await;
+        let tenant = create_tenant(match case {
+            IndependentShutdown::Cancel => "independent-shutdown-cancel",
+            IndependentShutdown::LeaseLoss => "independent-shutdown-lease",
+        });
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        let submission = helios_persistence::core::SubmissionId::generate("independent-shutdown");
+        backend
+            .create_submission(&tenant, &submission, None)
+            .await
+            .unwrap();
+        let manifest_url = "test://independent/manifest";
+        let manifest = backend
+            .add_manifest(&tenant, &submission, Some(manifest_url), None)
+            .await
+            .unwrap();
+        let lease_duration = match case {
+            IndependentShutdown::Cancel => std::time::Duration::from_secs(12),
+            IndependentShutdown::LeaseLoss => std::time::Duration::from_secs(2),
+        };
+        let lease = claim_specific_manifest(
+            &backend,
+            &WorkerId::new("independent-primary"),
+            &submission,
+            &manifest.manifest_id,
+            lease_duration,
+        )
+        .await;
+
+        let url_a = "test://independent/a.ndjson".to_string();
+        let url_b = "test://independent/b.ndjson".to_string();
+        let (reader_a, mut writer_a) = tokio::io::duplex(4096);
+        let (reader_b, mut writer_b) = tokio::io::duplex(4096);
+        writer_a
+            .write_all(b"{\"resourceType\":\"Patient\",\"id\":\"durable-first\"}\n")
+            .await
+            .unwrap();
+        let fetcher = std::sync::Arc::new(IndependentShutdownFetcher {
+            manifest: RemoteManifest {
+                requires_access_token: false,
+                output: vec![
+                    RemoteFile {
+                        resource_type: Some("Patient".to_string()),
+                        url: url_a.clone(),
+                        count: Some(2),
+                    },
+                    RemoteFile {
+                        resource_type: Some("Patient".to_string()),
+                        url: url_b.clone(),
+                        count: Some(1),
+                    },
+                ],
+                deleted: Vec::new(),
+            },
+            readers: std::sync::Mutex::new(std::collections::HashMap::from([
+                (url_a.clone(), reader_a),
+                (url_b.clone(), reader_b),
+            ])),
+        });
+        let (commit_tx, mut commit_rx) = tokio::sync::mpsc::unbounded_channel();
+        let output_dir = tempfile::tempdir().unwrap();
+        let output = std::sync::Arc::new(
+            LocalFsOutputStore::new(output_dir.path(), "http://unused.test")
+                .with_access_token_required(false),
+        );
+        let worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            fetcher,
+            output,
+            WorkerId::new("independent-primary"),
+        )
+        .with_batch_size(1)
+        .with_file_concurrency(2)
+        .with_write_observer(Some(std::sync::Arc::new(IndependentCommitObserver {
+            committed: commit_tx,
+        })))
+        .with_independent_file_tasks();
+        let worker_task = tokio::spawn(async move { worker.run_job(lease).await });
+
+        let first_commit =
+            tokio::time::timeout(std::time::Duration::from_secs(10), commit_rx.recv())
+                .await
+                .expect("first batch did not commit")
+                .expect("commit observer closed");
+        assert_eq!(first_commit, ("Patient".to_string(), 1, 0));
+
+        // Acquiring the sole pooled connection proves the first batch and its
+        // post-commit work have released it before the table blocker is installed.
+        let pooled = tokio::time::timeout(std::time::Duration::from_secs(5), backend.get_client())
+            .await
+            .expect("primary pool was not released after the durable batch")
+            .unwrap();
+        pooled.simple_query("SELECT 1").await.unwrap();
+        drop(pooled);
+
+        blocker
+            .batch_execute("BEGIN; LOCK TABLE resources IN ACCESS EXCLUSIVE MODE")
+            .await
+            .unwrap();
+        let blocker_pid: i32 = blocker
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        writer_a
+            .write_all(b"{\"resourceType\":\"Patient\",\"id\":\"blocked-a\"}\n")
+            .await
+            .unwrap();
+        writer_b
+            .write_all(b"{\"resourceType\":\"Patient\",\"id\":\"blocked-b\"}\n")
+            .await
+            .unwrap();
+        let blocked_query = wait_for_resource_lock(&observer, blocker_pid).await;
+        assert!(blocked_query.to_ascii_lowercase().contains("resources"));
+
+        // A separate checkout must remain pending while the observed query owns
+        // the primary pool's only connection.
+        let checkout_backend = backend.clone();
+        let mut waiting_checkout = tokio::spawn(async move {
+            let client = checkout_backend.get_client().await?;
+            client.simple_query("SELECT 1").await?;
+            Ok::<(), helios_persistence::error::StorageError>(())
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), &mut waiting_checkout)
+                .await
+                .is_err(),
+            "checkout unexpectedly completed while the sole connection was lock-blocked"
+        );
+        waiting_checkout.abort();
+        let _ = waiting_checkout.await;
+
+        match case {
+            IndependentShutdown::Cancel => {
+                control
+                    .abort_submission(&tenant, &submission, "integration cancellation")
+                    .await
+                    .unwrap();
+                blocker.batch_execute("ROLLBACK").await.unwrap();
+
+                // Both already-admitted batches are cooperative and therefore
+                // finish once the database blocker is released.
+                for _ in 0..2 {
+                    tokio::time::timeout(std::time::Duration::from_secs(10), commit_rx.recv())
+                        .await
+                        .expect("admitted batch did not finish after cancellation")
+                        .expect("commit observer closed");
+                }
+                // The keeper polls submission status at most every three seconds.
+                tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                drop(writer_a);
+                drop(writer_b);
+            }
+            IndependentShutdown::LeaseLoss => {
+                let takeover = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        if let Some(lease) = control
+                            .claim_next_manifest(
+                                &WorkerId::new("independent-takeover"),
+                                std::time::Duration::from_secs(10),
+                            )
+                            .await
+                            .unwrap()
+                        {
+                            break lease;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    }
+                })
+                .await
+                .expect("expired manifest was not reclaimable");
+                assert_eq!(takeover.submission_id, submission);
+                assert_eq!(takeover.manifest_id, manifest.manifest_id);
+
+                tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                    while !worker_task.is_finished() {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .expect("worker did not force-abort children after lease loss");
+                blocker.batch_execute("ROLLBACK").await.unwrap();
+                drop(writer_a);
+                drop(writer_b);
+            }
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), worker_task)
+            .await
+            .expect("worker did not drain independent file tasks")
+            .unwrap()
+            .unwrap();
+
+        // Transaction Drop rolls back asynchronously. Retry a real query rather
+        // than treating task drain as proof that the connection is already clean.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let Ok(client) = backend.get_client().await
+                    && client.simple_query("SELECT 1").await.is_ok()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("primary pool never returned a queryable connection");
+
+        match case {
+            IndependentShutdown::Cancel => {
+                assert_independent_shutdown_state(
+                    &observer,
+                    &tenant_id,
+                    &submission,
+                    &manifest.manifest_id,
+                    &["blocked-a", "blocked-b", "durable-first"],
+                )
+                .await;
+            }
+            IndependentShutdown::LeaseLoss => {
+                assert_independent_shutdown_state(
+                    &observer,
+                    &tenant_id,
+                    &submission,
+                    &manifest.manifest_id,
+                    &["durable-first"],
+                )
+                .await;
+            }
+        }
+    }
+
+    /// #1457: independent file tasks must not strand the single PostgreSQL
+    /// connection during cooperative cancellation or forced lease-loss cleanup.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_bulk_submit_independent_files_shutdown_returns_connections() {
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        run_independent_shutdown_case(IndependentShutdown::Cancel).await;
+        run_independent_shutdown_case(IndependentShutdown::LeaseLoss).await;
+    }
+
     /// #968, PostgreSQL: cancelling mid-manifest stops at the next batch
     /// boundary and keeps what was already committed. Each batch is its own
     /// Postgres transaction, so this pins that stopping does not roll the
