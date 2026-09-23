@@ -240,7 +240,7 @@ where
         &prefer,
         &req_headers,
         &format!("Resource deleted: {resource_type}/{id}"),
-    )?;
+    );
     response
         .extensions_mut()
         .insert(helios_audit::AuditResponseContext {
@@ -372,7 +372,7 @@ where
                 &prefer,
                 &req_headers,
                 &format!("Resource deleted: {resource_type}/{}", deleted.id()),
-            )?;
+            );
             response
                 .extensions_mut()
                 .insert(helios_audit::AuditResponseContext {
@@ -389,11 +389,11 @@ where
             // "No matches or One Match: The server performs an ordinary
             // delete", which answers 204 "if the resource does not exist at
             // all" — see the handler doc.
-            delete_response(
+            Ok(delete_response(
                 &prefer,
                 &req_headers,
                 &format!("No {resource_type} matched the search criteria; nothing was deleted"),
-            )
+            ))
         }
         ConditionalDeleteResult::MultipleMatches(count) => Err(RestError::MultipleMatches {
             operation: "delete".to_string(),
@@ -406,13 +406,12 @@ where
 /// `Prefer: return=OperationOutcome` — `200` with an informational
 /// OperationOutcome carrying `message`, in the negotiated format. The same
 /// shape create, update and patch answer that preference with.
-fn delete_response(
-    prefer: &PreferHeader,
-    req_headers: &HeaderMap,
-    message: &str,
-) -> RestResult<Response> {
+///
+/// A format the server cannot produce (XML without the `xml` feature) is
+/// answered with the formatter's own refusal, `406`, not a generic `500`.
+fn delete_response(prefer: &PreferHeader, req_headers: &HeaderMap, message: &str) -> Response {
     if !prefer.is_operation_outcome() {
-        return Ok(StatusCode::NO_CONTENT.into_response());
+        return StatusCode::NO_CONTENT.into_response();
     }
     let outcome = serde_json::json!({
         "resourceType": "OperationOutcome",
@@ -423,9 +422,6 @@ fn delete_response(
         }]
     });
     let format = negotiate_format(req_headers, None).format;
-    format_resource_response(StatusCode::OK, HeaderMap::new(), &outcome, format).map_err(|_| {
-        RestError::InternalError {
-            message: "Failed to serialize response".to_string(),
-        }
-    })
+    format_resource_response(StatusCode::OK, HeaderMap::new(), &outcome, format)
+        .unwrap_or_else(|refusal| refusal)
 }

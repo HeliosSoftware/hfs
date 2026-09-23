@@ -263,6 +263,26 @@ async fn instance_delete_honours_prefer_operation_outcome() {
     assert!(ids(&server).await.is_empty());
 }
 
+/// A format the build cannot produce is refused as the formatter refuses it
+/// (`406`), not turned into a `500` — and nothing is lost: the delete ran.
+#[cfg(not(feature = "xml"))]
+#[tokio::test]
+async fn an_unproducible_format_is_406_not_500() {
+    let server = test_server().await;
+    seed(&server).await;
+
+    server
+        .delete("/Patient?identifier=mrn-1")
+        .add_header(X_TENANT_ID, tenant())
+        .add_header(PREFER, RETURN_OUTCOME)
+        .add_header(
+            axum::http::header::ACCEPT,
+            HeaderValue::from_static("application/fhir+xml"),
+        )
+        .await
+        .assert_status(StatusCode::NOT_ACCEPTABLE);
+}
+
 /// A batch entry answers what the endpoint answers, and its neighbours proceed.
 #[tokio::test]
 async fn a_batch_delete_entry_with_no_match_is_204() {
