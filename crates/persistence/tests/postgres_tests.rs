@@ -10497,7 +10497,7 @@ mod postgres_integration {
     }
 
     /// The batched full-text phase of a reindex page deletes the stale row of a
-    /// resource whose content became empty (`index_fts_content_batch`, whose
+    /// resource whose content became empty (`index_fts_content_group`, whose
     /// error mapping #1230 restored). If that delete fails, the page must not
     /// skip it — the stale row would keep matching `_text` and `_content` — but
     /// fail and be replayed per resource. The trigger rejects only the first
@@ -11283,6 +11283,645 @@ mod postgres_integration {
         // The current implementation reaches 12: three rows per page in the
         // aborted batch plus three rows per page in the full-page fallback.
         assert_eq!(search_attempts, 6);
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_reindex_page_fts_group_sparse_failure() {
+        use helios_persistence::search::ReindexTarget;
+        use helios_persistence::types::StoredResource;
+
+        let oversized_text = (0..100_000)
+            .map(|index| format!("lexeme{index:08x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        for oversized_index in [0, 150, 300] {
+            let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+            let tenant = create_tenant("reindex-fts-group-sparse");
+            let tenant_id = tenant.tenant_id().as_str();
+            let resources: Vec<StoredResource> = (0..301)
+                .map(|index| {
+                    let id = format!("group-{index:03}");
+                    let text = if index == oversized_index {
+                        oversized_text.as_str()
+                    } else {
+                        "ordinary narrative"
+                    };
+                    StoredResource::new(
+                        "Observation",
+                        &id,
+                        tenant.tenant_id().clone(),
+                        json!({
+                            "resourceType": "Observation",
+                            "id": id,
+                            "status": "final",
+                            "text": {"status": "generated", "div": format!("<div>{text}</div>")}
+                        }),
+                        FhirVersion::default(),
+                    )
+                })
+                .collect();
+
+            let client = reindex_test_client_for(&dbname).await;
+            let suffix = uuid::Uuid::new_v4().simple().to_string();
+            let fts_attempts = format!("fts_group_attempts_{suffix}");
+            let search_attempts = format!("search_group_attempts_{suffix}");
+            let fts_function = format!("count_fts_group_attempts_{suffix}");
+            let search_function = format!("count_search_group_attempts_{suffix}");
+            let fts_trigger = format!("count_fts_group_attempts_{suffix}");
+            let search_trigger = format!("count_search_group_attempts_{suffix}");
+            let transaction_probe = format!("fts_group_transactions_{suffix}");
+            let transaction_function = format!("record_fts_group_transaction_{suffix}");
+            let transaction_search_trigger = format!("record_search_group_transaction_{suffix}");
+            let transaction_fts_trigger = format!("record_fts_group_transaction_{suffix}");
+            client
+                .batch_execute(&format!(
+                    "CREATE SEQUENCE {fts_attempts};
+                 CREATE SEQUENCE {search_attempts};
+                 CREATE TABLE {transaction_probe} (source text NOT NULL, resource_id text NOT NULL, transaction_id bigint NOT NULL);
+                 CREATE FUNCTION {fts_function}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN PERFORM nextval('{fts_attempts}'); RETURN NULL; END $$;
+                 CREATE FUNCTION {search_function}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN PERFORM nextval('{search_attempts}'); RETURN NEW; END $$;
+                 CREATE FUNCTION {transaction_function}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   INSERT INTO {transaction_probe} VALUES (TG_TABLE_NAME, NEW.resource_id, txid_current());
+                   RETURN NEW;
+                 END $$;
+                 CREATE TRIGGER {fts_trigger} BEFORE INSERT ON resource_fts
+                   FOR EACH STATEMENT EXECUTE FUNCTION {fts_function}();
+                 CREATE TRIGGER {search_trigger} AFTER INSERT ON search_index
+                   FOR EACH ROW EXECUTE FUNCTION {search_function}();
+                 CREATE TRIGGER {transaction_search_trigger} AFTER INSERT ON search_index
+                   FOR EACH ROW EXECUTE FUNCTION {transaction_function}();
+                 CREATE TRIGGER {transaction_fts_trigger} AFTER INSERT ON resource_fts
+                   FOR EACH ROW EXECUTE FUNCTION {transaction_function}();"
+                ))
+                .await
+                .unwrap();
+
+            let results = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                backend.write_search_entries_page(&tenant, &resources),
+            )
+            .await
+            .expect("group recovery must release a one-connection pool");
+            assert_eq!(results.len(), resources.len());
+            assert!(
+                results.iter().all(Result::is_ok),
+                "oversized index {oversized_index}: {results:?}"
+            );
+            let fts_count: i64 = client
+                .query_one(&format!("SELECT last_value FROM {fts_attempts}"), &[])
+                .await
+                .unwrap()
+                .get(0);
+            let search_count: i64 = client
+                .query_one(&format!("SELECT last_value FROM {search_attempts}"), &[])
+                .await
+                .unwrap()
+                .get(0);
+            let failing_group_size = if oversized_index == 300 { 1 } else { 100 };
+            // PostgreSQL fires the statement trigger before evaluating the
+            // grouped SELECT, so its failed upsert counts. The failed
+            // single-row VALUES expression does not reach that trigger; its
+            // truncated retry does. Sequence values survive savepoint rollback.
+            assert_eq!(
+                fts_count,
+                4 + failing_group_size,
+                "four grouped statements plus only the failing group's resource inserts"
+            );
+            let expected_search_rows: usize =
+                results.iter().map(|result| *result.as_ref().unwrap()).sum();
+            assert_eq!(
+                search_count, expected_search_rows as i64,
+                "search rows must not be replayed"
+            );
+            let transaction_row = client
+                .query_one(
+                    &format!(
+                        "SELECT COUNT(DISTINCT transaction_id), COUNT(DISTINCT source)
+                         FROM {transaction_probe}"
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap();
+            let transaction_count: i64 = transaction_row.get(0);
+            let source_count: i64 = transaction_row.get(1);
+            assert_eq!(transaction_count, 1, "recovered page must commit once");
+            assert_eq!(source_count, 2, "probe must see both search and FTS writes");
+
+            let fts_rows: i64 = client
+                .query_one(
+                    "SELECT COUNT(*) FROM resource_fts WHERE tenant_id = $1",
+                    &[&tenant_id],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(fts_rows, 301);
+            let checkout =
+                tokio::time::timeout(std::time::Duration::from_secs(5), backend.get_client())
+                    .await
+                    .expect("the page must return the only pooled connection");
+            assert!(checkout.is_ok());
+        }
+    }
+
+    async fn reindex_fts_group_rows(
+        client: &tokio_postgres::Client,
+        tenant_id: &str,
+        table: &str,
+    ) -> Vec<String> {
+        let sql = if table == "search_index" {
+            "SELECT (to_jsonb(s) - 'id' - 'tenant_id' - 'last_updated')::text
+             FROM search_index s WHERE tenant_id = $1"
+        } else {
+            "SELECT (to_jsonb(f) - 'tenant_id')::text
+             FROM resource_fts f WHERE tenant_id = $1"
+        };
+        let mut rows: Vec<String> = client
+            .query(sql, &[&tenant_id])
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_reindex_page_fts_group_multiple_failures() {
+        use helios_persistence::search::ReindexTarget;
+        use helios_persistence::types::StoredResource;
+
+        let oversized_text = (0..100_000)
+            .map(|index| format!("lexeme{index:08x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        for (positions, failing_groups) in [([50, 150], 2), ([120, 121], 1)] {
+            let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+            let tenant = create_tenant("fts-group-multiple");
+            let reference = create_tenant("fts-group-multiple-reference");
+            let make_resources = |scoped_tenant: &TenantContext| {
+                (0..301)
+                    .map(|index| {
+                        let id = format!("multiple-{index:03}");
+                        let narrative = if positions.contains(&index) {
+                            oversized_text.as_str()
+                        } else {
+                            "ordinary narrative"
+                        };
+                        StoredResource::new(
+                            "Observation",
+                            &id,
+                            scoped_tenant.tenant_id().clone(),
+                            json!({
+                                "resourceType": "Observation",
+                                "id": id,
+                                "status": "final",
+                                "text": {
+                                    "status": "generated",
+                                    "div": format!("<div>{narrative}</div>")
+                                }
+                            }),
+                            FhirVersion::default(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let resources = make_resources(&tenant);
+            let reference_resources = make_resources(&reference);
+            let client = reindex_test_client_for(&dbname).await;
+            let suffix = uuid::Uuid::new_v4().simple().to_string();
+            let attempts = format!("fts_multi_attempts_{suffix}");
+            let function = format!("count_fts_multi_attempts_{suffix}");
+            let trigger = format!("count_fts_multi_attempts_{suffix}");
+            client
+                .batch_execute(&format!(
+                    "CREATE SEQUENCE {attempts};
+                     CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$
+                     BEGIN PERFORM nextval('{attempts}'); RETURN NULL; END $$;
+                     CREATE TRIGGER {trigger} BEFORE INSERT ON resource_fts
+                       FOR EACH STATEMENT EXECUTE FUNCTION {function}();"
+                ))
+                .await
+                .unwrap();
+
+            let results = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                backend.write_search_entries_page(&tenant, &resources),
+            )
+            .await
+            .expect("multiple oversized groups must finish with a one-connection pool");
+            assert_eq!(results.len(), resources.len());
+            assert!(results.iter().all(Result::is_ok));
+            let statement_attempts: i64 = client
+                .query_one(&format!("SELECT last_value FROM {attempts}"), &[])
+                .await
+                .unwrap()
+                .get(0);
+            // Use the same statement-trigger accounting as the sparse case:
+            // each failed group counts once, then its resource retries count.
+            assert_eq!(
+                statement_attempts,
+                4 + 100 * failing_groups,
+                "only each failing group may receive single-resource inserts"
+            );
+
+            let mut reference_results = Vec::with_capacity(reference_resources.len());
+            for resource in &reference_resources {
+                reference_results.push(backend.write_search_entries(&reference, resource).await);
+            }
+            let counts = |outcomes: &[Result<usize, StorageError>]| {
+                outcomes
+                    .iter()
+                    .map(|outcome| {
+                        outcome
+                            .as_ref()
+                            .map(|count| *count)
+                            .map_err(ToString::to_string)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(counts(&results), counts(&reference_results));
+            for table in ["search_index", "resource_fts"] {
+                assert_eq!(
+                    reindex_fts_group_rows(&client, tenant.tenant_id().as_str(), table).await,
+                    reindex_fts_group_rows(&client, reference.tenant_id().as_str(), table).await,
+                    "{table} differs from the individual writer for positions {positions:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_reindex_page_fts_group_empty_and_filtered() {
+        use helios_persistence::search::ReindexTarget;
+        use helios_persistence::types::StoredResource;
+
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenant = create_tenant("fts-group-filtered");
+        let bystander = create_tenant("fts-group-filtered-bystander");
+        let oversized_text = (0..100_000)
+            .map(|index| format!("lexeme{index:08x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut resources = vec![StoredResource::new(
+            "Patient",
+            "filtered-invalid",
+            tenant.tenant_id().clone(),
+            json!({"resourceType": "Observation", "id": "filtered-invalid"}),
+            FhirVersion::default(),
+        )];
+        for index in 0..202 {
+            let id = format!("filtered-{index:03}");
+            let content = if (100..=200).contains(&index) {
+                json!({})
+            } else if index == 201 {
+                json!({
+                    "resourceType": "Patient",
+                    "id": id,
+                    "text": {
+                        "status": "generated",
+                        "div": format!("<div>{oversized_text}</div>")
+                    }
+                })
+            } else {
+                json!({
+                    "resourceType": "Patient",
+                    "id": id,
+                    "name": [{"family": format!("Family{index:03}")}]
+                })
+            };
+            resources.push(StoredResource::new(
+                "Patient",
+                &id,
+                tenant.tenant_id().clone(),
+                content,
+                FhirVersion::default(),
+            ));
+        }
+
+        let client = reindex_test_client_for(&dbname).await;
+        for (scoped_tenant, id) in [
+            (&tenant, "filtered-100"),
+            (&tenant, "filtered-200"),
+            (&bystander, "filtered-100"),
+            (&bystander, "filtered-200"),
+        ] {
+            client
+                .execute(
+                    "INSERT INTO resource_fts
+                     (tenant_id, resource_type, resource_id, narrative_tsvector, content_tsvector)
+                     VALUES ($1, 'Patient', $2, to_tsvector('english', 'stale'), to_tsvector('english', 'stale'))",
+                    &[&scoped_tenant.tenant_id().as_str(), &id],
+                )
+                .await
+                .unwrap();
+        }
+        let bystander_before =
+            reindex_fts_group_rows(&client, bystander.tenant_id().as_str(), "resource_fts").await;
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let attempts = format!("fts_filtered_attempts_{suffix}");
+        let function = format!("count_fts_filtered_attempts_{suffix}");
+        let trigger = format!("count_fts_filtered_attempts_{suffix}");
+        client
+            .batch_execute(&format!(
+                "CREATE SEQUENCE {attempts};
+                 CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN PERFORM nextval('{attempts}'); RETURN NULL; END $$;
+                 CREATE TRIGGER {trigger} BEFORE INSERT ON resource_fts
+                   FOR EACH STATEMENT EXECUTE FUNCTION {function}();"
+            ))
+            .await
+            .unwrap();
+
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            backend.write_search_entries_page(&tenant, &resources),
+        )
+        .await
+        .expect("filtered group recovery must finish");
+        assert_eq!(results.len(), resources.len());
+        assert!(
+            results[0]
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("Search parameter extraction failed")
+        );
+        assert!(results[1..].iter().all(Result::is_ok));
+        let statement_attempts: i64 = client
+            .query_one(&format!("SELECT last_value FROM {attempts}"), &[])
+            .await
+            .unwrap()
+            .get(0);
+        // The failed grouped SELECT counts before its VALUES are evaluated;
+        // the failed single-resource VALUES attempt does not count.
+        assert_eq!(
+            statement_attempts, 3,
+            "one clean upsert, one failed group upsert, and one recovered oversized row; the all-empty group has no upsert"
+        );
+        for id in ["filtered-100", "filtered-200", "filtered-invalid"] {
+            let remaining: i64 = client
+                .query_one(
+                    "SELECT COUNT(*) FROM resource_fts
+                     WHERE tenant_id = $1 AND resource_id = $2",
+                    &[&tenant.tenant_id().as_str(), &id],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(remaining, 0, "{id} retained a stale FTS row");
+        }
+        let target_fts: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM resource_fts WHERE tenant_id = $1",
+                &[&tenant.tenant_id().as_str()],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(target_fts, 101);
+        assert_eq!(
+            reindex_fts_group_rows(&client, bystander.tenant_id().as_str(), "resource_fts").await,
+            bystander_before
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_reindex_page_fts_group_clean_boundaries() {
+        use helios_persistence::search::{ReindexSource, ReindexTarget};
+        use helios_persistence::types::StoredResource;
+
+        let core_rows = |table: &'static str| {
+            if table == "resources" {
+                "SELECT to_jsonb(r)::text FROM resources r WHERE tenant_id = $1"
+            } else {
+                "SELECT to_jsonb(h)::text FROM resource_history h WHERE tenant_id = $1"
+            }
+        };
+        for size in [0_usize, 1, 100, 101, 301] {
+            let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+            let tenant = create_tenant("fts-group-boundary");
+            let reference = create_tenant("fts-group-boundary-reference");
+            for index in 0..size {
+                let id = format!("boundary-{index:03}");
+                backend
+                    .create(
+                        &tenant,
+                        "Patient",
+                        json!({
+                            "resourceType": "Patient",
+                            "id": id,
+                            "identifier": [{
+                                "system": "http://example.org/mrn",
+                                "value": format!("MRN-{index:03}")
+                            }],
+                            "name": [{"family": format!("Family{index:03}")}],
+                            "contained": [{
+                                "resourceType": "Practitioner",
+                                "id": format!("contained-{index:03}"),
+                                "name": [{"family": format!("Contained{index:03}")}]
+                            }]
+                        }),
+                        FhirVersion::default(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let resources = if size == 0 {
+                Vec::new()
+            } else {
+                backend
+                    .fetch_resources_page(&tenant, "Patient", None, (size + 1) as u32)
+                    .await
+                    .unwrap()
+                    .resources
+            };
+            assert_eq!(resources.len(), size);
+            let client = reindex_test_client_for(&dbname).await;
+            let mut before_core = Vec::new();
+            for table in ["resources", "resource_history"] {
+                let mut rows: Vec<String> = client
+                    .query(core_rows(table), &[&tenant.tenant_id().as_str()])
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|row| row.get(0))
+                    .collect();
+                rows.sort();
+                before_core.push(rows);
+            }
+            assert_eq!(before_core[0].len(), size);
+            assert!(before_core[1].len() >= size);
+
+            let results = backend.write_search_entries_page(&tenant, &resources).await;
+            assert_eq!(results.len(), size, "size {size}: result slots");
+            assert!(
+                results.iter().all(Result::is_ok),
+                "size {size}: {results:?}"
+            );
+            for (position, table) in ["resources", "resource_history"].into_iter().enumerate() {
+                let mut after: Vec<String> = client
+                    .query(core_rows(table), &[&tenant.tenant_id().as_str()])
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|row| row.get(0))
+                    .collect();
+                after.sort();
+                assert_eq!(after, before_core[position], "size {size}: {table} changed");
+            }
+
+            let mut reference_results = Vec::with_capacity(size);
+            for resource in &resources {
+                let reference_resource = StoredResource::new(
+                    resource.resource_type(),
+                    resource.id(),
+                    reference.tenant_id().clone(),
+                    resource.content().clone(),
+                    FhirVersion::default(),
+                );
+                reference_results.push(
+                    backend
+                        .write_search_entries(&reference, &reference_resource)
+                        .await,
+                );
+            }
+            let counts = |outcomes: &[Result<usize, StorageError>]| {
+                outcomes
+                    .iter()
+                    .map(|outcome| {
+                        outcome
+                            .as_ref()
+                            .map(|count| *count)
+                            .map_err(ToString::to_string)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(counts(&results), counts(&reference_results), "size {size}");
+            for table in ["search_index", "resource_fts"] {
+                assert_eq!(
+                    reindex_fts_group_rows(&client, tenant.tenant_id().as_str(), table).await,
+                    reindex_fts_group_rows(&client, reference.tenant_id().as_str(), table).await,
+                    "size {size}: {table} differs from the individual writer"
+                );
+            }
+            if size > 0 {
+                let contained: i64 = client
+                    .query_one(
+                        "SELECT COUNT(*) FROM search_index
+                         WHERE tenant_id = $1 AND contained_type = 'Practitioner'",
+                        &[&tenant.tenant_id().as_str()],
+                    )
+                    .await
+                    .unwrap()
+                    .get(0);
+                assert!(contained > 0, "size {size}: contained rows missing");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_reindex_page_fts_group_later_other_error() {
+        use helios_persistence::search::ReindexTarget;
+        use helios_persistence::types::StoredResource;
+
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenant = create_tenant("fts-group-later-error");
+        let reference = create_tenant("fts-group-later-error-reference");
+        let make_resources = |scoped_tenant: &TenantContext| {
+            (0..101)
+                .map(|index| {
+                    let id = format!("error-{index:03}");
+                    StoredResource::new(
+                        "Patient",
+                        &id,
+                        scoped_tenant.tenant_id().clone(),
+                        json!({
+                            "resourceType": "Patient",
+                            "id": id,
+                            "name": [{"family": format!("Family{index:03}")}]
+                        }),
+                        FhirVersion::default(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let resources = make_resources(&tenant);
+        let reference_resources = make_resources(&reference);
+        let client = reindex_test_client_for(&dbname).await;
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let function = format!("reject_later_fts_group_{suffix}");
+        let trigger = format!("reject_later_fts_group_{suffix}");
+        client
+            .batch_execute(&format!(
+                "CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   IF NEW.tenant_id = '{}' AND NEW.resource_id = 'error-100' THEN
+                     RAISE EXCEPTION 'later FTS group failure';
+                   END IF;
+                   RETURN NEW;
+                 END $$;
+                 CREATE TRIGGER {trigger} BEFORE INSERT ON resource_fts
+                   FOR EACH ROW EXECUTE FUNCTION {function}();",
+                tenant.tenant_id().as_str()
+            ))
+            .await
+            .unwrap();
+
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            backend.write_search_entries_page(&tenant, &resources),
+        )
+        .await
+        .expect("later group error must release the one-connection pool");
+        assert_eq!(results.len(), resources.len());
+        for (index, result) in results.iter().enumerate() {
+            if index == 100 {
+                assert!(result.is_err(), "the target must retain its error slot");
+            } else {
+                assert!(result.is_ok(), "resource {index} must recover");
+            }
+        }
+        let checkout =
+            tokio::time::timeout(std::time::Duration::from_secs(5), backend.get_client())
+                .await
+                .expect("fallback must release the only pooled connection");
+        assert!(checkout.is_ok());
+        drop(checkout);
+
+        let mut reference_results = Vec::with_capacity(reference_resources.len());
+        for resource in &reference_resources {
+            reference_results.push(backend.write_search_entries(&reference, resource).await);
+        }
+        for index in 0..100 {
+            assert_eq!(
+                *results[index].as_ref().unwrap(),
+                *reference_results[index].as_ref().unwrap(),
+                "search row count for {index}"
+            );
+        }
+        assert_eq!(
+            reindex_fts_group_rows(&client, tenant.tenant_id().as_str(), "search_index").await,
+            reindex_fts_group_rows(&client, reference.tenant_id().as_str(), "search_index").await
+        );
+        let target_fts =
+            reindex_fts_group_rows(&client, tenant.tenant_id().as_str(), "resource_fts").await;
+        let reference_fts =
+            reindex_fts_group_rows(&client, reference.tenant_id().as_str(), "resource_fts").await;
+        assert_eq!(target_fts.len(), 100);
+        assert_eq!(reference_fts.len(), 101);
+        assert_eq!(
+            target_fts,
+            reference_fts
+                .into_iter()
+                .filter(|row| !row.contains("error-100"))
+                .collect::<Vec<_>>()
+        );
     }
 
     async fn reindex_page_fts_trigger_case(
