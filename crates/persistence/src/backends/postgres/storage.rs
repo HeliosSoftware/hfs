@@ -144,12 +144,10 @@ WHERE resource_fts.content_tsvector IS DISTINCT FROM EXCLUDED.content_tsvector \
 /// `FTS_MAX_INPUT_BYTES`, which assumes the session is still usable: true for
 /// an ordinary write, which runs without an explicit transaction. This
 /// statement runs inside the page's managed transaction, where a
-/// `program_limit_exceeded` has aborted it back to the `reindex_fts_phase`
-/// savepoint, and a grouped statement cannot say which row was too large. So
-/// nothing here truncates or retries — the page writer rolls back to that
-/// savepoint, keeping the `search_index` work already done, and replays the
-/// FTS phase one resource at a time under per-resource savepoints, truncating
-/// only the oversized ones (see
+/// `program_limit_exceeded` has aborted the current group back to its savepoint,
+/// and a grouped statement cannot say which row was too large. The page writer
+/// replays only that group under per-resource savepoints, keeping earlier FTS
+/// groups and `search_index` work, and truncates only oversized inputs (see
 /// `postgres_integration_reindex_page_recovers_oversized_fts_without_replaying_search_parameters`).
 const FTS_BATCH_UPSERT_SQL: &str = "\
 INSERT INTO resource_fts (tenant_id, resource_type, resource_id, narrative_tsvector, content_tsvector) \
@@ -171,8 +169,8 @@ WHERE resource_fts.content_tsvector IS DISTINCT FROM EXCLUDED.content_tsvector \
 /// bulk import defaults to `HFS_REINDEX_BATCH_SIZE`, whose 1,000 makes it ten
 /// statements over this same code. Nothing here bounds the bytes a group
 /// carries — the four `text[]` parameters are as large as the resources in
-/// them — and a group whose input is too large for one `to_tsvector` fails the
-/// FTS phase, which is replayed per resource and truncated there (see
+/// them — and a group whose input is too large for one `to_tsvector` fails
+/// that group, which is replayed per resource and truncated there (see
 /// [`FTS_BATCH_UPSERT_SQL`]).
 ///
 /// The three things this number trades off: the parameters one statement binds
@@ -1819,11 +1817,10 @@ impl PostgresBackend {
         //
         // Retry once against a truncated input instead. Ordinary resource
         // writes run without an explicit transaction, so their session remains
-        // usable. A page reindex does not call this inside its managed
-        // transaction at all: the batched statement fails in its own statement,
-        // PostgreSQL aborts that transaction there, the page writer rolls it
-        // back and repeats the page per resource, and this function is reached
-        // from that fallback — outside any transaction, where the truncated
+        // usable. A page reindex handles oversized vectors inside its managed
+        // transaction by rolling back and replaying only the failing group.
+        // It does not call this function there. This function is reached from
+        // the whole-page fallback outside any transaction, where the truncated
         // retry can succeed. The bundle path (`PostgresTransaction`) does not
         // write `resource_fts` at all.
         if err.code() != Some(&tokio_postgres::error::SqlState::PROGRAM_LIMIT_EXCEEDED) {
@@ -1838,122 +1835,189 @@ impl PostgresBackend {
         Ok(())
     }
 
-    /// Writes a page's full-text rows in consecutive groups of
-    /// [`FTS_BATCH_SIZE`], one statement per group.
-    ///
-    /// `resources` is the page *minus* the resources whose search-parameter
-    /// extraction failed. Those are reported per resource by the caller and
-    /// have no full-text row to rebuild, so this function never has to make an
-    /// error decision: everything it is handed is expected to be written.
-    /// Ordering, the `search_index` row counts, and the error slots all stay
-    /// with the caller too — this writes FTS rows and nothing else.
-    ///
-    /// Groups are consecutive slices of the page rather than a regathering of
-    /// it, so the statement boundaries are a function of the page alone.
-    ///
-    /// The `SearchableContent` for one group is built inside the iteration and
-    /// dropped at the end of it, so the text this holds twice (the resource
-    /// `data` the page already carries, plus the extracted narrative and
-    /// content) is bounded by [`FTS_BATCH_SIZE`] resources rather than by the
-    /// page's length.
-    ///
-    /// A resource whose content is empty is left out of the group's arrays and
-    /// its row is deleted instead, in one statement per group that has any:
-    /// the page's own `DELETE FROM resource_fts` names only the resources whose
-    /// extraction failed (#1146), so the row of an emptied resource is this
-    /// function's to remove, exactly as `index_fts_content` removes it on the
-    /// per-resource path. A group left holding only such resources issues the
-    /// delete and no upsert; a group with none issues the upsert alone.
-    ///
-    /// Every error is returned as it arrives — never truncated, never retried,
-    /// never re-split into smaller groups. A `program_limit_exceeded` is
-    /// reported as [`BatchFtsError::ProgramLimitExceeded`] so the caller can
-    /// roll back to its FTS-phase savepoint and replay the phase per resource,
-    /// truncating the oversized input there; every other error is page-fatal
-    /// and the caller re-runs the page through the per-resource path.
-    async fn index_fts_content_batch<C>(
-        &self,
+    /// Writes one FTS group. Its arrays are dropped before the caller replays
+    /// an oversized group, keeping extracted text bounded to one group.
+    async fn index_fts_content_group<C>(
         client: &C,
         tenant_id: &str,
-        resources: &[&StoredResource],
+        group: &[&StoredResource],
     ) -> Result<(), BatchFtsError>
     where
         C: deadpool_postgres::GenericClient + ?Sized,
     {
-        if !self
-            .fts_table_exists(client)
-            .await
-            .map_err(BatchFtsError::Other)?
-        {
-            return Ok(());
+        debug_assert!(!group.is_empty() && group.len() <= FTS_BATCH_SIZE);
+        let mut resource_types = Vec::with_capacity(group.len());
+        let mut resource_ids = Vec::with_capacity(group.len());
+        let mut narratives = Vec::with_capacity(group.len());
+        let mut full_contents = Vec::with_capacity(group.len());
+        let mut empty_types: Vec<&str> = Vec::new();
+        let mut empty_ids: Vec<&str> = Vec::new();
+
+        for resource in group {
+            let content = extract_searchable_content(resource.content());
+            if content.is_empty() {
+                empty_types.push(resource.resource_type());
+                empty_ids.push(resource.id());
+                continue;
+            }
+            resource_types.push(resource.resource_type().to_string());
+            resource_ids.push(resource.id().to_string());
+            narratives.push(content.narrative);
+            full_contents.push(content.full_content);
         }
 
-        for group in resources.chunks(FTS_BATCH_SIZE) {
-            let mut resource_types = Vec::with_capacity(group.len());
-            let mut resource_ids = Vec::with_capacity(group.len());
-            let mut narratives = Vec::with_capacity(group.len());
-            let mut full_contents = Vec::with_capacity(group.len());
-            let mut empty_types: Vec<&str> = Vec::new();
-            let mut empty_ids: Vec<&str> = Vec::new();
-
-            for resource in group {
-                let content = extract_searchable_content(resource.content());
-                if content.is_empty() {
-                    empty_types.push(resource.resource_type());
-                    empty_ids.push(resource.id());
-                    continue;
-                }
-                resource_types.push(resource.resource_type().to_string());
-                resource_ids.push(resource.id().to_string());
-                narratives.push(content.narrative);
-                full_contents.push(content.full_content);
-            }
-
-            if !empty_ids.is_empty() {
-                execute_cached(
-                    client,
-                    "DELETE FROM resource_fts
+        if !empty_ids.is_empty() {
+            execute_cached(
+                client,
+                "DELETE FROM resource_fts
                      WHERE tenant_id = $1
                        AND (resource_type, resource_id) IN (
                            SELECT * FROM unnest($2::text[], $3::text[])
                        )",
-                    &[&tenant_id, &empty_types, &empty_ids],
-                )
-                .await
-                .map_err(|e| {
-                    BatchFtsError::Other(internal_error(format!(
-                        "Failed to delete empty FTS index: {}",
-                        e
-                    )))
-                })?;
-            }
-
-            if resource_types.is_empty() {
-                continue;
-            }
-
-            execute_cached(
-                client,
-                FTS_BATCH_UPSERT_SQL,
-                &[
-                    &tenant_id,
-                    &resource_types,
-                    &resource_ids,
-                    &narratives,
-                    &full_contents,
-                ],
+                &[&tenant_id, &empty_types, &empty_ids],
             )
             .await
-            .map_err(|error| {
-                if error.code() == Some(&tokio_postgres::error::SqlState::PROGRAM_LIMIT_EXCEEDED) {
-                    BatchFtsError::ProgramLimitExceeded(error)
-                } else {
-                    BatchFtsError::Other(internal_error(format!(
-                        "Failed to insert FTS content: {}",
-                        error
-                    )))
-                }
+            .map_err(|e| {
+                BatchFtsError::Other(internal_error(format!(
+                    "Failed to delete empty FTS index: {}",
+                    e
+                )))
             })?;
+        }
+
+        if resource_types.is_empty() {
+            return Ok(());
+        }
+
+        execute_cached(
+            client,
+            FTS_BATCH_UPSERT_SQL,
+            &[
+                &tenant_id,
+                &resource_types,
+                &resource_ids,
+                &narratives,
+                &full_contents,
+            ],
+        )
+        .await
+        .map_err(|error| {
+            if error.code() == Some(&tokio_postgres::error::SqlState::PROGRAM_LIMIT_EXCEEDED) {
+                BatchFtsError::ProgramLimitExceeded(error)
+            } else {
+                BatchFtsError::Other(internal_error(format!(
+                    "Failed to insert FTS content: {}",
+                    error
+                )))
+            }
+        })?;
+        Ok(())
+    }
+
+    /// Saves successful groups and search-parameter writes in one transaction.
+    /// Only a group with an oversized FTS vector is replayed per resource.
+    async fn index_reindex_fts_groups(
+        &self,
+        transaction: &deadpool_postgres::Transaction<'_>,
+        tenant_id: &str,
+        resources: &[&StoredResource],
+    ) -> StorageResult<()> {
+        if resources.is_empty() || !self.fts_table_exists(transaction).await? {
+            return Ok(());
+        }
+
+        // chunks() supplies the nonempty, bounded groups required by the
+        // group helper. Release each savepoint before reusing its name.
+        for group in resources.chunks(FTS_BATCH_SIZE) {
+            reindex_fts_savepoint_command(transaction, "SAVEPOINT reindex_fts_group")
+                .await
+                .map_err(|e| {
+                    internal_error(format!("Failed to create FTS group savepoint: {e}"))
+                })?;
+
+            match Self::index_fts_content_group(transaction, tenant_id, group).await {
+                Ok(()) => {}
+                Err(BatchFtsError::Other(error)) => return Err(error),
+                Err(BatchFtsError::ProgramLimitExceeded(error)) => {
+                    reindex_fts_savepoint_command(
+                        transaction,
+                        "ROLLBACK TO SAVEPOINT reindex_fts_group",
+                    )
+                    .await
+                    .map_err(|e| {
+                        internal_error(format!(
+                            "Failed to rollback FTS group after PROGRAM_LIMIT_EXCEEDED: {e}"
+                        ))
+                    })?;
+                    tracing::debug!(
+                        "Recovering PostgreSQL reindex FTS group after PROGRAM_LIMIT_EXCEEDED: {}",
+                        error
+                    );
+
+                    for resource in group {
+                        reindex_fts_savepoint_command(
+                            transaction,
+                            "SAVEPOINT reindex_fts_resource",
+                        )
+                        .await
+                        .map_err(|e| {
+                            internal_error(format!("Failed to create FTS resource savepoint: {e}"))
+                        })?;
+
+                        let attempt = self
+                            .index_fts_content_page(
+                                transaction,
+                                tenant_id,
+                                resource.resource_type(),
+                                resource.id(),
+                                resource.content(),
+                            )
+                            .await;
+                        match attempt {
+                            Ok(()) => {}
+                            Err(PageFtsError::ProgramLimitExceeded { content, error }) => {
+                                reindex_fts_savepoint_command(
+                                    transaction,
+                                    "ROLLBACK TO SAVEPOINT reindex_fts_resource",
+                                )
+                                .await
+                                .map_err(|e| {
+                                    internal_error(format!(
+                                        "Failed to rollback FTS resource after PROGRAM_LIMIT_EXCEEDED: {e}"
+                                    ))
+                                })?;
+                                tracing::debug!(
+                                    "Retrying PostgreSQL reindex FTS resource after PROGRAM_LIMIT_EXCEEDED: {}",
+                                    error
+                                );
+                                Self::retry_truncated_fts(
+                                    transaction,
+                                    tenant_id,
+                                    resource.resource_type(),
+                                    resource.id(),
+                                    &content,
+                                )
+                                .await?;
+                            }
+                            Err(PageFtsError::Other(error)) => return Err(error),
+                        }
+                        reindex_fts_savepoint_command(
+                            transaction,
+                            "RELEASE SAVEPOINT reindex_fts_resource",
+                        )
+                        .await
+                        .map_err(|e| {
+                            internal_error(format!("Failed to release FTS resource savepoint: {e}"))
+                        })?;
+                    }
+                }
+            }
+
+            reindex_fts_savepoint_command(transaction, "RELEASE SAVEPOINT reindex_fts_group")
+                .await
+                .map_err(|e| {
+                    internal_error(format!("Failed to release FTS group savepoint: {e}"))
+                })?;
         }
 
         Ok(())
@@ -4376,7 +4440,7 @@ impl ReindexTarget for PostgresBackend {
             })?;
 
             // Every resource whose extraction succeeded reaches
-            // `index_fts_content_batch` later in this same transaction, and
+            // `index_reindex_fts_groups` later in this same transaction, and
             // that call decides each row's fate from the content: non-empty
             // content keeps the row and replaces its stored vectors in place
             // through the `idx_fts_lookup` upsert, which withholds the write
@@ -4448,129 +4512,22 @@ impl ReindexTarget for PostgresBackend {
                     .sum(),
             );
 
-            transaction
-                .batch_execute("SAVEPOINT reindex_fts_phase")
-                .await
-                .map_err(|e| {
-                    internal_error(format!("Failed to create FTS phase savepoint: {}", e))
-                })?;
             let fts_span = crate::perf::span(crate::perf::Phase::ReindexFts);
-            // One statement per group of `FTS_BATCH_SIZE` resources, instead of
-            // one per resource: the whole point of this path. The resource ids
-            // are already flattened for the page's `search_index` writes, and
-            // they are unique per page, which is what the statement's
-            // `ON CONFLICT` needs (see `FTS_BATCH_UPSERT_SQL`).
-            //
-            // The batch runs under `reindex_fts_phase`. A `to_tsvector` input
-            // over PostgreSQL's 1 MB limit aborts the transaction, but only
-            // back to that savepoint: the page's `search_index` work above it
-            // survives, and the FTS phase is replayed one resource at a time,
-            // truncating just the oversized ones (`retry_truncated_fts`).
-            // Any other failure still fails the page, which
-            // `write_reindex_page_individually` repeats per resource.
+            // Resources are unique in a fetched page, as required by the
+            // grouped upsert's ON CONFLICT. Search-index writes above each
+            // group savepoint survive a group rollback. A non-size FTS failure
+            // still abandons this transaction for the whole-page individual path.
             let fts_batch: Vec<&StoredResource> = resources
                 .iter()
                 .zip(&extraction_errors)
                 .filter(|(_, error)| error.is_none())
                 .map(|(resource, _)| resource)
                 .collect();
-            let oversized = match self
-                .index_fts_content_batch(&transaction, tenant_id, &fts_batch)
-                .await
-            {
-                Ok(()) => None,
-                Err(BatchFtsError::ProgramLimitExceeded(error)) => Some(error),
-                Err(BatchFtsError::Other(error)) => return Err(error),
-            };
-
-            if let Some(error) = oversized {
-                transaction
-                    .batch_execute("ROLLBACK TO SAVEPOINT reindex_fts_phase")
-                    .await
-                    .map_err(|e| {
-                        internal_error(format!(
-                            "Failed to rollback FTS phase after PROGRAM_LIMIT_EXCEEDED: {}",
-                            e
-                        ))
-                    })?;
-                tracing::debug!(
-                    "Recovering PostgreSQL reindex FTS page after PROGRAM_LIMIT_EXCEEDED: {}",
-                    error
-                );
-
-                for resource in &fts_batch {
-                    transaction
-                        .batch_execute("SAVEPOINT reindex_fts_resource")
-                        .await
-                        .map_err(|e| {
-                            internal_error(format!("Failed to create FTS resource savepoint: {}", e))
-                        })?;
-
-                    let attempt = self
-                        .index_fts_content_page(
-                            &transaction,
-                            tenant_id,
-                            resource.resource_type(),
-                            resource.id(),
-                            resource.content(),
-                        )
-                        .await;
-                    match attempt {
-                        Ok(()) => {
-                            transaction
-                                .batch_execute("RELEASE SAVEPOINT reindex_fts_resource")
-                                .await
-                                .map_err(|e| {
-                                    internal_error(format!(
-                                        "Failed to release FTS resource savepoint: {}",
-                                        e
-                                    ))
-                                })?;
-                        }
-                        Err(PageFtsError::ProgramLimitExceeded { content, error }) => {
-                            transaction
-                                .batch_execute("ROLLBACK TO SAVEPOINT reindex_fts_resource")
-                                .await
-                                .map_err(|e| {
-                                    internal_error(format!(
-                                        "Failed to rollback FTS resource after PROGRAM_LIMIT_EXCEEDED: {}",
-                                        e
-                                    ))
-                                })?;
-                            tracing::debug!(
-                                "Retrying PostgreSQL reindex FTS resource after PROGRAM_LIMIT_EXCEEDED: {}",
-                                error
-                            );
-                            Self::retry_truncated_fts(
-                                &transaction,
-                                tenant_id,
-                                resource.resource_type(),
-                                resource.id(),
-                                &content,
-                            )
-                            .await?;
-                            transaction
-                                .batch_execute("RELEASE SAVEPOINT reindex_fts_resource")
-                                .await
-                                .map_err(|e| {
-                                    internal_error(format!(
-                                        "Failed to release FTS resource savepoint: {}",
-                                        e
-                                    ))
-                                })?;
-                        }
-                        Err(PageFtsError::Other(error)) => return Err(error),
-                    }
-                }
-            }
-
-            transaction
-                .batch_execute("RELEASE SAVEPOINT reindex_fts_phase")
-                .await
-                .map_err(|e| {
-                    internal_error(format!("Failed to release FTS phase savepoint: {}", e))
-                })?;
+            let fts_result = self
+                .index_reindex_fts_groups(&transaction, tenant_id, &fts_batch)
+                .await;
             drop(fts_span);
+            fts_result?;
             Ok(())
         }
         .await;
@@ -4653,6 +4610,42 @@ impl ReindexTarget for PostgresBackend {
 // FTS Content Extraction (local copy to avoid cross-feature dependency on sqlite)
 // ============================================================================
 
+async fn reindex_fts_savepoint_command(
+    transaction: &deadpool_postgres::Transaction<'_>,
+    sql: &'static str,
+) -> Result<(), tokio_postgres::Error> {
+    #[cfg(test)]
+    let sql = reindex_fts_group_test_hooks::SAVEPOINT_HOOKS
+        .try_with(|hooks| {
+            let mut hooks = hooks.borrow_mut();
+            let command = if hooks.fault == Some(sql) {
+                hooks.fault = None;
+                "SELECT 1 / 0"
+            } else {
+                sql
+            };
+            hooks.commands.push(command);
+            command
+        })
+        .unwrap_or(sql);
+    transaction.batch_execute(sql).await
+}
+
+#[cfg(test)]
+mod reindex_fts_group_test_hooks {
+    use std::cell::RefCell;
+
+    #[derive(Default, Clone)]
+    pub(super) struct SavepointHooks {
+        pub fault: Option<&'static str>,
+        pub commands: Vec<&'static str>,
+    }
+
+    tokio::task_local! {
+        pub(super) static SAVEPOINT_HOOKS: RefCell<SavepointHooks>;
+    }
+}
+
 /// Outcome of one resource's FTS statement inside a reindex page transaction.
 ///
 /// A `program_limit_exceeded` (the 1 MB `tsvector` cap) is surfaced with the
@@ -4671,7 +4664,7 @@ enum PageFtsError {
 ///
 /// A grouped statement cannot say which of its rows exceeded the `tsvector`
 /// limit, so `ProgramLimitExceeded` carries only the error: the caller rolls
-/// back to the FTS-phase savepoint and replays the page per resource, where
+/// back to the group savepoint and replays that group per resource, where
 /// [`PageFtsError`] identifies the oversized one.
 enum BatchFtsError {
     ProgramLimitExceeded(tokio_postgres::Error),
@@ -5754,5 +5747,280 @@ mod reindex_prepare_tests {
         if let Ok(pool) = reindex_prepare_pool() {
             assert_eq!(pool.current_num_threads(), expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod reindex_fts_group_controls_tests {
+    use super::*;
+    use crate::backends::postgres::PostgresConfig;
+    use crate::core::ResourceStorage;
+    use crate::search::reindex::{ReindexSource, ReindexTarget};
+    use crate::tenant::{TenantId, TenantPermissions};
+    use reindex_fts_group_test_hooks::{SAVEPOINT_HOOKS, SavepointHooks};
+    use serde_json::json;
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+    use testcontainers::ImageExt;
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::postgres::Postgres;
+    use tokio_postgres::NoTls;
+
+    async fn isolated_backend(host: &str, port: u16) -> PostgresBackend {
+        let dbname = format!("reindex_1462_r1_{}", uuid::Uuid::new_v4().simple());
+        let mut admin_config = tokio_postgres::Config::new();
+        admin_config
+            .host(host)
+            .port(port)
+            .user("postgres")
+            .password("postgres")
+            .dbname("postgres");
+        let (admin, connection) = admin_config.connect(NoTls).await.unwrap();
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        admin
+            .batch_execute(&format!("CREATE DATABASE {dbname}"))
+            .await
+            .unwrap();
+        drop(admin);
+
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|path| path.parent())
+            .unwrap()
+            .join("data");
+        let config = PostgresConfig {
+            host: host.to_string(),
+            port,
+            dbname,
+            user: "postgres".to_string(),
+            password: Some("postgres".to_string()),
+            max_connections: 1,
+            data_dir: Some(data_dir),
+            ..Default::default()
+        };
+        let schema_backend = PostgresBackend::new(PostgresConfig {
+            max_connections: 5,
+            ..config.clone()
+        })
+        .await
+        .unwrap();
+        schema_backend.init_schema().await.unwrap();
+        drop(schema_backend);
+        PostgresBackend::new(config).await.unwrap()
+    }
+
+    fn tenant(name: &str) -> TenantContext {
+        TenantContext::new(TenantId::new(name), TenantPermissions::full_access())
+    }
+
+    async fn index_snapshot(
+        client: &deadpool_postgres::Client,
+        tenant_id: &str,
+        table: &str,
+    ) -> Vec<String> {
+        let sql = if table == "search_index" {
+            "SELECT (to_jsonb(s) - 'id' - 'tenant_id' - 'last_updated')::text
+             FROM search_index s WHERE tenant_id = $1"
+        } else {
+            "SELECT (to_jsonb(f) - 'tenant_id')::text
+             FROM resource_fts f WHERE tenant_id = $1"
+        };
+        let mut rows: Vec<String> = client
+            .query(sql, &[&tenant_id])
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    #[tokio::test]
+    async fn postgres_reindex_fts_group_controls() {
+        let container = Postgres::default()
+            .with_tag("16-alpine")
+            .start()
+            .await
+            .unwrap();
+        let host = container.get_host().await.unwrap().to_string();
+        let port = container.get_host_port_ipv4(5432).await.unwrap();
+        let oversized_text = (0..100_000)
+            .map(|index| format!("lexeme{index:08x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        for (label, fault, oversized) in [
+            ("group-create", "SAVEPOINT reindex_fts_group", false),
+            (
+                "group-rollback",
+                "ROLLBACK TO SAVEPOINT reindex_fts_group",
+                true,
+            ),
+            (
+                "group-release",
+                "RELEASE SAVEPOINT reindex_fts_group",
+                false,
+            ),
+            (
+                "resource-release",
+                "RELEASE SAVEPOINT reindex_fts_resource",
+                true,
+            ),
+        ] {
+            let backend = isolated_backend(&host, port).await;
+            let target = tenant("fault_target");
+            let reference = tenant("fault_reference");
+            let entries = if oversized {
+                vec![
+                    ("a-normal", false),
+                    ("b-oversized", true),
+                    ("c-normal", false),
+                ]
+            } else {
+                vec![("a-normal", false), ("b-normal", false)]
+            };
+            for (id, is_oversized) in entries {
+                let narrative = if is_oversized {
+                    oversized_text.as_str()
+                } else {
+                    "ordinary narrative"
+                };
+                let patient = json!({
+                    "resourceType": "Patient",
+                    "id": id,
+                    "name": [{"family": id}],
+                    "text": {
+                        "status": "generated",
+                        "div": format!("<div>{narrative}</div>")
+                    }
+                });
+                for scoped_tenant in [&target, &reference] {
+                    backend
+                        .create(
+                            scoped_tenant,
+                            "Patient",
+                            patient.clone(),
+                            FhirVersion::default(),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            let resources = backend
+                .fetch_resources_page(&target, "Patient", None, 10)
+                .await
+                .unwrap()
+                .resources;
+            let reference_resources = backend
+                .fetch_resources_page(&reference, "Patient", None, 10)
+                .await
+                .unwrap()
+                .resources;
+            let (results, hooks) = SAVEPOINT_HOOKS
+                .scope(
+                    RefCell::new(SavepointHooks {
+                        fault: Some(fault),
+                        commands: Vec::new(),
+                    }),
+                    async {
+                        let results = backend.write_search_entries_page(&target, &resources).await;
+                        let hooks = SAVEPOINT_HOOKS.with(|hooks| hooks.borrow().clone());
+                        (results, hooks)
+                    },
+                )
+                .await;
+            assert!(
+                hooks.fault.is_none(),
+                "{label}: selected fault did not fire"
+            );
+            assert!(
+                hooks.commands.contains(&"SELECT 1 / 0"),
+                "{label}: fault command was not recorded"
+            );
+            assert_eq!(results.len(), resources.len(), "{label}: result slots");
+            assert!(
+                results.iter().all(Result::is_ok),
+                "{label}: individual fallback failed"
+            );
+            let checkout =
+                tokio::time::timeout(std::time::Duration::from_secs(5), backend.get_client())
+                    .await
+                    .expect("fallback must release the one-connection pool")
+                    .unwrap();
+            drop(checkout);
+
+            let expected = backend
+                .write_reindex_page_individually(&reference, &reference_resources)
+                .await;
+            let counts = |outcomes: &[StorageResult<usize>]| {
+                outcomes
+                    .iter()
+                    .map(|outcome| {
+                        outcome
+                            .as_ref()
+                            .map(|count| *count)
+                            .map_err(ToString::to_string)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                counts(&results),
+                counts(&expected),
+                "{label}: result counts"
+            );
+            let client = backend.get_client().await.unwrap();
+            for table in ["search_index", "resource_fts"] {
+                assert_eq!(
+                    index_snapshot(&client, target.tenant_id().as_str(), table).await,
+                    index_snapshot(&client, reference.tenant_id().as_str(), table).await,
+                    "{label}: {table} differs from the individual writer"
+                );
+            }
+        }
+
+        for size in [0, 1, 100, 101, 301] {
+            let backend = isolated_backend(&host, port).await;
+            let target = tenant("count_target");
+            let resources: Vec<StoredResource> = (0..size)
+                .map(|index| {
+                    let id = format!("count-{index:03}");
+                    StoredResource::new(
+                        "Patient",
+                        &id,
+                        target.tenant_id().clone(),
+                        json!({
+                            "resourceType": "Patient",
+                            "id": id,
+                            "name": [{"family": format!("Family{index:03}")}]
+                        }),
+                        FhirVersion::default(),
+                    )
+                })
+                .collect();
+            let (results, hooks) = SAVEPOINT_HOOKS
+                .scope(RefCell::new(SavepointHooks::default()), async {
+                    let results = backend.write_search_entries_page(&target, &resources).await;
+                    let hooks = SAVEPOINT_HOOKS.with(|hooks| hooks.borrow().clone());
+                    (results, hooks)
+                })
+                .await;
+            assert_eq!(results.len(), size);
+            assert!(results.iter().all(Result::is_ok), "size {size}");
+            assert!(hooks.fault.is_none());
+            let group_count = size.div_ceil(FTS_BATCH_SIZE);
+            let expected: Vec<&'static str> = (0..group_count)
+                .flat_map(|_| {
+                    [
+                        "SAVEPOINT reindex_fts_group",
+                        "RELEASE SAVEPOINT reindex_fts_group",
+                    ]
+                })
+                .collect();
+            assert_eq!(hooks.commands, expected, "size {size}");
+        }
+        drop(container);
     }
 }
