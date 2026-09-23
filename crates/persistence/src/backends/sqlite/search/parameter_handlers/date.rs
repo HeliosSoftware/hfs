@@ -1,6 +1,6 @@
 //! Date parameter SQL handler.
 
-use crate::search::{DateValuePrecision, FhirDateValue};
+use crate::search::{DateValuePrecision, FhirDateValue, StorageResolution};
 use crate::types::{SearchPrefix, SearchValue};
 
 use super::super::query_builder::{SqlFragment, SqlParam};
@@ -23,7 +23,7 @@ use super::super::query_builder::{SqlFragment, SqlParam};
 /// of millisecond precision: `_lastUpdated=eq2026-09-06T08:44:27.804Z` would
 /// match every resource written in that second, which is exactly what a
 /// transaction Bundle produces once the writes are fast enough to land in one.
-/// Millisecond-precision values therefore go through `strftime('%f')`, which
+/// Fractional-precision values therefore go through `strftime('%f')`, which
 /// keeps `SS.SSS` and still folds timezone offsets to UTC. Both sides are
 /// first cut to three fractional digits in SQL ([`truncated_to_millis`]):
 /// `last_updated` holds nanoseconds, which SQLite would *round* to the
@@ -40,11 +40,12 @@ use super::super::query_builder::{SqlFragment, SqlParam};
 /// whose `+` was form-decoded into a space (#1296).
 ///
 /// This does not translate [`crate::search::DatePredicate`]: the single-bind
-/// SQL above predates it and already agrees with it (the tests hold the two
-/// against each other), with one documented exception. A fraction is always
-/// compared at the millisecond — `.5` means `[.500, .501)` here, not
-/// `[.5, .6)`, and digits past the third are cut — because both sides go
-/// through the same millisecond truncation.
+/// SQL above predates it, and tests hold the two against each other. A
+/// one- or two-digit fraction uses `strftime()` with a fractional-second
+/// modifier for its upper bound; `.5` means `[.500, .600)`. Fractions with
+/// three or more digits compare at the millisecond after truncation. If the
+/// modifier crosses year 9999, `strftime()` returns NULL, so the parsed range
+/// end provides the bounded fallback.
 ///
 /// Returns the SQL and the value to bind for its (single) parameter, or `None`
 /// when the value is not a date. The search gate
@@ -69,11 +70,14 @@ pub(crate) fn date_condition(
     // The SQL modifier that derives the range end from the bound range start.
     // Second precision needs none: `datetime()` cuts the column to the second,
     // so plain comparisons already treat the whole second as one value.
+    // Fractions with three or more digits occupy one stored millisecond.
     let bump = match precision {
         DateValuePrecision::Year => Some("+1 year"),
         DateValuePrecision::Month => Some("+1 month"),
         DateValuePrecision::Day => Some("+1 day"),
         DateValuePrecision::Minute => Some("+1 minute"),
+        DateValuePrecision::Fraction(1) => Some("+0.1 seconds"),
+        DateValuePrecision::Fraction(2) => Some("+0.01 seconds"),
         DateValuePrecision::Second | DateValuePrecision::Fraction(_) => None,
     };
 
@@ -103,7 +107,20 @@ pub(crate) fn date_condition(
     };
     let col = normalize(column);
     let p = normalize(&format!("?{param_num}"));
-    let end = |m: &str| format!("datetime(?{param_num}, '{m}')");
+    let end = |m: &str| {
+        if has_fractional_seconds {
+            let bounded_end = parsed
+                .range_at(StorageResolution::Millis)
+                .1
+                .format("%Y-%m-%d %H:%M:%S%.3f");
+            format!(
+                "COALESCE(strftime('%Y-%m-%d %H:%M:%f', {}, '{m}'), '{bounded_end}')",
+                truncated_to_millis(&format!("?{param_num}")),
+            )
+        } else {
+            format!("datetime(?{param_num}, '{m}')")
+        }
+    };
 
     let sql = match (prefix, bump) {
         (SearchPrefix::Eq, Some(m)) => format!("({col} >= {p} AND {col} < {})", end(m)),
@@ -261,9 +278,15 @@ mod tests {
     fn build_sql_binds_exactly_one_parameter() {
         // The multi-value caller advances the offset by one per value, so eq
         // must not consume two slots.
-        let value = SearchValue::new(SearchPrefix::Eq, "2024-01-15");
-        let frag = DateHandler::build_sql(&value, 0);
-        assert_eq!(frag.params.len(), 1);
+        for search in [
+            "2024-01-15",
+            "2024-01-15T23:59:59.9Z",
+            "2024-01-15T23:59:59.99Z",
+        ] {
+            let value = SearchValue::new(SearchPrefix::Eq, search);
+            let frag = DateHandler::build_sql(&value, 0);
+            assert_eq!(frag.params.len(), 1, "{search}");
+        }
     }
 
     #[test]
@@ -626,6 +649,10 @@ mod shared_grammar_tests {
             "2013-04-06T09:00:00 05:30",
             "2013-04-06T03:30:00.123Z",
             "2013-04-05T23:30:00.123456-04:00",
+            "2013-04-06T03:30:00.5Z",
+            "2013-04-06T03:30:00.50Z",
+            "2013-04-06T03:30:00.99Z",
+            "2013-04-06T03:30:00.00Z",
         ];
         let stored = [
             "2012-12-31T23:59:59Z",
@@ -641,6 +668,15 @@ mod shared_grammar_tests {
             "2013-04-05T23:30:00.123-04:00",
             "2013-04-05T23:30:00.123999-04:00",
             "2013-04-05T23:30:00.124-04:00",
+            "2013-04-06T03:30:00.499Z",
+            "2013-04-06T03:30:00.500Z",
+            "2013-04-06T03:30:00.509Z",
+            "2013-04-06T03:30:00.550Z",
+            "2013-04-06T03:30:00.599Z",
+            "2013-04-06T03:30:00.600Z",
+            "2013-04-06T03:30:00.990Z",
+            "2013-04-06T03:30:00.999Z",
+            "2013-04-06T03:30:01.000Z",
             "2013-04-05T23:30:01-04:00",
             "2013-04-06",
             "2013-12-31T23:59:59.999Z",
@@ -672,19 +708,76 @@ mod shared_grammar_tests {
         }
     }
 
-    /// The one place this handler is narrower than the shared range: a
-    /// fraction is compared at the millisecond whatever its digit count.
     #[test]
-    fn short_fractions_compare_at_the_millisecond() {
+    fn short_fractions_cover_their_full_precision_range() {
         assert!(sqlite_matches(
             SearchPrefix::Eq,
             "2013-04-06T03:30:00.5Z",
             "2013-04-06T03:30:00.500Z"
         ));
-        assert!(!sqlite_matches(
+        assert!(sqlite_matches(
             SearchPrefix::Eq,
             "2013-04-06T03:30:00.5Z",
             "2013-04-06T03:30:00.55Z"
         ));
+        assert!(sqlite_matches(
+            SearchPrefix::Eq,
+            "2013-04-06T03:30:00.5Z",
+            "2013-04-06T03:30:00.5996Z"
+        ));
+        assert!(!sqlite_matches(
+            SearchPrefix::Eq,
+            "2013-04-06T03:30:00.5Z",
+            "2013-04-06T03:30:00.600Z"
+        ));
+        assert!(sqlite_matches(
+            SearchPrefix::Eq,
+            "2013-04-05T23:30:00.99-04:00",
+            "2013-04-06T03:30:00.999Z"
+        ));
+        assert!(!sqlite_matches(
+            SearchPrefix::Eq,
+            "2013-04-05T23:30:00.99-04:00",
+            "2013-04-06T03:30:01.000Z"
+        ));
+        assert!(sqlite_matches(
+            SearchPrefix::Eq,
+            "2013-04-06T23:59:59.99Z",
+            "2013-04-06T23:59:59.999Z"
+        ));
+        assert!(!sqlite_matches(
+            SearchPrefix::Eq,
+            "2013-04-06T23:59:59.99Z",
+            "2013-04-07T00:00:00.000Z"
+        ));
+    }
+
+    #[test]
+    fn short_fractions_at_last_supported_second_match_the_shared_predicate() {
+        for search in ["9999-12-31T23:59:59.9Z", "9999-12-31T23:59:59.99Z"] {
+            let value = FhirDateValue::parse(search).unwrap();
+            for prefix in [
+                SearchPrefix::Eq,
+                SearchPrefix::Ne,
+                SearchPrefix::Gt,
+                SearchPrefix::Sa,
+                SearchPrefix::Le,
+            ] {
+                let predicate = value.predicate(prefix, StorageResolution::Millis).unwrap();
+                for stored in [
+                    "9999-12-31T23:59:59.950Z",
+                    "9999-12-31T23:59:59.995Z",
+                    "9999-12-31T23:59:59.998Z",
+                    "9999-12-31T23:59:59.999Z",
+                ] {
+                    let point = FhirDateValue::parse(stored).unwrap().start;
+                    assert_eq!(
+                        sqlite_matches(prefix, search, stored),
+                        predicate.matches(point),
+                        "{prefix}{search} against stored {stored}"
+                    );
+                }
+            }
+        }
     }
 }
