@@ -7272,13 +7272,14 @@ mod reindex_fts_group_controls_tests {
         for size in [0, 1, 100, 101, 301] {
             let backend = isolated_backend(&host, port).await;
             let target = tenant("count_target");
-            let resources: Vec<StoredResource> = (0..size)
-                .map(|index| {
-                    let id = format!("count-{index:03}");
-                    StoredResource::new(
+            // Reindex reloads current rows; missing identities never reach FTS.
+            let mut resources = Vec::with_capacity(size);
+            for index in 0..size {
+                let id = format!("count-{index:03}");
+                let stored = backend
+                    .create(
+                        &target,
                         "Patient",
-                        &id,
-                        target.tenant_id().clone(),
                         json!({
                             "resourceType": "Patient",
                             "id": id,
@@ -7286,8 +7287,11 @@ mod reindex_fts_group_controls_tests {
                         }),
                         FhirVersion::default(),
                     )
-                })
-                .collect();
+                    .await
+                    .unwrap();
+                assert_eq!(stored.id(), id);
+                resources.push(stored);
+            }
             let (results, hooks) = SAVEPOINT_HOOKS
                 .scope(RefCell::new(SavepointHooks::default()), async {
                     let results = backend.write_search_entries_page(&target, &resources).await;
@@ -7297,8 +7301,17 @@ mod reindex_fts_group_controls_tests {
                 .await;
             assert_eq!(results.len(), size);
             assert!(results.iter().all(Result::is_ok), "size {size}");
+            assert!(
+                results
+                    .iter()
+                    .all(|result| matches!(result, Ok(count) if *count > 0)),
+                "size {size}: live resources must produce index rows"
+            );
             assert!(hooks.fault.is_none());
-            let group_count = size.div_ceil(FTS_BATCH_SIZE);
+            let group_count: usize = resources
+                .chunks(128)
+                .map(|group| group.len().div_ceil(FTS_BATCH_SIZE))
+                .sum();
             let expected: Vec<&'static str> = (0..group_count)
                 .flat_map(|_| {
                     [
