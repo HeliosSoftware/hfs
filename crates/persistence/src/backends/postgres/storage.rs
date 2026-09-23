@@ -3765,6 +3765,9 @@ fn resolve_bundle_references(
 // resources are read from during a reindex.
 // ============================================================================
 
+/// Maximum number of distinct resource IDs bound in one reindex lookup.
+const REINDEX_IDS_QUERY_SIZE: usize = 1000;
+
 // Size only the count-limited keys, then fetch bodies only for the admitted
 // prefix. MATERIALIZED keeps the count-limited keys and the ranked window
 // result fixed before the byte filter; without the ranked fence PostgreSQL 16
@@ -3960,6 +3963,42 @@ impl ReindexSource for PostgresBackend {
             next_cursor,
             skipped: Vec::new(),
         })
+    }
+
+    async fn fetch_resources_by_ids(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[String],
+    ) -> StorageResult<Vec<StoredResource>> {
+        let unique: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
+        if unique.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut unique: Vec<&str> = unique.into_iter().collect();
+        unique.sort_unstable();
+
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let mut found = Vec::with_capacity(unique.len());
+        for batch in unique.chunks(REINDEX_IDS_QUERY_SIZE) {
+            let rows = query_cached(
+                &client,
+                "/* hfs_reindex_by_ids */
+                 SELECT id, version_id, data, last_updated, fhir_version
+                 FROM resources
+                 WHERE tenant_id = $1 AND resource_type = $2
+                   AND is_deleted = FALSE AND id = ANY($3::text[])",
+                &[&tenant_id, &resource_type, &batch],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to fetch resources by IDs: {e}")))?;
+            found.extend(
+                rows.iter()
+                    .map(|row| decode_reindex_page_row(row, tenant, resource_type)),
+            );
+        }
+        Ok(found)
     }
 
     async fn fetch_resources_page_capped(
