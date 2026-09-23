@@ -275,13 +275,20 @@ impl S3Keyspace {
     ///
     /// `file_url` names the manifest output file the line came from; see
     /// [`submit_file_segment`] for why it is part of the key.
-    pub fn submit_raw_line_key(
+    /// Key for the raw NDJSON archive of one ingest batch (chunk) of a file.
+    ///
+    /// One object holds every line of the batch, keyed by the batch's first
+    /// line number so successive chunks of the same file (each a separate
+    /// `process_entries` call) never collide (#1429). `file_url` names the
+    /// manifest output file the lines came from; see [`submit_file_segment`]
+    /// for why it is part of the key (two files' line-1 batches must differ).
+    pub fn submit_raw_batch_key(
         &self,
         submitter: &str,
         submission_id: &str,
         manifest_id: &str,
         file_url: Option<&str>,
-        line: u64,
+        first_line: u64,
     ) -> String {
         self.join(&[
             "bulk",
@@ -291,7 +298,7 @@ impl S3Keyspace {
             "raw",
             manifest_id,
             &submit_file_segment(file_url),
-            &format!("line-{}.ndjson", line),
+            &format!("batch-{}.ndjson", first_line),
         ])
     }
 
@@ -333,6 +340,34 @@ impl S3Keyspace {
             submission_id,
             "changes",
             &format!("{}.json", change_id),
+        ])
+    }
+
+    /// Key for one ingest batch's coalesced change log — every change the batch
+    /// recorded, in a single object rather than one per resource (#1429).
+    ///
+    /// Sits under the same `changes/` prefix that [`Self::submit_change_key`]
+    /// writes and that `load_changes` lists, but nested by manifest and file so
+    /// batches never collide: like the raw archive and the entry receipts, the
+    /// key is discriminated by `file_url` (line numbers restart per file, see
+    /// [`submit_file_segment`]) and keyed by the batch's first line.
+    pub fn submit_change_batch_key(
+        &self,
+        submitter: &str,
+        submission_id: &str,
+        manifest_id: &str,
+        file_url: Option<&str>,
+        first_line: u64,
+    ) -> String {
+        self.join(&[
+            "bulk",
+            "submit",
+            submitter,
+            submission_id,
+            "changes",
+            manifest_id,
+            &submit_file_segment(file_url),
+            &format!("batch-{}.json", first_line),
         ])
     }
 

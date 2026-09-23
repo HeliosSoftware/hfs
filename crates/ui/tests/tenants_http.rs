@@ -777,6 +777,7 @@ async fn delete_reports_the_removed_tenant_to_the_write_observer() {
         false,
         None,
         "http://localhost:8080".to_string(),
+        Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
         helios_ui::PatientNameSearchSupport::Enabled,
         Some(observer.clone() as Arc<dyn WriteObserver>),
     );

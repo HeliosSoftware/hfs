@@ -1152,6 +1152,168 @@ pub fn create_bundle_from_resources_for_version(
     }
 }
 
+/// Precomputed compartment filter built from patient and group references.
+///
+/// Separates the one-time setup (absent-target validation, group member
+/// resolution, patient-set construction) from the per-resource membership
+/// test so the streaming path can validate once — against just the
+/// Patient/Group documents the references name — then apply the filter one
+/// document at a time without materialising the full corpus.
+pub struct CompartmentFilter {
+    targets: std::collections::HashSet<String>,
+    group_refs: Vec<String>,
+    fhir_version: FhirVersion,
+}
+
+/// Splits a compartment `patient=` / `group=` reference into its canonical
+/// `Type/id` form and the bare resource id it names.
+///
+/// References arrive either fully qualified (`Patient/p1`) or as a bare id
+/// (`p1`); a versioned reference (`Patient/p1/_history/2`) names the same
+/// resource. The id is `None` only for a reference that names no id at all
+/// (`""` / `"Patient/"`), which cannot resolve and is reported as absent.
+fn canonical_compartment_ref(reference: &str, resource_type: &str) -> (String, Option<String>) {
+    let prefix = format!("{}/", resource_type);
+    let canonical = if reference.starts_with(&prefix) {
+        reference.to_string()
+    } else {
+        format!("{}{}", prefix, reference)
+    };
+    let id = canonical
+        .strip_prefix(&prefix)
+        .and_then(|rest| rest.split('/').next())
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+    (canonical, id)
+}
+
+/// Returns the distinct resource ids named by a set of compartment references,
+/// in first-seen order.
+///
+/// Lets a caller fetch exactly the `resource_type` documents that
+/// [`CompartmentFilter::build`] needs — by id, rather than by scanning the
+/// type — so filter setup stays proportional to the number of references
+/// instead of to the corpus.
+pub fn compartment_reference_ids(refs: &[String], resource_type: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut ids = Vec::new();
+    for reference in refs {
+        if let (_, Some(id)) = canonical_compartment_ref(reference, resource_type)
+            && seen.insert(id.clone())
+        {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+impl CompartmentFilter {
+    /// Builds the filter from the supporting Patient/Group resources.
+    ///
+    /// Validates that every patient and group reference resolves to a resource
+    /// in `supporting`, then constructs the effective `Patient/{id}` target set.
+    /// Errors identically to [`filter_resources_by_patient_and_group`].
+    ///
+    /// `supporting` need only contain the Patient and Group documents that
+    /// `patient_refs` / `group_refs` actually name — validation is a point
+    /// lookup per reference and a Group's members are read off that Group, so
+    /// nothing here consumes the rest of either collection. Callers that can
+    /// fetch by id should use [`compartment_reference_ids`] and pass just those
+    /// documents; the whole-collection slice that
+    /// [`filter_resources_by_patient_and_group`] passes is a superset, not a
+    /// requirement.
+    pub fn build(
+        patient_refs: &[String],
+        group_refs: &[String],
+        supporting: &[serde_json::Value],
+        fhir_version: FhirVersion,
+    ) -> Result<Self, SofError> {
+        use std::collections::HashSet;
+
+        let mut absent: Vec<String> = Vec::new();
+        for (refs, resource_type) in [(patient_refs, "Patient"), (group_refs, "Group")] {
+            for reference in refs {
+                let (canonical, id) = canonical_compartment_ref(reference, resource_type);
+                let found = id
+                    .map(|id| {
+                        supporting.iter().any(|res| {
+                            res.get("resourceType").and_then(|v| v.as_str()) == Some(resource_type)
+                                && res.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
+                        })
+                    })
+                    .unwrap_or(false);
+                if !found {
+                    absent.push(canonical);
+                }
+            }
+        }
+        if !absent.is_empty() {
+            return Err(SofError::ReferencedResourceNotFound(format!(
+                "{} not found in supplied resources",
+                absent.join(", ")
+            )));
+        }
+
+        let mut targets: HashSet<String> = patient_refs
+            .iter()
+            .map(|r| canonical_compartment_ref(r, "Patient").0)
+            .collect();
+
+        if !group_refs.is_empty() {
+            targets.extend(compartment::resolve_group_members_to_patient_refs(
+                group_refs, supporting,
+            ));
+        }
+
+        Ok(Self {
+            targets,
+            group_refs: group_refs.to_vec(),
+            fhir_version,
+        })
+    }
+
+    /// Returns `true` when the filter has no effective patient targets.
+    ///
+    /// This happens when all supplied groups resolved to zero Patient members.
+    /// The targets themselves were present (they passed absent-target validation),
+    /// so this is an empty-but-valid result: every resource fails the filter.
+    pub fn is_empty(&self) -> bool {
+        self.targets.is_empty()
+    }
+
+    /// Tests whether `resource` is in the effective patient compartment.
+    ///
+    /// A Group whose `Group/{id}` was requested directly is a first-class
+    /// compartment member and skips the FHIRPath scan. Every other resource —
+    /// *including* a Group that was not requested directly — goes through
+    /// [`compartment::resource_in_patient_compartment`]. That fall-through
+    /// matters for Group specifically: `Group` is in the patient
+    /// CompartmentDefinition via `member`, so a Group listing a target patient
+    /// as a member is in that patient's compartment even though it was never
+    /// named in `group_refs`.
+    pub fn apply(&self, resource: &serde_json::Value) -> Result<bool, SofError> {
+        if self.targets.is_empty() {
+            return Ok(false);
+        }
+
+        if resource.get("resourceType").and_then(|v| v.as_str()) == Some("Group")
+            && resource
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|id| {
+                    self.group_refs
+                        .iter()
+                        .any(|g| g == &format!("Group/{}", id) || g == id)
+                })
+                .unwrap_or(false)
+        {
+            return Ok(true);
+        }
+
+        compartment::resource_in_patient_compartment(resource, &self.targets, self.fhir_version)
+    }
+}
+
 /// Filters raw FHIR resource JSON by patient and/or group references using
 /// the FHIR `CompartmentDefinition-patient` spec data.
 ///
@@ -1184,119 +1346,21 @@ pub fn filter_resources_by_patient_and_group(
     group_refs: &[String],
     fhir_version: FhirVersion,
 ) -> Result<Vec<serde_json::Value>, SofError> {
-    use std::collections::HashSet;
-
     if patient_refs.is_empty() && group_refs.is_empty() {
         return Ok(resources);
     }
-
-    // Absent-target detection: any `patient` / `group` reference that
-    // isn't represented by a resource in the supplied bundle is a hard
-    // error per the SoF v2 spec error table.
-    let mut absent: Vec<String> = Vec::new();
-    for r in patient_refs {
-        let canonical = if r.starts_with("Patient/") {
-            r.clone()
-        } else {
-            format!("Patient/{}", r)
-        };
-        let id = canonical
-            .strip_prefix("Patient/")
-            .and_then(|s| s.split('/').next());
-        let found = id
-            .map(|id| {
-                resources.iter().any(|res| {
-                    res.get("resourceType").and_then(|v| v.as_str()) == Some("Patient")
-                        && res.get("id").and_then(|v| v.as_str()) == Some(id)
-                })
-            })
-            .unwrap_or(false);
-        if !found {
-            absent.push(canonical);
-        }
-    }
-    for g in group_refs {
-        let canonical = if g.starts_with("Group/") {
-            g.clone()
-        } else {
-            format!("Group/{}", g)
-        };
-        let id = canonical
-            .strip_prefix("Group/")
-            .and_then(|s| s.split('/').next());
-        let found = id
-            .map(|id| {
-                resources.iter().any(|res| {
-                    res.get("resourceType").and_then(|v| v.as_str()) == Some("Group")
-                        && res.get("id").and_then(|v| v.as_str()) == Some(id)
-                })
-            })
-            .unwrap_or(false);
-        if !found {
-            absent.push(canonical);
-        }
-    }
-    if !absent.is_empty() {
-        return Err(SofError::ReferencedResourceNotFound(format!(
-            "{} not found in supplied resources",
-            absent.join(", ")
-        )));
-    }
-
-    // Build the effective patient-compartment set: explicit patient refs +
-    // patient refs resolved from supplied groups. Both forms are
-    // canonicalised to `Patient/{id}` so downstream comparisons don't
-    // double-handle the prefix.
-    let mut targets: HashSet<String> = patient_refs
-        .iter()
-        .map(|r| {
-            if r.starts_with("Patient/") {
-                r.clone()
-            } else {
-                format!("Patient/{}", r)
-            }
-        })
-        .collect();
-
-    if !group_refs.is_empty() {
-        targets.extend(compartment::resolve_group_members_to_patient_refs(
-            group_refs, &resources,
-        ));
-    }
-
-    // No effective patient targets (e.g. supplied Group resolved to zero
-    // Patient members). The targets themselves are present (they got past
-    // the absent-target check above), so this is an empty-but-valid result.
-    if targets.is_empty() {
+    let filter = CompartmentFilter::build(patient_refs, group_refs, &resources, fhir_version)?;
+    if filter.is_empty() {
         return Ok(Vec::new());
     }
-
-    let mut filtered = Vec::with_capacity(resources.len());
-    for resource in resources.into_iter() {
-        // Group resources are first-class compartment members when their
-        // `Group/{id}` was requested directly (i.e. not via member
-        // resolution). Skip the FHIRPath scan for Group itself.
-        if resource.get("resourceType").and_then(|v| v.as_str()) == Some("Group")
-            && resource
-                .get("id")
-                .and_then(|v| v.as_str())
-                .map(|id| {
-                    group_refs
-                        .iter()
-                        .any(|g| g == &format!("Group/{}", id) || g == id)
-                })
-                .unwrap_or(false)
-        {
-            filtered.push(resource);
-            continue;
-        }
-
-        if compartment::resource_in_patient_compartment(&resource, &targets, fhir_version)? {
-            filtered.push(resource);
-        }
-    }
-
-    Ok(filtered)
+    resources
+        .into_iter()
+        .filter_map(|r| match filter.apply(&r) {
+            Ok(true) => Some(Ok(r)),
+            Ok(false) => None,
+            Err(e) => Some(Err(e)),
+        })
+        .collect()
 }
 
 /// Filters raw FHIR resource JSON by their `meta.lastUpdated` timestamp,
@@ -4511,6 +4575,27 @@ pub fn format_parquet_multi_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `compartment_reference_ids` accepts both reference forms the SoF spec
+    /// allows, ignores a version suffix, drops an id-less reference, and
+    /// de-duplicates — so a caller can turn the filter's references straight
+    /// into a by-id fetch (#1453).
+    #[test]
+    fn compartment_reference_ids_normalises_and_dedups() {
+        let refs = [
+            "Patient/p1",
+            "p2",
+            "Patient/p1/_history/2",
+            "p1",
+            "Patient/",
+            "",
+        ]
+        .map(str::to_string);
+        assert_eq!(
+            compartment_reference_ids(&refs, "Patient"),
+            vec!["p1".to_string(), "p2".to_string()]
+        );
+    }
 
     /// A typed R4 ViewDefinition built from `json`, for exercising
     /// `validate_view_definition` (#821) the same way a real caller of this

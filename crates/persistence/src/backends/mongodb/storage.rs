@@ -570,36 +570,103 @@ impl crate::sof::in_process::ResourceScan for MongoResourceScan {
         &self,
         tenant: &TenantContext,
         resource_type: &str,
-    ) -> Result<Vec<Value>, crate::core::sof_runner::SofError> {
+    ) -> Result<crate::sof::in_process::ResourceStream, crate::core::sof_runner::SofError> {
         use crate::core::sof_runner::SofError;
+        use futures::stream;
 
         let client = self
             .client
             .get_or_try_init(|| super::backend::connect_client(&self.config))
             .await
             .map_err(|e| SofError::Storage(e.to_string()))?;
-        let resources = client
-            .database(&self.config.database_name)
-            .collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+
         let filter = doc! {
             "tenant_id": tenant.tenant_id().as_str(),
             "resource_type": resource_type,
             "is_deleted": false,
         };
-        let cursor = resources
+        let cursor = client
+            .database(&self.config.database_name)
+            .collection::<Document>(MongoBackend::RESOURCES_COLLECTION)
             .find(filter)
             .await
             .map_err(|e| SofError::Storage(e.to_string()))?;
-        let docs = collect_documents(cursor)
+
+        let tenant_owned = tenant.clone();
+        let resource_type = resource_type.to_string();
+
+        let scan_stream = stream::try_unfold(cursor, move |mut cursor| {
+            let tenant_owned = tenant_owned.clone();
+            let resource_type = resource_type.clone();
+            async move {
+                match cursor.advance().await {
+                    Err(e) => Err(SofError::Storage(e.to_string())),
+                    Ok(false) => Ok(None),
+                    Ok(true) => {
+                        let doc = cursor
+                            .deserialize_current()
+                            .map_err(|e| SofError::Storage(e.to_string()))?;
+                        let value =
+                            document_to_stored_resource(&doc, &tenant_owned, &resource_type)
+                                .map(StoredResource::into_content_with_meta)
+                                .map_err(|e| SofError::Storage(e.to_string()))?;
+                        Ok(Some((value, cursor)))
+                    }
+                }
+            }
+        });
+
+        Ok(Box::pin(scan_stream))
+    }
+
+    async fn read_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[String],
+    ) -> Result<Vec<Value>, crate::core::sof_runner::SofError> {
+        use crate::core::sof_runner::SofError;
+
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let client = self
+            .client
+            .get_or_try_init(|| super::backend::connect_client(&self.config))
             .await
             .map_err(|e| SofError::Storage(e.to_string()))?;
-        docs.iter()
-            .map(|doc| {
-                document_to_stored_resource(doc, tenant, resource_type)
-                    .map(StoredResource::into_content_with_meta)
-                    .map_err(|e| SofError::Storage(e.to_string()))
-            })
-            .collect()
+
+        // One `find` over the same `(tenant_id, resource_type, id)` index the
+        // single-resource read uses; soft-deleted ids drop out with the filter.
+        let filter = doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": resource_type,
+            "is_deleted": false,
+            "id": { "$in": ids },
+        };
+        let mut cursor = client
+            .database(&self.config.database_name)
+            .collection::<Document>(MongoBackend::RESOURCES_COLLECTION)
+            .find(filter)
+            .await
+            .map_err(|e| SofError::Storage(e.to_string()))?;
+
+        let mut out = Vec::with_capacity(ids.len());
+        while cursor
+            .advance()
+            .await
+            .map_err(|e| SofError::Storage(e.to_string()))?
+        {
+            let doc = cursor
+                .deserialize_current()
+                .map_err(|e| SofError::Storage(e.to_string()))?;
+            let value = document_to_stored_resource(&doc, tenant, resource_type)
+                .map(StoredResource::into_content_with_meta)
+                .map_err(|e| SofError::Storage(e.to_string()))?;
+            out.push(value);
+        }
+        Ok(out)
     }
 }
 
