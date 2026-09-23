@@ -302,10 +302,13 @@ impl S3Keyspace {
         ])
     }
 
-    /// Key for the processing result of a single NDJSON line.
+    /// Key for the processing result of a single NDJSON line — the legacy
+    /// per-line receipt shape, which the ingest no longer writes (#1429) but
+    /// the readers still accept; kept so the tests can plant one.
     ///
     /// `file_url` names the manifest output file the line came from; see
     /// [`submit_file_segment`] for why it is part of the key.
+    #[cfg(test)]
     pub fn submit_result_line_key(
         &self,
         submitter: &str,
@@ -323,6 +326,34 @@ impl S3Keyspace {
             manifest_id,
             &submit_file_segment(file_url),
             &format!("line-{}.json", line),
+        ])
+    }
+
+    /// Key for one ingest batch's coalesced receipts — every entry result the
+    /// batch produced, in a single object rather than one per line (#1429).
+    ///
+    /// Sits under the same `results/<manifest>/` prefix that
+    /// [`Self::submit_result_line_key`] writes and that `load_entry_results`
+    /// sweeps, nested by file and keyed by the batch's first line exactly like
+    /// the raw archive and the change log, so batches of one file never
+    /// collide and two files' batches stay apart (#457).
+    pub fn submit_result_batch_key(
+        &self,
+        submitter: &str,
+        submission_id: &str,
+        manifest_id: &str,
+        file_url: Option<&str>,
+        first_line: u64,
+    ) -> String {
+        self.join(&[
+            "bulk",
+            "submit",
+            submitter,
+            submission_id,
+            "results",
+            manifest_id,
+            &submit_file_segment(file_url),
+            &format!("batch-{}.json", first_line),
         ])
     }
 

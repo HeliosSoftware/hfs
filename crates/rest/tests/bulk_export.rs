@@ -280,7 +280,7 @@ async fn both_mode_header_tenant_can_follow_unprefixed_bulk_export_urls() {
 
 #[tokio::test]
 async fn test_system_export_full_lifecycle() {
-    let (server, backend, output, _tmp) = create_bulk_export_server().await;
+    let (server, backend, output, tmp) = create_bulk_export_server().await;
     seed_patients(&backend, 3).await;
 
     // Kick-off — requires Prefer: respond-async.
@@ -358,6 +358,16 @@ async fn test_system_export_full_lifecycle() {
         .add_header("x-tenant-id", "test-tenant")
         .await;
     assert_eq!(gone.status_code(), StatusCode::NOT_FOUND);
+
+    // And so is the job's output directory: DELETE tears down the files, not
+    // just the job row (#1272).
+    let job_id = status_path.rsplit('/').next().unwrap();
+    let job_dir = tmp.path().join("test-tenant").join(job_id);
+    assert!(
+        !job_dir.exists(),
+        "job output directory {} survived DELETE",
+        job_dir.display()
+    );
 }
 
 #[tokio::test]

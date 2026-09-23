@@ -67,6 +67,9 @@ server was built with.
 | `/ui/status` | GET | Reference implementation of the fragment-vs-full-page pattern |
 | `/ui/version` | POST | Persists the sidebar FHIR-version choice, redirects back |
 | `/ui/tenant`, `/ui/tenant/options` | POST/GET | Tenant selector |
+| `/ui/login` | GET | Interactive login (#1449): starts Authorization Code + PKCE, redirects to the IdP. 404 unless `HFS_UI_LOGIN_CLIENT_ID` is set |
+| `/ui/callback` | GET | The IdP's redirect back: verifies `state`, exchanges the code, sets the `hfs_session` cookie |
+| `/ui/logout` | POST | Ends the session (and the IdP's, via end-session); the account menu's Sign out form posts here |
 | `/ui/assets/*` | GET | Embedded htmx, CSS, JS, fonts, logo |
 
 The router `fallback_service` is the FHIR app, so anything not under `/ui` falls
