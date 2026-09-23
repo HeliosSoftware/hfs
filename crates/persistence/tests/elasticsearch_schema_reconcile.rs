@@ -237,6 +237,10 @@ fn assert_reconciled(mapping: &Value) {
     let (date, composite_date) = date_fields(mapping);
     assert_eq!(date["ignore_malformed"], json!(true), "{date}");
     assert_eq!(composite_date["ignore_malformed"], json!(true));
+    // Schema version 2 (#1391): the end of the range a date covers.
+    let end = &mapping["properties"]["search_params"]["properties"]["date"]["properties"]["end"];
+    assert_eq!(end["type"], "date", "{end}");
+    assert_eq!(end["ignore_malformed"], json!(true), "{end}");
     assert_eq!(
         mapping["_meta"][SCHEMA_VERSION_META_KEY],
         json!(SCHEMA_VERSION)
@@ -321,6 +325,73 @@ async fn startup_reconciles_an_old_index_and_a_malformed_date_then_indexes() {
         ["bad-after", "seed"],
         "the document is searchable by its other parameters"
     );
+}
+
+/// #1391: an index laid out at schema version 1 has no `search_params.date.end`.
+/// A backend starting on it adds the field, and a `Period` indexed afterwards
+/// is found by the range comparisons that read it.
+#[tokio::test]
+async fn startup_adds_the_date_range_end_to_a_version_1_index() {
+    // The current mapping without `end`, marked version 1: what a version-1
+    // build created. A field cannot be removed from a live index, so it is
+    // copied into a fresh one.
+    let template = started_backend_on(&new_prefix()).await;
+    create_patient(&template, "seed", "Templateseed").await;
+    let mut mapping = mapping_of(&template.index_name("reconcile", "Patient")).await;
+    let date = &mut mapping["properties"]["search_params"]["properties"]["date"]["properties"];
+    assert!(date.as_object_mut().unwrap().remove("end").is_some());
+    mapping["_meta"] = json!({ SCHEMA_VERSION_META_KEY: 1 });
+
+    let prefix = new_prefix();
+    let index = backend_on(&prefix)
+        .await
+        .index_name("reconcile", "Encounter");
+    let response = raw_client()
+        .await
+        .indices()
+        .create(elasticsearch::indices::IndicesCreateParts::Index(&index))
+        .body(json!({
+            "settings": {
+                "number_of_replicas": 0,
+                "analysis": { "normalizer": { "lowercase_normalizer": {
+                    "type": "custom", "filter": ["lowercase"]
+                } } }
+            },
+            "mappings": mapping
+        }))
+        .send()
+        .await
+        .expect("create a version-1 index");
+    assert!(response.status_code().is_success(), "create failed");
+
+    let backend = started_backend_on(&prefix).await;
+    assert_reconciled(&mapping_of(&index).await);
+
+    backend
+        .create(
+            &tenant(),
+            "Encounter",
+            json!({
+                "resourceType": "Encounter",
+                "id": "e1",
+                "status": "finished",
+                "class": { "code": "AMB" },
+                "period": { "start": "2020-03-01", "end": "2020-09-30" }
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("create");
+    let date_query = |value: &str| {
+        SearchQuery::new("Encounter").with_parameter(SearchParameter {
+            name: "date".to_string(),
+            param_type: SearchParamType::Date,
+            values: vec![SearchValue::parse(value)],
+            ..Default::default()
+        })
+    };
+    assert_eq!(found_ids(&backend, &date_query("2020")).await, ["e1"]);
+    assert!(found_ids(&backend, &date_query("2020-03")).await.is_empty());
 }
 
 /// The per-index mapping version Elasticsearch keeps in the cluster state; it

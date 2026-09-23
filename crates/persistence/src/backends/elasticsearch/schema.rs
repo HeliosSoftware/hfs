@@ -66,7 +66,11 @@ use super::backend::ElasticsearchBackend;
 /// - `1` — first versioned mapping; delivers `ignore_malformed` on
 ///   `search_params.date.value` and `search_params.composite.date` (#1314) to
 ///   indices created before it.
-pub const SCHEMA_VERSION: u64 = 1;
+/// - `2` — `search_params.date.end`, the end of the range a date value covers
+///   (#1391). Documents indexed before it have no `end`, and a date search
+///   compares against it for every prefix but `lt` and `sa`: they are not
+///   found by date until a `$reindex`.
+pub const SCHEMA_VERSION: u64 = 2;
 
 /// The key, in an index mapping's `_meta`, that holds [`SCHEMA_VERSION`].
 pub const SCHEMA_VERSION_META_KEY: &str = "hfs_schema_version";
@@ -188,6 +192,15 @@ pub fn create_index_mapping(config: &super::backend::ElasticsearchConfig) -> ser
                                 // document (#1314). Existing indices get it
                                 // from the reconcile pass (#1335).
                                 "value": {
+                                    "type": "date",
+                                    "format": "strict_date_optional_time||epoch_millis||yyyy||yyyy-MM||yyyy-MM-dd",
+                                    "ignore_malformed": true
+                                },
+                                // Where the range the value covers ends
+                                // (exclusive): one unit of its precision after
+                                // `value` for a point, the end of a `Period`
+                                // (#1391).
+                                "end": {
                                     "type": "date",
                                     "format": "strict_date_optional_time||epoch_millis||yyyy||yyyy-MM||yyyy-MM-dd",
                                     "ignore_malformed": true
@@ -655,6 +668,19 @@ fn note_reconcile_outcome(backend: &ElasticsearchBackend, index: &str, outcome: 
     }
 }
 
+/// Warns that indices just brought up from an older mapping hold documents
+/// indexed without `search_params.date.end` (schema version `2`, #1391):
+/// every index below [`SCHEMA_VERSION`] predates it. Their dates are not found
+/// by most prefixes until the resources are indexed again.
+fn warn_reindex_needed(indices: usize) {
+    tracing::warn!(
+        indices,
+        schema_version = SCHEMA_VERSION,
+        "Elasticsearch indices were upgraded from a mapping without date range ends; \
+         run `$reindex` so that date searches find the documents indexed before the upgrade"
+    );
+}
+
 /// Brings every existing HFS index under the configured prefix up to
 /// [`SCHEMA_VERSION`]. Run at startup; see [`SCHEMA_VERSION`] for the
 /// convention and the failure policy.
@@ -715,6 +741,9 @@ pub async fn reconcile_index_mappings(backend: &ElasticsearchBackend) -> Reconci
         }
     }
 
+    if report.updated > 0 {
+        warn_reindex_needed(report.updated);
+    }
     if report.updated > 0 || report.failed > 0 {
         tracing::info!(
             schema_version = SCHEMA_VERSION,
@@ -756,6 +785,7 @@ async fn reconcile_index(backend: &ElasticsearchBackend, index: &str) {
             schema_version = SCHEMA_VERSION,
             "reconciled Elasticsearch index mapping"
         );
+        warn_reindex_needed(1);
     }
     note_reconcile_outcome(backend, index, &outcome);
 }

@@ -3,7 +3,9 @@
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Value, json};
 
-use crate::search::{DatePredicate, DateValuePrecision, FhirDateValue, StorageResolution};
+use crate::search::{
+    DatePredicate, DateValuePrecision, FhirDateValue, RangeCondition, StorageResolution,
+};
 use crate::types::SearchPrefix;
 
 /// A precision-aware comparison on one ES date field, ready to be wrapped in
@@ -93,19 +95,63 @@ fn es_bound(instant: DateTime<Utc>, precision: DateValuePrecision) -> String {
 
 /// Builds an ES query clause for an indexed date search parameter.
 ///
+/// Every indexed date is a range `[value, end)` — one unit of its precision
+/// for a point, the whole of a `Period` — and each prefix compares the search
+/// range against it by the FHIR rules for a range target, as
+/// [`FhirDateValue::range_predicate`] spells them for every backend (#1391):
+/// `eq` needs the stored range inside the search range, `sa` its start after
+/// the search range, `ap` an overlap with the search range widened by
+/// [`FhirDateValue::approx_margin`], and so on. Both comparisons of a group
+/// apply to the same nested entry, so a `Period` is never matched by its start
+/// against one condition and by its end against another.
+///
+/// The bounds are complete instants, never a partial date: Elasticsearch
+/// rounds a partial `gt`/`lte` bound *up* over the fields it is missing, which
+/// would move the `end` comparisons by up to a day.
+///
+/// `_lastUpdated` and composite components are points and keep
+/// [`field_range`].
+///
 /// Always `Some`: a value that is not a date yields [`match_none`].
 pub fn build_clause(name: &str, value: &str, prefix: SearchPrefix) -> Option<Value> {
-    let name_term = json!({ "term": { "search_params.date.name": name } });
-    let bool_body = match field_range("search_params.date.value", value, prefix) {
-        Some(DateRange::Within(range)) => json!({ "must": [name_term, range] }),
-        Some(DateRange::Outside(range)) => json!({ "must": [name_term], "must_not": [range] }),
-        None => return Some(match_none()),
+    let parsed = match FhirDateValue::parse(value) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            tracing::warn!(
+                "unvalidated date search value reached the Elasticsearch handler: {error}"
+            );
+            return Some(match_none());
+        }
     };
+    let predicate = parsed.range_predicate(prefix, StorageResolution::Millis);
+
+    let condition = |condition: &RangeCondition| {
+        let (field, op, at) = match *condition {
+            RangeCondition::StartAtOrAfter(at) => ("search_params.date.value", "gte", at),
+            RangeCondition::StartBefore(at) => ("search_params.date.value", "lt", at),
+            RangeCondition::EndAfter(at) => ("search_params.date.end", "gt", at),
+            RangeCondition::EndAtOrBefore(at) => ("search_params.date.end", "lte", at),
+        };
+        json!({ "range": { field: { op: at.to_rfc3339_opts(SecondsFormat::Millis, true) } } })
+    };
+    let mut must = vec![json!({ "term": { "search_params.date.name": name } })];
+    match predicate.any_of.as_slice() {
+        [group] => must.extend(group.iter().map(condition)),
+        groups => must.push(json!({
+            "bool": {
+                "should": groups
+                    .iter()
+                    .map(|group| json!({ "bool": { "must": group.iter().map(condition).collect::<Vec<_>>() } }))
+                    .collect::<Vec<_>>(),
+                "minimum_should_match": 1
+            }
+        })),
+    }
 
     Some(json!({
         "nested": {
             "path": "search_params.date",
-            "query": { "bool": bool_body }
+            "query": { "bool": { "must": must } }
         }
     }))
 }
@@ -149,34 +195,106 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_eq_range() {
-        let clause = build_clause("birthdate", "2024-01-15", SearchPrefix::Eq).unwrap();
-        let s = serde_json::to_string(&clause).unwrap();
-        assert!(s.contains("gte"));
-        assert!(s.contains("2024-01-15"));
-        assert!(s.contains("2024-01-16"));
-    }
-
-    #[test]
-    fn test_gt_range() {
-        let clause = build_clause("birthdate", "2024-01-15", SearchPrefix::Gt).unwrap();
-        let s = serde_json::to_string(&clause).unwrap();
-        assert!(s.contains("gte"));
-        assert!(s.contains("2024-01-16")); // starts after precision range
-    }
-
-    #[test]
-    fn ne_is_the_negated_precision_range() {
-        let clause = build_clause("birthdate", "2024-01-15", SearchPrefix::Ne).unwrap();
-        let bool_body = &clause["nested"]["query"]["bool"];
+    /// The `must` list of a clause, after the name term.
+    fn conditions(value: &str, prefix: SearchPrefix) -> Vec<Value> {
+        let clause = build_clause("date", value, prefix).unwrap();
+        let must = clause["nested"]["query"]["bool"]["must"]
+            .as_array()
+            .expect("a bool must")
+            .clone();
         assert_eq!(
-            bool_body["must"][0]["term"]["search_params.date.name"],
-            "birthdate"
+            must[0],
+            json!({ "term": { "search_params.date.name": "date" } })
         );
-        let range = &bool_body["must_not"][0]["range"]["search_params.date.value"];
-        assert_eq!(range["gte"], "2024-01-15");
-        assert_eq!(range["lt"], "2024-01-16");
+        must[1..].to_vec()
+    }
+
+    fn range(field: &str, op: &str, at: &str) -> Value {
+        json!({ "range": { format!("search_params.date.{field}"): { op: at } } })
+    }
+
+    fn any_of(groups: Vec<Vec<Value>>) -> Value {
+        json!({
+            "bool": {
+                "should": groups
+                    .into_iter()
+                    .map(|group| json!({ "bool": { "must": group } }))
+                    .collect::<Vec<_>>(),
+                "minimum_should_match": 1
+            }
+        })
+    }
+
+    /// #1391: every prefix compares the search range `[s, e)` against the
+    /// stored range `[value, end)` of the same nested entry, per the FHIR
+    /// table for a range target.
+    #[test]
+    fn prefixes_compare_the_search_range_with_the_stored_range() {
+        let (s, e) = ("2024-01-15T00:00:00.000Z", "2024-01-16T00:00:00.000Z");
+        let eq = vec![range("value", "gte", s), range("end", "lte", e)];
+        assert_eq!(conditions("2024-01-15", SearchPrefix::Eq), eq);
+        assert_eq!(
+            conditions("2024-01-15", SearchPrefix::Ne),
+            vec![any_of(vec![
+                vec![range("value", "lt", s)],
+                vec![range("end", "gt", e)],
+            ])]
+        );
+        assert_eq!(
+            conditions("2024-01-15", SearchPrefix::Gt),
+            vec![range("end", "gt", e)]
+        );
+        assert_eq!(
+            conditions("2024-01-15", SearchPrefix::Lt),
+            vec![range("value", "lt", s)]
+        );
+        assert_eq!(
+            conditions("2024-01-15", SearchPrefix::Ge),
+            vec![any_of(vec![vec![range("end", "gt", e)], eq.clone()])]
+        );
+        assert_eq!(
+            conditions("2024-01-15", SearchPrefix::Le),
+            vec![any_of(vec![vec![range("value", "lt", s)], eq])]
+        );
+        assert_eq!(
+            conditions("2024-01-15", SearchPrefix::Sa),
+            vec![range("value", "gte", e)]
+        );
+        assert_eq!(
+            conditions("2024-01-15", SearchPrefix::Eb),
+            vec![range("end", "lte", s)]
+        );
+    }
+
+    /// #1391: `ap` is an overlap with the search range widened by the shared
+    /// margin — a day either side of a day — no longer the plain `eq` range.
+    #[test]
+    fn ap_is_an_overlap_with_the_widened_range() {
+        assert_eq!(
+            conditions("2024-01-15", SearchPrefix::Ap),
+            vec![
+                range("value", "lt", "2024-01-17T00:00:00.000Z"),
+                range("end", "gt", "2024-01-14T00:00:00.000Z"),
+            ]
+        );
+        assert_eq!(
+            conditions("2024-01", SearchPrefix::Ap),
+            vec![
+                range("value", "lt", "2024-03-01T00:00:00.000Z"),
+                range("end", "gt", "2023-12-01T00:00:00.000Z"),
+            ]
+        );
+    }
+
+    /// Bounds are complete instants even for a date-only value: Elasticsearch
+    /// rounds a partial `gt`/`lte` bound up to the end of the missing fields.
+    #[test]
+    fn bounds_are_complete_instants() {
+        let clause =
+            serde_json::to_string(&build_clause("date", "2024", SearchPrefix::Le).unwrap())
+                .unwrap();
+        assert!(clause.contains("\"2025-01-01T00:00:00.000Z\""), "{clause}");
+        assert!(!clause.contains("\"2025-01-01\""), "{clause}");
     }
 
     #[test]

@@ -541,6 +541,24 @@ async fn mongodb_minute_precision_stored_dates_are_indexed() {
     .await;
 }
 
+/// The backend-agnostic suite for Period and Timing range targets (#1391).
+/// Same `#[path]` arrangement.
+#[path = "search/date_period_suite.rs"]
+mod date_period_suite;
+
+/// #1391: a Period was indexed as two unrelated points, so `eq`/`ap`
+/// over-matched, `sa`/`eb` could match on the wrong end and an open end was
+/// an instant. It is one `[value_date, value_date_end)` range now. Needs the
+/// full registry so `Encounter.date` and friends extract.
+#[tokio::test]
+async fn mongodb_date_period_targets_are_ranges() {
+    let Some(backend) = create_backend_with_full_registry("date_period").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    date_period_suite::period_targets_are_ranges(&backend, "date-period-1391").await;
+}
+
 /// The backend-agnostic `_contained` suite (#1336, #1362, #1363). Same
 /// `#[path]` arrangement.
 #[path = "search/contained_suite.rs"]
@@ -14138,7 +14156,7 @@ async fn mongodb_integration_boot_creates_only_inline_search_indexes_and_keeps_g
     db.collection::<Document>("schema_version")
         .update_one(
             doc! { "_id": "schema_version" },
-            doc! { "$set": { "search_indexes": { "generation": 3_i32 } } },
+            doc! { "$set": { "search_indexes": { "generation": 4_i32 } } },
         )
         .await
         .unwrap();
@@ -14155,7 +14173,7 @@ async fn mongodb_integration_boot_creates_only_inline_search_indexes_and_keeps_g
         doc.get_document("search_indexes")
             .unwrap()
             .get_i32("generation"),
-        Ok(3)
+        Ok(4)
     );
 }
 
@@ -14229,8 +14247,9 @@ async fn seed_generation1_indexes(db: &mongodb::Database) {
 /// Generation 3: `idx_search_contained` is no longer a `search_index`
 /// background spec (#1160) — it now lives inline on `search_index_contained`
 /// (see [`index_names`] calls against that collection instead).
+/// Generation 4: `idx_search_date_v3` replaces `idx_search_date_v2` (#1391).
 const CURRENT_BACKGROUND_NAMES: [&str; 9] = [
-    "idx_search_date_v2",
+    "idx_search_date_v3",
     "idx_search_identifier_type_v2",
     "idx_search_number_v2",
     "idx_search_quantity_v2",
@@ -14348,7 +14367,7 @@ async fn mongodb_integration_builder_fresh_database_ends_with_generation2_set() 
             .get_document("search_indexes")
             .unwrap()
             .get_i32("generation"),
-        Ok(3)
+        Ok(4)
     );
 }
 
@@ -14418,6 +14437,62 @@ async fn mongodb_integration_builder_upgrades_a_generation1_database_and_drops_v
             .items
             .len(),
         5
+    );
+}
+
+/// #1391: a generation-3 database carries `idx_search_date_v2`, keyed on
+/// `value_date` alone. The builder must build `idx_search_date_v3` (and only
+/// that), then drop `idx_search_date_v2`, and record generation 4.
+#[tokio::test]
+async fn mongodb_integration_builder_upgrades_a_generation3_database_and_drops_date_v2() {
+    let Some(cs) = shared_mongo::connection_string().await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let db_name = build_test_database_name("builder_upgrade_g3");
+    let db = raw_test_client(&cs).await.unwrap().database(&db_name);
+    // Generation 4 fully built, then staged back to generation 3: drop the
+    // date index and put back the generation-2 one, exactly as it was.
+    let first = boot_with_mode(&cs, &db_name, IndexBuildMode::Inline).await;
+    assert!(matches!(
+        first.wait_for_search_index_build().await,
+        Some(BuildOutcome::Built { .. })
+    ));
+    let search_index = db.collection::<Document>("search_index");
+    search_index.drop_index("idx_search_date_v3").await.unwrap();
+    db.run_command(doc! { "createIndexes": "search_index", "indexes": [{
+        "key": { "tenant_id": 1, "resource_type": 1, "param_name": 1, "value_date": 1, "resource_id": 1 },
+        "name": "idx_search_date_v2",
+        "partialFilterExpression": { "value_date": { "$exists": true } },
+    }]})
+    .await
+    .unwrap();
+
+    let backend = boot_with_mode(&cs, &db_name, IndexBuildMode::Inline).await;
+    let outcome = backend
+        .wait_for_search_index_build()
+        .await
+        .expect("builder ran");
+    assert_eq!(
+        outcome,
+        BuildOutcome::Built {
+            created: vec!["idx_search_date_v3".to_string()],
+            dropped: vec!["idx_search_date_v2".to_string()],
+        }
+    );
+    assert_eq!(search_index_names(&db).await, expected_current_names());
+    let record = db
+        .collection::<Document>("schema_version")
+        .find_one(doc! { "_id": "schema_version" })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record
+            .get_document("search_indexes")
+            .unwrap()
+            .get_i32("generation"),
+        Ok(4)
     );
 }
 
@@ -14509,7 +14584,7 @@ async fn mongodb_integration_builder_moves_contained_rows_and_drops_the_old_part
         .unwrap()
         .unwrap();
     let si = sv.get_document("search_indexes").unwrap();
-    assert_eq!(si.get_i32("generation"), Ok(3));
+    assert_eq!(si.get_i32("generation"), Ok(4));
     assert_eq!(si.get_bool("contained_rows_moved"), Ok(true));
 
     // Second boot: nothing to move, nothing to build.
@@ -14538,7 +14613,7 @@ async fn mongodb_integration_builder_refuses_to_touch_a_conflicting_v2_name() {
     seed_generation1_indexes(&db).await;
     // A person built something under our name with different keys.
     db.run_command(doc! { "createIndexes": "search_index", "indexes": [
-        { "key": { "tenant_id": 1, "value_date": 1 }, "name": "idx_search_date_v2" }
+        { "key": { "tenant_id": 1, "value_date": 1 }, "name": "idx_search_date_v3" }
     ]})
     .await
     .unwrap();
@@ -14557,7 +14632,7 @@ async fn mongodb_integration_builder_refuses_to_touch_a_conflicting_v2_name() {
         .await
         .expect_err("a conflicting v2 index must fail inline boot");
     let message = format!("{err}");
-    assert!(message.contains("idx_search_date_v2"), "{message}");
+    assert!(message.contains("idx_search_date_v3"), "{message}");
     let names = search_index_names(&db).await;
     assert!(
         names.contains(&"idx_search_string".to_string()),
@@ -14761,17 +14836,17 @@ async fn mongodb_integration_builder_second_boot_issues_no_create_indexes() {
          search_index); this assertion cannot be trusted until profiling is confirmed working"
     );
 
-    let generation2_created = db
+    let background_created = db
         .collection::<Document>("system.profile")
         .count_documents(doc! {
             "command.createIndexes": "search_index",
-            "command.indexes.name": { "$regex": "_v2$|^idx_search_contained$" },
+            "command.indexes.name": { "$regex": "_v2$|_v3$|^idx_search_contained$" },
         })
         .await
         .unwrap();
     assert_eq!(
-        generation2_created, 0,
-        "second boot must not issue createIndexes for any generation-2 search_index index"
+        background_created, 0,
+        "second boot must not issue createIndexes for any generation-2/-4 search_index index"
     );
 }
 
@@ -14832,8 +14907,11 @@ async fn assert_search_index_ops_are_covered(
     }
 }
 
+/// #1391: date rows are ranges `[value_date, value_date_end)`, so a date
+/// search bounds `value_date`, `value_date_end`, or both. Every prefix shape
+/// must still be a covered scan on `idx_search_date_v3`, which carries both.
 #[tokio::test]
-async fn mongodb_integration_date_range_search_is_a_covered_v2_scan() {
+async fn mongodb_integration_date_range_search_is_a_covered_v3_scan() {
     let Some(backend) = create_backend_with_full_registry("covered_date").await else {
         eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
         return;
@@ -14858,23 +14936,33 @@ async fn mongodb_integration_date_range_search_is_a_covered_v2_scan() {
         .await
         .unwrap()
         .database(&backend.config().database_name);
-    let q = SearchQuery::new("Observation").with_parameter(SearchParameter {
-        name: "date".into(),
-        param_type: SearchParamType::Date,
-        modifier: None,
-        values: vec![SearchValue::parse("ge2016-01-10")],
-        chain: vec![],
-        components: vec![],
-    });
-    assert_search_index_ops_are_covered(
-        &db,
-        async {
-            let r = backend.search(&tenant, &q).await.unwrap();
-            assert_eq!(r.resources.items.len(), 11);
-        },
-        "idx_search_date_v2",
-    )
-    .await;
+    // `gt` bounds only the end, `eq` and `eb` both ends. The two-branch
+    // prefixes (`ge`, `le`, `ne`) still seek on this index but, as an `$or`
+    // under the shared tenant/type/param filter, MongoDB 5.0 reads the
+    // documents of the param's slice for them, so they are not asserted here.
+    for (value, expected) in [("gt2016-01-10", 10), ("2016-01-10", 1), ("eb2016-01-10", 9)] {
+        let q = SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "date".into(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: vec![SearchValue::parse(value)],
+            chain: vec![],
+            components: vec![],
+        });
+        // Each search is profiled on its own: the helper reads every
+        // `search_index` op in `system.profile`, so clear it between runs.
+        let _ = db.run_command(doc! { "profile": 0_i32 }).await;
+        let _ = db.collection::<Document>("system.profile").drop().await;
+        assert_search_index_ops_are_covered(
+            &db,
+            async {
+                let r = backend.search(&tenant, &q).await.unwrap();
+                assert_eq!(r.resources.items.len(), expected, "date={value}");
+            },
+            "idx_search_date_v3",
+        )
+        .await;
+    }
 }
 
 #[tokio::test]

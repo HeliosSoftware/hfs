@@ -17,7 +17,7 @@ use crate::core::{
     IncludeProvider, ResourceStorage, RevincludeProvider, SearchProvider, SearchResult,
 };
 use crate::error::{BackendError, QueryErrorExt, SearchError, StorageError, StorageResult};
-use crate::search::{DatePredicate, FhirDateValue, StorageResolution};
+use crate::search::{DatePredicate, FhirDateValue, RangeCondition, StorageResolution};
 use crate::tenant::TenantContext;
 use crate::types::{
     CompartmentMembership, CursorDirection, CursorValue, IncludeDirective, IncludeType, Page,
@@ -52,8 +52,30 @@ fn chrono_to_bson(dt: DateTime<Utc>) -> BsonDateTime {
     BsonDateTime::from_millis(dt.timestamp_millis())
 }
 
-/// The date filter document for one search value (#519). A free function so
-/// the range semantics are unit-testable without a live MongoDB.
+/// The `search_index` field a date row stores the end of its range in
+/// (#1391); `value_date` holds the start.
+const VALUE_DATE_END: &str = "value_date_end";
+
+/// Reads a date search value with the grammar every backend shares.
+///
+/// A value that is not a date is an error here, never a filter. The search
+/// gate (`validate_date_values`) reports it first on every ordinary path;
+/// this is what the in-transaction conditional paths, which build filters
+/// without passing the gate, fall back on.
+fn parse_date_search_value(value: &SearchValue, param: &str) -> StorageResult<FhirDateValue> {
+    FhirDateValue::parse(&value.value).map_err(|error| {
+        StorageError::Search(SearchError::InvalidDateValue {
+            param: param.to_string(),
+            value: value.value.clone(),
+            reason: error.to_string(),
+        })
+    })
+}
+
+/// The date filter document for one search value against a stored *point*
+/// in `field` (#519): `_lastUpdated` on the resources collection, and a date
+/// component of a composite parameter. A free function so the semantics are
+/// unit-testable without a live MongoDB.
 ///
 /// The value is read by [`FhirDateValue`], the grammar and precision range
 /// every backend shares. A search value names a *range*, never an instant:
@@ -64,26 +86,14 @@ fn chrono_to_bson(dt: DateTime<Utc>) -> BsonDateTime {
 /// milliseconds, so the range is clamped to that: a microsecond search value
 /// still finds the millisecond-truncated date stored for it.
 ///
-/// A value that is not a date is an error here, never a filter. The search
-/// gate (`validate_date_values`) reports it first on every ordinary path;
-/// this is what the in-transaction conditional paths, which build filters
-/// without passing the gate, fall back on.
+/// `ap` accepts a point inside [`FhirDateValue::approx_window`], the window
+/// every backend shares (#1391; it used to be ±12h around the start here).
 fn build_date_filter_doc(value: &SearchValue, param: &str, field: &str) -> StorageResult<Document> {
-    let parsed = FhirDateValue::parse(&value.value).map_err(|error| {
-        StorageError::Search(SearchError::InvalidDateValue {
-            param: param.to_string(),
-            value: value.value.clone(),
-            reason: error.to_string(),
-        })
-    })?;
+    let parsed = parse_date_search_value(value, param)?;
 
     let Some(predicate) = parsed.predicate(value.prefix, StorageResolution::Millis) else {
-        // `ap`, which the shared layer leaves to each backend: ±12h around
-        // the start of the range, as before.
-        let (start, _) = parsed.range_at(StorageResolution::Millis);
-        let lower = chrono_to_bson(start - chrono::Duration::hours(12));
-        let upper = chrono_to_bson(start + chrono::Duration::hours(12));
-        return Ok(doc! { field: { "$gte": lower, "$lte": upper } });
+        let (low, high) = parsed.approx_window(StorageResolution::Millis);
+        return Ok(doc! { field: { "$gte": chrono_to_bson(low), "$lt": chrono_to_bson(high) } });
     };
 
     Ok(match predicate {
@@ -98,6 +108,66 @@ fn build_date_filter_doc(value: &SearchValue, param: &str, field: &str) -> Stora
         },
         DatePredicate::AtOrAfter(bound) => doc! { field: { "$gte": chrono_to_bson(bound) } },
         DatePredicate::Before(bound) => doc! { field: { "$lt": chrono_to_bson(bound) } },
+    })
+}
+
+/// The date filter document for one search value against the *range* a
+/// `search_index` row stores, `[value_date, value_date_end)` (#1391): a
+/// `Period` is one row, not two unrelated points, and every prefix follows
+/// the FHIR rule for a range target ([`FhirDateValue::range_predicate`]).
+///
+/// A row indexed before #1391 has no `value_date_end` and fails every
+/// condition on the end until it is reindexed (`$reindex`); treating the
+/// missing end as open would make it match `gt` for any date.
+fn build_date_range_filter_doc(value: &SearchValue, param: &str) -> StorageResult<Document> {
+    let parsed = parse_date_search_value(value, param)?;
+    let predicate = parsed.range_predicate(value.prefix, StorageResolution::Millis);
+
+    let mut arms: Vec<Document> = predicate
+        .any_of
+        .iter()
+        .map(|group| {
+            let mut arm = Document::new();
+            let mut bound_on = |field: &str, op: &str, bound| {
+                if let Ok(ops) = arm.get_document_mut(field) {
+                    ops.insert(op, chrono_to_bson(bound));
+                } else {
+                    arm.insert(field, doc! { op: chrono_to_bson(bound) });
+                }
+            };
+            for condition in group {
+                match *condition {
+                    RangeCondition::StartAtOrAfter(bound) => bound_on("value_date", "$gte", bound),
+                    RangeCondition::StartBefore(bound) => bound_on("value_date", "$lt", bound),
+                    RangeCondition::EndAfter(bound) => bound_on(VALUE_DATE_END, "$gt", bound),
+                    RangeCondition::EndAtOrBefore(bound) => {
+                        // Implied, since every stored range is at least one
+                        // unit wide; it lets `eq` and `eb` seek on
+                        // `idx_search_date_v3`, which leads with `value_date`.
+                        bound_on("value_date", "$lt", bound);
+                        bound_on(VALUE_DATE_END, "$lte", bound);
+                    }
+                }
+            }
+            if arm.contains_key("value_date") {
+                arm
+            } else {
+                // `idx_search_date_v3` is partial on `value_date` existing; a
+                // filter on the end alone would not imply it and would scan
+                // every row of the resource type instead. `$ne: null` rather
+                // than `$exists: true`, which the index cannot answer without
+                // reading the document.
+                let mut with_start = doc! { "value_date": { "$ne": null } };
+                with_start.extend(arm);
+                with_start
+            }
+        })
+        .collect();
+
+    Ok(if arms.len() == 1 {
+        arms.remove(0)
+    } else {
+        doc! { "$or": arms }
     })
 }
 
@@ -328,6 +398,18 @@ pub(super) fn value_field_for(param_type: SearchParamType) -> Option<&'static st
         SearchParamType::Reference => Some("value_reference"),
         SearchParamType::Uri => Some("value_uri"),
         SearchParamType::Composite | SearchParamType::Special => None,
+    }
+}
+
+/// What a parameter sort aggregates per resource: the value field, except
+/// that a descending date sort reads the end of each stored range (#1391) —
+/// a `Period` sorts by where it ends, as the SQL backends' `MAX` over the end
+/// column. A row indexed before #1391 has no end and falls back to its start.
+fn sort_key_expression(value_field: &str, direction: crate::types::SortDirection) -> Bson {
+    if value_field == "value_date" && direction == crate::types::SortDirection::Descending {
+        Bson::Document(doc! { "$ifNull": [format!("${VALUE_DATE_END}"), "$value_date"] })
+    } else {
+        Bson::String(format!("${value_field}"))
     }
 }
 
@@ -1727,6 +1809,7 @@ impl MongoBackend {
             SortDirection::Ascending => ("$min", 1),
             SortDirection::Descending => ("$max", -1),
         };
+        let sort_key = sort_key_expression(value_field, directive.direction);
         let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
 
         if let Some(allowed) = allowed {
@@ -1749,7 +1832,7 @@ impl MongoBackend {
                     }},
                     doc! { "$group": {
                         "_id": "$resource_id",
-                        "key": { accumulator: format!("${value_field}") },
+                        "key": { accumulator: sort_key.clone() },
                     }},
                 ];
                 let cursor = search_index
@@ -1792,7 +1875,7 @@ impl MongoBackend {
             }},
             doc! { "$group": {
                 "_id": "$resource_id",
-                "key": { accumulator: format!("${value_field}") },
+                "key": { accumulator: sort_key.clone() },
             }},
             doc! { "$sort": { "key": order, "_id": 1 } },
             doc! { "$project": { "_id": 1 } },
@@ -2439,8 +2522,14 @@ impl MongoBackend {
                     component,
                     component_value.clone(),
                 );
-                let predicate =
-                    self.build_index_value_filter(&synthetic, &component_value, &targets)?;
+                // A composite's date component is compared as a point on
+                // `value_date`, as on every backend: only a standalone date
+                // parameter is range-aware (#1391).
+                let predicate = if component.param_type == SearchParamType::Date {
+                    self.build_date_filter(&component_value, &synthetic.name, "value_date")?
+                } else {
+                    self.build_index_value_filter(&synthetic, &component_value, &targets)?
+                };
 
                 let mut scoped = doc! {
                     "tenant_id": tenant_id,
@@ -2731,7 +2820,7 @@ impl MongoBackend {
         match param.param_type {
             SearchParamType::String => self.build_string_filter(param, value),
             SearchParamType::Token => self.build_token_filter(param, value),
-            SearchParamType::Date => self.build_date_filter(value, &param.name, "value_date"),
+            SearchParamType::Date => build_date_range_filter_doc(value, &param.name),
             SearchParamType::Number => self.build_number_filter(&param.name, value),
             SearchParamType::Reference => {
                 self.build_reference_filter(param, value, reference_targets)
@@ -4169,17 +4258,120 @@ mod date_filter_tests {
         );
     }
 
-    /// ap: ±12h around the start, unchanged semantics.
+    /// ap on a point: the shared window, the range widened by one unit of a
+    /// date-only precision on each side (#1391; it was ±12h around the start).
     #[test]
-    fn ap_keeps_the_twelve_hour_window() {
+    fn ap_on_a_point_uses_the_shared_window() {
         let ap = filter("ap1995-10-02");
         assert_eq!(
             bounds(&ap).get_datetime("$gte").unwrap(),
-            &at("1995-10-01T12:00:00Z")
+            &at("1995-10-01T00:00:00Z")
         );
         assert_eq!(
-            bounds(&ap).get_datetime("$lte").unwrap(),
-            &at("1995-10-02T12:00:00Z")
+            bounds(&ap).get_datetime("$lt").unwrap(),
+            &at("1995-10-04T00:00:00Z")
+        );
+    }
+
+    fn range_filter(raw: &str) -> Document {
+        build_date_range_filter_doc(&SearchValue::parse(raw), "date").expect("valid date")
+    }
+
+    /// #1391: a standalone date parameter compares the stored range
+    /// `[value_date, value_date_end)` per the FHIR rules for a range target.
+    /// `2020` spans [2020-01-01, 2021-01-01).
+    #[test]
+    fn range_prefixes_compare_both_ends_of_the_stored_range() {
+        let (s, e) = (at("2020-01-01T00:00:00Z"), at("2021-01-01T00:00:00Z"));
+        let contained = doc! {
+            "value_date": { "$gte": s, "$lt": e },
+            "value_date_end": { "$lte": e },
+        };
+        let end_after = doc! {
+            "value_date": { "$ne": null },
+            "value_date_end": { "$gt": e },
+        };
+        assert_eq!(range_filter("2020"), contained);
+        assert_eq!(
+            range_filter("ne2020"),
+            doc! { "$or": [ { "value_date": { "$lt": s } }, end_after.clone() ] }
+        );
+        assert_eq!(range_filter("gt2020"), end_after);
+        assert_eq!(range_filter("lt2020"), doc! { "value_date": { "$lt": s } });
+        assert_eq!(
+            range_filter("ge2020"),
+            doc! { "$or": [ end_after.clone(), contained.clone() ] }
+        );
+        assert_eq!(
+            range_filter("le2020"),
+            doc! { "$or": [ { "value_date": { "$lt": s } }, contained.clone() ] }
+        );
+        assert_eq!(range_filter("sa2020"), doc! { "value_date": { "$gte": e } });
+        assert_eq!(
+            range_filter("eb2020"),
+            doc! {
+                "value_date": { "$lt": s },
+                "value_date_end": { "$lte": s },
+            }
+        );
+        assert_eq!(
+            range_filter("ap2020"),
+            doc! {
+                "value_date": { "$lt": at("2022-01-01T00:00:00Z") },
+                "value_date_end": { "$gt": at("2019-01-01T00:00:00Z") },
+            }
+        );
+    }
+
+    /// The filters agree with the shared predicate on the cases #1391 is
+    /// about: a Period straddling the search range, and open ends.
+    #[test]
+    fn range_filters_decide_the_issue_cases() {
+        let matches = |raw: &str, ts: &str, te: &str| {
+            let parsed = FhirDateValue::parse(&SearchValue::parse(raw).value).unwrap();
+            parsed
+                .range_predicate(SearchValue::parse(raw).prefix, StorageResolution::Millis)
+                .matches(bson_to_chrono(&at(ts)), bson_to_chrono(&at(te)))
+        };
+        let open_end = crate::search::open_end(StorageResolution::Millis).to_rfc3339();
+        let open_start = crate::search::open_start().to_rfc3339();
+        // A Period from 2019-06 to the end of 2020-03 is not "in" 2020.
+        assert!(!matches(
+            "2020",
+            "2019-06-01T00:00:00Z",
+            "2020-04-01T00:00:00Z"
+        ));
+        // One that only ends in 2021 does not start after 2020.
+        assert!(!matches(
+            "sa2020",
+            "2020-06-01T00:00:00Z",
+            "2021-06-01T00:00:00Z"
+        ));
+        // Open ends are unbounded.
+        assert!(matches("gt2030", "2019-01-01T00:00:00Z", &open_end));
+        assert!(matches("lt1900", &open_start, "2020-01-01T00:00:00Z"));
+        // Every prefix yields a filter.
+        for prefix in ["", "ne", "gt", "lt", "ge", "le", "sa", "eb", "ap"] {
+            range_filter(&format!("{prefix}2020-06-15T10:00Z"));
+        }
+    }
+
+    /// Descending date sorts read the end of the stored range; everything
+    /// else, and ascending date sorts, read the value field itself.
+    #[test]
+    fn descending_date_sort_reads_the_range_end() {
+        use crate::types::SortDirection;
+        assert_eq!(
+            sort_key_expression("value_date", SortDirection::Descending),
+            Bson::Document(doc! { "$ifNull": ["$value_date_end", "$value_date"] })
+        );
+        assert_eq!(
+            sort_key_expression("value_date", SortDirection::Ascending),
+            Bson::String("$value_date".to_string())
+        );
+        assert_eq!(
+            sort_key_expression("value_string", SortDirection::Descending),
+            Bson::String("$value_string".to_string())
         );
     }
 
@@ -4205,6 +4397,15 @@ mod date_filter_tests {
                         if param == "date"
                 ),
                 "{raw}: {error:?}"
+            );
+            let error =
+                build_date_range_filter_doc(&SearchValue::parse(raw), "date").expect_err(raw);
+            assert!(
+                matches!(
+                    &error,
+                    StorageError::Search(SearchError::InvalidDateValue { .. })
+                ),
+                "{raw} (range): {error:?}"
             );
         }
     }

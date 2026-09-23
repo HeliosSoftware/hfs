@@ -53,6 +53,9 @@ pub mod chained_tests;
 /// Backend-agnostic scenarios, shared with the PostgreSQL and MongoDB test
 /// binaries via `#[path]` (#1315).
 pub mod date_minute_index_suite;
+/// Backend-agnostic scenarios for Period and Timing targets, shared with the
+/// PostgreSQL, MongoDB and Elasticsearch test binaries via `#[path]` (#1391).
+pub mod date_period_suite;
 pub mod date_precision_suite;
 pub mod date_tests;
 /// Backend-agnostic scenarios, shared with the PostgreSQL, MongoDB and
@@ -89,3 +92,13 @@ pub mod string_tests;
 /// Elasticsearch test binaries via `#[path]` (#1379).
 pub mod token_code_system_suite;
 pub mod token_tests;
+
+/// The shared Period table (#1391): a Period is one range, a missing side is
+/// unbounded, and every prefix follows the FHIR rules for range targets.
+/// PostgreSQL, MongoDB and Elasticsearch run the same one.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn date_period_targets_are_ranges() {
+    let backend = make_sqlite_backend();
+    date_period_suite::period_targets_are_ranges(&backend, "date-period").await;
+}

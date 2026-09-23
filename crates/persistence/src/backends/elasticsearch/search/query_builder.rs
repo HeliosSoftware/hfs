@@ -446,6 +446,17 @@ impl<'a> EsQueryBuilder<'a> {
                 // with a 200 (#883).
                 name => {
                     let (group, field) = match directive.param_type {
+                        // A date is a range `[value, end)` (#1391): an
+                        // ascending sort orders by where it starts, a
+                        // descending one by where it ends, so a `Period` sorts
+                        // by its end as it did when each end was its own
+                        // entry. Chosen by the requested direction, not the
+                        // paging one, so a `Previous` cursor keeps the key.
+                        Some(SearchParamType::Date)
+                            if matches!(directive.direction, SortDirection::Descending) =>
+                        {
+                            ("date", "search_params.date.end")
+                        }
                         Some(SearchParamType::Date) => ("date", "search_params.date.value"),
                         Some(SearchParamType::Number) => ("number", "search_params.number.value"),
                         Some(SearchParamType::Quantity) => {
@@ -880,6 +891,34 @@ mod tests {
         assert_eq!(
             clause["nested"]["filter"]["term"]["search_params.date.name"],
             "birthdate"
+        );
+    }
+
+    /// #1391: a descending date sort orders by where each range ends — the
+    /// end of a `Period` — and keeps that key under a `Previous` cursor.
+    #[test]
+    fn test_descending_date_sort_uses_the_range_end() {
+        let directive = SortDirective {
+            parameter: "date".to_string(),
+            direction: SortDirection::Descending,
+            param_type: Some(SearchParamType::Date),
+        };
+        let builder = EsQueryBuilder::new("acme", "Encounter", "hfs_acme_encounter".to_string());
+
+        let query = SearchQuery::new("Encounter").with_sort(directive.clone());
+        let sort = &builder.build(&query).body["sort"][0];
+        let clause = &sort["search_params.date.end"];
+        assert!(!clause.is_null(), "descending sorts on the end, got {sort}");
+        assert_eq!(clause["order"], "desc");
+        assert_eq!(clause["mode"], "max");
+
+        let query = SearchQuery::new("Encounter")
+            .with_sort(directive)
+            .with_cursor(previous_cursor("e-5"));
+        let sort = &builder.build(&query).body["sort"][0];
+        assert!(
+            !sort["search_params.date.end"].is_null(),
+            "a Previous cursor keeps the sort key, got {sort}"
         );
     }
 

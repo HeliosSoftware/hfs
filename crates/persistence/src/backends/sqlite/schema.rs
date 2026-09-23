@@ -10,7 +10,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 34;
+pub const SCHEMA_VERSION: i32 = 35;
 
 /// The `search_index` value indexes. Excludes `idx_search_composite`, which the
 /// delete-by-resource path needs at all times, and `idx_search_token_display`,
@@ -445,6 +445,7 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             31 => migrate_v31_to_v32(conn)?,
             32 => migrate_v32_to_v33(conn)?,
             33 => migrate_v33_to_v34(conn)?,
+            34 => migrate_v34_to_v35(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -1594,6 +1595,97 @@ fn migrate_v33_to_v34(conn: &Connection) -> StorageResult<()> {
             ON secondary_sync_failures (last_failed_at);",
     )
     .map_err(|e| migration_err(format!("v34 create secondary_sync_failures: {e}")))?;
+    Ok(())
+}
+
+/// Migrate from schema version 34 to version 35 (#1391).
+///
+/// Adds `search_index.value_date_end`: every date row is a range
+/// `[value_date, value_date_end)`, so a `Period` is one row instead of its two
+/// ends as unrelated points, and the search prefixes compare ranges the way
+/// FHIR defines them. The end is fixed-width UTC text
+/// ([`super::search::writer::SQLITE_INSTANT_FORMAT`]); an open `Period` ends
+/// at the last instant of the supported years rather than NULL, so NULL only
+/// ever means "no end could be read".
+///
+/// Existing date rows were all indexed as points, so each is backfilled with
+/// the end of its own precision — the end the writer gives a point today. A
+/// `Period` indexed before this version stays two point rows until the
+/// resource is reindexed (`$reindex`).
+///
+/// The backfill runs in Rust, in rowid batches, through the writer's own
+/// [`super::search::writer::stored_date_end`], so an old row gets exactly the
+/// end a new one would. The FTS triggers stay in place: their `WHEN` needs a
+/// `value_string` or `value_token_display`, which a date row never has.
+/// Replay-safe: the column is added only when missing, and only rows still
+/// without an end are visited.
+fn migrate_v34_to_v35(conn: &Connection) -> StorageResult<()> {
+    use crate::search::converters::{DateEnd, IndexValue};
+    use crate::types::DatePrecision;
+
+    if !table_columns(conn, "search_index")?
+        .iter()
+        .any(|column| column == "value_date_end")
+    {
+        conn.execute(
+            "ALTER TABLE search_index ADD COLUMN value_date_end TEXT",
+            [],
+        )
+        .map_err(|e| migration_err(format!("v35 add value_date_end: {e}")))?;
+    }
+
+    const BATCH: i64 = 10_000;
+    let mut after = 0_i64;
+    loop {
+        let rows: Vec<(i64, String, Option<String>)> = {
+            let mut select = conn
+                .prepare_cached(
+                    "SELECT rowid, value_date, value_date_precision FROM search_index
+                      WHERE rowid > ?1 AND value_date IS NOT NULL AND value_date_end IS NULL
+                      ORDER BY rowid LIMIT ?2",
+                )
+                .map_err(|e| migration_err(format!("v35 read date rows: {e}")))?;
+            let rows = select
+                .query_map(rusqlite::params![after, BATCH], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .map_err(|e| migration_err(format!("v35 read date rows: {e}")))?;
+            rows.collect::<Result<_, _>>()
+                .map_err(|e| migration_err(format!("v35 read date rows: {e}")))?
+        };
+        let Some(&(last, _, _)) = rows.last() else {
+            break;
+        };
+        after = last;
+
+        let mut update = conn
+            .prepare_cached("UPDATE search_index SET value_date_end = ?2 WHERE rowid = ?1")
+            .map_err(|e| migration_err(format!("v35 backfill value_date_end: {e}")))?;
+        for (rowid, value, precision) in rows {
+            // Rows written without a precision (the `_lastUpdated` fallback)
+            // hold the instant as written, whose shape says it.
+            let precision = match precision.as_deref() {
+                Some("year") => DatePrecision::Year,
+                Some("month") => DatePrecision::Month,
+                Some("day") => DatePrecision::Day,
+                Some("hour") => DatePrecision::Hour,
+                Some("minute") => DatePrecision::Minute,
+                Some("second") => DatePrecision::Second,
+                Some("millisecond") => DatePrecision::Millisecond,
+                _ => DatePrecision::from_date_string(&value),
+            };
+            let point = IndexValue::Date {
+                value,
+                precision,
+                end: DateEnd::Precision,
+            };
+            if let Some(end) = super::search::writer::stored_date_end(&point) {
+                update
+                    .execute(rusqlite::params![rowid, end])
+                    .map_err(|e| migration_err(format!("v35 backfill value_date_end: {e}")))?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -3828,6 +3920,64 @@ mod tests {
                 .unwrap_or_else(|e| panic!("replay from v{from} failed: {e:?}"));
             assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
         }
+    }
+
+    /// #1391: v35 adds `value_date_end` and backfills every existing date row
+    /// with the end of its own precision, as the writer would; rows without a
+    /// readable date keep NULL, and a replay leaves ends already set alone.
+    #[test]
+    fn test_v35_backfills_value_date_end_by_precision() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        // Index rows without their resources: only the date columns matter.
+        conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        let rows = [
+            ("a", Some("2020-01-01T00:00:00"), Some("year")),
+            ("b", Some("2020-06-01T00:00:00"), Some("month")),
+            ("c", Some("2020-06-15T00:00:00"), Some("day")),
+            ("d", Some("2020-06-15T10:00:00+02:00"), Some("second")),
+            ("e", Some("2026-09-06T08:44:27.828123+00:00"), None),
+            ("f", Some("garbage"), Some("day")),
+            ("g", None, None),
+        ];
+        for (id, value, precision) in rows {
+            conn.execute(
+                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name,
+                     value_date, value_date_precision, value_string)
+                 VALUES ('t', 'Patient', ?1, 'date', ?2, ?3, ?4)",
+                rusqlite::params![id, value, precision, value.is_none().then_some("x")],
+            )
+            .unwrap();
+        }
+        set_schema_version(&conn, 34).unwrap();
+        initialize_schema(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        let end = |id: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT value_date_end FROM search_index WHERE resource_id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(end("a").as_deref(), Some("2021-01-01 00:00:00.000"));
+        assert_eq!(end("b").as_deref(), Some("2020-07-01 00:00:00.000"));
+        assert_eq!(end("c").as_deref(), Some("2020-06-16 00:00:00.000"));
+        assert_eq!(end("d").as_deref(), Some("2020-06-15 08:00:01.000"));
+        // No precision recorded: the instant's own shape, a microsecond.
+        assert_eq!(end("e").as_deref(), Some("2026-09-06 08:44:27.829"));
+        assert_eq!(end("f"), None);
+        assert_eq!(end("g"), None);
+
+        // A replay neither fails on the existing column nor rewrites an end.
+        conn.execute(
+            "UPDATE search_index SET value_date_end = 'kept' WHERE resource_id = 'a'",
+            [],
+        )
+        .unwrap();
+        migrate_v34_to_v35(&conn).unwrap();
+        assert_eq!(end("a").as_deref(), Some("kept"));
     }
 
     /// #1127: the v32 file-progress table and skipped counter exist on a fresh
