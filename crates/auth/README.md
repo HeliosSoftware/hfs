@@ -162,10 +162,10 @@ session's `last_seen` is written through at most once a minute. Two nodes
 refreshing the same session at once are reconciled by the row's version: the
 one whose write lands second adopts the winner's tokens instead of handing out
 its own, now-superseded ones. Pending logins are consumed exactly once
-cluster-wide because the store's delete is the arbiter. **SQLite** and
-**PostgreSQL** (standalone and with Elasticsearch) are store-backed today;
-MongoDB and S3 still hold sessions in process and say so at startup — one
-node, or sticky sessions, until their implementations land. The user's access, refresh and ID tokens are
+cluster-wide because the store's delete is the arbiter. **SQLite**,
+**PostgreSQL** and **MongoDB** (standalone and with Elasticsearch) are
+store-backed today; S3 still holds sessions in process and says so at startup
+— one node, or sticky sessions, until its implementation lands. The user's access, refresh and ID tokens are
 stored as they are: they never leave the server, and the IdP's own lifetimes
 bound them.
 
