@@ -2867,6 +2867,93 @@ mod tests {
         assert!(matching_ids.contains(&"p1".to_string()));
     }
 
+    /// #1389, end to end on real rows: `system|` on a chained token terminal
+    /// matches every code in that system, forward and reverse. The SQL text
+    /// tests cannot show the predicate matches anything.
+    #[tokio::test]
+    async fn test_resolve_chain_system_only_token_matches_rows() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let tenant_id = tenant.tenant_id().as_str();
+
+        for (ty, id, body) in [
+            ("Patient", "p1", json!({"id": "p1"})),
+            ("Patient", "p2", json!({"id": "p2"})),
+            (
+                "Observation",
+                "o1",
+                json!({"id": "o1", "subject": {"reference": "Patient/p1"}}),
+            ),
+            (
+                "Observation",
+                "o2",
+                json!({"id": "o2", "subject": {"reference": "Patient/p2"}}),
+            ),
+        ] {
+            let _ = id;
+            backend
+                .create(&tenant, ty, body, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+        {
+            let conn = backend.get_connection().unwrap();
+            for (rt, rid, name, refv) in [
+                ("Observation", "o1", "subject", "Patient/p1"),
+                ("Observation", "o2", "subject", "Patient/p2"),
+            ] {
+                conn.execute(
+                    "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_reference)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![tenant_id, rt, rid, name, refv],
+                )
+                .unwrap();
+            }
+            for (rt, rid, name, sys, code) in [
+                ("Patient", "p1", "identifier", "http://ex.org/mrn", "MRN1"),
+                ("Patient", "p2", "identifier", "http://other.example", "X1"),
+                ("Observation", "o1", "code", "http://loinc.org", "8867-4"),
+                (
+                    "Observation",
+                    "o2",
+                    "code",
+                    "http://snomed.info/sct",
+                    "271649006",
+                ),
+            ] {
+                conn.execute(
+                    "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_token_system, value_token_code)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![tenant_id, rt, rid, name, sys, code],
+                )
+                .unwrap();
+            }
+        }
+
+        let forward = backend
+            .resolve_chain(
+                &tenant,
+                "Observation",
+                "subject.identifier",
+                "http://ex.org/mrn|",
+            )
+            .await
+            .unwrap();
+        assert_eq!(forward, vec!["o1".to_string()]);
+
+        let reverse_chain = ReverseChainedParameter::terminal(
+            "Observation",
+            "subject",
+            "code",
+            crate::types::SearchValue::eq("http://loinc.org|"),
+        );
+        let reverse = backend
+            .resolve_reverse_chain(&tenant, "Patient", &reverse_chain)
+            .await
+            .unwrap();
+        assert_eq!(reverse, vec!["p1".to_string()]);
+    }
+
     #[tokio::test]
     async fn test_resolve_chain_multi_level() {
         // Test 3-level chain: Observation?subject.organization.name=Hospital

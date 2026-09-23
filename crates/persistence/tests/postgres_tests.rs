@@ -13285,6 +13285,109 @@ mod postgres_integration {
         assert_eq!(ids, vec!["o1".to_string()]);
     }
 
+    /// #1389, end to end on real rows: `system|` on a chained token terminal
+    /// matches every code in that system, forward and reverse. The unit tests
+    /// only see the SQL text; this runs it. Before the fix the empty code was
+    /// bound as `value_token_code = ''` and both resolutions returned nothing.
+    #[tokio::test]
+    async fn postgres_integration_resolve_chain_system_only_token_matches_rows() {
+        use helios_persistence::core::ChainedSearchProvider;
+        use helios_persistence::types::{ReverseChainedParameter, SearchValue};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("chain-system-only");
+        let tenant_id = tenant.tenant_id().as_str();
+
+        for (ty, body) in [
+            ("Patient", json!({"id": "p1"})),
+            ("Patient", json!({"id": "p2"})),
+            (
+                "Observation",
+                json!({"id": "o1", "subject": {"reference": "Patient/p1"}}),
+            ),
+            (
+                "Observation",
+                json!({"id": "o2", "subject": {"reference": "Patient/p2"}}),
+            ),
+        ] {
+            backend
+                .create(&tenant, ty, body, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+
+        for (id, reference) in [("o1", "Patient/p1"), ("o2", "Patient/p2")] {
+            insert_search_index(
+                tenant_id,
+                "Observation",
+                id,
+                "subject",
+                "value_reference",
+                reference,
+            )
+            .await;
+        }
+
+        let pg = shared_pg().await;
+        let conn_str = format!(
+            "host={} port={} user=postgres password=postgres dbname=postgres",
+            pg.host, pg.port,
+        );
+        let (client, connection) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
+            .await
+            .expect("connect to shared pg");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        for (rt, id, param, system, code) in [
+            ("Patient", "p1", "identifier", "http://ex.org/mrn", "MRN1"),
+            ("Patient", "p2", "identifier", "http://other.example", "X1"),
+            ("Observation", "o1", "code", "http://loinc.org", "8867-4"),
+            (
+                "Observation",
+                "o2",
+                "code",
+                "http://snomed.info/sct",
+                "271649006",
+            ),
+        ] {
+            client
+                .execute(
+                    "INSERT INTO search_index \
+                     (tenant_id, resource_type, resource_id, param_name, value_token_system, value_token_code) \
+                     VALUES ($1, $2, $3, $4, $5, $6)",
+                    &[&tenant_id, &rt, &id, &param, &system, &code],
+                )
+                .await
+                .unwrap();
+        }
+
+        // Observation?subject.identifier=http://ex.org/mrn|
+        let forward = backend
+            .resolve_chain(
+                &tenant,
+                "Observation",
+                "subject.identifier",
+                "http://ex.org/mrn|",
+            )
+            .await
+            .unwrap();
+        assert_eq!(forward, vec!["o1".to_string()]);
+
+        // Patient?_has:Observation:subject:code=http://loinc.org|
+        let rc = ReverseChainedParameter::terminal(
+            "Observation",
+            "subject",
+            "code",
+            SearchValue::eq("http://loinc.org|"),
+        );
+        let reverse = backend
+            .resolve_reverse_chain(&tenant, "Patient", &rc)
+            .await
+            .unwrap();
+        assert_eq!(reverse, vec!["p1".to_string()]);
+    }
+
     /// `backend.search()` reads neither `SearchParameter::chain` nor
     /// `SearchQuery::reverse_chains`: an unresolved `_has` was dropped (every
     /// Patient matched) and a forward chain was read as a reference to an id
