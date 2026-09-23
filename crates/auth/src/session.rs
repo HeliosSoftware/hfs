@@ -44,10 +44,10 @@ pub const PENDING_COOKIE: &str = "hfs_login";
 
 /// How long a login may stay pending between the redirect to the IdP and the
 /// callback before it is discarded.
-const PENDING_TTL: Duration = Duration::from_secs(10 * 60);
+pub const PENDING_TTL: Duration = Duration::from_secs(10 * 60);
 
 /// How long an idle session lives with no refresh token to renew it.
-const SESSION_IDLE_TTL: Duration = Duration::from_secs(8 * 60 * 60);
+pub const SESSION_IDLE_TTL: Duration = Duration::from_secs(8 * 60 * 60);
 
 /// Renew an access token this long before it actually expires, so a request
 /// never goes out with a token about to lapse mid-flight.
@@ -55,8 +55,9 @@ const REFRESH_SKEW: Duration = Duration::from_secs(30);
 
 /// How often at most a session's `last_seen` is written through to the
 /// attached persistence. Every request touches the in-process copy; the
-/// store only needs to know within this window.
-const TOUCH_WRITE_INTERVAL: Duration = Duration::from_secs(60);
+/// store only needs to know within this window — so a stored session's
+/// `last_seen` lags the real one by at most this much.
+pub const TOUCH_WRITE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The IdP client configuration the login flow drives.
 #[derive(Debug, Clone)]

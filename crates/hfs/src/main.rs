@@ -1194,7 +1194,12 @@ async fn init_login_sessions(
 /// restart. Called from a backend's `start_*` once its Arc exists: the store
 /// itself is built with the auth state, before any backend is. Nothing to
 /// attach when interactive login is off.
-#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "s3"
+))]
 fn attach_login_sessions(
     auth_state: Option<&Arc<AuthMiddlewareState>>,
     persistence: Arc<dyn helios_auth::SessionPersistence>,
@@ -1204,10 +1209,12 @@ fn attach_login_sessions(
     }
 }
 
-/// The backends without a [`helios_auth::SessionPersistence`] yet keep login
-/// sessions in process: fine on one node, but a cluster needs sticky sessions
-/// and a restart signs everyone out. Said once at startup so an operator
-/// knows which mode they are in.
+/// A deployment with nowhere tenant-independent to keep them (S3
+/// bucket-per-tenant with no system bucket — the same case that leaves
+/// `/_user/settings` unwired) keeps login sessions in process: fine on one
+/// node, but a cluster needs sticky sessions and a restart signs everyone
+/// out. Said once at startup so an operator knows which mode they are in.
+#[cfg(feature = "s3")]
 fn warn_login_sessions_in_process(auth_state: Option<&Arc<AuthMiddlewareState>>) {
     if auth_state.is_some_and(|state| state.sessions.is_some()) {
         warn!(
@@ -1400,11 +1407,9 @@ async fn main() -> anyhow::Result<()> {
             start_mongodb_elasticsearch(config, auth_config, auth_state, audit_state).await?;
         }
         StorageBackendMode::S3 => {
-            warn_login_sessions_in_process(auth_state.as_ref());
             start_s3(config, auth_config, auth_state, audit_state).await?;
         }
         StorageBackendMode::S3Elasticsearch => {
-            warn_login_sessions_in_process(auth_state.as_ref());
             start_s3_elasticsearch(config, auth_config, auth_state, audit_state).await?;
         }
     }
@@ -3370,6 +3375,11 @@ async fn start_s3(
     })?;
 
     let backend = Arc::new(backend);
+    if backend.supports_user_settings() {
+        attach_login_sessions(auth_state.as_ref(), backend.clone());
+    } else {
+        warn_login_sessions_in_process(auth_state.as_ref());
+    }
     let serve_audit_state = audit_state.clone();
     // Standalone S3 seeds no conformance resources, but its REST writes, bulk
     // submit, and UI purges still report to the one write observer (#1078).
@@ -3539,6 +3549,11 @@ async fn start_s3_elasticsearch(
             e
         )
     })?);
+    if s3.supports_user_settings() {
+        attach_login_sessions(auth_state.as_ref(), s3.clone());
+    } else {
+        warn_login_sessions_in_process(auth_state.as_ref());
+    }
     // Refresh reads from the primary; the ES backend shares its registry Arc
     // (wired below, once it's populated). Seeding waits for the composite
     // further down, so the writes also index into ES.
