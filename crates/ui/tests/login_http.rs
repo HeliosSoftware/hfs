@@ -366,3 +366,41 @@ async fn a_session_whose_token_is_dead_is_dropped_at_the_gate_not_after_a_stale_
         "the dead session is gone"
     );
 }
+
+#[tokio::test]
+async fn a_signed_in_page_shows_the_user_in_the_account_menu_with_sign_out() {
+    let _serial = SERIAL.lock().await;
+    let (app, sessions) = app();
+    let session = seeded_session(&sessions);
+    let response = app
+        .oneshot(
+            Request::get("/ui")
+                .header(header::COOKIE, format!("hfs_session={}", session.id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = http_body_util::BodyExt::collect(response.into_body())
+        .await
+        .unwrap()
+        .to_bytes();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        html.contains("<div class=\"user-menu__name\">Demo User</div>"),
+        "display name from the session's claims"
+    );
+    assert!(
+        html.contains("<div class=\"user-menu__hint\">demo@example.org</div>"),
+        "email as the secondary line"
+    );
+    // The partial renders the initials on their own indented line inside the
+    // avatar, so compare with the whitespace removed.
+    let compact: String = html.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(compact.contains(">DU</summary>"), "initials in the avatar");
+    assert!(
+        html.contains("<form class=\"user-menu__out-form\" method=\"post\" action=\"/ui/logout\">"),
+        "Sign out posts to /ui/logout"
+    );
+}

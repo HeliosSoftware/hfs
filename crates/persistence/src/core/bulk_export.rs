@@ -941,7 +941,15 @@ pub trait BulkExportStorage: Send + Sync {
         job_id: &ExportJobId,
     ) -> StorageResult<()>;
 
-    /// Deletes an export job and its output files.
+    /// Deletes an export job's rows (the job, its progress and its file
+    /// records).
+    ///
+    /// Output artifacts are not touched: they live in the
+    /// [`ExportOutputStore`](crate::core::bulk_export_output::ExportOutputStore),
+    /// which this store does not know about, and the caller removes them with
+    /// `delete_job_outputs`. A worker may still be running the job when this
+    /// returns — cancellation is cooperative — so a caller tearing down a live
+    /// job should sweep the outputs again after deleting the row (#1272).
     ///
     /// # Arguments
     ///

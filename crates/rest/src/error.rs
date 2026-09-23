@@ -1563,6 +1563,11 @@ mod tests {
                 message: "poisoned mutex".to_string(),
                 source: None,
             },
+            BackendError::Internal {
+                backend_name: "postgres".to_string(),
+                message: "sensitive detail".to_string(),
+                source: Some(Box::new(std::io::Error::other("sensitive cause"))),
+            },
             BackendError::QueryError {
                 message: "relation \"resources\" does not exist".to_string(),
             },
