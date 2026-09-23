@@ -217,6 +217,69 @@ fn internal_error(message: String) -> StorageError {
     })
 }
 
+pub(super) fn internal_postgres_error(
+    message: String,
+    error: tokio_postgres::Error,
+) -> StorageError {
+    StorageError::Backend(BackendError::Internal {
+        backend_name: "postgres".to_string(),
+        message,
+        source: Some(Box::new(error)),
+    })
+}
+
+fn classify_standalone_reindex_error(error: StorageError) -> StorageError {
+    let StorageError::Backend(BackendError::Internal {
+        backend_name,
+        message,
+        source: Some(source),
+    }) = error
+    else {
+        return error;
+    };
+    if backend_name != "postgres" {
+        return StorageError::Backend(BackendError::Internal {
+            backend_name,
+            message,
+            source: Some(source),
+        });
+    }
+    let driver_error = match source.downcast::<tokio_postgres::Error>() {
+        Ok(driver_error) => *driver_error,
+        Err(source) => {
+            return StorageError::Backend(BackendError::Internal {
+                backend_name,
+                message,
+                source: Some(source),
+            });
+        }
+    };
+    match crate::error::classify_postgres_error("", driver_error) {
+        BackendError::Timeout { backend_name, .. } => {
+            StorageError::Backend(BackendError::Timeout {
+                backend_name,
+                message,
+            })
+        }
+        BackendError::Unavailable { backend_name, .. } => {
+            StorageError::Backend(BackendError::Unavailable {
+                backend_name,
+                message,
+            })
+        }
+        BackendError::Internal {
+            backend_name,
+            message: _,
+            source,
+        } => StorageError::Backend(BackendError::Internal {
+            backend_name,
+            message,
+            source,
+        }),
+        other => StorageError::Backend(other),
+    }
+}
+
 #[allow(dead_code)]
 fn serialization_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::SerializationError { message })
@@ -1589,7 +1652,10 @@ impl PostgresBackend {
                 &[],
             )
             .await
-            .map_err(|e| internal_error(format!("Failed to check FTS table: {}", e)))?
+            .map_err(|e| {
+                let message = format!("Failed to check FTS table: {e}");
+                internal_postgres_error(message, e)
+            })?
             .is_some();
         let _ = self.fts_table_exists.set(exists);
         Ok(exists)
@@ -1721,7 +1787,10 @@ impl PostgresBackend {
         };
         Self::execute_fts_statement(client, tenant_id, resource_type, resource_id, &truncated)
             .await
-            .map_err(|e| internal_error(format!("Failed to insert FTS content: {}", e)))
+            .map_err(|e| {
+                let message = format!("Failed to insert FTS content: {e}");
+                internal_postgres_error(message, e)
+            })
     }
 
     async fn index_fts_content_page<C>(
@@ -1754,14 +1823,14 @@ impl PostgresBackend {
             {
                 Err(PageFtsError::ProgramLimitExceeded { error, content })
             }
-            Err(error) if content.is_empty() => Err(PageFtsError::Other(internal_error(format!(
-                "Failed to delete empty FTS index: {}",
-                error
-            )))),
-            Err(error) => Err(PageFtsError::Other(internal_error(format!(
-                "Failed to insert FTS content: {}",
-                error
-            )))),
+            Err(error) if content.is_empty() => {
+                let message = format!("Failed to delete empty FTS index: {error}");
+                Err(PageFtsError::Other(internal_postgres_error(message, error)))
+            }
+            Err(error) => {
+                let message = format!("Failed to insert FTS content: {error}");
+                Err(PageFtsError::Other(internal_postgres_error(message, error)))
+            }
         }
     }
 
@@ -1796,8 +1865,10 @@ impl PostgresBackend {
                 .await;
 
         if content.is_empty() {
-            result
-                .map_err(|e| internal_error(format!("Failed to delete empty FTS index: {}", e)))?;
+            result.map_err(|e| {
+                let message = format!("Failed to delete empty FTS index: {e}");
+                internal_postgres_error(message, e)
+            })?;
             return Ok(());
         }
 
@@ -1824,10 +1895,8 @@ impl PostgresBackend {
         // retry can succeed. The bundle path (`PostgresTransaction`) does not
         // write `resource_fts` at all.
         if err.code() != Some(&tokio_postgres::error::SqlState::PROGRAM_LIMIT_EXCEEDED) {
-            return Err(internal_error(format!(
-                "Failed to insert FTS content: {}",
-                err
-            )));
+            let message = format!("Failed to insert FTS content: {err}");
+            return Err(internal_postgres_error(message, err));
         }
 
         Self::retry_truncated_fts(client, tenant_id, resource_type, resource_id, &content).await?;
@@ -1878,10 +1947,8 @@ impl PostgresBackend {
             )
             .await
             .map_err(|e| {
-                BatchFtsError::Other(internal_error(format!(
-                    "Failed to delete empty FTS index: {}",
-                    e
-                )))
+                let message = format!("Failed to delete empty FTS index: {e}");
+                BatchFtsError::Other(internal_postgres_error(message, e))
             })?;
         }
 
@@ -1905,10 +1972,8 @@ impl PostgresBackend {
             if error.code() == Some(&tokio_postgres::error::SqlState::PROGRAM_LIMIT_EXCEEDED) {
                 BatchFtsError::ProgramLimitExceeded(error)
             } else {
-                BatchFtsError::Other(internal_error(format!(
-                    "Failed to insert FTS content: {}",
-                    error
-                )))
+                let message = format!("Failed to insert FTS content: {error}");
+                BatchFtsError::Other(internal_postgres_error(message, error))
             }
         })?;
         Ok(())
@@ -1932,7 +1997,8 @@ impl PostgresBackend {
             reindex_fts_savepoint_command(transaction, "SAVEPOINT reindex_fts_group")
                 .await
                 .map_err(|e| {
-                    internal_error(format!("Failed to create FTS group savepoint: {e}"))
+                    let message = format!("Failed to create FTS group savepoint: {e}");
+                    internal_postgres_error(message, e)
                 })?;
 
             match Self::index_fts_content_group(transaction, tenant_id, group).await {
@@ -1945,9 +2011,10 @@ impl PostgresBackend {
                     )
                     .await
                     .map_err(|e| {
-                        internal_error(format!(
+                        let message = format!(
                             "Failed to rollback FTS group after PROGRAM_LIMIT_EXCEEDED: {e}"
-                        ))
+                        );
+                        internal_postgres_error(message, e)
                     })?;
                     tracing::debug!(
                         "Recovering PostgreSQL reindex FTS group after PROGRAM_LIMIT_EXCEEDED: {}",
@@ -1961,7 +2028,8 @@ impl PostgresBackend {
                         )
                         .await
                         .map_err(|e| {
-                            internal_error(format!("Failed to create FTS resource savepoint: {e}"))
+                            let message = format!("Failed to create FTS resource savepoint: {e}");
+                            internal_postgres_error(message, e)
                         })?;
 
                         let attempt = self
@@ -1982,9 +2050,10 @@ impl PostgresBackend {
                                 )
                                 .await
                                 .map_err(|e| {
-                                    internal_error(format!(
+                                    let message = format!(
                                         "Failed to rollback FTS resource after PROGRAM_LIMIT_EXCEEDED: {e}"
-                                    ))
+                                    );
+                                    internal_postgres_error(message, e)
                                 })?;
                                 tracing::debug!(
                                     "Retrying PostgreSQL reindex FTS resource after PROGRAM_LIMIT_EXCEEDED: {}",
@@ -2007,7 +2076,8 @@ impl PostgresBackend {
                         )
                         .await
                         .map_err(|e| {
-                            internal_error(format!("Failed to release FTS resource savepoint: {e}"))
+                            let message = format!("Failed to release FTS resource savepoint: {e}");
+                            internal_postgres_error(message, e)
                         })?;
                     }
                 }
@@ -2016,7 +2086,8 @@ impl PostgresBackend {
             reindex_fts_savepoint_command(transaction, "RELEASE SAVEPOINT reindex_fts_group")
                 .await
                 .map_err(|e| {
-                    internal_error(format!("Failed to release FTS group savepoint: {e}"))
+                    let message = format!("Failed to release FTS group savepoint: {e}");
+                    internal_postgres_error(message, e)
                 })?;
         }
 
@@ -2066,7 +2137,10 @@ impl PostgresBackend {
                 &[&tenant_id, &resource_type, &resource_id],
             )
             .await
-            .map_err(|e| internal_error(format!("Failed to delete search index: {}", e)))?;
+            .map_err(|e| {
+                let message = format!("Failed to delete search index: {e}");
+                internal_postgres_error(message, e)
+            })?;
 
         // The full-text row goes with them.
         execute_cached(
@@ -2075,7 +2149,10 @@ impl PostgresBackend {
             &[&tenant_id, &resource_type, &resource_id],
         )
         .await
-        .map_err(|e| internal_error(format!("Failed to delete FTS index: {}", e)))?;
+        .map_err(|e| {
+            let message = format!("Failed to delete FTS index: {e}");
+            internal_postgres_error(message, e)
+        })?;
 
         Ok(deleted)
     }
@@ -2086,14 +2163,20 @@ impl PostgresBackend {
         resources: &[StoredResource],
     ) -> Vec<StorageResult<usize>> {
         let _fallback_span = crate::perf::span(crate::perf::Phase::ReindexFallback);
+        let should_classify = !self.is_search_offloaded();
         let mut results = Vec::with_capacity(resources.len());
         for resource in resources {
-            match self
+            let result = match self
                 .delete_search_entries(tenant, resource.resource_type(), resource.id())
                 .await
             {
-                Ok(_) => results.push(self.write_search_entries(tenant, resource).await),
-                Err(error) => results.push(Err(error)),
+                Ok(_) => self.write_search_entries(tenant, resource).await,
+                Err(error) => Err(error),
+            };
+            if should_classify {
+                results.push(result.map_err(classify_standalone_reindex_error));
+            } else {
+                results.push(result);
             }
         }
         results
@@ -4643,7 +4726,8 @@ impl ReindexTarget for PostgresBackend {
             .await;
             drop(search_delete_span);
             deleted.map_err(|e| {
-                internal_error(format!("Failed to delete search index page: {}", e))
+                let message = format!("Failed to delete search index page: {e}");
+                internal_postgres_error(message, e)
             })?;
 
             // Every resource whose extraction succeeded reaches
@@ -4686,7 +4770,8 @@ impl ReindexTarget for PostgresBackend {
                 .await;
                 drop(fts_delete_span);
                 deleted.map_err(|e| {
-                    internal_error(format!("Failed to delete FTS index page: {}", e))
+                    let message = format!("Failed to delete FTS index page: {e}");
+                    internal_postgres_error(message, e)
                 })?;
             }
 
@@ -6229,5 +6314,121 @@ mod reindex_fts_group_controls_tests {
             assert_eq!(hooks.commands, expected, "size {size}");
         }
         drop(container);
+    }
+}
+
+#[cfg(test)]
+mod standalone_reindex_classify_tests {
+    use super::classify_standalone_reindex_error;
+    use crate::error::{BackendError, StorageError};
+
+    fn io_source(message: &str) -> Box<dyn std::error::Error + Send + Sync> {
+        Box::new(std::io::Error::other(message.to_string()))
+    }
+
+    #[test]
+    fn classify_standalone_reindex_error_internal_without_source_passes_through() {
+        let error = StorageError::Backend(BackendError::Internal {
+            backend_name: "postgres".to_string(),
+            message: "Failed to insert FTS content: db error".to_string(),
+            source: None,
+        });
+        let classified = classify_standalone_reindex_error(error);
+        match classified {
+            StorageError::Backend(BackendError::Internal {
+                backend_name,
+                message,
+                source,
+            }) => {
+                assert_eq!(backend_name, "postgres");
+                assert_eq!(message, "Failed to insert FTS content: db error");
+                assert!(source.is_none());
+            }
+            other => panic!("Internal without source must pass through, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_standalone_reindex_error_internal_with_non_driver_source_passes_through() {
+        let error = StorageError::Backend(BackendError::Internal {
+            backend_name: "postgres".to_string(),
+            message: "Failed to delete search index: boom".to_string(),
+            source: Some(io_source("boom")),
+        });
+        let classified = classify_standalone_reindex_error(error);
+        match classified {
+            StorageError::Backend(BackendError::Internal {
+                backend_name,
+                message,
+                source,
+            }) => {
+                assert_eq!(backend_name, "postgres");
+                assert_eq!(message, "Failed to delete search index: boom");
+                let source = source.expect("non-driver source must survive");
+                assert!(source.to_string().contains("boom"), "source: {}", source);
+            }
+            other => panic!("Internal with non-driver source must pass through, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_standalone_reindex_error_other_backend_source_passes_through() {
+        let error = StorageError::Backend(BackendError::Internal {
+            backend_name: "sqlite".to_string(),
+            message: "sqlite failure".to_string(),
+            source: Some(io_source("sqlite io")),
+        });
+        let classified = classify_standalone_reindex_error(error);
+        match classified {
+            StorageError::Backend(BackendError::Internal {
+                backend_name,
+                message,
+                source,
+            }) => {
+                assert_eq!(backend_name, "sqlite");
+                assert_eq!(message, "sqlite failure");
+                let source = source.expect("other-backend source must survive");
+                assert!(
+                    source.to_string().contains("sqlite io"),
+                    "source: {}",
+                    source
+                );
+            }
+            other => panic!("other-backend Internal must pass through, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_standalone_reindex_error_connection_failed_passes_through() {
+        let error = StorageError::Backend(BackendError::ConnectionFailed {
+            backend_name: "postgres".to_string(),
+            message: "connection refused".to_string(),
+        });
+        let classified = classify_standalone_reindex_error(error);
+        match classified {
+            StorageError::Backend(BackendError::ConnectionFailed {
+                backend_name,
+                message,
+            }) => {
+                assert_eq!(backend_name, "postgres");
+                assert_eq!(message, "connection refused");
+            }
+            other => panic!("ConnectionFailed must pass through, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_standalone_reindex_error_pool_exhausted_passes_through() {
+        let error = StorageError::Backend(BackendError::PoolExhausted {
+            backend_name: "postgres".to_string(),
+        });
+        let classified = classify_standalone_reindex_error(error);
+        assert!(
+            matches!(
+                classified,
+                StorageError::Backend(BackendError::PoolExhausted { .. })
+            ),
+            "PoolExhausted must pass through, got {classified:?}"
+        );
     }
 }

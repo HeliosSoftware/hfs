@@ -156,17 +156,10 @@ use chrono::{DateTime, Utc};
 
 use crate::backends::postgres::cached::execute_cached;
 use crate::backends::postgres::schema::IndexLayout;
-use crate::error::{BackendError, StorageResult};
+use crate::backends::postgres::storage::internal_postgres_error;
+use crate::error::StorageResult;
 use crate::search::{converters::IndexValue, extractor::ExtractedValue};
 use crate::types::strip_reference_version;
-
-fn internal_error(message: String) -> crate::error::StorageError {
-    crate::error::StorageError::Backend(BackendError::Internal {
-        backend_name: "postgres".to_string(),
-        message,
-        source: None,
-    })
-}
 
 fn postgres_error_message(error: &tokio_postgres::Error) -> String {
     error.as_db_error().map_or_else(
@@ -1282,7 +1275,10 @@ impl PostgresSearchIndexWriter {
                 &[&tenant_id, &resource_type, &resource_id],
             )
             .await
-            .map_err(|e| internal_error(format!("Failed to clear search index rows: {}", e)))?;
+            .map_err(|e| {
+                let message = format!("Failed to clear search index rows: {e}");
+                internal_postgres_error(message, e)
+            })?;
             return Ok(());
         }
 
@@ -1314,10 +1310,11 @@ impl PostgresSearchIndexWriter {
             execute_cached(client, sql, &param_refs)
                 .await
                 .map_err(|e| {
-                    internal_error(format!(
+                    let message = format!(
                         "Failed to insert search index rows: {}",
                         postgres_error_message(&e)
-                    ))
+                    );
+                    internal_postgres_error(message, e)
                 })?;
         }
 
@@ -1383,10 +1380,11 @@ impl PostgresSearchIndexWriter {
             execute_cached(client, INSERT_SQL_MULTI.as_str(), &param_refs)
                 .await
                 .map_err(|e| {
-                    internal_error(format!(
+                    let message = format!(
                         "Failed to insert search index rows: {}",
                         postgres_error_message(&e)
-                    ))
+                    );
+                    internal_postgres_error(message, e)
                 })?;
         }
 
