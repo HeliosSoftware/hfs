@@ -150,8 +150,24 @@ Off unless `HFS_UI_LOGIN_CLIENT_ID` is set (auth must be enabled):
 
 The authorize and token endpoints come from `HFS_SMART_AUTHORIZE_ENDPOINT` /
 `HFS_SMART_TOKEN_ENDPOINT` when set, otherwise from the issuer's
-`.well-known/openid-configuration` at startup. The session store is in-process:
-a session does not survive a restart and is not shared across nodes.
+`.well-known/openid-configuration` at startup.
+
+**Where sessions live.** The session store keeps sessions in process and, on
+a storage backend that implements `SessionPersistence`, also in the primary
+store (`login_sessions` table), so a session established on one node resolves
+on every other — the callback and every later page may land anywhere behind
+a load balancer — and survives a restart. The in-process copy stays the fast
+path: a request costs no store read once the node knows the session, and a
+session's `last_seen` is written through at most once a minute. Two nodes
+refreshing the same session at once are reconciled by the row's version: the
+one whose write lands second adopts the winner's tokens instead of handing out
+its own, now-superseded ones. Pending logins are consumed exactly once
+cluster-wide because the store's delete is the arbiter. **SQLite** (standalone
+and with Elasticsearch) is store-backed today; PostgreSQL, MongoDB and S3 still
+hold sessions in process and say so at startup — one node, or sticky sessions,
+until their implementations land. The user's access, refresh and ID tokens are
+stored as they are: they never leave the server, and the IdP's own lifetimes
+bound them.
 
 **The user's access token must be one HFS can validate and authorize.** Two
 things the IdP has to put in it:
@@ -542,10 +558,13 @@ TLS, short token lifetimes, and audience/issuer validation.
 
 ## Multi-Instance Deployments
 
-`helios-auth` holds no cross-instance state. Each instance maintains its own
-JWKS cache, and token validation is purely local (signature plus claim checks),
-so instances behind a load balancer need no shared infrastructure and no sticky
-sessions.
+Bearer validation holds no cross-instance state. Each instance maintains its
+own JWKS cache, and token validation is purely local (signature plus claim
+checks), so instances behind a load balancer need no shared infrastructure and
+no sticky sessions. The web UI's interactive login is the one exception: its
+sessions are shared through the primary store where the backend supports it
+(see [Web UI Interactive Login](#web-ui-interactive-login)), and otherwise
+need sticky sessions.
 
 ## Testing
 

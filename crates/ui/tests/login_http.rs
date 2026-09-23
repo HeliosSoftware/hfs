@@ -224,7 +224,7 @@ async fn callback_without_a_pending_login_is_rejected() {
 async fn callback_with_a_state_mismatch_is_rejected_and_the_pending_login_is_consumed() {
     let _serial = SERIAL.lock().await;
     let (app, sessions) = app();
-    let (pending_id, _) = sessions.begin("/ui");
+    let (pending_id, _) = sessions.begin("/ui").await;
     let request = || {
         Request::get("/ui/callback?code=abc&state=wrong")
             .header(header::COOKIE, format!("hfs_login={pending_id}"))

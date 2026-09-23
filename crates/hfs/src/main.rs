@@ -1188,6 +1188,34 @@ async fn init_login_sessions(
     ))))
 }
 
+/// Gives the web UI's login sessions a home in the primary store (#1481), so
+/// a session established on one node resolves on every other and outlives a
+/// restart. Called from a backend's `start_*` once its Arc exists: the store
+/// itself is built with the auth state, before any backend is. Nothing to
+/// attach when interactive login is off.
+#[cfg(feature = "sqlite")]
+fn attach_login_sessions(
+    auth_state: Option<&Arc<AuthMiddlewareState>>,
+    persistence: Arc<dyn helios_auth::SessionPersistence>,
+) {
+    if let Some(sessions) = auth_state.and_then(|state| state.sessions.as_ref()) {
+        sessions.attach_persistence(persistence);
+    }
+}
+
+/// The backends without a [`helios_auth::SessionPersistence`] yet keep login
+/// sessions in process: fine on one node, but a cluster needs sticky sessions
+/// and a restart signs everyone out. Said once at startup so an operator
+/// knows which mode they are in.
+fn warn_login_sessions_in_process(auth_state: Option<&Arc<AuthMiddlewareState>>) {
+    if auth_state.is_some_and(|state| state.sessions.is_some()) {
+        warn!(
+            "web login sessions are held in process on this storage backend: a session is \
+             not shared across nodes and does not survive a restart"
+        );
+    }
+}
+
 /// Initializes the audit subsystem from environment configuration.
 ///
 /// Returns the audit sink (for use as auth bridge) and optional middleware state.
@@ -1359,21 +1387,27 @@ async fn main() -> anyhow::Result<()> {
             start_sqlite_elasticsearch(config, auth_config, auth_state, audit_state).await?;
         }
         StorageBackendMode::Postgres => {
+            warn_login_sessions_in_process(auth_state.as_ref());
             start_postgres(config, auth_config, auth_state, audit_state).await?;
         }
         StorageBackendMode::PostgresElasticsearch => {
+            warn_login_sessions_in_process(auth_state.as_ref());
             start_postgres_elasticsearch(config, auth_config, auth_state, audit_state).await?;
         }
         StorageBackendMode::MongoDB => {
+            warn_login_sessions_in_process(auth_state.as_ref());
             start_mongodb(config, auth_config, auth_state, audit_state).await?;
         }
         StorageBackendMode::MongoDBElasticsearch => {
+            warn_login_sessions_in_process(auth_state.as_ref());
             start_mongodb_elasticsearch(config, auth_config, auth_state, audit_state).await?;
         }
         StorageBackendMode::S3 => {
+            warn_login_sessions_in_process(auth_state.as_ref());
             start_s3(config, auth_config, auth_state, audit_state).await?;
         }
         StorageBackendMode::S3Elasticsearch => {
+            warn_login_sessions_in_process(auth_state.as_ref());
             start_s3_elasticsearch(config, auth_config, auth_state, audit_state).await?;
         }
     }
@@ -1671,6 +1705,7 @@ async fn start_sqlite(
 ) -> anyhow::Result<()> {
     let serve_audit_state = audit_state.clone();
     let backend = Arc::new(create_sqlite_backend(&config)?);
+    attach_login_sessions(auth_state.as_ref(), backend.clone());
     let observability = helios_rest::WriteObservability::new();
     seed_conformance_resources(&*backend, &config, Some(observability.observers.as_ref())).await;
     spawn_sqlite_search_param_refresh(backend.clone(), &config);
@@ -2534,6 +2569,7 @@ async fn start_sqlite_elasticsearch(
     let mut sqlite = create_sqlite_backend(&config)?;
     sqlite.set_search_offloaded(true);
     let sqlite = Arc::new(sqlite);
+    attach_login_sessions(auth_state.as_ref(), sqlite.clone());
     info!("SQLite search indexing disabled (offloaded to Elasticsearch)");
     // Refresh reads from the primary; the ES backend shares its registry Arc.
     // Seeding waits for the composite below, so the writes also index into ES.

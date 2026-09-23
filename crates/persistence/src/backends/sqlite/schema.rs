@@ -10,7 +10,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 34;
+pub const SCHEMA_VERSION: i32 = 35;
 
 /// The `search_index` value indexes. Excludes `idx_search_composite`, which the
 /// delete-by-resource path needs at all times, and `idx_search_token_display`,
@@ -445,6 +445,7 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             31 => migrate_v31_to_v32(conn)?,
             32 => migrate_v32_to_v33(conn)?,
             33 => migrate_v33_to_v34(conn)?,
+            34 => migrate_v34_to_v35(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -1594,6 +1595,32 @@ fn migrate_v33_to_v34(conn: &Connection) -> StorageResult<()> {
             ON secondary_sync_failures (last_failed_at);",
     )
     .map_err(|e| migration_err(format!("v34 create secondary_sync_failures: {e}")))?;
+    Ok(())
+}
+
+/// Migrate from schema version 34 to version 35.
+///
+/// Adds `login_sessions`: the web UI's interactive login sessions and the
+/// logins still pending at the identity provider (#1481), one JSON document
+/// per opaque id with a monotonic `version` for conditional writes, so a
+/// session established on one node resolves on every other and outlives a
+/// restart. `kind` keeps sessions and pending logins apart; `expires_at` is
+/// fixed-width RFC 3339 text and drives the sweep. Independent of the FHIR
+/// `resources` table, like `user_settings`.
+fn migrate_v34_to_v35(conn: &Connection) -> StorageResult<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS login_sessions (
+            id         TEXT NOT NULL PRIMARY KEY,
+            kind       TEXT NOT NULL,
+            data       TEXT NOT NULL,
+            version    INTEGER NOT NULL DEFAULT 1,
+            expires_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_login_sessions_expires
+            ON login_sessions (expires_at);",
+    )
+    .map_err(|e| migration_err(format!("v35 create login_sessions: {e}")))?;
     Ok(())
 }
 
@@ -3828,6 +3855,41 @@ mod tests {
                 .unwrap_or_else(|e| panic!("replay from v{from} failed: {e:?}"));
             assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
         }
+    }
+
+    /// #1481: the v35 login-sessions table exists on a fresh database and on
+    /// one migrated from v34, with the sweep index in place.
+    #[test]
+    fn test_v35_adds_login_sessions() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        let columns = table_columns(&conn, "login_sessions").unwrap();
+        for expected in ["id", "kind", "data", "version", "expires_at", "updated_at"] {
+            assert!(columns.iter().any(|c| c == expected), "missing {expected}");
+        }
+        let indexed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' \
+                 AND name = 'idx_login_sessions_expires'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 1);
+
+        let migrated = Connection::open_in_memory().unwrap();
+        initialize_schema(&migrated).unwrap();
+        migrated
+            .execute_batch("DROP INDEX idx_login_sessions_expires; DROP TABLE login_sessions;")
+            .unwrap();
+        set_schema_version(&migrated, 34).unwrap();
+        initialize_schema(&migrated).unwrap();
+        assert_eq!(get_schema_version(&migrated).unwrap(), SCHEMA_VERSION);
+        assert!(
+            !table_columns(&migrated, "login_sessions")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// #1127: the v32 file-progress table and skipped counter exist on a fresh
