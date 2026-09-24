@@ -543,26 +543,36 @@ fn public_status_url(
 /// targets this server, never a third party.
 pub(crate) async fn forward_identity(
     state: &WebState,
-    mut request: reqwest::RequestBuilder,
+    request: reqwest::RequestBuilder,
     headers: &HeaderMap,
     tenant: &str,
     audience: &str,
 ) -> Result<reqwest::RequestBuilder, String> {
-    match headers.get("authorization").and_then(|v| v.to_str().ok()) {
-        Some(auth) => request = request.header("Authorization", auth),
-        None => match crate::login::session_authorization(state, headers).await {
-            Some(bearer) => request = request.header("Authorization", bearer),
-            None => {
-                request = state
-                    .outbound_auth
-                    .authorize(request, audience)
-                    .await
-                    .map_err(|e| format!("outbound credential unavailable: {e}"))?;
-            }
-        },
+    let request = forward_credential(state, request, headers, audience).await?;
+    Ok(request.header("X-Tenant-ID", tenant))
+}
+
+/// The credential half of [`forward_identity`]: the browser's own
+/// `Authorization`, else the signed-in session's bearer, else the process's
+/// outbound service credential. Shared with the Import page, whose
+/// self-calls set their tenant themselves.
+pub(crate) async fn forward_credential(
+    state: &WebState,
+    request: reqwest::RequestBuilder,
+    headers: &HeaderMap,
+    audience: &str,
+) -> Result<reqwest::RequestBuilder, String> {
+    if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+        return Ok(request.header("Authorization", auth));
     }
-    request = request.header("X-Tenant-ID", tenant);
-    Ok(request)
+    if let Some(bearer) = crate::login::session_authorization(state, headers).await {
+        return Ok(request.header("Authorization", bearer));
+    }
+    state
+        .outbound_auth
+        .authorize(request, audience)
+        .await
+        .map_err(|e| format!("outbound credential unavailable: {e}"))
 }
 
 // ---------------------------------------------------------------------------

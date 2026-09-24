@@ -150,14 +150,19 @@ Off unless `HFS_UI_LOGIN_CLIENT_ID` is set (auth must be enabled):
 
 A page that starts a job on the user's behalf — the Export page's `$export`
 kick-off, poll and download, the SQL Export page's `$sql-export`, the
-Patient/Group pickers — makes a server-side self-call that runs **as the
-signed-in user**: the session's access token is forwarded (refreshed the
-same way the middleware does it), so the job carries the user's own scopes
-and is audited as them. The outbound service credential
+Patient/Group pickers, the Import page's `$bulk-submit` and its status
+calls when the recipient is this server — makes a server-side self-call that
+runs **as the signed-in user**: the session's access token is forwarded
+(refreshed the same way the middleware does it), so the job carries the
+user's own scopes and is audited as them. The outbound service credential
 (`HFS_OUTBOUND_BEARER_TOKEN`) is only the fallback when there is no session.
-The Import page is the exception: its `$bulk-submit` needs the
-`system/bulk-submit` scope, which a user token does not carry, so it keeps
-using the service credential.
+One consequence for the Import page: `$bulk-submit` is gated on the named
+operation scope `system/bulk-submit`, not on resource scopes, so a user who
+imports needs that scope on their own token — grant it at the IdP to the
+role that may import (HFS accepts the literal scope on any token; the
+bundled realm's `hfs-web` defaults do not include it). A submission whose
+recipient is another server keeps its own SMART Backend Services client, as
+before.
 
 The authorize and token endpoints come from `HFS_SMART_AUTHORIZE_ENDPOINT` /
 `HFS_SMART_TOKEN_ENDPOINT` when set, otherwise from the issuer's

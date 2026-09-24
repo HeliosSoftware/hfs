@@ -566,4 +566,57 @@ mod selfcall_tests {
         let sent = built_headers(&state, &HeaderMap::new()).await;
         assert!(sent.get("authorization").is_none());
     }
+
+    async fn import_headers(
+        state: &WebState,
+        submission: &crate::bulk_import::Submission,
+        headers: &HeaderMap,
+    ) -> reqwest::header::HeaderMap {
+        let request = reqwest::Client::new().post("http://localhost:8080/$bulk-submit");
+        crate::bulk_import::authorize_self_call(state, submission, headers, request, "aud")
+            .await
+            .expect("credential resolved")
+            .build()
+            .expect("request builds")
+            .headers()
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn the_import_page_submits_to_this_server_as_the_signed_in_user_too() {
+        let state = web_state(Some(store()));
+        let to_self = crate::bulk_import::Submission {
+            auth: "none".to_string(),
+            recipient_base_url: "http://localhost:8080".to_string(),
+            ..Default::default()
+        };
+
+        // Same order as every other page: the session's bearer goes on.
+        let sent = import_headers(&state, &to_self, &cookie("hfs_session=sess-1")).await;
+        assert_eq!(
+            sent.get("authorization").and_then(|v| v.to_str().ok()),
+            Some(format!("Bearer {TOKEN}").as_str())
+        );
+
+        // The browser's own header still wins.
+        let mut both = cookie("hfs_session=sess-1");
+        both.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer browser-token"),
+        );
+        let sent = import_headers(&state, &to_self, &both).await;
+        assert_eq!(
+            sent.get("authorization").and_then(|v| v.to_str().ok()),
+            Some("Bearer browser-token")
+        );
+
+        // Another server never sees this server's user or service token.
+        let elsewhere = crate::bulk_import::Submission {
+            auth: "none".to_string(),
+            recipient_base_url: "https://recipient.example".to_string(),
+            ..Default::default()
+        };
+        let sent = import_headers(&state, &elsewhere, &cookie("hfs_session=sess-1")).await;
+        assert!(sent.get("authorization").is_none());
+    }
 }
