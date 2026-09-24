@@ -105,13 +105,21 @@ async fn create_client(config: &MongoBackendConfig) -> StorageResult<Client> {
     })
 }
 
+/// Name of the unique `(tenant_id, resource_type, id)` index on `resources`;
+/// the `$reindex` id phase hints it (#1403).
+pub(crate) const RESOURCES_IDENTITY_INDEX: &str = "idx_resources_identity";
+/// Name of the `(tenant_id, resource_type, is_deleted, last_updated, id)`
+/// index on `resources`; the `$reindex` catch-up rounds and newest-live
+/// probe hint it (#1021, #1403).
+pub(crate) const RESOURCES_TYPE_SCAN_INDEX: &str = "idx_resources_type_scan";
+
 async fn ensure_resources_indexes(database: &Database) -> StorageResult<()> {
     let resources = database.collection::<Document>("resources");
 
     create_index(
         &resources,
         doc! { "tenant_id": 1_i32, "resource_type": 1_i32, "id": 1_i32 },
-        "idx_resources_identity",
+        RESOURCES_IDENTITY_INDEX,
         true,
     )
     .await?;
@@ -129,6 +137,11 @@ async fn ensure_resources_indexes(database: &Database) -> StorageResult<()> {
     // Measured at 300 000 resources: first page 676 ms examining 300 000
     // documents, against 2 ms examining 500 with this index.
     //
+    // Since #1403 the `$reindex` walk pages each type in `id` order on
+    // `idx_resources_identity`; this index still serves the walk's catch-up
+    // rounds (the `(last_updated, id)` keyset) and the newest-live probe that
+    // sets its floor and ceilings.
+    //
     // `idx_resources_type_deleted` was exactly this index's leading prefix, so
     // it is dropped rather than kept beside it: every query it served is served
     // here, and carrying both would cost a second B-tree on every write for no
@@ -142,7 +155,7 @@ async fn ensure_resources_indexes(database: &Database) -> StorageResult<()> {
             "last_updated": 1_i32,
             "id": 1_i32,
         },
-        "idx_resources_type_scan",
+        RESOURCES_TYPE_SCAN_INDEX,
         false,
     )
     .await?;
