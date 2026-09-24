@@ -634,3 +634,178 @@ async fn wait_for_terminal(
     .await
     .expect("reindex status should become terminal")
 }
+
+// ===========================================================================
+// T9: plans — hint honoured, no blocking sort, no from-floor re-scan (#1021)
+// ===========================================================================
+
+#[tokio::test]
+async fn mongodb_reindex_id_walk_pages_plan_without_a_blocking_sort() {
+    use futures::stream::TryStreamExt;
+
+    let Some(backend) = create_backend("reindex_id_walk_plan").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("walk-plan");
+    let fixture = seed_walk_fixture(&backend, &tenant, 300, "walk-plan-extra").await;
+    backdate_fixture(&backend, &tenant, &fixture).await;
+
+    let db = backend.get_database().await.unwrap();
+    let resources = db.collection::<Document>("resources");
+    let tail_ids: Vec<String> = (250..300).map(|i| format!("obs-{i:03}")).collect();
+    resources
+        .update_many(
+            doc! {
+                "tenant_id": "walk-plan",
+                "resource_type": "Observation",
+                "id": { "$in": &tail_ids },
+            },
+            doc! {
+                "$set": {
+                    "last_updated": BsonDateTime::from_millis(
+                        (chrono::Utc::now() - chrono::Duration::seconds(10)).timestamp_millis(),
+                    ),
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    let profiling_enabled = db.run_command(doc! { "profile": 2_i32 }).await.is_ok();
+    if !profiling_enabled {
+        eprintln!(
+            "mongodb_reindex_id_walk_pages_plan_without_a_blocking_sort: server refused \
+             {{profile: 2}} (likely a managed/shared HFS_TEST_MONGODB_URL); skipping the \
+             plan assertions"
+        );
+        return;
+    }
+
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = backend
+            .fetch_resources_page(&tenant, "Observation", cursor.as_deref(), 20)
+            .await
+            .unwrap();
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    let _ = db.run_command(doc! { "profile": 0_i32 }).await;
+
+    let profile: mongodb::Collection<Document> = db.collection("system.profile");
+    let entries: Vec<Document> = profile
+        .find(doc! {
+            "ns": format!("{}.resources", db.name()),
+            "op": "query",
+            "command.find": "resources",
+        })
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+
+    let mut id_queries = 0u32;
+    let mut probes = 0u32;
+    let mut round_queries = 0u32;
+    let mut round_queries_with_or = 0u32;
+
+    for entry in &entries {
+        let command = match entry.get_document("command") {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let hint = command.get_str("hint").ok();
+        let sort = command.get_document("sort").ok();
+        let has_sort_stage = entry.get_bool("hasSortStage").unwrap_or(false);
+        let keys_examined = entry
+            .get_i64("keysExamined")
+            .or_else(|_| entry.get_i32("keysExamined").map(i64::from))
+            .unwrap_or(0);
+        let docs_examined = entry
+            .get_i64("docsExamined")
+            .or_else(|_| entry.get_i32("docsExamined").map(i64::from))
+            .unwrap_or(0);
+
+        let mut inner = Document::new();
+        for key in ["find", "filter", "sort", "limit", "projection", "hint"] {
+            if let Some(v) = command.get(key) {
+                inner.insert(key, v.clone());
+            }
+        }
+        let explain = db
+            .run_command(doc! { "explain": inner, "verbosity": "executionStats" })
+            .await
+            .unwrap();
+        let winning_plan = match explain
+            .get_document("queryPlanner")
+            .and_then(|qp| qp.get_document("winningPlan"))
+        {
+            Ok(p) => p.clone(),
+            Err(_) => continue,
+        };
+        let mut names = Vec::new();
+        collect_index_names(&winning_plan, &mut names);
+        let has_sort = contains_stage_named(&winning_plan, "SORT");
+
+        let is_probe = sort == Some(&doc! { "last_updated": -1_i32, "id": -1_i32 });
+        match hint {
+            Some(h) if h == "idx_resources_identity" => {
+                id_queries += 1;
+                assert!(!has_sort_stage, "id query used a blocking sort");
+                assert!(!has_sort, "id query plan has a SORT stage");
+                assert!(
+                    !names.is_empty() && names.iter().all(|n| n == "idx_resources_identity"),
+                    "{names:?}"
+                );
+                assert!(keys_examined <= 20 + 3 + 50 + 1, "id query examined {keys_examined} keys");
+            }
+            Some(h) if h == "idx_resources_type_scan" && is_probe => {
+                probes += 1;
+                assert!(
+                    !names.is_empty() && names.iter().all(|n| n == "idx_resources_type_scan"),
+                    "{names:?}"
+                );
+                assert!(!has_sort);
+                assert!(keys_examined <= 2, "probe examined {keys_examined} keys");
+                assert_eq!(docs_examined, 0, "the probe must be covered");
+            }
+            Some(h) if h == "idx_resources_type_scan" => {
+                round_queries += 1;
+                // A round's continuation query plans as SORT_MERGE of two
+                // IXSCANs of the same index (run 17's measured plan, S2 §4.3),
+                // so `names` holds two equal entries here, not one —
+                // `collect_index_names` does not de-duplicate.
+                assert!(
+                    !names.is_empty() && names.iter().all(|n| n == "idx_resources_type_scan"),
+                    "{names:?}"
+                );
+                assert!(!has_sort, "round query plan has a SORT stage (SORT_MERGE is fine)");
+                assert!(!has_sort_stage);
+                assert!(
+                    keys_examined <= 20 + 2,
+                    "round query examined {keys_examined} keys (>= 40 would mean a from-floor rescan)"
+                );
+                let filter_has_or = command
+                    .get_document("filter")
+                    .map(|f| f.contains_key("$or"))
+                    .unwrap_or(false);
+                if filter_has_or {
+                    round_queries_with_or += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert!(id_queries >= 13, "expected at least 13 id queries, got {id_queries}");
+    assert!(probes >= 2, "expected at least 2 probes, got {probes}");
+    assert!(round_queries >= 4, "expected at least 4 round queries, got {round_queries}");
+    assert!(
+        round_queries_with_or >= 3,
+        "expected at least 3 round queries carrying $or, got {round_queries_with_or}"
+    );
+}
