@@ -3363,10 +3363,11 @@ async fn sql_library_details_new_lede_shows_only_for_the_starter() {
     assert!(!html.contains("Rename it and point relatedArtifact[0]"));
 }
 
-/// #840: Save fuses the posted Details document (no SQL attachment, a
-/// non-SQL one kept) with the posted SQL pane into one Library —
-/// `sql_libraries::embed_sql` appends the `application/sql` attachment
-/// alongside the surviving `text/plain` one — and redirects to it.
+/// #840/#1233: Save fuses the posted Details document (no SQL attachment, a
+/// non-SQL one kept) with the posted SQL pane into one Library — the
+/// Details JSON carries no readable `application/sql` attachment, so
+/// `sql_libraries::fill_sql_attachment` appends one alongside the
+/// surviving `text/plain` attachment — and redirects to it.
 /// `StaticConformanceSource::save_resource` does not persist (see
 /// `sql_editor_save_roundtrips_special_characters_byte_for_byte`'s own doc
 /// comment), so the merged document is read back off
@@ -3533,10 +3534,11 @@ async fn sql_library_save_invalid_json_shows_the_invalid_form_card() {
     assert_eq!(sql_textarea_value(&html), "SELECT 3");
 }
 
-/// #840: `POST …/run` embeds the posted SQL into the posted (content-less)
-/// Details document exactly as Save does, before handing it to `$sql-run` —
-/// the same `sql_libraries::embed_sql` merge, proven here against the live
-/// preview endpoint rather than Save's redirect.
+/// #840/#1233: `POST …/run` folds the posted SQL into the posted
+/// (content-less) Details document exactly as Save does, before handing it
+/// to `$sql-run` — the Details JSON carries no readable `application/sql`
+/// attachment, so `sql_libraries::fill_sql_attachment` fills it in, proven
+/// here against the live preview endpoint rather than Save's redirect.
 #[tokio::test]
 async fn sql_queries_run_embeds_the_sql_into_the_content_less_document() {
     let source = helios_ui::StaticConformanceSource::empty()
@@ -3569,6 +3571,88 @@ async fn sql_queries_run_embeds_the_sql_into_the_content_less_document() {
     assert_eq!(
         String::from_utf8(decoded).unwrap(),
         "SELECT COUNT(*) AS n FROM v"
+    );
+}
+
+/// #1233: Save keeps the Details JSON's own readable `application/sql`
+/// attachment over the SQL card's posted text — the JSON is the document
+/// of record; the card only fills in when the JSON carries no readable
+/// attachment (proven separately by
+/// `sql_library_save_merges_details_and_sql_into_one_library`).
+#[tokio::test]
+async fn sql_library_save_keeps_the_json_sql_attachment_over_the_sql_card() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let details = serde_json::json!({"resourceType": "Library", "id": "q1", "name": "q1",
+        "status": "active",
+        "type": {"coding": [{"system": system, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT 1")}]});
+    let source = helios_ui::StaticConformanceSource::empty();
+    let app = library_app(source.clone());
+
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "q1")
+        .append_pair("action", "save")
+        .append_pair("json", &details.to_string())
+        .append_pair("sql", "SELECT 2")
+        .finish();
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/queries")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let saved = source.saved_resources();
+    assert_eq!(saved.len(), 1);
+    let content = saved[0]["content"].as_array().expect("content array");
+    let sql_attachments: Vec<&Value> = content
+        .iter()
+        .filter(|a| a["contentType"] == "application/sql")
+        .collect();
+    assert_eq!(sql_attachments.len(), 1);
+    assert_eq!(
+        sql_attachments[0]["data"].as_str().unwrap(),
+        BASE64.encode("SELECT 1")
+    );
+}
+
+/// #1233: `POST …/run` keeps the Details JSON's own readable
+/// `application/sql` attachment over the SQL card's posted text — the run
+/// executes and analyzes the JSON's SQL, not the card's.
+#[tokio::test]
+async fn sql_queries_run_keeps_the_json_sql_attachment_over_the_sql_card() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 1})]));
+    let app = library_app(source.clone());
+    let details = serde_json::json!({
+        "resourceType": "Library", "name": "unsaved_query", "status": "draft",
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT 1")}],
+    });
+
+    let response = app
+        .oneshot(post_run(
+            "/ui/sql/queries/run",
+            library_run_body("lib1", &details, "SELECT 2"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let calls = source.sql_run_calls();
+    assert_eq!(calls.len(), 1);
+    let content = calls[0]["content"].as_array().expect("content array");
+    let sql_attachments: Vec<&Value> = content
+        .iter()
+        .filter(|a| a["contentType"] == "application/sql")
+        .collect();
+    assert_eq!(sql_attachments.len(), 1);
+    assert_eq!(
+        sql_attachments[0]["data"].as_str().unwrap(),
+        BASE64.encode("SELECT 1")
     );
 }
 

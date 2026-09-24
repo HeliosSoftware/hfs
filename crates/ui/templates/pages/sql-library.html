@@ -191,14 +191,16 @@
     </div>
 
     {#- The SQL card (#839): the only other card in this layout, always
-        open. Save/Run fuse this pane into Details on the server
-        (`sql_libraries::embed_sql`, #840): it replaces the first
-        `content[]` attachment whose `contentType` is `application/sql`, or
-        appends one when Details carries none — so a SQL attachment typed
-        by hand into the Details JSON card is always overwritten by this
-        one, never the reverse. The textarea carries the same live-preview
-        wiring the View Definitions editor uses (#752): htmx reposts it
-        500ms after the last change, targeting the notice region below. -#}
+        open. The Details JSON's own `application/sql` attachment is the
+        document of record (#1233): Save/Run only fold this pane's text
+        into Details' `content[]` (`sql_libraries::fill_sql_attachment`)
+        when Details carries no readable SQL attachment of its own — none,
+        missing `data`, invalid base64, or non-UTF-8 bytes. A readable
+        attachment already in Details always wins, and the run/analysis
+        that follows always uses that effective SQL. The textarea carries
+        the same live-preview wiring the View Definitions editor uses
+        (#752): htmx reposts it 500ms after the last change, targeting the
+        notice region below. -#}
     <section class="card">
       <div class="card-head">
         <h3>{{ i18n.t(editor_heading_key) }}</h3>

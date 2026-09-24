@@ -6195,8 +6195,9 @@ async fn sql_library_save(
     // #840: this page only ever shows and saves Libraries of its own kind —
     // saving a `sql-view` from SQL Queries (or the reverse) would silently
     // vanish it from the rail it was just edited on. Checked ahead of
-    // `embed_sql` below, against the resource exactly as submitted, so a
-    // rejected Save changes nothing about what the user typed.
+    // `fill_sql_attachment` below, against the resource exactly as
+    // submitted, so a rejected Save changes nothing about what the user
+    // typed.
     if !sql_libraries::has_library_code(&resource, kind.code) {
         let status = sql_libraries::extract_status(&resource);
         return render(
@@ -6216,7 +6217,8 @@ async fn sql_library_save(
     // `0..0` — reject a save (or Duplicate) that would persist a non-empty
     // one rather than silently keeping declarations the page never lets the
     // user act on. Checked after #840's own type gate above, against the
-    // resource exactly as submitted (before `embed_sql`), same as it is.
+    // resource exactly as submitted (before `fill_sql_attachment`), same as
+    // it is.
     if !kind.declares_parameters
         && resource
             .get("parameter")
@@ -6237,7 +6239,10 @@ async fn sql_library_save(
             .await,
         );
     }
-    sql_libraries::embed_sql(&mut resource, &form.sql);
+    // #1233: the Details JSON attachment wins over the SQL card — this only
+    // fills in when the JSON carries no readable `application/sql`
+    // attachment of its own.
+    sql_libraries::fill_sql_attachment(&mut resource, &form.sql);
     // Read before `resource` moves into `save_resource` below — only the
     // save-failure branch needs it, but the value must be captured here.
     let status = sql_libraries::extract_status(&resource);
@@ -6296,9 +6301,10 @@ struct SqlLibRunForm {
     /// The editor's full text, exactly as posted — never reformatted or
     /// re-serialized before either parsing it or embedding `sql` into it.
     json: String,
-    /// The SQL pane's exact posted text, embedded into `json`'s
-    /// `application/sql` attachment the same way Save does
-    /// ([`sql_libraries::embed_sql`]).
+    /// The SQL pane's exact posted text, folded into `json`'s
+    /// `application/sql` attachment the same way Save does — only when
+    /// `json` carries no readable one of its own (#1233,
+    /// [`sql_libraries::fill_sql_attachment`]).
     sql: String,
     /// Every submitted `param:{name}` value (#841), keyed by name.
     values: std::collections::HashMap<String, String>,
@@ -6507,6 +6513,13 @@ async fn sql_library_run(
         );
     }
 
+    // #1233: the Details JSON attachment wins over the SQL card — fill in
+    // only when the JSON carries no readable `application/sql` attachment
+    // of its own, once, ahead of every analysis below. `sql` is the
+    // effective SQL this run analyzes and executes from here on.
+    sql_libraries::fill_sql_attachment(&mut resource, &form.sql);
+    let sql = sql_libraries::extract_sql(&resource);
+
     // #841: a SQL View's own profile fixes `Library.parameter` to
     // `0..0` — this kind never declares parameters, so it never builds the
     // Parameters card (`kind.declares_parameters` gates that below) and
@@ -6539,7 +6552,7 @@ async fn sql_library_run(
     // always runs — the run/notice gate below needs its result regardless
     // of whether the card travels.
     let deps = sql_libraries::table_dependencies(&resource);
-    let unknown_tables = sql_libraries::unknown_tables(&form.sql, &deps);
+    let unknown_tables = sql_libraries::unknown_tables(&sql, &deps);
     let unknown_names: Vec<String> = unknown_tables.iter().map(|t| t.name.clone()).collect();
     let tables_signature = sql_libraries::tables_signature_with_unknown(&deps, &unknown_names);
     let tables_card = if tables_signature != form.tables_sig {
@@ -6590,7 +6603,6 @@ async fn sql_library_run(
     }
 
     if !kind.declares_parameters {
-        sql_libraries::embed_sql(&mut resource, &form.sql);
         let (run_results, columns) =
             match run_sql_preview(&state, &resource, &[], rv.0, &rt.id).await {
                 Ok((table, raw_rows, ms)) => {
@@ -6601,7 +6613,7 @@ async fn sql_library_run(
                         "ran a Library preview"
                     );
                     let columns = columns_fragment_for_success(
-                        &state, rv.0, &rt.id, i18n, kind, &table, &raw_rows, &form.sql, &deps,
+                        &state, rv.0, &rt.id, i18n, kind, &table, &raw_rows, &sql, &deps,
                     )
                     .await;
                     (standard(RunResultsState::Success(table, ms)), columns)
@@ -6620,7 +6632,7 @@ async fn sql_library_run(
     // #841: SQL Query — declared parameters, undeclared-placeholder hints,
     // and the values/bindings this run supplies, all from one analysis so
     // the signature comparison below and the run itself never disagree.
-    let analysis = analyze_params(&resource, &form.sql, &form.values);
+    let analysis = analyze_params(&resource, &sql, &form.values);
     let oob = analysis.signature != form.params_sig;
 
     let (run_results, columns) = if !analysis.missing_required.is_empty() {
@@ -6632,7 +6644,6 @@ async fn sql_library_run(
             stale_columns(),
         )
     } else {
-        sql_libraries::embed_sql(&mut resource, &form.sql);
         // Borrowed across the `await`, not cloned: `analysis` itself is
         // untouched until after this call returns, so its own `bindings`
         // stay valid for the whole request.
@@ -6645,7 +6656,7 @@ async fn sql_library_run(
                     "ran a Library preview"
                 );
                 let columns = columns_fragment_for_success(
-                    &state, rv.0, &rt.id, i18n, kind, &table, &raw_rows, &form.sql, &deps,
+                    &state, rv.0, &rt.id, i18n, kind, &table, &raw_rows, &sql, &deps,
                 )
                 .await;
                 (standard(RunResultsState::Success(table, ms)), columns)
