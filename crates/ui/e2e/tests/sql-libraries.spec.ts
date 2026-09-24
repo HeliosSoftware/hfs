@@ -604,6 +604,149 @@ test.describe("Details", () => {
   }
 });
 
+// Details <-> SQL sync (#1233): `sql-library-sync.js` keeps the Details
+// JSON's own `application/sql` attachment and the SQL card reading as one
+// document live, in both directions, with no Save or Run needed to see it.
+test.describe("Details <-> SQL sync (#1233)", () => {
+  test("typing in the SQL card updates the attachment in the Details JSON", async ({
+    page,
+    request,
+  }) => {
+    const canonical = `http://example.org/ViewDefinition/e2e-sync-${Date.now()}`;
+    const libId = await createSqlQueryLibrary(
+      request,
+      `e2e_sync_sql_${Date.now()}`,
+      canonical,
+      "SELECT 1",
+    );
+    await waitSearchable(request, "Library", libId);
+
+    await page.goto(`/ui/sql/queries?lib=${libId}`);
+    const sqlEditor = page.locator(".sql-editor .cm-content[role='textbox']");
+    await sqlEditor.click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText("SELECT 2");
+
+    const jsonPane = page.locator("textarea[name='json']");
+    await expect
+      .poll(
+        async () => {
+          const text = await jsonPane.inputValue();
+          try {
+            const doc = JSON.parse(text);
+            const attachment = (doc.content as Array<{ contentType: string; data: string }>).find(
+              (a) => a.contentType.startsWith("application/sql"),
+            );
+            return attachment ? Buffer.from(attachment.data, "base64").toString() : null;
+          } catch {
+            return null;
+          }
+        },
+        { timeout: 3000 },
+      )
+      .toBe("SELECT 2");
+
+    // No Save happened - the stored Library still reads the original SQL.
+    const untouched = await readResource(request, "Library", libId);
+    const content = untouched.content as Array<{ contentType: string; data: string }>;
+    const sqlAttachment = content.find((a) => a.contentType === "application/sql");
+    expect(Buffer.from(sqlAttachment!.data, "base64").toString()).toBe("SELECT 1");
+  });
+
+  test("editing the attachment data in the Details JSON updates the SQL card", async ({
+    page,
+    request,
+  }) => {
+    const canonical = `http://example.org/ViewDefinition/e2e-sync-${Date.now()}`;
+    const libId = await createSqlQueryLibrary(
+      request,
+      `e2e_sync_json_${Date.now()}`,
+      canonical,
+      "SELECT 1",
+    );
+    await waitSearchable(request, "Library", libId);
+
+    await page.goto(`/ui/sql/queries?lib=${libId}`);
+    const jsonPane = page.locator("textarea[name='json']");
+    const before = await jsonPane.inputValue();
+    const doc = JSON.parse(before);
+    const attachment = (doc.content as Array<{ contentType: string; data: string }>).find(
+      (a) => a.contentType === "application/sql",
+    );
+    attachment!.data = Buffer.from("SELECT 3").toString("base64");
+    const edited = JSON.stringify(doc, null, 2);
+
+    const jsonEditor = page.locator("#lib-details-editor .cm-content");
+    await jsonEditor.click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText(edited);
+
+    await expect(page.locator(".sql-editor .cm-content[role='textbox']")).toContainText(
+      "SELECT 3",
+      { timeout: 3000 },
+    );
+  });
+
+  test("pasting a whole Library into the Details JSON fills the SQL card", async ({
+    page,
+    request,
+  }) => {
+    const canonical = `http://example.org/ViewDefinition/e2e-sync-${Date.now()}`;
+    const libId = await createSqlQueryLibrary(
+      request,
+      `e2e_sync_paste_${Date.now()}`,
+      canonical,
+      "SELECT 1",
+    );
+    await waitSearchable(request, "Library", libId);
+
+    await page.goto(`/ui/sql/queries?lib=${libId}`);
+    const before = await page.locator("textarea[name='json']").inputValue();
+    const doc = JSON.parse(before);
+    doc.content = [
+      { contentType: "application/sql", data: Buffer.from("SELECT 4").toString("base64") },
+    ];
+    const wholeLibrary = JSON.stringify(doc, null, 2);
+
+    const jsonEditor = page.locator("#lib-details-editor .cm-content");
+    await jsonEditor.click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText(wholeLibrary);
+
+    await expect(page.locator(".sql-editor .cm-content[role='textbox']")).toContainText(
+      "SELECT 4",
+      { timeout: 3000 },
+    );
+    expect(await page.locator("textarea[name='json']").inputValue()).toContain("application/sql");
+  });
+
+  test("Save persists the SQL typed in the card once", async ({ page, request }) => {
+    const canonical = `http://example.org/ViewDefinition/e2e-sync-${Date.now()}`;
+    const libId = await createSqlQueryLibrary(
+      request,
+      `e2e_sync_save_${Date.now()}`,
+      canonical,
+      "SELECT 1",
+    );
+    await waitSearchable(request, "Library", libId);
+
+    await page.goto(`/ui/sql/queries?lib=${libId}`);
+    const sqlEditor = page.locator(".sql-editor .cm-content[role='textbox']");
+    await sqlEditor.click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText("SELECT 5");
+
+    await page.locator("button[name='action'][value='save']").click();
+    await page.waitForURL(new RegExp(`lib=${libId}&saved=1`));
+
+    const saved = await readResource(request, "Library", libId);
+    const content = saved.content as Array<{ contentType: string; data: string }>;
+    const sqlAttachments = content.filter((a) => a.contentType === "application/sql");
+    expect(sqlAttachments).toHaveLength(1);
+    expect(Buffer.from(sqlAttachments[0].data, "base64").toString()).toBe("SELECT 5");
+  });
+});
+
 // Parameters card (#841, SQL Query only): declare an undeclared placeholder,
 // bind it a value, watch the live run react, and undo the declaration.
 test.describe("Parameters card", () => {

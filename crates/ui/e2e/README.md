@@ -76,10 +76,13 @@ Pure-function browser modules (`assets/combobox.js`; `assets/editor-pair.js`'s
 `minimalChange`; `assets/vd-editor.js`'s completion/diagnostic-fix helpers
 (#821) — `skeletonForDetail`, `classifyObjectGap`, `buildKeyInsertion`,
 `codePointOffset`/`utf16OffsetForCodePoints`, `stringContentRange`,
-`escapeJsonStringContent`, `removeKeyRange`; the vendored bundle's own export
-surface and size budget) get a third, faster ring: plain Node tests under
-`unit/` (`editor-pair.test.cjs`, `vd-editor.test.cjs`,
-`codemirror-bundle.test.cjs`), run with `npm run test:unit` — no browser, no
+`escapeJsonStringContent`, `removeKeyRange`; `assets/sql-library-sync.js`'s
+own base64/JSON helpers behind the live Details JSON <-> SQL card sync
+(#1233) — `encodeSql`, `decodeSql`, `findSqlAttachment`, `sqlFromJson`,
+`jsonWithSql`; the vendored bundle's own export surface and size budget) get
+a third, faster ring: plain Node tests under `unit/` (`editor-pair.test.cjs`,
+`vd-editor.test.cjs`, `codemirror-bundle.test.cjs`,
+`sql-library-sync.test.cjs`), run with `npm run test:unit` — no browser, no
 server. `editor-pair.js` and `vd-editor.js` are wired UMD-style
 (`module.exports` under Node; `window.HfsEditorPair` / auto-mount under a
 real `document`) specifically so this stays possible without a second copy
