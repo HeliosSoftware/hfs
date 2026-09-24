@@ -10186,7 +10186,10 @@ mod bulk_submit {
 
     /// Creates a submission with one fetchable manifest — the shape the REST
     /// kickoff handler produces.
-    async fn seed(backend: &MongoBackend, tenant: &TenantContext) -> (SubmissionId, String) {
+    ///
+    /// `pub(super)` so the sibling `#[path]`-included `reindex_id_walk.rs`
+    /// module can reach it as `super::bulk_submit::seed` (#1403 P11).
+    pub(super) async fn seed(backend: &MongoBackend, tenant: &TenantContext) -> (SubmissionId, String) {
         let id = SubmissionId::generate("data-provider");
         backend.create_submission(tenant, &id, None).await.unwrap();
         let manifest = backend

@@ -1099,3 +1099,346 @@ async fn mongodb_reindex_id_walk_heals_an_update_racing_a_catch_up_page() {
     backend.write_search_entries(&tenant, &resource).await.unwrap();
     assert_eq!(snapshot(&db, "walk-rnd", false).await, s_final);
 }
+
+// ===========================================================================
+// T5: a deferred create below the cursor is indexed
+// ===========================================================================
+//
+// Uses `super::bulk_submit::seed`, made `pub(super)` for this call (#1403
+// P11), instead of a local copy — the two functions would otherwise be
+// byte-identical duplicates in the same test binary.
+
+#[tokio::test]
+async fn mongodb_reindex_id_walk_indexes_a_deferred_create_below_the_cursor() {
+    use helios_persistence::core::{BulkProcessingOptions, BulkSubmitProvider, NdjsonEntry};
+    use std::sync::Arc;
+
+    let Some(backend) = create_backend("reindex_id_walk_deferred_create").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let backend = Arc::new(backend);
+    let tenant_legacy = create_tenant("walk-crt-legacy");
+    let tenant_new = create_tenant("walk-crt-new");
+
+    let fixture_legacy = seed_walk_fixture(&backend, &tenant_legacy, 60, "extra").await;
+    backdate_fixture(&backend, &tenant_legacy, &fixture_legacy).await;
+    let (sid_legacy, mid_legacy) = super::bulk_submit::seed(&backend, &tenant_legacy).await;
+
+    let fixture_new = seed_walk_fixture(&backend, &tenant_new, 60, "extra").await;
+    backdate_fixture(&backend, &tenant_new, &fixture_new).await;
+    let (sid_new, mid_new) = super::bulk_submit::seed(&backend, &tenant_new).await;
+
+    // The create happens mid-walk, triggered by obs-030 (S2 §9.2 T5), so it
+    // lands behind the cursor as a real non-inline write — not before the
+    // walk starts, where nothing would exercise the id-order phase's healing.
+    let mutation_for = |backend: Arc<MongoBackend>,
+                         tenant: TenantContext,
+                         sid: helios_persistence::core::SubmissionId,
+                         mid: String| {
+        Box::new(move || {
+            let backend = backend.clone();
+            let tenant = tenant.clone();
+            let sid = sid.clone();
+            let mid = mid.clone();
+            Box::pin(async move {
+                backend
+                    .process_entries(
+                        &tenant,
+                        &sid,
+                        &mid,
+                        vec![NdjsonEntry::new(
+                            1,
+                            "Observation",
+                            json!({
+                                "resourceType": "Observation",
+                                "id": "--below-cursor",
+                                "status": "final",
+                                "code": { "coding": [{ "system": "http://loinc.org", "code": "8867-4" }] },
+                                "identifier": [{ "system": "urn:walk", "value": "o-below" }],
+                            }),
+                        )],
+                        &BulkProcessingOptions::new().with_defer_indexing(true),
+                    )
+                    .await
+                    .unwrap();
+            }) as futures::future::BoxFuture<'static, ()>
+        }) as Box<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>
+    };
+
+    let regs = backend.tenant_registries().clone();
+
+    let legacy_source: Arc<dyn helios_persistence::search::ReindexSource> = Arc::new(MutatingSource {
+        inner: Arc::new(LegacyWalkSource { backend: backend.clone() }),
+        trigger_id: "obs-030".to_string(),
+        fired: std::sync::atomic::AtomicBool::new(false),
+        mutation: mutation_for(backend.clone(), tenant_legacy.clone(), sid_legacy, mid_legacy),
+    });
+    let legacy_op = ReindexOperation::with_parts(legacy_source, vec![backend.clone()], regs.clone());
+    let job = legacy_op
+        .start(tenant_legacy.clone(), ReindexRequest::for_types(["Observation"]).with_batch_size(10), None)
+        .await
+        .unwrap();
+    wait_for_terminal(&legacy_op, &job).await;
+
+    let new_source: Arc<dyn helios_persistence::search::ReindexSource> = Arc::new(MutatingSource {
+        inner: backend.clone(),
+        trigger_id: "obs-030".to_string(),
+        fired: std::sync::atomic::AtomicBool::new(false),
+        mutation: mutation_for(backend.clone(), tenant_new.clone(), sid_new, mid_new),
+    });
+    let new_op = ReindexOperation::with_parts(new_source, vec![backend.clone()], regs);
+    let job = new_op
+        .start(tenant_new.clone(), ReindexRequest::for_types(["Observation"]).with_batch_size(10), None)
+        .await
+        .unwrap();
+    wait_for_terminal(&new_op, &job).await;
+
+    // Only after both walks have run does the deferred create's absence from
+    // the search index get resolved — it writes no rows itself (deferred
+    // indexing), so asserting this any earlier would always pass vacuously.
+    assert!(search_index_entry_count(&backend, &tenant_legacy, "Observation", "--below-cursor").await > 0);
+    assert!(search_index_entry_count(&backend, &tenant_new, "Observation", "--below-cursor").await > 0);
+
+    let db = backend.get_database().await.unwrap();
+    assert_eq!(
+        snapshot(&db, "walk-crt-legacy", true).await,
+        snapshot(&db, "walk-crt-new", true).await
+    );
+
+    let query = walk_identifier_query("o-below");
+    assert_eq!(backend.search(&tenant_new, &query).await.unwrap().resources.items.len(), 1);
+}
+
+// ===========================================================================
+// T6: a delete mid-walk behaves as on HEAD (orphan rows unchanged)
+// ===========================================================================
+
+#[tokio::test]
+async fn mongodb_reindex_id_walk_delete_mid_walk_behaves_as_the_legacy_walk() {
+    use std::sync::Arc;
+
+    let Some(backend) = create_backend("reindex_id_walk_delete_mid").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let backend = Arc::new(backend);
+    let tenant_legacy = create_tenant("walk-del-legacy");
+    let tenant_new = create_tenant("walk-del-new");
+    for tenant in [&tenant_legacy, &tenant_new] {
+        let fixture = seed_walk_fixture(&backend, tenant, 60, "extra").await;
+        backdate_fixture(&backend, tenant, &fixture).await;
+    }
+
+    let mutation_for = |backend: Arc<MongoBackend>, tenant: TenantContext| {
+        Box::new(move || {
+            let backend = backend.clone();
+            let tenant = tenant.clone();
+            Box::pin(async move {
+                backend.delete(&tenant, "Observation", "obs-042").await.unwrap();
+            }) as futures::future::BoxFuture<'static, ()>
+        }) as Box<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>
+    };
+
+    let regs = backend.tenant_registries().clone();
+    let legacy_source: Arc<dyn helios_persistence::search::ReindexSource> = Arc::new(MutatingSource {
+        inner: Arc::new(LegacyWalkSource { backend: backend.clone() }),
+        trigger_id: "obs-042".to_string(),
+        fired: std::sync::atomic::AtomicBool::new(false),
+        mutation: mutation_for(backend.clone(), tenant_legacy.clone()),
+    });
+    let legacy_op = ReindexOperation::with_parts(legacy_source, vec![backend.clone()], regs.clone());
+    let job = legacy_op
+        .start(tenant_legacy.clone(), ReindexRequest::for_types(["Observation"]).with_batch_size(10), None)
+        .await
+        .unwrap();
+    let legacy_progress = wait_for_terminal(&legacy_op, &job).await;
+
+    let new_source: Arc<dyn helios_persistence::search::ReindexSource> = Arc::new(MutatingSource {
+        inner: backend.clone(),
+        trigger_id: "obs-042".to_string(),
+        fired: std::sync::atomic::AtomicBool::new(false),
+        mutation: mutation_for(backend.clone(), tenant_new.clone()),
+    });
+    let new_op = ReindexOperation::with_parts(new_source, vec![backend.clone()], regs);
+    let job = new_op
+        .start(tenant_new.clone(), ReindexRequest::for_types(["Observation"]).with_batch_size(10), None)
+        .await
+        .unwrap();
+    let new_progress = wait_for_terminal(&new_op, &job).await;
+
+    for p in [&legacy_progress, &new_progress] {
+        assert_eq!(p.status, helios_persistence::search::ReindexStatus::Completed);
+        assert!(p.errors.is_empty());
+    }
+
+    let db = backend.get_database().await.unwrap();
+    assert_eq!(
+        snapshot(&db, "walk-del-legacy", true).await,
+        snapshot(&db, "walk-del-new", true).await,
+        "orphan rows from the mid-walk delete must match HEAD exactly"
+    );
+
+    let query = walk_identifier_query("o-42");
+    assert!(backend.search(&tenant_new, &query).await.unwrap().resources.items.is_empty());
+}
+
+// ===========================================================================
+// T10: an import tail is written exactly once
+// ===========================================================================
+
+#[tokio::test]
+async fn mongodb_reindex_id_walk_writes_an_import_tail_once() {
+    use std::sync::Arc;
+
+    let Some(backend) = create_backend("reindex_id_walk_tail").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let backend = Arc::new(backend);
+    capture_walk_logs();
+    let tenant = create_tenant("walk-tail");
+    let fixture = seed_walk_fixture(&backend, &tenant, 300, "extra").await;
+    let db = backend.get_database().await.unwrap();
+    let s_crud = snapshot(&db, "walk-tail", false).await;
+    backdate_fixture(&backend, &tenant, &fixture).await;
+
+    let resources = db.collection::<Document>("resources");
+    let tail_ids: Vec<String> = (250..300).map(|i| format!("obs-{i:03}")).collect();
+    resources
+        .update_many(
+            doc! { "tenant_id": "walk-tail", "resource_type": "Observation", "id": { "$in": &tail_ids } },
+            doc! {
+                "$set": {
+                    "last_updated": BsonDateTime::from_millis(
+                        (chrono::Utc::now() - chrono::Duration::seconds(10)).timestamp_millis(),
+                    ),
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    let target = Arc::new(RecordingTarget::new(backend.clone()));
+    let op = ReindexOperation::with_parts(backend.clone(), vec![target.clone()], backend.tenant_registries().clone());
+    let job = op
+        .start(tenant.clone(), ReindexRequest::for_types(["Observation"]).with_batch_size(40), None)
+        .await
+        .unwrap();
+    let progress = wait_for_terminal(&op, &job).await;
+    assert_eq!(progress.status, helios_persistence::search::ReindexStatus::Completed);
+    assert!(progress.errors.is_empty());
+    assert_eq!(progress.processed_resources, progress.total_resources);
+    assert_eq!(progress.processed_resources, 297);
+
+    let writes = target.writes.lock().unwrap().clone();
+    let written_ids: Vec<&str> = writes.iter().map(|(id, _)| id.as_str()).collect();
+    let non_tail_written: std::collections::HashSet<&str> = written_ids
+        .iter()
+        .filter(|id| !tail_ids.iter().any(|t| t == *id))
+        .cloned()
+        .collect();
+    let last_non_tail_pos = written_ids
+        .iter()
+        .enumerate()
+        .filter(|(_, id)| non_tail_written.contains(*id))
+        .map(|(i, _)| i)
+        .max()
+        .unwrap_or(0);
+    let first_tail_pos = written_ids
+        .iter()
+        .enumerate()
+        .find(|(_, id)| tail_ids.iter().any(|t| t == *id))
+        .map(|(i, _)| i);
+    if let Some(first_tail_pos) = first_tail_pos {
+        assert!(first_tail_pos > last_non_tail_pos, "{written_ids:?}");
+    }
+    // Every live id is recorded exactly once (no duplicates from a re-visit).
+    let mut sorted = written_ids.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), written_ids.len(), "{written_ids:?}");
+
+    assert_eq!(snapshot(&db, "walk-tail", false).await, s_crud);
+
+    let round1_finished = walk_log_lines(&[
+        "tenant=walk-tail",
+        "resource_type=Observation",
+        "mongodb reindex catch-up round finished",
+        "round=1",
+    ]);
+    assert!(round1_finished.iter().any(|l| l.contains("walked=50")), "{round1_finished:?}");
+}
+
+// ===========================================================================
+// T11: a future-stamped resource is indexed
+// ===========================================================================
+
+#[tokio::test]
+async fn mongodb_reindex_id_walk_indexes_a_future_stamped_resource() {
+    use std::sync::Arc;
+
+    let Some(backend) = create_backend("reindex_id_walk_future_stamp").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let backend = Arc::new(backend);
+    capture_walk_logs();
+    let tenant = create_tenant("walk-future");
+    let fixture = seed_walk_fixture(&backend, &tenant, 60, "extra").await;
+    let db = backend.get_database().await.unwrap();
+    let s_crud = snapshot(&db, "walk-future", false).await;
+    backdate_fixture(&backend, &tenant, &fixture).await;
+
+    let resources = db.collection::<Document>("resources");
+    resources
+        .update_many(
+            doc! { "tenant_id": "walk-future", "resource_type": "Observation", "id": "obs-033" },
+            doc! {
+                "$set": {
+                    "last_updated": BsonDateTime::from_millis(
+                        (chrono::Utc::now() + chrono::Duration::days(1)).timestamp_millis(),
+                    ),
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    let target = Arc::new(RecordingTarget::new(backend.clone()));
+    let op = ReindexOperation::with_parts(backend.clone(), vec![target.clone()], backend.tenant_registries().clone());
+    let job = op
+        .start(tenant.clone(), ReindexRequest::for_types(["Observation"]).with_batch_size(10), None)
+        .await
+        .unwrap();
+    let progress = wait_for_terminal(&op, &job).await;
+    assert_eq!(progress.status, helios_persistence::search::ReindexStatus::Completed);
+    assert!(progress.errors.is_empty());
+    assert_eq!(progress.processed_resources, progress.total_resources);
+    assert_eq!(progress.processed_resources, 59);
+
+    let writes = target.writes.lock().unwrap().clone();
+    let count_033 = writes.iter().filter(|(id, _)| id == "obs-033").count();
+    assert_eq!(count_033, 1, "{writes:?}");
+
+    // Every other live Observation is also recorded exactly once — the future
+    // stamp must not cause it, or anything else, to be walked twice.
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for (id, _) in &writes {
+        *counts.entry(id.as_str()).or_insert(0) += 1;
+    }
+    let live_ids: std::collections::BTreeSet<&str> =
+        fixture.live.get("Observation").unwrap().iter().map(String::as_str).collect();
+    let written_ids: std::collections::BTreeSet<&str> = counts.keys().copied().collect();
+    assert_eq!(written_ids, live_ids, "written ids must equal the 59 live ids");
+    assert!(counts.values().all(|&n| n == 1), "{counts:?}");
+
+    assert_eq!(snapshot(&db, "walk-future", false).await, s_crud);
+
+    let future_lines = walk_log_lines(&[
+        "tenant=walk-future",
+        "resource_type=Observation",
+        "mongodb reindex found live resources stamped in the future",
+    ]);
+    assert_eq!(future_lines.len(), 1, "{future_lines:?}");
+}
