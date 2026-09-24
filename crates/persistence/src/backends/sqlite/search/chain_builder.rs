@@ -1038,7 +1038,11 @@ mod date_condition_tests {
         let value = SearchValue::new(SearchPrefix::Eq, "1995-10-02");
         let (sql, params) = build_date_condition("t2", &value, 7);
         assert!(
-            sql.starts_with("(strftime('%Y-%m-%d %H:%M:%f', CASE WHEN instr(t2.value_date, '.')"),
+            // The implied `end > start bound` comes first, so the end index
+            // can be sought (#1391).
+            sql.starts_with(
+                "(t2.value_date_end > ?7 AND strftime('%Y-%m-%d %H:%M:%f', CASE WHEN instr(t2.value_date, '.')"
+            ),
             "{sql}"
         );
         assert!(

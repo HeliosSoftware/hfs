@@ -194,6 +194,18 @@ struct ListedIndex {
     extra_options: Vec<String>,
 }
 
+/// Whether moving to the current generation should warn that date rows
+/// written before #1391 lack `value_date_end` (#1391), given the generation
+/// recorded before this boot (`None`: never recorded) and whether
+/// `search_index` is empty.
+///
+/// Only on the transition: a database already at the current generation has
+/// nothing left to say, and an empty one (a new database, or a collection
+/// nobody has written to) has no old rows to reindex.
+fn unindexed_date_ranges_warning_due(recorded: Option<i32>, search_index_is_empty: bool) -> bool {
+    recorded.is_none_or(|generation| generation < SEARCH_INDEX_GENERATION) && !search_index_is_empty
+}
+
 pub(super) struct SearchIndexBuilder {
     database: Database,
     mode: IndexBuildMode,
@@ -352,10 +364,37 @@ impl SearchIndexBuilder {
     }
 
     async fn record_if_needed(&self) -> StorageResult<()> {
-        if get_search_index_generation(&self.database).await? != Some(SEARCH_INDEX_GENERATION) {
+        let recorded = get_search_index_generation(&self.database).await?;
+        if recorded != Some(SEARCH_INDEX_GENERATION) {
+            // The one moment the upgrade is visible: once generation 4 is
+            // recorded this branch is never taken again, so the check costs
+            // nothing on later boots.
+            if unindexed_date_ranges_warning_due(recorded, self.search_index_is_empty().await) {
+                tracing::warn!(
+                    from_generation = ?recorded,
+                    to_generation = SEARCH_INDEX_GENERATION,
+                    "search_index date rows written before #1391 have no value_date_end and will \
+                     not match date searches with the eq, ne, gt, ge, le, eb or ap prefixes until \
+                     they are reindexed; run `$reindex` to rebuild them (lt and sa, and rows \
+                     written by this version, are not affected)"
+                );
+            }
             set_search_index_generation(&self.database, SEARCH_INDEX_GENERATION).await?;
         }
         Ok(())
+    }
+
+    /// Whether `search_index` holds no rows, from collection metadata: no
+    /// scan, however large the collection. A collection that does not exist
+    /// counts as empty; a failed count as not empty (it only decides whether
+    /// a warning is logged).
+    async fn search_index_is_empty(&self) -> bool {
+        self.database
+            .collection::<Document>(SEARCH_INDEX_COLLECTION)
+            .estimated_document_count()
+            .await
+            .map(|count| count == 0)
+            .unwrap_or(false)
     }
 
     /// Raw `listIndexes`, because the driver's `IndexModel` does not expose
@@ -782,6 +821,28 @@ mod builder_tests {
                 },
             ]
         );
+    }
+
+    /// #1391: the warning is for an upgrade with rows to reindex, once.
+    #[test]
+    fn unindexed_date_ranges_warning_is_due_only_on_an_upgrade_with_rows() {
+        let current = SEARCH_INDEX_GENERATION;
+        // Never recorded, rows present: a database from before generations.
+        assert!(unindexed_date_ranges_warning_due(None, false));
+        // Every earlier generation, rows present.
+        for generation in 1..current {
+            assert!(
+                unindexed_date_ranges_warning_due(Some(generation), false),
+                "generation {generation}"
+            );
+        }
+        // A new database, or one nobody wrote to.
+        assert!(!unindexed_date_ranges_warning_due(None, true));
+        assert!(!unindexed_date_ranges_warning_due(Some(current - 1), true));
+        // Already there (or newer, from a later binary): silent on every boot.
+        assert!(!unindexed_date_ranges_warning_due(Some(current), false));
+        assert!(!unindexed_date_ranges_warning_due(Some(current), true));
+        assert!(!unindexed_date_ranges_warning_due(Some(current + 1), false));
     }
 
     #[test]

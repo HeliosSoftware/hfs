@@ -37,7 +37,9 @@ pub(crate) fn match_none() -> Value {
 /// at its own precision — a year, a month, a day, a minute, a second, or a
 /// fraction of one, as [`FhirDateValue`] defines for every backend: `eq` means
 /// `[start, end)`, `ne` its complement, `gt`/`sa` start at the end of the
-/// range, `lt`/`eb` end before its start, and `le` reaches its end.
+/// range, `lt`/`eb` end before its start, and `le` reaches its end. `ap` is
+/// the window [`FhirDateValue::approx_window`] — the range widened by the
+/// shared margin.
 ///
 /// Only `gte` and `lt` bounds are ever emitted, and always as complete
 /// server-generated dates. This used to send a value with a time as written,
@@ -60,11 +62,16 @@ pub(crate) fn field_range(field: &str, value: &str, prefix: SearchPrefix) -> Opt
     let bound = |instant: DateTime<Utc>| es_bound(instant, parsed.precision);
     let range = |bounds: Value| json!({ "range": { field: bounds } });
 
-    // `ap` on a date is the precision range itself: ES has no fuzzy date
-    // matching, and the implied period is the natural tolerance.
-    let predicate = parsed
-        .predicate(prefix, StorageResolution::Millis)
-        .or_else(|| parsed.predicate(SearchPrefix::Eq, StorageResolution::Millis))?;
+    // `ap` accepts a point inside the window every backend shares
+    // ([`FhirDateValue::approx_window`], #1391): the precision range widened by
+    // the same margin as the indexed ranges, so `_lastUpdated=ap…` and a
+    // composite's date component agree with MongoDB and with `build_clause`.
+    let Some(predicate) = parsed.predicate(prefix, StorageResolution::Millis) else {
+        let (low, high) = parsed.approx_window(StorageResolution::Millis);
+        return Some(DateRange::Within(range(
+            json!({ "gte": bound(low), "lt": bound(high) }),
+        )));
+    };
 
     Some(match predicate {
         DatePredicate::Within { ge, lt } => {
@@ -325,16 +332,56 @@ mod tests {
         assert_eq!(within(instant, SearchPrefix::Lt), json!({ "lt": start }));
         assert_eq!(within(instant, SearchPrefix::Eb), json!({ "lt": start }));
         assert_eq!(within(instant, SearchPrefix::Le), json!({ "lt": end }));
-        // `ap` is the precision range itself, as before.
+        // `ap` is the range widened by ten seconds a side (#1391).
         assert_eq!(
             within(instant, SearchPrefix::Ap),
-            json!({ "gte": start, "lt": end })
+            json!({ "gte": "2024-01-15T09:59:50.000Z", "lt": "2024-01-15T10:00:11.000Z" })
         );
 
         let Some(DateRange::Outside(ne)) = field_range("f", instant, SearchPrefix::Ne) else {
             panic!("ne must be a negated range")
         };
         assert_eq!(ne["range"]["f"], json!({ "gte": start, "lt": end }));
+    }
+
+    /// #1391: on a point field (`_lastUpdated`, a composite's date component)
+    /// `ap` is the shared window, the same one MongoDB builds: a year, a month,
+    /// a day, ten minutes or ten seconds either side of the value's own range,
+    /// by precision — no longer plain `eq`.
+    #[test]
+    fn ap_on_a_point_field_is_the_shared_approx_window() {
+        for (value, low, high) in [
+            ("2024", "2023-01-01", "2026-01-01"),
+            ("2024-03", "2024-02-01", "2024-05-01"),
+            ("2024-03-15", "2024-03-14", "2024-03-17"),
+            (
+                "2024-03-15T10:30Z",
+                "2024-03-15T10:20:00.000Z",
+                "2024-03-15T10:41:00.000Z",
+            ),
+            (
+                "2024-03-15T10:30:00Z",
+                "2024-03-15T10:29:50.000Z",
+                "2024-03-15T10:30:11.000Z",
+            ),
+            (
+                "2024-03-15T10:30:00.123Z",
+                "2024-03-15T10:29:50.123Z",
+                "2024-03-15T10:30:10.124Z",
+            ),
+        ] {
+            assert_eq!(
+                within(value, SearchPrefix::Ap),
+                json!({ "gte": low, "lt": high }),
+                "ap{value}"
+            );
+            // Not the `eq` range it used to be.
+            assert_ne!(
+                within(value, SearchPrefix::Ap),
+                within(value, SearchPrefix::Eq),
+                "ap{value}"
+            );
+        }
     }
 
     #[test]

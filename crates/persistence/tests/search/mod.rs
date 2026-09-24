@@ -48,6 +48,9 @@ pub fn make_sqlite_backend_for(fhir_version: FhirVersion) -> SqliteBackend {
 }
 
 pub mod chained_tests;
+/// The date component of a composite compares as a point on a Period's start,
+/// not as the range a date parameter compares (#1391).
+pub mod composite_period_pin;
 /// Backend-agnostic scenarios, shared with the PostgreSQL, MongoDB and
 /// Elasticsearch test binaries via `#[path]` (#1293, #1295, #1296, #1297).
 /// Backend-agnostic scenarios, shared with the PostgreSQL and MongoDB test
@@ -101,4 +104,15 @@ pub mod token_tests;
 async fn date_period_targets_are_ranges() {
     let backend = make_sqlite_backend();
     date_period_suite::period_targets_are_ranges(&backend, "date-period").await;
+}
+
+/// A composite's date component is a point on a Period's start, where the plain
+/// date parameter is a range (#1391); `Observation?code-value-date` is the
+/// registry composite that admits a Period there.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn date_composite_component_is_a_point_on_a_period() {
+    let backend = make_sqlite_backend();
+    composite_period_pin::composite_date_component_is_a_point(&backend, "date-composite-period")
+        .await;
 }

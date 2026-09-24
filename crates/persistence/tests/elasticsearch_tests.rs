@@ -5995,6 +5995,107 @@ mod es_integration {
         );
     }
 
+    /// #1391: `ap` on `_lastUpdated` is the window every backend shares — the
+    /// value's own range widened by a margin that follows its precision (a day
+    /// at day precision, ten seconds at second precision) — where it used to
+    /// be plain `eq` here while MongoDB widened it.
+    #[tokio::test]
+    async fn es_integration_last_updated_ap_uses_the_shared_window() {
+        use chrono::Duration;
+        use helios_persistence::types::SearchParamType::Date;
+
+        let backend = create_backend_with("1ms", WriteRefreshPolicy::WaitFor).await;
+        let tenant = create_tenant("last-updated-ap-1391");
+        // Creating the first resource of a type creates its index, which can
+        // take seconds on a busy machine; the ten-second margins below are
+        // measured from the resource's own timestamp, so the index is made
+        // first.
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({ "resourceType": "Patient", "id": "warm-up" }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let created = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({ "resourceType": "Patient", "id": "ap-1391" }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let modified = created.last_modified();
+        let one = std::collections::BTreeSet::from(["ap-1391".to_string()]);
+        let none = std::collections::BTreeSet::new();
+
+        let day = |offset: i64| {
+            (modified + Duration::days(offset))
+                .format("%Y-%m-%d")
+                .to_string()
+        };
+        let second = |offset: i64| {
+            (modified + Duration::seconds(offset))
+                .format("%Y-%m-%dT%H:%M:%SZ")
+                .to_string()
+        };
+        let found = |value: String| {
+            let backend = &backend;
+            let tenant = &tenant;
+            async move {
+                let mut ids = found_ids(
+                    backend,
+                    tenant,
+                    &param_query("Patient", &[("_lastUpdated", Date, &value)]),
+                )
+                .await;
+                ids.remove("warm-up");
+                ids
+            }
+        };
+
+        // Day precision: a day of margin on each side of the day searched.
+        assert_eq!(found(format!("ap{}", day(0))).await, one, "the day itself");
+        for offset in [-1, 1] {
+            assert_eq!(
+                found(format!("ap{}", day(offset))).await,
+                one,
+                "a day away is inside the margin"
+            );
+            assert_eq!(
+                found(day(offset)).await,
+                none,
+                "and is not `eq`, which `ap` used to be"
+            );
+        }
+        for offset in [-2, 2] {
+            assert_eq!(
+                found(format!("ap{}", day(offset))).await,
+                none,
+                "two days away is outside the margin"
+            );
+        }
+
+        // Second precision: ten seconds of margin.
+        for offset in [-5, 0, 5] {
+            assert_eq!(
+                found(format!("ap{}", second(offset))).await,
+                one,
+                "{offset}s is inside the margin"
+            );
+        }
+        for offset in [-30, 30] {
+            assert_eq!(
+                found(format!("ap{}", second(offset))).await,
+                none,
+                "{offset}s is outside the margin"
+            );
+        }
+    }
+
     // ========================================================================
     // Full-Text Search Tests
     // ========================================================================

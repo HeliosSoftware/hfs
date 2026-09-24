@@ -473,6 +473,145 @@ async fn ensure_index_reconciles_an_index_the_startup_pass_did_not_see() {
     );
 }
 
+/// Records the `WARN`-and-above events this crate logs. `#[traced_test]` is no
+/// use in an integration test: it keeps only the test crate's own events. It is
+/// installed as the *global* subscriber, once: a per-thread one races with the
+/// other tests in this binary over tracing's per-callsite interest cache, and
+/// a test would sometimes not see events its own thread logged. Every test
+/// therefore reads it by the name of an index of its own.
+#[derive(Clone, Default)]
+struct WarningLog(Arc<std::sync::Mutex<Vec<String>>>);
+
+struct FieldText(String);
+
+impl tracing::field::Visit for FieldText {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.push_str(&format!("{}={value:?} ", field.name()));
+    }
+}
+
+impl tracing::Subscriber for WarningLog {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        *metadata.level() <= tracing::Level::WARN
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        if event.metadata().target().starts_with("helios_persistence") {
+            let mut text = FieldText(String::new());
+            event.record(&mut text);
+            self.0.lock().unwrap().push(text.0);
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+static WARNINGS: std::sync::OnceLock<WarningLog> = std::sync::OnceLock::new();
+
+impl WarningLog {
+    fn install() -> &'static WarningLog {
+        WARNINGS.get_or_init(|| {
+            let log = WarningLog::default();
+            tracing::subscriber::set_global_default(log.clone())
+                .expect("no other global subscriber in this test binary");
+            log
+        })
+    }
+
+    /// The warnings about documents indexed before #1391 that name `index`.
+    fn reindex_warnings_for(&self, index: &str) -> Vec<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.contains("before #1391") && line.contains(index))
+            .cloned()
+            .collect()
+    }
+}
+
+/// #1391: upgrading an index below schema version 2 that holds documents warns,
+/// once, that they have no `search_params.date.end` until `$reindex`; an empty
+/// index and one already at version 2 do not. Run on the real cluster so the
+/// document count the decision rests on is the one Elasticsearch reports.
+#[tokio::test]
+async fn upgrading_an_old_index_with_documents_warns_that_reindex_is_needed() {
+    let log = WarningLog::install();
+
+    // Version 1 with a document: warned, once, naming the index.
+    let prefix = new_prefix();
+    let first = started_backend_on(&prefix).await;
+    create_patient(&first, "seed", "Warnseed").await;
+    let index = first.index_name("reconcile", "Patient");
+    downgrade_to_pre_1335_mapping(&index, json!({ SCHEMA_VERSION_META_KEY: 1 })).await;
+    assert!(
+        log.reindex_warnings_for(&index).is_empty(),
+        "nothing to warn about yet"
+    );
+    started_backend_on(&prefix).await;
+    let warnings = log.reindex_warnings_for(&index);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    for needle in [
+        "search_params.date.end",
+        "$reindex",
+        "eq, ne, gt, ge, le, eb or ap",
+    ] {
+        assert!(
+            warnings[0].contains(needle),
+            "{needle} missing: {}",
+            warnings[0]
+        );
+    }
+
+    // The second start finds it current: no second warning.
+    started_backend_on(&prefix).await;
+    assert_eq!(log.reindex_warnings_for(&index).len(), 1);
+
+    // An old index with no document left in it: nothing to reindex.
+    let empty_prefix = new_prefix();
+    let empty = started_backend_on(&empty_prefix).await;
+    create_patient(&empty, "gone", "Emptyseed").await;
+    let empty_index = empty.index_name("reconcile", "Patient");
+    let deleted = raw_client()
+        .await
+        .delete(elasticsearch::DeleteParts::IndexId(
+            &empty_index,
+            "Patient_gone",
+        ))
+        .refresh(elasticsearch::params::Refresh::True)
+        .send()
+        .await
+        .expect("delete");
+    assert!(deleted.status_code().is_success(), "delete failed");
+    downgrade_to_pre_1335_mapping(&empty_index, json!({ SCHEMA_VERSION_META_KEY: 1 })).await;
+    started_backend_on(&empty_prefix).await;
+    assert_reconciled(&mapping_of(&empty_index).await);
+    assert!(log.reindex_warnings_for(&empty_index).is_empty());
+
+    // Already at the current version, documents and all: not touched, no warning.
+    let current_prefix = new_prefix();
+    let current = started_backend_on(&current_prefix).await;
+    create_patient(&current, "seed", "Currentseed").await;
+    let current_index = current.index_name("reconcile", "Patient");
+    started_backend_on(&current_prefix).await;
+    assert!(log.reindex_warnings_for(&current_index).is_empty());
+
+    // The write path reconciles an index the startup pass did not see, and
+    // gives the same warning for it.
+    let rolling_prefix = new_prefix();
+    let older = started_backend_on(&rolling_prefix).await;
+    let newer = started_backend_on(&rolling_prefix).await;
+    create_patient(&older, "seed", "Rollingwarn").await;
+    let rolling_index = older.index_name("reconcile", "Patient");
+    downgrade_to_pre_1335_mapping(&rolling_index, json!({ SCHEMA_VERSION_META_KEY: 1 })).await;
+    create_patient(&newer, "second", "Rollingwarn").await;
+    assert_eq!(log.reindex_warnings_for(&rolling_index).len(), 1);
+}
+
 /// An index a newer build has already taken past this version is left alone:
 /// re-applying this build's mapping could reset a parameter the newer one set.
 #[tokio::test]

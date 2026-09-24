@@ -2787,6 +2787,47 @@ mod tests {
         );
     }
 
+    /// A `Period` bound is read strictly: the extractor indexes a `Period` only
+    /// when both bounds are valid FHIR dates, and an `end` that is not one —
+    /// ISO 8601 spellings outside the grammar included — drops the whole
+    /// `Period` rather than being read as open.
+    #[test]
+    fn a_period_with_an_end_that_is_not_a_fhir_date_is_skipped_whole() {
+        let period = |start: &str, end: &str| {
+            let value = IndexValue::date_range(Some(start), Some(end)).expect("a Period");
+            ExtractedValue::new(
+                "date",
+                "http://hl7.org/fhir/SearchParameter/clinical-date",
+                value.param_type(),
+                value,
+            )
+        };
+        let doc = build_es_document(
+            "t1",
+            "Encounter",
+            "e1",
+            "1",
+            &json!({ "resourceType": "Encounter", "id": "e1" }),
+            FhirVersion::default(),
+            &[
+                period("2024-03-15", "2024-03-15T12:00:00+05:30"),
+                period("2024-03-15", "2024-03-15T12Z"),
+                period("2024-03-15", "2024-03-15T12:00:00+0530"),
+                period("2024-03-15", "not-a-date"),
+            ],
+        );
+        let ranges: Vec<(&str, &str)> = doc["search_params"]["date"]
+            .as_array()
+            .expect("date entries")
+            .iter()
+            .map(|e| (e["value"].as_str().unwrap(), e["end"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            ranges,
+            vec![("2024-03-15T00:00:00.000Z", "2024-03-15T06:30:01.000Z")]
+        );
+    }
+
     #[test]
     fn chunk_ranges_caps_operations_per_request() {
         assert_eq!(chunk_ranges(&[1; 5], 2, usize::MAX), vec![0..2, 2..4, 4..5]);

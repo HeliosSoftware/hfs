@@ -14909,7 +14909,8 @@ async fn assert_search_index_ops_are_covered(
 
 /// #1391: date rows are ranges `[value_date, value_date_end)`, so a date
 /// search bounds `value_date`, `value_date_end`, or both. Every prefix shape
-/// must still be a covered scan on `idx_search_date_v3`, which carries both.
+/// (`ge`, `le` and `ne` included) and a comma list must still be a covered
+/// scan on `idx_search_date_v3`, which carries both.
 #[tokio::test]
 async fn mongodb_integration_date_range_search_is_a_covered_v3_scan() {
     let Some(backend) = create_backend_with_full_registry("covered_date").await else {
@@ -14936,16 +14937,25 @@ async fn mongodb_integration_date_range_search_is_a_covered_v3_scan() {
         .await
         .unwrap()
         .database(&backend.config().database_name);
-    // `gt` bounds only the end, `eq` and `eb` both ends. The two-branch
-    // prefixes (`ge`, `le`, `ne`) still seek on this index but, as an `$or`
-    // under the shared tenant/type/param filter, MongoDB 5.0 reads the
-    // documents of the param's slice for them, so they are not asserted here.
-    for (value, expected) in [("gt2016-01-10", 10), ("2016-01-10", 1), ("eb2016-01-10", 9)] {
+    // `gt` bounds only the end, `eq` and `eb` both ends, and `ge`, `le`, `ne`
+    // have two alternatives, which are sent as an `$or` at the top of the
+    // filter so that each arm is a covered scan too. Comma lists ride the
+    // same top-level `$or`.
+    for (value, expected) in [
+        ("gt2016-01-10", 10),
+        ("2016-01-10", 1),
+        ("eb2016-01-10", 9),
+        ("ge2016-01-10", 11),
+        ("le2016-01-10", 10),
+        ("ne2016-01-10", 19),
+        ("ge2016-01-19,lt2016-01-03", 4),
+    ] {
+        let values: Vec<SearchValue> = value.split(',').map(SearchValue::parse).collect();
         let q = SearchQuery::new("Observation").with_parameter(SearchParameter {
             name: "date".into(),
             param_type: SearchParamType::Date,
             modifier: None,
-            values: vec![SearchValue::parse(value)],
+            values,
             chain: vec![],
             components: vec![],
         });
@@ -14963,6 +14973,194 @@ async fn mongodb_integration_date_range_search_is_a_covered_v3_scan() {
         )
         .await;
     }
+}
+
+/// The ids a `date` search returns, sorted; each inner list is one occurrence
+/// of the parameter (`date=a,b&date=c` is `[[a, b], [c]]`).
+async fn date_search_ids(
+    backend: &MongoBackend,
+    tenant: &TenantContext,
+    occurrences: &[&str],
+) -> Vec<String> {
+    let mut q = SearchQuery::new("Observation");
+    for occurrence in occurrences {
+        q = q.with_parameter(SearchParameter {
+            name: "date".into(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: occurrence.split(',').map(SearchValue::parse).collect(),
+            chain: vec![],
+            components: vec![],
+        });
+    }
+    let mut ids: Vec<String> = backend
+        .search(tenant, &q)
+        .await
+        .unwrap()
+        .resources
+        .items
+        .iter()
+        .map(|r| r.id().to_string())
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// #1391: `ge`, `le` and `ne` moved their `$or` to the top of the filter to
+/// be covered scans. That must not change what a comma list (OR) or a
+/// repeated parameter (AND) return, nor how a Period is read.
+#[tokio::test]
+async fn mongodb_integration_date_or_and_semantics_survive_top_level_or() {
+    let Some(backend) = create_backend_with_full_registry("date_or_and").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-date-or-and");
+    for year in 2015..=2022 {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation", "id": format!("y{year}"), "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "8302-2" }] },
+                    "effectiveDateTime": year.to_string()
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    // A Period from mid-2019 to March 2020: in neither year, over both.
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation", "id": "period", "status": "final",
+                "code": { "coding": [{ "system": "http://loinc.org", "code": "8302-2" }] },
+                "effectivePeriod": { "start": "2019-06", "end": "2020-03" }
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let ids = |list: &[&str]| -> Vec<String> {
+        let mut v: Vec<String> = list.iter().map(|s| s.to_string()).collect();
+        v.sort();
+        v
+    };
+    let ge2020_or_lt2019 = ids(&[
+        "y2015", "y2016", "y2017", "y2018", "y2020", "y2021", "y2022",
+    ]);
+    // A comma list is an OR, in either order.
+    assert_eq!(
+        date_search_ids(&backend, &tenant, &["ge2020,lt2019"]).await,
+        ge2020_or_lt2019
+    );
+    assert_eq!(
+        date_search_ids(&backend, &tenant, &["lt2019,ge2020"]).await,
+        ge2020_or_lt2019
+    );
+    // Every value of the list is one of the alternatives: `ne2019` or `eq2019`
+    // is everything.
+    assert_eq!(
+        date_search_ids(&backend, &tenant, &["ne2019,2019"])
+            .await
+            .len(),
+        9
+    );
+    // Repeated parameters are an AND: `ge2018` and `lt2021`.
+    assert_eq!(
+        date_search_ids(&backend, &tenant, &["ge2018", "lt2021"]).await,
+        ids(&["period", "y2018", "y2019", "y2020"])
+    );
+    // A comma list ANDed with another occurrence.
+    assert_eq!(
+        date_search_ids(&backend, &tenant, &["ge2020,lt2019", "ne2016"]).await,
+        ids(&["y2015", "y2017", "y2018", "y2020", "y2021", "y2022"])
+    );
+    // The Period alone, per prefix: it is over 2019 and 2020 but neither
+    // starts after nor ends before them.
+    assert!(
+        date_search_ids(&backend, &tenant, &["ge2019"])
+            .await
+            .contains(&"period".to_string())
+    );
+    assert!(
+        !date_search_ids(&backend, &tenant, &["ge2020"])
+            .await
+            .contains(&"period".to_string())
+    );
+    assert!(
+        date_search_ids(&backend, &tenant, &["ne2019"])
+            .await
+            .contains(&"period".to_string())
+    );
+    assert!(
+        !date_search_ids(&backend, &tenant, &["le2019"])
+            .await
+            .contains(&"period".to_string())
+    );
+}
+
+/// #1391: a `Period` with an `end` that is not a valid date is dropped whole
+/// (the shared extractor's one rule for every backend), never indexed as open
+/// above; a readable one keeps the range it names.
+#[tokio::test]
+async fn mongodb_integration_period_with_unreadable_end_is_dropped_not_open() {
+    let Some(backend) = create_backend_with_full_registry("date_unreadable_end").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-date-unreadable-end");
+    for (id, end) in [
+        ("readable", "2020-06-01T10:00:00Z"),
+        ("garbage", "not-a-date"),
+    ] {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation", "id": id, "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "8302-2" }] },
+                    "effectivePeriod": { "start": "2020-01-01", "end": end }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    // The readable one ends where its text says: inside 2020, after 09:00 that
+    // day, not after the next day.
+    let eq2020 = date_search_ids(&backend, &tenant, &["2020"]).await;
+    assert!(eq2020.contains(&"readable".to_string()), "{eq2020:?}");
+    assert!(!eq2020.contains(&"garbage".to_string()), "{eq2020:?}");
+    assert_eq!(
+        date_search_ids(&backend, &tenant, &["gt2020-06-01T09:00:00Z"])
+            .await
+            .into_iter()
+            .filter(|id| id == "readable")
+            .count(),
+        1
+    );
+    assert!(
+        !date_search_ids(&backend, &tenant, &["gt2020-06-02"])
+            .await
+            .contains(&"readable".to_string())
+    );
+    // The unreadable end is not open above, and its Period is not found by
+    // its start either.
+    assert!(
+        date_search_ids(&backend, &tenant, &["gt2030"])
+            .await
+            .is_empty()
+    );
+    let lt2021 = date_search_ids(&backend, &tenant, &["lt2021"]).await;
+    assert!(lt2021.contains(&"readable".to_string()), "{lt2021:?}");
+    assert!(!lt2021.contains(&"garbage".to_string()), "{lt2021:?}");
 }
 
 #[tokio::test]

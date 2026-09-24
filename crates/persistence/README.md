@@ -1183,8 +1183,12 @@ The SQLite backend includes a complete FHIR search implementation using pre-comp
   (`2020-03` is `[2020-03-01, 2020-04-01)`). A `Period`, and a `Timing`'s
   `repeat.boundsPeriod`, is **one** range from its `start` to the end of its
   `end` at that value's precision. A missing `start` or `end` is unbounded,
-  stored as the supported-range limit (year 1 / year 9999). A Period with an
-  unparseable side is not indexed at all, rather than read as open.
+  stored as the supported-range limit (year 1 / year 9999). One rule for all
+  four backends: a Period whose `start` or `end` is not a valid FHIR
+  date/dateTime (as the search grammar reads it, so minute precision is fine
+  but `2024-03-15T10Z` or `+0530` is not) is not indexed at all, rather than
+  read as open. Before #1391 each end was indexed as its own point and a
+  backend could be lenient about the format.
 - With search range `[s, e)` and indexed range `[ts, te)`, all four backends
   apply the FHIR rules for range targets: `eq` `s ≤ ts ∧ te ≤ e`, `ne` its
   negation, `gt` `te > e`, `lt` `ts < s`, `ge` `gt ∨ eq`, `le` `lt ∨ eq`,
@@ -1195,8 +1199,20 @@ The SQLite backend includes a complete FHIR search implementation using pre-comp
   1 day, 10 minutes, or 10 seconds for year, month, day, minute and
   second-or-finer values.
 - Descending `_sort` on a date parameter orders by the largest range end.
+- SQLite keeps an index on the range end (`idx_search_date_end`, created by the
+  v35 migration) and adds the implied `end > start-bound` term to every group
+  that bounds the start, so `eq`, `gt` and `sa` seek instead of scanning the
+  parameter's rows (2M date rows: `eq` 0.9 s -> 0.1 s). Conditions that bound
+  only the start (`lt`, `ge`, `ne`, `ap`) still evaluate a normalizing
+  expression per row and are slower than before on very large
+  date slices (measured 1.3x-2.5x).
 - `_lastUpdated` and the date components of composite parameters are still
   compared as points.
+- SQLite rows indexed before `value_date_precision` existed (or by the fallback
+  indexer) have no recorded precision, and a padded `T00:00:00` value cannot
+  say whether it was a year, month, day or second. The v35 backfill does not
+  guess: such a row gets a one-second range, the migration logs how many it
+  filled, and `ne`/`ap` on them can differ until `$reindex`.
 - **After upgrading, run `$reindex`.** The SQLite (v35) and PostgreSQL (v43)
   migrations fill in the range end of existing rows, so point values keep
   working, but a Period indexed before the upgrade is still two point rows

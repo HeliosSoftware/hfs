@@ -171,6 +171,51 @@ fn build_date_range_filter_doc(value: &SearchValue, param: &str) -> StorageResul
     })
 }
 
+/// Flattens the date filters of one parameter's values into a single
+/// top-level `$or` whose arms each repeat the `scope` conjuncts (tenant,
+/// resource type, parameter name), so that every arm is a plain conjunction
+/// the `idx_search_date_v3` index can seek on, covered (#1391).
+///
+/// A value filter is either one conjunction or `{ "$or": [conjunction, ..] }`
+/// (see [`build_date_range_filter_doc`]); comma-separated values are OR'd, so
+/// the union of all arms is the same set of rows as the nested form matched.
+fn scoped_date_alternatives(scope: &Document, value_filters: Vec<Document>) -> Document {
+    let mut arms: Vec<Bson> = Vec::new();
+    for value_filter in value_filters {
+        let alternatives = match value_filter.get_array("$or") {
+            Ok(alternatives) if value_filter.len() == 1 => alternatives.clone(),
+            _ => vec![Bson::Document(value_filter)],
+        };
+        for alternative in alternatives {
+            if let Bson::Document(conditions) = alternative {
+                let mut arm = scope.clone();
+                arm.extend(conditions);
+                arms.push(Bson::Document(arm));
+            }
+        }
+    }
+    doc! { "$or": arms }
+}
+
+/// Drops the `tenant_id` / `resource_type` scope from a filter built by
+/// `build_search_index_filter`: at the top and, for a date filter, in each arm
+/// of its top-level `$or` ([`scoped_date_alternatives`]).
+fn strip_index_scope(filter: &mut Document, param_type: SearchParamType) {
+    filter.remove("tenant_id");
+    filter.remove("resource_type");
+    if param_type != SearchParamType::Date {
+        return;
+    }
+    if let Ok(arms) = filter.get_array_mut("$or") {
+        for arm in arms {
+            if let Bson::Document(arm) = arm {
+                arm.remove("tenant_id");
+                arm.remove("resource_type");
+            }
+        }
+    }
+}
+
 /// The error for a number or quantity search value whose number is not one.
 ///
 /// As for dates, such a value is an error here, never a filter — not even one
@@ -1210,8 +1255,7 @@ impl MongoBackend {
             // Reuse the standard per-param value filter, dropping the tenant /
             // resource_type scoping (handled by the pipeline's top `$match`).
             let mut branch = self.build_search_index_filter("", "", param)?;
-            branch.remove("tenant_id");
-            branch.remove("resource_type");
+            strip_index_scope(&mut branch, param.param_type);
             branches.push(branch);
             if !distinct_names.contains(&param.name) {
                 distinct_names.push(param.name.clone());
@@ -2397,6 +2441,18 @@ impl MongoBackend {
             .iter()
             .map(|value| self.build_index_value_filter(param, value, &targets))
             .collect::<StorageResult<Vec<_>>>()?;
+
+        // #1391: a date value can be several alternatives of its own (`ge`,
+        // `le`, `ne`), and a comma list adds more. MongoDB 5.0 answers an
+        // `$or` nested under the shared tenant/type/param conjuncts by
+        // reading the documents, not as a covered scan; an `$or` at the top,
+        // every arm carrying the scope itself, plans one index scan per arm.
+        // The alternatives and their OR are unchanged; only where they sit.
+        if param.param_type == SearchParamType::Date
+            && (value_filters.len() > 1 || value_filters.iter().any(|f| f.contains_key("$or")))
+        {
+            return Ok(scoped_date_alternatives(&filter, value_filters));
+        }
 
         if value_filters.len() == 1 {
             if let Some(single) = value_filters.into_iter().next() {
@@ -4788,6 +4844,157 @@ mod value_list_tests {
                 doc.contains_key("value_date"),
                 "each $or arm constrains value_date: {doc:?}"
             );
+        }
+    }
+
+    fn date_param(values: &[&str]) -> SearchParameter {
+        SearchParameter {
+            name: "date".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: values.iter().map(|v| SearchValue::parse(v)).collect(),
+            chain: vec![],
+            components: vec![],
+        }
+    }
+
+    fn at_date(rfc3339: &str) -> BsonDateTime {
+        chrono_to_bson(
+            DateTime::parse_from_rfc3339(rfc3339)
+                .expect("test instant")
+                .with_timezone(&Utc),
+        )
+    }
+
+    /// The arms of a date filter's top-level `$or`, as documents.
+    fn top_level_arms(filter: &Document) -> Vec<Document> {
+        assert_eq!(filter.len(), 1, "only the $or at the top: {filter:?}");
+        filter
+            .get_array("$or")
+            .expect("top-level $or")
+            .iter()
+            .map(|arm| arm.as_document().expect("arm").clone())
+            .collect()
+    }
+
+    /// #1391: a date value with alternatives (`ge`, `le`, `ne`) puts its `$or`
+    /// at the top, each arm repeating tenant/type/param, so MongoDB plans one
+    /// covered `idx_search_date_v3` scan per arm; nested under the shared
+    /// conjuncts it reads the documents instead.
+    #[test]
+    fn two_branch_date_prefixes_scope_every_arm() {
+        let backend = backend();
+        let (s, e) = (
+            at_date("2020-01-01T00:00:00Z"),
+            at_date("2021-01-01T00:00:00Z"),
+        );
+        let scope = doc! { "tenant_id": "t1", "resource_type": "Patient", "param_name": "date" };
+        let expect = |arm: Document| {
+            let mut scoped = scope.clone();
+            scoped.extend(arm);
+            Bson::Document(scoped)
+        };
+        let end_after = doc! { "value_date": { "$ne": null }, "value_date_end": { "$gt": e } };
+        let contained = doc! {
+            "value_date": { "$gte": s, "$lt": e },
+            "value_date_end": { "$lte": e },
+        };
+        let before = doc! { "value_date": { "$lt": s } };
+
+        let cases = [
+            ("ge2020", vec![end_after.clone(), contained.clone()]),
+            ("le2020", vec![before.clone(), contained.clone()]),
+            ("ne2020", vec![before.clone(), end_after.clone()]),
+        ];
+        for (raw, arms) in cases {
+            let filter = backend
+                .build_search_index_filter("t1", "Patient", &date_param(&[raw]))
+                .expect(raw);
+            let expected = doc! { "$or": arms.into_iter().map(expect).collect::<Vec<_>>() };
+            assert_eq!(filter, expected, "date={raw}");
+        }
+    }
+
+    /// One-condition and both-end prefixes keep the flat shape: the
+    /// conjuncts and the value condition side by side, no `$or` at all.
+    #[test]
+    fn single_branch_date_prefixes_stay_flat() {
+        let backend = backend();
+        for raw in ["gt2020", "lt2020", "sa2020", "eb2020", "2020", "ap2020"] {
+            let filter = backend
+                .build_search_index_filter("t1", "Patient", &date_param(&[raw]))
+                .expect(raw);
+            assert!(!filter.contains_key("$or"), "date={raw}: {filter:?}");
+            assert_eq!(filter.get_str("tenant_id"), Ok("t1"), "date={raw}");
+            assert_eq!(filter.get_str("resource_type"), Ok("Patient"), "date={raw}");
+            assert_eq!(filter.get_str("param_name"), Ok("date"), "date={raw}");
+        }
+    }
+
+    /// A comma list is the OR of its values' alternatives, every one a
+    /// self-contained scoped arm at the top: `ge2020,lt2019` is
+    /// `[ge-end-arm, ge-contained-arm, lt-arm]`, not an `$or` of an `$or`.
+    #[test]
+    fn comma_list_of_date_values_flattens_into_one_top_level_or() {
+        let backend = backend();
+        let filter = backend
+            .build_search_index_filter("t1", "Patient", &date_param(&["ge2020", "lt2019"]))
+            .expect("filter");
+        let arms = top_level_arms(&filter);
+        assert_eq!(arms.len(), 3, "{arms:?}");
+        for arm in &arms {
+            assert_eq!(arm.get_str("tenant_id"), Ok("t1"), "{arm:?}");
+            assert_eq!(arm.get_str("resource_type"), Ok("Patient"), "{arm:?}");
+            assert_eq!(arm.get_str("param_name"), Ok("date"), "{arm:?}");
+            assert!(!arm.contains_key("$or"), "no nested $or: {arm:?}");
+            assert!(arm.contains_key("value_date"), "{arm:?}");
+        }
+        // The same alternatives, in the same order, as the values alone.
+        let alone: Vec<Document> = ["ge2020", "lt2019"]
+            .iter()
+            .flat_map(|raw| {
+                let one = backend
+                    .build_search_index_filter("t1", "Patient", &date_param(&[raw]))
+                    .unwrap();
+                if one.contains_key("$or") {
+                    top_level_arms(&one)
+                } else {
+                    vec![one]
+                }
+            })
+            .collect();
+        assert_eq!(arms, alone);
+    }
+
+    /// A repeated parameter (`date=ge2020&date=le2021`) is still two separate
+    /// filters, one per occurrence; nothing is merged across them.
+    #[test]
+    fn repeated_date_parameters_stay_separate_filters() {
+        let backend = backend();
+        let first = backend
+            .build_search_index_filter("t1", "Patient", &date_param(&["ge2020"]))
+            .unwrap();
+        let second = backend
+            .build_search_index_filter("t1", "Patient", &date_param(&["le2021"]))
+            .unwrap();
+        assert_eq!(top_level_arms(&first).len(), 2);
+        assert_eq!(top_level_arms(&second).len(), 2);
+        assert_ne!(first, second);
+    }
+
+    /// The contained-resource search reuses the filter under its own scope:
+    /// tenant and type come off every arm, the parameter name stays.
+    #[test]
+    fn stripping_the_scope_reaches_into_date_arms() {
+        let backend = backend();
+        let mut filter = backend
+            .build_search_index_filter("", "", &date_param(&["ge2020"]))
+            .unwrap();
+        strip_index_scope(&mut filter, SearchParamType::Date);
+        for arm in top_level_arms(&filter) {
+            assert!(!arm.contains_key("tenant_id"), "{arm:?}");
+            assert!(!arm.contains_key("resource_type"), "{arm:?}");
+            assert_eq!(arm.get_str("param_name"), Ok("date"), "{arm:?}");
         }
     }
 

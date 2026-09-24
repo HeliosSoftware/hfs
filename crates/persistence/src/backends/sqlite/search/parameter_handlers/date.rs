@@ -56,19 +56,25 @@ pub(crate) fn date_range_condition(
         .any_of
         .iter()
         .map(|group| {
-            let conditions: Vec<String> = group
-                .iter()
-                .map(|condition| {
-                    let (column, op, bound) = match *condition {
-                        RangeCondition::StartAtOrAfter(bound) => (start.as_str(), ">=", bound),
-                        RangeCondition::StartBefore(bound) => (start.as_str(), "<", bound),
-                        RangeCondition::EndAfter(bound) => (end_column, ">", bound),
-                        RangeCondition::EndAtOrBefore(bound) => (end_column, "<=", bound),
-                    };
-                    binds.push(sqlite_instant(bound));
-                    format!("{column} {op} ?{}", first_param + binds.len() - 1)
-                })
-                .collect();
+            let mut conditions: Vec<String> = Vec::with_capacity(group.len() + 1);
+            for condition in group {
+                let (column, op, bound) = match *condition {
+                    RangeCondition::StartAtOrAfter(bound) => (start.as_str(), ">=", bound),
+                    RangeCondition::StartBefore(bound) => (start.as_str(), "<", bound),
+                    RangeCondition::EndAfter(bound) => (end_column, ">", bound),
+                    RangeCondition::EndAtOrBefore(bound) => (end_column, "<=", bound),
+                };
+                binds.push(sqlite_instant(bound));
+                let param = first_param + binds.len() - 1;
+                if matches!(condition, RangeCondition::StartAtOrAfter(_)) {
+                    // Implied: every stored range is at least one unit wide, so
+                    // `start >= b` means `end > b`. It is what lets `eq` and
+                    // `sa` seek on `idx_search_date_end` instead of evaluating
+                    // the `strftime` expression on every date row of the type.
+                    conditions.push(format!("{end_column} > ?{param}"));
+                }
+                conditions.push(format!("{column} {op} ?{param}"));
+            }
             conditions.join(" AND ")
         })
         .collect();
@@ -858,7 +864,7 @@ mod range_tests {
         )
         .unwrap();
         assert!(
-            sql.starts_with("((t3.value_date_end > ?4) OR (strftime("),
+            sql.starts_with("((t3.value_date_end > ?4) OR (t3.value_date_end > ?5 AND strftime("),
             "{sql}"
         );
         assert!(
