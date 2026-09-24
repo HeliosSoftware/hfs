@@ -2776,6 +2776,24 @@ async fn start_sqlite_elasticsearch(
     )
 }
 
+/// Selects reindex width only for the exact standalone PostgreSQL mode.
+#[cfg(feature = "postgres")]
+fn postgres_reindex_selection(
+    config: &ServerConfig,
+    pool_max_connections: usize,
+) -> (Option<StorageBackendMode>, usize, usize) {
+    let mode = config.storage_backend_mode().ok();
+    let n = config
+        .bulk_submit
+        .effective_file_concurrency(BackendKind::Postgres) as usize;
+    let width = if mode == Some(StorageBackendMode::Postgres) {
+        n.min(pool_max_connections.max(1))
+    } else {
+        1
+    };
+    (mode, n, width)
+}
+
 /// Starts the server with PostgreSQL backend.
 #[cfg(feature = "postgres")]
 async fn start_postgres(
@@ -2785,6 +2803,16 @@ async fn start_postgres(
     audit_state: Option<Arc<AuditMiddlewareState>>,
 ) -> anyhow::Result<()> {
     let backend = create_postgres_backend(&config).await?;
+    let (exact_mode, requested, width) =
+        postgres_reindex_selection(&config, backend.config().max_connections);
+    let backend = backend.with_reindex_concurrency(width);
+    info!(
+        storage_mode = ?exact_mode,
+        file_concurrency = requested,
+        reindex_width = width,
+        concurrent_reindex = width > 1,
+        "Selected PostgreSQL reindex scheduling"
+    );
 
     backend.init_schema().await?;
     let backend = Arc::new(backend);
@@ -4152,6 +4180,44 @@ mod tests {
             Some(StorageBackendMode::PostgresElasticsearch),
             8,
         ));
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn test_postgres_reindex_groups_selection() {
+        let mut config = ServerConfig::default();
+        config.bulk_submit.file_concurrency = 4;
+        for mode in [
+            StorageBackendMode::Sqlite,
+            StorageBackendMode::SqliteElasticsearch,
+            StorageBackendMode::Postgres,
+            StorageBackendMode::PostgresElasticsearch,
+            StorageBackendMode::MongoDB,
+            StorageBackendMode::MongoDBElasticsearch,
+            StorageBackendMode::S3,
+            StorageBackendMode::S3Elasticsearch,
+        ] {
+            config.storage_backend = mode.to_string();
+            let (_, n, width) = postgres_reindex_selection(&config, 8);
+            assert_eq!(n, 4);
+            assert_eq!(
+                width,
+                if mode == StorageBackendMode::Postgres {
+                    4
+                } else {
+                    1
+                }
+            );
+        }
+        config.storage_backend = "postgres".to_string();
+        assert_eq!(postgres_reindex_selection(&config, 1).2, 1);
+        assert_eq!(postgres_reindex_selection(&config, 2).2, 2);
+        config.bulk_submit.file_concurrency = 0;
+        assert_eq!(postgres_reindex_selection(&config, 8).2, 1);
+        config.storage_backend.clear();
+        assert_eq!(postgres_reindex_selection(&config, 8).2, 1);
+        config.storage_backend = "invalid".to_string();
+        assert_eq!(postgres_reindex_selection(&config, 8).2, 1);
     }
 
     #[cfg(feature = "ui")]

@@ -24,9 +24,9 @@ use crate::backends::s3::keyspace::S3Keyspace;
 use crate::backends::s3::user_settings::settings_object_id;
 use crate::core::bulk_export::{ExportDataProvider, ExportRequest};
 use crate::core::bulk_submit::{
-    BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider, CANCELLED_ABORT_REASON,
-    CancelToken, NdjsonEntry, StreamingBulkSubmitProvider, SubmissionChange, SubmissionId,
-    SubmissionStatus,
+    BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
+    BulkSubmitRollbackProvider, CANCELLED_ABORT_REASON, CancelToken, NdjsonEntry,
+    StreamingBulkSubmitProvider, SubmissionChange, SubmissionId, SubmissionStatus, UnindexedEntry,
 };
 use crate::core::history::{
     HistoryParams, InstanceHistoryProvider, SystemHistoryProvider, TypeHistoryProvider,
@@ -1133,6 +1133,468 @@ async fn bulk_submit_change_log_is_one_object_per_batch() {
         3,
         "all three changes must be readable back from the coalesced object"
     );
+}
+
+/// #1429: an ingest batch writes its receipts as one object under `results/`,
+/// not one per line, and the receipt page, counts, and status manifest read the
+/// same set back.
+#[tokio::test]
+async fn bulk_submit_receipts_are_one_object_per_batch() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+
+    let submission_id = SubmissionId::new("client-a", "sub-receipts");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    // Three good lines and one whose resourceType does not match its entry —
+    // a validation-error receipt — so the batch carries both outcomes.
+    let mut entries: Vec<NdjsonEntry> = (1..=3)
+        .map(|i| {
+            NdjsonEntry::new(
+                i,
+                "Patient",
+                json!({"resourceType": "Patient", "id": format!("r{i}")}),
+            )
+        })
+        .collect();
+    entries.push(NdjsonEntry::new(
+        4,
+        "Patient",
+        json!({"resourceType": "Observation", "id": "wrong-type"}),
+    ));
+    let results = backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            entries,
+            &BulkProcessingOptions::new().with_file_url("http://files/Patient.ndjson"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 4);
+
+    let receipt_puts: Vec<_> = mock
+        .recorded_puts()
+        .into_iter()
+        .filter(|put| put.key.contains("/results/"))
+        .collect();
+    assert_eq!(
+        receipt_puts.len(),
+        1,
+        "the four-entry batch must write its receipts in one object, not four"
+    );
+    assert!(
+        receipt_puts[0].key.ends_with("/batch-1.json"),
+        "keyed by the batch's first line: {}",
+        receipt_puts[0].key
+    );
+
+    let counts = backend
+        .get_entry_counts(&tenant, &submission_id, &manifest.manifest_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        (counts.total, counts.success, counts.validation_error),
+        (4, 3, 1)
+    );
+
+    let page = backend
+        .get_entry_results_page(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            None,
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut lines: Vec<u64> = page.entries.iter().map(|e| e.result.line_number).collect();
+    lines.sort_unstable();
+    assert_eq!(
+        lines,
+        vec![1, 2, 3, 4],
+        "every receipt of the batch reads back"
+    );
+    let errors = backend
+        .get_entry_results_page(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            Some(BulkEntryOutcome::ValidationError),
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(errors.entries.len(), 1);
+    assert_eq!(errors.entries[0].result.line_number, 4);
+
+    backend
+        .complete_submission(&tenant, &submission_id)
+        .await
+        .unwrap();
+    let summary = backend
+        .get_submission(&tenant, &submission_id)
+        .await
+        .unwrap()
+        .expect("submission");
+    assert_eq!(summary.status, SubmissionStatus::Complete);
+    assert_eq!(
+        (
+            summary.total_entries,
+            summary.success_count,
+            summary.error_count
+        ),
+        (4, 3, 1)
+    );
+}
+
+/// The `results/` readers accept both shapes: a coalesced batch array (#1429)
+/// and a legacy per-line receipt object.
+#[tokio::test]
+async fn bulk_submit_receipts_read_batch_and_legacy_objects() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+
+    let submission_id = SubmissionId::new("client-a", "sub-receipts-mixed");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    let entries: Vec<NdjsonEntry> = (1..=2)
+        .map(|i| {
+            NdjsonEntry::new(
+                i,
+                "Patient",
+                json!({"resourceType": "Patient", "id": format!("b{i}")}),
+            )
+        })
+        .collect();
+    backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            entries,
+            &BulkProcessingOptions::new(),
+        )
+        .await
+        .unwrap();
+
+    // A legacy per-line receipt, as the ingest wrote them before #1429.
+    let location = backend.tenant_location(&tenant).unwrap();
+    let legacy_key = location.keyspace.submit_result_line_key(
+        &submission_id.submitter,
+        &submission_id.submission_id,
+        &manifest.manifest_id,
+        None,
+        7,
+    );
+    let legacy = BulkEntryResult::success(7, "Patient", "legacy-7", true);
+    backend
+        .put_json_object(
+            &location.bucket,
+            &legacy_key,
+            &serde_json::to_vec(&legacy).unwrap(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let page = backend
+        .get_entry_results_page(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            None,
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut ids: Vec<String> = page
+        .entries
+        .iter()
+        .filter_map(|e| e.result.resource_id.clone())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec!["b1", "b2", "legacy-7"]);
+    let counts = backend
+        .get_entry_counts(&tenant, &submission_id, &manifest.manifest_id)
+        .await
+        .unwrap();
+    assert_eq!(counts.success, 3);
+}
+
+/// `mark_entries_unindexed` on a coalesced receipt object flips only the
+/// receipts that match, rewrites the object once, and leaves it readable.
+#[tokio::test]
+async fn bulk_submit_unindexed_marking_rewrites_the_receipt_batch_in_place() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+
+    let submission_id = SubmissionId::new("client-a", "sub-receipts-mark");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    let entries: Vec<NdjsonEntry> = (1..=4)
+        .map(|i| {
+            NdjsonEntry::new(
+                i,
+                "Patient",
+                json!({"resourceType": "Patient", "id": format!("u{i}")}),
+            )
+        })
+        .collect();
+    backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            entries,
+            &BulkProcessingOptions::new(),
+        )
+        .await
+        .unwrap();
+    let puts_before = mock.recorded_puts().len();
+
+    let outcome = json!({"resourceType": "OperationOutcome", "issue": [{"severity": "error", "code": "exception", "diagnostics": "index write failed"}]});
+    let affected = backend
+        .mark_entries_unindexed(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            &[
+                UnindexedEntry {
+                    resource_type: "Patient".to_string(),
+                    resource_id: "u2".to_string(),
+                    operation_outcome: outcome.clone(),
+                },
+                UnindexedEntry {
+                    resource_type: "Patient".to_string(),
+                    resource_id: "u4".to_string(),
+                    operation_outcome: outcome.clone(),
+                },
+                UnindexedEntry {
+                    resource_type: "Observation".to_string(),
+                    resource_id: "u1".to_string(),
+                    operation_outcome: outcome,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(affected, 2, "two receipts match; u1 is a different type");
+    let puts_after = mock.recorded_puts();
+    let receipt_rewrites: Vec<_> = puts_after[puts_before..]
+        .iter()
+        .filter(|put| put.key.contains("/results/"))
+        .collect();
+    assert_eq!(
+        receipt_rewrites.len(),
+        1,
+        "the batch object is rewritten once, not once per receipt"
+    );
+
+    let page = backend
+        .get_entry_results_page(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            None,
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        page.entries.len(),
+        4,
+        "the rewritten batch still holds all four"
+    );
+    for e in &page.entries {
+        let id = e.result.resource_id.as_deref().unwrap();
+        let flipped = e.result.outcome == BulkEntryOutcome::ProcessingError;
+        assert_eq!(flipped, matches!(id, "u2" | "u4"), "{id}");
+        assert_eq!(e.result.operation_outcome.is_some(), flipped, "{id}");
+    }
+    let counts = backend
+        .get_entry_counts(&tenant, &submission_id, &manifest.manifest_id)
+        .await
+        .unwrap();
+    assert_eq!((counts.success, counts.processing_error), (2, 2));
+}
+
+/// With a per-entry error cap the batch runs serially and, past the cap, the
+/// remaining entries are skipped; the skips ride the same receipt object and
+/// the counts close.
+#[tokio::test]
+async fn bulk_submit_receipt_batch_carries_the_max_errors_skips() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+
+    let submission_id = SubmissionId::new("client-a", "sub-receipts-skips");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    // Line 1 good, line 2 a validation error (hits the cap of 1), lines 3-4
+    // skipped.
+    let entries = vec![
+        NdjsonEntry::new(1, "Patient", json!({"resourceType": "Patient", "id": "s1"})),
+        NdjsonEntry::new(
+            2,
+            "Patient",
+            json!({"resourceType": "Observation", "id": "bad"}),
+        ),
+        NdjsonEntry::new(3, "Patient", json!({"resourceType": "Patient", "id": "s3"})),
+        NdjsonEntry::new(4, "Patient", json!({"resourceType": "Patient", "id": "s4"})),
+    ];
+    let results = backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            entries,
+            &BulkProcessingOptions::new()
+                .with_max_errors(1)
+                .with_continue_on_error(true),
+        )
+        .await
+        .unwrap();
+    let outcomes: Vec<BulkEntryOutcome> = results.iter().map(|r| r.outcome).collect();
+    assert_eq!(
+        outcomes,
+        vec![
+            BulkEntryOutcome::Success,
+            BulkEntryOutcome::ValidationError,
+            BulkEntryOutcome::Skipped,
+            BulkEntryOutcome::Skipped
+        ]
+    );
+    assert_eq!(
+        mock.recorded_puts()
+            .iter()
+            .filter(|put| put.key.contains("/results/"))
+            .count(),
+        1
+    );
+    let counts = backend
+        .get_entry_counts(&tenant, &submission_id, &manifest.manifest_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            counts.total,
+            counts.success,
+            counts.validation_error,
+            counts.skipped
+        ),
+        (4, 1, 1, 2)
+    );
+    let skipped = backend
+        .get_entry_results_page(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            Some(BulkEntryOutcome::Skipped),
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut lines: Vec<u64> = skipped
+        .entries
+        .iter()
+        .map(|e| e.result.line_number)
+        .collect();
+    lines.sort_unstable();
+    assert_eq!(lines, vec![3, 4]);
+}
+
+/// Two files of one manifest both start at line 1; their receipt batches are
+/// discriminated by `file_url` (#457) so neither overwrites the other.
+#[tokio::test]
+async fn bulk_submit_receipt_batches_are_kept_apart_per_file() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+
+    let submission_id = SubmissionId::new("client-a", "sub-receipts-files");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    for (file, id) in [
+        ("http://files/a.ndjson", "fa"),
+        ("http://files/b.ndjson", "fb"),
+    ] {
+        backend
+            .process_entries(
+                &tenant,
+                &submission_id,
+                &manifest.manifest_id,
+                vec![NdjsonEntry::new(
+                    1,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": id}),
+                )],
+                &BulkProcessingOptions::new().with_file_url(file),
+            )
+            .await
+            .unwrap();
+    }
+    let keys: HashSet<String> = mock
+        .recorded_puts()
+        .into_iter()
+        .filter(|put| put.key.contains("/results/"))
+        .map(|put| put.key)
+        .collect();
+    assert_eq!(
+        keys.len(),
+        2,
+        "one distinct batch object per file: {keys:?}"
+    );
+    let counts = backend
+        .get_entry_counts(&tenant, &submission_id, &manifest.manifest_id)
+        .await
+        .unwrap();
+    assert_eq!(counts.success, 2, "both files' line-1 receipts survive");
 }
 
 /// `load_changes` reads both shapes under the `changes/` prefix: the coalesced
