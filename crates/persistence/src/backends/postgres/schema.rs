@@ -3886,7 +3886,13 @@ const OPEN_END_SQL: &str = "TIMESTAMPTZ '9999-12-31 23:59:59.999999+00'";
 ///   x` with no bound on the start, and without it a sparse or empty `gt` (the
 ///   benchmark's `date=gt2070-01-01`) would walk the whole parameter slice
 ///   instead of seeking — see `open_range_needs_empty_guard` in `search_impl.rs`
-///   for why that matters.
+///   for why that matters. It is partial on `value_date_end IS NOT NULL`, not
+///   on `value_date`: the emitted `gt` predicate is `value_date_end > $n` and
+///   nothing else, which implies the former and not the latter, and PostgreSQL
+///   only uses a partial index whose predicate the query implies. Keyed on
+///   `value_date`, the index was never chosen (`idx_scan = 0`) and `gt` fell
+///   back to a sequential scan of the whole table (measured: 600k date rows,
+///   sparse `gt`, 40 ms -> 0.1 ms with the fix).
 /// - A multivariate statistic on the end mirrors v16's on `value_date`.
 ///
 /// ## Lock / cost / recovery
@@ -3950,7 +3956,7 @@ async fn migrate_v42_to_v43(client: &mut deadpool_postgres::Client) -> StorageRe
         "CREATE INDEX idx_search_date_end
          ON search_index (tenant_id, resource_type, param_name, value_date_end)
          INCLUDE (resource_id, last_updated)
-         WHERE value_date IS NOT NULL"
+         WHERE value_date_end IS NOT NULL"
             .to_string(),
         "CREATE STATISTICS IF NOT EXISTS stx_search_type_param_date_end (mcv, dependencies)
          ON resource_type, param_name, value_date_end FROM search_index"
@@ -5941,6 +5947,83 @@ mod postgres_integration_migrations {
         assert_eq!(statement_timeout(&client).await, "900ms");
     }
 
+    /// #1391: a sparse `gt` on a date parameter seeks on `idx_search_date_end`.
+    /// The predicate is the one the query builder really emits (`value_date_end
+    /// > $n`, nothing on `value_date`), so this fails if the index's own
+    /// predicate stops being implied by it — PostgreSQL then ignores the index
+    /// and scans the whole table.
+    #[tokio::test]
+    async fn postgres_integration_sparse_gt_seeks_on_the_end_index() {
+        use crate::backends::postgres::search::query_builder::{SqlParam, date_range_predicate};
+        use crate::types::SearchPrefix;
+
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let pg = shared_pg().await;
+        let backend = create_database(
+            pg,
+            &format!("hfs_gt_index_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+        let mut client = backend.get_client().await.unwrap();
+        initialize_schema(&mut client)
+            .await
+            .expect("create the current schema");
+
+        // Enough rows, over several parameters, for the planner to prefer a
+        // seek over a scan for a predicate that matches almost nothing.
+        client
+            .batch_execute(
+                "INSERT INTO search_index
+                   (tenant_id, resource_type, resource_id, param_name, value_date,
+                    value_date_precision, value_date_end, last_updated)
+                 SELECT 'tenant-a', 'Encounter', 'd-' || g, 'date', d, 'day',
+                        d + interval '1 day', now() - (g || ' seconds')::interval
+                   FROM (SELECT g, timestamptz '1950-01-01' + (g % 29000) * interval '1 day' AS d
+                           FROM generate_series(1, 60000) g) s;
+                 INSERT INTO search_index
+                   (tenant_id, resource_type, resource_id, param_name, value_token_code, last_updated)
+                 SELECT 'tenant-a', 'Encounter', 'd-' || g, 'status', 'finished',
+                        now() - (g || ' seconds')::interval
+                   FROM generate_series(1, 60000) g;
+                 ANALYZE search_index;",
+            )
+            .await
+            .expect("seed date and token rows");
+
+        let mut next = 0;
+        let (predicate, params) = date_range_predicate(
+            "value_date",
+            "value_date_end",
+            SearchPrefix::Gt,
+            "2031",
+            &mut next,
+        );
+        let [SqlParam::Timestamp(bound)] = params.as_slice() else {
+            panic!("gt binds one instant, got {params:?}");
+        };
+        let sql = format!(
+            "EXPLAIN (FORMAT JSON)
+             SELECT DISTINCT resource_id, last_updated FROM search_index
+              WHERE tenant_id = 'tenant-a' AND resource_type = 'Encounter'
+                AND param_name = 'date' AND {predicate}
+              ORDER BY last_updated DESC, resource_id ASC LIMIT 21"
+        );
+        let plan: serde_json::Value = client
+            .query_one(sql.as_str(), &[bound])
+            .await
+            .expect("explain the gt query")
+            .get(0);
+        let plan = plan.to_string();
+        assert!(
+            plan.contains("idx_search_date_end"),
+            "a sparse gt must seek on the end index: {plan}"
+        );
+        assert!(
+            !plan.contains("Seq Scan"),
+            "a sparse gt must not scan the table: {plan}"
+        );
+    }
+
     /// v43 backfills the end of every existing date row from its own
     /// precision, in UTC whatever the session zone, clamps at the supported
     /// limit, leaves non-date rows alone, and puts the end on the date indexes.
@@ -6091,10 +6174,13 @@ mod postgres_integration_migrations {
                 .await
                 .unwrap_or_else(|| panic!("{name} must exist after v43"));
             assert!(definition.contains(include), "{name}: {definition}");
-            assert!(
-                definition.contains("WHERE (value_date IS NOT NULL)"),
-                "{name}: {definition}"
-            );
+            // The end index is partial on the end itself: see the v43 docs.
+            let predicate = if name == "idx_search_date_end" {
+                "WHERE (value_date_end IS NOT NULL)"
+            } else {
+                "WHERE (value_date IS NOT NULL)"
+            };
+            assert!(definition.contains(predicate), "{name}: {definition}");
         }
         assert!(
             index_definition(&client, "idx_search_date_end")
