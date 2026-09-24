@@ -2289,7 +2289,9 @@ impl MongoBackend {
     }
 
     /// [`Self::build_search_index_filter_at`] with `ap` dates measured from
-    /// the current time, for the conditional paths that have no search query.
+    /// the current time, for tests that have no search query. Production
+    /// callers pass the instant they pinned for the whole search.
+    #[cfg(test)]
     pub(super) fn build_search_index_filter(
         &self,
         tenant_id: &str,
