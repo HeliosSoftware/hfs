@@ -435,6 +435,64 @@ async fn conditional_batch_patch_resolves_one_target_and_checks_if_match() {
 }
 
 #[tokio::test]
+async fn conditional_batch_patch_refuses_zero_or_multiple_matches_without_writing() {
+    let server = server().await;
+    seed(&server, "p1").await;
+    seed(&server, "p2").await;
+
+    let response = server
+        .post("/")
+        .json(&bundle(
+            "batch",
+            vec![
+                json!({"request":{"method":"PATCH","url":"Patient?_id=missing"},
+                    "resource":fhirpath_replace_active(true)}),
+                json!({"request":{"method":"PATCH","url":"Patient?_id=p1,p2"},
+                    "resource":fhirpath_replace_active(true)}),
+                patch_entry("missing", fhirpath_replace_active(true)),
+                json!({"request":{"method":"PATCH","url":"NotAResource/p1"},
+                    "resource":fhirpath_replace_active(true)}),
+                json!({"request":{"method":"PATCH","url":"Patient/p1"}}),
+            ],
+        ))
+        .await;
+    response.assert_status(StatusCode::OK);
+    let body: Value = response.json();
+    assert!(
+        body["entry"][0]["response"]["status"]
+            .as_str()
+            .unwrap()
+            .starts_with("404"),
+        "{body}"
+    );
+    assert!(
+        body["entry"][1]["response"]["status"]
+            .as_str()
+            .unwrap()
+            .starts_with("412"),
+        "{body}"
+    );
+    for index in [2, 3] {
+        assert!(
+            body["entry"][index]["response"]["status"]
+                .as_str()
+                .unwrap()
+                .starts_with("404"),
+            "{body}"
+        );
+    }
+    assert!(
+        body["entry"][4]["response"]["status"]
+            .as_str()
+            .unwrap()
+            .starts_with("400"),
+        "{body}"
+    );
+    assert_eq!(patient(&server, "p1").await["active"], false);
+    assert_eq!(patient(&server, "p2").await["active"], false);
+}
+
+#[tokio::test]
 async fn transaction_patch_if_match_failure_rolls_back_prior_write() {
     let server = server().await;
     seed(&server, "p1").await;

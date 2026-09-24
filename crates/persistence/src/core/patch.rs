@@ -1274,6 +1274,201 @@ mod tests {
 
     #[cfg(feature = "R4")]
     #[test]
+    fn fhirpath_patch_rejects_malformed_operation_parts() {
+        let malformed_documents = [
+            json!({"resourceType":"Patient","parameter":[]}),
+            operations(vec![]),
+            operations(vec![json!({"name":"wrong","part":[]})]),
+            operations(vec![json!({"name":"operation","part":[
+                {"name":"type","valueCode":"delete"},
+                {"name":"type","valueCode":"delete"},
+                {"name":"path","valueString":"Patient.active"}
+            ]})]),
+            operations(vec![operation(
+                "insert",
+                "Patient.name",
+                vec![
+                    json!({"name":"index","valueInteger":-1}),
+                    json!({"name":"value","valueHumanName":{"family":"New"}}),
+                ],
+            )]),
+            operations(vec![operation("replace", "Patient.active", vec![])]),
+            operations(vec![operation(
+                "delete",
+                "Patient.active",
+                vec![json!({"name":"value","valueBoolean":true})],
+            )]),
+            operations(vec![operation(
+                "replace",
+                "Patient.active",
+                vec![json!({"name":"value"})],
+            )]),
+        ];
+        for document in malformed_documents {
+            let result = decode_bundle_patch_resource(&document, FhirVersion::R4);
+            assert!(
+                matches!(result, Err(PatchError::MalformedDocument { .. })),
+                "{document}: {result:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "R4")]
+    #[test]
+    fn nested_fhirpath_values_keep_repeating_children_and_refuse_duplicate_scalar_children() {
+        let value = json!({"name":"value","part":[
+            {"name":"given","valueString":"Ada"},
+            {"name":"given","valueString":"Grace"},
+            {"name":"family","valueString":"Lovelace"}
+        ]});
+        let add_name = |value| {
+            operations(vec![operation(
+                "add",
+                "Patient",
+                vec![json!({"name":"name","valueString":"name"}), value],
+            )])
+        };
+        let result = apply_patch_for_version(
+            &patient(),
+            &PatchFormat::FhirPathPatch(add_name(value)),
+            FhirVersion::R4,
+        )
+        .unwrap();
+        assert_eq!(result["name"][1]["given"], json!(["Ada", "Grace"]));
+        assert_eq!(result["name"][1]["family"], "Lovelace");
+
+        let duplicate = json!({"name":"value","part":[
+            {"name":"family","valueString":"One"},
+            {"name":"family","valueString":"Two"}
+        ]});
+        assert!(matches!(
+            apply_patch_for_version(
+                &patient(),
+                &PatchFormat::FhirPathPatch(add_name(duplicate)),
+                FhirVersion::R4
+            ),
+            Err(PatchError::MalformedDocument { .. })
+        ));
+    }
+
+    #[cfg(feature = "R4")]
+    #[test]
+    fn fhirpath_patch_checks_collection_bounds_and_scalar_additions() {
+        for patch in [
+            operation(
+                "add",
+                "Patient",
+                vec![
+                    json!({"name":"name","valueString":"active"}),
+                    json!({"name":"value","valueBoolean":true}),
+                ],
+            ),
+            operation(
+                "insert",
+                "Patient.name",
+                vec![
+                    json!({"name":"index","valueInteger":2}),
+                    json!({"name":"value","valueHumanName":{"family":"New"}}),
+                ],
+            ),
+            operation(
+                "move",
+                "Patient.name",
+                vec![
+                    json!({"name":"source","valueInteger":1}),
+                    json!({"name":"destination","valueInteger":0}),
+                ],
+            ),
+        ] {
+            let result = apply_patch_for_version(
+                &patient(),
+                &PatchFormat::FhirPathPatch(operations(vec![patch])),
+                FhirVersion::R4,
+            );
+            assert!(
+                matches!(result, Err(PatchError::OperationFailed { .. })),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "R4")]
+    #[test]
+    fn fhirpath_selectors_address_one_editable_node() {
+        let mut input = patient();
+        input["name"] = json!([{"family":"First"},{"family":"Last"}]);
+        for (path, expected) in [
+            ("(Patient.name).first().family", json!(["Changed", "Last"])),
+            ("Patient.name.last().family", json!(["First", "Changed"])),
+        ] {
+            let patch = operations(vec![operation(
+                "replace",
+                path,
+                vec![json!({"name":"value","valueString":"Changed"})],
+            )]);
+            let result = apply_patch_for_version(
+                &input,
+                &PatchFormat::FhirPathPatch(patch),
+                FhirVersion::R4,
+            )
+            .unwrap();
+            assert_eq!(
+                json!([result["name"][0]["family"], result["name"][1]["family"]]),
+                expected
+            );
+        }
+
+        for path in [
+            "Patient.name.single().family",
+            "Patient.name[-1].family",
+            "Patient.name.where(given.resolve().exists()).family",
+        ] {
+            let patch = operations(vec![operation(
+                "replace",
+                path,
+                vec![json!({"name":"value","valueString":"Changed"})],
+            )]);
+            let result = apply_patch_for_version(
+                &input,
+                &PatchFormat::FhirPathPatch(patch),
+                FhirVersion::R4,
+            );
+            assert!(
+                matches!(result, Err(PatchError::OperationFailed { .. })),
+                "{path}: {result:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "R4")]
+    #[test]
+    fn choice_addition_needs_a_supported_typed_value() {
+        let observation =
+            json!({"resourceType":"Observation","id":"o1","status":"final","code":{"text":"test"}});
+        let add_choice = |value| {
+            let patch = operations(vec![operation(
+                "add",
+                "Observation",
+                vec![json!({"name":"name","valueString":"value[x]"}), value],
+            )]);
+            apply_patch_for_version(
+                &observation,
+                &PatchFormat::FhirPathPatch(patch),
+                FhirVersion::R4,
+            )
+        };
+        assert!(matches!(
+            add_choice(json!({"name":"value","part":[{"name":"text","valueString":"nested"}]})),
+            Err(PatchError::MalformedDocument { .. })
+        ));
+        assert!(matches!(
+            add_choice(json!({"name":"value","valueHumanName":{"family":"Wrong"}})),
+            Err(PatchError::OperationFailed { .. })
+        ));
+    }
+
+    #[cfg(feature = "R4")]
+    #[test]
     fn bundle_decoder_accepts_parameters_and_refuses_r4_binary() {
         let parameters = operations(vec![operation("delete", "Patient.active", vec![])]);
         assert!(matches!(
