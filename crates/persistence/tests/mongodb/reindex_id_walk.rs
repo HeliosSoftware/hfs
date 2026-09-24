@@ -1647,6 +1647,32 @@ async fn mongodb_reindex_id_walk_indexes_a_future_stamped_resource() {
     let s_crud = snapshot(&db, "walk-future", false).await;
     backdate_fixture(&backend, &tenant, &fixture).await;
 
+    // Regression guard for the catch-up/id-page filters' tenant scope (#1403
+    // review finding): a second tenant, freshly seeded in the same database
+    // with a live Observation under an id "walk-future" never uses, must
+    // never surface in this tenant's walk output. If either filter ever lost
+    // its `tenant_id` clause, this id would leak into `written_ids` below and
+    // the `written_ids == live_ids` assertion would fail.
+    let other_tenant = create_tenant("walk-future-other-tenant");
+    backend
+        .create(
+            &other_tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-cross-tenant",
+                "status": "final",
+                "code": { "coding": [{ "system": "http://loinc.org", "code": "8867-4" }] },
+                "subject": { "reference": "Patient/A-1" },
+                "effectiveDateTime": "2020-01-01",
+                "valueQuantity": { "value": 0, "unit": "/min" },
+                "identifier": [{ "system": "urn:walk", "value": "o-cross-tenant" }],
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
     let resources = db.collection::<Document>("resources");
     resources
         .update_many(

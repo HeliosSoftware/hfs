@@ -6415,6 +6415,12 @@ mod reindex_walk_tests {
         let floor = ts("2026-01-01T00:00:00.000Z");
         let first = reindex_id_page_filter("t1", "Observation", floor, None);
         assert!(!first.contains_key("id"));
+        // Tenant/type scope: a regression here (e.g. PR2a/PR2b's
+        // `reindex_find_page` refactor dropping a clause) would let the walk
+        // read another tenant's or resource type's rows undetected by any
+        // Docker-gated test (#1403 review finding).
+        assert_eq!(first.get_str("tenant_id"), Ok("t1"));
+        assert_eq!(first.get_str("resource_type"), Ok("Observation"));
         assert_eq!(first.get_bool("is_deleted"), Ok(false));
         assert_eq!(
             first.get_document("last_updated").unwrap().get("$lt"),
@@ -6422,6 +6428,8 @@ mod reindex_walk_tests {
         );
 
         let later = reindex_id_page_filter("t1", "Observation", floor, Some("obs-010"));
+        assert_eq!(later.get_str("tenant_id"), Ok("t1"));
+        assert_eq!(later.get_str("resource_type"), Ok("Observation"));
         assert_eq!(later.get_bool("is_deleted"), Ok(false));
         assert_eq!(
             later.get_document("last_updated").unwrap().get("$lt"),
@@ -6439,6 +6447,14 @@ mod reindex_walk_tests {
         let ceiling = ts("2026-01-01T00:02:00.000Z");
         let first = reindex_catch_up_page_filter("t1", "Observation", floor, ceiling, None);
         assert!(!first.contains_key("$or"));
+        // Tenant/type scope and the deleted-row exclusion: nothing else would
+        // catch either clause silently dropping from the catch-up filter
+        // (#1403 review finding) — the integration tests can't distinguish a
+        // scoped catch-up round from an unscoped one that happens to see the
+        // same rows.
+        assert_eq!(first.get_str("tenant_id"), Ok("t1"));
+        assert_eq!(first.get_str("resource_type"), Ok("Observation"));
+        assert_eq!(first.get_bool("is_deleted"), Ok(false));
         let range = first.get_document("last_updated").unwrap();
         assert_eq!(range.get("$gte"), Some(&Bson::from(chrono_to_bson(floor))));
         assert_eq!(range.get("$lt"), Some(&Bson::from(chrono_to_bson(ceiling))));
@@ -6451,6 +6467,9 @@ mod reindex_walk_tests {
             ceiling,
             Some((after_lu, "obs-020")),
         );
+        assert_eq!(continuation.get_str("tenant_id"), Ok("t1"));
+        assert_eq!(continuation.get_str("resource_type"), Ok("Observation"));
+        assert_eq!(continuation.get_bool("is_deleted"), Ok(false));
         assert!(!continuation.contains_key("last_updated"));
         let or = continuation.get_array("$or").unwrap();
         assert_eq!(or.len(), 2);
