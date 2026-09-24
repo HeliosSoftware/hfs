@@ -78,7 +78,7 @@ pub(crate) fn extract_status(library: &Value) -> String {
 /// `data` is not valid base64, or the decoded bytes are not UTF-8 (#1233).
 /// This is the sole place that decodes the attachment — [`extract_sql`]
 /// and [`fill_sql_attachment`] both build on it rather than repeating the
-/// decode. The client-side sync (#1233/T3) keeps the Details JSON and SQL
+/// decode. The client-side sync (#1233) keeps the Details JSON and SQL
 /// card in step as the user types, so in practice the two already agree by
 /// the time either textarea is posted; this function (and the merge rule
 /// built on it) is what the server relies on when they do not — e.g. a
