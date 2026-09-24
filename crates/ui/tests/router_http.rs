@@ -2012,17 +2012,20 @@ async fn editor_pane_form_hidden_content_drops_its_rows_and_add_option_but_keeps
     assert!(doc_field.contains("aGVsbG8="));
 }
 
-/// `legend=sql-library` (#840) swaps in the SQL Query/SQL View pair of
+/// `legend=sql-library` (#840/#1233) swaps in the SQL Query/SQL View trio of
 /// legend lines — neither the Resource Editor's generic "constraints and
 /// terminology" line nor View Definitions' single line.
 #[tokio::test]
-async fn editor_pane_form_sql_library_legend_shows_its_own_two_lines() {
+async fn editor_pane_form_sql_library_legend_shows_its_own_three_lines() {
     let doc = serde_json::json!({ "resourceType": "Library", "status": "draft" });
     let html = edit(&form_pane_body(&doc, &[("legend", "sql-library")])).await;
 
     assert!(html.contains("editor-legend__live"));
     assert!(html.contains("editor-legend__save"));
     assert!(html.contains("SQL on FHIR Library type"));
+    assert!(html.contains(
+        "The SQL attachment (content) is not listed here: edit it in the SQL card below"
+    ));
     assert!(!html.contains("constraints and terminology"));
     assert!(!html.contains("FHIRPath syntax"));
 }
@@ -3277,6 +3280,48 @@ async fn sql_library_details_json_shows_the_full_library_while_the_form_hides_co
     assert!(!html.contains(r#"data-path="content""#));
     assert!(html.contains("Checked on save: SQL on FHIR"));
     assert!(!html.contains("Edit as JSON"));
+}
+
+/// #1233: the guided form's legend says where the SQL attachment is
+/// actually edited (it never lists `content` itself), and the SQL card
+/// carries the "unreadable attachment" chip, server-painted hidden with no
+/// text of its own — `sql-library-sync.js` is the only thing that ever
+/// shows it, client-side, and only for its own "unreadable" state.
+#[tokio::test]
+async fn sql_library_details_legend_points_to_the_sql_card() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let lib = serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+    "status": "active",
+    "type": {"coding": [{"system": system, "code": "sql-query"}]},
+    "content": [
+        {"contentType": "application/sql", "data": BASE64.encode("SELECT 1")},
+    ]});
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        vec![lib],
+    );
+    let app = library_app(source);
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    assert!(html.contains(
+        "The SQL attachment (content) is not listed here: edit it in the SQL card below"
+    ));
+    assert!(html.contains(r#"id="sql-attachment-state""#));
+    assert!(html.contains(r#"<span class="editor-validity" id="sql-attachment-state" hidden"#));
+    assert!(html.contains(
+        r#"data-msg-unreadable="SQL attachment unreadable: the SQL card keeps its last readable text; typing here repairs it""#
+    ));
 }
 
 /// #1233: the Details JSON pane is the exact document `GET` returns for the

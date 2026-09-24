@@ -745,6 +745,80 @@ test.describe("Details <-> SQL sync (#1233)", () => {
     expect(sqlAttachments).toHaveLength(1);
     expect(Buffer.from(sqlAttachments[0].data, "base64").toString()).toBe("SELECT 5");
   });
+
+  test("an unreadable attachment in the JSON flags the SQL card and typing there repairs it", async ({
+    page,
+    request,
+  }) => {
+    const canonical = `http://example.org/ViewDefinition/e2e-sync-${Date.now()}`;
+    const libId = await createSqlQueryLibrary(
+      request,
+      `e2e_sync_unreadable_${Date.now()}`,
+      canonical,
+      "SELECT 1",
+    );
+    await waitSearchable(request, "Library", libId);
+
+    await page.goto(`/ui/sql/queries?lib=${libId}`);
+    const stateChip = page.locator("#sql-attachment-state");
+    const sqlEditor = page.locator(".sql-editor .cm-content[role='textbox']");
+    const jsonPane = page.locator("textarea[name='json']");
+    const jsonEditor = page.locator("#lib-details-editor .cm-content");
+
+    await expect(stateChip).toBeHidden();
+
+    // Break the attachment's `data`: not valid base64 at all.
+    const before = await jsonPane.inputValue();
+    const broken = JSON.parse(before);
+    const attachment = (broken.content as Array<{ contentType: string; data: string }>).find(
+      (a) => a.contentType === "application/sql",
+    );
+    attachment!.data = "%%%not-base64%%%";
+    await jsonEditor.click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText(JSON.stringify(broken, null, 2));
+
+    await expect(stateChip).toBeVisible();
+    await expect(stateChip).toHaveText(
+      "SQL attachment unreadable: the SQL card keeps its last readable text; typing here repairs it",
+    );
+    await expect(sqlEditor).toContainText("SELECT 1");
+
+    // Typing in the SQL card re-encodes the attachment and hides the chip.
+    await sqlEditor.click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText("SELECT 9");
+
+    await expect(stateChip).toBeHidden();
+    await expect
+      .poll(async () => {
+        const text = await jsonPane.inputValue();
+        try {
+          const doc = JSON.parse(text);
+          const fixed = (doc.content as Array<{ contentType: string; data: string }>).find(
+            (a) => a.contentType === "application/sql",
+          );
+          return fixed ? fixed.data : null;
+        } catch {
+          return null;
+        }
+      })
+      .toBe(Buffer.from("SELECT 9").toString("base64"));
+
+    // Second case: repairing `data` in the JSON itself also clears the chip
+    // and updates the SQL card.
+    const current = JSON.parse(await jsonPane.inputValue());
+    const currentAttachment = (
+      current.content as Array<{ contentType: string; data: string }>
+    ).find((a) => a.contentType === "application/sql");
+    currentAttachment!.data = Buffer.from("SELECT 7").toString("base64");
+    await jsonEditor.click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText(JSON.stringify(current, null, 2));
+
+    await expect(stateChip).toBeHidden();
+    await expect(sqlEditor).toContainText("SELECT 7");
+  });
 });
 
 // Parameters card (#841, SQL Query only): declare an undeclared placeholder,

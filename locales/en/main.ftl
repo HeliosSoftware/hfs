@@ -533,12 +533,15 @@ vd-form-legend-live = Checked as you type: structure, cardinality, required bind
 # states ("No issues.", "3 issues"), never the longer editor-invalid-json
 # sentence.
 vd-form-invalid-chip = Invalid JSON
-# SQL Query / SQL View's own two-line legend (#840): Save there gates the
-# SQL on FHIR Library type and the SQL attachment, not the generic
+# SQL Query / SQL View's own three-line legend (#840/#1233): Save there
+# gates the SQL on FHIR Library type and the SQL attachment, not the generic
 # constraints/terminology promise `editor-legend-save` makes — a promise
-# `HFS_VALIDATION_MODE` off (the default) would make false.
+# `HFS_VALIDATION_MODE` off (the default) would make false. The third line
+# says where that attachment is actually edited, since this guided form
+# never lists it (`hidden=["content"]`).
 lib-form-legend-live = Checked as you type: structure, cardinality, required bindings
 lib-form-legend-save = Checked on save: SQL on FHIR Library type and the SQL attachment
+lib-form-legend-content = The SQL attachment (content) is not listed here: edit it in the SQL card below
 editor-deferred-badge = on save
 editor-deferred-hint = Codes are verified against the value set when you save (and live in the picker where a terminology server is configured)
 editor-must-support-hint = Must-support: consumers of this profile are expected to handle this element
@@ -995,6 +998,13 @@ lib-degraded = The library list could not be loaded.
 # The SQL card's "runs as you type" legend (#839) — shared verbatim by SQL
 # Queries and SQL Views, unlike the headings/failure prefix above.
 lib-run-hint = Runs as you type — results follow the current SQL, saved or not
+# The SQL card's own notice (#1233), shown next to the legend above only
+# while the Details JSON's `application/sql` attachment does not decode
+# (invalid base64, non-UTF-8 bytes, or a missing `data`) — the card keeps
+# showing its last readable text rather than clearing it, and typing there
+# repairs the attachment. `sql-library-sync.js` is the only thing that ever
+# shows it; the server always paints it hidden.
+lib-sql-attachment-unreadable = SQL attachment unreadable: the SQL card keeps its last readable text; typing here repairs it
 lib-delete-confirm = Delete "{ $name }"? This cannot be undone.
 lib-delete-failed = Could not delete the library.
 # Details section (#840): the full stored Library (SQL attachment

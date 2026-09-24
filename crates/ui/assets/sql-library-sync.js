@@ -25,9 +25,13 @@
  *     one this cannot read (missing `data`, invalid base64, non-UTF-8 bytes)
  *     never touches the SQL card — `mount`'s optional `onState` callback
  *     still hears about it (`"invalid-json"` / `"none"` / `"unreadable"` /
- *     `"ok"`), an extension point for a caller that wants to surface it
- *     (e.g. a warning that the attachment is unreadable); nothing here
- *     calls it for anything beyond that plumbing.
+ *     `"ok"`), an extension point for a caller that wants to surface it.
+ *     The auto-mount below is exactly that caller (#1233): its `onState`
+ *     shows the `#sql-attachment-state` chip (`sql-library.html`) only for
+ *     `"unreadable"`, and hides it again for every other state — the chip
+ *     goes away both when the JSON is repaired and when the SQL card is
+ *     typed into, since a card edit re-encodes the attachment and makes it
+ *     readable again by construction.
  *
  * Anti-echo: both textareas fire `input` for a programmatic write exactly
  * like a manual edit (`host.setDoc`, `view.dispatch`, and the plain-textarea
@@ -198,10 +202,10 @@
    * the JSON->SQL direction with a mounted `view`) -
    * `window.HfsEditorPair.minimalChange`. `onState` (optional) - an
    * extension point for a caller that wants to reflect the Details JSON's
-   * own attachment state somewhere (e.g. a warning once it turns
-   * unreadable); called with `sqlFromJson`'s own `state` after every
-   * JSON->SQL attempt, and with `"ok"` after every SQL->JSON write. Unused
-   * by this file's own auto-mount below.
+   * own attachment state somewhere; called with `sqlFromJson`'s own `state`
+   * after every JSON->SQL attempt, and with `"ok"` after every SQL->JSON
+   * write. The auto-mount below passes one that drives the
+   * `#sql-attachment-state` chip (#1233).
    */
   function mount(options) {
     options = options || {};
@@ -312,6 +316,13 @@ if (typeof window !== "undefined" && window.document) {
     var sqlTextarea = document.querySelector('#lib-editor-form textarea[name="sql"]');
     if (!jsonTextarea || !sqlTextarea) return;
 
+    // The "unreadable attachment" chip (#1233): server-painted `hidden`,
+    // with no text of its own — `sql-library.html` only ever sets
+    // `data-msg-unreadable`. Missing entirely on a page without this chip
+    // (there is none today, but nothing here requires one), `onState`
+    // below is simply a no-op for every state.
+    var stateChip = document.getElementById("sql-attachment-state");
+
     window.HfsSqlLibrarySync.mount({
       jsonTextarea: jsonTextarea,
       sqlTextarea: sqlTextarea,
@@ -322,6 +333,17 @@ if (typeof window !== "undefined" && window.document) {
         return window.HfsSqlEditor && window.HfsSqlEditor.view;
       },
       minimalChange: window.HfsEditorPair && window.HfsEditorPair.minimalChange,
+      onState: function (state) {
+        if (!stateChip) return;
+        if (state === "unreadable") {
+          stateChip.textContent = stateChip.dataset.msgUnreadable;
+          stateChip.hidden = false;
+          stateChip.classList.remove("editor-validity--ok");
+        } else {
+          stateChip.hidden = true;
+          stateChip.textContent = "";
+        }
+      },
     });
   })();
 }

@@ -215,6 +215,15 @@
       <div class="card-head">
         <h3>{{ i18n.t(editor_heading_key) }}</h3>
         <div class="card-head__tools">
+          {#- #1233: the "unreadable attachment" chip. `sql-library-sync.js`
+              is the only thing that ever un-hides it (client-side only, for
+              its own "unreadable" state) and fills its text from
+              `data-msg-unreadable` — the server never renders it visible,
+              since without that script there is no synchroniser and the
+              Details<->SQL card fallback (`sql_libraries::fill_sql_attachment`)
+              already covers an unreadable stored attachment. -#}
+          <span class="editor-validity" id="sql-attachment-state" hidden
+                data-msg-unreadable="{{ i18n.t("lib-sql-attachment-unreadable") }}"></span>
           <p class="editor-legend">
             <span class="editor-legend__live">{{ i18n.t("lib-run-hint") }}</span>
           </p>
