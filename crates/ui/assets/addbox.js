@@ -53,6 +53,17 @@
       }
       return;
     }
+    /* An open addbox--modal's <summary> is itself the full-screen backdrop
+       (app.css): its native toggle would close the <details> without ever
+       reaching close(), skipping the confirm and the reset. Route a closing
+       summary click (modal or not) through close() instead (#1240). */
+    var summary = event.target.closest("summary");
+    var owner = summary && summary.parentElement;
+    if (owner && owner.matches("details.addbox[open]")) {
+      event.preventDefault();
+      close(owner);
+      return;
+    }
     document.querySelectorAll(OPEN).forEach(function (box) {
       if (!box.contains(event.target)) close(box);
     });

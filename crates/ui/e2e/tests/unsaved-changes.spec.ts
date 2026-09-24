@@ -549,6 +549,59 @@ test("the bulk import dialog asks before closing with typed values and keeps the
   await expect(cue).toBeHidden();
 });
 
+test("clicking the modal backdrop asks before discarding typed values", async ({
+  page,
+  bulkImport,
+}) => {
+  // The addbox--modal's own <summary> is the full-screen backdrop
+  // (app.css): a click on it outside the panel is a native <details> toggle
+  // that must still be routed through close() (#1240).
+  await bulkImport.goto();
+  await bulkImport.newSubmission.click();
+  await expect(bulkImport.createDialog).toBeVisible();
+
+  const nameInput = page.locator("input[name='name']");
+  const cue = bulkImport.createDialog.locator(".tag--unsaved");
+  await nameInput.fill("Backdrop Dirty Submission");
+  await expect(cue).toBeVisible();
+
+  const summary = bulkImport.newSubmission;
+
+  // Dismissed: the dialog stays open with the typed value.
+  armDialog(page, "dismiss");
+  await summary.click({ position: { x: 4, y: 4 }, force: true });
+  expect(dialogsSeen(page)).toContainEqual({
+    type: "confirm",
+    message: "You have unsaved changes. Discard them and close?",
+  });
+  await expect(bulkImport.createDialog).toBeVisible();
+  await expect(nameInput).toHaveValue("Backdrop Dirty Submission");
+
+  // Accepted: the dialog closes and resets.
+  armDialog(page, "accept");
+  await summary.click({ position: { x: 4, y: 4 }, force: true });
+  await expect(bulkImport.createDialog).toBeHidden();
+
+  await bulkImport.newSubmission.click();
+  await expect(bulkImport.createDialog).toBeVisible();
+  await expect(nameInput).toHaveValue("");
+  await expect(cue).toBeHidden();
+});
+
+test("clicking the modal backdrop on a clean dialog closes without asking", async ({
+  page,
+  bulkImport,
+}) => {
+  await bulkImport.goto();
+  await bulkImport.newSubmission.click();
+  await expect(bulkImport.createDialog).toBeVisible();
+
+  dialogsSeen(page);
+  await bulkImport.newSubmission.click({ position: { x: 4, y: 4 }, force: true });
+  await expect(bulkImport.createDialog).toBeHidden();
+  expect(dialogsSeen(page)).toEqual([]);
+});
+
 test("the tenants dialog: whitespace only is clean, a name is dirty, a successful add is clean", async ({
   page,
   tenants,
