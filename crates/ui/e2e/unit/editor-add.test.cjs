@@ -35,6 +35,12 @@ test("parentPath drops a trailing index and the last path segment", () => {
   assert.equal(editorAdd.parentPath("name[0].given[2]"), "name[0]");
   assert.equal(editorAdd.parentPath("extension[0]"), "");
   assert.equal(editorAdd.parentPath(""), "");
+  // The editor's own dotted spelling (`crates/ui/src/editor.rs`).
+  assert.equal(editorAdd.parentPath("name.1"), "");
+  assert.equal(editorAdd.parentPath("extension.0"), "");
+  assert.equal(editorAdd.parentPath("name.0.family"), "name.0");
+  assert.equal(editorAdd.parentPath("name.0.given.2"), "name.0");
+  assert.equal(editorAdd.parentPath("name.0.extension.0"), "name.0");
 });
 
 test("leafName drops a trailing index and keeps the last path segment", () => {
@@ -43,4 +49,8 @@ test("leafName drops a trailing index and keeps the last path segment", () => {
   assert.equal(editorAdd.leafName("name[0].family"), "family");
   assert.equal(editorAdd.leafName("valueString"), "valueString");
   assert.equal(editorAdd.leafName("extension[0]"), "extension");
+  assert.equal(editorAdd.leafName("name.1"), "name");
+  assert.equal(editorAdd.leafName("extension.0"), "extension");
+  assert.equal(editorAdd.leafName("name.0.family"), "family");
+  assert.equal(editorAdd.leafName("name.0.given.2"), "given");
 });

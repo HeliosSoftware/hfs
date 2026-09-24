@@ -69,22 +69,29 @@
     return null;
   }
 
-  /* `path` with a trailing `[n]` index stripped, and everything from the
-   * last remaining `.` on dropped — the parent row's own `data-path`, or
-   * `""` for a path with no parent (a top-level element, or the empty
-   * root path itself). */
+  /* A trailing repetition index, in either spelling. The editor's own paths
+   * are dotted with numeric segments (`name.0.given.2`, `extension.0` — see
+   * `crates/ui/src/editor.rs`); the bracket form is accepted for callers
+   * that spell them the FHIRPath way (`name[0].given[2]`). */
+  var TRAILING_INDEX = /(\.\d+|\[\d+\])$/;
+
+  /* `path` with a trailing repetition index stripped, and everything from
+   * the last remaining `.` on dropped — the parent row's own `data-path`,
+   * or `""` for a path with no parent (a top-level element, or the empty
+   * root path itself). `name.1` and `extension.0` are top-level: their
+   * parent is the root. */
   function parentPath(path) {
     if (!path) return "";
-    var stripped = path.replace(/\[\d+\]$/, "");
+    var stripped = path.replace(TRAILING_INDEX, "");
     var dot = stripped.lastIndexOf(".");
     return dot === -1 ? "" : stripped.substring(0, dot);
   }
 
-  /* `path` with a trailing `[n]` index stripped, and everything up to and
-   * including the last remaining `.` dropped — the element name a picker's
-   * "added" signal names. */
+  /* `path` with a trailing repetition index stripped, and everything up to
+   * and including the last remaining `.` dropped — the element name a
+   * picker's "added" signal names (`name.1` → `name`). */
   function leafName(path) {
-    var stripped = (path || "").replace(/\[\d+\]$/, "");
+    var stripped = (path || "").replace(TRAILING_INDEX, "");
     var dot = stripped.lastIndexOf(".");
     return dot === -1 ? stripped : stripped.substring(dot + 1);
   }
