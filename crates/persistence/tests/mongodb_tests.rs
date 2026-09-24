@@ -14415,21 +14415,11 @@ async fn mongodb_integration_boot_creates_only_inline_search_indexes_and_keeps_g
     let client = raw_test_client(&connection_string).await.unwrap();
     let db = client.database(&config.database_name);
     let names = search_index_names(&db).await;
-    assert_eq!(
-        names,
-        vec!["_id_", "idx_search_composite", "idx_search_resource"]
-    );
+    assert_eq!(names, expected_inline_names());
 
-    // Generation 3: the contained collection gets its two indexes inline too.
+    // Generation 3: the contained collection gets its three indexes inline too.
     let contained_names = index_names(&db, "search_index_contained").await;
-    assert_eq!(
-        contained_names,
-        vec![
-            "_id_",
-            "idx_search_contained",
-            "idx_search_contained_resource"
-        ]
-    );
+    assert_eq!(contained_names, expected_contained_names());
 
     // A record written by the builder must survive the next boot.
     db.collection::<Document>("schema_version")
@@ -14538,12 +14528,38 @@ const CURRENT_BACKGROUND_NAMES: [&str; 9] = [
     "idx_search_uri_v2",
 ];
 
+const CURRENT_INLINE_NAMES: [&str; 3] = [
+    "idx_search_composite",
+    "idx_search_composite_slot_probe",
+    "idx_search_resource",
+];
+
+const CURRENT_CONTAINED_NAMES: [&str; 3] = [
+    "idx_search_contained",
+    "idx_search_contained_composite_slot_probe",
+    "idx_search_contained_resource",
+];
+
+fn expected_inline_names() -> Vec<String> {
+    let mut names = vec!["_id_".to_string()];
+    names.extend(CURRENT_INLINE_NAMES.map(String::from));
+    names.sort();
+    names
+}
+
+fn expected_contained_names() -> Vec<String> {
+    let mut names = vec!["_id_".to_string()];
+    names.extend(CURRENT_CONTAINED_NAMES.map(String::from));
+    names.sort();
+    names
+}
+
 fn expected_current_names() -> Vec<String> {
     let mut all: Vec<String> = CURRENT_BACKGROUND_NAMES
         .iter()
         .map(|s| s.to_string())
         .collect();
-    all.extend(["_id_", "idx_search_composite", "idx_search_resource"].map(String::from));
+    all.extend(expected_inline_names());
     all.sort();
     all
 }
@@ -14624,15 +14640,11 @@ async fn mongodb_integration_builder_fresh_database_ends_with_generation2_set() 
     }
     let db = raw_test_client(&cs).await.unwrap().database(&db_name);
     assert_eq!(search_index_names(&db).await, expected_current_names());
-    // The contained collection's two inline indexes, built by
+    // The contained collection's three inline indexes, built by
     // `initialize_schema_async` (Task 3), independent of the builder.
     assert_eq!(
         index_names(&db, "search_index_contained").await,
-        vec![
-            "_id_",
-            "idx_search_contained",
-            "idx_search_contained_resource"
-        ]
+        expected_contained_names()
     );
     let record = db
         .collection::<Document>("schema_version")
@@ -14793,11 +14805,7 @@ async fn mongodb_integration_builder_moves_contained_rows_and_drops_the_old_part
     );
     assert_eq!(
         index_names(&db, "search_index_contained").await,
-        vec![
-            "_id_",
-            "idx_search_contained",
-            "idx_search_contained_resource"
-        ]
+        expected_contained_names()
     );
     let sv = db
         .collection::<Document>("schema_version")
@@ -14888,14 +14896,10 @@ async fn mongodb_integration_builder_off_mode_warns_and_changes_nothing() {
     missing.sort();
     assert_eq!(missing, CURRENT_BACKGROUND_NAMES.map(String::from).to_vec());
     // `off` mode changes nothing about the background (generation-2/v1)
-    // indexes the builder is responsible for; the two inline-class specs
-    // (`idx_search_composite`, `idx_search_resource`) are still created by
+    // indexes the builder is responsible for; the three inline specs are still created by
     // `initialize_schema_async` on every boot regardless of build mode (Task 3).
     let mut expected = before;
-    expected.extend([
-        "idx_search_composite".to_string(),
-        "idx_search_resource".to_string(),
-    ]);
+    expected.extend(CURRENT_INLINE_NAMES.map(String::from));
     expected.sort();
     assert_eq!(search_index_names(&db).await, expected);
 }
