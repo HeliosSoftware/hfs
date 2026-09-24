@@ -1,6 +1,7 @@
 import { test, expect, armDialog, dialogsSeen } from "../pages/fixtures";
 import { Editor } from "../pages/editor";
-import { createResource, waitSearchable } from "../pages/api";
+import { createResource, createSqlQueryLibrary, waitSearchable } from "../pages/api";
+import { VdEditor } from "../pages/vd-editor";
 
 // Unsaved-changes tracking (#1240) in the standalone /ui/editor page and the
 // Resources modal: the "Unsaved changes" pill next to Save, the browser's own
@@ -240,4 +241,193 @@ test("saving in the modal clears the cue", async ({ resources, page }) => {
   dialogsSeen(page);
   await resources.modal.closeWithEscape();
   expect(dialogsSeen(page)).toEqual([]);
+});
+
+// ---- View Definitions (#1240) ----------------------------------------------
+//
+// `vd-editor.js` opts `#vd-editor-form` into HfsUnsaved right after
+// `EditorPair.mount` — no `read` of its own: `serialize(form)` already
+// covers the hidden `id` field and the `json` textarea, comparing the
+// latter in canonical form so a reindent is never a false positive.
+
+/** A minimal savable ViewDefinition, named for the rail. */
+function unsavedVdStarter(name: string) {
+  return {
+    name,
+    status: "active",
+    resource: "Patient",
+    select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+  };
+}
+
+test("the View Definition editor shows the cue on a real change and hides it when the JSON is only reformatted", async ({
+  page,
+  request,
+}) => {
+  const stamp = Date.now().toString(36);
+  const vdId = await createResource(
+    request,
+    "ViewDefinition",
+    unsavedVdStarter(`unsaved_vd_${stamp}`),
+  );
+  await waitSearchable(request, "ViewDefinition", vdId);
+
+  await page.goto(`/ui/sql/view-definitions?vd=${vdId}`);
+  const vd = new VdEditor(page);
+  const cue = page.locator("#vd-editor-form .tag--unsaved");
+  await expect(cue).toBeHidden();
+
+  const original = await vd.doc();
+  const parsed = JSON.parse(original);
+
+  // Reformatting only — same document, different whitespace.
+  await vd.setDoc(JSON.stringify(parsed, null, 4));
+  await expect(cue).toBeHidden();
+
+  // A real change.
+  await vd.setDoc(JSON.stringify({ ...parsed, name: `${parsed.name}_renamed` }));
+  await expect(cue).toBeVisible();
+
+  // Back to the document as loaded.
+  await vd.setDoc(original);
+  await expect(cue).toBeHidden();
+});
+
+test("saving a View Definition does not ask and lands clean", async ({ page, request }) => {
+  const stamp = Date.now().toString(36);
+  const vdId = await createResource(
+    request,
+    "ViewDefinition",
+    unsavedVdStarter(`unsaved_vd_save_${stamp}`),
+  );
+  await waitSearchable(request, "ViewDefinition", vdId);
+
+  await page.goto(`/ui/sql/view-definitions?vd=${vdId}`);
+  const vd = new VdEditor(page);
+  const cue = page.locator("#vd-editor-form .tag--unsaved");
+  const original = await vd.doc();
+  const parsed = JSON.parse(original);
+  await vd.setDoc(JSON.stringify({ ...parsed, name: `${parsed.name}_edited` }));
+  await expect(cue).toBeVisible();
+
+  armDialog(page, "dismiss");
+  await page.locator("#vd-editor-form button[value='save']").click();
+  await page.waitForURL(/saved=1/);
+
+  expect(dialogsSeen(page).some((d) => d.type === "beforeunload")).toBe(false);
+  await expect(cue).toBeHidden();
+});
+
+test("leaving a dirty View Definition asks the browser", async ({ page, request, chrome }) => {
+  const stamp = Date.now().toString(36);
+  const vdId = await createResource(
+    request,
+    "ViewDefinition",
+    unsavedVdStarter(`unsaved_vd_leave_${stamp}`),
+  );
+  await waitSearchable(request, "ViewDefinition", vdId);
+
+  await page.goto(`/ui/sql/view-definitions?vd=${vdId}`);
+  const vd = new VdEditor(page);
+  const cue = page.locator("#vd-editor-form .tag--unsaved");
+  const original = await vd.doc();
+  const parsed = JSON.parse(original);
+  await vd.setDoc(JSON.stringify({ ...parsed, name: `${parsed.name}_dirty` }));
+  await expect(cue).toBeVisible();
+
+  armDialog(page, "dismiss");
+  await chrome.navLink("/ui/resources").click();
+  await expect.poll(() => dialogsSeen(page).some((d) => d.type === "beforeunload")).toBe(true);
+
+  // Dismissed: the navigation never happened.
+  await expect(page).toHaveURL(/\/ui\/sql\/view-definitions/);
+  await expect(cue).toBeVisible();
+});
+
+// ---- SQL library (#1240) ---------------------------------------------------
+//
+// `sql-editor.js` opts a whole `<main>` into HfsUnsaved (`root`), tracking
+// `#lib-editor-form` (`form`): the Details JSON textarea sits outside that
+// `<form>` in the DOM (associated only by its own `form` attribute), so its
+// `input` events never bubble through the form — but they, and a server-
+// driven Declare's own `input` dispatch, do bubble through their shared
+// `<main>`. `serialize(form)` still reads every associated control (`id`,
+// `sql`, `json`) since `form.elements` already includes them regardless of
+// DOM position.
+
+test("the SQL library cue follows the SQL pane, the Details JSON and a server-side Declare", async ({
+  page,
+  request,
+}) => {
+  const stamp = Date.now().toString(36);
+  const canonical = `http://example.org/ViewDefinition/e2e-unsaved-${stamp}`;
+  await createResource(request, "ViewDefinition", {
+    name: `unsaved_lib_source_${stamp}`,
+    url: canonical,
+    status: "active",
+    resource: "Patient",
+    select: [
+      {
+        column: [
+          { name: "id", path: "getResourceKey()" },
+          { name: "family", path: "name.family.first()" },
+        ],
+      },
+    ],
+  });
+  const libId = await createSqlQueryLibrary(
+    request,
+    `unsaved_lib_${stamp}`,
+    canonical,
+    "SELECT id, family FROM v WHERE family = :fam",
+  );
+  await waitSearchable(request, "Library", libId);
+
+  await page.goto(`/ui/sql/queries?lib=${libId}`);
+  const cue = page.locator("#lib-editor-form .tag--unsaved");
+  await expect(cue).toBeHidden();
+
+  // The SQL pane.
+  const sqlEditor = page.locator(".sql-editor .cm-content[role='textbox']");
+  const sqlTextarea = page.locator("textarea[name='sql']");
+  const originalSql = await sqlTextarea.inputValue();
+  await sqlEditor.click();
+  await page.keyboard.press("ControlOrMeta+a");
+  await page.keyboard.press("Delete");
+  await page.keyboard.insertText(originalSql + " -- edited");
+  await expect(cue).toBeVisible();
+
+  await sqlEditor.click();
+  await page.keyboard.press("ControlOrMeta+a");
+  await page.keyboard.press("Delete");
+  await page.keyboard.insertText(originalSql);
+  await expect(cue).toBeHidden();
+
+  // The Details JSON pane — outside the `<form>`, associated by `form=`.
+  const detailsEditor = page.locator("#lib-details-editor .cm-content");
+  const jsonTextarea = page.locator("textarea[name='json']");
+  const originalJson = await jsonTextarea.inputValue();
+  const editedJson = JSON.stringify(
+    { ...JSON.parse(originalJson), name: `unsaved_lib_${stamp}_renamed` },
+    null,
+    2,
+  );
+  await detailsEditor.click();
+  await page.keyboard.press("ControlOrMeta+a");
+  await page.keyboard.insertText(editedJson);
+  await expect(cue).toBeVisible();
+
+  await detailsEditor.click();
+  await page.keyboard.press("ControlOrMeta+a");
+  await page.keyboard.insertText(originalJson);
+  await expect(cue).toBeHidden();
+
+  // A server-side Declare parameter mutation — pushed into the Details
+  // textarea via `setDoc`, which already dispatches `input` on it (#841).
+  const paramsCard = page.locator("#lib-params");
+  const declareButton = paramsCard.getByRole("button", { name: "Declare :fam" });
+  await expect(declareButton).toBeVisible();
+  await declareButton.click();
+  await expect(jsonTextarea).toHaveValue(/"name": "fam"/, { timeout: 3000 });
+  await expect(cue).toBeVisible();
 });

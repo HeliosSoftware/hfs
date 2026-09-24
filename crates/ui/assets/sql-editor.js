@@ -34,6 +34,26 @@
   var CM = window.HfsCodeMirror;
   var form = document.getElementById("lib-editor-form");
   var textarea = form ? form.querySelector('textarea[name="sql"]') : null;
+
+  // #1240: tracked before the CodeMirror early return below, so the cue
+  // still works over the plain textarea with no bundle mounted. `root` is
+  // the form's own `<main>` ancestor, not the form itself: the Details JSON
+  // textarea (`textarea[name="json"][form="lib-editor-form"]`) lives outside
+  // this `<form>` in the DOM, associated only by its `form` attribute, so
+  // its `input` events never bubble through the form — but they do bubble
+  // through their common `<main>`, same as the `htmx:afterSwap` a server-
+  // driven document mutation (Declare parameter, Add table) dispatches on
+  // it. `serialize(form)` still reads every associated control (`id`,
+  // `sql`, `json`) since `form.elements` already includes them regardless
+  // of DOM position.
+  if (form && window.HfsUnsaved) {
+    window.HfsUnsaved.track({
+      root: form.closest("main") || document.body,
+      form: form,
+      cue: form.querySelector(".form-actions"),
+    });
+  }
+
   if (!CodeEditor || !CM || !textarea) return;
 
   var sqlLanguage = CM.sql({ dialect: CM.SQLite });
