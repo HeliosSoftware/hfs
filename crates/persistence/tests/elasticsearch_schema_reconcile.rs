@@ -394,6 +394,68 @@ async fn startup_adds_the_date_range_end_to_a_version_1_index() {
     assert!(found_ids(&backend, &date_query("2020-03")).await.is_empty());
 }
 
+/// #1391: `hfs` does not run `initialize` at startup, so an index at schema
+/// version 1 keeps its mapping until its first write. A descending date sort
+/// reads `search_params.date.end`, which such an index lacks: the search must
+/// still work (it used to be a 400, "No mapping found ... in order to sort").
+#[tokio::test]
+async fn a_descending_date_sort_works_on_an_index_not_yet_reconciled() {
+    let template = started_backend_on(&new_prefix()).await;
+    create_patient(&template, "seed", "Templateseed").await;
+    let mut mapping = mapping_of(&template.index_name("reconcile", "Patient")).await;
+    let date = &mut mapping["properties"]["search_params"]["properties"]["date"]["properties"];
+    assert!(date.as_object_mut().unwrap().remove("end").is_some());
+    mapping["_meta"] = json!({ SCHEMA_VERSION_META_KEY: 1 });
+
+    let prefix = new_prefix();
+    // Not initialized, as `hfs` builds it.
+    let backend = backend_on(&prefix).await;
+    let index = backend.index_name("reconcile", "Encounter");
+    let response = raw_client()
+        .await
+        .indices()
+        .create(elasticsearch::indices::IndicesCreateParts::Index(&index))
+        .body(json!({
+            "settings": {
+                "number_of_replicas": 0,
+                "analysis": { "normalizer": { "lowercase_normalizer": {
+                    "type": "custom", "filter": ["lowercase"]
+                } } }
+            },
+            "mappings": mapping
+        }))
+        .send()
+        .await
+        .expect("create a version-1 index");
+    assert!(response.status_code().is_success(), "create failed");
+    assert_eq!(mapping_version_meta(&index).await, Some(1));
+
+    for direction in [
+        helios_persistence::types::SortDirection::Descending,
+        helios_persistence::types::SortDirection::Ascending,
+    ] {
+        let query =
+            SearchQuery::new("Encounter").with_sort(helios_persistence::types::SortDirective {
+                parameter: "date".to_string(),
+                direction,
+                param_type: Some(SearchParamType::Date),
+            });
+        let result = backend.search(&tenant(), &query).await;
+        assert!(
+            result.is_ok(),
+            "a {direction:?} date sort must not fail on an unreconciled index: {:?}",
+            result.err()
+        );
+    }
+    // Searching does not reconcile the index.
+    assert_eq!(mapping_version_meta(&index).await, Some(1));
+}
+
+/// The `hfs_schema_version` in an index's mapping `_meta`, if any.
+async fn mapping_version_meta(index: &str) -> Option<u64> {
+    mapping_of(index).await["_meta"][SCHEMA_VERSION_META_KEY].as_u64()
+}
+
 /// The per-index mapping version Elasticsearch keeps in the cluster state; it
 /// goes up by one for every mapping update that changed something.
 async fn mapping_version(index: &str) -> u64 {

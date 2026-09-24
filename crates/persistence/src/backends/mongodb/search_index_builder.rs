@@ -375,8 +375,10 @@ impl SearchIndexBuilder {
                     to_generation = SEARCH_INDEX_GENERATION,
                     "search_index date rows written before #1391 have no value_date_end and will \
                      not match date searches with the eq, ne, gt, ge, le, eb or ap prefixes until \
-                     they are reindexed; run `$reindex` to rebuild them (lt and sa, and rows \
-                     written by this version, are not affected)"
+                     they are reindexed, and a Period indexed before #1391 is still two \
+                     independent point rows, so even lt and sa compare each of its ends on its \
+                     own until then; run `$reindex` to rebuild them (rows written by this \
+                     version are not affected)"
                 );
             }
             set_search_index_generation(&self.database, SEARCH_INDEX_GENERATION).await?;

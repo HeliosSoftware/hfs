@@ -13,7 +13,7 @@ Since #1391 a date row stores the range it denotes, `[value_date, value_date_end
 
 ### Upgrading: reindex the date rows
 
-Rows written before #1391 have no `value_date_end`. They never match the prefixes that bound the end (`eq`, `ne`, `gt`, `ge`, `le`, `eb`, `ap`) until they are rewritten, and `lt` and `sa` are unaffected. Run `$reindex` after the upgrade. HFS reminds you: when the builder records generation 4 on a database that was at an earlier generation (or had none recorded) and `search_index` is not empty, it logs one `warn` naming `$reindex`. The check reads the recorded generation and the collection's metadata count, never the rows, and only runs on that transition: it is silent on a new empty database and on every boot once generation 4 is recorded.
+Rows written before #1391 have no `value_date_end`. They never match the prefixes that bound the end (`eq`, `ne`, `gt`, `ge`, `le`, `eb`, `ap`) until they are rewritten. A Period indexed before #1391 is also still two independent point rows, so even `lt` and `sa` compare each of its ends on its own until it is rewritten (point values are unaffected by those two). Run `$reindex` after the upgrade. HFS reminds you: when the builder records generation 4 on a database that was at an earlier generation (or had none recorded) and `search_index` is not empty, it logs one `warn` naming `$reindex`. The check reads the recorded generation and the collection's metadata count, never the rows, and only runs on that transition: it is silent on a new empty database and on every boot once generation 4 is recorded.
 
 ## `HFS_MONGODB_INDEX_BUILD`
 

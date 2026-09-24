@@ -475,19 +475,26 @@ impl<'a> EsQueryBuilder<'a> {
                     // orders an ascending sort, the largest a descending one
                     // (the SQL backends' MIN/MAX).
                     let mode = if order == "asc" { "min" } else { "max" };
-                    sort_clauses.push(json!({
-                        field: {
-                            "order": order,
-                            "mode": mode,
-                            "nested": {
-                                "path": format!("search_params.{group}"),
-                                "filter": {
-                                    "term": { format!("search_params.{group}.name"): name }
-                                }
-                            },
-                            "missing": if order == "asc" { "_last" } else { "_first" }
-                        }
-                    }));
+                    let mut clause = json!({
+                        "order": order,
+                        "mode": mode,
+                        "nested": {
+                            "path": format!("search_params.{group}"),
+                            "filter": {
+                                "term": { format!("search_params.{group}.name"): name }
+                            }
+                        },
+                        "missing": if order == "asc" { "_last" } else { "_first" }
+                    });
+                    // `search_params.date.end` exists only in indices at schema
+                    // version 2 (#1391). An index that has not been reconciled
+                    // yet (the mapping is brought up to date on the first write
+                    // to it) lacks the field, and Elasticsearch refuses to sort
+                    // on an unmapped one with a 400 unless told its type.
+                    if field == "search_params.date.end" {
+                        clause["unmapped_type"] = json!("date");
+                    }
+                    sort_clauses.push(json!({ field: clause }));
                 }
             }
         }
@@ -911,6 +918,8 @@ mod tests {
         assert!(!clause.is_null(), "descending sorts on the end, got {sort}");
         assert_eq!(clause["order"], "desc");
         assert_eq!(clause["mode"], "max");
+        // An index not yet reconciled to schema version 2 has no `end`.
+        assert_eq!(clause["unmapped_type"], "date");
 
         let query = SearchQuery::new("Encounter")
             .with_sort(directive)

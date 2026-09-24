@@ -69,7 +69,9 @@ use super::backend::ElasticsearchBackend;
 /// - `2` — `search_params.date.end`, the end of the range a date value covers
 ///   (#1391). Documents indexed before it have no `end`, and a date search
 ///   compares against it for every prefix but `lt` and `sa`: they are not
-///   found by date until a `$reindex`.
+///   found by those prefixes until a `$reindex`. A `Period` indexed before it
+///   is still two independent points, so `lt` and `sa` are only right for
+///   point values until then.
 pub const SCHEMA_VERSION: u64 = 2;
 
 /// The key, in an index mapping's `_meta`, that holds [`SCHEMA_VERSION`].
@@ -755,7 +757,8 @@ async fn document_counts(
 /// (schema version `2`) and so have no `search_params.date.end`: a date search
 /// with `eq`, `ne`, `gt`, `ge`, `le`, `eb` or `ap` compares against it, so
 /// they are not found by those prefixes until `$reindex` indexes them again.
-/// (`lt` and `sa` read only the start and are unaffected.)
+/// (`lt` and `sa` read only the start, so they are unaffected for point values;
+/// a `Period` indexed before #1391 is still two independent points.)
 ///
 /// Does nothing for no indices: an empty or new index holds nothing to reindex.
 fn warn_reindex_needed(indices: &[String]) {
@@ -770,7 +773,8 @@ fn warn_reindex_needed(indices: &[String]) {
         "Elasticsearch indices holding documents indexed before #1391 were upgraded to a \
          mapping with `search_params.date.end`, but those documents have no such field and \
          will not match date searches with the eq, ne, gt, ge, le, eb or ap prefixes until \
-         `$reindex` is run"
+         `$reindex` is run, and a Period indexed before #1391 is still two independent \
+         point rows, so even lt and sa compare each of its ends on its own"
     );
 }
 

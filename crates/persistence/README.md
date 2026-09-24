@@ -1199,7 +1199,7 @@ The SQLite backend includes a complete FHIR search implementation using pre-comp
   1 day, 10 minutes, or 10 seconds for year, month, day, minute and
   second-or-finer values.
 - Descending `_sort` on a date parameter orders by the largest range end.
-- SQLite keeps an index on the range end (`idx_search_date_end`, created by the
+- SQLite keeps an index on the range end and start (`idx_search_date_end`, created by the
   v35 migration) and adds the implied `end > start-bound` term to every group
   that bounds the start, so `eq`, `gt` and `sa` seek instead of scanning the
   parameter's rows (2M date rows: `eq` 0.9 s -> 0.1 s). Conditions that bound
