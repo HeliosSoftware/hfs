@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use helios_fhir::FhirVersion;
 use mongodb::{
     ClientSession, Collection, Cursor, SessionCursor,
@@ -22,8 +22,8 @@ use crate::core::{
     normalize_etag,
 };
 use crate::error::{
-    BackendError, ConcurrencyError, QueryErrorExt, ResourceError, StorageError, StorageResult,
-    TransactionError,
+    BackendError, ConcurrencyError, QueryErrorExt, ResourceError, SearchError, StorageError,
+    StorageResult, TransactionError,
 };
 use crate::search::converters::IndexValue;
 use crate::search::extractor::ExtractedValue;
@@ -5268,6 +5268,269 @@ async fn insert_search_entries_chunk(
     Ok(insert_failures)
 }
 
+/// Most catch-up rounds one type's `$reindex` walk runs (#1403).
+const REINDEX_CATCH_UP_MAX_ROUNDS: u8 = 3;
+/// Smallest catch-up margin honoured: below it every round would count as
+/// "needed" and a quiescent type would run all rounds.
+const REINDEX_CATCH_UP_MARGIN_MIN_MS: u64 = 1_000;
+/// Largest catch-up margin honoured, so `t0 - margin` stays in range.
+const REINDEX_CATCH_UP_MARGIN_MAX_MS: u64 = 86_400_000;
+
+/// The walk position handed to the driver between calls (#1403). `v2|` and a
+/// tag version the grammar; anything else is a foreign or corrupt cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReindexWalkCursor {
+    Id {
+        floor: DateTime<Utc>,
+        after_id: String,
+    },
+    Round {
+        round: u8,
+        floor: DateTime<Utc>,
+        ceiling: DateTime<Utc>,
+        walked: u64,
+        after_last_updated: DateTime<Utc>,
+        after_id: String,
+    },
+}
+
+impl ReindexWalkCursor {
+    fn encode(&self) -> String {
+        match self {
+            ReindexWalkCursor::Id { floor, after_id } => {
+                format!("v2|i|{}|{}", format_walk_instant(*floor), after_id)
+            }
+            ReindexWalkCursor::Round {
+                round,
+                floor,
+                ceiling,
+                walked,
+                after_last_updated,
+                after_id,
+            } => format!(
+                "v2|c|{}|{}|{}|{}|{}|{}",
+                round,
+                format_walk_instant(*floor),
+                format_walk_instant(*ceiling),
+                walked,
+                format_walk_instant(*after_last_updated),
+                after_id
+            ),
+        }
+    }
+
+    /// Anything that does not exactly match the grammar (including HEAD's
+    /// `<rfc3339>|<id>` and an empty string) is `SearchError::InvalidCursor`.
+    /// A cursor this process did not produce means there is a bug; restarting
+    /// the type could loop forever, so the run fails instead (#1403).
+    fn parse(cursor: &str) -> StorageResult<Self> {
+        let invalid = || {
+            StorageError::Search(SearchError::InvalidCursor {
+                cursor: cursor.to_string(),
+            })
+        };
+        let rest = cursor.strip_prefix("v2|").ok_or_else(invalid)?;
+        let (tag, rest) = rest.split_once('|').ok_or_else(invalid)?;
+        match tag {
+            "i" => {
+                let (floor, after_id) = rest.split_once('|').ok_or_else(invalid)?;
+                if after_id.is_empty() {
+                    return Err(invalid());
+                }
+                let floor = DateTime::parse_from_rfc3339(floor)
+                    .map_err(|_| invalid())?
+                    .with_timezone(&Utc);
+                Ok(ReindexWalkCursor::Id {
+                    floor,
+                    after_id: after_id.to_string(),
+                })
+            }
+            "c" => {
+                let fields: Vec<&str> = rest.splitn(6, '|').collect();
+                let [round, floor, ceiling, walked, after_lu, after_id] = fields[..] else {
+                    return Err(invalid());
+                };
+                if after_id.is_empty() {
+                    return Err(invalid());
+                }
+                let round: u8 = round.parse().map_err(|_| invalid())?;
+                if !(1..=REINDEX_CATCH_UP_MAX_ROUNDS).contains(&round) {
+                    return Err(invalid());
+                }
+                let walked: u64 = walked.parse().map_err(|_| invalid())?;
+                let floor = DateTime::parse_from_rfc3339(floor)
+                    .map_err(|_| invalid())?
+                    .with_timezone(&Utc);
+                let ceiling = DateTime::parse_from_rfc3339(ceiling)
+                    .map_err(|_| invalid())?
+                    .with_timezone(&Utc);
+                let after_last_updated = DateTime::parse_from_rfc3339(after_lu)
+                    .map_err(|_| invalid())?
+                    .with_timezone(&Utc);
+                if !(floor < ceiling
+                    && floor <= after_last_updated
+                    && after_last_updated < ceiling)
+                {
+                    return Err(invalid());
+                }
+                Ok(ReindexWalkCursor::Round {
+                    round,
+                    floor,
+                    ceiling,
+                    walked,
+                    after_last_updated,
+                    after_id: after_id.to_string(),
+                })
+            }
+            _ => Err(invalid()),
+        }
+    }
+}
+
+/// Whether round-start should run the round, declare the walk complete, or
+/// stop at the round cap (#1403).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoundStartDecision {
+    Run,
+    Complete,
+    CapReached,
+}
+
+fn truncate_to_millis(dt: DateTime<Utc>) -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp_millis(dt.timestamp_millis()).unwrap_or(dt)
+}
+
+fn format_walk_instant(dt: DateTime<Utc>) -> String {
+    dt.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+/// Clamps a configured margin to `[REINDEX_CATCH_UP_MARGIN_MIN_MS,
+/// REINDEX_CATCH_UP_MARGIN_MAX_MS]` (#1403).
+fn reindex_catch_up_margin(configured_ms: u64) -> chrono::Duration {
+    chrono::Duration::milliseconds(
+        configured_ms.clamp(REINDEX_CATCH_UP_MARGIN_MIN_MS, REINDEX_CATCH_UP_MARGIN_MAX_MS) as i64,
+    )
+}
+
+/// `min(newest_live + 1 ms, t0 - margin)` (#1403).
+fn reindex_catch_up_floor(
+    t0: DateTime<Utc>,
+    newest_live: Option<DateTime<Utc>>,
+    margin: chrono::Duration,
+) -> DateTime<Utc> {
+    let fresh = truncate_to_millis(t0 - margin);
+    match newest_live {
+        Some(newest) => (newest + chrono::Duration::milliseconds(1)).min(fresh),
+        None => fresh,
+    }
+}
+
+/// `max(now + margin, newest_live + 1 ms)` (#1403).
+fn reindex_catch_up_ceiling(
+    now: DateTime<Utc>,
+    newest_live: Option<DateTime<Utc>>,
+    margin: chrono::Duration,
+) -> DateTime<Utc> {
+    let by_margin = truncate_to_millis(now + margin);
+    match newest_live {
+        Some(newest) => by_margin.max(newest + chrono::Duration::milliseconds(1)),
+        None => by_margin,
+    }
+}
+
+/// Whether the next round should run, or the walk is done (#1403).
+fn reindex_round_start_decision(
+    round: u8,
+    floor: DateTime<Utc>,
+    now: DateTime<Utc>,
+    margin: chrono::Duration,
+) -> RoundStartDecision {
+    if round == 1 {
+        return RoundStartDecision::Run;
+    }
+    if now < floor - margin / 2 {
+        return RoundStartDecision::Complete;
+    }
+    if round > REINDEX_CATCH_UP_MAX_ROUNDS {
+        return RoundStartDecision::CapReached;
+    }
+    RoundStartDecision::Run
+}
+
+/// The id phase's filter: live resources older than `floor`, keyset on `id`
+/// (#1403).
+fn reindex_id_page_filter(
+    tenant_id: &str,
+    resource_type: &str,
+    floor: DateTime<Utc>,
+    after_id: Option<&str>,
+) -> Document {
+    let mut filter = doc! {
+        "tenant_id": tenant_id,
+        "resource_type": resource_type,
+        "is_deleted": false,
+        "last_updated": { "$lt": chrono_to_bson(floor) },
+    };
+    if let Some(after_id) = after_id {
+        filter.insert("id", doc! { "$gt": after_id });
+    }
+    filter
+}
+
+/// A catch-up round's filter over `[floor, ceiling)`, keyset on
+/// `(last_updated, id)` once a page has been returned (#1403).
+fn reindex_catch_up_page_filter(
+    tenant_id: &str,
+    resource_type: &str,
+    floor: DateTime<Utc>,
+    ceiling: DateTime<Utc>,
+    after: Option<(DateTime<Utc>, &str)>,
+) -> Document {
+    let mut filter = doc! {
+        "tenant_id": tenant_id,
+        "resource_type": resource_type,
+        "is_deleted": false,
+    };
+    match after {
+        None => {
+            filter.insert(
+                "last_updated",
+                doc! { "$gte": chrono_to_bson(floor), "$lt": chrono_to_bson(ceiling) },
+            );
+        }
+        Some((after_lu, after_id)) => {
+            filter.insert(
+                "$or",
+                vec![
+                    doc! { "last_updated": { "$gt": chrono_to_bson(after_lu), "$lt": chrono_to_bson(ceiling) } },
+                    doc! { "last_updated": chrono_to_bson(after_lu), "id": { "$gt": after_id } },
+                ],
+            );
+        }
+    }
+    filter
+}
+
+/// Keeps only the last (newest) occurrence of each `id` in `docs`, preserving
+/// scan order otherwise; a document with no string `id` is kept in place and
+/// left to fail parsing with HEAD's error (#1403).
+fn dedupe_reindex_page_keep_last(docs: Vec<Document>) -> Vec<Document> {
+    let mut last_index_for_id: HashMap<String, usize> = HashMap::new();
+    for (i, doc) in docs.iter().enumerate() {
+        if let Ok(id) = doc.get_str("id") {
+            last_index_for_id.insert(id.to_string(), i);
+        }
+    }
+    docs.into_iter()
+        .enumerate()
+        .filter(|(i, doc)| match doc.get_str("id").ok() {
+            Some(id) => last_index_for_id.get(id) == Some(i),
+            None => true,
+        })
+        .map(|(_, doc)| doc)
+        .collect()
+}
+
 /// Parses a `{rfc3339}|{id}` keyset-pagination cursor for the reindex source.
 fn parse_reindex_cursor(cursor: &str) -> Option<(DateTime<Utc>, String)> {
     let (ts, id) = cursor.split_once('|')?;
@@ -5634,5 +5897,305 @@ mod history_query_tests {
             system_history_sort(),
             doc! { "last_updated": -1_i32, "resource_type": -1_i32, "id": -1_i32 }
         );
+    }
+}
+
+#[cfg(test)]
+mod reindex_walk_tests {
+    //! Docker-free unit tests for #1403's id-order `$reindex` walk: the
+    //! cursor grammar, the pure floor/ceiling/round-decision rules, the
+    //! filter builders, and the round-page dedupe. The walk itself
+    //! (`fetch_resources_page`) is covered by the MongoDB integration suite
+    //! in `tests/mongodb/reindex_id_walk.rs`, since it needs a live server.
+
+    use super::*;
+
+    fn ts(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    // --- Cursor grammar ---
+
+    #[test]
+    fn cursor_round_trips_every_state() {
+        let id_cursor = ReindexWalkCursor::Id {
+            floor: ts("2026-01-01T00:00:00.123Z"),
+            after_id: "A-1.b".to_string(),
+        };
+        assert_eq!(ReindexWalkCursor::parse(&id_cursor.encode()).unwrap(), id_cursor);
+
+        for round in [1u8, REINDEX_CATCH_UP_MAX_ROUNDS] {
+            for walked in [0u64, u64::MAX] {
+                let round_cursor = ReindexWalkCursor::Round {
+                    round,
+                    floor: ts("2026-01-01T00:00:00.000Z"),
+                    ceiling: ts("2026-01-01T00:02:00.000Z"),
+                    walked,
+                    after_last_updated: ts("2026-01-01T00:01:00.500Z"),
+                    after_id: "obs-017".to_string(),
+                };
+                assert_eq!(
+                    ReindexWalkCursor::parse(&round_cursor.encode()).unwrap(),
+                    round_cursor
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cursor_id_is_the_verbatim_remainder() {
+        let id_cursor = ReindexWalkCursor::Id {
+            floor: ts("2026-01-01T00:00:00.000Z"),
+            after_id: "a|b".to_string(),
+        };
+        assert_eq!(ReindexWalkCursor::parse(&id_cursor.encode()).unwrap(), id_cursor);
+
+        let round_cursor = ReindexWalkCursor::Round {
+            round: 1,
+            floor: ts("2026-01-01T00:00:00.000Z"),
+            ceiling: ts("2026-01-01T00:02:00.000Z"),
+            walked: 3,
+            after_last_updated: ts("2026-01-01T00:01:00.000Z"),
+            after_id: "a|b".to_string(),
+        };
+        assert_eq!(
+            ReindexWalkCursor::parse(&round_cursor.encode()).unwrap(),
+            round_cursor
+        );
+    }
+
+    #[test]
+    fn cursor_rejects_foreign_and_malformed_tokens() {
+        let instant = "2026-01-01T00:00:00.000Z";
+        let ceiling = "2026-01-01T00:02:00.000Z";
+        let bad: Vec<String> = vec![
+            "".to_string(),
+            "2026-09-19T04:43:29.668+00:00|e357ce58-f379-216d-a369-99da40ff76ae".to_string(),
+            format!("v1|i|{instant}|a"),
+            format!("v3|i|{instant}|a"),
+            format!("v2|x|{instant}|a"),
+            format!("v2|s|1|{instant}"),
+            format!("v2|i|{instant}|"),
+            "v2|i|not-a-time|a".to_string(),
+            // round 0 (below the 1..=MAX range)
+            format!("v2|c|0|{instant}|{ceiling}|0|{instant}|a"),
+            // round MAX + 1 (above the range)
+            format!(
+                "v2|c|{}|{instant}|{ceiling}|0|{instant}|a",
+                REINDEX_CATCH_UP_MAX_ROUNDS + 1
+            ),
+            // five fields instead of six (missing after_lu)
+            format!("v2|c|1|{instant}|{ceiling}|0|a"),
+            // walked = -1
+            format!("v2|c|1|{instant}|{ceiling}|-1|{instant}|a"),
+            // floor == ceiling
+            format!("v2|c|1|{instant}|{instant}|0|{instant}|a"),
+            // after_lu < floor
+            format!("v2|c|1|{instant}|{ceiling}|0|2025-12-31T23:59:59.000Z|a"),
+            // after_lu == ceiling
+            format!("v2|c|1|{instant}|{ceiling}|0|{ceiling}|a"),
+        ];
+        for cursor in bad {
+            match ReindexWalkCursor::parse(&cursor) {
+                Err(StorageError::Search(SearchError::InvalidCursor { .. })) => {}
+                other => panic!("expected InvalidCursor for {cursor:?}, got {other:?}"),
+            }
+        }
+    }
+
+    // --- Floor / ceiling / margin / round decision ---
+
+    #[test]
+    fn floor_is_newest_plus_one_ms_for_old_data() {
+        let t0 = ts("2026-01-01T01:00:00.000Z");
+        let newest = ts("2026-01-01T00:00:00.000Z"); // far older than t0 - margin
+        let margin = chrono::Duration::seconds(120);
+        assert_eq!(
+            reindex_catch_up_floor(t0, Some(newest), margin),
+            newest + chrono::Duration::milliseconds(1)
+        );
+    }
+
+    #[test]
+    fn floor_is_t0_minus_margin_for_fresh_data() {
+        let t0 = ts("2026-01-01T01:00:00.000Z");
+        let newest = t0 - chrono::Duration::seconds(1); // inside the margin
+        let margin = chrono::Duration::seconds(120);
+        assert_eq!(reindex_catch_up_floor(t0, Some(newest), margin), t0 - margin);
+    }
+
+    #[test]
+    fn floor_without_live_resources_is_t0_minus_margin() {
+        let t0 = ts("2026-01-01T01:00:00.000Z");
+        let margin = chrono::Duration::seconds(120);
+        assert_eq!(reindex_catch_up_floor(t0, None, margin), t0 - margin);
+    }
+
+    #[test]
+    fn floor_truncates_to_milliseconds() {
+        let t0 = Utc::now(); // sub-millisecond precision on most platforms
+        let margin = chrono::Duration::seconds(120);
+        let floor = reindex_catch_up_floor(t0, None, margin);
+        assert_eq!(floor.timestamp_subsec_nanos() % 1_000_000, 0);
+    }
+
+    #[test]
+    fn ceiling_is_now_plus_margin_for_past_stamps() {
+        let now = ts("2026-01-01T01:00:00.000Z");
+        let margin = chrono::Duration::seconds(120);
+        assert_eq!(
+            reindex_catch_up_ceiling(now, Some(now - chrono::Duration::seconds(1)), margin),
+            now + margin
+        );
+        assert_eq!(reindex_catch_up_ceiling(now, None, margin), now + margin);
+    }
+
+    #[test]
+    fn ceiling_passes_a_future_stamp() {
+        let now = ts("2026-01-01T01:00:00.000Z");
+        let margin = chrono::Duration::seconds(120);
+        let newest = now + margin + chrono::Duration::seconds(5);
+        assert_eq!(
+            reindex_catch_up_ceiling(now, Some(newest), margin),
+            newest + chrono::Duration::milliseconds(1)
+        );
+    }
+
+    #[test]
+    fn round_start_decision_round_one_always_runs() {
+        let floor = ts("2026-01-01T00:00:00.000Z");
+        let margin = chrono::Duration::seconds(120);
+        assert_eq!(
+            reindex_round_start_decision(1, floor, floor - chrono::Duration::hours(1), margin),
+            RoundStartDecision::Run
+        );
+        assert_eq!(
+            reindex_round_start_decision(1, floor, floor + chrono::Duration::hours(1), margin),
+            RoundStartDecision::Run
+        );
+    }
+
+    #[test]
+    fn round_start_decision_round_two_completes_or_runs_at_the_half_margin_boundary() {
+        let floor = ts("2026-01-01T00:02:00.000Z");
+        let margin = chrono::Duration::seconds(120);
+        let boundary = floor - margin / 2;
+        assert_eq!(
+            reindex_round_start_decision(2, floor, boundary, margin),
+            RoundStartDecision::Run
+        );
+        assert_eq!(
+            reindex_round_start_decision(2, floor, boundary - chrono::Duration::milliseconds(1), margin),
+            RoundStartDecision::Complete
+        );
+    }
+
+    #[test]
+    fn round_start_decision_caps_or_completes_past_the_round_limit() {
+        let floor = ts("2026-01-01T00:02:00.000Z");
+        let margin = chrono::Duration::seconds(120);
+        let boundary = floor - margin / 2;
+        let round = REINDEX_CATCH_UP_MAX_ROUNDS + 1;
+        assert_eq!(
+            reindex_round_start_decision(round, floor, boundary, margin),
+            RoundStartDecision::CapReached
+        );
+        assert_eq!(
+            reindex_round_start_decision(round, floor, boundary - chrono::Duration::milliseconds(1), margin),
+            RoundStartDecision::Complete
+        );
+    }
+
+    #[test]
+    fn margin_is_clamped() {
+        assert_eq!(reindex_catch_up_margin(0), chrono::Duration::seconds(1));
+        assert_eq!(reindex_catch_up_margin(120_000), chrono::Duration::seconds(120));
+        assert_eq!(reindex_catch_up_margin(u64::MAX), chrono::Duration::hours(24));
+    }
+
+    // --- Filter shapes ---
+
+    #[test]
+    fn id_page_filter_shape() {
+        let floor = ts("2026-01-01T00:00:00.000Z");
+        let first = reindex_id_page_filter("t1", "Observation", floor, None);
+        assert!(!first.contains_key("id"));
+        assert_eq!(first.get_bool("is_deleted"), Ok(false));
+        assert_eq!(
+            first.get_document("last_updated").unwrap().get("$lt"),
+            Some(&Bson::from(chrono_to_bson(floor)))
+        );
+
+        let later = reindex_id_page_filter("t1", "Observation", floor, Some("obs-010"));
+        assert_eq!(later.get_bool("is_deleted"), Ok(false));
+        assert_eq!(
+            later.get_document("last_updated").unwrap().get("$lt"),
+            Some(&Bson::from(chrono_to_bson(floor)))
+        );
+        assert_eq!(
+            later.get_document("id").unwrap().get_str("$gt"),
+            Ok("obs-010")
+        );
+    }
+
+    #[test]
+    fn catch_up_filter_shape() {
+        let floor = ts("2026-01-01T00:00:00.000Z");
+        let ceiling = ts("2026-01-01T00:02:00.000Z");
+        let first = reindex_catch_up_page_filter("t1", "Observation", floor, ceiling, None);
+        assert!(!first.contains_key("$or"));
+        let range = first.get_document("last_updated").unwrap();
+        assert_eq!(range.get("$gte"), Some(&Bson::from(chrono_to_bson(floor))));
+        assert_eq!(range.get("$lt"), Some(&Bson::from(chrono_to_bson(ceiling))));
+
+        let after_lu = ts("2026-01-01T00:01:00.000Z");
+        let continuation = reindex_catch_up_page_filter(
+            "t1",
+            "Observation",
+            floor,
+            ceiling,
+            Some((after_lu, "obs-020")),
+        );
+        assert!(!continuation.contains_key("last_updated"));
+        let or = continuation.get_array("$or").unwrap();
+        assert_eq!(or.len(), 2);
+        let first_arm_doc = or[0].as_document().unwrap();
+        assert_eq!(first_arm_doc.len(), 1, "arm 0 must hold only `last_updated`: {first_arm_doc:?}");
+        let first_arm = first_arm_doc.get_document("last_updated").unwrap();
+        assert_eq!(first_arm.get("$gt"), Some(&Bson::from(chrono_to_bson(after_lu))));
+        assert_eq!(first_arm.get("$lt"), Some(&Bson::from(chrono_to_bson(ceiling))));
+        let second_arm = or[1].as_document().unwrap();
+        assert_eq!(
+            second_arm.len(),
+            2,
+            "arm 1 must hold exactly `last_updated` and `id`: {second_arm:?}"
+        );
+        assert_eq!(
+            second_arm.get("last_updated"),
+            Some(&Bson::from(chrono_to_bson(after_lu)))
+        );
+        assert_eq!(
+            second_arm.get_document("id").unwrap().get_str("$gt"),
+            Ok("obs-020")
+        );
+    }
+
+    // --- Dedupe ---
+
+    #[test]
+    fn dedupe_keeps_the_last_occurrence_in_scan_order() {
+        let docs = vec![
+            doc! { "id": "a", "v": 1 },
+            doc! { "note": "no id" },
+            doc! { "id": "b", "v": 1 },
+            doc! { "id": "a", "v": 2 },
+        ];
+        let deduped = dedupe_reindex_page_keep_last(docs);
+        assert_eq!(deduped.len(), 3);
+        assert!(!deduped[0].contains_key("id")); // "no id" doc kept in place
+        assert_eq!(deduped[0].get_str("note"), Ok("no id"));
+        assert_eq!(deduped[1].get_str("id"), Ok("b"));
+        assert_eq!(deduped[2].get_str("id"), Ok("a"));
+        assert_eq!(deduped[2].get_i32("v"), Ok(2));
     }
 }
