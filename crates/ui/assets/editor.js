@@ -117,12 +117,14 @@
         if (toggle) toggle.classList.add("editor-json__act--on");
       }
     }
-    window.HfsEditorAdd.restorePickers(body, state.pickers);
-
-    // The server names the node the mutation created; the caret goes there.
-    // Otherwise it returns to the field that was focused before the swap.
+    // The server names the node the mutation created; the picker that
+    // created it clears its filter and shows the added signal, #1239.
     var formEl = body.querySelector("#editor-form");
     var createdPath = formEl && formEl.dataset ? formEl.dataset.focus : null;
+    window.HfsEditorAdd.restorePickers(body, state.pickers, createdPath);
+
+    // The caret goes to the node the mutation created. Otherwise it
+    // returns to the field that was focused before the swap.
     var target = createdPath ? inputByPath(createdPath) : null;
     if (target) {
       target.focus();

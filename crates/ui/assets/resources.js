@@ -133,10 +133,12 @@
         if (toggle) toggle.classList.add("editor-json__act--on");
       }
     }
-    window.HfsEditorAdd.restorePickers(editorBody, state.pickers);
-
+    // The server names the node the mutation created; the picker that
+    // created it clears its filter and shows the added signal, #1239.
     var formEl = editorBody.querySelector("#editor-form");
     var createdPath = formEl && formEl.dataset ? formEl.dataset.focus : null;
+    window.HfsEditorAdd.restorePickers(editorBody, state.pickers, createdPath);
+
     var target = createdPath ? editorNodeBy("data-set", createdPath) : null;
     if (target) {
       target.focus();
