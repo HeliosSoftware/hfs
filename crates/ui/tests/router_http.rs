@@ -7086,3 +7086,38 @@ async fn the_account_menu_is_the_shared_component_verbatim() {
          Expected to find:\n{expected}",
     );
 }
+
+/// #1239: `editor-add.js` — the shared add-picker module — must load before
+/// each host script that reads `window.HfsEditorAdd` at mount time.
+#[tokio::test]
+async fn editor_pages_load_the_shared_picker_script_before_their_own() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/editor?type=Patient&id=abc")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("/ui/assets/editor-add.js"));
+    assert!(html.contains("/ui/assets/editor.js"));
+    assert!(
+        html.find("/ui/assets/editor-add.js") < html.find("/ui/assets/editor.js"),
+        "editor-add.js must load before editor.js"
+    );
+
+    let response = app()
+        .oneshot(Request::get("/ui/resources").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("/ui/assets/editor-add.js"));
+    assert!(html.contains("/ui/assets/resources.js"));
+    assert!(
+        html.find("/ui/assets/editor-add.js") < html.find("/ui/assets/resources.js"),
+        "editor-add.js must load before resources.js"
+    );
+}

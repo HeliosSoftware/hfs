@@ -287,10 +287,12 @@
      script in this list defines, so the order below is load-bearing: the
      vendored CodeMirror 6 bundle before its shared mount helper, before
      the guided form's shared loop, before the shared editor/form pairing,
-     before either page-specific editor script. editor-form.js and
-     editor-pair.js are loaded here, not from base.html, the same as on
-     View Definitions — nothing outside this page drives the Details
-     pairing through them yet. sql-library-panels.js (#841) is last: its own
+     before either page-specific editor script. editor-add.js (#1239) loads
+     right before editor-form.js, which reads window.HfsEditorAdd when it
+     mounts. editor-form.js and editor-pair.js are loaded here, not from
+     base.html, the same as on View Definitions — nothing outside this page
+     drives the Details pairing through them yet. sql-library-panels.js
+     (#841) is last: its own
      `htmx:afterSwap` listener only ever reads `window.HfsSqlLibraryDetails`
      from inside that handler, well after every script here has already
      run, so the order relative to sql-library-details.js does not change
@@ -301,6 +303,7 @@
      matches anything on SQL Views, which render no `#lib-params` at all. -->
 <script src="/ui/assets/vendor/codemirror.bundle.js" defer></script>
 <script src="/ui/assets/code-editor.js" defer></script>
+<script src="/ui/assets/editor-add.js" defer></script>
 <script src="/ui/assets/editor-form.js" defer></script>
 <script src="/ui/assets/editor-pair.js" defer></script>
 <script src="/ui/assets/sql-editor.js" defer></script>

@@ -107,15 +107,7 @@
     if (active && editorBody.contains(active) && active.dataset && active.dataset.set) {
       state.focus = { path: active.dataset.set, start: active.selectionStart, end: active.selectionEnd };
     }
-    editorBody.querySelectorAll("details.editor-add[open]").forEach(function (box) {
-      var row = box.closest("[data-path]");
-      var filter = box.querySelector(".editor-add__filter");
-      state.pickers.push({
-        path: row ? row.dataset.path : "",
-        filter: filter ? filter.value : "",
-        focusFilter: filter === document.activeElement,
-      });
-    });
+    state.pickers = window.HfsEditorAdd.capturePickers(editorBody);
     return state;
   }
 
@@ -141,19 +133,7 @@
         if (toggle) toggle.classList.add("editor-json__act--on");
       }
     }
-    state.pickers.forEach(function (saved) {
-      var row = saved.path ? editorNodeBy("data-path", saved.path) : editorBody;
-      if (!row) return;
-      var box = row.querySelector("details.editor-add");
-      if (!box) return;
-      box.setAttribute("open", "");
-      var filter = box.querySelector(".editor-add__filter");
-      if (filter && saved.filter) {
-        filter.value = saved.filter;
-        filter.dispatchEvent(new Event("input", { bubbles: true }));
-      }
-      if (saved.focusFilter && filter) filter.focus();
-    });
+    window.HfsEditorAdd.restorePickers(editorBody, state.pickers);
 
     var formEl = editorBody.querySelector("#editor-form");
     var createdPath = formEl && formEl.dataset ? formEl.dataset.focus : null;
@@ -201,8 +181,7 @@
     if (rm) { editorSend("remove", { path: rm.dataset.remove }); return; }
     var ext = event.target.closest("[data-extension]");
     if (ext) {
-      var panel = ext.closest(".editor-add__ext");
-      var url = ext.dataset.url || (panel ? panel.querySelector(".editor-add__ext-url").value.trim() : "");
+      var url = window.HfsEditorAdd.extensionUrl(ext);
       editorSend("extension", { path: ext.dataset.extension, url: url });
     }
   });
@@ -268,14 +247,8 @@
     editorSend("set", { path: input.dataset.set, value: input.value });
   }, true);
 
-  editorBody.addEventListener("input", function (event) {
-    var filter = event.target.closest(".editor-add__filter");
-    if (!filter) return;
-    var needle = filter.value.trim().toLowerCase();
-    filter.closest(".editor-add__panel").querySelectorAll("[data-add-name]").forEach(function (item) {
-      item.hidden = needle && item.dataset.addName.toLowerCase().indexOf(needle) < 0;
-    });
-  });
+  /* The add-picker's own typeahead over the "add" list (#1239). */
+  window.HfsEditorAdd.attach(editorBody);
 
   function openResource(type, id) {
     current = { type: type, id: id };
