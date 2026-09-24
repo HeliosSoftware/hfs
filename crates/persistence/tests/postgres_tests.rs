@@ -78,6 +78,11 @@ mod date_minute_index_suite;
 #[path = "search/ap_prefix_suite.rs"]
 mod ap_prefix_suite;
 
+/// The backend-agnostic `ap` suite for composites, chains and `_filter`
+/// (#1390). Same `#[path]` arrangement.
+#[path = "search/ap_relations_suite.rs"]
+mod ap_relations_suite;
+
 /// The backend-agnostic suite for exponent-form number and quantity search
 /// values (#1337). Same `#[path]` arrangement.
 #[path = "search/number_exponent_suite.rs"]
@@ -26455,6 +26460,21 @@ mod postgres_integration {
     async fn postgres_integration_ap_prefix_suite() {
         let backend = create_backend().await;
         super::ap_prefix_suite::ap_prefix(&backend, &unique_base("ap_prefix"), true).await;
+    }
+
+    /// #1390: `ap` in the quantity and date components of a composite.
+    #[tokio::test]
+    async fn postgres_integration_ap_composite() {
+        let backend = create_backend().await;
+        super::ap_relations_suite::ap_composite(&backend, &unique_base("ap_composite")).await;
+    }
+
+    /// #1390: `ap` on the terminal of a chain and of `_has` is measured from
+    /// the outer query's `now`.
+    #[tokio::test]
+    async fn postgres_integration_ap_chained() {
+        let backend = create_backend().await;
+        super::ap_relations_suite::ap_chained(&backend, &unique_base("ap_chained")).await;
     }
 
     /// #1379: `gender=<system>|female` never matched a `code` element.

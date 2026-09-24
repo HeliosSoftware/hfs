@@ -686,6 +686,11 @@ mod contained_suite;
 #[path = "search/ap_prefix_suite.rs"]
 mod ap_prefix_suite;
 
+/// The backend-agnostic `ap` suite for composites, chains and `_filter`
+/// (#1390). Same `#[path]` arrangement.
+#[path = "search/ap_relations_suite.rs"]
+mod ap_relations_suite;
+
 /// The backend-agnostic suite for exponent-form number and quantity search
 /// values (#1337). Same `#[path]` arrangement.
 #[path = "search/number_exponent_suite.rs"]
@@ -1091,6 +1096,14 @@ mod es_integration {
     async fn es_ap_prefix_suite() {
         let backend = create_backend().await;
         super::ap_prefix_suite::ap_prefix(&backend, "ap-prefix-1390", true).await;
+    }
+
+    /// #1390: `ap` in the quantity and date components of a composite.
+    /// Elasticsearch rejects chains and `_has`, so there is no chained case.
+    #[tokio::test]
+    async fn es_ap_composite() {
+        let backend = create_backend().await;
+        super::ap_relations_suite::ap_composite(&backend, "ap-composite-1390").await;
     }
 
     /// #1340: a number that did not parse made the handler return `None`,

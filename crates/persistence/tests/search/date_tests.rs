@@ -301,6 +301,32 @@ async fn test_ap_prefix_suite() {
     super::ap_prefix_suite::ap_prefix(&backend, "ap-prefix", true).await;
 }
 
+/// `ap` in the quantity and date components of a composite (#1390);
+/// PostgreSQL, MongoDB and Elasticsearch run the same tables.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_ap_composite_suite() {
+    let backend = super::make_sqlite_backend();
+    super::ap_relations_suite::ap_composite(&backend, "ap-composite").await;
+}
+
+/// `ap` on the terminal of a chain and of `_has` is measured from the outer
+/// query's `now` (#1390); PostgreSQL runs the same table.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_ap_chained_suite() {
+    let backend = super::make_sqlite_backend();
+    super::ap_relations_suite::ap_chained(&backend, "ap-chained").await;
+}
+
+/// `_filter` date `ap` end to end (#1390). `_filter` is SQLite-only.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_ap_filter_date_suite() {
+    let backend = super::make_sqlite_backend();
+    super::ap_relations_suite::ap_filter_date(&backend, "ap-filter").await;
+}
+
 /// The shared table for stored dateTimes with minutes but no seconds (#1315);
 /// PostgreSQL and MongoDB run the same one. SQLite never had the gap — it
 /// indexes the text as stored and `strftime` reads `hh:mm` — so this pins it.

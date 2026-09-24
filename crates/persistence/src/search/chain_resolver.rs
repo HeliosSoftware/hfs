@@ -1284,6 +1284,134 @@ mod tests {
         assert_eq!(run(&b, &t, &q).await, ["pr3", "pr4"]);
     }
 
+    /// #1390: the `now` an `ap` date window is measured from reaches the
+    /// terminal sub-search of a chain — from the outer query, or from
+    /// `ChainResolveOptions::now`, which takes precedence — and the wall clock
+    /// is never read.
+    #[tokio::test]
+    async fn forward_chain_ap_uses_the_pinned_now() {
+        use chrono::{TimeZone, Utc};
+
+        let b = backend();
+        let t = tenant();
+        let years = [2013, 2015, 2016, 2017, 2019, 2036, 2039, 2041, 2044];
+        for year in years {
+            let resources = [
+                json!({ "resourceType": "Patient", "id": format!("ap-p-{year}"),
+                        "birthDate": format!("{year}-06-15") }),
+                json!({ "resourceType": "Procedure", "id": format!("ap-d-{year}"),
+                        "status": "completed",
+                        "subject": { "reference": format!("Patient/ap-p-{year}") },
+                        "performedDateTime": format!("{year}-06-15T12:00:00Z") }),
+            ];
+            for resource in resources {
+                let resource_type = resource["resourceType"].as_str().unwrap().to_string();
+                b.create(&t, &resource_type, resource, FhirVersion::default())
+                    .await
+                    .unwrap();
+            }
+        }
+        let procedures =
+            |years: &[i32]| -> Vec<String> { years.iter().map(|y| format!("ap-d-{y}")).collect() };
+        let at = |year, month, day| Utc.with_ymd_and_hms(year, month, day, 0, 0, 0).unwrap();
+
+        // The terminal's rewritten `_id` values, sorted.
+        let resolved_ids = |rewritten: &SearchQuery| -> Vec<String> {
+            let mut ids: Vec<String> = rewritten
+                .parameters
+                .iter()
+                .filter(|p| p.name == "_id")
+                .flat_map(|p| p.values.iter().map(|v| v.value.clone()))
+                .collect();
+            ids.sort();
+            ids
+        };
+        let q = forward("Procedure", SUBJECT_BIRTHDATE, &["ap2016"]);
+
+        // Positive control: without `ap` the same chain resolves the range.
+        let control = forward("Procedure", SUBJECT_BIRTHDATE, &["ge1900-01-01"]);
+        let rewritten = resolve_chains(&b, &t, &control.with_now(at(2026, 1, 1)))
+            .await
+            .unwrap();
+        assert_eq!(resolved_ids(&rewritten), procedures(&years));
+
+        // [2016, 2017) is 3287 days before 2026-01-01: a 328.7-day margin,
+        // [~2015-02-06, ~2017-11-25).
+        let narrow = resolve_chains_with(
+            &b,
+            &t,
+            &q.clone().with_now(at(2026, 1, 1)),
+            ChainResolveOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved_ids(&narrow), procedures(&[2015, 2016, 2017]));
+
+        // From 2046-01-01 the margin is 1059 days: [~2013-02-05, ~2019-11-26).
+        let wide = resolve_chains_with(
+            &b,
+            &t,
+            &q.clone().with_now(at(2046, 1, 1)),
+            ChainResolveOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resolved_ids(&wide),
+            procedures(&[2013, 2015, 2016, 2017, 2019])
+        );
+
+        // `resolve_chains` is `resolve_chains_with` and the default options.
+        let wide_again = resolve_chains(&b, &t, &q.clone().with_now(at(2046, 1, 1)))
+            .await
+            .unwrap();
+        assert_eq!(resolved_ids(&wide_again), resolved_ids(&wide));
+
+        // `options.now` wins over the outer query's, both ways round.
+        let options = ChainResolveOptions {
+            now: Some(at(2046, 1, 1)),
+            ..Default::default()
+        };
+        let overridden = resolve_chains_with(&b, &t, &q.clone().with_now(at(2026, 1, 1)), options)
+            .await
+            .unwrap();
+        assert_eq!(resolved_ids(&overridden), resolved_ids(&wide));
+        let options = ChainResolveOptions {
+            now: Some(at(2026, 1, 1)),
+            ..Default::default()
+        };
+        let overridden = resolve_chains_with(&b, &t, &q.clone().with_now(at(2046, 1, 1)), options)
+            .await
+            .unwrap();
+        assert_eq!(resolved_ids(&overridden), resolved_ids(&narrow));
+
+        // `now` inside the range: no margin at all.
+        let inside = resolve_chains(&b, &t, &q.with_now(at(2016, 6, 1)))
+            .await
+            .unwrap();
+        assert_eq!(resolved_ids(&inside), procedures(&[2016]));
+
+        // The same holds for `_has`.
+        let reverse = has("Patient", "Procedure", "subject", "date", "ap2016");
+        let narrow_has = resolve_chains(&b, &t, &reverse.clone().with_now(at(2026, 1, 1)))
+            .await
+            .unwrap();
+        let expected =
+            |years: &[i32]| -> Vec<String> { years.iter().map(|y| format!("ap-p-{y}")).collect() };
+        assert_eq!(resolved_ids(&narrow_has), expected(&[2015, 2016, 2017]));
+        let options = ChainResolveOptions {
+            now: Some(at(2046, 1, 1)),
+            ..Default::default()
+        };
+        let wide_has = resolve_chains_with(&b, &t, &reverse.with_now(at(2026, 1, 1)), options)
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved_ids(&wide_has),
+            expected(&[2013, 2015, 2016, 2017, 2019])
+        );
+    }
+
     #[tokio::test]
     async fn forward_chain_quantity_prefix() {
         let b = backend();

@@ -599,6 +599,11 @@ async fn mongodb_contained_sort_and_id_only_contained() {
 #[path = "search/ap_prefix_suite.rs"]
 mod ap_prefix_suite;
 
+/// The backend-agnostic `ap` suite for composites, chains and `_filter`
+/// (#1390). Same `#[path]` arrangement.
+#[path = "search/ap_relations_suite.rs"]
+mod ap_relations_suite;
+
 /// The backend-agnostic suite for exponent-form number and quantity search
 /// values (#1337). Same `#[path]` arrangement.
 #[path = "search/number_exponent_suite.rs"]
@@ -631,6 +636,96 @@ async fn mongodb_ap_prefix_suite() {
         return;
     };
     ap_prefix_suite::ap_prefix(&backend, "ap-prefix-1390", false).await;
+}
+
+/// #1390: `ap` in the quantity and date components of a composite. Needs the
+/// full registry so the composites and their components extract. MongoDB
+/// rejects chains and `_has`, so there is no chained case.
+#[tokio::test]
+async fn mongodb_ap_composite() {
+    let Some(backend) = create_backend_with_full_registry("ap_composite").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    ap_relations_suite::ap_composite(&backend, "ap-composite-1390").await;
+}
+
+/// #1390: an `ifNoneExist` criterion with an `ap` date is matched through the
+/// same shared window as a search, measured from one instant per match.
+///
+/// The matcher reads the wall clock, so the cases sit far enough from it that
+/// the answer does not depend on when the test runs: `ap2016` is widened by a
+/// tenth of its distance to today (about a year, and more as time passes),
+/// which holds a June 2016 procedure and never reaches one in 2010's window.
+#[tokio::test]
+async fn mongodb_if_none_exist_ap_date() {
+    let Some(backend) = create_backend_with_full_registry("if_none_exist_ap").await else {
+        eprintln!(
+            "Skipping mongodb_if_none_exist_ap_date (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-if-none-exist-ap");
+    let name = "mongodb_if_none_exist_ap_date";
+
+    let existing = backend
+        .create(
+            &tenant,
+            "Procedure",
+            json!({
+                "resourceType": "Procedure",
+                "status": "completed",
+                "subject": {"reference": "Patient/ap-subject"},
+                "performedDateTime": "2016-06-15T12:00:00Z"
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let conditional_create = |criteria: &str| {
+        vec![BundleEntry {
+            method: BundleMethod::Post,
+            url: "Procedure".to_string(),
+            resource: Some(json!({
+                "resourceType": "Procedure",
+                "status": "completed",
+                "subject": {"reference": "Patient/ap-subject"},
+                "performedDateTime": "2016-06-16T12:00:00Z"
+            })),
+            if_match: None,
+            if_none_match: None,
+            if_none_exist: Some(criteria.to_string()),
+            full_url: None,
+        }]
+    };
+
+    // Inside the widened window: the existing procedure is the match.
+    let Some(matched) =
+        process_transaction_or_skip(&backend, &tenant, conditional_create("date=ap2016"), name)
+            .await
+    else {
+        return;
+    };
+    assert_eq!(matched.entries[0].status, 200, "date=ap2016 must match");
+    assert_eq!(matched.entries[0].effect, BundleEntryEffect::NoOp);
+    assert!(
+        matched.entries[0]
+            .location
+            .as_deref()
+            .is_some_and(|l| l.contains(existing.id())),
+        "the 200 entry must name the existing procedure, got {:?}",
+        matched.entries[0].location
+    );
+
+    // Far outside it: nothing matches, so the create goes ahead.
+    let Some(created) =
+        process_transaction_or_skip(&backend, &tenant, conditional_create("date=ap2010"), name)
+            .await
+    else {
+        return;
+    };
+    assert_eq!(created.entries[0].status, 201, "date=ap2010 must not match");
 }
 
 /// The backend-agnostic number / quantity validation suite (#1319, #1340).
