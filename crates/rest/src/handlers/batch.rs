@@ -763,6 +763,16 @@ where
             Ok((StatusCode::OK, Json(response_bundle)).into_response())
         }
         Err(e) => {
+            let e = match e {
+                TransactionError::BundleError { index, message } => {
+                    let index = indexed_entries
+                        .get(index)
+                        .map(|(orig_idx, _, _)| *orig_idx)
+                        .unwrap_or(index);
+                    TransactionError::BundleError { index, message }
+                }
+                other => other,
+            };
             // Derive a sanitized reason so backend detail carried by a
             // rolled-back/internal transaction error never reaches the client
             // response, the audit trail, or the entry outcome. The raw detail is

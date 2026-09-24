@@ -1589,6 +1589,45 @@ mod conditional_entries {
         assert_eq!(patient_count(&backend).await, 2);
     }
 
+    #[tokio::test]
+    async fn transaction_failure_names_the_clients_entry_index() {
+        let (server, backend) = create_test_server().await;
+        seed_patient_with_identifier(&backend, "p1", "One").await;
+        seed_patient_with_identifier(&backend, "p2", "Two").await;
+        let before = patient_count(&backend).await;
+
+        let response = post_bundle(
+            &server,
+            json!({
+                "resourceType": "Bundle",
+                "type": "transaction",
+                "entry": [
+                    {
+                        "request": { "method": "PUT", "url": "Patient/px" },
+                        "resource": {
+                            "resourceType": "Patient",
+                            "id": "px",
+                            "name": [{"family": "Valid"}]
+                        }
+                    },
+                    if_none_exist_post("identifier=http://example.org|12345", "Third", None)
+                ]
+            }),
+        )
+        .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let body: Value = response.json();
+        let text = body["issue"][0]["details"]["text"]
+            .as_str()
+            .expect("outcome text");
+        assert!(
+            text.contains("entry 1"),
+            "the failing entry is the client's entry 1: {text}"
+        );
+        assert_eq!(patient_count(&backend).await, before);
+    }
+
     /// The transaction executor resolves `ifNoneExist` inside the transaction:
     /// the same transaction twice creates once, and on the replay a `urn:uuid`
     /// reference to the matched entry resolves to the match.
