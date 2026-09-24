@@ -8267,6 +8267,85 @@ mod postgres_integration {
         );
     }
 
+    /// #1344: a criterion naming a search parameter the server does not know
+    /// (`identifer` for `identifier`) used to match nothing, so a conditional
+    /// create made a duplicate and a conditional delete answered as if there
+    /// had been nothing to delete. It is refused, and nothing is written.
+    #[tokio::test]
+    async fn postgres_integration_conditional_writes_refuse_an_unknown_parameter() {
+        use helios_persistence::core::{ConditionalStorage, EntityTagPrecondition};
+        use helios_persistence::error::{SearchError, StorageError};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant-unknown-criterion");
+        let criteria = "identifer=http://hospital.org/mrn|MRN-UNKNOWN-1";
+        let patient = json!({
+            "resourceType": "Patient",
+            "identifier": [{"system": "http://hospital.org/mrn", "value": "MRN-UNKNOWN-1"}],
+            "name": [{"family": "Original"}]
+        });
+
+        backend
+            .create(&tenant, "Patient", patient.clone(), FhirVersion::default())
+            .await
+            .unwrap();
+
+        let is_refused = |error: &StorageError, context: &str| {
+            assert!(
+                matches!(
+                    error,
+                    StorageError::Search(SearchError::QueryParseError { message })
+                        if message.contains("'identifer'")
+                ),
+                "{context}: expected a QueryParseError naming 'identifer', got {error:?}"
+            );
+        };
+
+        let created = backend
+            .conditional_create(
+                &tenant,
+                "Patient",
+                patient.clone(),
+                criteria,
+                FhirVersion::default(),
+            )
+            .await;
+        is_refused(
+            &created.expect_err("conditional create"),
+            "conditional create",
+        );
+
+        let updated = backend
+            .conditional_update(
+                &tenant,
+                "Patient",
+                patient,
+                criteria,
+                true,
+                FhirVersion::default(),
+                &EntityTagPrecondition::Absent,
+            )
+            .await;
+        is_refused(
+            &updated.expect_err("conditional update"),
+            "conditional update",
+        );
+
+        let deleted = backend
+            .conditional_delete(&tenant, "Patient", criteria, &EntityTagPrecondition::Absent)
+            .await;
+        is_refused(
+            &deleted.expect_err("conditional delete"),
+            "conditional delete",
+        );
+
+        assert_eq!(
+            backend.count(&tenant, Some("Patient")).await.unwrap(),
+            1,
+            "nothing was written or deleted"
+        );
+    }
+
     #[tokio::test]
     async fn postgres_integration_conditional_create_multiple_matches() {
         use helios_persistence::core::{ConditionalCreateResult, ConditionalStorage};
