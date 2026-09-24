@@ -12524,7 +12524,10 @@ mod bulk_submit {
             .await
             .unwrap()
             .expect("schema version document");
-        assert_eq!(schema_version.get_i32("version").unwrap(), 10_i32);
+        assert_eq!(
+            schema_version.get_i32("version").unwrap(),
+            helios_persistence::backends::mongodb::SCHEMA_VERSION
+        );
 
         let receipt_indexes: Vec<_> = entry_results
             .list_indexes()

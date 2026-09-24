@@ -25,6 +25,7 @@ mod composite_search;
 mod login_sessions;
 mod retry;
 pub(crate) mod schema;
+pub use schema::SCHEMA_VERSION;
 mod search_impl;
 pub(crate) mod search_index_builder;
 pub(crate) mod search_index_catalog;
