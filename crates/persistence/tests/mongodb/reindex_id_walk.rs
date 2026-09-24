@@ -6,10 +6,10 @@
 //! `mongodb_tests.rs`, not a standalone test binary.
 
 use super::*;
-use std::collections::{BTreeMap, BTreeSet};
-use mongodb::bson::{DateTime as BsonDateTime, Document};
 use helios_persistence::error::StorageResult;
 use helios_persistence::search::{ReindexOperation, ReindexRequest, ReindexSource, ReindexTarget};
+use mongodb::bson::{DateTime as BsonDateTime, Document};
+use std::collections::{BTreeMap, BTreeSet};
 
 // `ReindexSource` and `ReindexTarget` must be in scope for dot-call syntax
 // (`x.fetch_resources_page(..)`, `x.write_search_entries_page(..)`, ...);
@@ -93,7 +93,10 @@ async fn seed_walk_fixture(
 
     for id in ["Z", "a.1"] {
         backend.delete(tenant, "Patient", id).await.unwrap();
-        tombstones.entry("Patient".to_string()).or_default().insert(id.to_string());
+        tombstones
+            .entry("Patient".to_string())
+            .or_default()
+            .insert(id.to_string());
     }
     for i in 0..observations {
         if i % 100 == 5 {
@@ -143,7 +146,13 @@ async fn backdate_fixture(backend: &MongoBackend, tenant: &TenantContext, fixtur
         .unwrap_or_default()
         .into_iter()
         .collect();
-    patient_ids.extend(fixture.tombstones.get("Patient").cloned().unwrap_or_default());
+    patient_ids.extend(
+        fixture
+            .tombstones
+            .get("Patient")
+            .cloned()
+            .unwrap_or_default(),
+    );
     if !patient_ids.is_empty() {
         resources
             .update_many(
@@ -165,8 +174,15 @@ async fn backdate_fixture(backend: &MongoBackend, tenant: &TenantContext, fixtur
     }
 
     let mut obs_by_group: [Vec<String>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-    let mut all_obs: BTreeSet<String> = fixture.live.get("Observation").cloned().unwrap_or_default();
-    all_obs.extend(fixture.tombstones.get("Observation").cloned().unwrap_or_default());
+    let mut all_obs: BTreeSet<String> =
+        fixture.live.get("Observation").cloned().unwrap_or_default();
+    all_obs.extend(
+        fixture
+            .tombstones
+            .get("Observation")
+            .cloned()
+            .unwrap_or_default(),
+    );
     for id in &all_obs {
         let i: usize = id.trim_start_matches("obs-").parse().unwrap();
         obs_by_group[i % 3].push(id.clone());
@@ -196,7 +212,9 @@ async fn backdate_fixture(backend: &MongoBackend, tenant: &TenantContext, fixtur
 }
 
 fn ts(s: &str) -> chrono::DateTime<chrono::Utc> {
-    chrono::DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&chrono::Utc)
+    chrono::DateTime::parse_from_rfc3339(s)
+        .unwrap()
+        .with_timezone(&chrono::Utc)
 }
 
 // ===========================================================================
@@ -216,7 +234,12 @@ async fn mongodb_reindex_id_walk_returns_each_live_resource_once_in_byte_order()
     backdate_fixture(&backend, &tenant_a, &fixture_a).await;
     backdate_fixture(&backend, &tenant_b, &fixture_b).await;
 
-    async fn walk_all(backend: &MongoBackend, tenant: &TenantContext, resource_type: &str, limit: u32) -> Vec<String> {
+    async fn walk_all(
+        backend: &MongoBackend,
+        tenant: &TenantContext,
+        resource_type: &str,
+        limit: u32,
+    ) -> Vec<String> {
         let mut ids = Vec::new();
         let mut cursor: Option<String> = None;
         for _ in 0..40 {
@@ -228,7 +251,10 @@ async fn mongodb_reindex_id_walk_returns_each_live_resource_once_in_byte_order()
             ids.extend(page.resources.iter().map(|r| r.id().to_string()));
             match page.next_cursor {
                 Some(next) => {
-                    assert!(!empty, "every page but the trailing one must return at least one resource");
+                    assert!(
+                        !empty,
+                        "every page but the trailing one must return at least one resource"
+                    );
                     cursor = Some(next);
                 }
                 None => {
@@ -241,7 +267,13 @@ async fn mongodb_reindex_id_walk_returns_each_live_resource_once_in_byte_order()
     }
 
     let patient_ids = walk_all(&backend, &tenant_a, "Patient", 3).await;
-    let expected_patients: Vec<String> = fixture_a.live.get("Patient").unwrap().iter().cloned().collect();
+    let expected_patients: Vec<String> = fixture_a
+        .live
+        .get("Patient")
+        .unwrap()
+        .iter()
+        .cloned()
+        .collect();
     assert_eq!(patient_ids, expected_patients);
     assert!(patient_ids.contains(&"only-in-a".to_string()));
     assert!(!patient_ids.contains(&"only-in-b".to_string()));
@@ -249,7 +281,13 @@ async fn mongodb_reindex_id_walk_returns_each_live_resource_once_in_byte_order()
     assert!(!patient_ids.contains(&"a.1".to_string()));
 
     let obs_ids = walk_all(&backend, &tenant_a, "Observation", 7).await;
-    let expected_obs: Vec<String> = fixture_a.live.get("Observation").unwrap().iter().cloned().collect();
+    let expected_obs: Vec<String> = fixture_a
+        .live
+        .get("Observation")
+        .unwrap()
+        .iter()
+        .cloned()
+        .collect();
     assert_eq!(obs_ids, expected_obs);
     assert_eq!(obs_ids.len(), 19);
     assert!(!obs_ids.contains(&"obs-005".to_string()));
@@ -366,8 +404,7 @@ async fn snapshot(
 fn capture_walk_logs() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
-        let writer =
-            tracing_test::internal::MockWriter::new(tracing_test::internal::global_buf());
+        let writer = tracing_test::internal::MockWriter::new(tracing_test::internal::global_buf());
         let dispatch = tracing_test::internal::get_subscriber(
             writer,
             "helios_persistence::backends::mongodb::storage=debug",
@@ -396,10 +433,7 @@ struct LegacyWalkSource {
 
 #[async_trait::async_trait]
 impl helios_persistence::search::ReindexSource for LegacyWalkSource {
-    async fn list_resource_types(
-        &self,
-        tenant: &TenantContext,
-    ) -> StorageResult<Vec<String>> {
+    async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
         self.backend.list_resource_types(tenant).await
     }
 
@@ -426,11 +460,13 @@ impl helios_persistence::search::ReindexSource for LegacyWalkSource {
             .sort(doc! { "last_updated": 1, "id": 1 })
             .limit(limit as i64)
             .await
-            .map_err(|e| StorageError::Backend(BackendError::Internal {
-                backend_name: "mongodb".to_string(),
-                message: format!("legacy walk find: {e}"),
-                source: None,
-            }))?;
+            .map_err(|e| {
+                StorageError::Backend(BackendError::Internal {
+                    backend_name: "mongodb".to_string(),
+                    message: format!("legacy walk find: {e}"),
+                    source: None,
+                })
+            })?;
         let mut docs: Vec<Document> = Vec::new();
         while stream.advance().await.map_err(|e| {
             StorageError::Backend(BackendError::Internal {
@@ -453,7 +489,9 @@ impl helios_persistence::search::ReindexSource for LegacyWalkSource {
             (true, Some(last)) => {
                 let dt = last.get_datetime("last_updated").unwrap();
                 let id = last.get_str("id").unwrap();
-                let lu = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(dt.timestamp_millis()).unwrap();
+                let lu =
+                    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(dt.timestamp_millis())
+                        .unwrap();
                 Some(format!("{}|{}", lu.to_rfc3339(), id))
             }
             _ => None,
@@ -463,7 +501,9 @@ impl helios_persistence::search::ReindexSource for LegacyWalkSource {
             .iter()
             .map(|d| {
                 let dt = d.get_datetime("last_updated").unwrap();
-                let lu = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(dt.timestamp_millis()).unwrap();
+                let lu =
+                    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(dt.timestamp_millis())
+                        .unwrap();
                 let data = d.get_document("data").unwrap();
                 let content: serde_json::Value =
                     mongodb::bson::from_document(data.clone()).unwrap();
@@ -551,14 +591,23 @@ async fn mongodb_reindex_id_walk_matches_the_legacy_walk_row_for_row() {
             .with_batch_size(40)
     };
 
-    let legacy_source = Arc::new(LegacyWalkSource { backend: backend.clone() });
-    let legacy_op = ReindexOperation::with_parts(legacy_source, vec![backend.clone()], regs.clone());
-    let legacy_job = legacy_op.start(tenant_a.clone(), request(), None).await.unwrap();
+    let legacy_source = Arc::new(LegacyWalkSource {
+        backend: backend.clone(),
+    });
+    let legacy_op =
+        ReindexOperation::with_parts(legacy_source, vec![backend.clone()], regs.clone());
+    let legacy_job = legacy_op
+        .start(tenant_a.clone(), request(), None)
+        .await
+        .unwrap();
     let legacy_progress = wait_for_terminal(&legacy_op, &legacy_job).await;
     let s_old = snapshot(&db, "walk-a", false).await;
 
     let new_op = ReindexOperation::new(backend.clone(), regs.clone());
-    let new_job = new_op.start(tenant_a.clone(), request(), None).await.unwrap();
+    let new_job = new_op
+        .start(tenant_a.clone(), request(), None)
+        .await
+        .unwrap();
     let new_progress = wait_for_terminal(&new_op, &new_job).await;
     let s_new = snapshot(&db, "walk-a", false).await;
 
@@ -571,25 +620,41 @@ async fn mongodb_reindex_id_walk_matches_the_legacy_walk_row_for_row() {
     assert_eq!(snapshot(&db, "walk-b", false).await, s_crud_b);
 
     for progress in [&legacy_progress, &new_progress] {
-        assert_eq!(progress.status, helios_persistence::search::ReindexStatus::Completed);
+        assert_eq!(
+            progress.status,
+            helios_persistence::search::ReindexStatus::Completed
+        );
         assert!(progress.errors.is_empty());
         assert_eq!(progress.processed_resources, progress.total_resources);
         assert_eq!(progress.processed_resources, 297 + 10);
     }
-    assert_eq!(legacy_progress.entries_created, new_progress.entries_created);
+    assert_eq!(
+        legacy_progress.entries_created,
+        new_progress.entries_created
+    );
 
-    let obs_started =
-        walk_log_lines(&["tenant=walk-a", "resource_type=Observation", "mongodb reindex walk started"]);
+    let obs_started = walk_log_lines(&[
+        "tenant=walk-a",
+        "resource_type=Observation",
+        "mongodb reindex walk started",
+    ]);
     assert!(
-        obs_started.iter().any(|l| l.contains("newest_live=2020-01-01T00:00:02.000Z")
-            && l.contains("floor=2020-01-01T00:00:02.001Z")),
+        obs_started
+            .iter()
+            .any(|l| l.contains("newest_live=2020-01-01T00:00:02.000Z")
+                && l.contains("floor=2020-01-01T00:00:02.001Z")),
         "{obs_started:?}"
     );
-    let patient_started =
-        walk_log_lines(&["tenant=walk-a", "resource_type=Patient", "mongodb reindex walk started"]);
+    let patient_started = walk_log_lines(&[
+        "tenant=walk-a",
+        "resource_type=Patient",
+        "mongodb reindex walk started",
+    ]);
     assert!(
-        patient_started.iter().any(|l| l.contains("newest_live=2020-01-01T00:00:03.000Z")
-            && l.contains("floor=2020-01-01T00:00:03.001Z")),
+        patient_started
+            .iter()
+            .any(|l| l.contains("newest_live=2020-01-01T00:00:03.000Z")
+                && l.contains("floor=2020-01-01T00:00:03.001Z")),
         "{patient_started:?}"
     );
     for rt in ["Observation", "Patient"] {
@@ -599,11 +664,21 @@ async fn mongodb_reindex_id_walk_matches_the_legacy_walk_row_for_row() {
             "mongodb reindex catch-up round finished",
             "round=1",
         ]);
-        assert!(finished.iter().any(|l| l.contains("walked=0")), "{rt}: {finished:?}");
+        assert!(
+            finished.iter().any(|l| l.contains("walked=0")),
+            "{rt}: {finished:?}"
+        );
     }
 
     // Rerun without clear_existing: no duplicates should appear.
-    let rerun_job = new_op.start(tenant_a.clone(), ReindexRequest::for_types(["Observation", "Patient"]).with_batch_size(40), None).await.unwrap();
+    let rerun_job = new_op
+        .start(
+            tenant_a.clone(),
+            ReindexRequest::for_types(["Observation", "Patient"]).with_batch_size(40),
+            None,
+        )
+        .await
+        .unwrap();
     wait_for_terminal(&new_op, &rerun_job).await;
     assert_eq!(snapshot(&db, "walk-a", false).await, s_crud_a);
 }
@@ -743,7 +818,7 @@ async fn mongodb_reindex_id_walk_pages_plan_without_a_blocking_sort() {
 
         let is_probe = sort == Some(&doc! { "last_updated": -1_i32, "id": -1_i32 });
         match hint {
-            Some(h) if h == "idx_resources_identity" => {
+            Some("idx_resources_identity") => {
                 id_queries += 1;
                 assert!(!has_sort_stage, "id query used a blocking sort");
                 assert!(!has_sort, "id query plan has a SORT stage");
@@ -751,7 +826,10 @@ async fn mongodb_reindex_id_walk_pages_plan_without_a_blocking_sort() {
                     !names.is_empty() && names.iter().all(|n| n == "idx_resources_identity"),
                     "{names:?}"
                 );
-                assert!(keys_examined <= 20 + 3 + 50 + 1, "id query examined {keys_examined} keys");
+                assert!(
+                    keys_examined <= 20 + 3 + 50 + 1,
+                    "id query examined {keys_examined} keys"
+                );
             }
             Some(h) if h == "idx_resources_type_scan" && is_probe => {
                 probes += 1;
@@ -763,7 +841,7 @@ async fn mongodb_reindex_id_walk_pages_plan_without_a_blocking_sort() {
                 assert!(keys_examined <= 2, "probe examined {keys_examined} keys");
                 assert_eq!(docs_examined, 0, "the probe must be covered");
             }
-            Some(h) if h == "idx_resources_type_scan" => {
+            Some("idx_resources_type_scan") => {
                 round_queries += 1;
                 // A round's continuation query plans as SORT_MERGE of two
                 // IXSCANs of the same index (run 17's measured plan, S2 §4.3),
@@ -773,7 +851,10 @@ async fn mongodb_reindex_id_walk_pages_plan_without_a_blocking_sort() {
                     !names.is_empty() && names.iter().all(|n| n == "idx_resources_type_scan"),
                     "{names:?}"
                 );
-                assert!(!has_sort, "round query plan has a SORT stage (SORT_MERGE is fine)");
+                assert!(
+                    !has_sort,
+                    "round query plan has a SORT stage (SORT_MERGE is fine)"
+                );
                 assert!(!has_sort_stage);
                 assert!(
                     keys_examined <= 20 + 2,
@@ -791,9 +872,15 @@ async fn mongodb_reindex_id_walk_pages_plan_without_a_blocking_sort() {
         }
     }
 
-    assert!(id_queries >= 13, "expected at least 13 id queries, got {id_queries}");
+    assert!(
+        id_queries >= 13,
+        "expected at least 13 id queries, got {id_queries}"
+    );
     assert!(probes >= 2, "expected at least 2 probes, got {probes}");
-    assert!(round_queries >= 4, "expected at least 4 round queries, got {round_queries}");
+    assert!(
+        round_queries >= 4,
+        "expected at least 4 round queries, got {round_queries}"
+    );
     assert!(
         round_queries_with_or >= 3,
         "expected at least 3 round queries carrying $or, got {round_queries_with_or}"
@@ -839,7 +926,11 @@ impl helios_persistence::search::ReindexSource for MutatingSource {
         self.inner.list_resource_types(tenant).await
     }
 
-    async fn count_resources(&self, tenant: &TenantContext, resource_type: &str) -> StorageResult<u64> {
+    async fn count_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+    ) -> StorageResult<u64> {
         self.inner.count_resources(tenant, resource_type).await
     }
 
@@ -850,7 +941,10 @@ impl helios_persistence::search::ReindexSource for MutatingSource {
         cursor: Option<&str>,
         limit: u32,
     ) -> StorageResult<helios_persistence::search::ResourcePage> {
-        let page = self.inner.fetch_resources_page(tenant, resource_type, cursor, limit).await?;
+        let page = self
+            .inner
+            .fetch_resources_page(tenant, resource_type, cursor, limit)
+            .await?;
         if !self.fired.load(std::sync::atomic::Ordering::SeqCst)
             && page.resources.iter().any(|r| r.id() == self.trigger_id)
         {
@@ -897,7 +991,9 @@ impl helios_persistence::search::ReindexTarget for RecordingTarget {
         resource_type: &str,
         resource_id: &str,
     ) -> StorageResult<u64> {
-        self.inner.delete_search_entries(tenant, resource_type, resource_id).await
+        self.inner
+            .delete_search_entries(tenant, resource_type, resource_id)
+            .await
     }
 
     async fn write_search_entries(
@@ -923,11 +1019,15 @@ impl helios_persistence::search::ReindexTarget for RecordingTarget {
                 .unwrap()
                 .push((r.id().to_string(), r.version_id().to_string()));
         }
-        let results = self.inner.write_search_entries_page(tenant, resources).await;
+        let results = self
+            .inner
+            .write_search_entries_page(tenant, resources)
+            .await;
         if !self.delay_after_page.is_zero() {
             tokio::time::sleep(self.delay_after_page).await;
         }
-        self.pages_written.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.pages_written
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.page_written.notify_one();
         results
     }
@@ -946,11 +1046,18 @@ async fn mongodb_reindex_id_walk_heals_an_update_between_fetch_and_write() {
         source: Arc<dyn helios_persistence::search::ReindexSource>,
         tenant: &TenantContext,
         regs: Arc<helios_persistence::search::TenantSearchRegistries>,
-    ) -> (Arc<RecordingTarget>, helios_persistence::search::ReindexProgress) {
+    ) -> (
+        Arc<RecordingTarget>,
+        helios_persistence::search::ReindexProgress,
+    ) {
         let target = Arc::new(RecordingTarget::new(backend));
         let op = ReindexOperation::with_parts(source, vec![target.clone()], regs);
         let job = op
-            .start(tenant.clone(), ReindexRequest::for_types(["Observation"]).with_batch_size(10), None)
+            .start(
+                tenant.clone(),
+                ReindexRequest::for_types(["Observation"]).with_batch_size(10),
+                None,
+            )
             .await
             .unwrap();
         let progress = wait_for_terminal(&op, &job).await;
@@ -974,7 +1081,11 @@ async fn mongodb_reindex_id_walk_heals_an_update_between_fetch_and_write() {
             let backend = backend.clone();
             let tenant = tenant.clone();
             Box::pin(async move {
-                let current = backend.read(&tenant, "Observation", "obs-017").await.unwrap().unwrap();
+                let current = backend
+                    .read(&tenant, "Observation", "obs-017")
+                    .await
+                    .unwrap()
+                    .unwrap();
                 let mut content = current.content().clone();
                 content["valueQuantity"]["value"] = json!(9999);
                 content["identifier"][0]["value"] = json!("o-17-updated");
@@ -985,12 +1096,15 @@ async fn mongodb_reindex_id_walk_heals_an_update_between_fetch_and_write() {
 
     let regs = backend.tenant_registries().clone();
 
-    let legacy_source: Arc<dyn helios_persistence::search::ReindexSource> = Arc::new(MutatingSource {
-        inner: Arc::new(LegacyWalkSource { backend: backend.clone() }),
-        trigger_id: "obs-017".to_string(),
-        fired: std::sync::atomic::AtomicBool::new(false),
-        mutation: mutation_for(backend.clone(), tenant_legacy.clone()),
-    });
+    let legacy_source: Arc<dyn helios_persistence::search::ReindexSource> =
+        Arc::new(MutatingSource {
+            inner: Arc::new(LegacyWalkSource {
+                backend: backend.clone(),
+            }),
+            trigger_id: "obs-017".to_string(),
+            fired: std::sync::atomic::AtomicBool::new(false),
+            mutation: mutation_for(backend.clone(), tenant_legacy.clone()),
+        });
     run_for(backend.clone(), legacy_source, &tenant_legacy, regs.clone()).await;
 
     let new_source: Arc<dyn helios_persistence::search::ReindexSource> = Arc::new(MutatingSource {
@@ -1000,13 +1114,23 @@ async fn mongodb_reindex_id_walk_heals_an_update_between_fetch_and_write() {
         mutation: mutation_for(backend.clone(), tenant_new.clone()),
     });
     let (target, progress) = run_for(backend.clone(), new_source, &tenant_new, regs.clone()).await;
-    assert_eq!(progress.status, helios_persistence::search::ReindexStatus::Completed);
+    assert_eq!(
+        progress.status,
+        helios_persistence::search::ReindexStatus::Completed
+    );
     assert!(progress.errors.is_empty());
 
     let writes = target.writes.lock().unwrap().clone();
-    let v1_idx = writes.iter().position(|(id, v)| id == "obs-017" && v == "1");
-    let v2_idx = writes.iter().position(|(id, v)| id == "obs-017" && v == "2");
-    assert!(v1_idx.is_some() && v2_idx.is_some() && v1_idx < v2_idx, "{writes:?}");
+    let v1_idx = writes
+        .iter()
+        .position(|(id, v)| id == "obs-017" && v == "1");
+    let v2_idx = writes
+        .iter()
+        .position(|(id, v)| id == "obs-017" && v == "2");
+    assert!(
+        v1_idx.is_some() && v2_idx.is_some() && v1_idx < v2_idx,
+        "{writes:?}"
+    );
 
     let db = backend.get_database().await.unwrap();
     let s_legacy = snapshot(&db, "walk-upd-legacy", true).await;
@@ -1017,11 +1141,26 @@ async fn mongodb_reindex_id_walk_heals_an_update_between_fetch_and_write() {
     let found = backend.search(&tenant_new, &query).await.unwrap();
     assert_eq!(found.resources.items.len(), 1);
     let stale_query = walk_identifier_query("o-17");
-    assert!(backend.search(&tenant_new, &stale_query).await.unwrap().resources.items.is_empty());
+    assert!(
+        backend
+            .search(&tenant_new, &stale_query)
+            .await
+            .unwrap()
+            .resources
+            .items
+            .is_empty()
+    );
 
     let s_final = snapshot(&db, "walk-upd-new", false).await;
-    let resource = backend.read(&tenant_new, "Observation", "obs-017").await.unwrap().unwrap();
-    backend.write_search_entries(&tenant_new, &resource).await.unwrap();
+    let resource = backend
+        .read(&tenant_new, "Observation", "obs-017")
+        .await
+        .unwrap()
+        .unwrap();
+    backend
+        .write_search_entries(&tenant_new, &resource)
+        .await
+        .unwrap();
     assert_eq!(snapshot(&db, "walk-upd-new", false).await, s_final);
 }
 
@@ -1044,7 +1183,11 @@ async fn mongodb_reindex_id_walk_heals_an_update_racing_a_catch_up_page() {
 
     for i in [10, 20, 30] {
         let id = format!("obs-{i:03}");
-        let current = backend.read(&tenant, "Observation", &id).await.unwrap().unwrap();
+        let current = backend
+            .read(&tenant, "Observation", &id)
+            .await
+            .unwrap()
+            .unwrap();
         let mut content = current.content().clone();
         content["identifier"][0]["value"] = json!(format!("o-{i}-v2"));
         backend.update(&tenant, &current, content).await.unwrap();
@@ -1057,7 +1200,11 @@ async fn mongodb_reindex_id_walk_heals_an_update_racing_a_catch_up_page() {
             let backend = backend_for_mutation.clone();
             let tenant = trigger_tenant.clone();
             Box::pin(async move {
-                let current = backend.read(&tenant, "Observation", "obs-020").await.unwrap().unwrap();
+                let current = backend
+                    .read(&tenant, "Observation", "obs-020")
+                    .await
+                    .unwrap()
+                    .unwrap();
                 let mut content = current.content().clone();
                 content["identifier"][0]["value"] = json!("o-20-v3");
                 backend.update(&tenant, &current, content).await.unwrap();
@@ -1071,32 +1218,71 @@ async fn mongodb_reindex_id_walk_heals_an_update_racing_a_catch_up_page() {
         mutation,
     });
     let target = Arc::new(RecordingTarget::new(backend.clone()));
-    let op = ReindexOperation::with_parts(source, vec![target.clone()], backend.tenant_registries().clone());
+    let op = ReindexOperation::with_parts(
+        source,
+        vec![target.clone()],
+        backend.tenant_registries().clone(),
+    );
     let job = op
-        .start(tenant.clone(), ReindexRequest::for_types(["Observation"]).with_batch_size(10), None)
+        .start(
+            tenant.clone(),
+            ReindexRequest::for_types(["Observation"]).with_batch_size(10),
+            None,
+        )
         .await
         .unwrap();
     let progress = wait_for_terminal(&op, &job).await;
-    assert_eq!(progress.status, helios_persistence::search::ReindexStatus::Completed);
+    assert_eq!(
+        progress.status,
+        helios_persistence::search::ReindexStatus::Completed
+    );
     assert!(progress.errors.is_empty());
 
     let writes = target.writes.lock().unwrap().clone();
-    let v2_idx = writes.iter().position(|(id, v)| id == "obs-020" && v == "2");
-    let v3_idx = writes.iter().position(|(id, v)| id == "obs-020" && v == "3");
+    let v2_idx = writes
+        .iter()
+        .position(|(id, v)| id == "obs-020" && v == "2");
+    let v3_idx = writes
+        .iter()
+        .position(|(id, v)| id == "obs-020" && v == "3");
     assert!(
         v2_idx.is_some() && v3_idx.is_some() && v2_idx < v3_idx,
         "under a design that ended the round on the short page, version 3 would never be written: {writes:?}"
     );
 
     let query = walk_identifier_query("o-20-v3");
-    assert_eq!(backend.search(&tenant, &query).await.unwrap().resources.items.len(), 1);
+    assert_eq!(
+        backend
+            .search(&tenant, &query)
+            .await
+            .unwrap()
+            .resources
+            .items
+            .len(),
+        1
+    );
     let stale_query = walk_identifier_query("o-20-v2");
-    assert!(backend.search(&tenant, &stale_query).await.unwrap().resources.items.is_empty());
+    assert!(
+        backend
+            .search(&tenant, &stale_query)
+            .await
+            .unwrap()
+            .resources
+            .items
+            .is_empty()
+    );
 
     let db = backend.get_database().await.unwrap();
     let s_final = snapshot(&db, "walk-rnd", false).await;
-    let resource = backend.read(&tenant, "Observation", "obs-020").await.unwrap().unwrap();
-    backend.write_search_entries(&tenant, &resource).await.unwrap();
+    let resource = backend
+        .read(&tenant, "Observation", "obs-020")
+        .await
+        .unwrap()
+        .unwrap();
+    backend
+        .write_search_entries(&tenant, &resource)
+        .await
+        .unwrap();
     assert_eq!(snapshot(&db, "walk-rnd", false).await, s_final);
 }
 
@@ -1133,9 +1319,9 @@ async fn mongodb_reindex_id_walk_indexes_a_deferred_create_below_the_cursor() {
     // lands behind the cursor as a real non-inline write — not before the
     // walk starts, where nothing would exercise the id-order phase's healing.
     let mutation_for = |backend: Arc<MongoBackend>,
-                         tenant: TenantContext,
-                         sid: helios_persistence::core::SubmissionId,
-                         mid: String| {
+                        tenant: TenantContext,
+                        sid: helios_persistence::core::SubmissionId,
+                        mid: String| {
         Box::new(move || {
             let backend = backend.clone();
             let tenant = tenant.clone();
@@ -1168,15 +1354,28 @@ async fn mongodb_reindex_id_walk_indexes_a_deferred_create_below_the_cursor() {
 
     let regs = backend.tenant_registries().clone();
 
-    let legacy_source: Arc<dyn helios_persistence::search::ReindexSource> = Arc::new(MutatingSource {
-        inner: Arc::new(LegacyWalkSource { backend: backend.clone() }),
-        trigger_id: "obs-030".to_string(),
-        fired: std::sync::atomic::AtomicBool::new(false),
-        mutation: mutation_for(backend.clone(), tenant_legacy.clone(), sid_legacy, mid_legacy),
-    });
-    let legacy_op = ReindexOperation::with_parts(legacy_source, vec![backend.clone()], regs.clone());
+    let legacy_source: Arc<dyn helios_persistence::search::ReindexSource> =
+        Arc::new(MutatingSource {
+            inner: Arc::new(LegacyWalkSource {
+                backend: backend.clone(),
+            }),
+            trigger_id: "obs-030".to_string(),
+            fired: std::sync::atomic::AtomicBool::new(false),
+            mutation: mutation_for(
+                backend.clone(),
+                tenant_legacy.clone(),
+                sid_legacy,
+                mid_legacy,
+            ),
+        });
+    let legacy_op =
+        ReindexOperation::with_parts(legacy_source, vec![backend.clone()], regs.clone());
     let job = legacy_op
-        .start(tenant_legacy.clone(), ReindexRequest::for_types(["Observation"]).with_batch_size(10), None)
+        .start(
+            tenant_legacy.clone(),
+            ReindexRequest::for_types(["Observation"]).with_batch_size(10),
+            None,
+        )
         .await
         .unwrap();
     wait_for_terminal(&legacy_op, &job).await;
@@ -1189,7 +1388,11 @@ async fn mongodb_reindex_id_walk_indexes_a_deferred_create_below_the_cursor() {
     });
     let new_op = ReindexOperation::with_parts(new_source, vec![backend.clone()], regs);
     let job = new_op
-        .start(tenant_new.clone(), ReindexRequest::for_types(["Observation"]).with_batch_size(10), None)
+        .start(
+            tenant_new.clone(),
+            ReindexRequest::for_types(["Observation"]).with_batch_size(10),
+            None,
+        )
         .await
         .unwrap();
     wait_for_terminal(&new_op, &job).await;
@@ -1197,8 +1400,13 @@ async fn mongodb_reindex_id_walk_indexes_a_deferred_create_below_the_cursor() {
     // Only after both walks have run does the deferred create's absence from
     // the search index get resolved — it writes no rows itself (deferred
     // indexing), so asserting this any earlier would always pass vacuously.
-    assert!(search_index_entry_count(&backend, &tenant_legacy, "Observation", "--below-cursor").await > 0);
-    assert!(search_index_entry_count(&backend, &tenant_new, "Observation", "--below-cursor").await > 0);
+    assert!(
+        search_index_entry_count(&backend, &tenant_legacy, "Observation", "--below-cursor").await
+            > 0
+    );
+    assert!(
+        search_index_entry_count(&backend, &tenant_new, "Observation", "--below-cursor").await > 0
+    );
 
     let db = backend.get_database().await.unwrap();
     assert_eq!(
@@ -1207,7 +1415,16 @@ async fn mongodb_reindex_id_walk_indexes_a_deferred_create_below_the_cursor() {
     );
 
     let query = walk_identifier_query("o-below");
-    assert_eq!(backend.search(&tenant_new, &query).await.unwrap().resources.items.len(), 1);
+    assert_eq!(
+        backend
+            .search(&tenant_new, &query)
+            .await
+            .unwrap()
+            .resources
+            .items
+            .len(),
+        1
+    );
 }
 
 // ===========================================================================
@@ -1235,21 +1452,32 @@ async fn mongodb_reindex_id_walk_delete_mid_walk_behaves_as_the_legacy_walk() {
             let backend = backend.clone();
             let tenant = tenant.clone();
             Box::pin(async move {
-                backend.delete(&tenant, "Observation", "obs-042").await.unwrap();
+                backend
+                    .delete(&tenant, "Observation", "obs-042")
+                    .await
+                    .unwrap();
             }) as futures::future::BoxFuture<'static, ()>
         }) as Box<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>
     };
 
     let regs = backend.tenant_registries().clone();
-    let legacy_source: Arc<dyn helios_persistence::search::ReindexSource> = Arc::new(MutatingSource {
-        inner: Arc::new(LegacyWalkSource { backend: backend.clone() }),
-        trigger_id: "obs-042".to_string(),
-        fired: std::sync::atomic::AtomicBool::new(false),
-        mutation: mutation_for(backend.clone(), tenant_legacy.clone()),
-    });
-    let legacy_op = ReindexOperation::with_parts(legacy_source, vec![backend.clone()], regs.clone());
+    let legacy_source: Arc<dyn helios_persistence::search::ReindexSource> =
+        Arc::new(MutatingSource {
+            inner: Arc::new(LegacyWalkSource {
+                backend: backend.clone(),
+            }),
+            trigger_id: "obs-042".to_string(),
+            fired: std::sync::atomic::AtomicBool::new(false),
+            mutation: mutation_for(backend.clone(), tenant_legacy.clone()),
+        });
+    let legacy_op =
+        ReindexOperation::with_parts(legacy_source, vec![backend.clone()], regs.clone());
     let job = legacy_op
-        .start(tenant_legacy.clone(), ReindexRequest::for_types(["Observation"]).with_batch_size(10), None)
+        .start(
+            tenant_legacy.clone(),
+            ReindexRequest::for_types(["Observation"]).with_batch_size(10),
+            None,
+        )
         .await
         .unwrap();
     let legacy_progress = wait_for_terminal(&legacy_op, &job).await;
@@ -1262,13 +1490,20 @@ async fn mongodb_reindex_id_walk_delete_mid_walk_behaves_as_the_legacy_walk() {
     });
     let new_op = ReindexOperation::with_parts(new_source, vec![backend.clone()], regs);
     let job = new_op
-        .start(tenant_new.clone(), ReindexRequest::for_types(["Observation"]).with_batch_size(10), None)
+        .start(
+            tenant_new.clone(),
+            ReindexRequest::for_types(["Observation"]).with_batch_size(10),
+            None,
+        )
         .await
         .unwrap();
     let new_progress = wait_for_terminal(&new_op, &job).await;
 
     for p in [&legacy_progress, &new_progress] {
-        assert_eq!(p.status, helios_persistence::search::ReindexStatus::Completed);
+        assert_eq!(
+            p.status,
+            helios_persistence::search::ReindexStatus::Completed
+        );
         assert!(p.errors.is_empty());
     }
 
@@ -1280,7 +1515,15 @@ async fn mongodb_reindex_id_walk_delete_mid_walk_behaves_as_the_legacy_walk() {
     );
 
     let query = walk_identifier_query("o-42");
-    assert!(backend.search(&tenant_new, &query).await.unwrap().resources.items.is_empty());
+    assert!(
+        backend
+            .search(&tenant_new, &query)
+            .await
+            .unwrap()
+            .resources
+            .items
+            .is_empty()
+    );
 }
 
 // ===========================================================================
@@ -1320,13 +1563,24 @@ async fn mongodb_reindex_id_walk_writes_an_import_tail_once() {
         .unwrap();
 
     let target = Arc::new(RecordingTarget::new(backend.clone()));
-    let op = ReindexOperation::with_parts(backend.clone(), vec![target.clone()], backend.tenant_registries().clone());
+    let op = ReindexOperation::with_parts(
+        backend.clone(),
+        vec![target.clone()],
+        backend.tenant_registries().clone(),
+    );
     let job = op
-        .start(tenant.clone(), ReindexRequest::for_types(["Observation"]).with_batch_size(40), None)
+        .start(
+            tenant.clone(),
+            ReindexRequest::for_types(["Observation"]).with_batch_size(40),
+            None,
+        )
         .await
         .unwrap();
     let progress = wait_for_terminal(&op, &job).await;
-    assert_eq!(progress.status, helios_persistence::search::ReindexStatus::Completed);
+    assert_eq!(
+        progress.status,
+        helios_persistence::search::ReindexStatus::Completed
+    );
     assert!(progress.errors.is_empty());
     assert_eq!(progress.processed_resources, progress.total_resources);
     assert_eq!(progress.processed_resources, 297);
@@ -1367,7 +1621,10 @@ async fn mongodb_reindex_id_walk_writes_an_import_tail_once() {
         "mongodb reindex catch-up round finished",
         "round=1",
     ]);
-    assert!(round1_finished.iter().any(|l| l.contains("walked=50")), "{round1_finished:?}");
+    assert!(
+        round1_finished.iter().any(|l| l.contains("walked=50")),
+        "{round1_finished:?}"
+    );
 }
 
 // ===========================================================================
@@ -1406,13 +1663,24 @@ async fn mongodb_reindex_id_walk_indexes_a_future_stamped_resource() {
         .unwrap();
 
     let target = Arc::new(RecordingTarget::new(backend.clone()));
-    let op = ReindexOperation::with_parts(backend.clone(), vec![target.clone()], backend.tenant_registries().clone());
+    let op = ReindexOperation::with_parts(
+        backend.clone(),
+        vec![target.clone()],
+        backend.tenant_registries().clone(),
+    );
     let job = op
-        .start(tenant.clone(), ReindexRequest::for_types(["Observation"]).with_batch_size(10), None)
+        .start(
+            tenant.clone(),
+            ReindexRequest::for_types(["Observation"]).with_batch_size(10),
+            None,
+        )
         .await
         .unwrap();
     let progress = wait_for_terminal(&op, &job).await;
-    assert_eq!(progress.status, helios_persistence::search::ReindexStatus::Completed);
+    assert_eq!(
+        progress.status,
+        helios_persistence::search::ReindexStatus::Completed
+    );
     assert!(progress.errors.is_empty());
     assert_eq!(progress.processed_resources, progress.total_resources);
     assert_eq!(progress.processed_resources, 59);
@@ -1427,10 +1695,18 @@ async fn mongodb_reindex_id_walk_indexes_a_future_stamped_resource() {
     for (id, _) in &writes {
         *counts.entry(id.as_str()).or_insert(0) += 1;
     }
-    let live_ids: std::collections::BTreeSet<&str> =
-        fixture.live.get("Observation").unwrap().iter().map(String::as_str).collect();
+    let live_ids: std::collections::BTreeSet<&str> = fixture
+        .live
+        .get("Observation")
+        .unwrap()
+        .iter()
+        .map(String::as_str)
+        .collect();
     let written_ids: std::collections::BTreeSet<&str> = counts.keys().copied().collect();
-    assert_eq!(written_ids, live_ids, "written ids must equal the 59 live ids");
+    assert_eq!(
+        written_ids, live_ids,
+        "written ids must equal the 59 live ids"
+    );
     assert!(counts.values().all(|&n| n == 1), "{counts:?}");
 
     assert_eq!(snapshot(&db, "walk-future", false).await, s_crud);
@@ -1450,7 +1726,10 @@ async fn mongodb_reindex_id_walk_indexes_a_future_stamped_resource() {
 /// A copy of `create_backend_with_search_offloaded` (anchor `:1233-1247` at
 /// HEAD c86d0f08b) that also sets `reindex_catch_up_margin_ms`, so a
 /// termination test does not have to wait out the real 120 s margin.
-async fn create_backend_with_catch_up_margin(test_name: &str, margin_ms: u64) -> Option<MongoBackend> {
+async fn create_backend_with_catch_up_margin(
+    test_name: &str,
+    margin_ms: u64,
+) -> Option<MongoBackend> {
     let connection_string = shared_mongo::connection_string().await?;
     let config = MongoBackendConfig {
         connection_string,
@@ -1491,7 +1770,11 @@ impl helios_persistence::search::ReindexSource for PausingSource {
         self.inner.list_resource_types(tenant).await
     }
 
-    async fn count_resources(&self, tenant: &TenantContext, resource_type: &str) -> StorageResult<u64> {
+    async fn count_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+    ) -> StorageResult<u64> {
         self.inner.count_resources(tenant, resource_type).await
     }
 
@@ -1503,7 +1786,10 @@ impl helios_persistence::search::ReindexSource for PausingSource {
         limit: u32,
     ) -> StorageResult<helios_persistence::search::ResourcePage> {
         let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        let page = self.inner.fetch_resources_page(tenant, resource_type, cursor, limit).await?;
+        let page = self
+            .inner
+            .fetch_resources_page(tenant, resource_type, cursor, limit)
+            .await?;
         if call == self.pause_on_call {
             self.reached.notify_one();
             self.resume.acquire().await.unwrap().forget();
@@ -1539,19 +1825,30 @@ async fn mongodb_reindex_id_walk_cancel_then_rerun_leaves_no_duplicates() {
         backend.tenant_registries().clone(),
     ));
     let job = op
-        .start(tenant.clone(), ReindexRequest::for_types(["Observation"]).with_batch_size(20), None)
+        .start(
+            tenant.clone(),
+            ReindexRequest::for_types(["Observation"]).with_batch_size(20),
+            None,
+        )
         .await
         .unwrap();
 
-    tokio::time::timeout(std::time::Duration::from_secs(30), pausing.reached.notified())
-        .await
-        .expect("PausingSource never reached its pause point");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        pausing.reached.notified(),
+    )
+    .await
+    .expect("PausingSource never reached its pause point");
     op.cancel(&job).await.unwrap();
     pausing.resume.add_permits(1);
 
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
-            if recording.pages_written.load(std::sync::atomic::Ordering::SeqCst) >= 3 {
+            if recording
+                .pages_written
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 3
+            {
                 return;
             }
             recording.page_written.notified().await;
@@ -1562,14 +1859,26 @@ async fn mongodb_reindex_id_walk_cancel_then_rerun_leaves_no_duplicates() {
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     assert_eq!(pausing.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
-    assert_eq!(recording.pages_written.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert_eq!(
+        recording
+            .pages_written
+            .load(std::sync::atomic::Ordering::SeqCst),
+        3
+    );
 
     let progress = op.get_progress(&job).await.unwrap();
-    assert_eq!(progress.status, helios_persistence::search::ReindexStatus::Cancelled);
+    assert_eq!(
+        progress.status,
+        helios_persistence::search::ReindexStatus::Cancelled
+    );
 
     let rerun_op = ReindexOperation::new(backend.clone(), backend.tenant_registries().clone());
     let rerun_job = rerun_op
-        .start(tenant.clone(), ReindexRequest::for_types(["Observation"]).with_batch_size(20), None)
+        .start(
+            tenant.clone(),
+            ReindexRequest::for_types(["Observation"]).with_batch_size(20),
+            None,
+        )
         .await
         .unwrap();
     wait_for_terminal(&rerun_op, &rerun_job).await;
@@ -1584,7 +1893,8 @@ async fn mongodb_reindex_id_walk_cancel_then_rerun_leaves_no_duplicates() {
 async fn mongodb_reindex_id_walk_terminates_under_continuous_writes() {
     use std::sync::Arc;
 
-    let Some(backend) = create_backend_with_catch_up_margin("reindex_id_walk_churn", 2_000).await else {
+    let Some(backend) = create_backend_with_catch_up_margin("reindex_id_walk_churn", 2_000).await
+    else {
         eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
         return;
     };
@@ -1594,7 +1904,13 @@ async fn mongodb_reindex_id_walk_terminates_under_continuous_writes() {
     let fixture = seed_walk_fixture(&backend, &tenant, 60, "only-in-churn").await;
     backdate_fixture(&backend, &tenant, &fixture).await;
 
-    let live_ids: Vec<String> = fixture.live.get("Observation").unwrap().iter().cloned().collect();
+    let live_ids: Vec<String> = fixture
+        .live
+        .get("Observation")
+        .unwrap()
+        .iter()
+        .cloned()
+        .collect();
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let updates = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let writer = {
@@ -1624,10 +1940,20 @@ async fn mongodb_reindex_id_walk_terminates_under_continuous_writes() {
     }
     let u0 = updates.load(std::sync::atomic::Ordering::SeqCst);
 
-    let target = Arc::new(RecordingTarget::new(backend.clone()).with_delay(std::time::Duration::from_millis(250)));
-    let op = ReindexOperation::with_parts(backend.clone(), vec![target], backend.tenant_registries().clone());
+    let target = Arc::new(
+        RecordingTarget::new(backend.clone()).with_delay(std::time::Duration::from_millis(250)),
+    );
+    let op = ReindexOperation::with_parts(
+        backend.clone(),
+        vec![target],
+        backend.tenant_registries().clone(),
+    );
     let job = op
-        .start(tenant.clone(), ReindexRequest::for_types(["Observation"]).with_batch_size(5), None)
+        .start(
+            tenant.clone(),
+            ReindexRequest::for_types(["Observation"]).with_batch_size(5),
+            None,
+        )
         .await
         .unwrap();
     let progress = tokio::time::timeout(std::time::Duration::from_secs(45), async {
@@ -1645,8 +1971,15 @@ async fn mongodb_reindex_id_walk_terminates_under_continuous_writes() {
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
     writer.await.unwrap();
 
-    assert!(u1 - u0 >= 50, "writer made only {} updates during the walk; the test's timing assumptions do not hold", u1 - u0);
-    assert_eq!(progress.status, helios_persistence::search::ReindexStatus::Completed);
+    assert!(
+        u1 - u0 >= 50,
+        "writer made only {} updates during the walk; the test's timing assumptions do not hold",
+        u1 - u0
+    );
+    assert_eq!(
+        progress.status,
+        helios_persistence::search::ReindexStatus::Completed
+    );
     assert!(progress.errors.is_empty());
 
     let round3_started = walk_log_lines(&[
@@ -1655,7 +1988,10 @@ async fn mongodb_reindex_id_walk_terminates_under_continuous_writes() {
         "mongodb reindex catch-up round started",
         "round=3",
     ]);
-    assert!(!round3_started.is_empty(), "expected round 3 to start under sustained writes");
+    assert!(
+        !round3_started.is_empty(),
+        "expected round 3 to start under sustained writes"
+    );
     let capped = walk_log_lines(&[
         "tenant=walk-churn",
         "resource_type=Observation",

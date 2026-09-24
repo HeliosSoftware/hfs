@@ -4955,11 +4955,18 @@ impl ReindexSource for MongoBackend {
                         floor = %format_walk_instant(floor),
                         "mongodb reindex walk started"
                     );
-                    WalkStep::IdPhase { floor, after_id: None }
+                    WalkStep::IdPhase {
+                        floor,
+                        after_id: None,
+                    }
                 }
                 WalkStep::IdPhase { floor, after_id } => {
-                    let filter =
-                        reindex_id_page_filter(tenant_id, resource_type, floor, after_id.as_deref());
+                    let filter = reindex_id_page_filter(
+                        tenant_id,
+                        resource_type,
+                        floor,
+                        after_id.as_deref(),
+                    );
                     let docs = self
                         .reindex_find_page(
                             &resources,
@@ -4980,7 +4987,10 @@ impl ReindexSource for MongoBackend {
                             &docs,
                             resource_type,
                             tenant,
-                            ReindexWalkCursor::Id { floor, after_id: last_id },
+                            ReindexWalkCursor::Id {
+                                floor,
+                                after_id: last_id,
+                            },
                         );
                     }
                     tracing::info!(
@@ -5023,7 +5033,11 @@ impl ReindexSource for MongoBackend {
                         }
                         RoundStartDecision::Run => {
                             let newest_live = self
-                                .reindex_newest_live_last_updated(&resources, tenant_id, resource_type)
+                                .reindex_newest_live_last_updated(
+                                    &resources,
+                                    tenant_id,
+                                    resource_type,
+                                )
                                 .await?;
                             let ceiling = reindex_catch_up_ceiling(now, newest_live, margin);
                             if let Some(newest_live) = newest_live {
@@ -5047,11 +5061,23 @@ impl ReindexSource for MongoBackend {
                                 ceiling = %format_walk_instant(ceiling),
                                 "mongodb reindex catch-up round started"
                             );
-                            WalkStep::Round { round, floor, ceiling, walked: 0, after: None }
+                            WalkStep::Round {
+                                round,
+                                floor,
+                                ceiling,
+                                walked: 0,
+                                after: None,
+                            }
                         }
                     }
                 }
-                WalkStep::Round { round, floor, ceiling, walked, after } => {
+                WalkStep::Round {
+                    round,
+                    floor,
+                    ceiling,
+                    walked,
+                    after,
+                } => {
                     let filter = reindex_catch_up_page_filter(
                         tenant_id,
                         resource_type,
@@ -5078,7 +5104,10 @@ impl ReindexSource for MongoBackend {
                             walked,
                             "mongodb reindex catch-up round finished"
                         );
-                        WalkStep::RoundStart { round: round + 1, floor: ceiling }
+                        WalkStep::RoundStart {
+                            round: round + 1,
+                            floor: ceiling,
+                        }
                     } else {
                         let last = scanned.last().expect("non-empty");
                         let scanned_lu = last
@@ -5616,9 +5645,7 @@ impl ReindexWalkCursor {
                 let after_last_updated = DateTime::parse_from_rfc3339(after_lu)
                     .map_err(|_| invalid())?
                     .with_timezone(&Utc);
-                if !(floor < ceiling
-                    && floor <= after_last_updated
-                    && after_last_updated < ceiling)
+                if !(floor < ceiling && floor <= after_last_updated && after_last_updated < ceiling)
                 {
                     return Err(invalid());
                 }
@@ -5656,9 +5683,10 @@ fn format_walk_instant(dt: DateTime<Utc>) -> String {
 /// Clamps a configured margin to `[REINDEX_CATCH_UP_MARGIN_MIN_MS,
 /// REINDEX_CATCH_UP_MARGIN_MAX_MS]` (#1403).
 fn reindex_catch_up_margin(configured_ms: u64) -> chrono::Duration {
-    chrono::Duration::milliseconds(
-        configured_ms.clamp(REINDEX_CATCH_UP_MARGIN_MIN_MS, REINDEX_CATCH_UP_MARGIN_MAX_MS) as i64,
-    )
+    chrono::Duration::milliseconds(configured_ms.clamp(
+        REINDEX_CATCH_UP_MARGIN_MIN_MS,
+        REINDEX_CATCH_UP_MARGIN_MAX_MS,
+    ) as i64)
 }
 
 /// `min(newest_live + 1 ms, t0 - margin)` (#1403).
@@ -6164,7 +6192,10 @@ mod reindex_walk_tests {
             floor: ts("2026-01-01T00:00:00.123Z"),
             after_id: "A-1.b".to_string(),
         };
-        assert_eq!(ReindexWalkCursor::parse(&id_cursor.encode()).unwrap(), id_cursor);
+        assert_eq!(
+            ReindexWalkCursor::parse(&id_cursor.encode()).unwrap(),
+            id_cursor
+        );
 
         for round in [1u8, REINDEX_CATCH_UP_MAX_ROUNDS] {
             for walked in [0u64, u64::MAX] {
@@ -6190,7 +6221,10 @@ mod reindex_walk_tests {
             floor: ts("2026-01-01T00:00:00.000Z"),
             after_id: "a|b".to_string(),
         };
-        assert_eq!(ReindexWalkCursor::parse(&id_cursor.encode()).unwrap(), id_cursor);
+        assert_eq!(
+            ReindexWalkCursor::parse(&id_cursor.encode()).unwrap(),
+            id_cursor
+        );
 
         let round_cursor = ReindexWalkCursor::Round {
             round: 1,
@@ -6263,7 +6297,10 @@ mod reindex_walk_tests {
         let t0 = ts("2026-01-01T01:00:00.000Z");
         let newest = t0 - chrono::Duration::seconds(1); // inside the margin
         let margin = chrono::Duration::seconds(120);
-        assert_eq!(reindex_catch_up_floor(t0, Some(newest), margin), t0 - margin);
+        assert_eq!(
+            reindex_catch_up_floor(t0, Some(newest), margin),
+            t0 - margin
+        );
     }
 
     #[test]
@@ -6327,7 +6364,12 @@ mod reindex_walk_tests {
             RoundStartDecision::Run
         );
         assert_eq!(
-            reindex_round_start_decision(2, floor, boundary - chrono::Duration::milliseconds(1), margin),
+            reindex_round_start_decision(
+                2,
+                floor,
+                boundary - chrono::Duration::milliseconds(1),
+                margin
+            ),
             RoundStartDecision::Complete
         );
     }
@@ -6343,7 +6385,12 @@ mod reindex_walk_tests {
             RoundStartDecision::CapReached
         );
         assert_eq!(
-            reindex_round_start_decision(round, floor, boundary - chrono::Duration::milliseconds(1), margin),
+            reindex_round_start_decision(
+                round,
+                floor,
+                boundary - chrono::Duration::milliseconds(1),
+                margin
+            ),
             RoundStartDecision::Complete
         );
     }
@@ -6351,8 +6398,14 @@ mod reindex_walk_tests {
     #[test]
     fn margin_is_clamped() {
         assert_eq!(reindex_catch_up_margin(0), chrono::Duration::seconds(1));
-        assert_eq!(reindex_catch_up_margin(120_000), chrono::Duration::seconds(120));
-        assert_eq!(reindex_catch_up_margin(u64::MAX), chrono::Duration::hours(24));
+        assert_eq!(
+            reindex_catch_up_margin(120_000),
+            chrono::Duration::seconds(120)
+        );
+        assert_eq!(
+            reindex_catch_up_margin(u64::MAX),
+            chrono::Duration::hours(24)
+        );
     }
 
     // --- Filter shapes ---
@@ -6402,10 +6455,20 @@ mod reindex_walk_tests {
         let or = continuation.get_array("$or").unwrap();
         assert_eq!(or.len(), 2);
         let first_arm_doc = or[0].as_document().unwrap();
-        assert_eq!(first_arm_doc.len(), 1, "arm 0 must hold only `last_updated`: {first_arm_doc:?}");
+        assert_eq!(
+            first_arm_doc.len(),
+            1,
+            "arm 0 must hold only `last_updated`: {first_arm_doc:?}"
+        );
         let first_arm = first_arm_doc.get_document("last_updated").unwrap();
-        assert_eq!(first_arm.get("$gt"), Some(&Bson::from(chrono_to_bson(after_lu))));
-        assert_eq!(first_arm.get("$lt"), Some(&Bson::from(chrono_to_bson(ceiling))));
+        assert_eq!(
+            first_arm.get("$gt"),
+            Some(&Bson::from(chrono_to_bson(after_lu)))
+        );
+        assert_eq!(
+            first_arm.get("$lt"),
+            Some(&Bson::from(chrono_to_bson(ceiling)))
+        );
         let second_arm = or[1].as_document().unwrap();
         assert_eq!(
             second_arm.len(),
