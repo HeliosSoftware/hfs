@@ -108,6 +108,8 @@ fn test_mongodb_config_defaults() {
     assert_eq!(config.server_selection_timeout_ms, 15_000);
     assert!(!config.search_offloaded);
     assert_eq!(config.fhir_version, FhirVersion::default());
+    // #1403: the `$reindex` walk's clock-skew and commit-lag allowance.
+    assert_eq!(config.reindex_catch_up_margin_ms, 120_000);
 }
 
 #[test]
