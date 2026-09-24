@@ -4535,39 +4535,9 @@ impl MongoBackend {
         // One parameter's comma-separated values OR; repeated parameters AND
         // through the top-level `$and`.
         for param in params.iter().filter(|p| p.name.as_str() == "identifier") {
-            if param.param_type != SearchParamType::Token {
-                return Err(StorageError::Search(
-                    crate::error::SearchError::QueryParseError {
-                        message: format!(
-                            "ifNoneExist parameter 'identifier' cannot be evaluated \
-                             against the resource collection when search is offloaded: \
-                             unsupported parameter type '{}'",
-                            param.param_type
-                        ),
-                    },
-                ));
-            }
-            if let Some(modifier) = param.modifier.as_ref() {
-                return Err(StorageError::Search(
-                    crate::error::SearchError::UnsupportedModifier {
-                        modifier: modifier.to_string(),
-                        param_type: param.param_type.to_string(),
-                    },
-                ));
-            }
+            Self::validate_offloaded_identifier_param(param)?;
             let mut branches: Vec<Bson> = Vec::with_capacity(param.values.len());
             for value in &param.values {
-                if value.prefix != SearchPrefix::Eq {
-                    return Err(StorageError::Search(
-                        crate::error::SearchError::QueryParseError {
-                            message: format!(
-                                "Unsupported prefix '{}' for ifNoneExist parameter \
-                                 'identifier' when search is offloaded",
-                                value.prefix
-                            ),
-                        },
-                    ));
-                }
                 if value.value.chars().filter(|c| *c == '|').count() > 1 {
                     return Err(StorageError::Search(
                         crate::error::SearchError::QueryParseError {
@@ -4658,6 +4628,45 @@ impl MongoBackend {
         }
 
         Ok(matches)
+    }
+
+    /// Keep the raw-document scan fail-closed if the conditional builder's
+    /// typed-parameter contract changes. This check needs no database session.
+    fn validate_offloaded_identifier_param(param: &SearchParameter) -> StorageResult<()> {
+        if param.param_type != SearchParamType::Token {
+            return Err(StorageError::Search(
+                crate::error::SearchError::QueryParseError {
+                    message: format!(
+                        "ifNoneExist parameter 'identifier' cannot be evaluated \
+                         against the resource collection when search is offloaded: \
+                         unsupported parameter type '{}'",
+                        param.param_type
+                    ),
+                },
+            ));
+        }
+        if let Some(modifier) = param.modifier.as_ref() {
+            return Err(StorageError::Search(
+                crate::error::SearchError::UnsupportedModifier {
+                    modifier: modifier.to_string(),
+                    param_type: param.param_type.to_string(),
+                },
+            ));
+        }
+        for value in &param.values {
+            if value.prefix != SearchPrefix::Eq {
+                return Err(StorageError::Search(
+                    crate::error::SearchError::QueryParseError {
+                        message: format!(
+                            "Unsupported prefix '{}' for ifNoneExist parameter \
+                             'identifier' when search is offloaded",
+                            value.prefix
+                        ),
+                    },
+                ));
+            }
+        }
+        Ok(())
     }
 
     async fn index_resource_in_bundle_transaction(
@@ -5364,6 +5373,59 @@ fn resolve_bundle_references(value: &mut Value, reference_map: &HashMap<String, 
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod offloaded_identifier_guard_tests {
+    use super::*;
+    use crate::types::{SearchModifier, SearchValue};
+
+    fn identifier_param() -> SearchParameter {
+        SearchParameter {
+            name: "identifier".to_string(),
+            param_type: SearchParamType::Token,
+            values: vec![SearchValue::eq("MRN-1")],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rejects_non_token_type() {
+        let param = SearchParameter {
+            param_type: SearchParamType::String,
+            ..identifier_param()
+        };
+        let err = MongoBackend::validate_offloaded_identifier_param(&param).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unsupported parameter type 'string'")
+        );
+    }
+
+    #[test]
+    fn rejects_modifier() {
+        let param = SearchParameter {
+            modifier: Some(SearchModifier::Missing),
+            ..identifier_param()
+        };
+        let err = MongoBackend::validate_offloaded_identifier_param(&param).unwrap_err();
+        assert!(err.to_string().contains("missing"));
+    }
+
+    #[test]
+    fn rejects_non_eq_prefix() {
+        let param = SearchParameter {
+            values: vec![SearchValue::new(SearchPrefix::Ne, "MRN-1")],
+            ..identifier_param()
+        };
+        let err = MongoBackend::validate_offloaded_identifier_param(&param).unwrap_err();
+        assert!(err.to_string().contains("Unsupported prefix 'ne'"));
+    }
+
+    #[test]
+    fn accepts_plain_token() {
+        MongoBackend::validate_offloaded_identifier_param(&identifier_param()).unwrap();
     }
 }
 
