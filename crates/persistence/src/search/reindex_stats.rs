@@ -4,8 +4,6 @@
 //! (`reindex job started` ... `reindex page`) is documented on its log
 //! helpers and in the design for #1403.
 
-#![allow(dead_code)] // #1403 PR0: removed in Task 3, once run_reindex reads every item
-
 use std::time::{Duration, Instant};
 
 use super::reindex::ReindexPageStats;
