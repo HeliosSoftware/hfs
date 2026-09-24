@@ -755,6 +755,7 @@ bulk-export-field-since-custom = Instante personalizado
 bulk-export-since-invalid = Ingresa un instante FHIR válido, como 2026-08-01T00:00:00Z.
 bulk-export-field-until = Hasta
 bulk-export-field-until-hint = Límite superior opcional. RFC 3339, p. ej. 2026-08-01T00:00:00Z.
+bulk-export-until-before-since = «Hasta» no puede ser anterior a «Desde».
 bulk-export-window-since = Desde
 bulk-export-window-until = Hasta
 bulk-export-start = Iniciar exportación

@@ -733,6 +733,50 @@ test("server rejects a malformed Until without creating an export", async ({
   await expect(page.locator(".job-card").filter({ hasText: exportName })).toHaveCount(0);
 });
 
+test("Until earlier than Since is rejected inline and revalidates when Since changes", async ({
+  page,
+  bulkExport,
+}) => {
+  await bulkExport.goto();
+  let submissions = 0;
+  page.on("request", (request) => {
+    if (request.url().endsWith("/ui/bulk-export") && request.method() === "POST") {
+      submissions += 1;
+    }
+  });
+
+  await bulkExport.nameInput.fill("Until before Since must not start");
+  await bulkExport.sincePreset.selectOption("custom");
+  await bulkExport.sinceCustom.fill("2026-09-17T10:38:49Z");
+  await bulkExport.until.fill("2026-01-01T00:00:00Z");
+  await bulkExport.startButton.click();
+
+  await expect(bulkExport.until).toBeFocused();
+  await expect(bulkExport.until).toHaveAttribute("aria-invalid", "true");
+  await expect(bulkExport.untilError).toHaveText("Until must not be earlier than Since.");
+  await expect(bulkExport.sinceCustomError).toBeHidden();
+  expect(submissions).toBe(0);
+
+  // Moving Since back clears the error without touching Until.
+  await bulkExport.sinceCustom.fill("2025-12-01T00:00:00Z");
+  await expect(bulkExport.untilError).toBeHidden();
+  await expect(bulkExport.until).not.toHaveAttribute("aria-invalid", /.+/);
+
+  // A preset resolves to a recent instant, so an old Until is rejected again.
+  await bulkExport.sincePreset.selectOption("day");
+  await expect(bulkExport.untilError).toHaveText("Until must not be earlier than Since.");
+
+  // A malformed Until still reports the format message, not the order one.
+  await bulkExport.until.fill("026-09-17T10:38:49Z");
+  await expect(bulkExport.untilError).toHaveText(
+    "Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z.",
+  );
+
+  await bulkExport.sincePreset.selectOption("");
+  await bulkExport.until.fill("2026-01-01T00:00:00Z");
+  await expect(bulkExport.untilError).toBeHidden();
+});
+
 test("Patient combobox supports keyboard selection, dedupe, removal, and scope serialization", async ({
   page,
   bulkExport,

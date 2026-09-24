@@ -755,6 +755,7 @@ bulk-export-field-since-custom = Benutzerdefinierter Zeitpunkt
 bulk-export-since-invalid = Geben Sie einen gültigen FHIR-Zeitpunkt ein, zum Beispiel 2026-08-01T00:00:00Z.
 bulk-export-field-until = Bis
 bulk-export-field-until-hint = Optionale Obergrenze. RFC 3339, z. B. 2026-08-01T00:00:00Z.
+bulk-export-until-before-since = „Bis“ darf nicht vor „Seit“ liegen.
 bulk-export-window-since = Seit
 bulk-export-window-until = Bis
 bulk-export-start = Export starten

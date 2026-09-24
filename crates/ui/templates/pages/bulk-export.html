@@ -158,7 +158,7 @@
                  {% if until_error.is_some() %}{% if name_error.is_none() && since_custom_error.is_none() %}autofocus {% endif %}aria-invalid="true" aria-describedby="bulk-export-until-hint bulk-export-until-error"{% else %}aria-describedby="bulk-export-until-hint"{% endif %}
                  placeholder="2026-08-01T00:00:00Z">
           <span id="bulk-export-until-hint" class="field__hint">{{ i18n.t("bulk-export-field-until-hint") }}</span>
-          <span id="bulk-export-until-error" class="field__hint field__hint--error" role="alert"{% if until_error.is_none() %} hidden{% endif %}>{% match until_error %}{% when Some(message) %}{{ message }}{% when None %}{{ i18n.t("bulk-export-since-invalid") }}{% endmatch %}</span>
+          <span data-invalid-message="{{ i18n.t("bulk-export-since-invalid") }}" data-order-message="{{ i18n.t("bulk-export-until-before-since") }}" id="bulk-export-until-error" class="field__hint field__hint--error" role="alert"{% if until_error.is_none() %} hidden{% endif %}>{% match until_error %}{% when Some(message) %}{{ message }}{% when None %}{{ i18n.t("bulk-export-since-invalid") }}{% endmatch %}</span>
         </label>
       </div>
     </div>

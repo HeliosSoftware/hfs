@@ -924,7 +924,13 @@ pub async fn start(
             .is_empty()
             .then(|| i18n.t("bulk-export-name-required")),
         since_custom: since.is_err().then(|| i18n.t("bulk-export-since-invalid")),
-        until: until.is_err().then(|| i18n.t("bulk-export-since-invalid")),
+        until: match (&since, &until) {
+            (_, Err(())) => Some(i18n.t("bulk-export-since-invalid")),
+            (Ok(since), Ok(until)) if crate::lookup::instant_before(until, since) => {
+                Some(i18n.t("bulk-export-until-before-since"))
+            }
+            _ => None,
+        },
         patients: (scope == "patient" && matches!(patient_refs, Ok(ref refs) if refs.is_empty()))
             .then(|| i18n.t("bulk-export-patients-required")),
         rejected: true,

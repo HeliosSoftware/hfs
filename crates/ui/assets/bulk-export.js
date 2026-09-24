@@ -106,14 +106,34 @@
     return !invalid;
   }
 
-  // Until has no preset: it is validated whenever it is non-empty (#1271).
+  // Lower bound Since resolves to, in epoch milliseconds, or NaN when it is
+  // open or not yet valid. Mirrors the server's preset arithmetic.
+  function sinceBound() {
+    if (!sincePreset) return NaN;
+    var days = { day: 1, week: 7, month: 28 }[sincePreset.value];
+    if (days) return Date.now() - days * 86400000;
+    if (sincePreset.value !== "custom" || !sinceCustom) return NaN;
+    var value = sinceCustom.value.trim();
+    if (!value || !isValidFhirInstant(value, sinceCustom.getAttribute("data-pattern"))) return NaN;
+    return Date.parse(value);
+  }
+
+  // Until has no preset: it is validated whenever it is non-empty, and must
+  // not fall before Since, which would make the export window empty (#1271).
   function validateUntil() {
     var invalid = false;
+    var message = untilError && untilError.getAttribute("data-invalid-message");
     if (untilInput) {
       var value = untilInput.value.trim();
       var pattern = untilInput.getAttribute("data-pattern");
-      invalid = Boolean(value && !isValidFhirInstant(value, pattern));
+      if (value && !isValidFhirInstant(value, pattern)) {
+        invalid = true;
+      } else if (value && Date.parse(value) < sinceBound()) {
+        invalid = true;
+        message = untilError && untilError.getAttribute("data-order-message");
+      }
     }
+    if (invalid && message) untilError.textContent = message;
     setFieldError(untilInput, untilError, invalid);
     return !invalid;
   }
@@ -241,12 +261,18 @@
   if (sincePreset) {
     sincePreset.addEventListener("change", function () {
       synchronizeSince();
-      if (validationStarted) validateSince();
+      if (validationStarted) {
+        validateSince();
+        validateUntil();
+      }
     });
   }
   if (sinceCustom) {
     sinceCustom.addEventListener("input", function () {
-      if (validationStarted) validateSince();
+      if (validationStarted) {
+        validateSince();
+        validateUntil();
+      }
     });
   }
   if (untilInput) {

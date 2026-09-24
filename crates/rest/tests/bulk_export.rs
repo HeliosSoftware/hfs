@@ -1006,6 +1006,71 @@ async fn test_invalid_since_rejected() {
 }
 
 #[tokio::test]
+async fn test_until_before_since_rejected() {
+    let (server, _backend, _output, _tmp) = create_bulk_export_server().await;
+
+    let resp = server
+        .get("/$export")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("prefer", "respond-async")
+        .add_query_param("_since", "2021-01-01T00:00:00Z")
+        .add_query_param("_until", "2020-01-01T00:00:00Z")
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST);
+    let text = resp.text();
+    assert!(
+        text.contains(
+            "_until '2020-01-01T00:00:00Z' is earlier than _since '2021-01-01T00:00:00Z'"
+        ),
+        "got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn test_until_before_since_rejected_in_post_parameters() {
+    let (server, _backend, _output, _tmp) = create_bulk_export_server().await;
+
+    let body = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "_since", "valueInstant": "2021-01-01T00:00:00Z"},
+            {"name": "_until", "valueInstant": "2020-12-31T23:59:59Z"}
+        ]
+    });
+    let resp = server
+        .post("/$export")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("prefer", "respond-async")
+        .json(&body)
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST);
+    let text = resp.text();
+    assert!(
+        text.contains(
+            "_until '2020-12-31T23:59:59Z' is earlier than _since '2021-01-01T00:00:00Z'"
+        ),
+        "got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn test_until_equal_to_since_accepted() {
+    let (server, backend, output, _tmp) = create_bulk_export_server().await;
+    seed_patients(&backend, 1).await;
+
+    let resp = server
+        .get("/$export")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("prefer", "respond-async")
+        .add_query_param("_since", "2020-01-01T00:00:00Z")
+        .add_query_param("_until", "2020-01-01T00:00:00Z")
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
+
+    drain_workers(&backend, &output).await;
+}
+
+#[tokio::test]
 async fn test_elements_parameter_accepted() {
     let (server, backend, output, _tmp) = create_bulk_export_server().await;
     seed_patients(&backend, 1).await;

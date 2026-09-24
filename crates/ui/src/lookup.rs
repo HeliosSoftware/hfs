@@ -159,6 +159,20 @@ pub(crate) fn optional_instant(value: &str) -> Result<String, ()> {
         .map(|_| value.to_string())
 }
 
+/// Whether `value` is strictly earlier than `bound`, both already validated by
+/// [`optional_instant`] / [`since_instant`]. An empty side is an open bound, so
+/// it never orders before anything. `$export` treats both ends of the window
+/// as inclusive, so only `until < since` is an empty window (#1271).
+pub(crate) fn instant_before(value: &str, bound: &str) -> bool {
+    match (
+        chrono::DateTime::parse_from_rfc3339(value),
+        chrono::DateTime::parse_from_rfc3339(bound),
+    ) {
+        (Ok(value), Ok(bound)) => value < bound,
+        _ => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Reference canonicalization & parsing (moved from bulk_export.rs, #836)
 // ---------------------------------------------------------------------------

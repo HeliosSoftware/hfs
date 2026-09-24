@@ -1911,6 +1911,67 @@ async fn an_invalid_until_yields_autofocus_to_an_earlier_invalid_field() {
     assert_no_default_user_jobs(&backend).await;
 }
 
+/// An Until earlier than Since is a well-formed but empty window: `$export`
+/// bounds are inclusive, so nothing could ever match. The form rejects it on
+/// Until with its own message, for a custom Since and for a preset alike,
+/// while an equal pair is still a valid (one-instant) window.
+#[tokio::test]
+async fn an_until_before_since_is_rejected_inline_without_a_job_or_kickoff() {
+    let (base, mock, backend) = serve().await;
+
+    for (preset, custom) in [("custom", "2026-09-17T10:38:49Z"), ("day", "")] {
+        let (status, html) = post_form_body(
+            &base,
+            "/ui/bulk-export",
+            &[
+                ("name", "until-before-since"),
+                ("scope", "system"),
+                ("since_preset", preset),
+                ("since_custom", custom),
+                ("until", "2026-01-01T00:00:00Z"),
+            ],
+        )
+        .await;
+
+        assert_eq!(status, 400, "{preset}: {html}");
+        let input = input_tag(&html, "until");
+        assert!(input.contains(r#"value="2026-01-01T00:00:00Z""#), "{input}");
+        assert!(
+            input.contains(
+                r#"autofocus aria-invalid="true" aria-describedby="bulk-export-until-hint bulk-export-until-error""#
+            ),
+            "{input}"
+        );
+        assert!(
+            html.contains(
+                r#"id="bulk-export-until-error" class="field__hint field__hint--error" role="alert">Until must not be earlier than Since.</span>"#
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"id="bulk-export-since-custom-error" class="field__hint field__hint--error" role="alert" hidden>"#),
+            "{html}"
+        );
+    }
+    assert!(mock.kickoffs.lock().unwrap().is_empty());
+    assert_no_default_user_jobs(&backend).await;
+
+    let (status, _) = post_form(
+        &base,
+        "/ui/bulk-export",
+        &[
+            ("name", "one-instant window"),
+            ("scope", "system"),
+            ("since_preset", "custom"),
+            ("since_custom", "2026-01-01T00:00:00Z"),
+            ("until", "2026-01-01T00:00:00Z"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 303);
+    assert_eq!(mock.kickoffs.lock().unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn all_resources_omits_type_even_when_a_hostile_form_sends_types() {
     let (base, mock, _) = serve().await;
