@@ -26,6 +26,9 @@ use crate::types::{
 };
 
 use super::MongoBackend;
+use super::search_index_catalog::{
+    COMPOSITE_SLOT_PROBE_INDEX, CONTAINED_COMPOSITE_SLOT_PROBE_INDEX,
+};
 
 /// Candidate ids per `$in` chunk when the parameter-sort aggregation is
 /// bounded to a matched set (#1040). Keeps each aggregate command well under
@@ -433,25 +436,14 @@ fn reject_contained_composite(query: &SearchQuery) -> StorageResult<()> {
 ///   entities yet.
 ///
 /// Other modifiers on ordinary parameters go to their value filter builder.
-/// Composite modifiers and repeated component types are refused because the
-/// contained composite rows cannot distinguish their declared slots.
+/// Composite modifiers are refused because `component_param` removes them
+/// before building the typed predicates.
 fn contained_unsupported_reason(param: &SearchParameter) -> Option<String> {
     if param.param_type == SearchParamType::Composite {
         if let Some(modifier) = &param.modifier {
             // component_param removes the composite modifier before building
             // typed predicates; no modifier can be honoured on this path.
             return Some(format!("the ':{modifier}' composite modifier is"));
-        }
-        let mut component_types = std::collections::HashSet::new();
-        if param
-            .components
-            .iter()
-            .any(|component| !component_types.insert(component.param_type))
-        {
-            // Component rows share param_name and composite_group, with no
-            // slot identifying which declared component wrote the row. Two
-            // components of one type can therefore exchange their matches.
-            return Some("composites with repeated component types are".to_string());
         }
     }
     if !param.chain.is_empty() {
@@ -1027,8 +1019,7 @@ impl MongoBackend {
     /// contained row carries its container's type, never the searched type)
     /// and the composite's own `param_name` is kept, since every component
     /// row shares it.
-    /// Modifier, chain and repeated component-type validation happens before
-    /// this builder; unsupported value types are checked by
+    /// Modifier and chain validation happens before this builder; unsupported value types are checked by
     /// `composite_component_filters`.
     fn contained_composite_component_filters(
         &self,
@@ -1108,6 +1099,15 @@ impl MongoBackend {
         let db = self.get_database().await?;
         let tenant_id = tenant.tenant_id().as_str();
         let contained_type = query.resource_type.as_str();
+        self.preflight_legacy_composites(
+            &db,
+            tenant_id,
+            contained_type,
+            &query.parameters,
+            true,
+            None,
+        )
+        .await?;
         let count = query.count.unwrap_or(100).max(1) as usize;
         let offset = query.offset.unwrap_or(0) as usize;
         let want_total = query.wants_total();
@@ -2083,6 +2083,16 @@ impl MongoBackend {
             return Ok(Some(HashSet::new()));
         }
 
+        self.preflight_legacy_composites(
+            db,
+            tenant_id,
+            resource_type,
+            &query.parameters,
+            false,
+            None,
+        )
+        .await?;
+
         let mut normal: Vec<&SearchParameter> = Vec::new();
         let mut missing: Vec<&SearchParameter> = Vec::new();
         let mut not_params: Vec<&SearchParameter> = Vec::new();
@@ -2599,8 +2609,8 @@ impl MongoBackend {
     /// Each returned document is a *full* filter (`tenant_id`,
     /// `resource_type`, `param_name` = the composite's own name, plus the
     /// component's typed predicate) — every row for every component of a
-    /// composite shares `param_name` with the composite itself, since the
-    /// extractor never stores a per-component slot.
+    /// composite shares `param_name` with the composite itself. Repeated
+    /// component types also require their declared `composite_slot`.
     ///
     /// Every predicate is additionally ANDed with `{value_field: {"$ne":
     /// null}}` for the component's own value field (review finding: an
@@ -2648,11 +2658,19 @@ impl MongoBackend {
         }
 
         let mut result = Vec::with_capacity(param.values.len());
+        // Match the extractor's per-type, declaration-order slot numbering.
+        // A unique type does not need a slot predicate, so old rows for
+        // composites with distinct component types remain searchable.
+        let mut counts = HashMap::<SearchParamType, usize>::new();
+        for component in &param.components {
+            *counts.entry(component.param_type).or_default() += 1;
+        }
         for value in &param.values {
             let component_values =
                 super::composite_search::split_composite_value(&value.value, &param.components)?;
 
             let mut per_component = Vec::with_capacity(param.components.len());
+            let mut seen = HashMap::<SearchParamType, i32>::new();
             for (component, component_value) in param.components.iter().zip(component_values) {
                 let negated = component_value.prefix == SearchPrefix::Ne;
                 let value_field = value_field_for(component.param_type).ok_or_else(|| {
@@ -2691,6 +2709,11 @@ impl MongoBackend {
                     "resource_type": resource_type,
                     "param_name": &param.name,
                 };
+                let slot = seen.entry(component.param_type).or_default();
+                *slot += 1;
+                if counts[&component.param_type] > 1 {
+                    scoped.insert("composite_slot", *slot);
+                }
                 scoped.insert(
                     "$and",
                     vec![
@@ -2706,6 +2729,103 @@ impl MongoBackend {
             result.push(per_component);
         }
         Ok(result)
+    }
+
+    /// Reject a repeated-type composite if an older matching component row
+    /// lacks its slot. Without this probe a slot-constrained query can report
+    /// a false negative until the tenant's index is rebuilt with `$reindex`.
+    pub(super) async fn preflight_legacy_composites(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        resource_type: &str,
+        parameters: &[SearchParameter],
+        contained: bool,
+        mut session: Option<&mut mongodb::ClientSession>,
+    ) -> StorageResult<()> {
+        let collection = db.collection::<Document>(if contained {
+            MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION
+        } else {
+            MongoBackend::SEARCH_INDEX_COLLECTION
+        });
+        let probe_index = if contained {
+            CONTAINED_COMPOSITE_SLOT_PROBE_INDEX
+        } else {
+            COMPOSITE_SLOT_PROBE_INDEX
+        };
+        for param in parameters
+            .iter()
+            .filter(|p| p.param_type == SearchParamType::Composite && p.modifier.is_none())
+        {
+            let mut seen = HashSet::new();
+            if !param
+                .components
+                .iter()
+                .any(|component| !seen.insert(component.param_type))
+            {
+                continue;
+            }
+            let normal_filters =
+                self.composite_component_filters(tenant_id, resource_type, param)?;
+            if !contained
+                && normal_filters
+                    .iter()
+                    .any(|value| value.iter().all(|c| c.negated))
+            {
+                // The driver planner's existing all-ne error takes precedence.
+                continue;
+            }
+            let filters = if contained {
+                self.contained_composite_component_filters(tenant_id, resource_type, param)?
+                    .into_iter()
+                    .map(|value| value.into_iter().map(|c| c.filter).collect::<Vec<_>>())
+                    .collect::<Vec<_>>()
+            } else {
+                normal_filters
+                    .into_iter()
+                    .map(|value| value.into_iter().map(|c| c.filter).collect::<Vec<_>>())
+                    .collect::<Vec<_>>()
+            };
+            for value in filters {
+                for mut filter in value {
+                    if filter.remove("composite_slot").is_none() {
+                        continue;
+                    }
+                    // Keep the typed value predicate: a row for another
+                    // candidate value does not require this query to fail.
+                    let legacy = doc! { "$and": [
+                        filter,
+                        { "composite_slot": { "$exists": false } },
+                        { "composite_group": { "$exists": true } },
+                    ] };
+                    let found = match session.as_deref_mut() {
+                        Some(s) => {
+                            collection
+                                .find_one(legacy)
+                                .hint(mongodb::options::Hint::Name(probe_index.to_string()))
+                                .session(s)
+                                .await
+                        }
+                        None => {
+                            collection
+                                .find_one(legacy)
+                                .hint(mongodb::options::Hint::Name(probe_index.to_string()))
+                                .await
+                        }
+                    }
+                    .or_query_error("Failed to probe legacy MongoDB composite rows")?;
+                    if found.is_some() {
+                        return Err(StorageError::Search(SearchError::InvalidComposite {
+                            message: format!(
+                                "composite search parameter '{}' has rows without component slots; run $reindex for this tenant",
+                                param.name
+                            ),
+                        }));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Counts documents matching `filter`, bounded by `limit`, using
@@ -5157,11 +5277,12 @@ mod composite_component_filter_tests {
             "Observation"
         );
         // Every component's row shares `param_name` with the composite
-        // itself -- there is no per-component slot.
+        // itself. This distinct-type composite can also use historical rows.
         assert_eq!(
             token_filter.get_str("param_name").unwrap(),
             "code-value-quantity"
         );
+        assert!(!token_filter.contains_key("composite_slot"));
         let and_arms = token_filter.get_array("$and").expect("$and conjunction");
         assert_eq!(and_arms.len(), 2, "not-null guard + typed predicate");
         let not_null = and_arms[0].as_document().expect("not-null arm");
@@ -5275,6 +5396,33 @@ mod composite_component_filter_tests {
             "expected QueryParseError like build_search_index_filter's own empty-values guard, \
              got {err:?}"
         );
+    }
+
+    #[test]
+    fn repeated_type_components_are_scoped_by_declared_slot() {
+        let backend = backend();
+        let param = SearchParameter {
+            name: "code-value-concept".to_string(),
+            param_type: SearchParamType::Composite,
+            modifier: None,
+            values: vec![SearchValue::eq("A$B")],
+            chain: vec![],
+            components: vec![
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "code".to_string(),
+                },
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "value-concept".to_string(),
+                },
+            ],
+        };
+        let filters = backend
+            .composite_component_filters("t1", "Observation", &param)
+            .unwrap();
+        assert_eq!(filters[0][0].filter.get_i32("composite_slot"), Ok(1));
+        assert_eq!(filters[0][1].filter.get_i32("composite_slot"), Ok(2));
     }
 }
 

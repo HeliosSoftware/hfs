@@ -1784,18 +1784,32 @@ where
     assert_cases(backend, &tenant, &controls, &cases).await;
 }
 
-/// MongoDB cannot identify component slots when a composite repeats a value
-/// type: both rows have the same parameter name and group. Refuse that query
-/// and modifiers before `_contained=both` can return a full top-level page.
-pub async fn ambiguous_composite_and_modifier_rejected<S>(backend: &S, tenant_base: &str)
+/// A repeated-type composite keeps its declared component order on both
+/// MongoDB index collections. Unsupported composite modifiers still fail.
+pub async fn repeated_type_composite_and_modifier<S>(backend: &S, tenant_base: &str)
 where
     S: ResourceStorage + SearchProvider,
 {
     let tenant = TenantContext::new(TenantId::new(tenant_base), TenantPermissions::full_access());
     let mut observed = observation("top", "A", "2020-06-15", &["cat1"]);
-    observed["valueCodeableConcept"] = json!({
-        "coding": [{"system": "http://example.org/value", "code": "B"}]
-    });
+    observed["code"]["coding"] = json!([
+        {"system": "http://loinc.org", "code": "A"},
+        {"system": "http://loinc.org", "code": "X"}
+    ]);
+    observed["valueCodeableConcept"] = json!({"coding": [
+        {"system": "http://example.org/value", "code": "B"},
+        {"system": "http://example.org/value", "code": "Y"}
+    ]});
+    observed["component"] = json!([
+        {
+            "code": {"coding": [{"system": "http://loinc.org", "code": "A"}]},
+            "valueCodeableConcept": {"coding": [{"system": "http://example.org/value", "code": "B"}]}
+        },
+        {
+            "code": {"coding": [{"system": "http://loinc.org", "code": "C"}]},
+            "valueCodeableConcept": {"coding": [{"system": "http://example.org/value", "code": "D"}]}
+        }
+    ]);
     backend
         .create(
             &tenant,
@@ -1843,33 +1857,107 @@ where
                 .expect("top-level code-value-concept=A$B control")
         ),
         vec!["top"],
-        "the composite pair must be indexed before testing its refusal",
+        "the composite pair must be indexed",
     );
 
-    for mode in [ContainedMode::On, ContainedMode::Both] {
-        let mut ambiguous = SearchQuery::new("Observation");
-        ambiguous.contained = mode;
-        ambiguous.count = Some(1);
-        // The indexed pair is A$B. Without component slots, B$A can swap
-        // those two token rows and falsely match the same group.
-        let mut pair = indexed_pair.clone();
-        pair.values = vec![SearchValue::new(SearchPrefix::Eq, "B$A")];
-        ambiguous.parameters.push(pair);
-        for result in [
-            backend.search(&tenant, &ambiguous).await.map(|_| ()),
-            backend.search_count(&tenant, &ambiguous).await.map(|_| ()),
+    for (mode, returns, expected) in [
+        (ContainedMode::Off, ContainedReturn::Container, vec!["top"]),
+        (
+            ContainedMode::On,
+            ContainedReturn::Container,
+            vec!["container"],
+        ),
+        (
+            ContainedMode::On,
+            ContainedReturn::Contained,
+            vec!["inside"],
+        ),
+        (
+            ContainedMode::Both,
+            ContainedReturn::Container,
+            vec!["container", "top"],
+        ),
+        (
+            ContainedMode::Both,
+            ContainedReturn::Contained,
+            vec!["inside", "top"],
+        ),
+    ] {
+        for (value, want_match) in [
+            ("A$B", true),
+            ("X$Y", true),
+            ("X$B", true),
+            ("B$A", false),
+            ("Y$X", false),
         ] {
-            let err = result.expect_err("repeated token components must fail closed");
-            assert!(
-                matches!(
-                    &err,
-                    StorageError::Search(SearchError::InvalidComposite { .. })
-                ),
-                "expected InvalidComposite for {mode:?}, got {err:?}"
+            let mut query = SearchQuery::new("Observation");
+            query.contained = mode;
+            query.contained_return = returns;
+            query.count = Some(1);
+            query.total = Some(TotalMode::Accurate);
+            let mut pair = indexed_pair.clone();
+            pair.values = vec![SearchValue::new(SearchPrefix::Eq, value)];
+            query.parameters.push(pair);
+            let result = backend
+                .search(&tenant, &query)
+                .await
+                .expect("repeated-type composite search");
+            let mut expected_ids = if want_match { expected.clone() } else { vec![] };
+            expected_ids.sort();
+            // A one-item page still has to report the full count.
+            assert_eq!(
+                result.total,
+                Some(expected_ids.len() as u64),
+                "{mode:?} {returns:?} {value}"
             );
-            assert!(err.to_string().contains("code-value-concept"));
+            assert_eq!(
+                backend.search_count(&tenant, &query).await.unwrap(),
+                expected_ids.len() as u64,
+                "{mode:?} {returns:?} {value}"
+            );
+            let mut full = query.clone();
+            full.count = Some(10);
+            assert_eq!(
+                sorted_ids(&backend.search(&tenant, &full).await.unwrap()),
+                expected_ids,
+                "{mode:?} {returns:?} {value}"
+            );
         }
+    }
 
+    let component_pair = SearchParameter {
+        name: "component-code-value-concept".to_string(),
+        components: indexed_pair.components.clone(),
+        ..indexed_pair.clone()
+    };
+    for mode in [ContainedMode::Off, ContainedMode::On, ContainedMode::Both] {
+        for (value, matched) in [
+            ("A$B", true),
+            ("C$D", true),
+            ("B$A", false),
+            ("D$C", false),
+            ("A$D", false),
+        ] {
+            let mut query = SearchQuery::new("Observation");
+            query.contained = mode;
+            let mut pair = component_pair.clone();
+            pair.values = vec![SearchValue::eq(value)];
+            query.parameters.push(pair);
+            let expected = match (mode, matched) {
+                (_, false) => vec![],
+                (ContainedMode::Off, true) => vec!["top"],
+                (ContainedMode::On, true) => vec!["container"],
+                (ContainedMode::Both, true) => vec!["container", "top"],
+            };
+            assert_eq!(
+                sorted_ids(&backend.search(&tenant, &query).await.unwrap()),
+                expected,
+                "{mode:?} {value}"
+            );
+        }
+    }
+
+    for mode in [ContainedMode::On, ContainedMode::Both] {
         let mut modified = SearchQuery::new("Observation");
         modified.contained = mode;
         modified.count = Some(1);

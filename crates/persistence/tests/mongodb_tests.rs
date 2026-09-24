@@ -614,16 +614,248 @@ async fn mongodb_contained_composites_pair_within_one_resource() {
 }
 
 #[tokio::test]
-async fn mongodb_contained_rejects_ambiguous_composites_and_modifiers() {
+async fn mongodb_contained_repeated_type_composite_and_modifier() {
     let Some(backend) = create_backend_with_full_registry("contained_comp_guard").await else {
         eprintln!("skipping: no MongoDB container available");
         return;
     };
-    contained_suite::ambiguous_composite_and_modifier_rejected(
+    contained_suite::repeated_type_composite_and_modifier(
         &backend,
         "contained-composite-guard-1407",
     )
     .await;
+}
+
+#[tokio::test]
+async fn mongodb_repeated_type_composite_legacy_rows_require_reindex() {
+    use helios_persistence::search::{ReindexOperation, ReindexRequest, ReindexStatus};
+    use helios_persistence::types::ContainedMode;
+
+    let Some(backend) = create_backend_with_full_registry("repeated_slot_legacy").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    let tenant = create_tenant("repeated-slot-legacy");
+    let observation = json!({
+        "resourceType": "Observation", "id": "top", "status": "final",
+        "code": {"coding": [{"system": "http://loinc.org", "code": "A"}]},
+        "valueCodeableConcept": {"coding": [{"system": "http://example.org/value", "code": "B"}]}
+    });
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            observation.clone(),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let mut inside = observation;
+    inside["id"] = json!("inside");
+    backend
+        .create(
+            &tenant,
+            "DiagnosticReport",
+            json!({
+                "resourceType": "DiagnosticReport", "id": "report", "status": "final",
+                "code": {"coding": [{"system": "http://loinc.org", "code": "report"}]},
+                "contained": [inside]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let pair = |value: &str| SearchParameter {
+        name: "code-value-concept".to_string(),
+        param_type: SearchParamType::Composite,
+        values: vec![SearchValue::eq(value)],
+        components: vec![
+            CompositeSearchComponent {
+                param_type: SearchParamType::Token,
+                param_name: "code".to_string(),
+            },
+            CompositeSearchComponent {
+                param_type: SearchParamType::Token,
+                param_name: "value-concept".to_string(),
+            },
+        ],
+        ..Default::default()
+    };
+    let query = |value: &str, contained| {
+        let mut query = SearchQuery::new("Observation");
+        query.parameters.push(pair(value));
+        query.contained = contained;
+        query.count = Some(1);
+        query
+    };
+    assert_eq!(
+        backend
+            .search_count(&tenant, &query("A$B", ContainedMode::Off))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        backend
+            .search_count(&tenant, &query("B$A", ContainedMode::Off))
+            .await
+            .unwrap(),
+        0
+    );
+
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap();
+    let db = client.database(&backend.config().database_name);
+    let own = db.collection::<Document>("search_index");
+    let held = db.collection::<Document>("search_index_contained");
+    let own_key = doc! {"tenant_id": tenant.tenant_id().as_str(), "resource_type": "Observation", "resource_id": "top", "param_name": "code-value-concept"};
+    let held_key = doc! {"tenant_id": tenant.tenant_id().as_str(), "resource_type": "DiagnosticReport", "contained_type": "Observation", "param_name": "code-value-concept"};
+    assert_eq!(
+        own.update_many(own_key.clone(), doc! {"$unset": {"composite_slot": ""}})
+            .await
+            .unwrap()
+            .modified_count,
+        2
+    );
+    for outcome in [
+        backend
+            .search(&tenant, &query("A$B", ContainedMode::Off))
+            .await
+            .map(|_| ()),
+        backend
+            .search_count(&tenant, &query("A$B", ContainedMode::Off))
+            .await
+            .map(|_| ()),
+    ] {
+        let error = outcome.expect_err("legacy primary index must fail closed");
+        assert!(error.to_string().contains("$reindex"), "{error:?}");
+    }
+
+    let transaction_entry = |value: &str| BundleEntry {
+        method: BundleMethod::Post,
+        url: "Observation".to_string(),
+        resource: Some(
+            json!({"resourceType": "Observation", "status": "final", "code": {"coding": [{"code": "new"}]}}),
+        ),
+        if_match: None,
+        if_none_match: None,
+        if_none_exist: Some(format!("code-value-concept={value}")),
+        full_url: None,
+    };
+    let error = backend
+        .process_transaction(
+            &tenant,
+            vec![transaction_entry("A$B")],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("legacy transactional index must fail closed");
+    assert!(error.to_string().contains("$reindex"), "{error:?}");
+
+    assert_eq!(
+        held.update_many(held_key.clone(), doc! {"$unset": {"composite_slot": ""}})
+            .await
+            .unwrap()
+            .modified_count,
+        2
+    );
+    for mode in [ContainedMode::On, ContainedMode::Both] {
+        for outcome in [
+            backend
+                .search(&tenant, &query("A$B", mode))
+                .await
+                .map(|_| ()),
+            backend
+                .search_count(&tenant, &query("A$B", mode))
+                .await
+                .map(|_| ()),
+        ] {
+            let error = outcome.expect_err("legacy contained index must fail closed");
+            assert!(
+                error.to_string().contains("$reindex"),
+                "{mode:?}: {error:?}"
+            );
+        }
+    }
+    // A tenant-wide rebuild covers both the top-level Observation and the
+    // DiagnosticReport that owns the contained Observation.
+    let registries = backend.tenant_registries().clone();
+    let backend = Arc::new(backend);
+    let reindex = ReindexOperation::new(backend.clone(), registries);
+    let job = reindex
+        .start(
+            tenant.clone(),
+            ReindexRequest {
+                clear_existing: false,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let progress = tokio::time::timeout(tokio::time::Duration::from_secs(30), async {
+        loop {
+            let progress = reindex.get_progress(&job).await.unwrap();
+            if !progress.status.is_running() {
+                break progress;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("tenant reindex timed out");
+    assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+    assert!(progress.errors.is_empty(), "{progress:?}");
+    assert!(progress.processed_resources >= 2, "{progress:?}");
+
+    assert_eq!(
+        backend
+            .search_count(&tenant, &query("A$B", ContainedMode::Off))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        backend
+            .search_count(&tenant, &query("B$A", ContainedMode::Off))
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        backend
+            .search_count(&tenant, &query("A$B", ContainedMode::On))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        backend
+            .search_count(&tenant, &query("B$A", ContainedMode::On))
+            .await
+            .unwrap(),
+        0
+    );
+    let matched = backend
+        .process_transaction(
+            &tenant,
+            vec![transaction_entry("A$B")],
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(matched.entries[0].status, 200);
+    let swapped = backend
+        .process_transaction(
+            &tenant,
+            vec![transaction_entry("B$A")],
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(swapped.entries[0].status, 201);
 }
 
 // Strict `_contained=both` dedup (#1407): a container of the searched type
@@ -15052,6 +15284,97 @@ async fn mongodb_integration_missing_false_search_is_a_covered_v2_scan() {
 // so they need `create_backend_with_full_registry` only to make sure the
 // *extractor* decomposes composites into per-component rows the same way the
 // real R4 registry does on write.
+
+/// Both index collections retain the token component position for a registered
+/// token + token composite. Ordinary token rows have no composite slot.
+#[tokio::test]
+async fn mongodb_integration_composite_slots_written_to_both_index_collections() {
+    let Some(backend) = create_backend_with_full_registry("composite_slots").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-composite-slots");
+    let observation = json!({
+        "resourceType": "Observation",
+        "id": "own",
+        "status": "final",
+        "code": {"coding": [{"system": "http://example.org/code", "code": "A"}]},
+        "valueCodeableConcept": {
+            "coding": [{"system": "http://example.org/value", "code": "B"}]
+        }
+    });
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            observation.clone(),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed top-level Observation");
+    let mut contained_observation = observation;
+    contained_observation["id"] = json!("inside");
+    backend
+        .create(
+            &tenant,
+            "DiagnosticReport",
+            json!({
+                "resourceType": "DiagnosticReport",
+                "id": "holder",
+                "status": "final",
+                "code": {"text": "panel"},
+                "contained": [contained_observation]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed contained Observation");
+
+    let db = raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap()
+        .database(&backend.config().database_name);
+    for (collection, resource_type, resource_id) in [
+        ("search_index", "Observation", "own"),
+        ("search_index_contained", "DiagnosticReport", "holder"),
+    ] {
+        let index = db.collection::<Document>(collection);
+        let mut filter = doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": resource_type,
+            "resource_id": resource_id,
+            "param_name": "code-value-concept",
+        };
+        if collection == "search_index_contained" {
+            filter.insert("contained_type", "Observation");
+            filter.insert("contained_local_id", "inside");
+        }
+        assert_eq!(
+            index.count_documents(filter.clone()).await.unwrap(),
+            2,
+            "{collection} must have exactly two code-value-concept rows"
+        );
+        for (code, slot) in [("A", 1), ("B", 2)] {
+            let mut component_filter = filter.clone();
+            component_filter.insert("value_token_code", code);
+            let row = index
+                .find_one(component_filter)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("missing {code} row in {collection}"));
+            assert_eq!(row.get_i32("composite_group"), Ok(0));
+            assert_eq!(row.get_i32("composite_slot"), Ok(slot));
+        }
+
+        filter.insert("param_name", "code");
+        let ordinary = index
+            .find_one(filter)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("missing ordinary code row in {collection}"));
+        assert!(!ordinary.contains_key("composite_slot"));
+    }
+}
 
 /// Builds a `code-value-quantity` composite query with the component types
 /// the registry supplies for `Observation` (Token code, Quantity value).
