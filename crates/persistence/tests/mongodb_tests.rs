@@ -8535,6 +8535,135 @@ async fn mongodb_integration_reindex_page_counts_contained_entries() {
     );
 }
 
+/// #1403 PR0: MongoDB is the only writer that measures its own phases in this
+/// PR. Every call goes through `&dyn ReindexTarget` to prove dynamic dispatch
+/// reaches MongoDB's override rather than the trait's zero-measuring default
+/// (S1 "default-method trap").
+#[tokio::test]
+async fn mongodb_integration_reindex_page_reports_phase_stats() {
+    use helios_persistence::search::{ReindexPageStats, ReindexTarget};
+    use helios_persistence::types::StoredResource;
+
+    let Some(backend) = create_backend_with_full_registry("reindex_page_phase_stats").await else {
+        eprintln!(
+            "Skipping mongodb_integration_reindex_page_reports_phase_stats (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("reindex-phase-stats-tenant");
+    let target: &dyn ReindexTarget = &backend;
+
+    // Step 1: seed 8 Patients.
+    let patients: Vec<StoredResource> = (0..8)
+        .map(|i| {
+            StoredResource::from_storage(
+                "Patient",
+                format!("phase-stats-{i}"),
+                "1",
+                tenant.tenant_id().clone(),
+                json!({
+                    "resourceType": "Patient",
+                    "id": format!("phase-stats-{i}"),
+                    "name": [{"family": "Stats"}],
+                    "gender": "female",
+                    "birthDate": "1990-01-01"
+                }),
+                chrono::Utc::now(),
+                chrono::Utc::now(),
+                None,
+                FhirVersion::default(),
+            )
+        })
+        .collect();
+    let mut first = ReindexPageStats::default();
+    let outcomes = target
+        .write_search_entries_page_timed(&tenant, &patients, &mut first)
+        .await;
+    assert!(outcomes.iter().all(|r| r.is_ok()), "{outcomes:?}");
+    assert_eq!(first.deleted_entries, 0, "the database is unique per test");
+    assert!(first.inserted_entries > 0);
+    assert_eq!(first.insert_commands, 1);
+    assert!(first.extract > std::time::Duration::ZERO);
+    assert!(first.delete > std::time::Duration::ZERO);
+    assert!(first.insert > std::time::Duration::ZERO);
+
+    // Step 2: rewrite the same page.
+    let mut second = ReindexPageStats::default();
+    let outcomes = target
+        .write_search_entries_page_timed(&tenant, &patients, &mut second)
+        .await;
+    assert!(outcomes.iter().all(|r| r.is_ok()), "{outcomes:?}");
+    assert_eq!(second.deleted_entries, first.inserted_entries);
+    assert_eq!(second.inserted_entries, first.inserted_entries);
+    let mut total_after_rewrite = 0u64;
+    for p in &patients {
+        total_after_rewrite += search_index_entry_count(&backend, &tenant, "Patient", p.id()).await;
+    }
+    assert_eq!(total_after_rewrite, first.inserted_entries);
+
+    // Step 3: contained.
+    let with_contained = StoredResource::from_storage(
+        "Observation",
+        "phase-stats-contained",
+        "1",
+        tenant.tenant_id().clone(),
+        json!({
+            "resourceType": "Observation",
+            "id": "phase-stats-contained",
+            "status": "final",
+            "contained": [{
+                "resourceType": "Patient",
+                "id": "inner",
+                "name": [{"family": "Contained"}]
+            }],
+            "subject": {"reference": "#inner"},
+            "code": {"coding": [{"system": "http://loinc.org", "code": "1234-5"}]}
+        }),
+        chrono::Utc::now(),
+        chrono::Utc::now(),
+        None,
+        FhirVersion::default(),
+    );
+    let mut third = ReindexPageStats::default();
+    let outcomes = target
+        .write_search_entries_page_timed(&tenant, std::slice::from_ref(&with_contained), &mut third)
+        .await;
+    assert!(outcomes.iter().all(|r| r.is_ok()), "{outcomes:?}");
+    let own_rows =
+        search_index_entry_count(&backend, &tenant, "Observation", "phase-stats-contained").await;
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect MongoDB client for search_index_contained assertions");
+    let database = client.database(&backend.config().database_name);
+    let contained_rows = database
+        .collection::<Document>("search_index_contained")
+        .count_documents(doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": "Observation",
+            "resource_id": "phase-stats-contained",
+        })
+        .await
+        .expect("failed to count search_index_contained rows");
+    assert!(contained_rows > 0);
+    assert_eq!(third.inserted_entries, own_rows + contained_rows);
+    assert_eq!(third.insert_commands, 2);
+
+    // Step 4: offloaded.
+    let Some(offloaded) =
+        create_backend_with_search_offloaded("reindex_page_phase_stats_offloaded", true).await
+    else {
+        eprintln!("Skipping the offloaded step (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let offloaded_target: &dyn ReindexTarget = &offloaded;
+    let mut offloaded_stats = ReindexPageStats::default();
+    let outcomes = offloaded_target
+        .write_search_entries_page_timed(&tenant, &patients, &mut offloaded_stats)
+        .await;
+    assert!(outcomes.iter().all(|r| matches!(r, Ok(0))), "{outcomes:?}");
+    assert_eq!(offloaded_stats, ReindexPageStats::default());
+}
+
 /// Guard for the `is_search_offloaded()` short-circuit the batched override
 /// needs. The default loop honors the flag via `delete_search_entries` and
 /// `write_search_entries`'s own guards; the page override has to reproduce
