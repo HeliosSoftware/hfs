@@ -4896,6 +4896,69 @@ mod postgres_integration {
         assert_eq!(result.resources.items[0].id(), "p1");
     }
 
+    #[tokio::test]
+    async fn postgres_integration_id_pages_keep_search_cursor_order() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::SearchQuery;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("id-pages");
+        for id in ["p1", "p2", "p3"] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({ "resourceType": "Patient", "id": id }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let query = SearchQuery::new("Patient").with_count(2);
+        let full_first = backend.search(&tenant, &query).await.unwrap();
+        let id_first = backend.search_ids(&tenant, &query).await.unwrap();
+        assert_eq!(
+            id_first.items,
+            full_first
+                .resources
+                .items
+                .iter()
+                .map(|resource| resource.id().to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            id_first.page_info.next_cursor,
+            full_first.resources.page_info.next_cursor
+        );
+
+        let next_query = query.with_cursor(id_first.page_info.next_cursor.unwrap());
+        let full_next = backend.search(&tenant, &next_query).await.unwrap();
+        let id_next = backend.search_ids(&tenant, &next_query).await.unwrap();
+        assert_eq!(
+            id_next.items,
+            full_next
+                .resources
+                .items
+                .iter()
+                .map(|resource| resource.id().to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(id_next.page_info.has_previous);
+        assert!(id_next.page_info.previous_cursor.is_some());
+
+        let mut offset_query = SearchQuery::new("Patient").with_count(2);
+        offset_query.offset = Some(0);
+        assert_eq!(
+            backend
+                .search_ids(&tenant, &offset_query)
+                .await
+                .unwrap()
+                .items,
+            id_first.items
+        );
+    }
+
     /// The backend-agnostic meta-parameter scenario (#523), shared verbatim
     /// with the SQLite suite that owns the file.
     #[tokio::test]

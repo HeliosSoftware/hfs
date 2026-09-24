@@ -978,12 +978,208 @@ where
 mod tests {
     use super::*;
     use crate::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
-    use crate::core::ResourceStorage;
+    use crate::core::{ResourceStorage, SearchResult};
     use crate::tenant::{TenantId, TenantPermissions};
-    use crate::types::ChainedParameter;
+    use crate::types::{ChainedParameter, Page, PageInfo, StoredResource};
     use helios_fhir::FhirVersion;
     use serde_json::json;
+    use std::collections::VecDeque;
     use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    struct ScriptedPages {
+        pages: Mutex<VecDeque<Page<String>>>,
+        calls: Mutex<Vec<(Option<String>, Option<u32>)>>,
+    }
+
+    impl ScriptedPages {
+        fn new(pages: Vec<Page<String>>) -> Self {
+            Self {
+                pages: Mutex::new(pages.into()),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn next_page(&self, query: &SearchQuery) -> Page<String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((query.cursor.clone(), query.offset));
+            self.pages
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected page")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ResourceStorage for ScriptedPages {
+        fn backend_name(&self) -> &'static str {
+            "scripted"
+        }
+
+        async fn create(
+            &self,
+            _: &TenantContext,
+            _: &str,
+            _: serde_json::Value,
+            _: FhirVersion,
+        ) -> StorageResult<StoredResource> {
+            unreachable!()
+        }
+
+        async fn create_or_update(
+            &self,
+            _: &TenantContext,
+            _: &str,
+            _: &str,
+            _: serde_json::Value,
+            _: FhirVersion,
+        ) -> StorageResult<(StoredResource, bool)> {
+            unreachable!()
+        }
+
+        async fn read(
+            &self,
+            _: &TenantContext,
+            _: &str,
+            _: &str,
+        ) -> StorageResult<Option<StoredResource>> {
+            unreachable!()
+        }
+
+        async fn update(
+            &self,
+            _: &TenantContext,
+            _: &StoredResource,
+            _: serde_json::Value,
+        ) -> StorageResult<StoredResource> {
+            unreachable!()
+        }
+
+        async fn delete(&self, _: &TenantContext, _: &str, _: &str) -> StorageResult<()> {
+            unreachable!()
+        }
+
+        async fn count(&self, _: &TenantContext, _: Option<&str>) -> StorageResult<u64> {
+            unreachable!()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SearchProvider for ScriptedPages {
+        async fn search(
+            &self,
+            tenant: &TenantContext,
+            query: &SearchQuery,
+        ) -> StorageResult<SearchResult> {
+            let resources = self.next_page(query).map(|id| {
+                StoredResource::new(
+                    query.resource_type.clone(),
+                    id.clone(),
+                    tenant.tenant_id().clone(),
+                    json!({ "resourceType": query.resource_type, "id": id }),
+                    FhirVersion::default(),
+                )
+            });
+            Ok(SearchResult::new(resources))
+        }
+
+        async fn search_ids(
+            &self,
+            _: &TenantContext,
+            query: &SearchQuery,
+        ) -> StorageResult<Page<String>> {
+            Ok(self.next_page(query))
+        }
+
+        async fn search_count(&self, _: &TenantContext, _: &SearchQuery) -> StorageResult<u64> {
+            unreachable!()
+        }
+
+        fn search_param_registry(
+            &self,
+            _: &TenantContext,
+        ) -> std::sync::Arc<parking_lot::RwLock<SearchParameterRegistry>> {
+            unreachable!()
+        }
+    }
+
+    fn scripted_page(ids: &[&str], next_cursor: Option<&str>, has_next: bool) -> Page<String> {
+        Page::new(
+            ids.iter().map(|id| (*id).to_string()).collect(),
+            PageInfo {
+                next_cursor: next_cursor.map(str::to_string),
+                previous_cursor: None,
+                total: None,
+                has_next,
+                has_previous: false,
+            },
+        )
+    }
+
+    async fn drain_scripted(storage: &ScriptedPages, ids_only: bool) -> StorageResult<Vec<String>> {
+        let mut query = SearchQuery::new("Patient");
+        query.cursor = Some("external".to_string());
+        query.offset = Some(99);
+        if ids_only {
+            search_all_ids(storage, &tenant(), query).await
+        } else {
+            search_all_pages(storage, &tenant(), query)
+                .await
+                .map(|resources| {
+                    resources
+                        .into_iter()
+                        .map(|resource| resource.id().to_string())
+                        .collect()
+                })
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_pages_use_offset_only_when_provider_has_no_cursor() {
+        for ids_only in [false, true] {
+            let storage = ScriptedPages::new(vec![
+                scripted_page(&["a"], None, true),
+                scripted_page(&["b"], None, false),
+            ]);
+            assert_eq!(
+                drain_scripted(&storage, ids_only).await.unwrap(),
+                ["a", "b"]
+            );
+            assert_eq!(
+                *storage.calls.lock().unwrap(),
+                [(None, None), (None, Some(1))]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_pages_reject_empty_continuations() {
+        for ids_only in [false, true] {
+            let storage = ScriptedPages::new(vec![scripted_page(&[], None, true)]);
+            let error = drain_scripted(&storage, ids_only).await.unwrap_err();
+            assert!(error.to_string().contains("empty"), "{error}");
+            assert_eq!(*storage.calls.lock().unwrap(), [(None, None)]);
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_pages_reject_repeated_cursors() {
+        for ids_only in [false, true] {
+            let storage = ScriptedPages::new(vec![
+                scripted_page(&["a"], Some("same"), true),
+                scripted_page(&["b"], Some("same"), true),
+            ]);
+            let error = drain_scripted(&storage, ids_only).await.unwrap_err();
+            assert!(error.to_string().contains("repeated"), "{error}");
+            assert_eq!(
+                *storage.calls.lock().unwrap(),
+                [(None, None), (Some("same".to_string()), None)]
+            );
+        }
+    }
 
     fn backend() -> SqliteBackend {
         let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

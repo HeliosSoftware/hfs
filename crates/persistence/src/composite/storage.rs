@@ -3618,6 +3618,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_ids_uses_the_same_provider_fallback_as_search() {
+        let tenant = TenantContext::new(
+            TenantId::new("composite-test"),
+            TenantPermissions::full_access(),
+        );
+        let query = SearchQuery::new("Patient");
+        let (mut composite, primary, search) = make_composite_with_dedicated_search(
+            vec![fake_patient("primary-id")],
+            vec![fake_patient("search-id")],
+        );
+
+        let ids = composite.search_ids(&tenant, &query).await.unwrap().items;
+        assert_eq!(ids, ["search-id"]);
+        assert_eq!(primary.call_count(), 0);
+        assert_eq!(search.call_count(), 1);
+
+        composite.search_providers.remove("search");
+        let ids = composite.search_ids(&tenant, &query).await.unwrap().items;
+        assert_eq!(ids, ["primary-id"]);
+        assert_eq!(primary.call_count(), 1);
+
+        composite.search_providers.remove("primary");
+        let error = composite.search_ids(&tenant, &query).await.unwrap_err();
+        assert!(matches!(
+            error,
+            StorageError::Backend(BackendError::UnsupportedCapability { backend_name, .. })
+                if backend_name == "primary"
+        ));
+    }
+
+    #[tokio::test]
+    async fn search_ids_without_dedicated_backend_uses_primary() {
+        let tenant = TenantContext::new(
+            TenantId::new("composite-test"),
+            TenantPermissions::full_access(),
+        );
+        let (composite, primary) =
+            make_composite_no_search_backend(vec![fake_patient("primary-id")]);
+        let ids = composite
+            .search_ids(&tenant, &SearchQuery::new("Patient"))
+            .await
+            .unwrap()
+            .items;
+        assert_eq!(ids, ["primary-id"]);
+        assert_eq!(primary.call_count(), 1);
+    }
+
+    #[tokio::test]
     async fn resolve_includes_delegates_to_shared_resolver_via_search_backend() {
         use crate::search::{SearchParameterDefinition, SearchParameterRegistry};
         use crate::types::IncludeType;
