@@ -382,15 +382,15 @@ own `display: flex` override is the example). Not View Definitions' own: SQL
 Query and SQL View's Details section (below) renders its guided-form card
 the same inline, server-side way and carries the identical `needs-js`.
 
-### Details (#840): the SQL Query/SQL View Library minus its SQL attachment
+### Details (#840, #1233): the SQL Query/SQL View Library, in full
 
 `/ui/sql/queries` and `/ui/sql/views` (`pages/sql-library.html`, one template
 keyed by the route's own `LibraryKind`) give each stored `Library` a Details
-section — the same JSON editor + guided-form pairing described above, over a
-different document: the `Library` with its `application/sql` `content[]`
-attachment stripped out (`sql_libraries::strip_sql_attachment`), since the
-SQL card beside it owns that attachment on its own. `crate::
-render_lib_details_pane` calls the shared engine with `hidden: &["content"]`
+section — the same JSON editor + guided-form pairing described above, over
+the full stored document, `application/sql` `content[]` attachment
+included: the SQL card beside it is a second view of that same attachment
+(#1233). `crate::render_lib_details_pane` calls the shared engine with
+`hidden: &["content"]`
 (so the guided form neither shows nor offers to mutate it) and `legend:
 "sql-library"` (its own two-line legend — "checked on save" here names the
 Library type coding and the SQL attachment, not the generic constraints/

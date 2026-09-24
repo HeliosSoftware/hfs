@@ -997,11 +997,12 @@ lib-degraded = The library list could not be loaded.
 lib-run-hint = Runs as you type — results follow the current SQL, saved or not
 lib-delete-confirm = Delete "{ $name }"? This cannot be undone.
 lib-delete-failed = Could not delete the library.
-# Details section (#840): the Library minus its SQL attachment, edited as
-# JSON (left) and through the guided form (right).
+# Details section (#840): the full stored Library (SQL attachment
+# included, #1233), edited as JSON (left) and through the guided form
+# (right).
 lib-details-heading = Details
 lib-details-json-heading = Library (JSON)
-lib-details-json-note = The SQL attachment is edited in the SQL card below and is not part of this view.
+lib-details-json-note = The SQL attachment (content[].data) is part of this document. The SQL card below edits the same attachment.
 # Shown only for `?lib=new`, under the Details heading — closes the #839
 # follow-up asking for a hint about the starter's `change-me` placeholder.
 lib-details-new-lede = Rename it and point relatedArtifact[0] at a ViewDefinition that exists.

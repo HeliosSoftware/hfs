@@ -22,8 +22,8 @@
   Details (#840): a JSON editor (CodeMirror 6, `sql-library-details.js`)
   beside the guided form the Resource Editor and View Definitions already
   share (`editor::build_form_pane`, `crate::render_lib_details_pane`) — the
-  Library minus its `application/sql` attachment, which the SQL card below
-  owns instead (`sql_libraries::strip_sql_attachment`). The two panes sync
+  full stored Library, `application/sql` attachment included; the SQL card
+  below is a second view of that same attachment (#1233). The two panes sync
   in both directions through the shared host (`editor-pair.js`, #840); the
   guided form's own "+ Add" and mutations never touch `content`
   (`hidden=content`, #840's engine). One Save posts both cards and the
@@ -152,7 +152,7 @@
     <p class="notice notice--warn">{{ error }}</p>
     {% endif %}
 
-    {#- Details (#840): the Library minus its SQL attachment, edited two
+    {#- Details (#840, #1233): the full stored Library, edited two
         ways at once — a JSON editor (left) and the guided form the
         Resource Editor and View Definitions already share (right,
         `details`, built server-side by `crate::render_lib_details_pane`

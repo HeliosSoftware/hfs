@@ -360,12 +360,12 @@ test("a parse error's line is tinted in the SQL editor; an execution error and a
   await expect(taggedLines).toHaveCount(0);
 });
 
-// Details (#840): the JSON editor + guided-form pairing over the Library
-// minus its SQL attachment — the same shared host (`editor-pair.js`) View
-// Definitions proves in sql-view-definitions.spec.ts, exercised here for
-// the Library-backed pages. Both routes share one template, so a route not
-// named below behaves identically — only the gate test (route-specific by
-// nature) exercises both.
+// Details (#840): the JSON editor + guided-form pairing over the full
+// stored Library (SQL attachment included, #1233) — the same shared host
+// (`editor-pair.js`) View Definitions proves in sql-view-definitions.spec.ts,
+// exercised here for the Library-backed pages. Both routes share one
+// template, so a route not named below behaves identically — only the gate
+// test (route-specific by nature) exercises both.
 test.describe("Details", () => {
   test("editing the guided form updates the JSON pane, and Save persists the merged document", async ({
     page,
@@ -389,8 +389,9 @@ test.describe("Details", () => {
 
     const jsonPane = page.locator("textarea[name='json']");
     await expect(jsonPane).toHaveValue(/e2e_details_renamed/, { timeout: 3000 });
-    // The SQL attachment never shows up in the Details JSON pane.
-    expect(await jsonPane.inputValue()).not.toContain("application/sql");
+    // The Details JSON pane is the full stored document — the SQL
+    // attachment is part of it (#1233).
+    expect(await jsonPane.inputValue()).toContain("application/sql");
 
     await page.locator("button[name='action'][value='save']").click();
     await page.waitForURL(new RegExp(`lib=${libId}&saved=1`));

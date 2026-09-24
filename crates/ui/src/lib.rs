@@ -5363,10 +5363,8 @@ struct SqlLibQuery {
 
 /// Shapes a stored `Library` resource into the editor's `(id, name, json,
 /// sql)` quadruple: `sql` decoded out of the base64 `application/sql`
-/// attachment for the SQL card, `json` the Details card's own document —
-/// `lib` with that same attachment stripped back out (#840,
-/// [`sql_libraries::strip_sql_attachment`]) — so the two cards never show
-/// the SQL text twice.
+/// attachment for the SQL card, `json` the full stored document — the SQL
+/// card below is a second view of its `application/sql` attachment (#1233).
 fn shape_lib(lib: &serde_json::Value) -> (String, String, String, String) {
     let id = lib
         .get("id")
@@ -5379,8 +5377,7 @@ fn shape_lib(lib: &serde_json::Value) -> (String, String, String, String) {
         .unwrap_or(&id)
         .to_string();
     let sql = sql_libraries::extract_sql(lib);
-    let json =
-        serde_json::to_string_pretty(&sql_libraries::strip_sql_attachment(lib)).unwrap_or_default();
+    let json = serde_json::to_string_pretty(lib).unwrap_or_default();
     (id, name, json, sql)
 }
 
@@ -5392,9 +5389,11 @@ fn shape_lib(lib: &serde_json::Value) -> (String, String, String, String) {
 /// place on first paint, not fetched after the fact. Mirrors
 /// [`render_vd_form_pane`]; `document`'s own `resourceType` decides the
 /// fallback resource type when absent, falling back to `"Library"` — every
-/// caller on this page hands it a `Library` (its SQL attachment already
-/// stripped by the caller), except the one Save-error path where the
-/// submitted document parses but carries some other type.
+/// caller on this page hands it the full `Library` document, `application/sql`
+/// attachment included (#1233), except the one Save-error path where the
+/// submitted document parses but carries some other type; `hidden=["content"]`
+/// below is what keeps that attachment out of the form's own rows and its
+/// "+ Add" list.
 fn render_lib_details_pane(
     i18n: I18n,
     version: helios_fhir::FhirVersion,
@@ -5425,9 +5424,10 @@ fn render_lib_details_pane(
 }
 
 /// The Details panel for whichever document this render selected (#840):
-/// the stored library — its SQL attachment stripped — or `?lib=new`'s
-/// starter document (which carries none to begin with), mirroring
-/// [`vd_form_pane_for_selection`]. `None` only alongside `selected: None`.
+/// the stored library — full document, `application/sql` attachment
+/// included (#1233) — or `?lib=new`'s starter document (which carries none
+/// to begin with), mirroring [`vd_form_pane_for_selection`]. `None` only
+/// alongside `selected: None`.
 fn lib_details_pane_for_selection(
     i18n: I18n,
     version: helios_fhir::FhirVersion,
@@ -5442,9 +5442,7 @@ fn lib_details_pane_for_selection(
             sql_libraries::starter_library_value(kind.code),
         ))
     } else {
-        selected_value.map(|lib| {
-            render_lib_details_pane(i18n, version, sql_libraries::strip_sql_attachment(lib))
-        })
+        selected_value.map(|lib| render_lib_details_pane(i18n, version, lib.clone()))
     }
 }
 
