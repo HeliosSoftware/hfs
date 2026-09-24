@@ -1442,3 +1442,228 @@ async fn mongodb_reindex_id_walk_indexes_a_future_stamped_resource() {
     ]);
     assert_eq!(future_lines.len(), 1, "{future_lines:?}");
 }
+
+// ===========================================================================
+// Harness: a backend with a shortened catch-up margin, and a pausing source
+// ===========================================================================
+
+/// A copy of `create_backend_with_search_offloaded` (anchor `:1233-1247` at
+/// HEAD c86d0f08b) that also sets `reindex_catch_up_margin_ms`, so a
+/// termination test does not have to wait out the real 120 s margin.
+async fn create_backend_with_catch_up_margin(test_name: &str, margin_ms: u64) -> Option<MongoBackend> {
+    let connection_string = shared_mongo::connection_string().await?;
+    let config = MongoBackendConfig {
+        connection_string,
+        database_name: build_test_database_name(test_name),
+        data_dir: Some(repo_data_dir()),
+        reindex_catch_up_margin_ms: margin_ms,
+        ..Default::default()
+    };
+    build_backend(config).await
+}
+
+/// Pauses at its `pause_on_call`-th call, after fetching the inner page but
+/// before returning it, so a test can observe an in-flight page and then
+/// cancel while it is still in flight.
+struct PausingSource {
+    inner: std::sync::Arc<MongoBackend>,
+    pause_on_call: usize,
+    calls: std::sync::atomic::AtomicUsize,
+    reached: tokio::sync::Notify,
+    resume: tokio::sync::Semaphore,
+}
+
+impl PausingSource {
+    fn new(inner: std::sync::Arc<MongoBackend>, pause_on_call: usize) -> Self {
+        Self {
+            inner,
+            pause_on_call,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            reached: tokio::sync::Notify::new(),
+            resume: tokio::sync::Semaphore::new(0),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl helios_persistence::search::ReindexSource for PausingSource {
+    async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
+        self.inner.list_resource_types(tenant).await
+    }
+
+    async fn count_resources(&self, tenant: &TenantContext, resource_type: &str) -> StorageResult<u64> {
+        self.inner.count_resources(tenant, resource_type).await
+    }
+
+    async fn fetch_resources_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> StorageResult<helios_persistence::search::ResourcePage> {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let page = self.inner.fetch_resources_page(tenant, resource_type, cursor, limit).await?;
+        if call == self.pause_on_call {
+            self.reached.notify_one();
+            self.resume.acquire().await.unwrap().forget();
+        }
+        Ok(page)
+    }
+}
+
+// ===========================================================================
+// T7: cancel while a page is in flight, then rerun without duplicates
+// ===========================================================================
+
+#[tokio::test]
+async fn mongodb_reindex_id_walk_cancel_then_rerun_leaves_no_duplicates() {
+    use std::sync::Arc;
+
+    let Some(backend) = create_backend("reindex_id_walk_cancel").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let backend = Arc::new(backend);
+    let tenant = create_tenant("walk-cancel");
+    let fixture = seed_walk_fixture(&backend, &tenant, 300, "extra").await;
+    let db = backend.get_database().await.unwrap();
+    let s_crud = snapshot(&db, "walk-cancel", false).await;
+    backdate_fixture(&backend, &tenant, &fixture).await;
+
+    let pausing = Arc::new(PausingSource::new(backend.clone(), 3));
+    let recording = Arc::new(RecordingTarget::new(backend.clone()));
+    let op = Arc::new(ReindexOperation::with_parts(
+        pausing.clone(),
+        vec![recording.clone()],
+        backend.tenant_registries().clone(),
+    ));
+    let job = op
+        .start(tenant.clone(), ReindexRequest::for_types(["Observation"]).with_batch_size(20), None)
+        .await
+        .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(30), pausing.reached.notified())
+        .await
+        .expect("PausingSource never reached its pause point");
+    op.cancel(&job).await.unwrap();
+    pausing.resume.add_permits(1);
+
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            if recording.pages_written.load(std::sync::atomic::Ordering::SeqCst) >= 3 {
+                return;
+            }
+            recording.page_written.notified().await;
+        }
+    })
+    .await
+    .expect("page 3 was never written");
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(pausing.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert_eq!(recording.pages_written.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+    let progress = op.get_progress(&job).await.unwrap();
+    assert_eq!(progress.status, helios_persistence::search::ReindexStatus::Cancelled);
+
+    let rerun_op = ReindexOperation::new(backend.clone(), backend.tenant_registries().clone());
+    let rerun_job = rerun_op
+        .start(tenant.clone(), ReindexRequest::for_types(["Observation"]).with_batch_size(20), None)
+        .await
+        .unwrap();
+    wait_for_terminal(&rerun_op, &rerun_job).await;
+    assert_eq!(snapshot(&db, "walk-cancel", false).await, s_crud);
+}
+
+// ===========================================================================
+// T8: termination and the round cap under continuous writes
+// ===========================================================================
+
+#[tokio::test]
+async fn mongodb_reindex_id_walk_terminates_under_continuous_writes() {
+    use std::sync::Arc;
+
+    let Some(backend) = create_backend_with_catch_up_margin("reindex_id_walk_churn", 2_000).await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let backend = Arc::new(backend);
+    capture_walk_logs();
+    let tenant = create_tenant("walk-churn");
+    let fixture = seed_walk_fixture(&backend, &tenant, 60, "only-in-churn").await;
+    backdate_fixture(&backend, &tenant, &fixture).await;
+
+    let live_ids: Vec<String> = fixture.live.get("Observation").unwrap().iter().cloned().collect();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let updates = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let writer = {
+        let backend = backend.clone();
+        let tenant = tenant.clone();
+        let stop = stop.clone();
+        let updates = updates.clone();
+        tokio::spawn(async move {
+            let mut i = 0usize;
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                let id = &live_ids[i % live_ids.len()];
+                if let Ok(Some(current)) = backend.read(&tenant, "Observation", id).await {
+                    let mut content = current.content().clone();
+                    let bumped = content["valueQuantity"]["value"].as_i64().unwrap_or(0) + 1;
+                    content["valueQuantity"]["value"] = json!(bumped);
+                    if backend.update(&tenant, &current, content).await.is_ok() {
+                        updates.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+                i += 1;
+            }
+        })
+    };
+
+    while updates.load(std::sync::atomic::Ordering::SeqCst) < 20 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let u0 = updates.load(std::sync::atomic::Ordering::SeqCst);
+
+    let target = Arc::new(RecordingTarget::new(backend.clone()).with_delay(std::time::Duration::from_millis(250)));
+    let op = ReindexOperation::with_parts(backend.clone(), vec![target], backend.tenant_registries().clone());
+    let job = op
+        .start(tenant.clone(), ReindexRequest::for_types(["Observation"]).with_batch_size(5), None)
+        .await
+        .unwrap();
+    let progress = tokio::time::timeout(std::time::Duration::from_secs(45), async {
+        loop {
+            let p = op.get_progress(&job).await.unwrap();
+            if p.status.is_finished() {
+                return p;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("reindex did not terminate within 45s");
+    let u1 = updates.load(std::sync::atomic::Ordering::SeqCst);
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    writer.await.unwrap();
+
+    assert!(u1 - u0 >= 50, "writer made only {} updates during the walk; the test's timing assumptions do not hold", u1 - u0);
+    assert_eq!(progress.status, helios_persistence::search::ReindexStatus::Completed);
+    assert!(progress.errors.is_empty());
+
+    let round3_started = walk_log_lines(&[
+        "tenant=walk-churn",
+        "resource_type=Observation",
+        "mongodb reindex catch-up round started",
+        "round=3",
+    ]);
+    assert!(!round3_started.is_empty(), "expected round 3 to start under sustained writes");
+    let capped = walk_log_lines(&[
+        "tenant=walk-churn",
+        "resource_type=Observation",
+        "mongodb reindex catch-up stopped at its round limit",
+        "rounds=3",
+    ]);
+    assert_eq!(capped.len(), 1, "{capped:?}");
+    assert!(progress.processed_resources >= progress.total_resources);
+    // Final-row correctness is not asserted: residual (a) is expected under
+    // continuous writes that outpace the walk.
+}
