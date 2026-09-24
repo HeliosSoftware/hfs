@@ -500,6 +500,10 @@ editor-save = Änderungen speichern
 editor-delete = Löschen
 editor-remove = Diesen Knoten entfernen
 editor-saved = Gespeichert.
+# Shared unsaved-changes tracker (#1240): the pill next to a Save button and
+# the confirm shown for in-page closes (a modal, an addbox disclosure).
+unsaved-changes = Ungespeicherte Änderungen
+unsaved-discard-confirm = Es gibt ungespeicherte Änderungen. Verwerfen und schließen?
 editor-load-error = Diese Ressource konnte nicht geladen werden.
 editor-confirm-delete = Diese Ressource löschen? Das lässt sich nicht rückgängig machen.
 editor-invalid-json = Das ist kein gültiges JSON und kann daher nicht als Formular bearbeitet werden. Ihr Text bleibt unverändert.

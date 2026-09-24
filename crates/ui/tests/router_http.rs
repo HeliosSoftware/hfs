@@ -383,6 +383,7 @@ async fn embedded_assets_are_served() {
         "/ui/assets/htmx.min.js",
         "/ui/assets/app.css",
         "/ui/assets/fhir-search-value.js",
+        "/ui/assets/unsaved.js",
     ] {
         let response = app()
             .oneshot(Request::get(asset).body(Body::empty()).unwrap())
@@ -390,6 +391,49 @@ async fn embedded_assets_are_served() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK, "{asset}");
     }
+}
+
+/// #1240: the shared unsaved-changes tracker loads from the layout, ahead of
+/// `addbox.js` (whose `close()` reads `window.HfsUnsaved` at click time), and
+/// the layout's `<body>` carries the two translated `data-msg-*` strings the
+/// tracker reads at runtime — the rendered copy, not the Fluent key, so a
+/// missing translation would be caught here too.
+#[tokio::test]
+async fn layout_carries_the_unsaved_changes_helper() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/assets/unsaved.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let js = body_text(response).await;
+    assert!(js.contains("HfsUnsaved"));
+
+    let response = app()
+        .oneshot(Request::get("/ui/queries").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"data-msg-unsaved="Unsaved changes""#));
+    assert!(html.contains(
+        r#"data-msg-unsaved-discard="You have unsaved changes. Discard them and close?""#
+    ));
+
+    let busy = html
+        .find(r#"src="/ui/assets/busy.js""#)
+        .expect("busy.js in the layout");
+    let unsaved = html
+        .find(r#"src="/ui/assets/unsaved.js""#)
+        .expect("unsaved.js in the layout");
+    let addbox = html
+        .find(r#"src="/ui/assets/addbox.js""#)
+        .expect("addbox.js in the layout");
+    assert!(busy < unsaved, "unsaved.js must load after busy.js");
+    assert!(unsaved < addbox, "unsaved.js must load before addbox.js");
 }
 
 /// #753: the vendored CodeMirror 6 + lezer-fhirpath bundle is

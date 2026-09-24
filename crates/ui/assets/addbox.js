@@ -9,6 +9,8 @@
   var OPEN = "details.addbox[open], details.menu[open]";
 
   function close(box) {
+    /* #1240: ask before discarding a dirty panel's edits. */
+    if (window.HfsUnsaved && !window.HfsUnsaved.confirmDiscard(box)) return;
     box.removeAttribute("open");
     /* Every close this script performs is a dismissal, so the dialog starts
        blank next time (#682). The failure path never comes through here — an

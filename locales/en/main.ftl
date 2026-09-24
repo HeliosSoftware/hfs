@@ -512,6 +512,10 @@ editor-save = Save Changes
 editor-delete = Delete
 editor-remove = Remove This Node
 editor-saved = Saved.
+# Shared unsaved-changes tracker (#1240): the pill next to a Save button and
+# the confirm shown for in-page closes (a modal, an addbox disclosure).
+unsaved-changes = Unsaved changes
+unsaved-discard-confirm = You have unsaved changes. Discard them and close?
 editor-load-error = Could not load that resource.
 editor-confirm-delete = Delete this resource? This cannot be undone.
 editor-invalid-json = That is not valid JSON, so it cannot be edited as a form. Your text is untouched.

@@ -3454,6 +3454,12 @@ tr:hover .result-id__copy,
   color: var(--warn);
 }
 
+/* Unsaved-changes pill (#1240), same tokens as .tag--draft. */
+.tag--unsaved {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
 .tag--retired {
   background: var(--input-bg);
   border: 1px solid var(--surface-border);
