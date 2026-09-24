@@ -363,20 +363,13 @@ pub(super) fn missing_presence_filter(
     filter
 }
 
-/// Rejects `_contained=true|both` combined with a composite search parameter
-/// (#1206 review finding 3).
+/// Rejects the `_contained=true|both` constraints that select *top-level*
+/// resources, which a contained resource never is (#1383, #1407).
 ///
-/// The top-level half of `_contained=both` is filtered by
-/// `matching_resource_ids` (composite-aware), but the contained half is
-/// resolved by `matching_contained`, which `continue`s straight past
-/// `Composite`/`Special` parameters (they are never indexed under
-/// `contained_type` rows the way a plain parameter is). Left unguarded,
-/// `_contained=both` would silently filter only its top-level half by the
-/// composite and let the contained half ignore it entirely. Composite
-/// parameters could in principle gain `_contained` support by teaching
-/// `matching_contained` the grouped pair check too, but that is unbuilt
-/// today, so this is a clear 400 rather than a silent under- or
-/// over-match.
+/// Kept as a separate gate from `matching_contained`'s per-parameter refusals
+/// because these constraints live outside `query.parameters` and `both` can
+/// fill a page without entering `matching_contained`. Supported composites
+/// pair their components per contained entity over `search_index_contained`.
 fn reject_contained_composite(query: &SearchQuery) -> StorageResult<()> {
     if query.contained == crate::types::ContainedMode::Off {
         return Ok(());
@@ -408,17 +401,18 @@ fn reject_contained_composite(query: &SearchQuery) -> StorageResult<()> {
                 .to_string(),
         }));
     }
-    match query
+    // In `both` mode the top-level page can be full, so matching_contained
+    // may never run. Refuse composites the contained index cannot interpret
+    // before either branch is executed.
+    if let Some((param, reason)) = query
         .parameters
         .iter()
-        .find(|p| p.param_type == SearchParamType::Composite)
+        .filter(|param| param.param_type == SearchParamType::Composite)
+        .find_map(|param| contained_unsupported_reason(param).map(|reason| (param, reason)))
     {
-        Some(param) => Err(reject_contained_parameter(
-            param,
-            "composite parameters are",
-        )),
-        None => Ok(()),
+        return Err(reject_contained_parameter(param, &reason));
     }
+    Ok(())
 }
 
 /// Why `matching_contained` cannot apply `param`, if it cannot (#1363).
@@ -432,15 +426,34 @@ fn reject_contained_composite(query: &SearchQuery) -> StorageResult<()> {
 ///   own, and the container's is not on these documents;
 /// - `_text`, `_content` and the other `_`-parameters resolved against
 ///   `resources`, which only knows the container;
-/// - composites (see [`reject_contained_composite`]) and chains;
+/// - chains (composite components are paired per contained entity instead);
 /// - `:not` and `:missing`, which the standard path resolves as a complement
 ///   over *resources* (`matching_resource_ids_complement_only`), never as a
 ///   `search_index` filter. There is no such complement over contained
 ///   entities yet.
 ///
-/// Every other modifier goes to `build_search_index_filter`, which honours or
-/// refuses it exactly as it does for a top-level search.
+/// Other modifiers on ordinary parameters go to their value filter builder.
+/// Composite modifiers and repeated component types are refused because the
+/// contained composite rows cannot distinguish their declared slots.
 fn contained_unsupported_reason(param: &SearchParameter) -> Option<String> {
+    if param.param_type == SearchParamType::Composite {
+        if let Some(modifier) = &param.modifier {
+            // component_param removes the composite modifier before building
+            // typed predicates; no modifier can be honoured on this path.
+            return Some(format!("the ':{modifier}' composite modifier is"));
+        }
+        let mut component_types = std::collections::HashSet::new();
+        if param
+            .components
+            .iter()
+            .any(|component| !component_types.insert(component.param_type))
+        {
+            // Component rows share param_name and composite_group, with no
+            // slot identifying which declared component wrote the row. Two
+            // components of one type can therefore exchange their matches.
+            return Some("composites with repeated component types are".to_string());
+        }
+    }
     if !param.chain.is_empty() {
         return Some("chained parameters are".to_string());
     }
@@ -459,7 +472,6 @@ fn contained_unsupported_reason(param: &SearchParameter) -> Option<String> {
         return Some("this parameter is".to_string());
     }
     match (&param.modifier, param.param_type) {
-        (_, SearchParamType::Composite) => Some("composite parameters are".to_string()),
         (_, SearchParamType::Special) => Some("special parameters are".to_string()),
         (Some(m @ (SearchModifier::Not | SearchModifier::Missing)), _) => {
             Some(format!("the ':{m}' modifier is"))
@@ -926,7 +938,162 @@ struct ComponentFilter {
     negated: bool,
 }
 
+/// One composite component's `search_index_contained` filter, scoped to
+/// `(tenant_id, contained_type, param_name)` instead of
+/// `(tenant_id, resource_type, param_name)`: contained rows carry the
+/// *container's* `resource_type`, so scoping by the searched type would match
+/// nothing. Built by [`MongoBackend::contained_composite_component_filters`].
+#[derive(Debug)]
+struct ContainedComponentFilter {
+    filter: Document,
+}
+
+/// Builds the aggregation stages matching one composite value's entities over
+/// `search_index_contained` (#1407).
+///
+/// Takes one value's already-scoped component filters (see
+/// [`MongoBackend::contained_composite_component_filters`]) and returns the
+/// stages matching every contained entity whose rows pair all components
+/// within a single `composite_group`: one `$match` arm per component, tagged
+/// with its `component_idx`, joined by `$unionWith`, then grouped by
+/// `(resource_type, resource_id, contained_local_id, composite_group)` with
+/// all component indices required, and finally collapsed to the entity shape
+/// `_id = {rtype, rid, lid}` the contained pipeline groups on.
+///
+/// Each arm keeps its full scoped filter (tenant, contained type, parameter
+/// name, typed predicate), so no arm can leak rows across tenants or
+/// parameters. `Ne` components need no special casing here: their filter is
+/// the same existence-bounded predicate the top-level pair check runs, and
+/// these arms only ever feed the grouped pair check, never a driver probe.
+/// An empty component list is a closed failure, never a vacuous match.
+fn contained_composite_value_stages(
+    components: &[ContainedComponentFilter],
+) -> StorageResult<Vec<Document>> {
+    if components.is_empty() {
+        return Err(StorageError::Search(SearchError::InvalidComposite {
+            message: "composite value has no components to match".to_string(),
+        }));
+    }
+    let arm = |index: usize, filter: &Document| {
+        vec![
+            doc! { "$match": filter.clone() },
+            doc! { "$addFields": { "component_idx": index as i32 } },
+        ]
+    };
+    let required: Vec<Bson> = (0..components.len())
+        .map(|index| Bson::Int32(index as i32))
+        .collect();
+    let mut first = components
+        .first()
+        .map(|component| arm(0, &component.filter))
+        .unwrap_or_default();
+    for (index, component) in components.iter().enumerate().skip(1) {
+        first.push(doc! { "$unionWith": {
+            "coll": MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION,
+            "pipeline": arm(index, &component.filter),
+        }});
+    }
+    first.push(doc! { "$group": {
+        "_id": {
+            "rtype": "$resource_type",
+            "rid": "$resource_id",
+            "lid": "$contained_local_id",
+            "grp": "$composite_group",
+        },
+        "components": { "$addToSet": "$component_idx" },
+    }});
+    first.push(doc! { "$match": { "components": { "$all": required } } });
+    first.push(doc! { "$group": {
+        "_id": {
+            "rtype": "$_id.rtype",
+            "rid": "$_id.rid",
+            "lid": "$_id.lid",
+        },
+    }});
+    Ok(first)
+}
+
 impl MongoBackend {
+    /// Builds every component's scoped `search_index_contained` filter for a
+    /// composite parameter under `_contained` (#1407) — outer index is the
+    /// (comma-OR'd) value, inner index is the component, in declaration order.
+    ///
+    /// Reuses [`Self::composite_component_filters`] so composite value
+    /// splitting, per-type prefix handling, quantity/date/number predicates
+    /// and the `{value_field: {"$ne": null}}` scoping conjunct stay on one
+    /// code path. Each returned filter is then re-scoped from the top-level
+    /// `(tenant_id, resource_type)` slice to the contained
+    /// `(tenant_id, contained_type)` slice: `resource_type` is removed (a
+    /// contained row carries its container's type, never the searched type)
+    /// and the composite's own `param_name` is kept, since every component
+    /// row shares it.
+    /// Modifier, chain and repeated component-type validation happens before
+    /// this builder; unsupported value types are checked by
+    /// `composite_component_filters`.
+    fn contained_composite_component_filters(
+        &self,
+        tenant_id: &str,
+        contained_type: &str,
+        param: &SearchParameter,
+    ) -> StorageResult<Vec<Vec<ContainedComponentFilter>>> {
+        let per_value = self.composite_component_filters(tenant_id, contained_type, param)?;
+        let mut result = Vec::with_capacity(per_value.len());
+        for per_component in per_value {
+            let mut rescoped = Vec::with_capacity(per_component.len());
+            for component in per_component {
+                let mut filter = component.filter;
+                filter.remove("resource_type");
+                filter.insert("tenant_id", tenant_id);
+                filter.insert("contained_type", contained_type);
+                filter.insert("param_name", param.name.clone());
+                rescoped.push(ContainedComponentFilter { filter });
+            }
+            result.push(rescoped);
+        }
+        Ok(result)
+    }
+
+    /// Builds the aggregation stages matching one composite parameter's entities
+    /// over `search_index_contained` (#1407): one value pipeline per
+    /// comma-separated value (see `contained_composite_value_stages`), joined
+    /// by `$unionWith` and de-duplicated by a final `$group` on `$_id`.
+    ///
+    /// Comma is OR: an entity matching any value matches the parameter. The
+    /// final `$group` collapses entities matched by several values (e.g. an
+    /// entity pairing both `A$gt5` and `B$gt5` groups) to one slot, in the
+    /// same `_id = {rtype, rid, lid}` shape `matching_contained` groups on.
+    /// No values is a closed failure, never a vacuous match.
+    fn contained_composite_stages(
+        &self,
+        tenant_id: &str,
+        contained_type: &str,
+        param: &SearchParameter,
+    ) -> StorageResult<Vec<Document>> {
+        let per_value =
+            self.contained_composite_component_filters(tenant_id, contained_type, param)?;
+        if per_value.is_empty() {
+            return Err(StorageError::Search(SearchError::InvalidComposite {
+                message: format!("composite search parameter '{}' has no values", param.name),
+            }));
+        }
+        let mut values = per_value.iter();
+        let first = values
+            .next()
+            .map(|value| contained_composite_value_stages(value))
+            .transpose()?
+            .unwrap_or_default();
+        let mut stages = first;
+        for value in values {
+            let pipeline = contained_composite_value_stages(value)?;
+            stages.push(doc! { "$unionWith": {
+                "coll": MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION,
+                "pipeline": pipeline,
+            }});
+        }
+        stages.push(doc! { "$group": { "_id": "$_id" } });
+        Ok(stages)
+    }
+
     /// Executes a `_contained=true|both` search (see the SQLite backend's
     /// `search_contained` for shared semantics). Returns containers (default) or
     /// contained resources (`_containedType=contained`); `both` merges top-level
@@ -949,10 +1116,7 @@ impl MongoBackend {
             ContainedMode::Both => {
                 // Top-level matches come first, contained matches second. The
                 // standard search is asked for its total so the boundary is
-                // known, and each source is paged on the server. Dedupe below
-                // is against the current top-level *page* only, as before
-                // this change, so a container that was a top-level match on
-                // an earlier page can still appear in a later contained page.
+                // known, and each source is paged on the server.
                 let mut top_query = query.clone();
                 top_query.contained = ContainedMode::Off;
                 top_query.contained_return = ContainedReturn::Container;
@@ -964,7 +1128,25 @@ impl MongoBackend {
                     )
                 })? as usize;
                 let mut items = top.resources.items;
-                let top_urls: HashSet<String> = items.iter().map(|r| r.url()).collect();
+
+                // A container of the searched type can also satisfy the
+                // top-level query. Resolve that query's full predicate, not
+                // just the current top-level page, so the contained pipeline
+                // can discard overlaps before its offset and count stages.
+                let top_filter = if query.contained_return == ContainedReturn::Container {
+                    let matched_ids = self
+                        .matching_resource_ids(&db, tenant_id, contained_type, &top_query)
+                        .await?;
+                    Some(self.build_resource_filter(
+                        tenant_id,
+                        contained_type,
+                        &top_query,
+                        matched_ids.as_ref(),
+                        None,
+                    )?)
+                } else {
+                    None
+                };
 
                 let (c_offset, c_limit) = if offset < top_total {
                     (0, count.saturating_sub(items.len()))
@@ -983,10 +1165,11 @@ impl MongoBackend {
                             c_offset,
                             c_limit,
                             want_total,
+                            top_filter.as_ref(),
                         )
                         .await?;
                     contained_total = page.total;
-                    let mut contained = self
+                    let contained = self
                         .materialize_contained(
                             &db,
                             tenant,
@@ -995,17 +1178,6 @@ impl MongoBackend {
                             &page.keys,
                         )
                         .await?;
-                    // Containers already on the top-level page are dropped
-                    // here rather than refilled: they are still within
-                    // [c_offset, c_offset + c_limit), so an offset-based
-                    // refill would just re-fetch the same keys on a later
-                    // page. The page may come back short by that many items.
-                    // Only a *container* can be a top-level match too; a
-                    // contained resource whose local id equals a top-level
-                    // id is a different resource (#1383).
-                    if query.contained_return == ContainedReturn::Container {
-                        contained.retain(|r| !top_urls.contains(&r.url()));
-                    }
                     items.extend(contained);
                 } else if want_total {
                     // No room left on this page for contained items, but the
@@ -1020,6 +1192,7 @@ impl MongoBackend {
                             c_offset,
                             1,
                             true,
+                            top_filter.as_ref(),
                         )
                         .await?;
                     contained_total = page.total;
@@ -1042,6 +1215,7 @@ impl MongoBackend {
                         offset,
                         count,
                         want_total,
+                        None,
                     )
                     .await?;
                 let items = self
@@ -1090,7 +1264,8 @@ impl MongoBackend {
     /// per-entity stage is instead one `$unionWith` arm per occurrence, and an
     /// entity must come back from all of them (#1362). A criterion this path
     /// cannot apply is refused, never skipped (#1363) — see
-    /// [`contained_unsupported_reason`].
+    /// [`contained_unsupported_reason`]. Composite parameters use their own
+    /// grouped component checks, then join this per-occurrence intersection.
     #[allow(clippy::too_many_arguments)]
     async fn matching_contained(
         &self,
@@ -1102,6 +1277,7 @@ impl MongoBackend {
         offset: usize,
         limit: usize,
         want_total: bool,
+        exclude_top_level: Option<&Document>,
     ) -> StorageResult<ContainedPage> {
         use crate::types::ContainedReturn;
         let contained_rows =
@@ -1112,8 +1288,10 @@ impl MongoBackend {
         // are ORed by `build_search_index_filter`.
         let mut branches: Vec<Document> = Vec::new();
         let mut distinct_names: Vec<String> = Vec::new();
+        let mut composite_branches: Vec<Vec<Document>> = Vec::new();
         // `_id` is the contained resource's local id, a field of every row.
         let mut id_clauses: Vec<Bson> = Vec::new();
+        let mut composite_id_clauses: Vec<Bson> = Vec::new();
         for param in &query.parameters {
             if let Some(reason) = contained_unsupported_reason(param) {
                 return Err(reject_contained_parameter(param, &reason));
@@ -1121,8 +1299,17 @@ impl MongoBackend {
             if param.name == "_id" {
                 let ids: Vec<&str> = param.values.iter().map(|v| v.value.as_str()).collect();
                 id_clauses.push(Bson::Document(
-                    doc! { "contained_local_id": { "$in": ids } },
+                    doc! { "contained_local_id": { "$in": ids.clone() } },
                 ));
+                composite_id_clauses.push(Bson::Document(doc! { "_id.lid": { "$in": ids } }));
+                continue;
+            }
+            if param.param_type == SearchParamType::Composite {
+                composite_branches.push(self.contained_composite_stages(
+                    tenant_id,
+                    contained_type,
+                    param,
+                )?);
                 continue;
             }
             // Reuse the standard per-param value filter, dropping the tenant /
@@ -1160,6 +1347,7 @@ impl MongoBackend {
         if !id_clauses.is_empty() {
             entity_scope.insert("$and", id_clauses);
         }
+        let has_plain_branches = !branches.is_empty();
 
         let entity = doc! {
             "rtype": "$resource_type",
@@ -1225,6 +1413,41 @@ impl MongoBackend {
             stages.push(doc! { "$match": { "occurrences": { "$all": required } } });
             stages
         };
+        if !composite_branches.is_empty() {
+            // Each composite has already paired its components within one
+            // contained entity. Intersect those entities with every plain
+            // criterion, including repeated names and compartment membership.
+            // `_id` is a local contained id and must constrain composite-only
+            // searches too; the plain arm applies it in `entity_scope`.
+            let mut occurrence_count = 0;
+            if has_plain_branches {
+                pipeline.push(doc! { "$addFields": { "occurrence": occurrence_count } });
+                occurrence_count += 1;
+            } else {
+                pipeline.clear();
+            }
+            for mut composite in composite_branches {
+                if !composite_id_clauses.is_empty() {
+                    composite.push(doc! { "$match": { "$and": composite_id_clauses.clone() } });
+                }
+                composite.push(doc! { "$addFields": { "occurrence": occurrence_count } });
+                if occurrence_count == 0 {
+                    pipeline = composite;
+                } else {
+                    pipeline.push(doc! { "$unionWith": {
+                        "coll": MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION,
+                        "pipeline": composite,
+                    }});
+                }
+                occurrence_count += 1;
+            }
+            let required: Vec<i32> = (0..occurrence_count).collect();
+            pipeline.push(doc! { "$group": {
+                "_id": "$_id",
+                "occurrences": { "$addToSet": "$occurrence" },
+            }});
+            pipeline.push(doc! { "$match": { "occurrences": { "$all": required } } });
+        }
         let sort = match contained_return {
             ContainedReturn::Container => {
                 // Collapse the surviving per-entity slots to one per
@@ -1232,6 +1455,27 @@ impl MongoBackend {
                 pipeline.push(doc! { "$group": {
                     "_id": { "rtype": "$_id.rtype", "rid": "$_id.rid" },
                 }});
+                if let Some(top_filter) = exclude_top_level {
+                    // Check every container against the full live top-level
+                    // predicate before pagination and the total facet. A
+                    // different container type may use the same id, so only
+                    // containers of the searched type can be overlaps.
+                    pipeline.push(doc! { "$lookup": {
+                        "from": MongoBackend::RESOURCES_COLLECTION,
+                        "localField": "_id.rid",
+                        "foreignField": "id",
+                        "pipeline": [
+                            { "$match": top_filter.clone() },
+                            { "$limit": 1 },
+                            { "$project": { "_id": 1 } },
+                        ],
+                        "as": "top_overlap",
+                    }});
+                    pipeline.push(doc! { "$match": { "$or": [
+                        { "_id.rtype": { "$ne": contained_type } },
+                        { "top_overlap": { "$eq": [] } },
+                    ] } });
+                }
                 doc! { "_id.rtype": 1, "_id.rid": 1 }
             }
             ContainedReturn::Contained => doc! { "_id.rtype": 1, "_id.rid": 1, "_id.lid": 1 },
