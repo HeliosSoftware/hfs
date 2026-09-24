@@ -10,7 +10,7 @@ use mongodb::{
     ClientSession, Collection, Cursor, SessionCursor,
     bson::{self, Bson, DateTime as BsonDateTime, Document, doc},
     error::{Error as MongoError, ErrorKind as MongoErrorKind},
-    options::FindOptions,
+    options::{FindOptions, Hint},
 };
 use serde_json::Value;
 
@@ -34,6 +34,7 @@ use crate::types::{
 };
 
 use super::MongoBackend;
+use super::schema::{RESOURCES_IDENTITY_INDEX, RESOURCES_TYPE_SCAN_INDEX};
 
 pub(super) fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -4751,6 +4752,139 @@ impl PurgableStorage for MongoBackend {
 // both — it can reindex itself standalone.
 // ============================================================================
 
+impl MongoBackend {
+    /// The newest-live probe (#1403): a covered reverse scan of
+    /// `idx_resources_type_scan` for the `last_updated` of the newest live
+    /// resource of `resource_type`, or `None` if it has no live resource.
+    async fn reindex_newest_live_last_updated(
+        &self,
+        resources: &Collection<Document>,
+        tenant_id: &str,
+        resource_type: &str,
+    ) -> StorageResult<Option<DateTime<Utc>>> {
+        let found = resources
+            .find_one(doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "is_deleted": false,
+            })
+            .sort(doc! { "last_updated": -1, "id": -1 })
+            .projection(doc! { "_id": 0, "last_updated": 1 })
+            .hint(Hint::Name(RESOURCES_TYPE_SCAN_INDEX.to_string()))
+            .await
+            .map_err(|e| internal_error(format!("Failed to probe newest resource: {e}")))?;
+        match found {
+            Some(doc) => {
+                let ts = doc
+                    .get_datetime("last_updated")
+                    .map_err(|e| internal_error(format!("Missing last_updated: {e}")))?;
+                Ok(Some(bson_to_chrono(ts)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// One hinted, sorted, limited find, fully drained (#1403).
+    async fn reindex_find_page(
+        &self,
+        resources: &Collection<Document>,
+        filter: Document,
+        sort: Document,
+        hint: &str,
+        limit: u32,
+    ) -> StorageResult<Vec<Document>> {
+        let mut stream = resources
+            .find(filter)
+            .sort(sort)
+            .limit(limit as i64)
+            .hint(Hint::Name(hint.to_string()))
+            .await
+            .map_err(|e| internal_error(format!("Failed to fetch resources: {e}")))?;
+
+        let mut docs = Vec::new();
+        while stream
+            .advance()
+            .await
+            .map_err(|e| internal_error(format!("Failed to advance cursor: {e}")))?
+        {
+            docs.push(
+                stream
+                    .deserialize_current()
+                    .map_err(|e| internal_error(format!("Failed to read resource: {e}")))?,
+            );
+        }
+        Ok(docs)
+    }
+}
+
+/// One step of the walk inside a single call (#1403); never leaves the
+/// call — only `ReindexWalkCursor::Id`/`Round` do, as an encoded cursor.
+enum WalkStep {
+    Start,
+    IdPhase {
+        floor: DateTime<Utc>,
+        after_id: Option<String>,
+    },
+    RoundStart {
+        round: u8,
+        floor: DateTime<Utc>,
+    },
+    Round {
+        round: u8,
+        floor: DateTime<Utc>,
+        ceiling: DateTime<Utc>,
+        walked: u64,
+        after: Option<(DateTime<Utc>, String)>,
+    },
+}
+
+impl From<ReindexWalkCursor> for WalkStep {
+    fn from(cursor: ReindexWalkCursor) -> Self {
+        match cursor {
+            ReindexWalkCursor::Id { floor, after_id } => WalkStep::IdPhase {
+                floor,
+                after_id: Some(after_id),
+            },
+            ReindexWalkCursor::Round {
+                round,
+                floor,
+                ceiling,
+                walked,
+                after_last_updated,
+                after_id,
+            } => WalkStep::Round {
+                round,
+                floor,
+                ceiling,
+                walked,
+                after: Some((after_last_updated, after_id)),
+            },
+        }
+    }
+}
+
+/// Converts a returned page plus its next cursor into a [`ResourcePage`],
+/// exactly as HEAD's `fetch_resources_page` did (`:4851-4863` at c86d0f08b).
+fn reindex_page_from_docs(
+    docs: &[Document],
+    resource_type: &str,
+    tenant: &TenantContext,
+    next_cursor: ReindexWalkCursor,
+) -> StorageResult<ResourcePage> {
+    let resources = docs
+        .iter()
+        .map(|doc| {
+            parse_history_row(doc, Some(resource_type), None)
+                .map(|row| row.into_stored_resource(tenant))
+        })
+        .collect::<StorageResult<Vec<_>>>()?;
+    Ok(ResourcePage {
+        resources,
+        next_cursor: Some(next_cursor.encode()),
+        skipped: Vec::new(),
+    })
+}
+
 #[async_trait]
 impl ReindexSource for MongoBackend {
     async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
@@ -4779,6 +4913,14 @@ impl ReindexSource for MongoBackend {
         self.count(tenant, Some(resource_type)).await
     }
 
+    /// Two phases per type (#1403): an id phase over live resources stamped
+    /// before the floor, keyset on id and hinted to idx_resources_identity,
+    /// then up to REINDEX_CATCH_UP_MAX_ROUNDS catch-up rounds over
+    /// [floor, ceiling) in (last_updated, id) order on idx_resources_type_scan.
+    /// A phase ends only on an empty query and the next phase starts in the
+    /// same call, so the driver sees non-empty pages with Some(cursor) and one
+    /// trailing empty page with None. The cursor is the versioned v2 grammar
+    /// of ReindexWalkCursor.
     async fn fetch_resources_page(
         &self,
         tenant: &TenantContext,
@@ -4788,80 +4930,184 @@ impl ReindexSource for MongoBackend {
     ) -> StorageResult<ResourcePage> {
         let db = self.get_database().await?;
         let resources: Collection<Document> = db.collection(MongoBackend::RESOURCES_COLLECTION);
+        let tenant_id = tenant.tenant_id().as_str();
+        let limit = limit.max(1); // MongoDB treats limit(0) as "no limit"
+        let margin = reindex_catch_up_margin(self.config().reindex_catch_up_margin_ms);
 
-        let mut filter = doc! {
-            "tenant_id": tenant.tenant_id().as_str(),
-            "resource_type": resource_type,
-            "is_deleted": false,
+        let mut step = match cursor {
+            None => WalkStep::Start,
+            Some(c) => WalkStep::from(ReindexWalkCursor::parse(c)?),
         };
 
-        // Keyset pagination on (last_updated, id) — the same cursor shape the
-        // bulk-export batcher and the SQLite reindex source use, so a cursor is
-        // stable across pages even as resources are written.
-        if let Some((cur_dt, cur_id)) = cursor.and_then(parse_reindex_cursor) {
-            filter.insert(
-                "$or",
-                vec![
-                    doc! { "last_updated": { "$gt": chrono_to_bson(cur_dt) } },
-                    doc! {
-                        "last_updated": chrono_to_bson(cur_dt),
-                        "id": { "$gt": cur_id },
-                    },
-                ],
-            );
+        loop {
+            step = match step {
+                WalkStep::Start => {
+                    let t0 = Utc::now();
+                    let newest_live = self
+                        .reindex_newest_live_last_updated(&resources, tenant_id, resource_type)
+                        .await?;
+                    let floor = reindex_catch_up_floor(t0, newest_live, margin);
+                    tracing::info!(
+                        tenant = %tenant_id,
+                        resource_type = %resource_type,
+                        t0 = %format_walk_instant(t0),
+                        newest_live = %newest_live.map(format_walk_instant).unwrap_or_else(|| "none".to_string()),
+                        floor = %format_walk_instant(floor),
+                        "mongodb reindex walk started"
+                    );
+                    WalkStep::IdPhase { floor, after_id: None }
+                }
+                WalkStep::IdPhase { floor, after_id } => {
+                    let filter =
+                        reindex_id_page_filter(tenant_id, resource_type, floor, after_id.as_deref());
+                    let docs = self
+                        .reindex_find_page(
+                            &resources,
+                            filter,
+                            doc! { "id": 1 },
+                            RESOURCES_IDENTITY_INDEX,
+                            limit,
+                        )
+                        .await?;
+                    if !docs.is_empty() {
+                        let last_id = docs
+                            .last()
+                            .expect("non-empty")
+                            .get_str("id")
+                            .map_err(|e| internal_error(format!("Missing id: {e}")))?
+                            .to_string();
+                        return reindex_page_from_docs(
+                            &docs,
+                            resource_type,
+                            tenant,
+                            ReindexWalkCursor::Id { floor, after_id: last_id },
+                        );
+                    }
+                    tracing::info!(
+                        tenant = %tenant_id,
+                        resource_type = %resource_type,
+                        floor = %format_walk_instant(floor),
+                        "mongodb reindex id phase finished"
+                    );
+                    WalkStep::RoundStart { round: 1, floor }
+                }
+                WalkStep::RoundStart { round, floor } => {
+                    let now = Utc::now();
+                    match reindex_round_start_decision(round, floor, now, margin) {
+                        RoundStartDecision::Complete => {
+                            tracing::debug!(
+                                tenant = %tenant_id,
+                                resource_type = %resource_type,
+                                rounds = round - 1,
+                                "mongodb reindex catch-up complete"
+                            );
+                            return Ok(ResourcePage {
+                                resources: Vec::new(),
+                                next_cursor: None,
+                                skipped: Vec::new(),
+                            });
+                        }
+                        RoundStartDecision::CapReached => {
+                            tracing::warn!(
+                                tenant = %tenant_id,
+                                resource_type = %resource_type,
+                                rounds = round - 1,
+                                last_ceiling = %format_walk_instant(floor),
+                                "mongodb reindex catch-up stopped at its round limit"
+                            );
+                            return Ok(ResourcePage {
+                                resources: Vec::new(),
+                                next_cursor: None,
+                                skipped: Vec::new(),
+                            });
+                        }
+                        RoundStartDecision::Run => {
+                            let newest_live = self
+                                .reindex_newest_live_last_updated(&resources, tenant_id, resource_type)
+                                .await?;
+                            let ceiling = reindex_catch_up_ceiling(now, newest_live, margin);
+                            if let Some(newest_live) = newest_live {
+                                let by_margin_only = truncate_to_millis(now + margin);
+                                if ceiling > by_margin_only {
+                                    tracing::warn!(
+                                        tenant = %tenant_id,
+                                        resource_type = %resource_type,
+                                        round,
+                                        newest_live = %format_walk_instant(newest_live),
+                                        ceiling = %format_walk_instant(ceiling),
+                                        "mongodb reindex found live resources stamped in the future"
+                                    );
+                                }
+                            }
+                            tracing::info!(
+                                tenant = %tenant_id,
+                                resource_type = %resource_type,
+                                round,
+                                floor = %format_walk_instant(floor),
+                                ceiling = %format_walk_instant(ceiling),
+                                "mongodb reindex catch-up round started"
+                            );
+                            WalkStep::Round { round, floor, ceiling, walked: 0, after: None }
+                        }
+                    }
+                }
+                WalkStep::Round { round, floor, ceiling, walked, after } => {
+                    let filter = reindex_catch_up_page_filter(
+                        tenant_id,
+                        resource_type,
+                        floor,
+                        ceiling,
+                        after.as_ref().map(|(lu, id)| (*lu, id.as_str())),
+                    );
+                    let scanned = self
+                        .reindex_find_page(
+                            &resources,
+                            filter,
+                            doc! { "last_updated": 1, "id": 1 },
+                            RESOURCES_TYPE_SCAN_INDEX,
+                            limit,
+                        )
+                        .await?;
+                    if scanned.is_empty() {
+                        tracing::info!(
+                            tenant = %tenant_id,
+                            resource_type = %resource_type,
+                            round,
+                            floor = %format_walk_instant(floor),
+                            ceiling = %format_walk_instant(ceiling),
+                            walked,
+                            "mongodb reindex catch-up round finished"
+                        );
+                        WalkStep::RoundStart { round: round + 1, floor: ceiling }
+                    } else {
+                        let last = scanned.last().expect("non-empty");
+                        let scanned_lu = last
+                            .get_datetime("last_updated")
+                            .map_err(|e| internal_error(format!("Missing last_updated: {e}")))?;
+                        let scanned_id = last
+                            .get_str("id")
+                            .map_err(|e| internal_error(format!("Missing id: {e}")))?
+                            .to_string();
+                        let scanned_last_updated = bson_to_chrono(scanned_lu);
+                        let docs = dedupe_reindex_page_keep_last(scanned);
+                        let walked = walked + docs.len() as u64;
+                        return reindex_page_from_docs(
+                            &docs,
+                            resource_type,
+                            tenant,
+                            ReindexWalkCursor::Round {
+                                round,
+                                floor,
+                                ceiling,
+                                walked,
+                                after_last_updated: scanned_last_updated,
+                                after_id: scanned_id,
+                            },
+                        );
+                    }
+                }
+            };
         }
-
-        let opts = FindOptions::builder()
-            .sort(doc! { "last_updated": 1, "id": 1 })
-            .limit(limit as i64)
-            .build();
-
-        let mut stream = resources
-            .find(filter)
-            .with_options(opts)
-            .await
-            .map_err(|e| internal_error(format!("Failed to fetch resources: {e}")))?;
-
-        let mut docs = Vec::new();
-        while stream
-            .advance()
-            .await
-            .map_err(|e| internal_error(format!("Failed to advance cursor: {e}")))?
-        {
-            docs.push(
-                stream
-                    .deserialize_current()
-                    .map_err(|e| internal_error(format!("Failed to read resource: {e}")))?,
-            );
-        }
-
-        let full_page = docs.len() as u32 == limit;
-        let next_cursor = match (full_page, docs.last()) {
-            (true, Some(last)) => {
-                let ts = last
-                    .get_datetime("last_updated")
-                    .map_err(|e| internal_error(format!("Missing last_updated: {e}")))?;
-                let id = last
-                    .get_str("id")
-                    .map_err(|e| internal_error(format!("Missing id: {e}")))?;
-                Some(format!("{}|{}", bson_to_chrono(ts).to_rfc3339(), id))
-            }
-            _ => None,
-        };
-
-        let resources = docs
-            .iter()
-            .map(|doc| {
-                parse_history_row(doc, Some(resource_type), None)
-                    .map(|row| row.into_stored_resource(tenant))
-            })
-            .collect::<StorageResult<Vec<_>>>()?;
-
-        Ok(ResourcePage {
-            resources,
-            next_cursor,
-            skipped: Vec::new(),
-        })
     }
 }
 
@@ -5529,13 +5775,6 @@ fn dedupe_reindex_page_keep_last(docs: Vec<Document>) -> Vec<Document> {
         })
         .map(|(_, doc)| doc)
         .collect()
-}
-
-/// Parses a `{rfc3339}|{id}` keyset-pagination cursor for the reindex source.
-fn parse_reindex_cursor(cursor: &str) -> Option<(DateTime<Utc>, String)> {
-    let (ts, id) = cursor.split_once('|')?;
-    let dt = DateTime::parse_from_rfc3339(ts).ok()?.with_timezone(&Utc);
-    Some((dt, id.to_string()))
 }
 
 fn resolve_bundle_references(value: &mut Value, reference_map: &HashMap<String, String>) {

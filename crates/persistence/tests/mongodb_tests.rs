@@ -818,6 +818,10 @@ async fn mongodb_conditional_patch() {
 #[path = "search/versioned_write_race_suite.rs"]
 mod versioned_write_race_suite;
 
+/// #1403: the id-order `$reindex` walk and its catch-up rounds.
+#[path = "mongodb/reindex_id_walk.rs"]
+mod reindex_id_walk;
+
 /// #1405: of several writers holding the same version, one `update` writes and
 /// every loser is a `ConcurrencyError` — the server's `WriteConflict` used to
 /// reach them as `BackendError::Internal`.
