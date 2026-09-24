@@ -5225,11 +5225,14 @@ impl ReindexTarget for MongoBackend {
     /// count).
     ///
     /// Precondition: `resources` must hold each `(resource_type, id)` at most
-    /// once. The one production caller, `fetch_resources_page`, reads the
-    /// current-resources collection keyset-ordered by `(last_updated, id)`
-    /// and cannot produce a duplicate; unlike Elasticsearch's `_id`-keyed
-    /// upsert, a repeated id here would double-insert, because the delete for
-    /// the whole page runs once, up front, rather than once per resource.
+    /// once; unlike Elasticsearch's `_id`-keyed upsert, a repeated id here
+    /// would double-insert, because the delete for the whole page runs once,
+    /// up front. The production caller, `fetch_resources_page`, guarantees
+    /// it: an id-phase page walks the unique `idx_resources_identity` in key
+    /// order, and a catch-up page is de-duplicated by id (keeping the newest
+    /// version) before it is returned (#1403). The same resource in two
+    /// different calls is expected — a catch-up round rewrites what the id
+    /// phase wrote.
     ///
     /// A page-level failure — getting the database handle, the grouped
     /// delete, or an insert error the driver does not attribute to a specific

@@ -8,14 +8,23 @@
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 use mongodb::bson::{DateTime as BsonDateTime, Document};
-use helios_persistence::search::ReindexSource;
+use helios_persistence::error::StorageResult;
+use helios_persistence::search::{ReindexOperation, ReindexRequest, ReindexSource};
 
-// `ReindexSource` must be in scope for its methods to be callable as
-// `x.fetch_resources_page(..)` — Rust only resolves a trait method by
-// dot-call syntax when the trait itself is imported, even though the
-// concrete type (`MongoBackend`) already implements it; without this
+// `StorageResult` is used bare (not fully qualified) throughout this file's
+// test doubles below. `ReindexSource` must be in scope for its methods to be
+// callable as `x.fetch_resources_page(..)` — Rust only resolves a trait
+// method by dot-call syntax when the trait itself is imported, even though
+// the concrete type (`MongoBackend`) already implements it; without this
 // import, every such call is E0599 ("no method named ... found — the
-// following trait is implemented but not in scope").
+// following trait is implemented but not in scope"). `ReindexStatus` and
+// `ResourcePage` are deliberately NOT imported here: every use of them in
+// this file is already fully qualified
+// (`helios_persistence::search::ReindexStatus::Completed` etc.), so
+// importing the bare name would be an `unused_imports` error under
+// `-D warnings` — they are plain types, not traits, so (unlike
+// `ReindexSource`) a fully-qualified reference elsewhere does not count as
+// "using" a bare import of them.
 
 // ===========================================================================
 // Harness
@@ -296,4 +305,332 @@ async fn mongodb_reindex_id_walk_rejects_a_foreign_cursor() {
         err,
         StorageError::Search(SearchError::InvalidCursor { .. })
     ));
+}
+
+/// All rows of `search_index` and `search_index_contained` for `tenant_id`,
+/// as canonical sorted JSON strings (order-independent, `_id`-independent).
+async fn index_rows(
+    db: &mongodb::Database,
+    collection: &str,
+    tenant_id: &str,
+    strip_tenant: bool,
+) -> Vec<String> {
+    use futures::stream::TryStreamExt;
+    let coll = db.collection::<Document>(collection);
+    let mut rows: Vec<Document> = coll
+        .find(doc! { "tenant_id": tenant_id })
+        .projection(doc! { "_id": 0 })
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    if strip_tenant {
+        for row in &mut rows {
+            row.remove("tenant_id");
+        }
+    }
+    let mut lines: Vec<String> = rows
+        .into_iter()
+        .map(|d| canonical(mongodb::bson::Bson::Document(d).into_relaxed_extjson()).to_string())
+        .collect();
+    lines.sort();
+    lines
+}
+
+/// Rebuilds `v` with every object's keys sorted, recursively, so two BSON
+/// documents with the same content but different field insertion order
+/// snapshot identically (#1403). `serde_json`'s `preserve_order` feature is
+/// enabled workspace-wide (`crates/sof/Cargo.toml`, and `helios-persistence`
+/// depends on `helios-sof`), so without this a `Value::Object`'s iteration
+/// order otherwise follows BSON insertion order rather than being sorted.
+fn canonical(v: serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<(String, serde_json::Value)> =
+                map.into_iter().map(|(k, v)| (k, canonical(v))).collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            serde_json::Value::Object(entries.into_iter().collect())
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(canonical).collect())
+        }
+        other => other,
+    }
+}
+
+async fn snapshot(
+    db: &mongodb::Database,
+    tenant_id: &str,
+    strip_tenant: bool,
+) -> (Vec<String>, Vec<String>) {
+    (
+        index_rows(db, "search_index", tenant_id, strip_tenant).await,
+        index_rows(db, "search_index_contained", tenant_id, strip_tenant).await,
+    )
+}
+
+/// Routes `helios_persistence::backends::mongodb::storage` events at `debug`
+/// and above into `tracing-test`'s global buffer, once per test binary. Every
+/// walk test that asserts on log lines calls this before it starts its walk.
+fn capture_walk_logs() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let writer =
+            tracing_test::internal::MockWriter::new(tracing_test::internal::global_buf());
+        let dispatch = tracing_test::internal::get_subscriber(
+            writer,
+            "helios_persistence::backends::mongodb::storage=debug",
+        );
+        tracing::dispatcher::set_global_default(dispatch)
+            .expect("no other global tracing subscriber in this test binary");
+    });
+}
+
+/// Captured log lines containing every one of `needles`.
+fn walk_log_lines(needles: &[&str]) -> Vec<String> {
+    let buf = tracing_test::internal::global_buf().lock().unwrap();
+    String::from_utf8_lossy(&buf)
+        .lines()
+        .filter(|line| needles.iter().all(|needle| line.contains(needle)))
+        .map(str::to_string)
+        .collect()
+}
+
+/// HEAD's walk, verbatim and test-only: `(last_updated, id)` keyset, no hint,
+/// `"{rfc3339}|{id}"` cursor. Copied rather than reused because PR1 replaces
+/// the production implementation.
+struct LegacyWalkSource {
+    backend: std::sync::Arc<MongoBackend>,
+}
+
+#[async_trait::async_trait]
+impl helios_persistence::search::ReindexSource for LegacyWalkSource {
+    async fn list_resource_types(
+        &self,
+        tenant: &TenantContext,
+    ) -> StorageResult<Vec<String>> {
+        self.backend.list_resource_types(tenant).await
+    }
+
+    async fn count_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+    ) -> StorageResult<u64> {
+        self.backend.count_resources(tenant, resource_type).await
+    }
+
+    async fn fetch_resources_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> StorageResult<helios_persistence::search::ResourcePage> {
+        let db = self.backend.get_database().await?;
+        let resources = db.collection::<Document>("resources");
+
+        let mut stream = resources
+            .find(legacy_filter(tenant, resource_type, cursor))
+            .sort(doc! { "last_updated": 1, "id": 1 })
+            .limit(limit as i64)
+            .await
+            .map_err(|e| StorageError::Backend(BackendError::Internal {
+                backend_name: "mongodb".to_string(),
+                message: format!("legacy walk find: {e}"),
+                source: None,
+            }))?;
+        let mut docs: Vec<Document> = Vec::new();
+        while stream.advance().await.map_err(|e| {
+            StorageError::Backend(BackendError::Internal {
+                backend_name: "mongodb".to_string(),
+                message: format!("legacy walk advance: {e}"),
+                source: None,
+            })
+        })? {
+            docs.push(stream.deserialize_current().map_err(|e| {
+                StorageError::Backend(BackendError::Internal {
+                    backend_name: "mongodb".to_string(),
+                    message: format!("legacy walk deserialize: {e}"),
+                    source: None,
+                })
+            })?);
+        }
+
+        let full_page = docs.len() as u32 == limit;
+        let next_cursor = match (full_page, docs.last()) {
+            (true, Some(last)) => {
+                let dt = last.get_datetime("last_updated").unwrap();
+                let id = last.get_str("id").unwrap();
+                let lu = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(dt.timestamp_millis()).unwrap();
+                Some(format!("{}|{}", lu.to_rfc3339(), id))
+            }
+            _ => None,
+        };
+
+        let resources_out: StorageResult<Vec<_>> = docs
+            .iter()
+            .map(|d| {
+                let dt = d.get_datetime("last_updated").unwrap();
+                let lu = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(dt.timestamp_millis()).unwrap();
+                let data = d.get_document("data").unwrap();
+                let content: serde_json::Value =
+                    mongodb::bson::from_document(data.clone()).unwrap();
+                Ok(helios_persistence::types::StoredResource::from_storage(
+                    resource_type,
+                    d.get_str("id").unwrap(),
+                    d.get_str("version_id").unwrap(),
+                    tenant.tenant_id().clone(),
+                    content,
+                    lu,
+                    lu,
+                    None,
+                    FhirVersion::default(),
+                ))
+            })
+            .collect();
+
+        Ok(helios_persistence::search::ResourcePage {
+            resources: resources_out?,
+            next_cursor,
+            skipped: Vec::new(),
+        })
+    }
+}
+
+/// HEAD's exact `fetch_resources_page` filter (`storage.rs:4790-4809` at
+/// c86d0f08b, before PR1 replaces it): `(last_updated, id)` keyset, no hint.
+fn legacy_filter(tenant: &TenantContext, resource_type: &str, cursor: Option<&str>) -> Document {
+    let mut filter = doc! {
+        "tenant_id": tenant.tenant_id().as_str(),
+        "resource_type": resource_type,
+        "is_deleted": false,
+    };
+    if let Some(cursor) = cursor {
+        if let Some((ts_str, id)) = cursor.split_once('|') {
+            if let Ok(cur_dt) = chrono::DateTime::parse_from_rfc3339(ts_str) {
+                let cur_dt = cur_dt.with_timezone(&chrono::Utc);
+                filter.insert(
+                    "$or",
+                    vec![
+                        doc! { "last_updated": { "$gt": BsonDateTime::from_millis(cur_dt.timestamp_millis()) } },
+                        doc! {
+                            "last_updated": BsonDateTime::from_millis(cur_dt.timestamp_millis()),
+                            "id": { "$gt": id },
+                        },
+                    ],
+                );
+            }
+        }
+    }
+    filter
+}
+
+// ===========================================================================
+// T1: parity with HEAD's walk
+// ===========================================================================
+
+#[tokio::test]
+async fn mongodb_reindex_id_walk_matches_the_legacy_walk_row_for_row() {
+    use std::sync::Arc;
+
+    let Some(backend) = create_backend("reindex_id_walk_parity").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let backend = Arc::new(backend);
+    capture_walk_logs();
+
+    let tenant_a = create_tenant("walk-a");
+    let tenant_b = create_tenant("walk-b");
+    let fixture_a = seed_walk_fixture(&backend, &tenant_a, 300, "only-in-a").await;
+    let fixture_b = seed_walk_fixture(&backend, &tenant_b, 300, "only-in-b").await;
+
+    let db = backend.get_database().await.unwrap();
+    let s_crud_a = snapshot(&db, "walk-a", false).await;
+    let s_crud_b = snapshot(&db, "walk-b", false).await;
+
+    backdate_fixture(&backend, &tenant_a, &fixture_a).await;
+    backdate_fixture(&backend, &tenant_b, &fixture_b).await;
+
+    let regs = backend.tenant_registries().clone();
+    let request = || {
+        ReindexRequest::for_types(["Observation", "Patient"])
+            .clear_existing()
+            .with_batch_size(40)
+    };
+
+    let legacy_source = Arc::new(LegacyWalkSource { backend: backend.clone() });
+    let legacy_op = ReindexOperation::with_parts(legacy_source, vec![backend.clone()], regs.clone());
+    let legacy_job = legacy_op.start(tenant_a.clone(), request(), None).await.unwrap();
+    let legacy_progress = wait_for_terminal(&legacy_op, &legacy_job).await;
+    let s_old = snapshot(&db, "walk-a", false).await;
+
+    let new_op = ReindexOperation::new(backend.clone(), regs.clone());
+    let new_job = new_op.start(tenant_a.clone(), request(), None).await.unwrap();
+    let new_progress = wait_for_terminal(&new_op, &new_job).await;
+    let s_new = snapshot(&db, "walk-a", false).await;
+
+    assert_eq!(s_new, s_old, "new walk must match HEAD's walk row for row");
+    assert_eq!(
+        s_new, s_crud_a,
+        "reindex must match CRUD indexing exactly (#1064) — if only this \
+         assertion fails, stop and report; do not change the writer"
+    );
+    assert_eq!(snapshot(&db, "walk-b", false).await, s_crud_b);
+
+    for progress in [&legacy_progress, &new_progress] {
+        assert_eq!(progress.status, helios_persistence::search::ReindexStatus::Completed);
+        assert!(progress.errors.is_empty());
+        assert_eq!(progress.processed_resources, progress.total_resources);
+        assert_eq!(progress.processed_resources, 297 + 10);
+    }
+    assert_eq!(legacy_progress.entries_created, new_progress.entries_created);
+
+    let obs_started =
+        walk_log_lines(&["tenant=walk-a", "resource_type=Observation", "mongodb reindex walk started"]);
+    assert!(
+        obs_started.iter().any(|l| l.contains("newest_live=2020-01-01T00:00:02.000Z")
+            && l.contains("floor=2020-01-01T00:00:02.001Z")),
+        "{obs_started:?}"
+    );
+    let patient_started =
+        walk_log_lines(&["tenant=walk-a", "resource_type=Patient", "mongodb reindex walk started"]);
+    assert!(
+        patient_started.iter().any(|l| l.contains("newest_live=2020-01-01T00:00:03.000Z")
+            && l.contains("floor=2020-01-01T00:00:03.001Z")),
+        "{patient_started:?}"
+    );
+    for rt in ["Observation", "Patient"] {
+        let finished = walk_log_lines(&[
+            "tenant=walk-a",
+            &format!("resource_type={rt}"),
+            "mongodb reindex catch-up round finished",
+            "round=1",
+        ]);
+        assert!(finished.iter().any(|l| l.contains("walked=0")), "{rt}: {finished:?}");
+    }
+
+    // Rerun without clear_existing: no duplicates should appear.
+    let rerun_job = new_op.start(tenant_a.clone(), ReindexRequest::for_types(["Observation", "Patient"]).with_batch_size(40), None).await.unwrap();
+    wait_for_terminal(&new_op, &rerun_job).await;
+    assert_eq!(snapshot(&db, "walk-a", false).await, s_crud_a);
+}
+
+async fn wait_for_terminal(
+    op: &helios_persistence::search::ReindexOperation,
+    job_id: &str,
+) -> helios_persistence::search::ReindexProgress {
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        loop {
+            let progress = op.get_progress(job_id).await.unwrap();
+            if progress.status.is_finished() {
+                return progress;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("reindex status should become terminal")
 }
