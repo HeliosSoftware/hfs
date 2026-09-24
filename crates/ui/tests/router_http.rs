@@ -5492,6 +5492,43 @@ async fn sql_query_page_shows_the_parameters_card_with_form_associated_fields() 
     assert!(html.contains(r#"name="params_sig" form="lib-editor-form" value="ward:string""#));
 }
 
+/// #1276: Create New (`?lib=new`) renders `#lib-params` for a SQL Query too,
+/// so `/run`'s out-of-band card has an element to replace once the pasted
+/// JSON declares a parameter. The starter declares none, so its signature is
+/// empty — the same one `/run` computes for the unedited starter. The SQL
+/// View route still never renders the card.
+#[tokio::test]
+async fn sql_query_create_new_renders_lib_params_card() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("Library", helios_fhir::FhirVersion::R4, Vec::new())
+        .with_sql_run(Ok(Vec::new()));
+
+    let response = library_app(source.clone())
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=new")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"id="lib-params""#));
+    assert!(html.contains(r#"name="params_sig" form="lib-editor-form" value="""#));
+
+    let response = library_app(source)
+        .oneshot(
+            Request::get("/ui/sql/views?lib=new")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(!html.contains(r#"id="lib-params""#));
+}
+
 /// #841: the same JSON, on the SQL View route, never shows `#lib-params` —
 /// `LibraryKind::declares_parameters` is `false` there, whatever
 /// `parameter[]` the stored document happens to carry.

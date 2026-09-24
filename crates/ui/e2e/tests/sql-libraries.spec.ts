@@ -764,6 +764,67 @@ test.describe("Parameters card", () => {
     await expect(wardField).toBeFocused();
     await expect(paramsCard).toHaveAttribute("data-e2e-marker", "untouched");
   });
+
+  // #1276: an unsaved `?lib=new` document must render the card too — the
+  // `/run` fragment only ever returns it as an `hx-swap-oob` companion, which
+  // htmx silently drops when no `#lib-params` is already on the page, so a
+  // required parameter declared before the first Save could never be given
+  // a value.
+  test("Create New: a required parameter declared in the unsaved JSON gets a value field, and filling it runs the query", async ({
+    page,
+    request,
+  }) => {
+    const patientId = await createResource(request, "Patient", { name: [{ family: "NewParamE2E" }] });
+    const canonical = `http://example.org/ViewDefinition/e2e-params-new-${Date.now()}`;
+    const vdId = await createResource(request, "ViewDefinition", {
+      name: "e2e_params_new_source",
+      url: canonical,
+      status: "active",
+      resource: "Patient",
+      select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+    });
+    await waitSearchable(request, "ViewDefinition", vdId);
+    await waitSearchable(request, "Patient", patientId);
+
+    await page.goto("/ui/sql/queries?lib=new");
+
+    const library = {
+      resourceType: "Library",
+      name: `e2e_params_new_${Date.now()}`,
+      status: "active",
+      type: {
+        coding: [
+          {
+            system: "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes",
+            code: "sql-query",
+          },
+        ],
+      },
+      relatedArtifact: [{ type: "depends-on", resource: canonical, label: "v" }],
+      parameter: [{ name: "min_height", use: "in", type: "decimal" }],
+    };
+    await page.locator("#lib-details-editor .cm-content").click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText(JSON.stringify(library, null, 2));
+
+    await page.locator(".sql-editor .cm-content[role='textbox']").click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText("SELECT id FROM v WHERE :min_height > 0");
+
+    // Declared, required, no default: the run waits — and the card offers
+    // the field to end the wait with.
+    const minHeight = page.locator("#lib-params input[name='param:min_height']");
+    await expect(minHeight).toBeVisible({ timeout: 3000 });
+    await expect(page.locator("#run-notice")).toContainText("Waiting for a value for :min_height", {
+      timeout: 3000,
+    });
+
+    await minHeight.fill("150");
+    await expect(page.locator("#run-notice")).not.toContainText("Waiting for a value", {
+      timeout: 3000,
+    });
+    await expect(page.locator("#run-results .data-table")).toBeVisible({ timeout: 3000 });
+  });
 });
 
 // Tables panel (#842, both kinds): Reads from / Used by, resolved against

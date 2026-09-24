@@ -5704,10 +5704,18 @@ async fn sql_library_page(
     // in before `?…&saved=1` can show a table; until then this render's own
     // `run_results` below shows the same "waiting" notice the `/run`
     // fragment would.
+    //
+    // #1276: built off `tables_document`, not `selected_value`, so
+    // `?lib=new` analyzes its starter document too. Without that the page
+    // renders no `#lib-params` at all, and `/run`'s own out-of-band card —
+    // sent once the pasted JSON declares a parameter — has no element to
+    // replace, so htmx drops it and no value can ever be typed in. The
+    // starter's own signature is what `/run` computes for an unedited
+    // document, so the card is swapped only once a declaration changes.
     let no_values = std::collections::HashMap::new();
     let analysis = kind
         .declares_parameters
-        .then_some(selected_value.as_ref())
+        .then_some(tables_document.as_ref())
         .flatten()
         .map(|lib| {
             let sql = selected
