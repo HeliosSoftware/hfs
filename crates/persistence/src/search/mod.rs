@@ -75,6 +75,7 @@ pub mod numeric_value;
 pub mod range;
 pub mod registry;
 pub mod reindex;
+mod reindex_stats;
 pub mod seeder;
 pub mod tenant_registries;
 pub mod text_fold;
@@ -115,8 +116,8 @@ pub use registry::{
 };
 pub use reindex::{
     DEFERRED_REINDEX_BATCH_SIZE, DeferredReindexLedger, ReindexOnFinish, ReindexOperation,
-    ReindexProgress, ReindexProgressError, ReindexRequest, ReindexSource, ReindexStatus,
-    ReindexTarget, ReindexableStorage, ResourcePage, ResourceRef, SkippedResource,
+    ReindexPageStats, ReindexProgress, ReindexProgressError, ReindexRequest, ReindexSource,
+    ReindexStatus, ReindexTarget, ReindexableStorage, ResourcePage, ResourceRef, SkippedResource,
 };
 pub use seeder::{
     SeedOutcome, seed_spec_compartment_definitions, seed_spec_search_parameters,
