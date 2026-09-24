@@ -384,6 +384,7 @@ async fn embedded_assets_are_served() {
         "/ui/assets/app.css",
         "/ui/assets/fhir-search-value.js",
         "/ui/assets/unsaved.js",
+        "/ui/assets/bulk-import.js",
     ] {
         let response = app()
             .oneshot(Request::get(asset).body(Body::empty()).unwrap())
@@ -434,6 +435,23 @@ async fn layout_carries_the_unsaved_changes_helper() {
         .expect("addbox.js in the layout");
     assert!(busy < unsaved, "unsaved.js must load after busy.js");
     assert!(unsaved < addbox, "unsaved.js must load before addbox.js");
+}
+
+/// #1240: the Bulk Import page loads `bulk-import.js`, which opts the New
+/// Submission dialog's form into the shared unsaved-changes tracker — even
+/// when this router registers no `BulkSubmitProvider` and the page renders
+/// its unavailable notice instead of the dialog, since the script tag itself
+/// sits outside that branch.
+#[tokio::test]
+async fn bulk_import_page_loads_the_unsaved_changes_script() {
+    let response = app()
+        .oneshot(Request::get("/ui/bulk-import").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"<script src="/ui/assets/bulk-import.js" defer></script>"#));
 }
 
 /// #753: the vendored CodeMirror 6 + lezer-fhirpath bundle is

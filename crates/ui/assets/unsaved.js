@@ -67,10 +67,25 @@
     file: true,
   };
 
+  /* `form.elements` itself, robust to a control named `elements` (e.g.
+   * bulk-export's own `_elements` filter field): once such a control exists,
+   * it shadows `HTMLFormElement.prototype.elements` as an own property, so
+   * plain `form.elements` would read the *input*, not the collection. Read
+   * the real getter straight off the prototype for an actual form; anything
+   * else (a plain Node/ad hoc object, as the unit tests under `require()`
+   * pass) falls back to the property as-is. */
+  function formElements(form) {
+    if (typeof HTMLFormElement !== "undefined" && form instanceof HTMLFormElement) {
+      return Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, "elements").get.call(form);
+    }
+    return form.elements;
+  }
+
   /* A form's own state as one comparable string: one "name=normalize(value)"
    * line per named, non-skipped control in `form.elements` (document order —
    * that collection already includes controls associated by a `form=`
-   * attribute elsewhere in the document, not just descendants). Checkboxes
+   * attribute elsewhere in the document, not just descendants), robust to a
+   * control named `elements` (see `formElements` above). Checkboxes
    * always emit a line, `name=` empty when unchecked, so toggling either way
    * counts as a change; a radio emits its own `value` but only when checked
    * (an unchecked radio in a group carries no information beyond "not this
@@ -79,7 +94,7 @@
    * `select[multiple]` emits one line per selected option. */
   function serialize(form) {
     var lines = "";
-    var elements = form.elements;
+    var elements = formElements(form);
     for (var i = 0; i < elements.length; i++) {
       var el = elements[i];
       var name = el.name;
