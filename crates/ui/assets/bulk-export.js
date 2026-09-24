@@ -18,6 +18,8 @@
   var sincePreset = form.querySelector('select[name="since_preset"]');
   var sinceCustom = form.querySelector('input[name="since_custom"]');
   var sinceCustomError = form.querySelector("#bulk-export-since-custom-error");
+  var untilInput = form.querySelector('input[name="until"]');
+  var untilError = form.querySelector("#bulk-export-until-error");
   var scopeRadios = Array.prototype.slice.call(form.querySelectorAll('input[name="scope"]'));
   var patientCombobox = form.querySelector(".combobox--scope-patient");
   var patientsError = form.querySelector("#bulk-export-patients-error");
@@ -60,8 +62,7 @@
     nameHeading.textContent = nameInput.value.trim() || defaultHeading;
   }
 
-  function isValidFhirInstant(value) {
-    var pattern = sinceCustom && sinceCustom.getAttribute("data-pattern");
+  function isValidFhirInstant(value, pattern) {
     if (!pattern || !new RegExp("^(?:" + pattern + ")$").test(value)) return false;
 
     var parts = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-](\d{2}):(\d{2}))$/.exec(
@@ -98,9 +99,22 @@
     var invalid = false;
     if (sincePreset && sinceCustom && sincePreset.value === "custom") {
       var value = sinceCustom.value.trim();
-      invalid = Boolean(value && !isValidFhirInstant(value));
+      var pattern = sinceCustom.getAttribute("data-pattern");
+      invalid = Boolean(value && !isValidFhirInstant(value, pattern));
     }
     setFieldError(sinceCustom, sinceCustomError, invalid);
+    return !invalid;
+  }
+
+  // Until has no preset: it is validated whenever it is non-empty (#1271).
+  function validateUntil() {
+    var invalid = false;
+    if (untilInput) {
+      var value = untilInput.value.trim();
+      var pattern = untilInput.getAttribute("data-pattern");
+      invalid = Boolean(value && !isValidFhirInstant(value, pattern));
+    }
+    setFieldError(untilInput, untilError, invalid);
     return !invalid;
   }
 
@@ -235,6 +249,11 @@
       if (validationStarted) validateSince();
     });
   }
+  if (untilInput) {
+    untilInput.addEventListener("input", function () {
+      if (validationStarted) validateUntil();
+    });
+  }
   scopeRadios.forEach(function (scope) {
     scope.addEventListener("change", function () {
       synchronizePatientScope();
@@ -252,13 +271,16 @@
     validationStarted = true;
     var nameValid = validateName();
     var sinceValid = validateSince();
+    var untilValid = validateUntil();
     var patientsValid = validatePatients();
-    if (!nameValid || !sinceValid || !patientsValid) {
+    if (!nameValid || !sinceValid || !untilValid || !patientsValid) {
       event.preventDefault();
       if (!nameValid && nameInput) {
         nameInput.focus();
       } else if (!sinceValid && sinceCustom) {
         sinceCustom.focus();
+      } else if (!untilValid && untilInput) {
+        untilInput.focus();
       } else if (!patientsValid) {
         var field = patientField();
         if (field) field.focus();
@@ -304,6 +326,7 @@
       synchronizePatientScope();
       setFieldError(nameInput, nameError, false);
       setFieldError(sinceCustom, sinceCustomError, false);
+      setFieldError(untilInput, untilError, false);
     }, 0);
   });
 })();
