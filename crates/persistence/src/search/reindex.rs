@@ -117,6 +117,43 @@ pub struct SkippedResource {
     pub reason: String,
 }
 
+/// What one writer measured while rebuilding one page, reported through
+/// [`ReindexTarget::write_search_entries_page_timed`] (#1403). A writer adds to
+/// it as each phase completes, so a page that fails part-way still reports the
+/// phases it finished. A writer that does not measure leaves it zero; the driver
+/// still times the whole call itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ReindexPageStats {
+    /// Search-parameter extraction and building the page's index entries.
+    pub extract: Duration,
+    /// Removing the page's stale entries (every delete command of the page,
+    /// including a failed one).
+    pub delete: Duration,
+    /// Writing the page's new entries (every insert command of the page,
+    /// including a failed one).
+    pub insert: Duration,
+    /// Stale entries the successful deletes removed.
+    pub deleted_entries: u64,
+    /// Entries handed to insert commands that were issued, including any the
+    /// backend then rejected.
+    pub inserted_entries: u64,
+    /// Insert commands issued, including any that failed.
+    pub insert_commands: u64,
+}
+
+impl ReindexPageStats {
+    /// Adds every duration and count of `other` to this one.
+    pub fn accumulate(&mut self, other: &ReindexPageStats) {
+        self.extract += other.extract;
+        self.delete += other.delete;
+        self.insert += other.insert;
+        self.deleted_entries += other.deleted_entries;
+        self.inserted_entries += other.inserted_entries;
+        self.insert_commands += other.insert_commands;
+    }
+}
+
 /// Identifies one resource of one type, for a reindex scoped to specific
 /// resources rather than whole types (see [`ReindexRequest::resource_ids`]).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -314,6 +351,9 @@ pub trait ReindexTarget: Send + Sync {
     /// PostgreSQL may split this input into bounded concurrent write groups;
     /// its result vector still has exactly one slot per input occurrence in
     /// input order. The next source page is fetched only after this call ends.
+    ///
+    /// The reindex driver calls [`Self::write_search_entries_page_timed`], whose
+    /// default delegates here.
     async fn write_search_entries_page(
         &self,
         tenant: &TenantContext,
@@ -330,6 +370,24 @@ pub trait ReindexTarget: Send + Sync {
             }
         }
         results
+    }
+
+    /// Like [`Self::write_search_entries_page`], also reporting where the
+    /// writer's time went (#1403). The reindex driver calls this one; `stats`
+    /// arrives zeroed and the writer adds to it as each phase completes. The
+    /// default measures nothing and delegates, so a writer that does not
+    /// override it behaves exactly as before. A writer that overrides this
+    /// MUST implement `write_search_entries_page` as a delegate to it (with a
+    /// throwaway `ReindexPageStats`), so the driver's path and direct callers
+    /// (the composite ingest sink) can never diverge.
+    async fn write_search_entries_page_timed(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+        stats: &mut ReindexPageStats,
+    ) -> Vec<StorageResult<usize>> {
+        let _ = stats;
+        self.write_search_entries_page(tenant, resources).await
     }
 }
 
@@ -2524,6 +2582,89 @@ mod tests {
             tenant: String,
             resource_type: String,
         },
+    }
+
+    #[test]
+    fn reindex_page_stats_accumulate_adds_every_field() {
+        let mut total = ReindexPageStats {
+            extract: Duration::from_millis(1),
+            delete: Duration::from_millis(2),
+            insert: Duration::from_millis(3),
+            deleted_entries: 4,
+            inserted_entries: 5,
+            insert_commands: 6,
+        };
+        let other = ReindexPageStats {
+            extract: Duration::from_millis(10),
+            delete: Duration::from_millis(20),
+            insert: Duration::from_millis(30),
+            deleted_entries: 40,
+            inserted_entries: 50,
+            insert_commands: 60,
+        };
+        total.accumulate(&other);
+        assert_eq!(total.extract, Duration::from_millis(11));
+        assert_eq!(total.delete, Duration::from_millis(22));
+        assert_eq!(total.insert, Duration::from_millis(33));
+        assert_eq!(total.deleted_entries, 44);
+        assert_eq!(total.inserted_entries, 55);
+        assert_eq!(total.insert_commands, 66);
+    }
+
+    /// The default `_timed` must behave exactly like calling
+    /// `write_search_entries_page` directly: same outcomes, same side effects,
+    /// and it must leave `stats` untouched — proving the plumbing before any
+    /// writer (MongoDB, in Task 4) overrides it (#1403).
+    #[tokio::test]
+    async fn default_timed_page_write_delegates_and_measures_nothing() {
+        // Two fresh targets: `RecordingTarget` is stateful (it records what it
+        // wrote), so the untimed and timed calls each need their own instance to
+        // compare like for like.
+        let first = RecordingTarget {
+            permanent: BTreeSet::from(["p1".to_string()]),
+            ..Default::default()
+        };
+        let second = RecordingTarget {
+            permanent: BTreeSet::from(["p1".to_string()]),
+            ..Default::default()
+        };
+        let tenant = named_tenant("default-timed-delegates");
+        let resources: Vec<StoredResource> = ["p0", "p1", "p2"]
+            .into_iter()
+            .map(|id| {
+                StoredResource::new(
+                    "Patient",
+                    id,
+                    tenant.tenant_id().clone(),
+                    serde_json::json!({"resourceType": "Patient", "id": id}),
+                    helios_fhir::FhirVersion::default(),
+                )
+            })
+            .collect();
+
+        let untimed = first.write_search_entries_page(&tenant, &resources).await;
+        let target: &dyn ReindexTarget = &second;
+        let mut stats = ReindexPageStats::default();
+        let timed = target
+            .write_search_entries_page_timed(&tenant, &resources, &mut stats)
+            .await;
+
+        let simplify = |v: Vec<StorageResult<usize>>| {
+            v.into_iter()
+                .map(|r| r.as_ref().ok().copied())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(simplify(untimed), vec![Some(1), None, Some(1)]);
+        assert_eq!(simplify(timed), vec![Some(1), None, Some(1)]);
+        assert_eq!(
+            first.written.lock().clone(),
+            vec!["p0".to_string(), "p1".to_string(), "p2".to_string()]
+        );
+        assert_eq!(
+            second.written.lock().clone(),
+            vec!["p0".to_string(), "p1".to_string(), "p2".to_string()]
+        );
+        assert_eq!(stats, ReindexPageStats::default());
     }
 
     struct ControlledBackend {
