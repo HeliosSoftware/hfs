@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::time::Duration as StdDuration;
 
 use crate::core::bulk_export::{
@@ -16,6 +17,7 @@ use crate::core::bulk_export_worker::{
     ExportClaimStrategy, ExportJobLease, ExportWorkerStorage, LeaseError, WorkerId, WorkerJobView,
     abandoned_export_message, export_lease_expiry,
 };
+use crate::core::patient_compartment::PatientCompartmentMatcher;
 use crate::error::{BackendError, BulkExportError, StorageError, StorageResult};
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 
@@ -1340,107 +1342,62 @@ impl PatientExportProvider for PostgresBackend {
             return Ok(NdjsonBatch::empty());
         }
 
-        let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
-
-        if resource_type == "Patient" {
-            // For Patient resources, just filter by the IDs using ANY($3::text[])
-            let mut sql = "SELECT id, data, last_updated FROM resources
-                 WHERE tenant_id = $1 AND resource_type = $2 AND id = ANY($3::text[]) AND is_deleted = FALSE".to_string();
-
-            let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
-                Box::new(tenant_id.to_string()),
-                Box::new(resource_type.to_string()),
-                Box::new(patient_ids.to_vec()),
-            ];
-            // Same `_since` / `_until` window as the non-Patient branch below.
-            // Bound before the cursor clause so it does not consume the
-            // placeholders the cursor needs.
-            let param_idx = push_export_window(&mut sql, &mut params, request, 4);
-
-            if let Some(cursor) = cursor {
-                let parts: Vec<&str> = cursor.splitn(2, '|').collect();
-                if parts.len() == 2 {
-                    if let Ok(dt) = DateTime::parse_from_rfc3339(parts[0]) {
-                        sql.push_str(&format!(
-                            " AND (last_updated, id) > (${}, ${})",
-                            param_idx,
-                            param_idx + 1
-                        ));
-                        params.push(Box::new(dt.with_timezone(&Utc)));
-                        params.push(Box::new(parts[1].to_string()));
-                    }
-                }
-            }
-
-            sql.push_str(&format!(
-                " ORDER BY last_updated, id LIMIT {}",
-                batch_size + 1
-            ));
-
-            let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
-                .iter()
-                .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-                .collect();
-
-            let rows = client
-                .query(&sql, &param_refs)
-                .await
-                .map_err(|e| internal_error(format!("Failed to query compartment: {}", e)))?;
-
-            let has_more = rows.len() > batch_size as usize;
-            let rows_slice = if has_more {
-                &rows[..batch_size as usize]
-            } else {
-                &rows[..]
-            };
-
-            let mut lines = Vec::new();
-            let mut last_cursor = None;
-
-            for row in rows_slice {
-                let id: String = row.get(0);
-                let resource: Value = row.get(1);
-                let last_updated: chrono::DateTime<Utc> = row.get(2);
-
-                let line = serde_json::to_string(&resource)
-                    .map_err(|e| internal_error(format!("Failed to serialize: {}", e)))?;
-                lines.push(line);
-                last_cursor = Some(format!("{}|{}", last_updated.to_rfc3339(), id));
-            }
-
-            return Ok(NdjsonBatch {
-                lines,
-                next_cursor: if has_more { last_cursor } else { None },
-                is_last: !has_more,
-            });
+        let matcher = PatientCompartmentMatcher::new(
+            self.tenant_registry(tenant_id),
+            request.fhir_version,
+            resource_type,
+        );
+        let is_patient = resource_type == "Patient";
+        if !is_patient && matcher.is_empty() {
+            return Ok(NdjsonBatch::empty());
         }
-
-        // For other resource types, find resources whose JSONB payload
-        // references one of the patients via `subject.reference` or
-        // `patient.reference`. We read the payload directly rather than the
-        // search_index, so this is correct even when search is offloaded to a
-        // secondary backend (postgres-elasticsearch), which leaves the local
-        // search_index empty.
-        let patient_refs: Vec<String> = patient_ids
+        let patient_refs: HashSet<String> = patient_ids
             .iter()
-            .map(|id| format!("Patient/{}", id))
+            .map(|id| format!("Patient/{id}"))
             .collect();
+        let patient_ref_list: Vec<String> = patient_refs.iter().cloned().collect();
 
+        // Membership is decided on the JSONB payload, not the search_index, so
+        // this holds when search is offloaded to a secondary backend
+        // (postgres-elasticsearch) and the local index is empty. The query only
+        // narrows to rows that mention one of the patients in some
+        // `reference` (or are the patients themselves); `matcher` then applies
+        // the compartment's own parameters to each candidate.
+        let client = self.get_client().await?;
         let mut sql = "SELECT id, data, last_updated FROM resources
              WHERE tenant_id = $1
                 AND resource_type = $2
-                AND is_deleted = FALSE
-                AND ((data #>> '{subject,reference}') = ANY($3::text[])
-                  OR (data #>> '{patient,reference}') = ANY($3::text[]))"
+                AND is_deleted = FALSE"
             .to_string();
-
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
             Box::new(tenant_id.to_string()),
             Box::new(resource_type.to_string()),
-            Box::new(patient_refs),
         ];
-        let param_idx = push_export_window(&mut sql, &mut params, request, 4);
+        let mentions_a_patient = |idx: usize| {
+            format!(
+                "EXISTS (SELECT 1 FROM jsonb_path_query(data, '$.**.reference') AS r \
+                 WHERE split_part(r #>> '{{}}', '/_history/', 1) = ANY(${idx}::text[]))"
+            )
+        };
+        let next_idx = if is_patient && matcher.is_empty() {
+            sql.push_str(" AND id = ANY($3::text[])");
+            params.push(Box::new(patient_ids.to_vec()));
+            4
+        } else if is_patient {
+            sql.push_str(&format!(
+                " AND (id = ANY($3::text[]) OR {})",
+                mentions_a_patient(4)
+            ));
+            params.push(Box::new(patient_ids.to_vec()));
+            params.push(Box::new(patient_ref_list));
+            5
+        } else {
+            sql.push_str(&format!(" AND {}", mentions_a_patient(3)));
+            params.push(Box::new(patient_ref_list));
+            4
+        };
+        let param_idx = push_export_window(&mut sql, &mut params, request, next_idx);
 
         if let Some(cursor) = cursor {
             let parts: Vec<&str> = cursor.splitn(2, '|').collect();
@@ -1472,6 +1429,9 @@ impl PatientExportProvider for PostgresBackend {
             .await
             .map_err(|e| internal_error(format!("Failed to query compartment: {}", e)))?;
 
+        // The cursor advances over every candidate the query returned, kept or
+        // not, so a page of candidates that all fail the exact test still
+        // moves the export forward (an empty, non-final batch is legal).
         let has_more = rows.len() > batch_size as usize;
         let rows_slice = if has_more {
             &rows[..batch_size as usize]
@@ -1486,11 +1446,16 @@ impl PatientExportProvider for PostgresBackend {
             let id: String = row.get(0);
             let resource: Value = row.get(1);
             let last_updated: chrono::DateTime<Utc> = row.get(2);
+            last_cursor = Some(format!("{}|{}", last_updated.to_rfc3339(), id));
 
+            let in_compartment = (is_patient && patient_ids.contains(&id))
+                || matcher.is_member(&resource, &patient_refs);
+            if !in_compartment {
+                continue;
+            }
             let line = serde_json::to_string(&resource)
                 .map_err(|e| internal_error(format!("Failed to serialize: {}", e)))?;
             lines.push(line);
-            last_cursor = Some(format!("{}|{}", last_updated.to_rfc3339(), id));
         }
 
         Ok(NdjsonBatch {

@@ -8,11 +8,11 @@
 use std::collections::{BTreeSet, HashSet};
 
 use async_trait::async_trait;
-use serde_json::Value;
 
 use crate::core::bulk_export::{
     ExportDataProvider, ExportRequest, GroupExportProvider, NdjsonBatch, PatientExportProvider,
 };
+use crate::core::patient_compartment::PatientCompartmentMatcher;
 use crate::error::{BulkExportError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
 use crate::types::StoredResource;
@@ -177,19 +177,6 @@ fn parse_resource_type_from_current_key(key: &str) -> Option<String> {
     parts.get(resources_idx + 1).map(|s| s.to_string())
 }
 
-/// Returns true if `value` (a FHIR resource JSON) has `subject.reference` or
-/// `patient.reference` matching one of the supplied `Patient/<id>` references.
-fn resource_in_patient_compartment(value: &Value, patient_refs: &HashSet<String>) -> bool {
-    let check = |key: &str| -> bool {
-        value
-            .get(key)
-            .and_then(|v| v.get("reference"))
-            .and_then(|r| r.as_str())
-            .is_some_and(|r| patient_refs.contains(r))
-    };
-    check("subject") || check("patient")
-}
-
 #[async_trait]
 impl PatientExportProvider for S3Backend {
     async fn list_patient_ids(
@@ -249,6 +236,15 @@ impl PatientExportProvider for S3Backend {
             return Ok(NdjsonBatch::empty());
         }
         let location = self.tenant_location(tenant)?;
+        let matcher = PatientCompartmentMatcher::new(
+            self.registries.for_tenant(tenant.tenant_id().as_str()),
+            request.fhir_version,
+            resource_type,
+        );
+        let is_patient = resource_type == "Patient";
+        if !is_patient && matcher.is_empty() {
+            return Ok(NdjsonBatch::empty());
+        }
         let patient_id_set: HashSet<String> = patient_ids.iter().cloned().collect();
         let patient_ref_set: HashSet<String> = patient_ids
             .iter()
@@ -281,11 +277,8 @@ impl PatientExportProvider for S3Backend {
             {
                 continue;
             }
-            let in_compartment = if resource_type == "Patient" {
-                patient_id_set.contains(resource.id())
-            } else {
-                resource_in_patient_compartment(resource.content(), &patient_ref_set)
-            };
+            let in_compartment = (is_patient && patient_id_set.contains(resource.id()))
+                || matcher.is_member(resource.content(), &patient_ref_set);
             if !in_compartment {
                 continue;
             }

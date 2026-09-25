@@ -14,10 +14,12 @@ use mongodb::{
     options::FindOptions,
 };
 use serde_json::Value;
+use std::collections::HashSet;
 
 use crate::core::bulk_export::{
     ExportDataProvider, ExportRequest, GroupExportProvider, NdjsonBatch, PatientExportProvider,
 };
+use crate::core::patient_compartment::PatientCompartmentMatcher;
 use crate::error::{BackendError, BulkExportError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
 
@@ -92,6 +94,18 @@ async fn collect_cursor(mut cursor: mongodb::Cursor<Document>) -> StorageResult<
 }
 
 fn ndjson_from_docs(docs: Vec<Document>, batch_size: u32) -> StorageResult<NdjsonBatch> {
+    ndjson_from_docs_where(docs, batch_size, |_, _| true)
+}
+
+/// Pages `docs` like [`ndjson_from_docs`], emitting only the payloads
+/// `keep(id, payload)` accepts. The cursor advances over every document of
+/// the page, kept or not, so a page whose candidates all fail the test still
+/// moves the export forward (an empty, non-final batch is legal).
+fn ndjson_from_docs_where(
+    docs: Vec<Document>,
+    batch_size: u32,
+    keep: impl Fn(&str, &Value) -> bool,
+) -> StorageResult<NdjsonBatch> {
     let has_more = docs.len() > batch_size as usize;
     let slice = if has_more {
         &docs[..batch_size as usize]
@@ -101,13 +115,6 @@ fn ndjson_from_docs(docs: Vec<Document>, batch_size: u32) -> StorageResult<Ndjso
     let mut lines = Vec::with_capacity(slice.len());
     let mut last_cursor = None;
     for d in slice {
-        let data = d
-            .get_document("data")
-            .map_err(|e| internal_error(format!("missing data payload: {e}")))?;
-        let val = document_to_value(data)?;
-        let line =
-            serde_json::to_string(&val).map_err(|e| internal_error(format!("serialize: {e}")))?;
-        lines.push(line);
         let last_updated = d
             .get_datetime("last_updated")
             .map_err(|e| internal_error(format!("missing last_updated: {e}")))?;
@@ -115,12 +122,51 @@ fn ndjson_from_docs(docs: Vec<Document>, batch_size: u32) -> StorageResult<Ndjso
             .get_str("id")
             .map_err(|e| internal_error(format!("missing id: {e}")))?;
         last_cursor = Some(make_cursor(last_updated, id));
+        let data = d
+            .get_document("data")
+            .map_err(|e| internal_error(format!("missing data payload: {e}")))?;
+        let val = document_to_value(data)?;
+        if !keep(id, &val) {
+            continue;
+        }
+        let line =
+            serde_json::to_string(&val).map_err(|e| internal_error(format!("serialize: {e}")))?;
+        lines.push(line);
     }
     Ok(NdjsonBatch {
         lines,
         next_cursor: if has_more { last_cursor } else { None },
         is_last: !has_more,
     })
+}
+
+/// The `$in` candidates matching a stored reference to one of `patient_refs`:
+/// the exact `Patient/{id}` and, as an anchored regex, its versioned form
+/// `Patient/{id}/_history/{vid}`.
+fn reference_candidates(patient_refs: &HashSet<String>) -> Vec<Bson> {
+    let mut refs: Vec<&String> = patient_refs.iter().collect();
+    refs.sort();
+    let mut candidates = Vec::with_capacity(refs.len() * 2);
+    for reference in refs {
+        candidates.push(Bson::String(reference.clone()));
+        candidates.push(Bson::RegularExpression(bson::Regex {
+            pattern: format!("^{}/_history/", regex_literal(reference)),
+            options: String::new(),
+        }));
+    }
+    candidates
+}
+
+/// Escapes `s` so a regex matches it literally.
+fn regex_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if "\\.^$|?*+()[]{}/".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 #[async_trait]
@@ -310,82 +356,75 @@ impl PatientExportProvider for MongoBackend {
         if patient_ids.is_empty() {
             return Ok(NdjsonBatch::empty());
         }
+        let tenant_id = tenant.tenant_id().as_str();
+        let matcher = PatientCompartmentMatcher::new(
+            self.tenant_registry(tenant_id),
+            request.fhir_version,
+            resource_type,
+        );
+        let is_patient = resource_type == "Patient";
+        if !is_patient && matcher.is_empty() {
+            return Ok(NdjsonBatch::empty());
+        }
+        let patient_refs: HashSet<String> = patient_ids
+            .iter()
+            .map(|id| format!("Patient/{id}"))
+            .collect();
+
+        // Membership is decided on the resource payload, not the search_index,
+        // so this holds when search is offloaded (mongodb-elasticsearch leaves
+        // the local index empty). The query narrows to documents whose payload
+        // carries one of the patients under an element path the compartment
+        // parameters read (`payload_paths`), or that are the patients
+        // themselves; `matcher` then applies the parameters exactly to each
+        // candidate. A parameter whose expression yields no element path
+        // leaves the type without a prefilter: every document is a candidate.
         let db = self.get_database().await?;
         let resources: Collection<Document> = db.collection(MongoBackend::RESOURCES_COLLECTION);
-        let tenant_id = tenant.tenant_id().as_str();
-
-        // Patient itself: just filter by id list.
-        if resource_type == "Patient" {
-            let mut filter = doc! {
-                "tenant_id": tenant_id,
-                "resource_type": "Patient",
-                "is_deleted": false,
-                "id": { "$in": patient_ids.to_vec() },
-            };
-            if let Some(range) = last_updated_range(request) {
-                filter.insert("last_updated", range);
-            }
-            if let Some((cur_dt, cur_id)) = cursor.and_then(parse_cursor) {
-                filter.insert(
-                    "$or",
-                    vec![
-                        doc! { "last_updated": { "$gt": chrono_to_bson(cur_dt) } },
-                        doc! {
-                            "last_updated": chrono_to_bson(cur_dt),
-                            "id": { "$gt": cur_id },
-                        },
-                    ],
-                );
-            }
-            let opts = FindOptions::builder()
-                .sort(doc! { "last_updated": 1, "id": 1 })
-                .limit((batch_size as i64) + 1)
-                .build();
-            let cursor_stream = resources
-                .find(filter)
-                .with_options(opts)
-                .await
-                .map_err(|e| internal_error(format!("compartment patients: {e}")))?;
-            let docs = collect_cursor(cursor_stream).await?;
-            return ndjson_from_docs(docs, batch_size);
-        }
-
-        // Other types: filter directly on the resource payload using dot
-        // notation on `data.subject.reference` / `data.patient.reference`.
-        // This is robust whether or not the local search_index is populated
-        // (mongodb-elasticsearch offloads search, leaving search_index empty).
-        let refs: Vec<String> = patient_ids.iter().map(|p| format!("Patient/{p}")).collect();
         let mut filter = doc! {
             "tenant_id": tenant_id,
             "resource_type": resource_type,
             "is_deleted": false,
-            "$or": vec![
-                doc! { "data.subject.reference": { "$in": &refs } },
-                doc! { "data.patient.reference": { "$in": &refs } },
-            ],
         };
         if let Some(range) = last_updated_range(request) {
             filter.insert("last_updated", range);
         }
-        if let Some((cur_dt, cur_id)) = cursor.and_then(parse_cursor) {
-            // Combine compartment-match $or with cursor keyset $or via $and.
-            let compartment = filter
-                .remove("$or")
-                .expect("compartment $or was inserted above");
-            filter.insert(
-                "$and",
-                vec![
-                    doc! { "$or": compartment },
-                    doc! { "$or": vec![
-                        doc! { "last_updated": { "$gt": chrono_to_bson(cur_dt) } },
-                        doc! {
-                            "last_updated": chrono_to_bson(cur_dt),
-                            "id": { "$gt": cur_id },
-                        },
-                    ]},
-                ],
-            );
+
+        let mut clauses: Vec<Document> = Vec::new();
+        let by_id = doc! { "id": { "$in": patient_ids.to_vec() } };
+        if matcher.is_empty() {
+            clauses.push(by_id);
+        } else if let Some(paths) = matcher.payload_paths() {
+            let candidates = reference_candidates(&patient_refs);
+            let mut arms: Vec<Document> = paths
+                .iter()
+                .map(|path| {
+                    let mut arm = Document::new();
+                    arm.insert(
+                        format!("data.{path}.reference"),
+                        doc! { "$in": candidates.clone() },
+                    );
+                    arm
+                })
+                .collect();
+            if is_patient {
+                arms.push(by_id);
+            }
+            clauses.push(doc! { "$or": arms });
         }
+        if let Some((cur_dt, cur_id)) = cursor.and_then(parse_cursor) {
+            clauses.push(doc! { "$or": vec![
+                doc! { "last_updated": { "$gt": chrono_to_bson(cur_dt) } },
+                doc! {
+                    "last_updated": chrono_to_bson(cur_dt),
+                    "id": { "$gt": cur_id },
+                },
+            ]});
+        }
+        if !clauses.is_empty() {
+            filter.insert("$and", clauses);
+        }
+
         let opts = FindOptions::builder()
             .sort(doc! { "last_updated": 1, "id": 1 })
             .limit((batch_size as i64) + 1)
@@ -396,7 +435,10 @@ impl PatientExportProvider for MongoBackend {
             .await
             .map_err(|e| internal_error(format!("compartment fetch: {e}")))?;
         let docs = collect_cursor(cursor_stream).await?;
-        ndjson_from_docs(docs, batch_size)
+        ndjson_from_docs_where(docs, batch_size, |id, value| {
+            (is_patient && patient_ids.iter().any(|p| p == id))
+                || matcher.is_member(value, &patient_refs)
+        })
     }
 }
 
