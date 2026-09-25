@@ -188,17 +188,15 @@ backend also delete `data/submit` (bulk-import status artifacts). `hfs-es-data` 
 
 Do this before T3.
 
-**1. Give the run its own index prefix**, exported in the shell that starts HFS and
-kept for 7.5 and §14. A retried T3 then starts clean, and step 3 is unambiguous.
+**1. Give the run its own index prefix** in the shell that starts HFS (keep it
+exported for 7.5 and §14), so a retried T3 starts clean:
 
 ```bash
 export ES_PREFIX=hfs_$(date +%Y%m%d_%H%M)          # e.g. hfs_20260916_1042
 export HFS_ELASTICSEARCH_INDEX_PREFIX=$ES_PREFIX   # default "hfs"
 ```
 
-Indices are named `{prefix}_{tenant}_{type in lower case}`.
-
-**2. Pre-flight the shard budget.**
+**2. Check the shard budget** before starting.
 
 ```bash
 curl -s "localhost:9200/_cat/health?v"                       # green or yellow, never red
@@ -206,13 +204,10 @@ curl -s "localhost:9200/_cat/shards" | wc -l                 # must be well unde
 curl -s "localhost:9200/_cat/indices?v&h=index,health,docs.count,store.size"
 ```
 
-Elasticsearch allows 1,000 shards per node. A corpus run uses about 52 (26 indices,
-one replica each), so ~19 uncleaned runs fill the cluster and every index creation
-is rejected (`maximum normal shards open`). HFS hits this **at startup**, seeding its
-SearchParameters, and never becomes ready: the log shows `Sync attempt failed,
-retrying` and nothing about Elasticsearch being full. It is not an HFS defect; run
-step 3. Yellow is normal on a single node (the replica cannot be allocated); only
-red is a failure.
+The shard count must stay well under 1,000 (a T3 run adds about 52). If the cluster
+is full, HFS never becomes ready and the log only shows `Sync attempt failed,
+retrying`. That is not an HFS defect: run step 3. Yellow is normal on a single node;
+only red is a failure.
 
 **3. Clean up at the end of the row.**
 
@@ -267,12 +262,7 @@ document writes `http://localhost:8080`; substitute your own base URL throughout
 
 ### One environment for the whole pass
 
-`HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for` is what T4 needs, but during T3 it makes
-every `_bulk` request, the search rebuild's included, wait for an Elasticsearch
-refresh while nobody reads the index. `HFS_ELASTICSEARCH_REINDEX_REFRESH` (#1156)
-sets the refresh policy of `$reindex` and the deferred rebuild separately, and
-follows `WRITE_REFRESH` when unset or blank. Setting both means one environment and
-no restart between T3 and T4:
+Use these settings for the whole pass; do not restart HFS between T3 and T4:
 
 | Setting | Value | Why |
 |---|---|---|
@@ -280,24 +270,18 @@ no restart between T3 and T4:
 | `HFS_ELASTICSEARCH_WRITE_REFRESH` | `wait_for` | same, for the Elasticsearch leg |
 | `HFS_ELASTICSEARCH_REINDEX_REFRESH` | `false` | the rebuild does not wait for refreshes |
 
-On a 1 % cut (228,580 resources, 4 GB heap, #937) the rebuild takes **806 s** without
-`REINDEX_REFRESH=false` and **145 s** with it, with 0 errors. Accepted values are
-`false`, `wait_for` and `true`; anything else is a startup error. It only affects the
-Elasticsearch writer, so it does nothing on non-composite rows.
+Without `REINDEX_REFRESH=false` the search rebuild in 7.4 is several times slower.
 
-This pass keeps the default `HFS_BULK_SUBMIT_DEFER_INDEXING=true`: the import stores
-first and the search index is rebuilt afterwards (7.4). On `*-es` rows,
-`DEFER_INDEXING=false` indexes each batch during ingest instead, using the same
-`REINDEX_REFRESH` policy. Use it only when the row is about it, and record it in the
-matrix cell, because it changes what 7.4 and §14 measure.
+Leave `HFS_BULK_SUBMIT_DEFER_INDEXING` at its default (`true`): the import stores first
+and the search index is rebuilt afterwards (7.4). If a row runs with `false`, record
+it in the matrix cell, because it changes what 7.4 and §14 measure.
 
 ### Cost of the status page during T3
 
 Keep the submission detail page open (7.3), but expect it to slow down. Its status
-card polls every 5 s, and on SQLite each poll aggregates over `bulk_entry_results`,
-which grows to 19M rows. In the #1126 campaign the gap between status updates
-stretched from seconds to minutes. That is expected, not a hang. The dashboard is
-safe to leave open (#1081).
+card polls every 5 s, and each poll gets slower as the import grows; on SQLite, gaps
+of minutes between updates are expected, not a hang. The dashboard is safe to leave
+open (#1081).
 
 ### Per-backend environment
 
@@ -466,20 +450,18 @@ operation, driven from the **Import** page, which makes HFS fetch the manifest a
 every file from a static HTTP server you run on port 8000 — or, alternatively,
 straight from the S3 bucket, where the archive has already been unpacked.
 
-Before starting, confirm HFS runs with the section 5 environment (on `*-es` rows
-that includes `HFS_ELASTICSEARCH_REINDEX_REFRESH=false`), `ES_PREFIX` is set and
-4.1's pre-flight passed.
+Before starting, confirm HFS runs with the section 5 environment and, on `*-es` rows,
+that 4.1 is done.
 
 ### 7.1 Download, unpack, and serve the corpus
 
 **Alternative: use the hosted manifest and skip the download and the server.** The
-24 NDJSON files sit in the S3 bucket next to
-<https://hfs-manual-test.s3.us-east-1.amazonaws.com/manifest.json>, whose `output`
-URLs point at the bucket. It is publicly readable. Record the per-type counts (below,
-hosted form), then go to 7.2 and enter that URL as the **Manifest URL**. Counts in 7.5
-and T4 are unchanged. HFS needs outbound internet and pulls ~35 GB, so the ingest time
-in 7.3 includes the download: note the source in the matrix cell. There is no local
-server log to watch in 7.3.
+manifest at <https://hfs-manual-test.s3.us-east-1.amazonaws.com/manifest.json> is
+publicly readable and its `output` URLs point at the bucket. Record the per-type
+counts (below, hosted form), then go to 7.2 and enter that URL as the **Manifest
+URL**. Counts in 7.5 and T4 are unchanged. HFS needs outbound internet and pulls
+~35 GB; note the source in the matrix cell. There is no local server log to watch in
+7.3.
 
 Otherwise, host the corpus locally:
 
@@ -503,12 +485,8 @@ Any static server works (e.g. `caddy file-server --root "$CORPUS" --listen :8000
 on SELinux add `,z` to the mount. Stop it with `docker rm -f hfs-corpus` after T3 and
 its search rebuild, not before.
 
-`python3 -m http.server` speaks HTTP/1.0 and closes the connection after every
-response. On this corpus **4–8 files per run lost their final 20–130 KB** (#1126);
-an HTTP/1.1 keep-alive server lost none. Since #1127 HFS retries the rest with a
-`Range` request and, if that fails, ends the manifest **`failed`, never `completed`**,
-so a truncating server now costs a T3 that fails after hours of ingest. Hence the
-byte check below.
+`python3 -m http.server` truncates large files on this corpus (#1126), which fails T3
+after hours of ingest. Run the byte check below before the import.
 
 #### Check the server answers HTTP/1.1 and serves whole files
 
@@ -540,8 +518,8 @@ sort > "$WORK/corpus-counts.tsv"
 cat "$WORK/corpus-counts.tsv"
 ```
 
-These are the expected counts for 7.5, for every type the corpus carries. With the
-hosted manifest there are no local files to count, so use its `count` per output:
+These are the expected counts for 7.5. With the hosted manifest, use its `count` per
+output instead:
 
 ```bash
 curl -sf https://hfs-manual-test.s3.us-east-1.amazonaws.com/manifest.json |
@@ -577,7 +555,7 @@ docker run -d --name hfs-corpus -p 8000:80 -v "$PWD":/usr/share/nginx/html:ro ng
 
 Whichever manifest is used, the counts in T4 for `Patient`, `Encounter`,
 `Condition`, and `Observation` are unchanged. Regenerate `corpus-counts.tsv` from the
-manifest you actually serve, so 7.5 compares against the right set of types.
+manifest you actually serve.
 
 ### 7.2 Create the submission in the UI
 
@@ -624,9 +602,8 @@ Wait for the status card to change to **Result** → *"Processing finished at �
 **Output files** = 24 (or 9 for the reduced manifest) and **Error files** = 0, the
 summary **Status** = **Completed**, and the log to end with
 `Status: got 200 OK — processing finished cleanly (24 outputs); submission completed.`
-Note that instant: with 7.2's creation instant it is the **ingest time** (§14).
-**Completed means the resources are stored, not searchable**; the rebuild is 7.4, so
-do not run the counts yet.
+Record that instant as the end of the ingest time (§14). Do not run the counts yet:
+the search index is rebuilt in 7.4.
 
 If the status becomes **Failed**, the **Error files** count is non-zero, or the log
 shows `POST <your HFS_BASE_URL>/$bulk-submit → …` with an error, record the log text
@@ -698,9 +675,7 @@ clean `completed`, so a shortfall is a regression to report.
    | Organization / Practitioner / PractitionerRole | 1,140 each |
    | Location | 1,142 |
 
-   **A short type is a T3 failure.** Record which type and by how much. In the #1126
-   1 % re-measurement Provenance was at 9,204 of 11,704 while every other type
-   matched.
+   **A short type is a T3 failure.** Record which type and by how much.
 
 3. In the **QUERY** box type `GET /Patient?_id=7d24f7a0-6f2e-ce3b-5568-db7b14695583`
    and press **Run**. One row: Cari853 Esperanza675 Parker433, female, 2015-12-29.
@@ -1326,12 +1301,8 @@ For each backend row, attach to the release issue:
 - **The T3 ingest time**: from the submission's creation instant (7.2) to
   *Processing finished at …* (7.3).
 - **The T3 searchable time**: from the same start to the rebuild reaching `completed`
-  (7.4), plus the rebuild's own elapsed time and its `$reindex-status` summary. On a
-  composite these can be days apart; in the #1126 campaign they were 18 h 31 min and
-  *never*.
-- **The final database size** and the resource count it holds. The #1126 `sqlite-es`
-  run ended at 238 GB for 18,955,865 resources (~12 KB each), which exposed a dead
-  SQLite search index.
+  (7.4), plus the rebuild's own elapsed time and its `$reindex-status` summary.
+- **The final database size** and the resource count it holds:
 
   ```bash
   du -sh data/hfs.db* data/submit 2>/dev/null                                    # sqlite
