@@ -343,7 +343,7 @@ where
         None => IndexBuildMode::default(),
     };
 
-    Ok(MongoBackendConfig {
+    let mut config = MongoBackendConfig {
         connection_string,
         database_name,
         max_connections,
@@ -354,9 +354,14 @@ where
         search_offloaded,
         max_included_resources,
         index_build,
-        app_name: MongoBackendConfig::default().app_name,
         reindex_catch_up_margin_ms: MongoBackendConfig::default().reindex_catch_up_margin_ms,
-    })
+        app_name: MongoBackendConfig::default().app_name,
+        ..Default::default()
+    };
+    config
+        .apply_reindex_env(&env)
+        .map_err(|message| anyhow::anyhow!(message))?;
+    Ok(config)
 }
 
 #[cfg(feature = "sqlite")]
@@ -4052,6 +4057,36 @@ mod tests {
         })
         .expect_err("invalid mode must fail startup");
         assert!(format!("{err}").contains("HFS_MONGODB_INDEX_BUILD"));
+    }
+
+    #[cfg(feature = "mongodb")]
+    #[test]
+    fn test_build_mongodb_config_reads_reindex_pipeline_knobs_and_rejects_invalid_values() {
+        let config = ServerConfig::default();
+
+        let mongo_config = build_mongodb_config_with_env(&config, false, |name| match name {
+            "HFS_MONGODB_REINDEX_OVERLAP" => Some("false".to_string()),
+            "HFS_MONGODB_REINDEX_PREPARE_THREADS" => Some("2".to_string()),
+            "HFS_MONGODB_REINDEX_PREFETCH" => Some("off".to_string()),
+            _ => None,
+        })
+        .expect("valid config");
+        assert!(!mongo_config.reindex_overlap);
+        assert_eq!(mongo_config.reindex_prepare_threads, 2);
+        assert!(!mongo_config.reindex_prefetch);
+
+        let default_config =
+            build_mongodb_config_with_env(&config, false, |_| None).expect("valid config");
+        assert!(default_config.reindex_overlap);
+        assert_eq!(default_config.reindex_prepare_threads, 0);
+        assert!(default_config.reindex_prefetch);
+
+        let err = build_mongodb_config_with_env(&config, false, |name| match name {
+            "HFS_MONGODB_REINDEX_OVERLAP" => Some("sideways".to_string()),
+            _ => None,
+        })
+        .expect_err("invalid value must fail startup");
+        assert!(format!("{err}").contains("HFS_MONGODB_REINDEX_OVERLAP"));
     }
 
     #[cfg(feature = "mongodb")]
