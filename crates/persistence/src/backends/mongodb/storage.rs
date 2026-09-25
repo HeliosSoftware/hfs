@@ -29,7 +29,8 @@ use crate::search::extractor::ExtractedValue;
 use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
 use crate::tenant::{Operation, TenantContext};
 use crate::types::{
-    CursorValue, Page, PageCursor, PageInfo, SearchParamType, SearchQuery, StoredResource,
+    CursorValue, Page, PageCursor, PageInfo, SearchParamType, SearchParameter, SearchPrefix,
+    SearchQuery, StoredResource,
 };
 
 use super::MongoBackend;
@@ -4212,11 +4213,19 @@ impl MongoBackend {
         }
 
         if self.is_search_offloaded() {
-            // This path reads the pairs itself; an empty `identifier=` would
-            // add no condition and match the whole type (#1360).
-            crate::search::conditional::reject_empty_criterion_values(&parsed_params)?;
+            // Typed first: the shared builder applies registry validation,
+            // type-aware parsing, OR splitting and modifier rules (#1312,
+            // #1321, #1323, #1360, #1366), so this path accepts and rejects
+            // the same criteria as `If-None-Exist` on the resource endpoint.
+            let typed_params =
+                self.build_search_parameters(tenant, resource_type, &parsed_params)?;
+            // Result-shaping names (`_format`, …) are not criteria; with
+            // nothing left, an empty filter would match the whole type.
+            if typed_params.is_empty() {
+                return Ok(Vec::new());
+            }
             return self
-                .if_none_exist_offloaded_scan(db, session, tenant, resource_type, &parsed_params)
+                .if_none_exist_offloaded_scan(db, session, tenant, resource_type, &typed_params)
                 .await;
         }
 
@@ -4475,18 +4484,37 @@ impl MongoBackend {
         Ok(matches)
     }
 
+    /// Matches `ifNoneExist` criteria against the raw `resources` documents.
+    ///
+    /// Search is offloaded, so there are no `search_index` rows to consult;
+    /// the match runs inside the transaction session (read-your-writes).
+    /// Criteria arrive typed by the shared conditional builder
+    /// ([`MongoBackend::build_search_parameters`]), which already applied
+    /// registry, empty-value, modifier and `:[type]` validation. This scan
+    /// evaluates only the shapes provable against raw documents and fails
+    /// closed on everything else — never silently ignoring a criterion
+    /// (which widens the match) nor silently failing to match (which creates
+    /// duplicates).
+    ///
+    /// Supported: `_id` / `_lastUpdated` (via [`MongoBackend::build_resource_filter`],
+    /// the same predicates direct search uses) and plain `identifier` values
+    /// in `code`, `|code`, or `system|code` form with a nonempty code (`|code`
+    /// matches any system, same as Mongo direct search). Comma-separated
+    /// values OR within one parameter; repeated parameters AND.
     async fn if_none_exist_offloaded_scan(
         &self,
         db: &mongodb::Database,
         session: &mut ClientSession,
         tenant: &TenantContext,
         resource_type: &str,
-        parsed_params: &[(String, String)],
+        params: &[SearchParameter],
     ) -> StorageResult<Vec<StoredResource>> {
         let tenant_id = tenant.tenant_id().as_str();
 
-        for (name, _) in parsed_params {
-            match name.as_str() {
+        // Anything outside the evaluatable set is rejected, not ignored:
+        // silently dropping a criterion widens the match.
+        for param in params {
+            match param.name.as_str() {
                 "_id" | "_lastUpdated" | "identifier" => {}
                 other => {
                     return Err(StorageError::Search(
@@ -4494,8 +4522,8 @@ impl MongoBackend {
                             message: format!(
                                 "ifNoneExist parameter '{other}' cannot be evaluated \
                                  against the resource collection when search is offloaded; \
-                                 use a supported parameter (_id, identifier) or disable \
-                                 search offloading"
+                                 use a supported parameter (_id, _lastUpdated, identifier) \
+                                 or disable search offloading"
                             ),
                         },
                     ));
@@ -4503,35 +4531,96 @@ impl MongoBackend {
             }
         }
 
-        let mut conditions = vec![doc! {
-            "tenant_id": tenant_id,
-            "resource_type": resource_type,
-            "is_deleted": false,
-        }];
+        let mut conditions: Vec<Document> = Vec::new();
 
-        for (name, value) in parsed_params {
-            match name.as_str() {
-                "_id" => {
-                    conditions.push(doc! { "id": value.as_str() });
+        // `_id` / `_lastUpdated` reuse the resource-level predicates direct
+        // search builds (prefix-aware, dates validated); they carry the
+        // tenant / type / live-only base with them.
+        let resource_params: Vec<SearchParameter> = params
+            .iter()
+            .filter(|p| matches!(p.name.as_str(), "_id" | "_lastUpdated"))
+            .cloned()
+            .collect();
+        if resource_params.is_empty() {
+            conditions.push(doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "is_deleted": false,
+            });
+        } else {
+            let query = SearchQuery {
+                resource_type: resource_type.to_string(),
+                parameters: resource_params,
+                count: Some(2),
+                ..Default::default()
+            };
+            conditions.push(self.build_resource_filter(
+                tenant_id,
+                resource_type,
+                &query,
+                None,
+                None,
+            )?);
+        }
+
+        // Plain `identifier` values against the raw `data.identifier` array.
+        // One parameter's comma-separated values OR; repeated parameters AND
+        // through the top-level `$and`.
+        for param in params.iter().filter(|p| p.name.as_str() == "identifier") {
+            Self::validate_offloaded_identifier_param(param)?;
+            let mut branches: Vec<Bson> = Vec::with_capacity(param.values.len());
+            for value in &param.values {
+                if value.value.chars().filter(|c| *c == '|').count() > 1 {
+                    return Err(StorageError::Search(
+                        crate::error::SearchError::QueryParseError {
+                            message: format!(
+                                "Unsupported value '{}' for ifNoneExist parameter \
+                                 'identifier' when search is offloaded: supported forms \
+                                 are 'code', '|code' and 'system|code' with a single '|'",
+                                value.value
+                            ),
+                        },
+                    ));
                 }
-                "_lastUpdated" => {}
-                "identifier" => {
-                    let mut elem_match = Document::new();
-                    if let Some((system, val)) = value.split_once('|') {
-                        if !system.is_empty() {
-                            elem_match.insert("system", system);
-                        }
-                        if !val.is_empty() {
-                            elem_match.insert("value", val);
-                        }
-                    } else if !value.is_empty() {
-                        elem_match.insert("value", value.as_str());
-                    }
-                    if !elem_match.is_empty() {
-                        conditions.push(doc! { "data.identifier": { "$elemMatch": elem_match } });
-                    }
+                let (system, code) = match value.value.split_once('|') {
+                    Some((system, code)) => (system, code),
+                    None => ("", value.value.as_str()),
+                };
+                if code.is_empty() {
+                    return Err(StorageError::Search(
+                        crate::error::SearchError::QueryParseError {
+                            message: "Unsupported empty code for ifNoneExist parameter \
+                                      'identifier' when search is offloaded: supported \
+                                      forms are 'code', '|code' and 'system|code' with a \
+                                      nonempty code"
+                                .to_string(),
+                        },
+                    ));
                 }
-                _ => unreachable!("unsupported params are rejected above"),
+                let mut elem_match = Document::new();
+                if !system.is_empty() {
+                    elem_match.insert("system", system);
+                }
+                elem_match.insert("value", code);
+                branches.push(Bson::Document(
+                    doc! { "data.identifier": { "$elemMatch": elem_match } },
+                ));
+            }
+            if branches.is_empty() {
+                return Err(StorageError::Search(
+                    crate::error::SearchError::QueryParseError {
+                        message: "ifNoneExist parameter 'identifier' carries no value; \
+                                  nothing was written"
+                            .to_string(),
+                    },
+                ));
+            } else if branches.len() == 1 {
+                match branches.remove(0) {
+                    Bson::Document(condition) => conditions.push(condition),
+                    _ => unreachable!("identifier branches are documents"),
+                }
+            } else {
+                conditions.push(doc! { "$or": Bson::Array(branches) });
             }
         }
 
@@ -4571,6 +4660,45 @@ impl MongoBackend {
         }
 
         Ok(matches)
+    }
+
+    /// Keep the raw-document scan fail-closed if the conditional builder's
+    /// typed-parameter contract changes. This check needs no database session.
+    fn validate_offloaded_identifier_param(param: &SearchParameter) -> StorageResult<()> {
+        if param.param_type != SearchParamType::Token {
+            return Err(StorageError::Search(
+                crate::error::SearchError::QueryParseError {
+                    message: format!(
+                        "ifNoneExist parameter 'identifier' cannot be evaluated \
+                         against the resource collection when search is offloaded: \
+                         unsupported parameter type '{}'",
+                        param.param_type
+                    ),
+                },
+            ));
+        }
+        if let Some(modifier) = param.modifier.as_ref() {
+            return Err(StorageError::Search(
+                crate::error::SearchError::UnsupportedModifier {
+                    modifier: modifier.to_string(),
+                    param_type: param.param_type.to_string(),
+                },
+            ));
+        }
+        for value in &param.values {
+            if value.prefix != SearchPrefix::Eq {
+                return Err(StorageError::Search(
+                    crate::error::SearchError::QueryParseError {
+                        message: format!(
+                            "Unsupported prefix '{}' for ifNoneExist parameter \
+                             'identifier' when search is offloaded",
+                            value.prefix
+                        ),
+                    },
+                ));
+            }
+        }
+        Ok(())
     }
 
     async fn index_resource_in_bundle_transaction(
@@ -5277,6 +5405,59 @@ fn resolve_bundle_references(value: &mut Value, reference_map: &HashMap<String, 
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod offloaded_identifier_guard_tests {
+    use super::*;
+    use crate::types::{SearchModifier, SearchValue};
+
+    fn identifier_param() -> SearchParameter {
+        SearchParameter {
+            name: "identifier".to_string(),
+            param_type: SearchParamType::Token,
+            values: vec![SearchValue::eq("MRN-1")],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rejects_non_token_type() {
+        let param = SearchParameter {
+            param_type: SearchParamType::String,
+            ..identifier_param()
+        };
+        let err = MongoBackend::validate_offloaded_identifier_param(&param).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unsupported parameter type 'string'")
+        );
+    }
+
+    #[test]
+    fn rejects_modifier() {
+        let param = SearchParameter {
+            modifier: Some(SearchModifier::Missing),
+            ..identifier_param()
+        };
+        let err = MongoBackend::validate_offloaded_identifier_param(&param).unwrap_err();
+        assert!(err.to_string().contains("missing"));
+    }
+
+    #[test]
+    fn rejects_non_eq_prefix() {
+        let param = SearchParameter {
+            values: vec![SearchValue::new(SearchPrefix::Ne, "MRN-1")],
+            ..identifier_param()
+        };
+        let err = MongoBackend::validate_offloaded_identifier_param(&param).unwrap_err();
+        assert!(err.to_string().contains("Unsupported prefix 'ne'"));
+    }
+
+    #[test]
+    fn accepts_plain_token() {
+        MongoBackend::validate_offloaded_identifier_param(&identifier_param()).unwrap();
     }
 }
 

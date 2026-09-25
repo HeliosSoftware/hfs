@@ -659,6 +659,8 @@ MongoDB remains the canonical write/read store while Elasticsearch owns delegate
 - MongoDB search index population is automatically disabled via `search_offloaded`
 - Composite routing preserves MongoDB as the source of truth for reads and writes
 
+> **MongoDB + Elasticsearch note:** with search offloaded, an in-transaction `ifNoneExist` is resolved by scanning the raw `resources` documents inside the transaction session. Only `_id`, `_lastUpdated` and plain `identifier` values (`code`, `|code`, or `system|code`, with a nonempty code) are evaluated; `|code` matches any system, same as Mongo direct search. Every other shape is rejected so the bundle rolls back instead of matching the wrong set (#1394).
+
 **Prerequisites:** Running MongoDB and Elasticsearch 8.x instances.
 
 ```bash
