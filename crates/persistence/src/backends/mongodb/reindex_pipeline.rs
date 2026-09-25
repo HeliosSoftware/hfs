@@ -371,6 +371,221 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
+async fn delete_page(
+    own: mongodb::Collection<Document>,
+    contained: mongodb::Collection<Document>,
+    filters: Vec<Document>,
+) -> DbTask<()> {
+    let started = std::time::Instant::now();
+    let mut stats = ReindexPageStats::default();
+    for filter in filters {
+        match own.delete_many(filter.clone()).await {
+            Ok(result) => stats.deleted_entries += result.deleted_count,
+            Err(e) => {
+                stats.delete += started.elapsed();
+                return DbTask {
+                    stats,
+                    result: Err(format!("Failed to delete search entries: {e}")),
+                };
+            }
+        }
+        match contained.delete_many(filter).await {
+            Ok(result) => stats.deleted_entries += result.deleted_count,
+            Err(e) => {
+                stats.delete += started.elapsed();
+                return DbTask {
+                    stats,
+                    result: Err(format!(
+                        "Failed to delete search_index_contained entries: {e}"
+                    )),
+                };
+            }
+        }
+    }
+    stats.delete += started.elapsed();
+    DbTask {
+        stats,
+        result: Ok(()),
+    }
+}
+
+async fn insert_sub_batch(
+    own: mongodb::Collection<Document>,
+    contained: mongodb::Collection<Document>,
+    docs: SubBatchDocs,
+) -> DbTask<InsertFailures> {
+    let mut stats = ReindexPageStats::default();
+    let started = std::time::Instant::now();
+    let own_result = super::storage::insert_search_entries_chunk(
+        &own,
+        &docs.own_owners,
+        &docs.own_docs,
+        "Failed to insert search index entries",
+        &mut stats,
+    )
+    .await;
+    stats.insert += started.elapsed();
+    let own_failures = match own_result {
+        Ok(failures) => failures,
+        Err(msg) => {
+            return DbTask {
+                stats,
+                result: Err(msg),
+            };
+        }
+    };
+    let mut contained_failures = HashMap::new();
+    if !docs.contained_docs.is_empty() {
+        let started = std::time::Instant::now();
+        let contained_result = super::storage::insert_search_entries_chunk(
+            &contained,
+            &docs.contained_owners,
+            &docs.contained_docs,
+            "Failed to insert search_index_contained entries",
+            &mut stats,
+        )
+        .await;
+        stats.insert += started.elapsed();
+        contained_failures = match contained_result {
+            Ok(failures) => failures,
+            Err(msg) => {
+                return DbTask {
+                    stats,
+                    result: Err(msg),
+                };
+            }
+        };
+    }
+    DbTask {
+        stats,
+        result: Ok(InsertFailures {
+            own: own_failures,
+            contained: contained_failures,
+        }),
+    }
+}
+
+impl super::MongoBackend {
+    /// Extracts one resource's search-index documents (#1403).
+    fn extract_one(
+        &self,
+        tenant_id: &str,
+        r: &StoredResource,
+    ) -> (SearchIndexDocuments, Option<String>) {
+        self.search_index_documents_checked(tenant_id, r.resource_type(), r.id(), r.content())
+    }
+
+    /// Serial writer: extracts every resource, deletes the page's stale
+    /// entries, then inserts the new ones, one command at a time (own rows,
+    /// then contained rows). Uses the rayon pool only for pages of at least
+    /// `REINDEX_SERIAL_POOL_MIN_PAGE` on a multi-thread runtime; the pool
+    /// accessor is never called otherwise, so single-resource
+    /// `write_search_entries` calls and current-thread tests never build one
+    /// (#1403).
+    pub(super) async fn write_page_serial(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        resources: &[StoredResource],
+        stats: &mut ReindexPageStats,
+        multi_thread: bool,
+    ) -> Vec<StorageResult<usize>> {
+        let n = resources.len();
+        let own = db.collection::<Document>(Self::SEARCH_INDEX_COLLECTION);
+        let contained = db.collection::<Document>(Self::SEARCH_INDEX_CONTAINED_COLLECTION);
+        let prepare = |i: usize| self.extract_one(tenant_id, &resources[i]);
+
+        let started = std::time::Instant::now();
+        let pool = if multi_thread && n >= REINDEX_SERIAL_POOL_MIN_PAGE {
+            self.reindex_prepare_pool()
+        } else {
+            None
+        };
+        let (prepared, on_pool) = if pool.is_some() {
+            let env = PrepareEnv {
+                pool,
+                gate: self.reindex_prepare_gate(),
+            };
+            extract_range(&env, 0..n, &prepare)
+        } else {
+            ((0..n).map(&prepare).collect(), false)
+        };
+        let mut extract_failures: Vec<Option<String>> = vec![None; n];
+        let mut doc_counts: Vec<usize> = vec![0; n];
+        let batch = flatten_sub_batch(0, prepared, &mut extract_failures, &mut doc_counts);
+        stats.extract += started.elapsed();
+        stats.sub_batches += 1;
+        stats.pool_sub_batches += u64::from(on_pool);
+
+        let filters = delete_filters(tenant_id, resources);
+        let done = delete_page(own.clone(), contained.clone(), filters).await;
+        absorb_db_task(stats, &done.stats);
+        if let Err(msg) = done.result {
+            // Serial db_wait is the awaited delete plus the awaited insert;
+            // on this early return only the delete has run.
+            stats.db_wait = Some(stats.delete + stats.insert);
+            return fan_out(n, &msg);
+        }
+
+        let done = insert_sub_batch(own, contained, batch).await;
+        absorb_db_task(stats, &done.stats);
+        stats.db_wait = Some(stats.delete + stats.insert);
+        let insert_failures = match done.result {
+            Ok(failures) => {
+                let mut into = HashMap::new();
+                merge_insert_failures(&mut into, failures);
+                into
+            }
+            Err(msg) => return fan_out(n, &msg),
+        };
+
+        let docs: u64 = doc_counts.iter().sum::<usize>() as u64;
+        crate::perf::record_duration(crate::perf::Phase::ReindexExtract, stats.extract);
+        crate::perf::record_duration(crate::perf::Phase::ReindexSearchDelete, stats.delete);
+        crate::perf::record_duration(crate::perf::Phase::ReindexSearchInsert, stats.insert);
+        crate::perf::record_duration(
+            crate::perf::Phase::ReindexDbWait,
+            stats.db_wait.unwrap_or_default(),
+        );
+        crate::perf::add_rows(crate::perf::Phase::ReindexSearchInsert, docs);
+        page_outcomes(extract_failures, insert_failures, &doc_counts)
+    }
+
+    /// Logs `mongodb reindex writer configuration` once per backend instance,
+    /// the first time a page of more than `REINDEX_SUBBATCH_FIRST` resources
+    /// reaches the dispatcher (#1403).
+    pub(super) fn log_reindex_mode_once(&self, multi_thread: bool, overlapped: bool) {
+        if self
+            .reindex_mode_logged()
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let prepare_threads_configured = self.config().reindex_prepare_threads;
+        let prepare_threads = resolve_prepare_width(prepare_threads_configured);
+        let pool = if prepare_threads < 2 {
+            "none"
+        } else if !multi_thread {
+            "unused"
+        } else if self.reindex_prepare_pool().is_some() {
+            "ready"
+        } else {
+            "unavailable"
+        };
+        let path = if overlapped { "overlapped" } else { "serial" };
+        tracing::info!(
+            overlap = self.config().reindex_overlap,
+            prefetch = self.config().reindex_prefetch && !self.is_search_offloaded(),
+            prepare_threads_configured,
+            prepare_threads,
+            pool = %pool,
+            multi_thread_runtime = multi_thread,
+            path = %path,
+            "mongodb reindex writer configuration"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

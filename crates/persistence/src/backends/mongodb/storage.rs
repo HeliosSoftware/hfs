@@ -1,7 +1,6 @@
 //! ResourceStorage implementation for MongoDB.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
 
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -5373,17 +5372,10 @@ impl ReindexTarget for MongoBackend {
         if resources.is_empty() {
             return Vec::new();
         }
-
         let _page_span = crate::perf::span(crate::perf::Phase::ReindexPage);
-
-        // Honors `is_search_offloaded()`, matching the guards in
-        // `delete_search_entries` and `write_search_entries`/`clear_search_index`
-        // above: a search-offloaded backend keeps no index of its own and must
-        // issue no commands here.
         if self.is_search_offloaded() {
             return resources.iter().map(|_| Ok(0)).collect();
         }
-
         let db = match self.get_database().await {
             Ok(db) => db,
             Err(e) => {
@@ -5394,178 +5386,16 @@ impl ReindexTarget for MongoBackend {
                     .collect();
             }
         };
-
         let tenant_id = tenant.tenant_id().as_str();
-
-        struct Prepared {
-            docs: SearchIndexDocuments,
-            failure: Option<String>,
+        let multi_thread = super::reindex_pipeline::tokio_multi_thread_runtime();
+        if resources.len() > super::reindex_pipeline::REINDEX_SUBBATCH_FIRST {
+            // `overlapped` is always `false` here: a later commit adds
+            // `write_page_overlapped` and rewrites this dispatcher to choose
+            // between the two paths on `self.config().reindex_overlap`.
+            self.log_reindex_mode_once(multi_thread, false);
         }
-        let extract_started = Instant::now();
-        let prepared: Vec<Prepared> = resources
-            .iter()
-            .map(|resource| {
-                let (docs, failure) = self.search_index_documents_checked(
-                    tenant_id,
-                    resource.resource_type(),
-                    resource.id(),
-                    resource.content(),
-                );
-                Prepared { docs, failure }
-            })
-            .collect();
-        let extract_time = extract_started.elapsed();
-        stats.extract += extract_time;
-        crate::perf::record_duration(crate::perf::Phase::ReindexExtract, extract_time);
-
-        let collection = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
-        let contained_collection =
-            db.collection::<Document>(MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION);
-
-        // ONE delete per distinct resource_type in the page (a production
-        // page is single-type — `fetch_resources_page` filters on one type —
-        // so this is one command; grouping keeps a hypothetical
-        // heterogeneous slice correct too), run against both collections so
-        // stale contained rows don't outlive the page they belonged to
-        // (#1160 Task 4). A failure on either delete means stale rows may
-        // remain for the whole page, so it fans out to every resource.
-        let mut ids_by_type: HashMap<&str, Vec<Bson>> = HashMap::new();
-        for resource in resources {
-            ids_by_type
-                .entry(resource.resource_type())
-                .or_default()
-                .push(Bson::from(resource.id()));
-        }
-        let delete_started = Instant::now();
-        for (resource_type, ids) in ids_by_type {
-            let filter = doc! {
-                "tenant_id": tenant_id,
-                "resource_type": resource_type,
-                "resource_id": { "$in": ids },
-            };
-            match collection.delete_many(filter.clone()).await {
-                Ok(result) => stats.deleted_entries += result.deleted_count,
-                Err(e) => {
-                    stats.delete += delete_started.elapsed();
-                    let msg = format!("Failed to delete search entries: {e}");
-                    return resources
-                        .iter()
-                        .map(|_| Err(internal_error(msg.clone())))
-                        .collect();
-                }
-            }
-            match contained_collection.delete_many(filter).await {
-                Ok(result) => stats.deleted_entries += result.deleted_count,
-                Err(e) => {
-                    stats.delete += delete_started.elapsed();
-                    let msg = format!("Failed to delete search_index_contained entries: {e}");
-                    return resources
-                        .iter()
-                        .map(|_| Err(internal_error(msg.clone())))
-                        .collect();
-                }
-            }
-        }
-        let delete_time = delete_started.elapsed();
-        stats.delete += delete_time;
-        crate::perf::record_duration(crate::perf::Phase::ReindexSearchDelete, delete_time);
-
-        // Flatten every resource's own documents into one insert, chunked at
-        // SEARCH_INDEX_INSERT_CHUNK, tracking which resource each document
-        // belongs to so an unordered write error attributes back to just
-        // that resource instead of failing the whole page.
-        let mut own_owners: Vec<usize> =
-            Vec::with_capacity(prepared.iter().map(|p| p.docs.own.len()).sum());
-        let mut own_docs: Vec<Document> = Vec::with_capacity(own_owners.capacity());
-        for (i, p) in prepared.iter().enumerate() {
-            for d in &p.docs.own {
-                own_owners.push(i);
-                own_docs.push(d.clone());
-            }
-        }
-
-        let insert_started = Instant::now();
-        let own_result = insert_search_entries_chunk(
-            &collection,
-            &own_owners,
-            &own_docs,
-            "Failed to insert search index entries",
-            stats,
-        )
-        .await;
-        let mut insert_time = insert_started.elapsed();
-        stats.insert += insert_time;
-        let mut insert_failures = match own_result {
-            Ok(failures) => failures,
-            Err(msg) => {
-                return resources
-                    .iter()
-                    .map(|_| Err(internal_error(msg.clone())))
-                    .collect();
-            }
-        };
-
-        // Same flatten-and-chunked-insert for contained rows, into their own
-        // collection. A failed contained insert attributes back to its
-        // resource exactly like a failed own insert; if a resource already
-        // has an own-row failure recorded, that one wins (matching the
-        // "first write error found" semantics `insert_search_entries_chunk`
-        // already uses within one collection).
-        let mut contained_owners: Vec<usize> =
-            Vec::with_capacity(prepared.iter().map(|p| p.docs.contained.len()).sum());
-        let mut contained_docs: Vec<Document> = Vec::with_capacity(contained_owners.capacity());
-        for (i, p) in prepared.iter().enumerate() {
-            for d in &p.docs.contained {
-                contained_owners.push(i);
-                contained_docs.push(d.clone());
-            }
-        }
-
-        if !contained_docs.is_empty() {
-            let contained_started = Instant::now();
-            let contained_result = insert_search_entries_chunk(
-                &contained_collection,
-                &contained_owners,
-                &contained_docs,
-                "Failed to insert search_index_contained entries",
-                stats,
-            )
-            .await;
-            let contained_time = contained_started.elapsed();
-            stats.insert += contained_time;
-            insert_time += contained_time;
-            match contained_result {
-                Ok(failures) => {
-                    for (owner, msg) in failures {
-                        insert_failures.entry(owner).or_insert(msg);
-                    }
-                }
-                Err(msg) => {
-                    return resources
-                        .iter()
-                        .map(|_| Err(internal_error(msg.clone())))
-                        .collect();
-                }
-            }
-        }
-
-        crate::perf::record_duration(crate::perf::Phase::ReindexSearchInsert, insert_time);
-        crate::perf::add_rows(
-            crate::perf::Phase::ReindexSearchInsert,
-            (own_docs.len() + contained_docs.len()) as u64,
-        );
-
-        prepared
-            .into_iter()
-            .enumerate()
-            .map(|(i, p)| match p.failure {
-                Some(msg) => Err(internal_error(msg)),
-                None => match insert_failures.remove(&i) {
-                    Some(msg) => Err(internal_error(msg)),
-                    None => Ok(p.docs.own.len() + p.docs.contained.len()),
-                },
-            })
-            .collect()
+        self.write_page_serial(&db, tenant_id, resources, stats, multi_thread)
+            .await
     }
 
     /// Delegates to [`Self::write_search_entries_page_timed`] with a
@@ -5587,7 +5417,7 @@ impl ReindexTarget for MongoBackend {
 /// `INSERT_DOCS_PER_COMMAND` (same value, same rationale: bound how much the
 /// driver serializes per command) without depending on that module, since a
 /// page's `search_index` documents are built the same way a batch's are.
-const SEARCH_INDEX_INSERT_CHUNK: usize = 5_000;
+pub(super) const SEARCH_INDEX_INSERT_CHUNK: usize = 5_000;
 
 /// Chunked, unordered `insert_many` of `docs` into `collection`, attributing
 /// each document to the resource index at the same position in `owners`.
@@ -5604,7 +5434,7 @@ const SEARCH_INDEX_INSERT_CHUNK: usize = 5_000;
 /// attribute to specific documents — is returned as `Err`, for the caller to
 /// fan out to every resource in the page. Also counts each command it issues,
 /// and the documents in it, into `stats` (#1403).
-async fn insert_search_entries_chunk(
+pub(super) async fn insert_search_entries_chunk(
     collection: &mongodb::Collection<Document>,
     owners: &[usize],
     docs: &[Document],

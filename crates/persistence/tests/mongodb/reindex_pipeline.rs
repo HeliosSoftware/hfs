@@ -860,3 +860,62 @@ async fn mongodb_integration_reindex_fetch_capped_round_page_bounds_multiple_row
         assert_eq!(counts.get(id), Some(&1), "{id} must appear exactly once");
     }
 }
+
+fn build_test_patients(tenant: &TenantContext, prefix: &str, n: usize) -> Vec<StoredResource> {
+    (0..n)
+        .map(|i| {
+            StoredResource::from_storage(
+                "Patient",
+                format!("{prefix}-{i}"),
+                "1",
+                tenant.tenant_id().clone(),
+                json!({
+                    "resourceType": "Patient",
+                    "id": format!("{prefix}-{i}"),
+                    "name": [{"family": format!("F{i}")}]
+                }),
+                chrono::Utc::now(),
+                chrono::Utc::now(),
+                None,
+                FhirVersion::default(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mongodb_integration_reindex_page_serial_pipeline_writes_a_large_page() {
+    let Some(backend) = create_backend_with("reindex_serial_pipeline_large_page", |c| {
+        c.reindex_prepare_threads = 1;
+    })
+    .await
+    else {
+        eprintln!(
+            "Skipping mongodb_integration_reindex_page_serial_pipeline_writes_a_large_page (requires Docker)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("reindex-serial-pipeline-tenant");
+    let page = build_test_patients(&tenant, "serialbig", 300);
+
+    let target: &dyn ReindexTarget = &*backend;
+    let mut stats = ReindexPageStats::default();
+    let outcomes = target
+        .write_search_entries_page_timed(&tenant, &page, &mut stats)
+        .await;
+    assert!(outcomes.iter().all(|o| o.is_ok()), "{outcomes:?}");
+    assert_eq!(
+        stats.sub_batches, 1,
+        "the serial path always runs exactly one extraction pass, whatever the page size"
+    );
+    assert!(stats.inserted_entries as usize >= page.len());
+
+    for resource in &page {
+        assert!(
+            search_index_entry_count(&backend, &tenant, "Patient", resource.id()).await > 0,
+            "resource {} must have a row",
+            resource.id()
+        );
+    }
+}
