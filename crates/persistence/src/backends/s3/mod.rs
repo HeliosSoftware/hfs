@@ -12,6 +12,7 @@ mod bundle;
 mod client;
 mod config;
 mod keyspace;
+mod login_sessions;
 mod models;
 mod output_store;
 mod storage;

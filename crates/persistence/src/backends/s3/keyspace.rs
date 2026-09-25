@@ -567,6 +567,18 @@ impl S3Keyspace {
         self.join(&["_system.user-settings/"])
     }
 
+    /// Object key for one web UI login session or pending login (#1481):
+    /// `kind` is `session` or `pending`, `id` the opaque random id (URL-safe
+    /// base64, so path-safe and fixed-length by construction).
+    pub fn login_session_key(&self, kind: &str, id: &str) -> String {
+        self.join(&["_system.login-sessions", kind, &format!("{id}.json")])
+    }
+
+    /// Prefix covering every login object of one `kind`, for the sweep.
+    pub fn login_sessions_prefix(&self, kind: &str) -> String {
+        self.join(&["_system.login-sessions", &format!("{kind}/")])
+    }
+
     /// Joins `parts` with `/`, prepending the base prefix when set.
     ///
     /// Trailing slashes are preserved only when the final part itself ends with

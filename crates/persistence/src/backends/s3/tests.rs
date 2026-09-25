@@ -3800,6 +3800,7 @@ async fn list_tenants_survives_tenants_named_after_control_plane_namespaces() {
         "history",
         "bulk",
         "_system.user-settings",
+        "_system.login-sessions",
     ] {
         let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
         let backend = make_prefix_backend(mock);

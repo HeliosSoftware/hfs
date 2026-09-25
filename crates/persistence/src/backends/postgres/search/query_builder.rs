@@ -13,7 +13,9 @@ use crate::backends::postgres::schema::IndexLayout;
 use crate::error::SearchError;
 use crate::search::IMPLICIT_TOKEN_SYSTEM;
 use crate::search::fold_text;
-use crate::search::{DatePredicate, FhirDateValue, RangeCondition, StorageResolution};
+use crate::search::{
+    DatePredicate, FhirDateValue, FhirNumberValue, RangeCondition, StorageResolution,
+};
 use crate::types::{
     CompartmentMembership, ContainedMode, SearchModifier, SearchParamType, SearchParameter,
     SearchPrefix, SearchQuery, SearchValue, strip_reference_version,
@@ -128,11 +130,11 @@ fn next_char(c: char) -> Option<char> {
 fn numeric_predicate(
     col: &str,
     prefix: SearchPrefix,
-    num: f64,
-    lo: f64,
-    hi: f64,
+    number: &FhirNumberValue,
     next: &mut usize,
 ) -> (String, Vec<SqlParam>) {
+    let num = number.value;
+    let (lo, hi) = number.implicit_range();
     match prefix {
         SearchPrefix::Eq => {
             *next += 1;
@@ -169,13 +171,13 @@ fn numeric_predicate(
             (format!("{col} <= ${next}"), vec![SqlParam::Float(num)])
         }
         SearchPrefix::Ap => {
-            let margin = (num.abs() * 0.1).max(0.0001);
+            let (lo, hi) = number.approx_range();
             *next += 1;
             let a = *next;
             *next += 1;
             (
                 format!("{col} BETWEEN ${a} AND ${next}"),
-                vec![SqlParam::Float(num - margin), SqlParam::Float(num + margin)],
+                vec![SqlParam::Float(lo), SqlParam::Float(hi)],
             )
         }
     }
@@ -192,6 +194,7 @@ fn numeric_predicate(
 /// they are not just invalid, they widen: `value_number < 'Infinity'` is true
 /// of every row, and Postgres orders `NaN` above every number, so
 /// `lt`/`le`/`ne` with `nan` would match everything.
+#[cfg(test)]
 pub(crate) fn parse_search_number(raw: &str) -> Option<f64> {
     crate::search::FhirNumberValue::parse(raw)
         .ok()
@@ -229,9 +232,8 @@ pub(crate) fn number_predicate(
     raw: &str,
     next: &mut usize,
 ) -> Option<(String, Vec<SqlParam>)> {
-    let number = unvalidated(crate::search::FhirNumberValue::parse(raw))?;
-    let (lo, hi) = number.implicit_range();
-    Some(numeric_predicate(col, prefix, number.value, lo, hi, next))
+    let number = unvalidated(FhirNumberValue::parse(raw))?;
+    Some(numeric_predicate(col, prefix, &number, next))
 }
 
 /// Builds the comparison of one `quantity` search value —
@@ -268,14 +270,11 @@ pub(crate) fn quantity_predicate(
     let (system, code) = (quantity.system.as_deref(), quantity.code.as_deref());
 
     // Raw branch: value comparison (exact for comparators, implicit-precision
-    // range for eq/ne) + the stored unit/system.
-    let (lo, hi) = quantity.number.implicit_range();
+    // range for eq/ne, the shared window for ap) + the stored unit/system.
     let (mut raw, mut params) = numeric_predicate(
         &format!("{table}value_quantity_value"),
         prefix,
-        num,
-        lo,
-        hi,
+        &quantity.number,
         next,
     );
     if let Some(c) = code {
@@ -323,8 +322,8 @@ pub(crate) fn quantity_predicate(
                     canon(num).map(|b| format!("{col} <= ${}", bind(b, &mut params, next)))
                 }
                 SearchPrefix::Ap => {
-                    let margin = (num.abs() * 0.1).max(0.0001);
-                    canon_window(num - margin, num + margin).map(|(lo, hi)| {
+                    let (lo, hi) = quantity.number.approx_range();
+                    canon_window(lo, hi).map(|(lo, hi)| {
                         let lo_p = bind(lo, &mut params, next);
                         let hi_p = bind(hi, &mut params, next);
                         format!("{col} BETWEEN ${lo_p} AND ${hi_p}")
@@ -2646,44 +2645,43 @@ impl PostgresQueryBuilder {
                 vec![SqlParam::text(&format!("{}%", value.value))],
             )),
             SearchParamType::Number => {
-                // Not a number: a bare `FALSE` predicate with no params, for
-                // the reason given on the Date arm below (#1319).
-                let Some(num) = parse_search_number(&value.value) else {
-                    return Some((match_nothing().sql, Vec::new()));
-                };
-                let op = Self::prefix_to_operator(&value.prefix);
-                Some((
-                    format!("{} {} ${}", number, op, offset + 1),
-                    vec![SqlParam::Float(num)],
-                ))
+                // The standalone `number` predicate on this slot's column, so a
+                // component means what the parameter does: the implicit-precision
+                // range for `eq`/`ne`, the shared window for `ap`. Not a number:
+                // a bare `FALSE` predicate with no params, for the reason given
+                // on the Date arm below (#1319). Left unparenthesized, as the
+                // quantity arm is: every caller parenthesizes a component or
+                // joins it where `AND` already binds tighter than `OR`.
+                let mut next = offset;
+                Some(
+                    number_predicate(&number, value.prefix, &value.value, &mut next)
+                        .unwrap_or_else(|| (match_nothing().sql, Vec::new())),
+                )
             }
             SearchParamType::Quantity => {
                 // As for Number: `FALSE`, never `None` (#1319). Split by the
                 // shared grammar, so an escaped `|` stays in the code and the
-                // `number|code` shorthand names a code here too.
+                // `number|code` shorthand names a code here too. The value is
+                // compared as the standalone raw branch compares it; the unit,
+                // when given, as stored.
                 let Some(quantity) =
                     unvalidated(crate::search::FhirQuantityValue::parse(&value.value))
                 else {
                     return Some((match_nothing().sql, Vec::new()));
                 };
-                let num = quantity.number.value;
-                let op = Self::prefix_to_operator(&value.prefix);
+                let mut next = offset;
+                let (mut sql, mut params) = numeric_predicate(
+                    "value_quantity_value",
+                    value.prefix,
+                    &quantity.number,
+                    &mut next,
+                );
                 if let Some(code) = quantity.code.as_deref() {
-                    Some((
-                        format!(
-                            "value_quantity_value {} ${} AND value_quantity_unit = ${}",
-                            op,
-                            offset + 1,
-                            offset + 2
-                        ),
-                        vec![SqlParam::Float(num), SqlParam::text(code)],
-                    ))
-                } else {
-                    Some((
-                        format!("value_quantity_value {} ${}", op, offset + 1),
-                        vec![SqlParam::Float(num)],
-                    ))
+                    next += 1;
+                    params.push(SqlParam::text(code));
+                    sql = format!("{sql} AND value_quantity_unit = ${next}");
                 }
+                Some((sql, params))
             }
             SearchParamType::Date => {
                 // The same precision range a standalone date parameter gets;
@@ -4319,6 +4317,60 @@ mod tests {
         }
     }
 
+    /// A number component of a composite gets the ranges a standalone number
+    /// parameter gets (#1390): `ap` the shared window, `eq` the
+    /// implicit-precision range. The shape is `MolecularSequence`'s
+    /// `chromosome-variant-coordinate` (token, number, number), so the second
+    /// number also covers the component in the second slot.
+    #[test]
+    fn composite_number_components_use_the_shared_ranges() {
+        let param = SearchParameter {
+            name: "chromosome-variant-coordinate".to_string(),
+            param_type: SearchParamType::Composite,
+            modifier: None,
+            values: vec![SearchValue::new(SearchPrefix::Eq, "1$ap100$1e2")],
+            chain: vec![],
+            components: vec![
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "chromosome".to_string(),
+                },
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Number,
+                    param_name: "variant-start".to_string(),
+                },
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Number,
+                    param_name: "variant-end".to_string(),
+                },
+            ],
+        };
+        let query = SearchQuery::new("MolecularSequence").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+        assert!(
+            frag.sql.contains("(value_number BETWEEN $4 AND $5)"),
+            "{}",
+            frag.sql
+        );
+        assert!(
+            frag.sql
+                .contains("(value_number_2 >= $6 AND value_number_2 < $7)"),
+            "{}",
+            frag.sql
+        );
+        let floats: Vec<f64> = frag
+            .params
+            .iter()
+            .filter_map(|p| match p {
+                SqlParam::Float(f) => Some(*f),
+                _ => None,
+            })
+            .collect();
+        // `ap100` is [90, 110]; `1e2` has one significant figure, so its
+        // `eq` range is [50, 150).
+        assert_eq!(floats, [90.0, 110.0, 50.0, 150.0]);
+    }
+
     #[test]
     fn composite_bare_code_emits_what_the_v27_index_is_keyed_for() {
         // `combo-code-value-quantity=8867-4$gt100` — 21 of the 27 composite
@@ -4398,18 +4450,36 @@ mod tests {
         // `WHERE value_quantity_value IS NOT NULL` on the composite index is
         // only provable from a STRICT operator over that column. Every prefix
         // the benchmark can send — and every prefix `parse_component_value`
-        // recognises — must therefore emit one. `IS DISTINCT FROM` or a
+        // recognises — must therefore emit one: a comparison, a conjunction or
+        // disjunction of comparisons, or a `BETWEEN`. `IS DISTINCT FROM` or a
         // `COALESCE` here would strand the index without any test failing.
-        for (spelling, op) in [
-            ("gt100", ">"),
-            ("lt100", "<"),
-            ("ge100", ">="),
-            ("le100", "<="),
-            ("ne100", "!="),
-            ("sa100", ">"),
-            ("eb100", "<"),
-            ("ap100", "="),
-            ("100", "="),
+        //
+        // The value is compared as a standalone quantity compares it (#1390):
+        // `eq`/`ne` over the implicit-precision range, `ap` over the shared
+        // window, `[90, 110]` for `ap100`.
+        let v = "value_quantity_value";
+        for (spelling, predicate, binds) in [
+            ("gt100", format!("({v} > $4)"), vec![100.0]),
+            ("lt100", format!("({v} < $4)"), vec![100.0]),
+            ("ge100", format!("({v} >= $4)"), vec![100.0]),
+            ("le100", format!("({v} <= $4)"), vec![100.0]),
+            ("sa100", format!("({v} > $4)"), vec![100.0]),
+            ("eb100", format!("({v} < $4)"), vec![100.0]),
+            (
+                "ne100",
+                format!("(({v} < $4 OR {v} >= $5))"),
+                vec![99.5, 100.5],
+            ),
+            (
+                "ap100",
+                format!("({v} BETWEEN $4 AND $5)"),
+                vec![90.0, 110.0],
+            ),
+            (
+                "100",
+                format!("({v} >= $4 AND {v} < $5)"),
+                vec![99.5, 100.5],
+            ),
         ] {
             let query = SearchQuery::new("Observation").with_parameter(composite_param(
                 "combo-code-value-quantity",
@@ -4417,11 +4487,19 @@ mod tests {
             ));
             let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
             assert!(
-                frag.sql
-                    .contains(&format!("(value_quantity_value {op} $4)")),
-                "{spelling} must emit a strict operator: {}",
+                frag.sql.contains(&predicate),
+                "{spelling} must emit a strict predicate: {}",
                 frag.sql
             );
+            let floats: Vec<f64> = frag
+                .params
+                .iter()
+                .filter_map(|p| match p {
+                    SqlParam::Float(f) => Some(*f),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(floats, binds, "{spelling}");
         }
     }
 
