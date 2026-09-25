@@ -5410,6 +5410,33 @@ mod count_routing_tests {
     }
 
     #[tokio::test]
+    async fn the_mock_refuses_writes_and_reads_nothing() {
+        let backend = Counting {
+            label: "primary",
+            counts: false,
+        };
+        let t = tenant();
+        let version = FhirVersion::default();
+        assert!(
+            backend
+                .create(&t, "Patient", Value::Null, version)
+                .await
+                .is_err()
+        );
+        assert!(
+            backend
+                .create_or_update(&t, "Patient", "p1", Value::Null, version)
+                .await
+                .is_err()
+        );
+        assert!(backend.read(&t, "Patient", "p1").await.unwrap().is_none());
+        assert!(backend.delete(&t, "Patient", "p1").await.is_err());
+        assert_eq!(backend.count(&t, None).await.unwrap(), 0);
+        assert_eq!(backend.backend_name(), "primary");
+        assert!(!backend.supports_type_counts());
+    }
+
+    #[tokio::test]
     async fn no_counting_backend_means_no_counts() {
         let composite = composite(false, false);
         assert!(!composite.supports_type_counts());
