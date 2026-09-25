@@ -404,6 +404,21 @@ impl ChainQueryBuilder {
                             ),
                             vec![SqlParam::Text(code.to_string())],
                         )
+                    } else if code.is_empty() {
+                        // `system|`: any code in that system, as the direct
+                        // token handler does. Without this branch the empty
+                        // code was bound as `value_token_code = ''` and the
+                        // terminal matched nothing. The `IS NOT NULL` conjunct
+                        // excludes no rows; it lets the planner use the
+                        // code-leading token index (see `token_value_predicate`).
+                        (
+                            format!(
+                                "({alias}.value_token_code IS NOT NULL AND {alias}.value_token_system = ${pn})",
+                                alias = alias,
+                                pn = param_num,
+                            ),
+                            vec![SqlParam::Text(system.to_string())],
+                        )
                     } else {
                         // Both halves are bound. The system used to be
                         // interpolated into the SQL text with its quotes doubled:
@@ -640,6 +655,21 @@ impl ChainQueryBuilder {
                                 pn = param_num,
                             ),
                             vec![SqlParam::Text(code.to_string())],
+                        )
+                    } else if code.is_empty() {
+                        // `system|`: any code in that system, as the direct
+                        // token handler does. Without this branch the empty
+                        // code was bound as `value_token_code = ''` and the
+                        // terminal matched nothing. The `IS NOT NULL` conjunct
+                        // excludes no rows; it lets the planner use the
+                        // code-leading token index (see `token_value_predicate`).
+                        (
+                            format!(
+                                "({alias}.value_token_code IS NOT NULL AND {alias}.value_token_system = ${pn})",
+                                alias = alias,
+                                pn = param_num,
+                            ),
+                            vec![SqlParam::Text(system.to_string())],
                         )
                     } else {
                         // Both halves are bound. The system used to be
@@ -1364,6 +1394,75 @@ mod tests {
             frag.sql
         );
         assert_eq!(frag.params.len(), 2);
+    }
+
+    /// `system|` (#1389) means "any code in this system". It used to fall into
+    /// the `system|code` branch with an empty code, binding
+    /// `value_token_code = ''` and matching nothing. It must bind only the
+    /// system, and must not accept the implicit system the way `system|code`
+    /// does.
+    #[test]
+    fn a_chained_system_only_token_matches_any_code_in_the_system() {
+        let registry = obs_subject_patient_org_code();
+        let builder = ChainQueryBuilder::new("t", "Observation", registry);
+        let parsed = builder.parse_chain("subject.identifier").unwrap();
+        let frag = builder
+            .build_forward_chain_sql(&parsed, &SearchValue::eq("http://ex.org/mrn|"))
+            .unwrap();
+
+        assert!(
+            frag.sql
+                .contains("(si1.value_token_code IS NOT NULL AND si1.value_token_system = $2)"),
+            "system-only predicate: {}",
+            frag.sql
+        );
+        assert!(
+            !frag.sql.contains("value_token_code = $"),
+            "no code equality: {}",
+            frag.sql
+        );
+        assert!(
+            !frag.sql.contains(IMPLICIT_TOKEN_SYSTEM),
+            "the implicit system is not accepted: {}",
+            frag.sql
+        );
+        assert_eq!(frag.params.len(), 1);
+        assert!(matches!(&frag.params[0], SqlParam::Text(v) if v == "http://ex.org/mrn"));
+    }
+
+    /// Same, on the reverse-chain terminal, which is a separate copy of the
+    /// same match.
+    #[test]
+    fn a_reverse_chained_system_only_token_matches_any_code_in_the_system() {
+        let registry = obs_subject_patient_org_code();
+        let builder = ChainQueryBuilder::new("t", "Patient", registry);
+        let rc = ReverseChainedParameter {
+            source_type: "Observation".to_string(),
+            reference_param: "subject".to_string(),
+            search_param: "code".to_string(),
+            value: Some(SearchValue::eq("http://loinc.org|")),
+            nested: None,
+        };
+        let frag = builder.build_reverse_chain_sql(&rc).unwrap();
+
+        assert!(
+            frag.sql.contains("value_token_code IS NOT NULL AND ")
+                && frag.sql.contains("value_token_system = $2)"),
+            "system-only predicate: {}",
+            frag.sql
+        );
+        assert!(
+            !frag.sql.contains("value_token_code = $"),
+            "no code equality: {}",
+            frag.sql
+        );
+        assert!(
+            !frag.sql.contains(IMPLICIT_TOKEN_SYSTEM),
+            "the implicit system is not accepted: {}",
+            frag.sql
+        );
+        assert_eq!(frag.params.len(), 1);
+        assert!(matches!(&frag.params[0], SqlParam::Text(v) if v == "http://loinc.org"));
     }
 
     #[test]

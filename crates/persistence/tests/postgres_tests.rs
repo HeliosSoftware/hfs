@@ -15748,6 +15748,201 @@ mod postgres_integration {
         assert_eq!(ids, vec!["o1".to_string()]);
     }
 
+    /// #1389, end to end on real rows: `system|` on a chained token terminal
+    /// matches every code in that system, forward and reverse. The unit tests
+    /// only see the SQL text; this runs it. Before the fix the empty code was
+    /// bound as `value_token_code = ''` and both resolutions returned nothing.
+    #[tokio::test]
+    async fn postgres_integration_resolve_chain_system_only_token_matches_rows() {
+        use helios_persistence::core::ChainedSearchProvider;
+        use helios_persistence::types::{ReverseChainedParameter, SearchValue};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("chain-system-only");
+        let tenant_id = tenant.tenant_id().as_str();
+
+        for (ty, body) in [
+            ("Patient", json!({"id": "p1"})),
+            ("Patient", json!({"id": "p2"})),
+            (
+                "Observation",
+                json!({"id": "o1", "subject": {"reference": "Patient/p1"}}),
+            ),
+            (
+                "Observation",
+                json!({"id": "o2", "subject": {"reference": "Patient/p2"}}),
+            ),
+        ] {
+            backend
+                .create(&tenant, ty, body, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+
+        for (id, reference) in [("o1", "Patient/p1"), ("o2", "Patient/p2")] {
+            insert_search_index(
+                tenant_id,
+                "Observation",
+                id,
+                "subject",
+                "value_reference",
+                reference,
+            )
+            .await;
+        }
+
+        let pg = shared_pg().await;
+        let conn_str = format!(
+            "host={} port={} user=postgres password=postgres dbname=postgres",
+            pg.host, pg.port,
+        );
+        let (client, connection) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
+            .await
+            .expect("connect to shared pg");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        for (rt, id, param, system, code) in [
+            ("Patient", "p1", "identifier", "http://ex.org/mrn", "MRN1"),
+            ("Patient", "p2", "identifier", "http://other.example", "X1"),
+            ("Observation", "o1", "code", "http://loinc.org", "8867-4"),
+            (
+                "Observation",
+                "o2",
+                "code",
+                "http://snomed.info/sct",
+                "271649006",
+            ),
+        ] {
+            client
+                .execute(
+                    "INSERT INTO search_index \
+                     (tenant_id, resource_type, resource_id, param_name, value_token_system, value_token_code) \
+                     VALUES ($1, $2, $3, $4, $5, $6)",
+                    &[&tenant_id, &rt, &id, &param, &system, &code],
+                )
+                .await
+                .unwrap();
+        }
+
+        // Observation?subject.identifier=http://ex.org/mrn|
+        let forward = backend
+            .resolve_chain(
+                &tenant,
+                "Observation",
+                "subject.identifier",
+                "http://ex.org/mrn|",
+            )
+            .await
+            .unwrap();
+        assert_eq!(forward, vec!["o1".to_string()]);
+
+        // Patient?_has:Observation:subject:code=http://loinc.org|
+        let rc = ReverseChainedParameter::terminal(
+            "Observation",
+            "subject",
+            "code",
+            SearchValue::eq("http://loinc.org|"),
+        );
+        let reverse = backend
+            .resolve_reverse_chain(&tenant, "Patient", &rc)
+            .await
+            .unwrap();
+        assert_eq!(reverse, vec!["p1".to_string()]);
+    }
+
+    /// `backend.search()` reads neither `SearchParameter::chain` nor
+    /// `SearchQuery::reverse_chains`: an unresolved `_has` was dropped (every
+    /// Patient matched) and a forward chain was read as a reference to an id
+    /// named by the terminal value (#1389). Through the trait API, with no
+    /// resolver in front, both must now be refused by `search` and
+    /// `search_count` alike rather than answered wrongly.
+    #[tokio::test]
+    async fn postgres_integration_search_refuses_unresolved_chains() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::error::{SearchError, StorageError};
+        use helios_persistence::types::{
+            ChainedParameter, ReverseChainedParameter, SearchParamType, SearchParameter,
+            SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("unresolved-chains");
+
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p1", "name": [{"family": "Smith"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "o1",
+                    "status": "final",
+                    "code": {"text": "x"},
+                    "subject": {"reference": "Patient/p1"}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        // Observation?subject:Patient.name=Smith — o1 is the right answer.
+        let forward = SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: vec![SearchValue::eq("Smith")],
+            chain: vec![ChainedParameter {
+                reference_param: "subject".to_string(),
+                target_type: Some("Patient".to_string()),
+                target_param: "name".to_string(),
+            }],
+            components: vec![],
+        });
+        // Patient?_has:Observation:subject:status=cancelled — nothing matches.
+        let mut reverse = SearchQuery::new("Patient");
+        reverse
+            .reverse_chains
+            .push(ReverseChainedParameter::terminal(
+                "Observation",
+                "subject",
+                "status",
+                SearchValue::eq("cancelled"),
+            ));
+
+        for err in [
+            backend.search(&tenant, &forward).await.err(),
+            backend.search_count(&tenant, &forward).await.err(),
+        ] {
+            match err {
+                Some(StorageError::Search(SearchError::ChainedSearchNotSupported { chain })) => {
+                    assert!(chain.contains("subject:Patient.name"), "{chain}")
+                }
+                other => panic!("expected ChainedSearchNotSupported, got {other:?}"),
+            }
+        }
+        for err in [
+            backend.search(&tenant, &reverse).await.err(),
+            backend.search_count(&tenant, &reverse).await.err(),
+        ] {
+            assert!(
+                matches!(
+                    err,
+                    Some(StorageError::Search(SearchError::ReverseChainNotSupported))
+                ),
+                "expected ReverseChainNotSupported, got {err:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn postgres_integration_resolve_reverse_chain_terminal() {
         use helios_persistence::core::ChainedSearchProvider;
