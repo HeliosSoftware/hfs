@@ -16,7 +16,17 @@
 // below is used.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::ops::Range;
+use std::time::Duration;
+
+use mongodb::bson::{Bson, Document, doc};
+
+use crate::error::StorageResult;
+use crate::search::reindex::ReindexPageStats;
+use crate::types::StoredResource;
+
+use super::storage::{SearchIndexDocuments, internal_error};
 
 /// A type's first page: too little is known yet to size from observation (#1403).
 pub(super) const REINDEX_SUBBATCH_FIRST: usize = 32;
@@ -175,6 +185,192 @@ pub(super) fn tokio_multi_thread_runtime() -> bool {
     })
 }
 
+/// One sub-batch's extracted documents, split by destination collection, with
+/// page-wide resource-index owners for each document (#1403).
+struct SubBatchDocs {
+    own_owners: Vec<usize>,
+    own_docs: Vec<Document>,
+    contained_owners: Vec<usize>,
+    contained_docs: Vec<Document>,
+}
+
+impl SubBatchDocs {
+    fn len(&self) -> usize {
+        self.own_docs.len() + self.contained_docs.len()
+    }
+}
+
+/// Moves sub-batch `[start, start + prepared.len())`'s extracted documents
+/// into one [`SubBatchDocs`], recording each resource's extraction failure
+/// and document count at its **page-wide** index, and moving (never cloning)
+/// its documents so each one is written exactly once (#1403).
+fn flatten_sub_batch(
+    start: usize,
+    prepared: Vec<(SearchIndexDocuments, Option<String>)>,
+    extract_failures: &mut [Option<String>],
+    doc_counts: &mut [usize],
+) -> SubBatchDocs {
+    let mut batch = SubBatchDocs {
+        own_owners: Vec::new(),
+        own_docs: Vec::new(),
+        contained_owners: Vec::new(),
+        contained_docs: Vec::new(),
+    };
+    for (offset, (docs, failure)) in prepared.into_iter().enumerate() {
+        let i = start + offset;
+        doc_counts[i] = docs.own.len() + docs.contained.len();
+        extract_failures[i] = failure;
+        for d in docs.own {
+            batch.own_owners.push(i);
+            batch.own_docs.push(d);
+        }
+        for d in docs.contained {
+            batch.contained_owners.push(i);
+            batch.contained_docs.push(d);
+        }
+    }
+    batch
+}
+
+/// Groups resources into one `{tenant_id, resource_type, resource_id: {$in:
+/// ids}}` filter per distinct resource type in the page, in first-seen type
+/// order (#1403).
+fn delete_filters(tenant_id: &str, resources: &[StoredResource]) -> Vec<Document> {
+    let mut order: Vec<&str> = Vec::new();
+    let mut ids_by_type: HashMap<&str, Vec<Bson>> = HashMap::new();
+    for resource in resources {
+        let resource_type = resource.resource_type();
+        ids_by_type
+            .entry(resource_type)
+            .or_insert_with(|| {
+                order.push(resource_type);
+                Vec::new()
+            })
+            .push(Bson::from(resource.id()));
+    }
+    order
+        .into_iter()
+        .map(|resource_type| {
+            let ids = ids_by_type.remove(resource_type).unwrap_or_default();
+            doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "resource_id": { "$in": ids },
+            }
+        })
+        .collect()
+}
+
+/// What a database task hands back to the page's own thread when joined:
+/// its own delete/insert phase timing and counts, and its outcome (#1403).
+struct DbTask<T> {
+    stats: ReindexPageStats,
+    result: Result<T, String>,
+}
+
+/// Per-resource write errors for one sub-batch's insert, kept separate by
+/// destination collection so [`merge_insert_failures`] can prefer an own-row
+/// failure over a contained-row one (#1403).
+struct InsertFailures {
+    own: HashMap<usize, String>,
+    contained: HashMap<usize, String>,
+}
+
+/// Adds exactly `t`'s delete/insert phase fields to `stats`. Never calls
+/// [`ReindexPageStats::accumulate`], which would fold busy time into
+/// `db_wait`: the caller tracks `db_wait` itself, from the *join* wait via
+/// [`add_db_wait`], not from a task's own busy time (#1403).
+fn absorb_db_task(stats: &mut ReindexPageStats, t: &ReindexPageStats) {
+    stats.delete += t.delete;
+    stats.insert += t.insert;
+    stats.deleted_entries += t.deleted_entries;
+    stats.inserted_entries += t.inserted_entries;
+    stats.insert_commands += t.insert_commands;
+}
+
+/// Records `d` as time the page's thread spent waiting on a joined database
+/// task, both in `stats.db_wait` and in the caller's running `page_wait`
+/// total (#1403).
+fn add_db_wait(stats: &mut ReindexPageStats, page_wait: &mut Duration, d: Duration) {
+    stats.db_wait = Some(stats.db_wait.unwrap_or_default() + d);
+    *page_wait += d;
+}
+
+/// Merges one sub-batch's insert failures into the page's running map,
+/// keeping the first message recorded per resource: own-row failures first,
+/// then contained-row failures (#1403).
+fn merge_insert_failures(into: &mut HashMap<usize, String>, f: InsertFailures) {
+    for (owner, msg) in f.own {
+        into.entry(owner).or_insert(msg);
+    }
+    for (owner, msg) in f.contained {
+        into.entry(owner).or_insert(msg);
+    }
+}
+
+/// Combines each resource's extraction and insert outcomes into one result
+/// per page-wide index: an extraction failure beats an insert failure, which
+/// beats success (#1403).
+fn page_outcomes(
+    extract_failures: Vec<Option<String>>,
+    mut insert_failures: HashMap<usize, String>,
+    doc_counts: &[usize],
+) -> Vec<StorageResult<usize>> {
+    extract_failures
+        .into_iter()
+        .enumerate()
+        .map(|(i, failure)| match failure {
+            Some(msg) => Err(internal_error(msg)),
+            None => match insert_failures.remove(&i) {
+                Some(msg) => Err(internal_error(msg)),
+                None => Ok(doc_counts[i]),
+            },
+        })
+        .collect()
+}
+
+/// `n` copies of `Err(msg)`, for a page-level failure that could not be
+/// attributed to specific resources (#1403).
+fn fan_out(n: usize, msg: &str) -> Vec<StorageResult<usize>> {
+    (0..n)
+        .map(|_| Err(internal_error(msg.to_string())))
+        .collect()
+}
+
+/// Turns a joined database task's `JoinError` into a page-level failure
+/// message. A panic resumes here, exactly where an un-spawned call would
+/// itself have panicked, so the panic still propagates instead of being
+/// silently swallowed as an ordinary `Err` (#1403).
+fn join_failure(e: tokio::task::JoinError, what: &str) -> String {
+    if e.is_panic() {
+        std::panic::resume_unwind(e.into_panic());
+    }
+    format!("search index {what} task ended without a result: {e}")
+}
+
+/// A spawned task aborted, not just dropped, when this wrapper goes away — so
+/// a run that stops mid-page (cancellation, a timeout on the composite ingest
+/// sink) never leaves an orphaned delete or insert running against the
+/// database (#1403).
+pub(super) struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T: Send + 'static> AbortOnDrop<T> {
+    fn spawn(fut: impl std::future::Future<Output = T> + Send + 'static) -> Self {
+        Self(tokio::spawn(fut))
+    }
+
+    /// Awaits the task's result. Call at most once.
+    async fn join(&mut self) -> Result<T, tokio::task::JoinError> {
+        (&mut self.0).await
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,5 +516,153 @@ mod tests {
         let (out, on_pool) = extract_range(&env, 0..5, &prepare);
         assert!(!on_pool, "a held gate must fall back to the calling thread");
         assert!(out.iter().all(|id| *id == calling_thread));
+    }
+
+    #[test]
+    fn flatten_moves_documents_with_page_global_owners() {
+        let own_a = doc! {"a": 1};
+        let contained_a = doc! {"ac": 1};
+        let own_b = doc! {"b": 1};
+        let prepared = vec![
+            (
+                SearchIndexDocuments {
+                    own: vec![own_a.clone()],
+                    contained: vec![contained_a.clone()],
+                },
+                None,
+            ),
+            (
+                SearchIndexDocuments {
+                    own: vec![own_b.clone()],
+                    contained: Vec::new(),
+                },
+                Some("boom".to_string()),
+            ),
+        ];
+        let mut extract_failures: Vec<Option<String>> = vec![None; 7];
+        let mut doc_counts: Vec<usize> = vec![0; 7];
+
+        // start = 5: this sub-batch is the third of a bigger page, so its
+        // owners land at the page-wide indices 5 and 6, not 0 and 1.
+        let batch = flatten_sub_batch(5, prepared, &mut extract_failures, &mut doc_counts);
+
+        assert_eq!(batch.own_owners, vec![5, 6]);
+        assert_eq!(batch.own_docs, vec![own_a, own_b]);
+        assert_eq!(batch.contained_owners, vec![5]);
+        assert_eq!(batch.contained_docs, vec![contained_a]);
+        assert_eq!(batch.len(), 3);
+        assert_eq!(doc_counts[5], 2);
+        assert_eq!(doc_counts[6], 1);
+        assert_eq!(doc_counts[0], 0);
+        assert_eq!(extract_failures[5], None);
+        assert_eq!(extract_failures[6], Some("boom".to_string()));
+    }
+
+    #[test]
+    fn page_outcomes_prefers_extract_then_insert_failures() {
+        let extract_failures = vec![Some("extract failed".to_string()), None, None];
+        let mut insert_failures = HashMap::new();
+        insert_failures.insert(1, "insert failed".to_string());
+        let doc_counts = vec![0, 0, 4];
+        let outcomes = page_outcomes(extract_failures, insert_failures, &doc_counts);
+        assert!(matches!(&outcomes[0], Err(e) if e.to_string().contains("extract failed")));
+        assert!(matches!(&outcomes[1], Err(e) if e.to_string().contains("insert failed")));
+        assert!(matches!(outcomes[2], Ok(4)));
+    }
+
+    #[test]
+    fn merge_insert_failures_prefers_own_over_contained() {
+        let mut own = HashMap::new();
+        own.insert(3, "own failed".to_string());
+        let mut contained = HashMap::new();
+        contained.insert(3, "contained failed".to_string());
+        contained.insert(4, "contained only".to_string());
+        let mut into = HashMap::new();
+        merge_insert_failures(&mut into, InsertFailures { own, contained });
+        assert_eq!(into.get(&3), Some(&"own failed".to_string()));
+        assert_eq!(into.get(&4), Some(&"contained only".to_string()));
+    }
+
+    #[test]
+    fn absorb_db_task_adds_only_the_db_fields() {
+        let mut stats = ReindexPageStats {
+            extract: Duration::from_millis(99),
+            sub_batches: 3,
+            ..ReindexPageStats::default()
+        };
+        let t = ReindexPageStats {
+            delete: Duration::from_millis(5),
+            insert: Duration::from_millis(7),
+            deleted_entries: 2,
+            inserted_entries: 9,
+            insert_commands: 1,
+            extract: Duration::from_millis(1000), // must NOT be absorbed
+            sub_batches: 100,                     // must NOT be absorbed
+            db_wait: Some(Duration::from_millis(1)), // must NOT be absorbed
+            ..ReindexPageStats::default()
+        };
+        absorb_db_task(&mut stats, &t);
+        assert_eq!(stats.delete, Duration::from_millis(5));
+        assert_eq!(stats.insert, Duration::from_millis(7));
+        assert_eq!(stats.deleted_entries, 2);
+        assert_eq!(stats.inserted_entries, 9);
+        assert_eq!(stats.insert_commands, 1);
+        assert_eq!(
+            stats.extract,
+            Duration::from_millis(99),
+            "extract must be untouched"
+        );
+        assert_eq!(stats.sub_batches, 3, "sub_batches must be untouched");
+        assert_eq!(
+            stats.db_wait, None,
+            "db_wait is tracked only via add_db_wait"
+        );
+    }
+
+    #[test]
+    fn add_db_wait_turns_none_into_some() {
+        let mut stats = ReindexPageStats::default();
+        let mut page_wait = Duration::ZERO;
+        add_db_wait(&mut stats, &mut page_wait, Duration::from_millis(10));
+        assert_eq!(stats.db_wait, Some(Duration::from_millis(10)));
+        assert_eq!(page_wait, Duration::from_millis(10));
+        add_db_wait(&mut stats, &mut page_wait, Duration::from_millis(5));
+        assert_eq!(stats.db_wait, Some(Duration::from_millis(15)));
+        assert_eq!(page_wait, Duration::from_millis(15));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_on_drop_aborts_a_pending_task() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+        let guard = DropSignal(Some(tx));
+        let task = AbortOnDrop::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        drop(task);
+        tokio::time::timeout(Duration::from_secs(1), rx)
+            .await
+            .expect("dropping AbortOnDrop must abort the task within 1s")
+            .expect("the guard's Drop must fire, delivering the oneshot");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn join_failure_resumes_a_panic() {
+        let handle = tokio::spawn(async { panic!("boom") });
+        let err = handle.await.expect_err("the spawned task panicked");
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| join_failure(err, "insert")));
+        assert!(
+            result.is_err(),
+            "join_failure must resume the panic, not swallow it"
+        );
     }
 }
