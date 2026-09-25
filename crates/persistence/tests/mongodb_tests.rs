@@ -541,6 +541,24 @@ async fn mongodb_minute_precision_stored_dates_are_indexed() {
     .await;
 }
 
+/// The backend-agnostic suite for Period and Timing range targets (#1391).
+/// Same `#[path]` arrangement.
+#[path = "search/date_period_suite.rs"]
+mod date_period_suite;
+
+/// #1391: a Period was indexed as two unrelated points, so `eq`/`ap`
+/// over-matched, `sa`/`eb` could match on the wrong end and an open end was
+/// an instant. It is one `[value_date, value_date_end)` range now. Needs the
+/// full registry so `Encounter.date` and friends extract.
+#[tokio::test]
+async fn mongodb_date_period_targets_are_ranges() {
+    let Some(backend) = create_backend_with_full_registry("date_period").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    date_period_suite::period_targets_are_ranges(&backend, "date-period-1391").await;
+}
+
 /// The backend-agnostic `_contained` suite (#1336, #1362, #1363). Same
 /// `#[path]` arrangement.
 #[path = "search/contained_suite.rs"]
@@ -14513,7 +14531,7 @@ async fn mongodb_integration_boot_creates_only_inline_search_indexes_and_keeps_g
     db.collection::<Document>("schema_version")
         .update_one(
             doc! { "_id": "schema_version" },
-            doc! { "$set": { "search_indexes": { "generation": 3_i32 } } },
+            doc! { "$set": { "search_indexes": { "generation": 4_i32 } } },
         )
         .await
         .unwrap();
@@ -14530,7 +14548,7 @@ async fn mongodb_integration_boot_creates_only_inline_search_indexes_and_keeps_g
         doc.get_document("search_indexes")
             .unwrap()
             .get_i32("generation"),
-        Ok(3)
+        Ok(4)
     );
 }
 
@@ -14604,8 +14622,9 @@ async fn seed_generation1_indexes(db: &mongodb::Database) {
 /// Generation 3: `idx_search_contained` is no longer a `search_index`
 /// background spec (#1160) — it now lives inline on `search_index_contained`
 /// (see [`index_names`] calls against that collection instead).
+/// Generation 4: `idx_search_date_v3` replaces `idx_search_date_v2` (#1391).
 const CURRENT_BACKGROUND_NAMES: [&str; 9] = [
-    "idx_search_date_v2",
+    "idx_search_date_v3",
     "idx_search_identifier_type_v2",
     "idx_search_number_v2",
     "idx_search_quantity_v2",
@@ -14745,7 +14764,7 @@ async fn mongodb_integration_builder_fresh_database_ends_with_generation2_set() 
             .get_document("search_indexes")
             .unwrap()
             .get_i32("generation"),
-        Ok(3)
+        Ok(4)
     );
 }
 
@@ -14815,6 +14834,62 @@ async fn mongodb_integration_builder_upgrades_a_generation1_database_and_drops_v
             .items
             .len(),
         5
+    );
+}
+
+/// #1391: a generation-3 database carries `idx_search_date_v2`, keyed on
+/// `value_date` alone. The builder must build `idx_search_date_v3` (and only
+/// that), then drop `idx_search_date_v2`, and record generation 4.
+#[tokio::test]
+async fn mongodb_integration_builder_upgrades_a_generation3_database_and_drops_date_v2() {
+    let Some(cs) = shared_mongo::connection_string().await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let db_name = build_test_database_name("builder_upgrade_g3");
+    let db = raw_test_client(&cs).await.unwrap().database(&db_name);
+    // Generation 4 fully built, then staged back to generation 3: drop the
+    // date index and put back the generation-2 one, exactly as it was.
+    let first = boot_with_mode(&cs, &db_name, IndexBuildMode::Inline).await;
+    assert!(matches!(
+        first.wait_for_search_index_build().await,
+        Some(BuildOutcome::Built { .. })
+    ));
+    let search_index = db.collection::<Document>("search_index");
+    search_index.drop_index("idx_search_date_v3").await.unwrap();
+    db.run_command(doc! { "createIndexes": "search_index", "indexes": [{
+        "key": { "tenant_id": 1, "resource_type": 1, "param_name": 1, "value_date": 1, "resource_id": 1 },
+        "name": "idx_search_date_v2",
+        "partialFilterExpression": { "value_date": { "$exists": true } },
+    }]})
+    .await
+    .unwrap();
+
+    let backend = boot_with_mode(&cs, &db_name, IndexBuildMode::Inline).await;
+    let outcome = backend
+        .wait_for_search_index_build()
+        .await
+        .expect("builder ran");
+    assert_eq!(
+        outcome,
+        BuildOutcome::Built {
+            created: vec!["idx_search_date_v3".to_string()],
+            dropped: vec!["idx_search_date_v2".to_string()],
+        }
+    );
+    assert_eq!(search_index_names(&db).await, expected_current_names());
+    let record = db
+        .collection::<Document>("schema_version")
+        .find_one(doc! { "_id": "schema_version" })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record
+            .get_document("search_indexes")
+            .unwrap()
+            .get_i32("generation"),
+        Ok(4)
     );
 }
 
@@ -14902,7 +14977,7 @@ async fn mongodb_integration_builder_moves_contained_rows_and_drops_the_old_part
         .unwrap()
         .unwrap();
     let si = sv.get_document("search_indexes").unwrap();
-    assert_eq!(si.get_i32("generation"), Ok(3));
+    assert_eq!(si.get_i32("generation"), Ok(4));
     assert_eq!(si.get_bool("contained_rows_moved"), Ok(true));
 
     // Second boot: nothing to move, nothing to build.
@@ -14931,7 +15006,7 @@ async fn mongodb_integration_builder_refuses_to_touch_a_conflicting_v2_name() {
     seed_generation1_indexes(&db).await;
     // A person built something under our name with different keys.
     db.run_command(doc! { "createIndexes": "search_index", "indexes": [
-        { "key": { "tenant_id": 1, "value_date": 1 }, "name": "idx_search_date_v2" }
+        { "key": { "tenant_id": 1, "value_date": 1 }, "name": "idx_search_date_v3" }
     ]})
     .await
     .unwrap();
@@ -14950,7 +15025,7 @@ async fn mongodb_integration_builder_refuses_to_touch_a_conflicting_v2_name() {
         .await
         .expect_err("a conflicting v2 index must fail inline boot");
     let message = format!("{err}");
-    assert!(message.contains("idx_search_date_v2"), "{message}");
+    assert!(message.contains("idx_search_date_v3"), "{message}");
     let names = search_index_names(&db).await;
     assert!(
         names.contains(&"idx_search_string".to_string()),
@@ -15150,17 +15225,17 @@ async fn mongodb_integration_builder_second_boot_issues_no_create_indexes() {
          search_index); this assertion cannot be trusted until profiling is confirmed working"
     );
 
-    let generation2_created = db
+    let background_created = db
         .collection::<Document>("system.profile")
         .count_documents(doc! {
             "command.createIndexes": "search_index",
-            "command.indexes.name": { "$regex": "_v2$|^idx_search_contained$" },
+            "command.indexes.name": { "$regex": "_v2$|_v3$|^idx_search_contained$" },
         })
         .await
         .unwrap();
     assert_eq!(
-        generation2_created, 0,
-        "second boot must not issue createIndexes for any generation-2 search_index index"
+        background_created, 0,
+        "second boot must not issue createIndexes for any generation-2/-4 search_index index"
     );
 }
 
@@ -15221,8 +15296,12 @@ async fn assert_search_index_ops_are_covered(
     }
 }
 
+/// #1391: date rows are ranges `[value_date, value_date_end)`, so a date
+/// search bounds `value_date`, `value_date_end`, or both. Every prefix shape
+/// (`ge`, `le` and `ne` included) and a comma list must still be a covered
+/// scan on `idx_search_date_v3`, which carries both.
 #[tokio::test]
-async fn mongodb_integration_date_range_search_is_a_covered_v2_scan() {
+async fn mongodb_integration_date_range_search_is_a_covered_v3_scan() {
     let Some(backend) = create_backend_with_full_registry("covered_date").await else {
         eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
         return;
@@ -15247,23 +15326,230 @@ async fn mongodb_integration_date_range_search_is_a_covered_v2_scan() {
         .await
         .unwrap()
         .database(&backend.config().database_name);
-    let q = SearchQuery::new("Observation").with_parameter(SearchParameter {
-        name: "date".into(),
-        param_type: SearchParamType::Date,
-        modifier: None,
-        values: vec![SearchValue::parse("ge2016-01-10")],
-        chain: vec![],
-        components: vec![],
-    });
-    assert_search_index_ops_are_covered(
-        &db,
-        async {
-            let r = backend.search(&tenant, &q).await.unwrap();
-            assert_eq!(r.resources.items.len(), 11);
-        },
-        "idx_search_date_v2",
-    )
-    .await;
+    // `gt` bounds only the end, `eq` and `eb` both ends, and `ge`, `le`, `ne`
+    // have two alternatives, which are sent as an `$or` at the top of the
+    // filter so that each arm is a covered scan too. Comma lists ride the
+    // same top-level `$or`.
+    for (value, expected) in [
+        ("gt2016-01-10", 10),
+        ("2016-01-10", 1),
+        ("eb2016-01-10", 9),
+        ("ge2016-01-10", 11),
+        ("le2016-01-10", 10),
+        ("ne2016-01-10", 19),
+        ("ge2016-01-19,lt2016-01-03", 4),
+    ] {
+        let values: Vec<SearchValue> = value.split(',').map(SearchValue::parse).collect();
+        let q = SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "date".into(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values,
+            chain: vec![],
+            components: vec![],
+        });
+        // Each search is profiled on its own: the helper reads every
+        // `search_index` op in `system.profile`, so clear it between runs.
+        let _ = db.run_command(doc! { "profile": 0_i32 }).await;
+        let _ = db.collection::<Document>("system.profile").drop().await;
+        assert_search_index_ops_are_covered(
+            &db,
+            async {
+                let r = backend.search(&tenant, &q).await.unwrap();
+                assert_eq!(r.resources.items.len(), expected, "date={value}");
+            },
+            "idx_search_date_v3",
+        )
+        .await;
+    }
+}
+
+/// The ids a `date` search returns, sorted; each inner list is one occurrence
+/// of the parameter (`date=a,b&date=c` is `[[a, b], [c]]`).
+async fn date_search_ids(
+    backend: &MongoBackend,
+    tenant: &TenantContext,
+    occurrences: &[&str],
+) -> Vec<String> {
+    let mut q = SearchQuery::new("Observation");
+    for occurrence in occurrences {
+        q = q.with_parameter(SearchParameter {
+            name: "date".into(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: occurrence.split(',').map(SearchValue::parse).collect(),
+            chain: vec![],
+            components: vec![],
+        });
+    }
+    let mut ids: Vec<String> = backend
+        .search(tenant, &q)
+        .await
+        .unwrap()
+        .resources
+        .items
+        .iter()
+        .map(|r| r.id().to_string())
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// #1391: `ge`, `le` and `ne` moved their `$or` to the top of the filter to
+/// be covered scans. That must not change what a comma list (OR) or a
+/// repeated parameter (AND) return, nor how a Period is read.
+#[tokio::test]
+async fn mongodb_integration_date_or_and_semantics_survive_top_level_or() {
+    let Some(backend) = create_backend_with_full_registry("date_or_and").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-date-or-and");
+    for year in 2015..=2022 {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation", "id": format!("y{year}"), "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "8302-2" }] },
+                    "effectiveDateTime": year.to_string()
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    // A Period from mid-2019 to March 2020: in neither year, over both.
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation", "id": "period", "status": "final",
+                "code": { "coding": [{ "system": "http://loinc.org", "code": "8302-2" }] },
+                "effectivePeriod": { "start": "2019-06", "end": "2020-03" }
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let ids = |list: &[&str]| -> Vec<String> {
+        let mut v: Vec<String> = list.iter().map(|s| s.to_string()).collect();
+        v.sort();
+        v
+    };
+    let ge2020_or_lt2019 = ids(&[
+        "y2015", "y2016", "y2017", "y2018", "y2020", "y2021", "y2022",
+    ]);
+    // A comma list is an OR, in either order.
+    assert_eq!(
+        date_search_ids(&backend, &tenant, &["ge2020,lt2019"]).await,
+        ge2020_or_lt2019
+    );
+    assert_eq!(
+        date_search_ids(&backend, &tenant, &["lt2019,ge2020"]).await,
+        ge2020_or_lt2019
+    );
+    // Every value of the list is one of the alternatives: `ne2019` or `eq2019`
+    // is everything.
+    assert_eq!(
+        date_search_ids(&backend, &tenant, &["ne2019,2019"])
+            .await
+            .len(),
+        9
+    );
+    // Repeated parameters are an AND: `ge2018` and `lt2021`.
+    assert_eq!(
+        date_search_ids(&backend, &tenant, &["ge2018", "lt2021"]).await,
+        ids(&["period", "y2018", "y2019", "y2020"])
+    );
+    // A comma list ANDed with another occurrence.
+    assert_eq!(
+        date_search_ids(&backend, &tenant, &["ge2020,lt2019", "ne2016"]).await,
+        ids(&["y2015", "y2017", "y2018", "y2020", "y2021", "y2022"])
+    );
+    // The Period alone, per prefix: it is over 2019 and 2020 but neither
+    // starts after nor ends before them.
+    assert!(
+        date_search_ids(&backend, &tenant, &["ge2019"])
+            .await
+            .contains(&"period".to_string())
+    );
+    assert!(
+        !date_search_ids(&backend, &tenant, &["ge2020"])
+            .await
+            .contains(&"period".to_string())
+    );
+    assert!(
+        date_search_ids(&backend, &tenant, &["ne2019"])
+            .await
+            .contains(&"period".to_string())
+    );
+    assert!(
+        !date_search_ids(&backend, &tenant, &["le2019"])
+            .await
+            .contains(&"period".to_string())
+    );
+}
+
+/// #1391: a `Period` with an `end` that is not a valid date is dropped whole
+/// (the shared extractor's one rule for every backend), never indexed as open
+/// above; a readable one keeps the range it names.
+#[tokio::test]
+async fn mongodb_integration_period_with_unreadable_end_is_dropped_not_open() {
+    let Some(backend) = create_backend_with_full_registry("date_unreadable_end").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-date-unreadable-end");
+    for (id, end) in [
+        ("readable", "2020-06-01T10:00:00Z"),
+        ("garbage", "not-a-date"),
+    ] {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation", "id": id, "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "8302-2" }] },
+                    "effectivePeriod": { "start": "2020-01-01", "end": end }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    // The readable one ends where its text says: inside 2020, after 09:00 that
+    // day, not after the next day.
+    let eq2020 = date_search_ids(&backend, &tenant, &["2020"]).await;
+    assert!(eq2020.contains(&"readable".to_string()), "{eq2020:?}");
+    assert!(!eq2020.contains(&"garbage".to_string()), "{eq2020:?}");
+    assert_eq!(
+        date_search_ids(&backend, &tenant, &["gt2020-06-01T09:00:00Z"])
+            .await
+            .into_iter()
+            .filter(|id| id == "readable")
+            .count(),
+        1
+    );
+    assert!(
+        !date_search_ids(&backend, &tenant, &["gt2020-06-02"])
+            .await
+            .contains(&"readable".to_string())
+    );
+    // The unreadable end is not open above, and its Period is not found by
+    // its start either.
+    assert!(
+        date_search_ids(&backend, &tenant, &["gt2030"])
+            .await
+            .is_empty()
+    );
+    let lt2021 = date_search_ids(&backend, &tenant, &["lt2021"]).await;
+    assert!(lt2021.contains(&"readable".to_string()), "{lt2021:?}");
+    assert!(!lt2021.contains(&"garbage".to_string()), "{lt2021:?}");
 }
 
 #[tokio::test]

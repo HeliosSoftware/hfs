@@ -276,7 +276,13 @@ async fn test_fractional_date_forward_and_reverse_chains() {
                     "resourceType": "Encounter",
                     "status": "finished",
                     "class": {"system": "http://terminology.hl7.org/CodeSystem/v3-ActCode", "code": "AMB"},
-                    "period": {"start": format!("2024-01-01T10:00:00.{fraction}Z")},
+                    // Bounded on both sides: since #1391 a date search
+                    // compares the whole `[start, end)` a Period denotes, and
+                    // an open end is unbounded, so `eq` could never contain it.
+                    "period": {
+                        "start": format!("2024-01-01T10:00:00.{fraction}Z"),
+                        "end": format!("2024-01-01T10:00:00.{fraction}Z"),
+                    },
                 }),
                 FhirVersion::default(),
             )
