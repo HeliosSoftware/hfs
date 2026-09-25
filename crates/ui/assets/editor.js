@@ -37,6 +37,18 @@
   var subject = document.getElementById("editor-subject");
   var messages = root.dataset;
 
+  /* Unsaved-changes tracking (#1240): opt in lazily, once the document is in
+   * scope, so `read` never runs before the fragment it reads exists. */
+  var unsaved = null;
+  function trackUnsaved() {
+    if (unsaved || !window.HfsUnsaved) return;
+    unsaved = window.HfsUnsaved.track({
+      root: root,
+      read: readWithPending,
+      cue: root.querySelector(".editor__actions"),
+    });
+  }
+
   var resourceType = messages.type;
   var resourceId = messages.id;
 
@@ -68,6 +80,7 @@
         body.innerHTML = html;
         applyView();
         restoreUiState(state);
+        if (unsaved) unsaved.check();
       });
   }
 
@@ -184,6 +197,40 @@
     return field ? field.value : "{}";
   }
 
+  /* Pending edits (#1240): a guided-form `[data-set]` control only round-trips
+   * through `send("set", …)` on blur (below), so #editor-doc alone lags a
+   * keystroke behind what is actually on screen. One "path=value" line per
+   * control whose value has moved from what it loaded with — a `select`'s
+   * loaded state is its `defaultSelected` option, every other control's is
+   * `defaultValue`. */
+  function pendingEdits(container) {
+    var lines = "";
+    var fields = container.querySelectorAll("[data-set]");
+    for (var i = 0; i < fields.length; i++) {
+      var el = fields[i];
+      var path = el.dataset.set;
+      if (!path) continue;
+      if (el.tagName === "SELECT") {
+        var selected = el.options[el.selectedIndex];
+        if (selected && !selected.defaultSelected) lines += path + "=" + el.value + "\n";
+      } else if ("defaultValue" in el) {
+        if (el.value !== el.defaultValue) lines += path + "=" + el.value + "\n";
+      }
+    }
+    return lines;
+  }
+
+  /* The unsaved-changes tracker's own `read` (#1240): the document plus any
+   * pending edit. With one pending, the whole string no longer parses as
+   * JSON, so it always differs from the last clean baseline — a pending edit
+   * is dirty by definition — until it either commits (the next render
+   * replaces #editor-doc and clears it) or is retyped back to its loaded
+   * value. */
+  function readWithPending() {
+    var pending = pendingEdits(body);
+    return currentDocument() + (pending ? "\n--pending--\n" + pending : "");
+  }
+
   /* ---- loading --------------------------------------------------------- */
 
   function load() {
@@ -195,7 +242,12 @@
       seed.set("op", "");
       return fetch("/ui/editor/render", { method: "POST", body: seed })
         .then(function (r) { return r.text(); })
-        .then(function (html) { body.innerHTML = html; applyView(); });
+        .then(function (html) {
+          body.innerHTML = html;
+          applyView();
+          trackUnsaved();
+          if (unsaved) unsaved.reset();
+        });
     }
     return fetch("/" + resourceType + "/" + resourceId, {
       headers: fhirHeaders(),
@@ -213,7 +265,10 @@
             ? " · " + new Date(resource.meta.lastUpdated).toLocaleString()
             : "");
         loadVersions();
-        return renderDocument(resource);
+        return renderDocument(resource).then(function () {
+          trackUnsaved();
+          if (unsaved) unsaved.reset();
+        });
       })
       .catch(function () {
         say(messages.msgLoadError, "error");
@@ -227,7 +282,11 @@
     form.set("op", "");
     return fetch("/ui/editor/render", { method: "POST", body: form })
       .then(function (r) { return r.text(); })
-      .then(function (html) { body.innerHTML = html; applyView(); });
+      .then(function (html) {
+        body.innerHTML = html;
+        applyView();
+        if (unsaved) unsaved.check();
+      });
   }
 
   /* ---- version history panel ------------------------------------------- */
@@ -536,6 +595,7 @@
             return;
           }
           say(messages.msgSaved, "ok");
+          if (unsaved) unsaved.reset();
           if (result.payload && result.payload.id && !parsed.id) {
             resourceId = result.payload.id;
           }
@@ -553,7 +613,10 @@
 
     fetch("/" + resourceType + "/" + parsed.id, { method: "DELETE", headers: fhirHeaders() })
       .then(function (response) {
-        if (response.ok) window.location.href = "/ui/queries";
+        if (response.ok) {
+          if (window.HfsUnsaved) window.HfsUnsaved.suspend();
+          window.location.href = "/ui/queries";
+        }
       })
       .catch(function (error) {
         say(String(error), "error");

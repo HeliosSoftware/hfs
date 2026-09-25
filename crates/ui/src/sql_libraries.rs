@@ -73,28 +73,55 @@ pub(crate) fn extract_status(library: &Value) -> String {
         .to_string()
 }
 
-/// The decoded SQL of the first `application/sql` content attachment, empty
-/// when there is none (or its data is not valid base64 UTF-8).
-pub(crate) fn extract_sql(library: &Value) -> String {
-    library
+/// The decoded SQL of the first `application/sql` content attachment, or
+/// `None` when there is no such attachment, it carries no `data`, that
+/// `data` is not valid base64, or the decoded bytes are not UTF-8 (#1233).
+/// This is the sole place that decodes the attachment — [`extract_sql`]
+/// and [`fill_sql_attachment`] both build on it rather than repeating the
+/// decode. The client-side sync (#1233) keeps the Details JSON and SQL
+/// card in step as the user types, so in practice the two already agree by
+/// the time either textarea is posted; this function (and the merge rule
+/// built on it) is what the server relies on when they do not — e.g. a
+/// hand-edited JSON, or a request built without JavaScript at all.
+pub(crate) fn readable_sql(library: &Value) -> Option<String> {
+    let data = library
         .get("content")
-        .and_then(Value::as_array)
-        .and_then(|atts| {
-            atts.iter().find(|a| {
-                a.get("contentType")
-                    .and_then(Value::as_str)
-                    .is_some_and(|ct| ct.starts_with("application/sql"))
-            })
-        })
-        .and_then(|a| a.get("data").and_then(Value::as_str))
-        .and_then(|data| BASE64.decode(data).ok())
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .unwrap_or_default()
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|a| {
+            a.get("contentType")
+                .and_then(Value::as_str)
+                .is_some_and(|ct| ct.starts_with("application/sql"))
+        })?
+        .get("data")
+        .and_then(Value::as_str)?;
+    let bytes = BASE64.decode(data).ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+/// The decoded SQL of the first `application/sql` content attachment, empty
+/// when there is none (or its data is not valid base64 UTF-8) — see
+/// [`readable_sql`] for the underlying rule.
+pub(crate) fn extract_sql(library: &Value) -> String {
+    readable_sql(library).unwrap_or_default()
+}
+
+/// Fills in `sql` as the Library's `application/sql` attachment only when
+/// none of its existing attachments already carry a readable one (#1233):
+/// the Details JSON attachment is the document of record, so this only ever
+/// backstops a JSON with no readable SQL of its own — none, missing `data`,
+/// invalid base64, or non-UTF-8 bytes (see [`readable_sql`]). A `library`
+/// that already has a readable attachment is left untouched, byte for byte.
+pub(crate) fn fill_sql_attachment(library: &mut Value, sql: &str) {
+    if readable_sql(library).is_none() {
+        embed_sql(library, sql);
+    }
 }
 
 /// Embeds `sql` as the base64 `data` of the Library's first `application/sql`
 /// attachment, appending one when none exists. Other attachments are left
-/// alone.
+/// alone. Unconditional — callers that must respect the "JSON wins" merge
+/// rule (#1233) call [`fill_sql_attachment`] instead.
 pub(crate) fn embed_sql(library: &mut Value, sql: &str) {
     let encoded = Value::String(BASE64.encode(sql));
     let Some(map) = library.as_object_mut() else {
@@ -349,49 +376,6 @@ pub(crate) fn add_parameter(
         arr.push(serde_json::json!({ "name": name, "use": "in", "type": type_code }));
     }
     Ok(())
-}
-
-/// Returns a copy of `library` without any `content[]` attachment whose
-/// `contentType` starts with `application/sql` (#840) — the document
-/// Details edits, since the SQL attachment lives in its own card. `content`
-/// is dropped entirely when stripping it empties the array; a `library`
-/// whose `content` is missing or not an array comes back unchanged. Other
-/// attachments (CQL, plain text, …) keep their order and content.
-///
-/// Paired with [`extract_sql`]/[`embed_sql`] at save/run time: for a Library
-/// with a single `application/sql` attachment,
-/// `embed_sql(strip_sql_attachment(lib), extract_sql(lib))` reconstructs
-/// `lib` (see the invariant test below) — stripping and re-embedding is a
-/// round trip except that a re-embedded attachment always lands last, which
-/// only matters when other attachments preceded it.
-///
-/// The Details panel's own document, both on the page's first paint
-/// (`crate::shape_lib`, `crate::render_lib_details_pane`) and in the
-/// `POST /ui/sql/queries`/`/ui/sql/views` Save error re-render.
-pub(crate) fn strip_sql_attachment(library: &Value) -> Value {
-    let mut out = library.clone();
-    let Some(map) = out.as_object_mut() else {
-        return out;
-    };
-    let Some(atts) = map.get("content").and_then(Value::as_array) else {
-        return out;
-    };
-    let kept: Vec<Value> = atts
-        .iter()
-        .filter(|attachment| {
-            !attachment
-                .get("contentType")
-                .and_then(Value::as_str)
-                .is_some_and(|ct| ct.starts_with("application/sql"))
-        })
-        .cloned()
-        .collect();
-    if kept.is_empty() {
-        map.remove("content");
-    } else {
-        map.insert("content".to_string(), Value::Array(kept));
-    }
-    out
 }
 
 // ---------------------------------------------------------------------
@@ -1055,6 +1039,68 @@ mod tests {
         assert_eq!(lib["content"].as_array().unwrap().len(), 1);
     }
 
+    // -----------------------------------------------------------------
+    // readable_sql() / fill_sql_attachment() (#1233)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn readable_sql_is_none_without_a_sql_attachment() {
+        let mut lib = library("sql-query", LIBRARY_TYPES_SYSTEM);
+        assert_eq!(readable_sql(&lib), None);
+        lib["content"] = json!([{"contentType": "text/plain", "data": BASE64.encode("notes")}]);
+        assert_eq!(readable_sql(&lib), None);
+    }
+
+    #[test]
+    fn readable_sql_is_none_for_invalid_base64_or_non_utf8() {
+        let mut lib = library("sql-query", LIBRARY_TYPES_SYSTEM);
+        lib["content"] = json!([{"contentType": "application/sql", "data": "%%%"}]);
+        assert_eq!(readable_sql(&lib), None);
+        lib["content"] = json!([{
+            "contentType": "application/sql",
+            "data": BASE64.encode([0xff, 0xfe]),
+        }]);
+        assert_eq!(readable_sql(&lib), None);
+    }
+
+    #[test]
+    fn readable_sql_decodes_the_first_sql_attachment() {
+        let mut lib = library("sql-query", LIBRARY_TYPES_SYSTEM);
+        lib["content"] = json!([
+            {"contentType": "application/sql", "data": BASE64.encode("SELECT 1")},
+            {"contentType": "application/sql", "data": BASE64.encode("SELECT 2")},
+        ]);
+        assert_eq!(readable_sql(&lib), Some("SELECT 1".to_string()));
+    }
+
+    #[test]
+    fn fill_sql_attachment_keeps_a_readable_attachment() {
+        let mut lib = library("sql-query", LIBRARY_TYPES_SYSTEM);
+        embed_sql(&mut lib, "SELECT 1");
+        fill_sql_attachment(&mut lib, "SELECT 2");
+        assert_eq!(extract_sql(&lib), "SELECT 1");
+        assert_eq!(lib["content"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn fill_sql_attachment_embeds_when_missing() {
+        let mut lib = library("sql-query", LIBRARY_TYPES_SYSTEM);
+        assert!(lib.get("content").is_none());
+        fill_sql_attachment(&mut lib, "SELECT 2");
+        assert_eq!(extract_sql(&lib), "SELECT 2");
+        assert_eq!(lib["content"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn fill_sql_attachment_replaces_an_unreadable_attachment() {
+        let mut lib = library("sql-query", LIBRARY_TYPES_SYSTEM);
+        lib["content"] = json!([{"contentType": "application/sql", "data": "%%%"}]);
+        fill_sql_attachment(&mut lib, "SELECT 2");
+        let atts = lib["content"].as_array().unwrap();
+        assert_eq!(atts.len(), 1);
+        assert_eq!(extract_sql(&lib), "SELECT 2");
+    }
+
     #[test]
     fn starters_parse_and_carry_their_coding() {
         for code in ["sql-query", "sql-view"] {
@@ -1069,57 +1115,6 @@ mod tests {
             // the title row's status chip reads on `?lib=new`.
             assert_eq!(lib["status"].as_str(), Some(STARTER_STATUS));
         }
-    }
-
-    #[test]
-    fn strip_sql_attachment_drops_the_key_when_sql_was_the_only_attachment() {
-        let mut lib = library("sql-query", LIBRARY_TYPES_SYSTEM);
-        embed_sql(&mut lib, "SELECT 1");
-        let stripped = strip_sql_attachment(&lib);
-        assert!(stripped.get("content").is_none());
-        // Nothing else in the document moved.
-        assert_eq!(stripped["name"], lib["name"]);
-    }
-
-    #[test]
-    fn strip_sql_attachment_keeps_other_attachments_in_order() {
-        let mut lib = library("sql-query", LIBRARY_TYPES_SYSTEM);
-        lib["content"] = json!([
-            { "contentType": "text/cql", "data": "cql-data" },
-            { "contentType": "application/sql", "data": "sql-data" },
-            { "contentType": "text/plain", "data": "plain-data" },
-        ]);
-        let stripped = strip_sql_attachment(&lib);
-        let content = stripped["content"].as_array().unwrap();
-        assert_eq!(content.len(), 2);
-        assert_eq!(content[0]["contentType"], "text/cql");
-        assert_eq!(content[1]["contentType"], "text/plain");
-    }
-
-    #[test]
-    fn strip_sql_attachment_passes_through_a_missing_or_non_array_content() {
-        let no_content = library("sql-query", LIBRARY_TYPES_SYSTEM);
-        assert_eq!(strip_sql_attachment(&no_content), no_content);
-
-        let mut non_array_content = library("sql-query", LIBRARY_TYPES_SYSTEM);
-        non_array_content["content"] = json!("not-an-array");
-        assert_eq!(strip_sql_attachment(&non_array_content), non_array_content);
-    }
-
-    /// #840's own round-trip invariant: for a Library with a single SQL
-    /// attachment, stripping it out and re-embedding the SQL it carried
-    /// reconstructs the original document — the attachment only moves when
-    /// other attachments already surrounded it (untested here, since there
-    /// are none), never when it was alone.
-    #[test]
-    fn strip_then_embed_reconstructs_a_library_with_only_a_sql_attachment() {
-        let mut lib = library("sql-query", LIBRARY_TYPES_SYSTEM);
-        embed_sql(&mut lib, "SELECT 1 FROM t");
-
-        let mut reconstructed = strip_sql_attachment(&lib);
-        embed_sql(&mut reconstructed, &extract_sql(&lib));
-
-        assert_eq!(reconstructed, lib);
     }
 
     #[test]

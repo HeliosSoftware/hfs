@@ -1,4 +1,5 @@
-//! Declarative catalog of the `search_index` indexes (#1059, #1084, #1160).
+//! Declarative catalog of the `search_index` indexes (#1059, #1084, #1160,
+//! #1391).
 //!
 //! Generation 2 replaces the nine full value indexes with partial indexes that
 //! carry `resource_id` as their trailing key, so a value-filtered scan can be
@@ -14,6 +15,14 @@
 //! over contained rows on `search_index` ([`superseded_contained_spec`]) is
 //! superseded: the builder drops it once the rows it used to serve have
 //! moved (see `search_index_builder.rs`).
+//!
+//! Generation 4 (#1391) stores every date row as a range
+//! `[value_date, value_date_end)`, and date searches filter on both ends.
+//! `idx_search_date_v3` adds `value_date_end` between `value_date` and
+//! `resource_id`, so a date search that bounds either end (`ge`, `gt`, `ne`,
+//! `eb`, ...) stays a covered scan. Generation 2's `idx_search_date_v2`
+//! ([`superseded_date_v2_spec`]) is superseded: the builder drops it once the
+//! generation-4 set is ready.
 
 use mongodb::{
     IndexModel,
@@ -35,7 +44,10 @@ pub(crate) const CONTAINED_COMPOSITE_SLOT_PROBE_INDEX: &str =
 /// once every [`IndexBuild::Background`] spec is present and the superseded
 /// indexes are gone. Generation 3 = generation 2 minus `idx_search_contained`
 /// on `search_index` (contained rows moved to their own collection, #1160).
-pub(crate) const SEARCH_INDEX_GENERATION: i32 = 3;
+/// Generation 4 = generation 3 with `idx_search_date_v2` replaced by
+/// `idx_search_date_v3`, which also carries `value_date_end`, so a date search
+/// over the stored range `[value_date, value_date_end)` stays covered (#1391).
+pub(crate) const SEARCH_INDEX_GENERATION: i32 = 4;
 
 /// When an index is created relative to boot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,8 +100,8 @@ impl SearchIndexSpec {
 
 const LEADING: [&str; 3] = ["tenant_id", "resource_type", "param_name"];
 
-/// A generation-2 value index: leading triple, the value keys, `resource_id`,
-/// partial on the first value key existing.
+/// A generation-2 (or later) value index: leading triple, the value keys,
+/// `resource_id`, partial on the first value key existing.
 fn value_v2(name: &'static str, value_keys: &[&str]) -> SearchIndexSpec {
     let mut keys = Document::new();
     for k in LEADING.iter().chain(value_keys.iter()) {
@@ -131,7 +143,10 @@ pub(crate) fn current_specs() -> Vec<SearchIndexSpec> {
             "idx_search_token_v2",
             &["value_token_code", "value_token_system"],
         ),
-        value_v2("idx_search_date_v2", &["value_date"]),
+        // Generation 4 (#1391): a date row is the range
+        // `[value_date, value_date_end)` and a search may bound either end.
+        // Partial on `value_date` only, which every date row carries.
+        value_v2("idx_search_date_v3", &["value_date", "value_date_end"]),
         value_v2("idx_search_number_v2", &["value_number"]),
         value_v2(
             "idx_search_quantity_v2",
@@ -204,6 +219,14 @@ pub(crate) fn superseded_v1_specs() -> Vec<SearchIndexSpec> {
             &["value_identifier_type_system", "value_identifier_type_code"],
         ),
     ]
+}
+
+/// The generation-2 date index the builder drops once `idx_search_date_v3`
+/// (and the rest of the current generation) is ready (#1391). No rollback
+/// script: a pre-generation-4 binary rebuilds it itself, in the background,
+/// as one of its own missing generation-2 specs.
+pub(crate) fn superseded_date_v2_spec() -> SearchIndexSpec {
+    value_v2("idx_search_date_v2", &["value_date"])
 }
 
 /// The indexes of `search_index_contained`. Created inline at boot: contained
@@ -348,7 +371,7 @@ mod tests {
     fn value_specs() -> Vec<SearchIndexSpec> {
         current_specs()
             .into_iter()
-            .filter(|s| s.name.ends_with("_v2"))
+            .filter(|s| s.build == IndexBuild::Background)
             .collect()
     }
 
@@ -360,7 +383,7 @@ mod tests {
             vec![
                 "idx_search_string_v2",
                 "idx_search_token_v2",
-                "idx_search_date_v2",
+                "idx_search_date_v3",
                 "idx_search_number_v2",
                 "idx_search_quantity_v2",
                 "idx_search_reference_v2",
@@ -372,7 +395,47 @@ mod tests {
                 COMPOSITE_SLOT_PROBE_INDEX,
             ]
         );
-        assert_eq!(SEARCH_INDEX_GENERATION, 3);
+        assert_eq!(SEARCH_INDEX_GENERATION, 4);
+    }
+
+    #[test]
+    fn date_v3_carries_the_range_end_and_is_partial_on_the_start() {
+        let date = current_specs()
+            .into_iter()
+            .find(|s| s.name == "idx_search_date_v3")
+            .unwrap();
+        let keys: Vec<&str> = date.keys.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "tenant_id",
+                "resource_type",
+                "param_name",
+                "value_date",
+                "value_date_end",
+                "resource_id"
+            ]
+        );
+        assert_eq!(
+            date.partial,
+            Some(doc! { "value_date": { "$exists": true } })
+        );
+        assert_eq!(date.build, IndexBuild::Background);
+    }
+
+    #[test]
+    fn superseded_date_v2_is_the_generation2_date_index_and_not_current() {
+        let v2 = superseded_date_v2_spec();
+        assert_eq!(v2.name, "idx_search_date_v2");
+        assert_eq!(
+            v2.keys,
+            doc! { "tenant_id": 1_i32, "resource_type": 1_i32, "param_name": 1_i32, "value_date": 1_i32, "resource_id": 1_i32 }
+        );
+        assert_eq!(v2.partial, Some(doc! { "value_date": { "$exists": true } }));
+        assert!(
+            current_specs().iter().all(|s| s.name != v2.name),
+            "idx_search_date_v2 is both superseded and current"
+        );
     }
 
     #[test]
@@ -565,11 +628,11 @@ mod tests {
                 "idx_search_identifier_type",
             ]
         );
-        let g2: Vec<&str> = current_specs().iter().map(|s| s.name).collect();
+        let current: Vec<&str> = current_specs().iter().map(|s| s.name).collect();
         for name in &v1 {
             assert!(
-                !g2.contains(name),
-                "{name} is both superseded and generation 2"
+                !current.contains(name),
+                "{name} is both superseded and current"
             );
         }
         // The old token index is system-first; pin it so the rollback script is faithful.

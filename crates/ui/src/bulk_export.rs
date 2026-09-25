@@ -725,6 +725,7 @@ struct BulkExportPage {
     error: Option<String>,
     name_error: Option<String>,
     since_custom_error: Option<String>,
+    until_error: Option<String>,
     patients_error: Option<String>,
     form: StartForm,
     rejected: bool,
@@ -813,6 +814,7 @@ async fn bulk_export_page(
         error,
         name_error: errors.name,
         since_custom_error: errors.since_custom,
+        until_error: errors.until,
         patients_error: errors.patients,
         form,
         rejected,
@@ -872,6 +874,7 @@ impl StartForm {
 struct StartErrors {
     name: Option<String>,
     since_custom: Option<String>,
+    until: Option<String>,
     /// Set when the effective scope is `patient` and the reference list
     /// parsed cleanly but came out empty (no selection at all).
     patients: Option<String>,
@@ -928,6 +931,7 @@ pub async fn start(
         Ok(Vec::new())
     };
     let since = crate::lookup::since_instant(&form.since_preset, &form.since_custom);
+    let until = crate::lookup::optional_instant(&form.until);
     let i18n = I18n::new(locale);
     let errors = StartErrors {
         name: form
@@ -936,6 +940,13 @@ pub async fn start(
             .is_empty()
             .then(|| i18n.t("bulk-export-name-required")),
         since_custom: since.is_err().then(|| i18n.t("bulk-export-since-invalid")),
+        until: match (&since, &until) {
+            (_, Err(())) => Some(i18n.t("bulk-export-since-invalid")),
+            (Ok(since), Ok(until)) if crate::lookup::instant_before(until, since) => {
+                Some(i18n.t("bulk-export-until-before-since"))
+            }
+            _ => None,
+        },
         patients: (scope == "patient" && matches!(patient_refs, Ok(ref refs) if refs.is_empty()))
             .then(|| i18n.t("bulk-export-patients-required")),
         rejected: true,
@@ -945,6 +956,7 @@ pub async fn start(
         .then(|| i18n.t("bulk-export-patient-invalid"));
     if errors.name.is_some()
         || errors.since_custom.is_some()
+        || errors.until.is_some()
         || errors.patients.is_some()
         || patient_error.is_some()
     {
@@ -956,6 +968,7 @@ pub async fn start(
 
     let patient_refs = patient_refs.expect("patient references were validated");
     let since = since.expect("custom instant was validated");
+    let until = until.expect("until instant was validated");
     let user_key = settings_user_key(principal.as_deref());
     let snapshot = load_jobs(&state, &user_key, &rt.id).await;
     let mut job = ExportJob {
@@ -970,7 +983,7 @@ pub async fn start(
         elements: form.elements.trim().to_string(),
         type_filter: form.type_filter.trim().to_string(),
         since,
-        until: form.until.trim().to_string(),
+        until,
         patient_refs,
         fhir_version: Some(rv.0),
         status: "in-progress".to_string(),

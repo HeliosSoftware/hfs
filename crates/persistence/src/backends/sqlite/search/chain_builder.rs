@@ -456,9 +456,7 @@ impl ChainQueryBuilder {
                 SqlParam::String(format!("%{}%", value.value)),
             ),
             SearchParamType::Date => {
-                // For date, use range comparison based on prefix
-                let date_col = format!("{}.value_date", alias);
-                build_date_condition(&date_col, value, param_num)
+                return Ok(build_date_condition(&alias, value, param_num));
             }
             SearchParamType::Number => {
                 return Ok(build_number_condition(&alias, value, param_num));
@@ -653,8 +651,7 @@ impl ChainQueryBuilder {
                 SqlParam::String(format!("%{}%", value.value)),
             ),
             SearchParamType::Date => {
-                let date_col = format!("{}.value_date", alias);
-                build_date_condition(&date_col, value, param_num)
+                return Ok(build_date_condition(&alias, value, param_num));
             }
             SearchParamType::Number => {
                 return Ok(build_number_condition(&alias, value, param_num));
@@ -676,17 +673,27 @@ impl ChainQueryBuilder {
     }
 }
 
-/// Builds a date comparison condition.
-fn build_date_condition(column: &str, value: &SearchValue, param_num: usize) -> (String, SqlParam) {
-    // Matches nothing, still binding `?param_num`, for a value that is not a
-    // date — which the search gate rejects before a chain is ever built.
-    let (sql, bound) = super::parameter_handlers::date::date_condition_or_nothing(
-        column,
+/// The terminal `date` comparison, against the range `{alias}.value_date` to
+/// `{alias}.value_date_end` (#1391) — the comparison the unchained date search
+/// makes.
+///
+/// Binds one parameter per bound (up to three), numbered `?N` from
+/// `param_num` with no gaps, or none for a value that is not a date — which
+/// the search gate rejects before a chain is ever built — whose condition then
+/// matches nothing.
+fn build_date_condition(
+    alias: &str,
+    value: &SearchValue,
+    param_num: usize,
+) -> (String, Vec<SqlParam>) {
+    let (sql, binds) = super::parameter_handlers::date::date_range_condition_or_nothing(
+        &format!("{alias}.value_date"),
+        &format!("{alias}.value_date_end"),
         value.prefix,
         &value.value,
         param_num,
     );
-    (sql, SqlParam::String(bound))
+    (sql, binds.into_iter().map(SqlParam::String).collect())
 }
 
 /// The terminal `token` comparison, against `{alias}.value_token_*`.
@@ -1070,27 +1077,64 @@ mod date_condition_tests {
     use super::*;
     use crate::types::SearchPrefix;
 
-    /// #456: chained date terminals use the precision-aware normalized
-    /// comparison, not the raw text `=` this used to emit.
+    fn strings(params: &[SqlParam]) -> Vec<&str> {
+        params
+            .iter()
+            .map(|param| match param {
+                SqlParam::String(s) => s.as_str(),
+                other => panic!("expected a string param, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// #456, #1391: a chained date terminal compares the stored range the
+    /// way the unchained date search does, not the raw text `=` it once
+    /// emitted.
     #[test]
-    fn chained_dates_are_precision_aware() {
+    fn chained_dates_compare_the_stored_range() {
         let value = SearchValue::new(SearchPrefix::Eq, "1995-10-02");
-        let (sql, param) = build_date_condition("t2.value_date", &value, 7);
-        assert_eq!(
-            sql,
-            "(datetime(t2.value_date) >= datetime(?7) AND datetime(t2.value_date) < datetime(?7, '+1 day'))"
+        let (sql, params) = build_date_condition("t2", &value, 7);
+        assert!(
+            // The implied `end > start bound` comes first, so the end index
+            // can be sought (#1391).
+            sql.starts_with(
+                "(t2.value_date_end > ?7 AND strftime('%Y-%m-%d %H:%M:%f', CASE WHEN instr(t2.value_date, '.')"
+            ),
+            "{sql}"
         );
-        match param {
-            SqlParam::String(s) => assert_eq!(s, "1995-10-02T00:00:00"),
-            _ => panic!("expected string param"),
-        }
+        assert!(
+            sql.ends_with(") >= ?7 AND t2.value_date_end <= ?8)"),
+            "{sql}"
+        );
+        assert_eq!(
+            strings(&params),
+            ["1995-10-02 00:00:00.000", "1995-10-03 00:00:00.000"]
+        );
+    }
+
+    /// `ge` is two alternatives over three bounds, numbered without gaps.
+    #[test]
+    fn chained_ge_binds_every_bound_in_order() {
+        let value = SearchValue::new(SearchPrefix::Ge, "2016-01-23T13:07:42-04:00");
+        let (sql, params) = build_date_condition("t2", &value, 3);
+        assert!(sql.contains("t2.value_date_end > ?3) OR ("), "{sql}");
+        assert!(sql.contains(">= ?4 AND t2.value_date_end <= ?5))"), "{sql}");
+        assert_eq!(
+            strings(&params),
+            [
+                "2016-01-23 17:07:43.000",
+                "2016-01-23 17:07:42.000",
+                "2016-01-23 17:07:43.000"
+            ]
+        );
     }
 
     #[test]
-    fn chained_full_precision_is_equality() {
-        let value = SearchValue::new(SearchPrefix::Eq, "2016-01-23T13:07:42-04:00");
-        let (sql, _) = build_date_condition("t2.value_date", &value, 3);
-        assert_eq!(sql, "datetime(t2.value_date) = datetime(?3)");
+    fn a_chained_value_that_is_not_a_date_matches_nothing() {
+        let value = SearchValue::new(SearchPrefix::Eq, "2024-02-30");
+        let (sql, params) = build_date_condition("t2", &value, 3);
+        assert_eq!(sql, "1 = 0");
+        assert!(params.is_empty());
     }
 }
 

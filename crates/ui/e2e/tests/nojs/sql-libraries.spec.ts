@@ -6,10 +6,12 @@ import { createResource, createSqlQueryLibrary, readResource, waitSearchable } f
 // all inert here — but both the Details JSON textarea and the SQL textarea
 // are plain, visible fields that post together (the JSON one via its
 // `form="lib-editor-form"` attribute, HTML5 form-associated even though it
-// lives outside that `<form>` in the DOM). Save merges them server-side
-// exactly as it does with JavaScript, and `?saved=1` still runs the just-
-// stored Library through $sql-run.
-test("with JavaScript disabled, editing both textareas and saving persists the merged Library and shows results", async ({
+// lives outside that `<form>` in the DOM). Without the client-side sync
+// (#1233/T3, JavaScript-only), the two fields can disagree; Save keeps the
+// Details JSON's own readable `application/sql` attachment over the SQL
+// card in that case, and `?saved=1` runs the just-stored Library — with
+// that effective SQL — through $sql-run.
+test("with JavaScript disabled, editing the Details JSON's SQL attachment wins over a stale SQL card, and Save persists it", async ({
   page,
   request,
 }) => {
@@ -54,8 +56,15 @@ test("with JavaScript disabled, editing both textareas and saving persists the m
 
   const details = JSON.parse(await jsonField.inputValue());
   details.name = "e2e_lib_nojs_renamed";
+  const detailsContent = details.content as Array<{ contentType: string; data: string }>;
+  const detailsSqlAttachment = detailsContent.find((a) => a.contentType === "application/sql");
+  expect(detailsSqlAttachment).toBeTruthy();
+  detailsSqlAttachment!.data = Buffer.from("SELECT id AS pid FROM v").toString("base64");
   await jsonField.fill(JSON.stringify(details, null, 2));
-  await sqlField.fill("SELECT id AS pid FROM v");
+  // The SQL card is left exactly as it loaded — the JSON's own readable
+  // attachment above wins on Save (#1233), so this stale text never reaches
+  // the saved Library.
+  await expect(sqlField).toHaveValue("SELECT id FROM v");
 
   await page.locator("#lib-editor-form button[name='action'][value='save']").click();
   await expect(page).toHaveURL(new RegExp(`lib=${libId}&saved=1`));
@@ -69,6 +78,56 @@ test("with JavaScript disabled, editing both textareas and saving persists the m
   const sqlAttachment = content.find((a) => a.contentType === "application/sql");
   expect(sqlAttachment).toBeTruthy();
   expect(Buffer.from(sqlAttachment!.data, "base64").toString()).toBe("SELECT id AS pid FROM v");
+});
+
+// #1233: the same Details/SQL pair, but the JSON carries no `content` at
+// all — the SQL card is the only source of SQL, so it fills the missing
+// attachment exactly as it did before the JSON-wins merge rule existed.
+test("without JavaScript the SQL card fills a Library whose JSON carries no SQL attachment", async ({
+  page,
+  request,
+}) => {
+  const patientId = await createResource(request, "Patient", {
+    name: [{ family: "LibNojsFillE2E" }],
+  });
+  const canonical = `http://example.org/ViewDefinition/e2e-lib-nojs-fill-${Date.now()}`;
+  await createResource(request, "ViewDefinition", {
+    name: "e2e_lib_nojs_fill_source",
+    url: canonical,
+    status: "active",
+    resource: "Patient",
+    where: [{ path: "name.family = 'LibNojsFillE2E'" }],
+    select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+  });
+  await waitSearchable(request, "Patient", patientId);
+  const libId = await createSqlQueryLibrary(
+    request,
+    `e2e_lib_nojs_fill_${Date.now()}`,
+    canonical,
+    "SELECT id FROM v",
+  );
+  await waitSearchable(request, "Library", libId);
+
+  await page.goto(`/ui/sql/queries?lib=${libId}`);
+
+  const jsonField = page.locator("textarea[name='json']");
+  const sqlField = page.locator("textarea[name='sql']");
+
+  const details = JSON.parse(await jsonField.inputValue());
+  delete details.content;
+  await jsonField.fill(JSON.stringify(details, null, 2));
+  await sqlField.fill("SELECT id AS pid2 FROM v");
+
+  await page.locator("#lib-editor-form button[name='action'][value='save']").click();
+  await expect(page).toHaveURL(new RegExp(`lib=${libId}&saved=1`));
+  await expect(page.locator(".notice", { hasText: "Saved." })).toBeVisible();
+  await expect(page.locator("#run-results .data-table th")).toHaveText(["pid2"]);
+
+  const saved = await readResource(request, "Library", libId);
+  const content = saved.content as Array<{ contentType: string; data: string }>;
+  const sqlAttachment = content.find((a) => a.contentType === "application/sql");
+  expect(sqlAttachment).toBeTruthy();
+  expect(Buffer.from(sqlAttachment!.data, "base64").toString()).toBe("SELECT id AS pid2 FROM v");
 });
 
 // Parameters card (#841) with JavaScript disabled: `<details>`/`<summary>`
@@ -196,7 +255,11 @@ test("with JavaScript disabled, Add table with a typed ViewDefinition reference 
 // so `?…&saved=1`'s own server-side render is what shows the lint — the
 // same notice and red row a live `/run` fragment would, plus the one
 // affordance a no-JS visitor has no other way to reach: *Add table* opens
-// itself, alias already the unknown table's own name.
+// itself, alias already the unknown table's own name. The unknown SQL is
+// introduced through the Details JSON's own `application/sql` attachment,
+// not the SQL card (#1233: without the client-side sync, the JSON's own
+// readable attachment wins on Save, so editing the card alone here would
+// be silently ignored) — the SQL card is left untouched.
 test("with JavaScript disabled, saving a SQL that reads an unknown table shows the lint, the red row, and pre-fills Add table", async ({
   page,
   request,
@@ -218,7 +281,16 @@ test("with JavaScript disabled, saving a SQL that reads an unknown table shows t
   await waitSearchable(request, "Library", libId);
 
   await page.goto(`/ui/sql/queries?lib=${libId}`);
-  await page.locator("textarea[name='sql']").fill("SELECT id FROM vv");
+  const jsonField = page.locator("textarea[name='json']");
+  const details = JSON.parse(await jsonField.inputValue());
+  const detailsContent = details.content as Array<{ contentType: string; data: string }>;
+  const detailsSqlAttachment = detailsContent.find((a) => a.contentType === "application/sql");
+  expect(detailsSqlAttachment).toBeTruthy();
+  detailsSqlAttachment!.data = Buffer.from("SELECT id FROM vv").toString("base64");
+  await jsonField.fill(JSON.stringify(details, null, 2));
+  // The SQL card is left untouched — the JSON's own readable attachment
+  // above is what Save persists (#1233).
+  await expect(page.locator("textarea[name='sql']")).toHaveValue("SELECT id FROM v");
   await page.locator("#lib-editor-form button[name='action'][value='save']").click();
   await expect(page).toHaveURL(new RegExp(`lib=${libId}&saved=1`));
 

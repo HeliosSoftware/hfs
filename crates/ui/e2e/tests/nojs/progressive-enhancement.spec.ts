@@ -471,7 +471,9 @@ test("Bulk Export lifecycle works without JavaScript", async ({ page }) => {
 // is today — visible, holding the decoded SQL, editable, and saved by a
 // real form POST. #839: there is no Run link at all, and Save's own
 // redirect runs the saved SQL server-side, so the results table appears
-// with no client-side request.
+// with no client-side request. #1233: without JavaScript the Details
+// JSON's own readable `application/sql` attachment is what Save persists,
+// so this test edits `content[].data` there rather than the SQL textarea.
 test("the SQL Queries pane is a plain textarea and Save shows the saved SQL's results without JavaScript", async ({
   page,
   request,
@@ -523,7 +525,16 @@ test("the SQL Queries pane is a plain textarea and Save shows the saved SQL's re
   await expect(page.locator("a[href*='run=1']")).toHaveCount(0);
 
   const updated = "SELECT family FROM v";
-  await textarea.fill(updated);
+  const jsonField = page.locator("textarea[name='json']");
+  const details = JSON.parse(await jsonField.inputValue());
+  const detailsContent = details.content as Array<{ contentType: string; data: string }>;
+  const detailsSqlAttachment = detailsContent.find((a) => a.contentType === "application/sql");
+  expect(detailsSqlAttachment).toBeTruthy();
+  detailsSqlAttachment!.data = Buffer.from(updated).toString("base64");
+  await jsonField.fill(JSON.stringify(details, null, 2));
+  // The SQL card is left exactly as it loaded — the JSON's own readable
+  // attachment above is what Save persists (#1233).
+  await expect(textarea).toHaveValue(sql);
   await page.locator("button[name='action'][value='save']").click();
   await expect(page).toHaveURL(/saved=1/);
   await expect(page.locator("textarea[name='sql']")).toHaveValue(updated);
