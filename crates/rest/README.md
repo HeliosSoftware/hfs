@@ -145,6 +145,9 @@ the background and is polled via `/$reindex-status/[job_id]`.
   rejected the document itself — for Elasticsearch, a resource over
   `HFS_ELASTICSEARCH_NESTED_OBJECTS_LIMIT` (#1050) — which a rerun cannot fix.
   A job that fails as a whole also carries `errorMessage`.
+- `startedAt` and `completedAt` (`valueDateTime`) appear once the job has
+  started and ended; their difference is how long the rebuild took. The same
+  applies to the automatic rebuild after a deferred-indexing `$bulk-submit`.
 - The `s3` backend standalone has no search index of any kind, so `$reindex`
   there returns `501`. Every other backend and composite supports it.
 - On standalone PostgreSQL, `$reindex` rewrites the index in groups of up to
