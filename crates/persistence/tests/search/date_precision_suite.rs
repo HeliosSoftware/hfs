@@ -65,6 +65,17 @@ const CASES: &[(&str, &[&str])] = &[
     ("gt2013-04-05T09:20-04:00", &["dp-fraction"]),
     ("le2013-04-05T09:20-04:00", &["dp-minute"]),
     // A fraction is matched at the fraction.
+    ("2013-04-05T23:30:00.1-04:00", &["dp-fraction"]),
+    ("eq2013-04-05T23:30:00.12-04:00", &["dp-fraction"]),
+    ("ne2013-04-05T23:30:00.1-04:00", &["dp-minute"]),
+    ("gt2013-04-05T23:30:00.1-04:00", &[]),
+    ("sa2013-04-05T23:30:00.12-04:00", &[]),
+    (
+        "le2013-04-05T23:30:00.12-04:00",
+        &["dp-fraction", "dp-minute"],
+    ),
+    ("2013-04-05T23:30:00.0-04:00", &[]),
+    ("2013-04-05T23:30:00.13-04:00", &[]),
     ("2013-04-05T23:30:00.123-04:00", &["dp-fraction"]),
     ("2013-04-05T23:30:00.124-04:00", &[]),
     // The same instant named in another zone, `+` encoded properly …
@@ -176,20 +187,23 @@ where
     }
 
     // `_lastUpdated` takes the same values through each backend's dedicated
-    // builder. A resource's own `meta.lastUpdated`, cut to the second or to
-    // the millisecond, must find it — the stored value is finer than either.
+    // builder. A resource's own `meta.lastUpdated`, cut to the second or a
+    // fraction of it, must find it. The stored value is finer than those cuts.
     let stored = backend
         .read(&tenant, "Procedure", FRACTION.0)
         .await
         .expect("read back")
         .expect("seeded procedure exists");
     let last_updated = stored.last_modified();
-    for format in [
-        "%Y-%m-%dT%H:%M:%SZ",
-        "%Y-%m-%dT%H:%M:%S%.3fZ",
-        "%Y-%m-%dT%H:%MZ",
+    let second = last_updated.format("%Y-%m-%dT%H:%M:%S");
+    let nanos = last_updated.timestamp_subsec_nanos();
+    for value in [
+        last_updated.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        format!("{second}.{}Z", nanos / 100_000_000),
+        format!("{second}.{:02}Z", nanos / 10_000_000),
+        last_updated.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+        last_updated.format("%Y-%m-%dT%H:%MZ").to_string(),
     ] {
-        let value = last_updated.format(format).to_string();
         for prefix in ["", "eq", "ge", "le"] {
             let hits = matched(
                 backend,
