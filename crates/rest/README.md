@@ -669,8 +669,8 @@ and an unusable value does not apply.
   `BundleEntry.if_none_match`; no handler or backend reads it.
 - `ifNoneExist` — **supported** on `POST` entries, in both `batch` and
   `transaction` bundles, on every backend that implements `ConditionalStorage`
-  (SQLite, PostgreSQL, MongoDB; S3's implementation is a stub and answers `501`
-  per entry). The value is passed to storage verbatim, as the `If-None-Exist`
+  (SQLite, PostgreSQL, MongoDB; on S3 only `_id` and `identifier` criteria, by
+  scan — anything else is a `400` per entry, #1435). The value is passed to storage verbatim, as the `If-None-Exist`
   header is. No match creates (`201`); one match answers `200` with the existing
   resource and its `location`, so a `urn:uuid` reference to that entry resolves to
   the match; several matches answer `412 multiple-matches`. In a transaction the

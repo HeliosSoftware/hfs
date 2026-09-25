@@ -10,6 +10,7 @@ mod bulk_provider;
 mod bulk_submit;
 mod bundle;
 mod client;
+mod conditional;
 mod config;
 mod keyspace;
 mod models;
