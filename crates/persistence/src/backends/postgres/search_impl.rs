@@ -649,6 +649,7 @@ impl SearchProvider for PostgresBackend {
         for param in &search_params {
             match param {
                 SqlParam::Text(value) => params.push(Box::new(value.clone())),
+                SqlParam::TextArray(ids) => params.push(Box::new(ids.clone())),
                 SqlParam::Float(value) => params.push(Box::new(*value)),
                 SqlParam::Integer(value) => params.push(Box::new(*value)),
                 SqlParam::Bool(value) => params.push(Box::new(*value)),
