@@ -2,7 +2,7 @@
 
 HFS keeps two kinds of index on the `search_index` collection.
 
-- **Inline** indexes (`idx_search_composite`, `idx_search_resource`) are created at every boot before the server serves. They are cheap to build.
+- **Inline** indexes (`idx_search_composite`, `idx_search_resource`, `idx_search_composite_slot_probe`) are created at every boot before the server serves. The slot probe index is partial and includes only composite rows.
 - **Generation 4** is the current generation: nine partial value indexes (`idx_search_date_v3` and eight named `idx_search_*_v2`), built by HFS **after** boot in one `createIndexes` command that scans the collection once, plus contained rows living in their own collection since generation 3 (see "Contained rows" below) rather than a partial index on `search_index`. MongoDB 4.2 and later do not block reads or writes during the value-index build. When every generation-2 value index is ready, HFS drops the nine generation-1 value indexes (`idx_search_string`, `idx_search_token`, ...); once the contained-row move is also done, HFS records `search_indexes.generation: 4` in the `schema_version` document.
 
 Why: a generation-1 value index carried one entry for every row of the collection, even rows that had no value of that type, and no value index carried `resource_id`, so every search fetched one document per matching key. Generation-2 indexes are partial (one entry per row that has the value) and end in `resource_id`, so a value-filtered scan is covered. Issues #1059 and #1084 have the measurements.
@@ -39,7 +39,7 @@ If a generation-2 name exists with a different key spec, HFS refuses to build or
 
 ## Contained rows (generation 3)
 
-Rows extracted from a resource's `contained` entries live in their own collection, `search_index_contained` (#1160). A standard search reads only `search_index`, so it can no longer match a container through a same-type contained resource; `_contained=true|both` searches read `search_index_contained`. Its two indexes are created inline at every boot, so running the script below is optional; it exists for operators who prefer to bootstrap a fresh database by script before first boot:
+Rows extracted from a resource's `contained` entries live in their own collection, `search_index_contained` (#1160). A standard search reads only `search_index`, so it can no longer match a container through a same-type contained resource; `_contained=true|both` searches read `search_index_contained`. Its three indexes are created inline at every boot, so running the script below is optional; it exists for operators who prefer to bootstrap a fresh database by script before first boot:
 
     mongosh "$HFS_MONGODB_URL/$HFS_MONGODB_DATABASE" docs/mongodb/search-index-contained.mongosh.js
 
@@ -63,10 +63,24 @@ All four scripts are generated from `crates/persistence/src/backends/mongodb/sea
 
 ## Composite parameters
 
-Composite search (`code-value-quantity`, `component-code-value-quantity`, ...) needs no index of its own (#1206). The extractor writes one `search_index` row per component value, all sharing `param_name` = the composite's own code and a `composite_group` (the base-instance index) — the same layout the generation-2 value indexes already cover per component type, so a component predicate is index-bounded exactly like a plain parameter of that type.
+Composite search (`code-value-quantity`, `component-code-value-quantity`, ...) uses the existing value indexes for matching (#1206). The extractor writes one row per component value in `search_index`, or in `search_index_contained` for a contained resource. Rows in one composite instance share `param_name` (the composite's code) and `composite_group` (the base-instance index). Each row also has a `composite_slot`, the component's position among components of the same type. The existing value indexes bound each component predicate by its type and value.
 
-The driver arm for a composite value is its most selective component's filter (lowest probe count); a resource that matches the driver arm has only proven *one* component, so every batch of candidates is re-checked by fetching `(resource_id, composite_group)` pairs per component, bounded to that batch, and intersecting them — a resource matches only if every component is satisfied by a row in the *same* `composite_group`. This mirrors SQLite's `GROUP BY resource_id, composite_group HAVING ...`.
+For standard searches, the driver arm is the component filter with the lowest probe count. Each candidate batch is then checked against the other components within the same `composite_group`. Contained searches group matching rows by contained entity and `composite_group`. When components share a type, both paths require the matching `composite_slot`, so `A$B` does not match rows for `B$A`. SQLite also groups components by `composite_group`, but its rows have no slot, so same-type components remain ambiguous there. PostgreSQL stores a per-component slot.
 
-Because no slot is stored per component, a composite whose two components share the same type is ambiguous in the rows themselves: 24 of the 46 R4 composites pair two Token components (e.g. `code-value-concept` and `component-code-value-concept`), so a query value `A$B` also matches a resource whose code is `B` and value is `A` — the rows for both components look alike and only differ by which row's `composite_group` they land in, not by which component they came from. SQLite shares this ambiguity (same non-slotted layout); Postgres does not, because it stores a per-component slot.
+Older MongoDB composite rows lack `composite_slot`. A same-type composite query that encounters a matching old row fails with an error asking for `$reindex` rather than silently omitting a match. The preflight probe uses `idx_search_composite_slot_probe` on `search_index` or `idx_search_contained_composite_slot_probe` on `search_index_contained`. Both indexes lead with tenant, searched resource type and parameter name, then `composite_slot`. They include only rows where `composite_group` exists, but retain rows with a missing slot. HFS builds them before serving, including when `HFS_MONGODB_INDEX_BUILD=off`; on a large database, build them ahead of deployment to avoid a longer startup. The contained pre-build script above includes its probe index. To pre-build the standard probe index, run this in `mongosh` against the HFS database:
+
+```javascript
+db.search_index.createIndex(
+  { tenant_id: 1, resource_type: 1, param_name: 1, composite_slot: 1 },
+  {
+    name: "idx_search_composite_slot_probe",
+    partialFilterExpression: { composite_group: { $exists: true } }
+  }
+);
+```
+
+After every writer runs the slot-writing version, send `POST /$reindex` for the affected tenant. With no body, `clearExisting` defaults to `false`; the job rewrites the resources' index rows without clearing the entire tenant index first. The response has a `jobId`. Poll `GET /$reindex-status/{job_id}` on the same server node until its `status` parameter is `completed` and `errorCount` is zero. The operation requires the `system/reindex` scope when authentication is enabled.
+
+Use the tenant-wide route even when the repeated-type parameter belongs to `Observation`. A contained Observation is indexed under its container's resource type, so `POST /Observation/$reindex` does not rebuild its rows when the container is another type. Keep older writers from writing to that tenant during and after the rebuild; they would create rows without slots again.
 
 An arity mismatch — a value with fewer or more `$`-separated parts than the parameter declares (e.g. `code-value-quantity=8302-2`, one part for a two-component parameter) — is a 400 (`InvalidComposite`) on MongoDB. SQLite and Postgres instead return an empty page for the same query.

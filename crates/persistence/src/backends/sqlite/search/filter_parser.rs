@@ -889,6 +889,22 @@ mod date_filter_tests {
         assert!(frag.sql.contains("value_string = ?5"), "{}", frag.sql);
     }
 
+    /// #1392: a two-digit fraction denotes a hundredth of a second, not a
+    /// millisecond. Since #1391 the bounds are the searched range itself
+    /// rather than a SQL modifier, so the one after it still follows without
+    /// a gap.
+    #[test]
+    fn short_fraction_date_keeps_following_filter_bind() {
+        let expr =
+            FilterParser::parse("date eq 2024-01-01T10:00:00.55Z and status eq completed").unwrap();
+        let frag = FilterSqlGenerator::new(1).generate(&expr);
+        assert_eq!(frag.params.len(), 3);
+        assert!(matches!(&frag.params[0], SqlParam::String(s) if s == "2024-01-01 10:00:00.550"));
+        assert!(matches!(&frag.params[1], SqlParam::String(s) if s == "2024-01-01 10:00:00.560"));
+        assert!(matches!(&frag.params[2], SqlParam::String(s) if s == "completed"));
+        assert!(frag.sql.contains("value_token_code = ?4"), "{}", frag.sql);
+    }
+
     /// Non-date columns keep the plain text operators.
     #[test]
     fn filter_strings_keep_text_operators() {

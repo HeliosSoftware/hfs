@@ -939,6 +939,29 @@ mod es_integration {
         backend
     }
 
+    /// A backend with a small `max_result_window` (10) and stable refresh, so
+    /// the #1407 over-window `_contained` test walks more than one round of
+    /// hits. The UUID prefix keeps its indices apart from every other test.
+    async fn create_backend_with_window() -> ElasticsearchBackend {
+        let es = shared_es().await;
+        let config = ElasticsearchConfig {
+            nodes: vec![format!("http://{}:{}", es.host, es.port)],
+            index_prefix: format!("hfs_{}", uuid::Uuid::new_v4().simple()),
+            number_of_replicas: 0,
+            refresh_interval: "1ms".to_string(),
+            write_refresh: WriteRefreshPolicy::WaitFor,
+            max_result_window: 10,
+            ..Default::default()
+        };
+        let backend = ElasticsearchBackend::with_shared_registry(config, build_search_registry())
+            .expect("Failed to create ElasticsearchBackend");
+        backend
+            .initialize()
+            .await
+            .expect("Failed to initialize ES backend");
+        backend
+    }
+
     fn create_tenant(id: &str) -> TenantContext {
         TenantContext::new(TenantId::new(id), TenantPermissions::full_access())
     }
@@ -1069,6 +1092,20 @@ mod es_integration {
     async fn es_contained_sort_and_id_only_contained() {
         let backend = create_backend().await;
         super::contained_suite::sort_and_id_only_contained(&backend, "contained-sort-1407").await;
+    }
+
+    /// #1407: `_contained` walks every hit past `max_result_window` (10 here,
+    /// 16 contained documents seeded): the list, `_total`, `search_count` and
+    /// the `_count`/`_offset` pages agree, and one container's hits split
+    /// across rounds collapse to a single entry.
+    #[tokio::test]
+    async fn es_contained_past_window_lists_every_contained_hit() {
+        let backend = create_backend_with_window().await;
+        super::contained_suite::past_window_lists_every_contained_hit(
+            &backend,
+            "contained-window-1407",
+        )
+        .await;
     }
 
     /// #1337: `1e2` is one significant figure, `[50, 150)`.

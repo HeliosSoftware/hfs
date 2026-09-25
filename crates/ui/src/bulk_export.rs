@@ -535,28 +535,44 @@ fn public_status_url(
 }
 
 /// Forwards the caller's credentials and tenant onto a self-call, so the
-/// export runs as the user who asked for it. When the browser sent no
-/// `Authorization` the process's outbound service credential is used instead
-/// (#1438): every request here targets this server, never a third party.
+/// export runs as the user who asked for it: the browser's own
+/// `Authorization` when it sent one; else the signed-in session's bearer
+/// (#1480) — a browser signed in through the web UI carries the session
+/// cookie, not a header, and its exports must still run as that user; else
+/// the process's outbound service credential (#1438). Every request here
+/// targets this server, never a third party.
 pub(crate) async fn forward_identity(
     state: &WebState,
-    mut request: reqwest::RequestBuilder,
+    request: reqwest::RequestBuilder,
     headers: &HeaderMap,
     tenant: &str,
     audience: &str,
 ) -> Result<reqwest::RequestBuilder, String> {
-    match headers.get("authorization").and_then(|v| v.to_str().ok()) {
-        Some(auth) => request = request.header("Authorization", auth),
-        None => {
-            request = state
-                .outbound_auth
-                .authorize(request, audience)
-                .await
-                .map_err(|e| format!("outbound credential unavailable: {e}"))?;
-        }
+    let request = forward_credential(state, request, headers, audience).await?;
+    Ok(request.header("X-Tenant-ID", tenant))
+}
+
+/// The credential half of [`forward_identity`]: the browser's own
+/// `Authorization`, else the signed-in session's bearer, else the process's
+/// outbound service credential. Shared with the Import page, whose
+/// self-calls set their tenant themselves.
+pub(crate) async fn forward_credential(
+    state: &WebState,
+    request: reqwest::RequestBuilder,
+    headers: &HeaderMap,
+    audience: &str,
+) -> Result<reqwest::RequestBuilder, String> {
+    if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+        return Ok(request.header("Authorization", auth));
     }
-    request = request.header("X-Tenant-ID", tenant);
-    Ok(request)
+    if let Some(bearer) = crate::login::session_authorization(state, headers).await {
+        return Ok(request.header("Authorization", bearer));
+    }
+    state
+        .outbound_auth
+        .authorize(request, audience)
+        .await
+        .map_err(|e| format!("outbound credential unavailable: {e}"))
 }
 
 // ---------------------------------------------------------------------------
