@@ -12,7 +12,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 42;
+pub const SCHEMA_VERSION: i32 = 44;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -400,6 +400,19 @@ async fn migrate_schema(
                 // The helper writes the v42 marker inside its own transaction,
                 // like v37, so the common loop must not stamp it again.
                 migrate_v41_to_v42(client).await?;
+                version += 1;
+                continue;
+            }
+            42 => {
+                // Same as v42: the helper commits its own marker.
+                migrate_v42_to_v43(client).await?;
+                version += 1;
+                continue;
+            }
+            43 => {
+                // The helper writes the v44 marker inside its own transaction,
+                // like v43, so the common loop must not stamp it again.
+                migrate_v43_to_v44(client).await?;
                 version += 1;
                 continue;
             }
@@ -3842,7 +3855,141 @@ async fn migrate_v41_to_v42(client: &mut deadpool_postgres::Client) -> StorageRe
     Ok(())
 }
 
-/// Best-effort `ANALYZE search_index` after the v42 index build.
+/// The instant `value_date_end` stores for an open-ended `Period` and clamps
+/// every other end to: [`open_end`](crate::search::open_end) at microsecond
+/// resolution, the last instant the shared date layer supports.
+const OPEN_END_SQL: &str = "TIMESTAMPTZ '9999-12-31 23:59:59.999999+00'";
+
+/// v42 -> v43: store every date as a range `[value_date, value_date_end)`
+/// (#1391).
+///
+/// A `Period` used to be indexed as two unrelated rows, one per bound, and each
+/// search prefix was decided per row: `date=2020` matched a period that only
+/// started or ended in 2020, `sa2020` matched on the end alone, and an
+/// open-ended period was a single instant. The writer now stores one row per
+/// date value carrying both bounds — a point covers one unit of its own
+/// precision, a `Period` runs to the end of its `end`, and an open end is
+/// stored as the supported limit ([`OPEN_END_SQL`], or year 1 for a missing
+/// start) rather than `NULL`, so `NULL` keeps meaning "no row".
+///
+/// ## Backfill
+///
+/// Every existing date row gets the end of its own precision, computed in UTC
+/// so the session `TimeZone` cannot move a month or day boundary. That is
+/// exact for every point value. It is **not** a repair of `Period`s: those rows
+/// were written as two points and stay two points until the resource is
+/// re-extracted — run `$reindex` after upgrading to index them as ranges. A
+/// fraction-of-a-second value was recorded as `millisecond` whatever its
+/// length, so its backfilled end is one millisecond on. Rows without a
+/// precision (composite components, which are compared as points on
+/// `value_date` alone) get one microsecond.
+///
+/// ## Indexes
+///
+/// - `idx_search_date` and `idx_search_date_recent` carry `value_date_end` in
+///   their payload, so the end filter of `eq`/`eb`/`ne` stays index-only on the
+///   value-first seek and on the fast path's recent-first scan.
+/// - `idx_search_date_end` is new, keyed on the end: `gt` is `value_date_end >
+///   x` with no bound on the start, and without it a sparse or empty `gt` (the
+///   benchmark's `date=gt2070-01-01`) would walk the whole parameter slice
+///   instead of seeking — see `open_range_needs_empty_guard` in `search_impl.rs`
+///   for why that matters. It is partial on `value_date_end IS NOT NULL`, not
+///   on `value_date`: the emitted `gt` predicate is `value_date_end > $n` and
+///   nothing else, which implies the former and not the latter, and PostgreSQL
+///   only uses a partial index whose predicate the query implies. Keyed on
+///   `value_date`, the index was never chosen (`idx_scan = 0`) and `gt` fell
+///   back to a sequential scan of the whole table (measured: 600k date rows,
+///   sparse `gt`, 40 ms -> 0.1 ms with the fix).
+/// - A multivariate statistic on the end mirrors v16's on `value_date`.
+///
+/// ## Lock / cost / recovery
+///
+/// As v42: one transaction with `statement_timeout = 0`, the marker written
+/// inside it, so a failure rolls everything back and the next startup retries.
+/// The `UPDATE` rewrites every date row, and the three index builds take a
+/// `SHARE` lock that blocks writes; budget a write pause proportional to the
+/// number of date rows. The best-effort `ANALYZE` runs after commit.
+async fn migrate_v42_to_v43(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|e| pg_error(format!("begin v43 migration: {e}")))?;
+    tx.execute("SET LOCAL statement_timeout = 0", &[])
+        .await
+        .map_err(|e| pg_error(format!("disable statement timeout for v43 migration: {e}")))?;
+
+    let utc_plus = |interval: &str| {
+        format!("(value_date AT TIME ZONE 'UTC' + INTERVAL '{interval}') AT TIME ZONE 'UTC'")
+    };
+    let backfill = format!(
+        "UPDATE search_index SET value_date_end = LEAST(
+             CASE value_date_precision
+                 WHEN 'year' THEN {year}
+                 WHEN 'month' THEN {month}
+                 WHEN 'day' THEN {day}
+                 WHEN 'hour' THEN {hour}
+                 WHEN 'minute' THEN {minute}
+                 WHEN 'second' THEN {second}
+                 WHEN 'millisecond' THEN {millisecond}
+                 ELSE value_date + INTERVAL '1 microsecond'
+             END,
+             {open_end})
+         WHERE value_date IS NOT NULL AND value_date_end IS NULL",
+        year = utc_plus("1 year"),
+        month = utc_plus("1 month"),
+        day = utc_plus("1 day"),
+        hour = utc_plus("1 hour"),
+        minute = utc_plus("1 minute"),
+        second = utc_plus("1 second"),
+        millisecond = utc_plus("1 millisecond"),
+        open_end = OPEN_END_SQL,
+    );
+    let statements = [
+        "ALTER TABLE search_index ADD COLUMN IF NOT EXISTS value_date_end TIMESTAMPTZ".to_string(),
+        backfill,
+        "DROP INDEX IF EXISTS idx_search_date".to_string(),
+        "CREATE INDEX idx_search_date
+         ON search_index (tenant_id, resource_type, param_name, value_date)
+         INCLUDE (resource_id, last_updated, value_date_end)
+         WHERE value_date IS NOT NULL"
+            .to_string(),
+        "DROP INDEX IF EXISTS idx_search_date_recent".to_string(),
+        "CREATE INDEX idx_search_date_recent
+         ON search_index (tenant_id, resource_type, param_name, last_updated DESC, resource_id ASC)
+         INCLUDE (value_date, value_date_end)
+         WHERE value_date IS NOT NULL"
+            .to_string(),
+        "DROP INDEX IF EXISTS idx_search_date_end".to_string(),
+        "CREATE INDEX idx_search_date_end
+         ON search_index (tenant_id, resource_type, param_name, value_date_end)
+         INCLUDE (resource_id, last_updated)
+         WHERE value_date_end IS NOT NULL"
+            .to_string(),
+        "CREATE STATISTICS IF NOT EXISTS stx_search_type_param_date_end (mcv, dependencies)
+         ON resource_type, param_name, value_date_end FROM search_index"
+            .to_string(),
+    ];
+    for sql in &statements {
+        tx.execute(sql.as_str(), &[])
+            .await
+            .map_err(|e| pg_error(format!("Migration v42->v43 failed: {e}")))?;
+    }
+    set_schema_version(&tx, 43).await?;
+    tx.commit()
+        .await
+        .map_err(|e| pg_error(format!("commit v43 migration: {e}")))?;
+
+    if let Err(e) = analyze_search_index_with_timeout(client, POST_MIGRATION_ANALYZE_TIMEOUT).await
+    {
+        tracing::warn!(
+            "Migration v42->v43: optional ANALYZE failed ({e}); plans may use default estimates until autovacuum runs"
+        );
+    }
+
+    Ok(())
+}
+
+/// Best-effort `ANALYZE search_index` after a migration's index build.
 async fn analyze_search_index_with_timeout(
     client: &mut deadpool_postgres::Client,
     timeout: &str,
@@ -3850,19 +3997,61 @@ async fn analyze_search_index_with_timeout(
     let tx = client
         .transaction()
         .await
-        .map_err(|e| pg_error(format!("begin v42 analyze: {e}")))?;
+        .map_err(|e| pg_error(format!("begin post-migration analyze: {e}")))?;
     tx.query_one(
         "SELECT set_config('statement_timeout', $1, true)",
         &[&timeout],
     )
     .await
-    .map_err(|e| pg_error(format!("set timeout for v42 analyze: {e}")))?;
+    .map_err(|e| pg_error(format!("set timeout for post-migration analyze: {e}")))?;
     tx.execute("ANALYZE search_index", &[])
         .await
-        .map_err(|e| pg_error(format!("analyze search_index after v42: {e}")))?;
+        .map_err(|e| pg_error(format!("analyze search_index after migration: {e}")))?;
     tx.commit()
         .await
-        .map_err(|e| pg_error(format!("commit v42 analyze: {e}")))
+        .map_err(|e| pg_error(format!("commit post-migration analyze: {e}")))
+}
+
+/// v43 -> v44: add `login_sessions`, the web UI's interactive login sessions
+/// and the logins still pending at the identity provider (#1481). One JSONB
+/// document per opaque id with a monotonic `version` for conditional writes,
+/// so a session established on one node resolves on every other and outlives
+/// a restart. `kind` keeps sessions and pending logins apart; `expires_at`
+/// drives the sweep. Independent of the FHIR `resources` table, like
+/// `user_settings`.
+///
+/// Runs in its own transaction with `SET LOCAL statement_timeout = 0` and
+/// writes the v44 marker inside it, like v43: a deployment-wide statement
+/// timeout must not be able to cut a migration's DDL short, the setting
+/// reverts at commit, and a failure rolls the table and the marker back
+/// together so the next startup retries the whole step.
+async fn migrate_v43_to_v44(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|e| pg_error(format!("begin v44 migration: {e}")))?;
+    tx.execute("SET LOCAL statement_timeout = 0", &[])
+        .await
+        .map_err(|e| pg_error(format!("disable statement timeout for v44 migration: {e}")))?;
+    tx.batch_execute(
+        "CREATE TABLE IF NOT EXISTS login_sessions (
+            id         TEXT PRIMARY KEY,
+            kind       TEXT NOT NULL,
+            data       JSONB NOT NULL,
+            version    BIGINT NOT NULL DEFAULT 1,
+            expires_at TIMESTAMPTZ NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_login_sessions_expires
+            ON login_sessions (expires_at);",
+    )
+    .await
+    .map_err(|e| pg_error(format!("Migration v43->v44 failed: {e}")))?;
+    set_schema_version(&tx, 44).await?;
+    tx.commit()
+        .await
+        .map_err(|e| pg_error(format!("commit v44 migration: {e}")))?;
+    Ok(())
 }
 
 /// v23 -> v24: drop `fk_search_resource`.
@@ -4592,6 +4781,50 @@ mod postgres_integration_migrations {
             .expect("mark fixture as v41");
         assert_eq!(get_schema_version(&client).await.unwrap(), 41);
         backend
+    }
+
+    /// A database at v42: the current schema with v43's column, indexes and
+    /// statistic taken back out and the two date indexes in their v42 form.
+    async fn create_v42_database(pg: &SharedPg, name: &str) -> PostgresBackend {
+        let backend = create_database(pg, name).await;
+        let mut client = backend.get_client().await.unwrap();
+        initialize_schema(&mut client)
+            .await
+            .expect("initialize current schema fixture");
+        client
+            .batch_execute(
+                "DROP STATISTICS stx_search_type_param_date_end;
+                 DROP INDEX idx_search_date_end;
+                 DROP INDEX idx_search_date;
+                 DROP INDEX idx_search_date_recent;
+                 ALTER TABLE search_index DROP COLUMN value_date_end;
+                 CREATE INDEX idx_search_date
+                 ON search_index (tenant_id, resource_type, param_name, value_date)
+                 INCLUDE (resource_id, last_updated)
+                 WHERE value_date IS NOT NULL;
+                 CREATE INDEX idx_search_date_recent
+                 ON search_index (tenant_id, resource_type, param_name, last_updated DESC, resource_id ASC)
+                 INCLUDE (value_date)
+                 WHERE value_date IS NOT NULL;",
+            )
+            .await
+            .expect("take v43 back out of the fixture");
+        set_schema_version(&client, 42)
+            .await
+            .expect("mark fixture as v42");
+        backend
+    }
+
+    async fn index_definition(client: &deadpool_postgres::Client, name: &str) -> Option<String> {
+        client
+            .query_opt(
+                "SELECT indexdef FROM pg_indexes
+                 WHERE schemaname = current_schema() AND indexname = $1",
+                &[&name],
+            )
+            .await
+            .expect("read index definition")
+            .map(|row| row.get(0))
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -5677,7 +5910,9 @@ mod postgres_integration_migrations {
             "ANALYZE timeout did not bound startup delay: {analyze_elapsed:?}"
         );
         assert!(
-            error.to_string().contains("analyze search_index after v42"),
+            error
+                .to_string()
+                .contains("analyze search_index after migration"),
             "unexpected ANALYZE error: {error}"
         );
         lock_tx
@@ -5759,5 +5994,262 @@ mod postgres_integration_migrations {
             "the retry must build a valid index"
         );
         assert_eq!(statement_timeout(&client).await, "900ms");
+    }
+
+    /// #1391: a sparse `gt` on a date parameter seeks on `idx_search_date_end`.
+    /// The predicate is the one the query builder really emits (`value_date_end
+    /// > $n`, nothing on `value_date`), so this fails if the index's own
+    /// predicate stops being implied by it — PostgreSQL then ignores the index
+    /// and scans the whole table.
+    #[tokio::test]
+    async fn postgres_integration_sparse_gt_seeks_on_the_end_index() {
+        use crate::backends::postgres::search::query_builder::{SqlParam, date_range_predicate};
+        use crate::types::SearchPrefix;
+
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let pg = shared_pg().await;
+        let backend = create_database(
+            pg,
+            &format!("hfs_gt_index_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+        let mut client = backend.get_client().await.unwrap();
+        initialize_schema(&mut client)
+            .await
+            .expect("create the current schema");
+
+        // Enough rows, over several parameters, for the planner to prefer a
+        // seek over a scan for a predicate that matches almost nothing.
+        client
+            .batch_execute(
+                "INSERT INTO search_index
+                   (tenant_id, resource_type, resource_id, param_name, value_date,
+                    value_date_precision, value_date_end, last_updated)
+                 SELECT 'tenant-a', 'Encounter', 'd-' || g, 'date', d, 'day',
+                        d + interval '1 day', now() - (g || ' seconds')::interval
+                   FROM (SELECT g, timestamptz '1950-01-01' + (g % 29000) * interval '1 day' AS d
+                           FROM generate_series(1, 60000) g) s;
+                 INSERT INTO search_index
+                   (tenant_id, resource_type, resource_id, param_name, value_token_code, last_updated)
+                 SELECT 'tenant-a', 'Encounter', 'd-' || g, 'status', 'finished',
+                        now() - (g || ' seconds')::interval
+                   FROM generate_series(1, 60000) g;
+                 ANALYZE search_index;",
+            )
+            .await
+            .expect("seed date and token rows");
+
+        let mut next = 0;
+        let (predicate, params) = date_range_predicate(
+            "value_date",
+            "value_date_end",
+            SearchPrefix::Gt,
+            "2031",
+            &mut next,
+        );
+        let [SqlParam::Timestamp(bound)] = params.as_slice() else {
+            panic!("gt binds one instant, got {params:?}");
+        };
+        let sql = format!(
+            "EXPLAIN (FORMAT JSON)
+             SELECT DISTINCT resource_id, last_updated FROM search_index
+              WHERE tenant_id = 'tenant-a' AND resource_type = 'Encounter'
+                AND param_name = 'date' AND {predicate}
+              ORDER BY last_updated DESC, resource_id ASC LIMIT 21"
+        );
+        let plan: serde_json::Value = client
+            .query_one(sql.as_str(), &[bound])
+            .await
+            .expect("explain the gt query")
+            .get(0);
+        let plan = plan.to_string();
+        assert!(
+            plan.contains("idx_search_date_end"),
+            "a sparse gt must seek on the end index: {plan}"
+        );
+        assert!(
+            !plan.contains("Seq Scan"),
+            "a sparse gt must not scan the table: {plan}"
+        );
+    }
+
+    /// v43 backfills the end of every existing date row from its own
+    /// precision, in UTC whatever the session zone, clamps at the supported
+    /// limit, leaves non-date rows alone, and puts the end on the date indexes.
+    #[tokio::test]
+    async fn postgres_integration_v42_to_v43_backfills_date_range_ends() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let pg = shared_pg().await;
+        let backend = create_v42_database(
+            pg,
+            &format!("hfs_v43_test_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+        let mut client = backend.get_client().await.unwrap();
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .expect("fixture instant")
+                .with_timezone(&Utc)
+        };
+
+        // (id, precision, value_date, expected value_date_end). The day row
+        // is the US spring-forward date: with the session zone below, local
+        // arithmetic would make that day 23 hours long.
+        let rows: &[(&str, Option<&str>, &str, &str)] = &[
+            (
+                "year",
+                Some("year"),
+                "2020-01-01T00:00:00Z",
+                "2021-01-01T00:00:00Z",
+            ),
+            (
+                "month",
+                Some("month"),
+                "2020-02-01T00:00:00Z",
+                "2020-03-01T00:00:00Z",
+            ),
+            (
+                "day",
+                Some("day"),
+                "2020-03-08T00:00:00Z",
+                "2020-03-09T00:00:00Z",
+            ),
+            (
+                "hour",
+                Some("hour"),
+                "2020-03-08T05:00:00Z",
+                "2020-03-08T06:00:00Z",
+            ),
+            (
+                "minute",
+                Some("minute"),
+                "2020-03-08T05:30:00Z",
+                "2020-03-08T05:31:00Z",
+            ),
+            (
+                "second",
+                Some("second"),
+                "2020-03-08T05:30:10Z",
+                "2020-03-08T05:30:11Z",
+            ),
+            (
+                "millisecond",
+                Some("millisecond"),
+                "2020-03-08T05:30:10.123Z",
+                "2020-03-08T05:30:10.124Z",
+            ),
+            (
+                "composite",
+                None,
+                "2020-03-08T05:30:10Z",
+                "2020-03-08T05:30:10.000001Z",
+            ),
+            (
+                "last-year",
+                Some("year"),
+                "9999-01-01T00:00:00Z",
+                "9999-12-31T23:59:59.999999Z",
+            ),
+        ];
+        for (id, precision, value, _) in rows {
+            client
+                .execute(
+                    "INSERT INTO search_index
+                     (tenant_id, resource_type, resource_id, param_name, value_date, value_date_precision)
+                     VALUES ('tenant-a', 'Encounter', $1, 'date', $2, $3)",
+                    &[id, &at(value), precision],
+                )
+                .await
+                .expect("seed a pre-v43 date row");
+        }
+        client
+            .execute(
+                "INSERT INTO search_index
+                 (tenant_id, resource_type, resource_id, param_name, value_token_code)
+                 VALUES ('tenant-a', 'Encounter', 'token', 'status', 'finished')",
+                &[],
+            )
+            .await
+            .expect("seed a pre-v43 token row");
+        client
+            .execute("SET TimeZone = 'America/New_York'", &[])
+            .await
+            .expect("set a zone with DST");
+
+        initialize_schema(&mut client)
+            .await
+            .expect("migrate v42 to v43");
+        assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            column_type(&client, "search_index", "value_date_end")
+                .await
+                .as_deref(),
+            Some("timestamp with time zone")
+        );
+
+        for (id, _, _, expected) in rows {
+            let end: Option<chrono::DateTime<Utc>> = client
+                .query_one(
+                    "SELECT value_date_end FROM search_index WHERE resource_id = $1",
+                    &[id],
+                )
+                .await
+                .expect("read backfilled end")
+                .get(0);
+            assert_eq!(end, Some(at(expected)), "{id}");
+        }
+        let token_end: Option<chrono::DateTime<Utc>> = client
+            .query_one(
+                "SELECT value_date_end FROM search_index WHERE resource_id = 'token'",
+                &[],
+            )
+            .await
+            .expect("read the token row")
+            .get(0);
+        assert_eq!(token_end, None, "a non-date row has no range");
+
+        for (name, include) in [
+            (
+                "idx_search_date",
+                "INCLUDE (resource_id, last_updated, value_date_end)",
+            ),
+            (
+                "idx_search_date_recent",
+                "INCLUDE (value_date, value_date_end)",
+            ),
+            ("idx_search_date_end", "INCLUDE (resource_id, last_updated)"),
+        ] {
+            let definition = index_definition(&client, name)
+                .await
+                .unwrap_or_else(|| panic!("{name} must exist after v43"));
+            assert!(definition.contains(include), "{name}: {definition}");
+            // The end index is partial on the end itself: see the v43 docs.
+            let predicate = if name == "idx_search_date_end" {
+                "WHERE (value_date_end IS NOT NULL)"
+            } else {
+                "WHERE (value_date IS NOT NULL)"
+            };
+            assert!(definition.contains(predicate), "{name}: {definition}");
+        }
+        assert!(
+            index_definition(&client, "idx_search_date_end")
+                .await
+                .is_some_and(|d| d.contains("param_name, value_date_end)")),
+            "idx_search_date_end is keyed on the end"
+        );
+
+        // Idempotent: a restart at v43 migrates nothing and keeps the ends.
+        initialize_schema(&mut client)
+            .await
+            .expect("reinitialize current schema");
+        let backfilled: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM search_index WHERE value_date_end IS NOT NULL",
+                &[],
+            )
+            .await
+            .expect("count backfilled rows")
+            .get(0);
+        assert_eq!(backfilled, rows.len() as i64);
     }
 }

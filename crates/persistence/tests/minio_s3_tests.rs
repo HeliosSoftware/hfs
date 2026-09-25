@@ -38,8 +38,8 @@ use uuid::Uuid;
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
 
-const DEFAULT_MINIO_IMAGE: &str = "quay.io/minio/minio";
-const DEFAULT_MINIO_TAG: &str = "RELEASE.2025-02-28T09-55-16Z";
+const DEFAULT_MINIO_IMAGE: &str = "ghcr.io/coollabsio/minio";
+const DEFAULT_MINIO_TAG: &str = "RELEASE.2025-10-15T17-29-55Z";
 const DEFAULT_MINIO_ROOT_USER: &str = "minioadmin";
 const DEFAULT_MINIO_ROOT_PASSWORD: &str = "minioadmin";
 
@@ -944,6 +944,136 @@ fn unique_user_key(scope: &str) -> String {
         "https://idp.example.com/realms/test|{scope}-{}",
         Uuid::new_v4()
     )
+}
+
+// ── Web UI login sessions (#1481) ──────────────────────────────────────
+
+fn login_session(id: &str) -> helios_auth::PersistedSession {
+    let now = chrono::Utc::now();
+    helios_auth::PersistedSession {
+        id: id.to_string(),
+        principal: helios_auth::SessionPrincipal {
+            subject: "demo-sub".to_string(),
+            issuer: "https://idp".to_string(),
+            name: Some("Demo User".to_string()),
+            preferred_username: None,
+            email: None,
+            picture: None,
+        },
+        access_token: "at-1".to_string(),
+        access_expires_at: now + chrono::TimeDelta::minutes(5),
+        refresh_token: Some("rt-1".to_string()),
+        id_token: None,
+        last_seen: now,
+        created_at: now,
+        version: 0,
+    }
+}
+
+fn pending_login(id: &str) -> helios_auth::PersistedPending {
+    helios_auth::PersistedPending {
+        id: id.to_string(),
+        state: "state-1".to_string(),
+        code_verifier: "verifier-1".to_string(),
+        next: "/ui/resources".to_string(),
+        started_at: chrono::Utc::now(),
+    }
+}
+
+#[tokio::test]
+async fn test_minio_login_session_round_trip_and_conflict() {
+    use helios_auth::{SaveOutcome, SessionPersistence};
+    if skip_if_disabled("test_minio_login_session_round_trip_and_conflict") {
+        return;
+    }
+    let harness = make_prefix_backend("login-session").await;
+    let backend = &harness.backend;
+    let id = format!("s-{}", Uuid::new_v4().simple());
+    assert!(backend.load_session(&id).await.unwrap().is_none());
+
+    assert_eq!(
+        backend
+            .save_session(&login_session(&id), Some(0))
+            .await
+            .unwrap(),
+        SaveOutcome::Saved(1)
+    );
+    let loaded = backend.load_session(&id).await.unwrap().unwrap();
+    assert_eq!(loaded.version, 1);
+    assert_eq!(loaded.access_token, "at-1");
+    assert_eq!(loaded.principal.display(), "Demo User");
+
+    let mut stale = login_session(&id);
+    stale.access_token = "at-stale".to_string();
+    assert_eq!(
+        backend.save_session(&stale, Some(0)).await.unwrap(),
+        SaveOutcome::Conflict { current: 1 }
+    );
+    assert_eq!(
+        backend.save_session(&stale, Some(7)).await.unwrap(),
+        SaveOutcome::Conflict { current: 1 }
+    );
+    let missing = format!("s-{}", Uuid::new_v4().simple());
+    assert_eq!(
+        backend
+            .save_session(&login_session(&missing), Some(1))
+            .await
+            .unwrap(),
+        SaveOutcome::Conflict { current: 0 }
+    );
+
+    let mut newer = loaded.clone();
+    newer.access_token = "at-2".to_string();
+    assert_eq!(
+        backend.save_session(&newer, Some(1)).await.unwrap(),
+        SaveOutcome::Saved(2)
+    );
+    assert_eq!(
+        backend.save_session(&newer, None).await.unwrap(),
+        SaveOutcome::Saved(3)
+    );
+    assert_eq!(
+        backend
+            .load_session(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .access_token,
+        "at-2"
+    );
+
+    // A fresh object survives the sweep.
+    backend.sweep(chrono::Utc::now()).await.unwrap();
+    assert!(backend.load_session(&id).await.unwrap().is_some());
+
+    backend.delete_session(&id).await.unwrap();
+    assert!(backend.load_session(&id).await.unwrap().is_none());
+    backend.delete_session(&id).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_minio_pending_login_is_consumed_exactly_once() {
+    use helios_auth::SessionPersistence;
+    if skip_if_disabled("test_minio_pending_login_is_consumed_exactly_once") {
+        return;
+    }
+    let harness = make_prefix_backend("login-pending").await;
+    let backend = &harness.backend;
+    let id = format!("p-{}", Uuid::new_v4().simple());
+    assert!(!backend.delete_pending(&id).await.unwrap());
+
+    backend.save_pending(&pending_login(&id)).await.unwrap();
+    let loaded = backend.load_pending(&id).await.unwrap().unwrap();
+    assert_eq!(loaded.state, "state-1");
+    assert_eq!(loaded.next, "/ui/resources");
+    assert!(
+        backend.load_session(&id).await.unwrap().is_none(),
+        "a pending id is never a session"
+    );
+
+    assert!(backend.delete_pending(&id).await.unwrap());
+    assert!(!backend.delete_pending(&id).await.unwrap());
+    assert!(backend.load_pending(&id).await.unwrap().is_none());
 }
 
 #[tokio::test]

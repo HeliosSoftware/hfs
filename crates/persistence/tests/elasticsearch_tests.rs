@@ -664,10 +664,25 @@ mod date_boundary_suite;
 #[path = "search/date_precision_suite.rs"]
 mod date_precision_suite;
 
+/// The backend-agnostic suite for Period and Timing range targets (#1391).
+/// Same `#[path]` arrangement.
+#[path = "search/date_period_suite.rs"]
+mod date_period_suite;
+
 /// The backend-agnostic `_contained` suite (#1336, #1362, #1363). Same
 /// `#[path]` arrangement.
 #[path = "search/contained_suite.rs"]
 mod contained_suite;
+
+/// The backend-agnostic `ap` prefix suite for number and quantity
+/// (#1390). Same `#[path]` arrangement.
+#[path = "search/ap_prefix_suite.rs"]
+mod ap_prefix_suite;
+
+/// The backend-agnostic `ap` suite for quantity composites
+/// (#1390). Same `#[path]` arrangement.
+#[path = "search/ap_relations_suite.rs"]
+mod ap_relations_suite;
 
 /// The backend-agnostic suite for exponent-form number and quantity search
 /// values (#1337). Same `#[path]` arrangement.
@@ -934,6 +949,29 @@ mod es_integration {
         backend
     }
 
+    /// A backend with a small `max_result_window` (10) and stable refresh, so
+    /// the #1407 over-window `_contained` test walks more than one round of
+    /// hits. The UUID prefix keeps its indices apart from every other test.
+    async fn create_backend_with_window() -> ElasticsearchBackend {
+        let es = shared_es().await;
+        let config = ElasticsearchConfig {
+            nodes: vec![format!("http://{}:{}", es.host, es.port)],
+            index_prefix: format!("hfs_{}", uuid::Uuid::new_v4().simple()),
+            number_of_replicas: 0,
+            refresh_interval: "1ms".to_string(),
+            write_refresh: WriteRefreshPolicy::WaitFor,
+            max_result_window: 10,
+            ..Default::default()
+        };
+        let backend = ElasticsearchBackend::with_shared_registry(config, build_search_registry())
+            .expect("Failed to create ElasticsearchBackend");
+        backend
+            .initialize()
+            .await
+            .expect("Failed to initialize ES backend");
+        backend
+    }
+
     fn create_tenant(id: &str) -> TenantContext {
         TenantContext::new(TenantId::new(id), TenantPermissions::full_access())
     }
@@ -1015,6 +1053,15 @@ mod es_integration {
         .await;
     }
 
+    /// #1391: a Period was indexed as two unrelated points, so `eq`/`ap`
+    /// over-matched, `sa`/`eb` could match on the wrong end and an open end
+    /// was an instant. It is one nested `{value, end}` range now.
+    #[tokio::test]
+    async fn es_date_period_targets_are_ranges() {
+        let backend = create_backend().await;
+        super::date_period_suite::period_targets_are_ranges(&backend, "date-period-1391").await;
+    }
+
     /// #1362: every contained resource is a document of its own here, so a
     /// repeated parameter is two clauses on one document.
     #[tokio::test]
@@ -1057,6 +1104,20 @@ mod es_integration {
         super::contained_suite::sort_and_id_only_contained(&backend, "contained-sort-1407").await;
     }
 
+    /// #1407: `_contained` walks every hit past `max_result_window` (10 here,
+    /// 16 contained documents seeded): the list, `_total`, `search_count` and
+    /// the `_count`/`_offset` pages agree, and one container's hits split
+    /// across rounds collapse to a single entry.
+    #[tokio::test]
+    async fn es_contained_past_window_lists_every_contained_hit() {
+        let backend = create_backend_with_window().await;
+        super::contained_suite::past_window_lists_every_contained_hit(
+            &backend,
+            "contained-window-1407",
+        )
+        .await;
+    }
+
     /// #1337: `1e2` is one significant figure, `[50, 150)`.
     #[tokio::test]
     async fn es_exponent_values_use_significant_figures() {
@@ -1067,6 +1128,20 @@ mod es_integration {
             true,
         )
         .await;
+    }
+
+    /// #1390: one number/quantity `ap` window, shared by every backend.
+    #[tokio::test]
+    async fn es_ap_prefix_suite() {
+        let backend = create_backend().await;
+        super::ap_prefix_suite::ap_prefix(&backend, "ap-prefix-1390", true).await;
+    }
+
+    /// #1390: `ap` in the quantity component of a composite.
+    #[tokio::test]
+    async fn es_ap_composite() {
+        let backend = create_backend().await;
+        super::ap_relations_suite::ap_composite(&backend, "ap-composite-1390").await;
     }
 
     /// #1340: a number that did not parse made the handler return `None`,
@@ -1089,7 +1164,6 @@ mod es_integration {
         super::token_code_system_suite::system_qualified_tokens_match_code_elements(
             &backend,
             "token-code-system-1379",
-            true,
         )
         .await;
     }
@@ -1282,7 +1356,9 @@ mod es_integration {
             .await
             .expect("a bad date must not fail the write");
 
-        // A Period with one bad end: the other end still indexes.
+        // A Period with one bad end is skipped whole (#1391): it is one range,
+        // and reading the bad end as open would match every range before or
+        // after the good one. The resource itself still indexes.
         backend
             .create(
                 &tenant,
@@ -1370,31 +1446,24 @@ mod es_integration {
             .await,
             one("bad-period-start"),
         );
-        assert_eq!(
-            found_ids(
-                &backend,
-                &tenant,
-                &param_query("Encounter", &[("date", Date, "2024-03-15")])
-            )
-            .await,
-            one("bad-period-start"),
-            "the valid end of the Period is indexed"
-        );
-        assert!(
-            found_ids(
-                &backend,
-                &tenant,
-                &param_query("Encounter", &[("date", Date, "lt2024-03-15")])
-            )
-            .await
-            .is_empty(),
-            "the bad start of the Period is not"
-        );
+        for value in ["2024-03-15", "lt2024-03-15", "gt2024-03-15", "ap2024-03-15"] {
+            assert!(
+                found_ids(
+                    &backend,
+                    &tenant,
+                    &param_query("Encounter", &[("date", Date, value)])
+                )
+                .await
+                .is_empty(),
+                "date={value}: a Period with a bad start indexes no range"
+            );
+        }
     }
 
     /// #1314: every valid FHIR date form indexes, at the instant the shared
-    /// parser gives it, and is found by `eq`/`ge`/`lt` at every precision.
-    /// Before, `:60` and a fraction longer than nine digits failed the write.
+    /// parser gives it, and is found by `eq`/`ge`/`lt`. Since #1391 the stored
+    /// value is the range of its own precision, so `eq` finds it only at that
+    /// precision or a coarser one. Before, `:60` and a fraction longer than nine digits failed the write.
     #[tokio::test]
     async fn es_integration_every_fhir_date_form_indexes_and_is_searchable() {
         use helios_persistence::types::SearchParamType::{Date, Token};
@@ -1403,48 +1472,54 @@ mod es_integration {
         const FORMS: &[(&str, &[&str], &[&str])] = &[
             (
                 "2024",
+                &["2024", "ge2024", "le2024", "lt2025"],
+                // A finer search does not contain the whole stored year
+                // (#1391).
                 &[
-                    "2024",
+                    "2023",
                     "2024-01",
                     "2024-01-01",
-                    "ge2024",
-                    "le2024",
-                    "lt2025",
                     "2024-01-01T00:00:00Z",
+                    "2024-02",
+                    "lt2024",
+                    "gt2024",
                 ],
-                &["2023", "2024-02", "lt2024", "gt2024"],
             ),
             (
                 "2024-03",
-                &["2024-03", "2024", "2024-03-01", "ge2024-03", "lt2024-04"],
-                &["2024-02", "2024-03-02", "lt2024-03", "gt2024-03"],
+                &["2024-03", "2024", "ge2024-03", "lt2024-04"],
+                &[
+                    "2024-02",
+                    "2024-03-01",
+                    "2024-03-02",
+                    "lt2024-03",
+                    "gt2024-03",
+                ],
             ),
             (
                 "2024-03-15",
+                &["2024-03-15", "2024-03", "ge2024-03-15", "lt2024-03-16"],
                 &[
-                    "2024-03-15",
-                    "2024-03",
-                    "ge2024-03-15",
-                    "lt2024-03-16",
+                    "2024-03-14",
                     "2024-03-15T00:00:00Z",
+                    "lt2024-03-15",
+                    "gt2024-03-15",
                 ],
-                &["2024-03-14", "lt2024-03-15", "gt2024-03-15"],
             ),
             // Minute precision: not the dateTime datatype, but valid in search.
             (
                 "2024-03-15T10:30",
+                &["2024-03-15T10:30", "2024-03-15", "ge2024-03-15T10:30Z"],
                 &[
-                    "2024-03-15T10:30",
+                    "2024-03-15T10:31",
                     "2024-03-15T10:30:00Z",
-                    "2024-03-15",
-                    "ge2024-03-15T10:30Z",
+                    "lt2024-03-15T10:30Z",
                 ],
-                &["2024-03-15T10:31", "lt2024-03-15T10:30Z"],
             ),
             (
                 "2024-03-15T10:30Z",
-                &["2024-03-15T10:30Z", "2024-03-15T10:30:00Z"],
-                &["2024-03-15T10:29Z"],
+                &["2024-03-15T10:30Z"],
+                &["2024-03-15T10:29Z", "2024-03-15T10:30:00Z"],
             ),
             // Zone-less is UTC.
             (
@@ -1488,12 +1563,13 @@ mod es_integration {
             ),
             (
                 "2024-03-15T10:30:45.1Z",
+                &["2024-03-15T10:30:45.1Z", "2024-03-15T10:30:45Z"],
+                // `.1` is a tenth of a second; `.100` is one millisecond.
                 &[
-                    "2024-03-15T10:30:45.1Z",
+                    "2024-03-15T10:30:45.2Z",
+                    "2024-03-15T10:30:45.0Z",
                     "2024-03-15T10:30:45.100Z",
-                    "2024-03-15T10:30:45Z",
                 ],
-                &["2024-03-15T10:30:45.2Z", "2024-03-15T10:30:45.0Z"],
             ),
             (
                 "2024-03-15T10:30:45.123Z",
@@ -1545,8 +1621,8 @@ mod es_integration {
             // indexing them where it did.
             (
                 "2024-03-15T10Z",
-                &["2024-03-15T10:00:00Z"],
-                &["2024-03-15T11:00:00Z"],
+                &["2024-03-15", "lt2024-03-15T10:00:01Z"],
+                &["lt2024-03-15T10:00:00Z", "2024-03-15T11:00:00Z"],
             ),
             (
                 "2024-03-15T10:30:45+0530",
@@ -1555,8 +1631,8 @@ mod es_integration {
             ),
             (
                 "2024-03-15T10:30:45,123Z",
-                &["2024-03-15T10:30:45.123Z"],
-                &["2024-03-15T10:30:45.124Z"],
+                &["2024-03-15", "lt2024-03-15T10:30:45.124Z"],
+                &["lt2024-03-15T10:30:45.123Z", "2024-03-15T10:30:45.124Z"],
             ),
         ];
 
@@ -5977,6 +6053,107 @@ mod es_integration {
             ne.resources.items.iter().all(|r| r.id() != "lu-ne-1"),
             "ne on the creation day must exclude the resource"
         );
+    }
+
+    /// #1391: `ap` on `_lastUpdated` is the window every backend shares — the
+    /// value's own range widened by a margin that follows its precision (a day
+    /// at day precision, ten seconds at second precision) — where it used to
+    /// be plain `eq` here while MongoDB widened it.
+    #[tokio::test]
+    async fn es_integration_last_updated_ap_uses_the_shared_window() {
+        use chrono::Duration;
+        use helios_persistence::types::SearchParamType::Date;
+
+        let backend = create_backend_with("1ms", WriteRefreshPolicy::WaitFor).await;
+        let tenant = create_tenant("last-updated-ap-1391");
+        // Creating the first resource of a type creates its index, which can
+        // take seconds on a busy machine; the ten-second margins below are
+        // measured from the resource's own timestamp, so the index is made
+        // first.
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({ "resourceType": "Patient", "id": "warm-up" }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let created = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({ "resourceType": "Patient", "id": "ap-1391" }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let modified = created.last_modified();
+        let one = std::collections::BTreeSet::from(["ap-1391".to_string()]);
+        let none = std::collections::BTreeSet::new();
+
+        let day = |offset: i64| {
+            (modified + Duration::days(offset))
+                .format("%Y-%m-%d")
+                .to_string()
+        };
+        let second = |offset: i64| {
+            (modified + Duration::seconds(offset))
+                .format("%Y-%m-%dT%H:%M:%SZ")
+                .to_string()
+        };
+        let found = |value: String| {
+            let backend = &backend;
+            let tenant = &tenant;
+            async move {
+                let mut ids = found_ids(
+                    backend,
+                    tenant,
+                    &param_query("Patient", &[("_lastUpdated", Date, &value)]),
+                )
+                .await;
+                ids.remove("warm-up");
+                ids
+            }
+        };
+
+        // Day precision: a day of margin on each side of the day searched.
+        assert_eq!(found(format!("ap{}", day(0))).await, one, "the day itself");
+        for offset in [-1, 1] {
+            assert_eq!(
+                found(format!("ap{}", day(offset))).await,
+                one,
+                "a day away is inside the margin"
+            );
+            assert_eq!(
+                found(day(offset)).await,
+                none,
+                "and is not `eq`, which `ap` used to be"
+            );
+        }
+        for offset in [-2, 2] {
+            assert_eq!(
+                found(format!("ap{}", day(offset))).await,
+                none,
+                "two days away is outside the margin"
+            );
+        }
+
+        // Second precision: ten seconds of margin.
+        for offset in [-5, 0, 5] {
+            assert_eq!(
+                found(format!("ap{}", second(offset))).await,
+                one,
+                "{offset}s is inside the margin"
+            );
+        }
+        for offset in [-30, 30] {
+            assert_eq!(
+                found(format!("ap{}", second(offset))).await,
+                none,
+                "{offset}s is outside the margin"
+            );
+        }
     }
 
     // ========================================================================

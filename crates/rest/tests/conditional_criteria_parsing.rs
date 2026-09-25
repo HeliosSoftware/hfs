@@ -1244,6 +1244,137 @@ async fn resource_level_parameters_are_valid_criteria() {
     }
 }
 
+/// `id -> family` for every Patient of `tenant`.
+async fn families_of(server: &TestServer, tenant: &'static str) -> Vec<(String, String)> {
+    let bundle: Value = server
+        .get("/Patient?_count=100")
+        .add_header(X_TENANT_ID, HeaderValue::from_static(tenant))
+        .await
+        .json();
+    let mut out: Vec<(String, String)> = bundle["entry"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|e| {
+            (
+                e["resource"]["id"].as_str().unwrap_or("?").to_string(),
+                e["resource"]["name"][1]["family"]
+                    .as_str()
+                    .unwrap_or("?")
+                    .to_string(),
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+fn nicknamed_patient(id: Option<&str>, nickname: &str, family: &str) -> Value {
+    let mut body = json!({
+        "resourceType": "Patient",
+        "name": [{"use": "nickname", "given": [nickname]}, {"family": family}]
+    });
+    if let Some(id) = id {
+        body["id"] = json!(id);
+    }
+    body
+}
+
+/// "Registered for the resource type" means registered in the *tenant's*
+/// registry, not only the spec set the server starts with: a custom
+/// `SearchParameter` a tenant has POSTed is a valid criterion there — the
+/// existing resource is found, no duplicate is created, a conditional `PUT`
+/// updates it — while a tenant without that parameter still gets the 400 an
+/// unknown criterion earns, and nothing is written.
+#[tokio::test]
+async fn a_tenant_custom_search_parameter_is_a_valid_criterion_only_in_that_tenant() {
+    const WITH_PARAM: &str = "acme1";
+    const WITHOUT_PARAM: &str = "acme2";
+    let server = test_server().await;
+
+    server
+        .post("/SearchParameter")
+        .add_header(X_TENANT_ID, HeaderValue::from_static(WITH_PARAM))
+        .json(&json!({
+            "resourceType": "SearchParameter",
+            "id": "patient-nickname",
+            "url": "http://acme.health/fhir/SearchParameter/patient-nickname",
+            "name": "nickname",
+            "status": "active",
+            "code": "nickname",
+            "base": ["Patient"],
+            "type": "string",
+            "expression": "Patient.name.where(use = 'nickname').given"
+        }))
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    // Created after the parameter, so they are indexed under it. The decoy
+    // makes a criterion that is ignored rather than evaluated observable: it
+    // would match both.
+    for (tenant, id, nickname, family) in [
+        (WITH_PARAM, "target", "Ace", "Adams"),
+        (WITH_PARAM, "decoy", "Bo", "Baker"),
+        (WITHOUT_PARAM, "target", "Ace", "Adams"),
+    ] {
+        server
+            .put(&format!("/Patient/{id}"))
+            .add_header(X_TENANT_ID, HeaderValue::from_static(tenant))
+            .json(&nicknamed_patient(Some(id), nickname, family))
+            .await
+            .assert_status(StatusCode::CREATED);
+    }
+    let seeded = pairs(&[("decoy", "Baker"), ("target", "Adams")]);
+    assert_eq!(families_of(&server, WITH_PARAM).await, seeded);
+
+    // If-None-Exist finds the existing resource instead of creating another.
+    let response = server
+        .post("/Patient")
+        .add_header(X_TENANT_ID, HeaderValue::from_static(WITH_PARAM))
+        .add_header(IF_NONE_EXIST, HeaderValue::from_static("nickname=Ace"))
+        .json(&nicknamed_patient(None, "Ace", "Incoming"))
+        .await;
+    assert_eq!(
+        response.status_code(),
+        StatusCode::OK,
+        "{}",
+        response.text()
+    );
+    let found: Value = response.json();
+    assert_eq!(found["id"], "target", "{found}");
+    assert_eq!(families_of(&server, WITH_PARAM).await, seeded);
+
+    // A conditional PUT updates that same resource.
+    let response = server
+        .put("/Patient?nickname=Ace")
+        .add_header(X_TENANT_ID, HeaderValue::from_static(WITH_PARAM))
+        .json(&nicknamed_patient(None, "Ace", "Updated"))
+        .await;
+    assert_eq!(
+        response.status_code(),
+        StatusCode::OK,
+        "{}",
+        response.text()
+    );
+    assert_eq!(
+        families_of(&server, WITH_PARAM).await,
+        pairs(&[("decoy", "Baker"), ("target", "Updated")])
+    );
+
+    // The other tenant never registered `nickname`: an unknown criterion.
+    let response = server
+        .post("/Patient")
+        .add_header(X_TENANT_ID, HeaderValue::from_static(WITHOUT_PARAM))
+        .add_header(IF_NONE_EXIST, HeaderValue::from_static("nickname=Ace"))
+        .json(&nicknamed_patient(None, "Ace", "Incoming"))
+        .await;
+    assert_rejected_naming(&response, "nickname", WITHOUT_PARAM);
+    assert_eq!(
+        families_of(&server, WITHOUT_PARAM).await,
+        pairs(&[("target", "Adams")])
+    );
+}
+
 // =============================================================================
 // Modifiers
 // =============================================================================

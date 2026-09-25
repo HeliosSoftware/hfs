@@ -28,7 +28,7 @@ use super::search_index_catalog::{
 /// `search_index` indexes are versioned separately by `search_indexes.generation`
 /// on the same document (see `search_index_catalog.rs`); `SCHEMA_VERSION` does
 /// not change for them.
-pub const SCHEMA_VERSION: i32 = 10;
+pub const SCHEMA_VERSION: i32 = 11;
 
 /// Initialize MongoDB collections/indexes required by the backend.
 ///
@@ -60,6 +60,7 @@ pub async fn initialize_schema_async(database: &Database) -> StorageResult<()> {
     ensure_history_indexes(database).await?;
     ensure_search_indexes(database).await?;
     ensure_user_settings_indexes(database).await?;
+    ensure_login_sessions_indexes(database).await?;
     ensure_tenants_indexes(database).await?;
     ensure_bulk_submit_indexes(database).await?;
     set_schema_version(database, SCHEMA_VERSION).await?;
@@ -74,6 +75,7 @@ pub async fn migrate_schema_async(database: &Database) -> StorageResult<()> {
         ensure_history_indexes(database).await?;
         ensure_search_indexes(database).await?;
         ensure_user_settings_indexes(database).await?;
+        ensure_login_sessions_indexes(database).await?;
         ensure_tenants_indexes(database).await?;
         ensure_bulk_submit_indexes(database).await?;
         set_schema_version(database, SCHEMA_VERSION).await?;
@@ -247,10 +249,10 @@ async fn ensure_history_indexes(database: &Database) -> StorageResult<()> {
     Ok(())
 }
 
-/// Creates the `search_index` indexes whose build is cheap enough to await at
-/// boot; the generation-2 value indexes are built by `SearchIndexBuilder`
-/// after boot (see the catalog). The contained collection's two indexes are
-/// small enough to create here, inline, every boot.
+/// Creates the inline search indexes before serving; `SearchIndexBuilder`
+/// builds the generation-2 value indexes after boot. Both collections have a
+/// partial composite-slot probe index. Building either probe on a large
+/// existing collection can extend startup; operators can pre-build them.
 async fn ensure_search_indexes(database: &Database) -> StorageResult<()> {
     let search_index = database.collection::<Document>(SEARCH_INDEX_COLLECTION);
     for spec in current_specs()
@@ -259,8 +261,8 @@ async fn ensure_search_indexes(database: &Database) -> StorageResult<()> {
     {
         search_index.create_index(spec.index_model()).await?;
     }
-    // Contained rows live in their own, small collection (#1160); both of
-    // its indexes are cheap enough to await at boot.
+    // Contained rows live in their own collection (#1160). Create its three
+    // indexes here so the legacy-slot probe can always use its named hint.
     let contained = database.collection::<Document>(SEARCH_INDEX_CONTAINED_COLLECTION);
     for spec in contained_specs() {
         contained.create_index(spec.index_model()).await?;
@@ -283,6 +285,24 @@ async fn ensure_user_settings_indexes(database: &Database) -> StorageResult<()> 
         doc! { "user_key": 1_i32 },
         "idx_user_settings_key",
         true,
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Index for the web UI's login sessions (#1481): one document per session or
+/// pending login keyed by `_id` (unique by construction), swept by
+/// `expires_at`. Separate from the FHIR collections like `user_settings`.
+async fn ensure_login_sessions_indexes(database: &Database) -> StorageResult<()> {
+    let login_sessions =
+        database.collection::<Document>(super::login_sessions::LOGIN_SESSIONS_COLLECTION);
+
+    create_index(
+        &login_sessions,
+        doc! { "expires_at": 1_i32 },
+        "idx_login_sessions_expires",
+        false,
     )
     .await?;
 

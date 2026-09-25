@@ -161,10 +161,11 @@ impl QuantityHandler {
                     unit,
                 )
             }
+            // ap: the shared window, both ends canonicalized.
             SearchPrefix::Ap => {
-                let margin = (value.abs() * 0.1).max(0.0001);
-                let (lo, unit) = canon(value - margin, code)?;
-                let (hi, _) = canon(value + margin, code)?;
+                let (lo, hi) = crate::search::approx_range(value, num_str);
+                let (lo, unit) = canon(lo, code)?;
+                let (hi, _) = canon(hi, code)?;
                 let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
                 (
                     format!("{col} BETWEEN ?{} AND ?{}", param_num, param_num + 1),
@@ -184,7 +185,7 @@ impl QuantityHandler {
 
     /// Builds the numeric comparison part of the condition against `column`.
     /// `num_str` is the search value's textual form (used only by `eq`/`ne`
-    /// to derive the implicit-precision range).
+    /// and `ap` to derive the implicit-precision range and the `ap` window).
     ///
     /// This is the one numeric per-prefix table on SQLite: number search
     /// ([`super::number::NumberHandler`]) and, through the two handlers, the
@@ -238,15 +239,13 @@ impl QuantityHandler {
                 format!("{column} <= ?{}", param_num),
                 vec![SqlParam::float(value)],
             ),
+            // ap: the shared window, `max(10%, half the implicit precision)`
+            // either side of the value (#1390).
             SearchPrefix::Ap => {
-                // +/- 10%
-                let margin = (value.abs() * 0.1).max(0.0001);
+                let (lo, hi) = crate::search::approx_range(value, num_str);
                 SqlFragment::with_params(
                     format!("{column} BETWEEN ?{} AND ?{}", param_num, param_num + 1),
-                    vec![
-                        SqlParam::float(value - margin),
-                        SqlParam::float(value + margin),
-                    ],
+                    vec![SqlParam::float(lo), SqlParam::float(hi)],
                 )
             }
         }
@@ -344,6 +343,16 @@ mod tests {
         let frag = QuantityHandler::build_sql(&value, 0);
 
         assert!(frag.sql.contains("BETWEEN"));
+        // The shared window (#1390): [90, 110] around 100.
+        assert!(
+            matches!(
+                frag.params.as_slice(),
+                [SqlParam::Float(lo), SqlParam::Float(hi), ..]
+                    if (lo - 90.0).abs() < 1e-9 && (hi - 110.0).abs() < 1e-9
+            ),
+            "{:?}",
+            frag.params
+        );
     }
 
     /// Defence in depth behind `validate_numeric_values` (#1340): a number
