@@ -4280,6 +4280,60 @@ mod tests {
         }
     }
 
+    /// A number component of a composite gets the ranges a standalone number
+    /// parameter gets (#1390): `ap` the shared window, `eq` the
+    /// implicit-precision range. The shape is `MolecularSequence`'s
+    /// `chromosome-variant-coordinate` (token, number, number), so the second
+    /// number also covers the component in the second slot.
+    #[test]
+    fn composite_number_components_use_the_shared_ranges() {
+        let param = SearchParameter {
+            name: "chromosome-variant-coordinate".to_string(),
+            param_type: SearchParamType::Composite,
+            modifier: None,
+            values: vec![SearchValue::new(SearchPrefix::Eq, "1$ap100$1e2")],
+            chain: vec![],
+            components: vec![
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "chromosome".to_string(),
+                },
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Number,
+                    param_name: "variant-start".to_string(),
+                },
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Number,
+                    param_name: "variant-end".to_string(),
+                },
+            ],
+        };
+        let query = SearchQuery::new("MolecularSequence").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+        assert!(
+            frag.sql.contains("(value_number BETWEEN $4 AND $5)"),
+            "{}",
+            frag.sql
+        );
+        assert!(
+            frag.sql
+                .contains("(value_number_2 >= $6 AND value_number_2 < $7)"),
+            "{}",
+            frag.sql
+        );
+        let floats: Vec<f64> = frag
+            .params
+            .iter()
+            .filter_map(|p| match p {
+                SqlParam::Float(f) => Some(*f),
+                _ => None,
+            })
+            .collect();
+        // `ap100` is [90, 110]; `1e2` has one significant figure, so its
+        // `eq` range is [50, 150).
+        assert_eq!(floats, [90.0, 110.0, 50.0, 150.0]);
+    }
+
     #[test]
     fn composite_bare_code_emits_what_the_v27_index_is_keyed_for() {
         // `combo-code-value-quantity=8867-4$gt100` — 21 of the 27 composite

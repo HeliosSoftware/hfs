@@ -267,6 +267,39 @@ mod tests {
     /// A numeric component gets the ranges a standalone number does, not an
     /// exact `term` (#1390).
     #[test]
+    fn number_component_uses_the_shared_ranges() {
+        // `MolecularSequence`'s `chromosome-variant-coordinate` shape, reduced
+        // to one number: a number component compares as a standalone number
+        // parameter does (#1390).
+        let param = composite_param(vec![
+            CompositeSearchComponent {
+                param_type: SearchParamType::Token,
+                param_name: "chromosome".to_string(),
+            },
+            CompositeSearchComponent {
+                param_type: SearchParamType::Number,
+                param_name: "variant-start".to_string(),
+            },
+        ]);
+        let value_range = |value: &str| {
+            let clause = build_clause(&param, value).unwrap();
+            clause["nested"]["query"]["bool"]["must"][2].clone()
+        };
+        assert_eq!(
+            value_range("1$ap100"),
+            json!({ "range": { "search_params.composite.number": { "gte": 90.0, "lte": 110.0 } } })
+        );
+        assert_eq!(
+            value_range("1$ap0"),
+            json!({ "range": { "search_params.composite.number": { "gte": -0.5, "lte": 0.5 } } })
+        );
+        assert_eq!(
+            value_range("1$1e2"),
+            json!({ "range": { "search_params.composite.number": { "gte": 50.0, "lt": 150.0 } } })
+        );
+    }
+
+    #[test]
     fn quantity_component_uses_the_shared_ranges() {
         let value_range = |value: &str| {
             let clause = build_clause(&code_quantity_param(), value).unwrap();
