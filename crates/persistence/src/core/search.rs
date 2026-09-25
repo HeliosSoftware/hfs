@@ -420,6 +420,9 @@ pub trait SearchProvider: ResourceStorage {
     ///
     /// Returns an owned `Arc` (cloned from the per-tenant cache); bind it to a
     /// local before `.read()`.
+    /// PostgreSQL guarded writes and reindex use the persisted SearchParameter
+    /// overlay under the tenant write gate. Mutating this cached registry
+    /// directly does not change their authoritative indexing definitions.
     fn search_param_registry(&self, tenant: &TenantContext)
     -> Arc<RwLock<SearchParameterRegistry>>;
 

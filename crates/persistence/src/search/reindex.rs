@@ -264,6 +264,13 @@ pub trait ReindexTarget: Send + Sync {
     /// because Elasticsearch's indexed document carries `version_id` and
     /// `fhir_version`, neither of which is reliably recoverable from the raw
     /// resource JSON.
+    ///
+    /// PostgreSQL treats the supplied resource as an identity only. It locks
+    /// that identity, reads the current stored row and current SearchParameter
+    /// definitions, then atomically replaces its search and FTS entries. A
+    /// deleted or absent identity clears stale entries and returns zero. Code
+    /// that needs to append arbitrary extracted rows must use the low-level
+    /// writer under its own transaction, locking, and freshness guarantees.
     async fn write_search_entries(
         &self,
         tenant: &TenantContext,
@@ -304,6 +311,9 @@ pub trait ReindexTarget: Send + Sync {
     /// one transaction — the reindex-side counterpart of the #815 batch
     /// ingest, and what keeps the fast-load rebuild (#903) from giving back
     /// the throughput the deferred ingest won.
+    /// PostgreSQL may split this input into bounded concurrent write groups;
+    /// its result vector still has exactly one slot per input occurrence in
+    /// input order. The next source page is fetched only after this call ends.
     async fn write_search_entries_page(
         &self,
         tenant: &TenantContext,

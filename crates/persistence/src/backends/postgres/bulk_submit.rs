@@ -195,6 +195,22 @@ fn is_grouped_fresh_create_eligible(
     })
 }
 
+/// A shared-gate batch may only use identities known before BEGIN.
+fn planned_batch_keys(entries: &[NdjsonEntry]) -> Option<Vec<(String, String)>> {
+    entries
+        .iter()
+        .map(|entry| {
+            let id = entry.resource_id.as_deref()?;
+            let payload_id = entry.resource.get("id")?.as_str()?;
+            let payload_type = entry.resource.get("resourceType")?.as_str()?;
+            (entry.resource_type != "SearchParameter"
+                && id == payload_id
+                && entry.resource_type == payload_type)
+                .then(|| (entry.resource_type.clone(), id.to_string()))
+        })
+        .collect()
+}
+
 /// Builds a `LeaseError::LeaseLost` for a submit manifest.
 fn lease_lost(lease: &ManifestLease) -> LeaseError {
     LeaseError::LeaseLost {
@@ -898,12 +914,21 @@ impl BulkSubmitProvider for PostgresBackend {
             defer_search_indexing: options.defer_indexing,
             ..Default::default()
         };
-        let mut txn = <Self as crate::core::TransactionProvider>::begin_transaction(
-            self,
-            tenant,
-            transaction_options.clone(),
-        )
-        .await?;
+        let lock_plan = planned_batch_keys(&entries);
+        let mut txn = match lock_plan.clone() {
+            Some(keys) => {
+                self.begin_planned_transaction(tenant, transaction_options.clone(), keys)
+                    .await?
+            }
+            None => {
+                <Self as crate::core::TransactionProvider>::begin_transaction(
+                    self,
+                    tenant,
+                    transaction_options.clone(),
+                )
+                .await?
+            }
+        };
         let processed = if is_grouped_fresh_create_eligible(
             &entries,
             options,
@@ -942,12 +967,20 @@ impl BulkSubmitProvider for PostgresBackend {
                     tracing::debug!(
                         "grouped PostgreSQL bulk-submit create failed; replaying entries individually: {grouped_error}"
                     );
-                    txn = <Self as crate::core::TransactionProvider>::begin_transaction(
-                        self,
-                        tenant,
-                        transaction_options,
-                    )
-                    .await?;
+                    txn = match lock_plan.clone() {
+                        Some(keys) => {
+                            self.begin_planned_transaction(tenant, transaction_options, keys)
+                                .await?
+                        }
+                        None => {
+                            <Self as crate::core::TransactionProvider>::begin_transaction(
+                                self,
+                                tenant,
+                                transaction_options,
+                            )
+                            .await?
+                        }
+                    };
                     None
                 }
                 Err(MixedAttemptError::Fatal(error)) => return Err(error),
@@ -1089,7 +1122,7 @@ impl BulkSubmitProvider for PostgresBackend {
             // `processed_entries` counts successes, `skipped_entries` the
             // deliberate skips, and `last_processed_line` advances by the
             // entries newly charged (#969, #954).
-            execute_cached(
+            match execute_cached(
                 client,
                     "UPDATE bulk_manifests SET
                         total_entries = total_entries + $1,
@@ -1111,7 +1144,19 @@ impl BulkSubmitProvider for PostgresBackend {
                     ],
             )
             .await
-            .map_err(|e| internal_error(format!("Failed to update manifest counts: {}", e)))?;
+            .map_err(|e| internal_error(format!("Failed to update manifest counts: {}", e)))
+            {
+                Ok(_) => {}
+                Err(error) => {
+                    // A late bookkeeping failure leaves the batch transaction
+                    // aborted. Roll it back on this connection so the pooled
+                    // session (and its six cached statements) is recycled
+                    // clean instead of being discarded by Drop.
+                    let _ =
+                        crate::core::Transaction::rollback(Box::new(txn)).await;
+                    return Err(error);
+                }
+            }
         }
 
         crate::core::Transaction::commit(Box::new(txn)).await?;
