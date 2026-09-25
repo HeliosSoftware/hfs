@@ -401,7 +401,7 @@ pub struct ExportRequest {
 
     /// The FHIR version the export runs against; it selects the
     /// CompartmentDefinition that decides Patient-compartment membership.
-    #[serde(default)]
+    #[serde(default = "helios_fhir::FhirVersion::default_enabled")]
     pub fhir_version: helios_fhir::FhirVersion,
 }
 
@@ -427,7 +427,7 @@ impl ExportRequest {
             patient_refs: Vec::new(),
             batch_size: default_batch_size(),
             output_format: default_output_format(),
-            fhir_version: helios_fhir::FhirVersion::default(),
+            fhir_version: helios_fhir::FhirVersion::default_enabled(),
         }
     }
 
