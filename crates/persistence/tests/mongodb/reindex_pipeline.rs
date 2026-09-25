@@ -10,6 +10,7 @@ use super::*;
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use crate::bulk_submit::FailPoint;
 use async_trait::async_trait;
@@ -996,15 +997,20 @@ async fn mongodb_integration_reindex_page_serial_pipeline_writes_a_large_page() 
     }
 }
 
-/// Reads every row of `collection`, drops `_id` and `tenant_id`, and sorts a
-/// deterministic per-row string — so two backends' collections can be
-/// compared regardless of insert order or `_id` values (#1403).
-async fn rows_without_id_and_tenant(backend: &MongoBackend, collection: &str) -> Vec<String> {
+/// Reads every row of `collection` matching `filter`, drops `_id` and
+/// `tenant_id`, and sorts a deterministic per-row string — so two backends'
+/// collections, or two tenants within the same collection, can be compared
+/// regardless of insert order or `_id` values (#1403).
+async fn rows_without_id_and_tenant(
+    backend: &MongoBackend,
+    collection: &str,
+    filter: Document,
+) -> Vec<String> {
     use futures::stream::TryStreamExt;
     let db = backend.get_database().await.expect("get_database");
     let mut rows: Vec<String> = db
         .collection::<Document>(collection)
-        .find(doc! {})
+        .find(filter)
         .await
         .expect("find")
         .try_collect::<Vec<Document>>()
@@ -1110,12 +1116,12 @@ async fn mongodb_integration_reindex_page_overlapped_matches_serial() {
     assert_eq!(stats_s.inserted_entries, stats_o.inserted_entries);
 
     assert_eq!(
-        rows_without_id_and_tenant(&serial, "search_index").await,
-        rows_without_id_and_tenant(&overlapped, "search_index").await
+        rows_without_id_and_tenant(&serial, "search_index", doc! {}).await,
+        rows_without_id_and_tenant(&overlapped, "search_index", doc! {}).await
     );
     assert_eq!(
-        rows_without_id_and_tenant(&serial, "search_index_contained").await,
-        rows_without_id_and_tenant(&overlapped, "search_index_contained").await
+        rows_without_id_and_tenant(&serial, "search_index_contained", doc! {}).await,
+        rows_without_id_and_tenant(&overlapped, "search_index_contained", doc! {}).await
     );
 }
 
@@ -1398,4 +1404,371 @@ async fn mongodb_integration_reindex_page_overlapped_fans_out_a_delete_failure()
             resource.id()
         );
     }
+}
+
+/// An in-memory, scripted `ReindexSource` that always allows prefetch
+/// (#1403) — used to prove that a page written from a resource seen on one
+/// fetch, followed by an update to the same resource seen on the next fetch,
+/// still ends with the later version's rows and no duplicates when the two
+/// pages' writes overlap with the driver's own paging.
+struct ScriptedResourceSource {
+    resource_type: &'static str,
+    pages: Vec<Vec<StoredResource>>,
+}
+
+#[async_trait]
+impl ReindexSource for ScriptedResourceSource {
+    async fn list_resource_types(&self, _: &TenantContext) -> StorageResult<Vec<String>> {
+        Ok(vec![self.resource_type.to_string()])
+    }
+
+    async fn count_resources(&self, _: &TenantContext, _: &str) -> StorageResult<u64> {
+        Ok(self.pages.iter().map(|p| p.len() as u64).sum())
+    }
+
+    async fn fetch_resources_page(
+        &self,
+        _: &TenantContext,
+        _: &str,
+        cursor: Option<&str>,
+        _: u32,
+    ) -> StorageResult<ResourcePage> {
+        let page = cursor.and_then(|c| c.parse::<usize>().ok()).unwrap_or(0);
+        let resources = self.pages.get(page).cloned().unwrap_or_default();
+        let next_cursor = (page + 1 < self.pages.len()).then(|| (page + 1).to_string());
+        Ok(ResourcePage {
+            resources,
+            next_cursor,
+            skipped: Vec::new(),
+        })
+    }
+
+    fn may_prefetch_page(&self, _: &str) -> bool {
+        true
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mongodb_integration_reindex_resource_in_consecutive_pages_ends_with_the_later_version() {
+    let Some(backend) = create_backend_with("reindex_prefetch_consecutive_versions", |c| {
+        c.reindex_overlap = true;
+        c.reindex_prepare_threads = 1;
+    })
+    .await
+    else {
+        eprintln!(
+            "Skipping mongodb_integration_reindex_resource_in_consecutive_pages_ends_with_the_later_version (requires Docker)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("reindex-prefetch-consecutive-tenant");
+    let r_v2 = StoredResource::from_storage(
+        "Patient",
+        "r",
+        "2",
+        tenant.tenant_id().clone(),
+        json!({"resourceType": "Patient", "id": "r", "name": [{"family": "V2"}]}),
+        chrono::Utc::now(),
+        chrono::Utc::now(),
+        None,
+        FhirVersion::default(),
+    );
+    let r_v1 = StoredResource::from_storage(
+        "Patient",
+        "r",
+        "1",
+        tenant.tenant_id().clone(),
+        json!({"resourceType": "Patient", "id": "r", "name": [{"family": "V1"}]}),
+        chrono::Utc::now(),
+        chrono::Utc::now(),
+        None,
+        FhirVersion::default(),
+    );
+    let mut page1 = vec![r_v1];
+    page1.extend(build_test_patients(&tenant, "others", 40));
+    let source = Arc::new(ScriptedResourceSource {
+        resource_type: "Patient",
+        pages: vec![page1, vec![r_v2.clone()]],
+    });
+
+    let op = ReindexOperation::with_parts(
+        source,
+        vec![backend.clone() as Arc<dyn ReindexTarget>],
+        backend.tenant_registries().clone(),
+    );
+    let job = op
+        .start(
+            tenant.clone(),
+            ReindexRequest::for_types(vec!["Patient".to_string()]).with_batch_size(50),
+            None,
+        )
+        .await
+        .expect("start");
+    let progress = super::reindex_id_walk::wait_for_terminal(&op, &job).await;
+    assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+
+    // A direct rewrite from v2 alone, into a fresh tenant, is the reference:
+    // R's rows in `tenant` must equal it exactly, including no duplicates.
+    let fresh_tenant = create_tenant("reindex-prefetch-consecutive-fresh");
+    let target: &dyn ReindexTarget = backend.as_ref();
+    let mut stats = ReindexPageStats::default();
+    let outcome = target
+        .write_search_entries_page_timed(&fresh_tenant, std::slice::from_ref(&r_v2), &mut stats)
+        .await;
+    assert!(outcome[0].is_ok());
+
+    assert_eq!(
+        rows_without_id_and_tenant(
+            &backend,
+            "search_index",
+            doc! {
+                "tenant_id": tenant.tenant_id().as_str(),
+                "resource_type": "Patient",
+                "resource_id": "r",
+            },
+        )
+        .await,
+        rows_without_id_and_tenant(
+            &backend,
+            "search_index",
+            doc! {
+                "tenant_id": fresh_tenant.tenant_id().as_str(),
+                "resource_type": "Patient",
+                "resource_id": "r",
+            },
+        )
+        .await,
+        "R must end with v2's rows and no duplicates"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mongodb_integration_reindex_run_parity_across_knobs() {
+    let configs: [(bool, bool, usize); 3] = [(false, false, 1), (true, false, 1), (true, true, 0)];
+    let mut backends: Vec<Arc<MongoBackend>> = Vec::new();
+    for (overlap, prefetch, threads) in configs {
+        let Some(backend) = create_backend_with("reindex_run_parity_across_knobs", move |c| {
+            c.reindex_overlap = overlap;
+            c.reindex_prefetch = prefetch;
+            c.reindex_prepare_threads = threads;
+            c.reindex_catch_up_margin_ms = 1_000;
+        })
+        .await
+        else {
+            eprintln!(
+                "Skipping mongodb_integration_reindex_run_parity_across_knobs (requires Docker)"
+            );
+            return;
+        };
+        backends.push(backend);
+    }
+
+    let tenants: Vec<TenantContext> = ["k0", "k1", "k2"]
+        .iter()
+        .map(|n| create_tenant(n))
+        .collect();
+    for (backend, tenant) in backends.iter().zip(&tenants) {
+        for n in 0..300 {
+            backend
+                .create_or_update(
+                    tenant,
+                    "Observation",
+                    &format!("obs-{n}"),
+                    json!({"resourceType": "Observation", "id": format!("obs-{n}"), "status": "final"}),
+                    FhirVersion::default(),
+                )
+                .await
+                .expect("seed");
+        }
+    }
+    settle_into_id_phase().await;
+
+    let mut entries_created = Vec::new();
+    for (backend, tenant) in backends.iter().zip(&tenants) {
+        let op = ReindexOperation::new(backend.clone(), backend.tenant_registries().clone());
+        let job = op
+            .start(
+                tenant.clone(),
+                ReindexRequest::for_types(vec!["Observation".to_string()]).with_batch_size(50),
+                None,
+            )
+            .await
+            .expect("start");
+        let progress = super::reindex_id_walk::wait_for_terminal(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+        assert_eq!(progress.error_message, None);
+        assert!(progress.errors.is_empty(), "{:?}", progress.errors);
+        entries_created.push(progress.entries_created);
+    }
+    assert_eq!(
+        entries_created[0], entries_created[1],
+        "entries_created must match across knobs"
+    );
+    assert_eq!(
+        entries_created[1], entries_created[2],
+        "entries_created must match across knobs"
+    );
+
+    let rows: Vec<Vec<String>> = {
+        let mut v = Vec::new();
+        for backend in &backends {
+            v.push(rows_without_id_and_tenant(backend, "search_index", doc! {}).await);
+        }
+        v
+    };
+    assert_eq!(rows[0], rows[1]);
+    assert_eq!(rows[1], rows[2]);
+}
+
+/// Wraps a real `MongoBackend` writer and, after each page write returns,
+/// checks whether `mongodb reindex id phase finished` is already in the
+/// capture buffer — proving whether the transition ran concurrently with, or
+/// only after, that page's write (#1403).
+struct PhaseLogProbeTarget {
+    backend: Arc<MongoBackend>,
+    saw_transition_early: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl ReindexTarget for PhaseLogProbeTarget {
+    async fn delete_search_entries(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+    ) -> StorageResult<u64> {
+        self.backend
+            .delete_search_entries(tenant, resource_type, id)
+            .await
+    }
+
+    async fn write_search_entries(
+        &self,
+        tenant: &TenantContext,
+        resource: &StoredResource,
+    ) -> StorageResult<usize> {
+        self.backend.write_search_entries(tenant, resource).await
+    }
+
+    // Delegates to `write_search_entries_page_timed` with a throwaway
+    // `ReindexPageStats`, per `ReindexTarget::write_search_entries_page`'s
+    // trait contract that an override MUST route the untimed page method
+    // through it, so the two paths cannot diverge.
+    async fn write_search_entries_page(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+    ) -> Vec<StorageResult<usize>> {
+        let mut stats = ReindexPageStats::default();
+        self.write_search_entries_page_timed(tenant, resources, &mut stats)
+            .await
+    }
+
+    async fn write_search_entries_page_timed(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+        stats: &mut ReindexPageStats,
+    ) -> Vec<StorageResult<usize>> {
+        let result = self
+            .backend
+            .write_search_entries_page_timed(tenant, resources, stats)
+            .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // `capture_walk_logs`/`walk_log_lines` install ONE global subscriber
+        // and ONE global buffer for the whole `mongodb_tests` binary, so
+        // filtering on the message alone would also match every other walk's
+        // lines from other tests in this binary. A tenant needle isolates
+        // this run's lines (walk lines log `tenant = %tenant_id`, which the
+        // test log capture prints unquoted as `tenant=<id>`) (#1403).
+        let tenant_needle = format!("tenant={}", tenant.tenant_id().as_str());
+        if !super::reindex_id_walk::walk_log_lines(&[
+            "mongodb reindex id phase finished",
+            &tenant_needle,
+        ])
+        .is_empty()
+        {
+            self.saw_transition_early
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        result
+    }
+
+    async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64> {
+        self.backend.clear_search_index(tenant).await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mongodb_integration_reindex_prefetch_logs_id_phase_finished_after_the_last_id_page_is_written()
+ {
+    let Some(backend) = create_id_phase_backend("reindex_prefetch_logs_id_phase_finished").await
+    else {
+        eprintln!(
+            "Skipping mongodb_integration_reindex_prefetch_logs_id_phase_finished_after_the_last_id_page_is_written (requires Docker)"
+        );
+        return;
+    };
+    let tenant = create_tenant("reindex-prefetch-log-order-tenant");
+    for n in 0..120 {
+        backend
+            .create_or_update(
+                &tenant,
+                "Observation",
+                &format!("obs-{n}"),
+                json!({"resourceType": "Observation", "id": format!("obs-{n}"), "status": "final"}),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("seed");
+    }
+    settle_into_id_phase().await;
+
+    // `capture_walk_logs` returns `()`; binding it (`let _capture = ..`) is a
+    // unit value binding, which clippy's `let_unit_value` rejects under
+    // `-D warnings`. Call it as a plain statement instead.
+    super::reindex_id_walk::capture_walk_logs();
+    let saw_transition_early = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let probe = Arc::new(PhaseLogProbeTarget {
+        backend: backend.clone(),
+        saw_transition_early: saw_transition_early.clone(),
+    });
+    let op = ReindexOperation::with_parts(
+        backend.clone(),
+        vec![probe as Arc<dyn ReindexTarget>],
+        backend.tenant_registries().clone(),
+    );
+    let job = op
+        .start(
+            tenant.clone(),
+            ReindexRequest::for_types(vec!["Observation".to_string()]).with_batch_size(50),
+            None,
+        )
+        .await
+        .expect("start");
+    let progress = super::reindex_id_walk::wait_for_terminal(&op, &job).await;
+    assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+    assert!(
+        !saw_transition_early.load(std::sync::atomic::Ordering::SeqCst),
+        "id phase finished must never be logged concurrently with an id-page write"
+    );
+
+    let tenant_needle = format!("tenant={}", tenant.tenant_id().as_str());
+    assert_eq!(
+        super::reindex_id_walk::walk_log_lines(&[
+            "mongodb reindex id phase finished",
+            &tenant_needle
+        ])
+        .len(),
+        1
+    );
+    assert_eq!(
+        super::reindex_id_walk::walk_log_lines(&[
+            "mongodb reindex catch-up round started",
+            &tenant_needle
+        ])
+        .len(),
+        1
+    );
 }
