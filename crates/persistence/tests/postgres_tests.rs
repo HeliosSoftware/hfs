@@ -22705,8 +22705,11 @@ mod postgres_integration {
         );
     }
 
+    /// An offloaded primary (pg-es) routes a mixed batch like a standalone one
+    /// (#939): the fresh runs either side of the existing entry flush grouped,
+    /// and the existing entry keeps its savepoint.
     #[tokio::test]
-    async fn postgres_bulk_submit_search_offload_keeps_the_individual_path() {
+    async fn postgres_bulk_submit_search_offload_takes_the_grouped_path() {
         use helios_persistence::core::{BulkEntryOutcome, BulkSubmitProvider, NdjsonEntry};
 
         let (mut backend, dbname) = isolated_reindex_backend().await;
@@ -22747,7 +22750,8 @@ mod postgres_integration {
             .await
             .unwrap();
         assert_eq!(results.len(), 100);
-        assert_eq!(resource_insert_statements(&client).await, 99);
+        // Two fresh runs (000–049, 051–099), one grouped statement each.
+        assert_eq!(resource_insert_statements(&client).await, 2);
         assert_eq!(observer.0.lock().unwrap().len(), 1);
         let page = backend
             .get_entry_results_page(&tenant, &submission, &manifest.manifest_id, None, 101, None)
@@ -23035,10 +23039,12 @@ mod postgres_integration {
         }
     }
 
-    /// A PostgreSQL primary whose search is offloaded (the pg-es wiring) keeps
-    /// the original individual path even for a large otherwise-eligible batch.
+    /// A PostgreSQL primary whose search is offloaded (the pg-es wiring) takes
+    /// the grouped path like a standalone one (#939): it writes no index rows
+    /// on either path, so only an observer that wants the committed resources
+    /// (see the next test) keeps a batch individual.
     #[tokio::test]
-    async fn postgres_bulk_submit_grouped_over_100_excludes_search_offload() {
+    async fn postgres_bulk_submit_grouped_over_100_includes_search_offload() {
         use helios_persistence::core::BulkSubmitProvider;
 
         let (mut backend, dbname) = isolated_reindex_backend().await;
@@ -23066,8 +23072,18 @@ mod postgres_integration {
                 .iter()
                 .all(|result| result.is_success() && result.created)
         );
-        assert_eq!(resource_insert_statements(&client).await, 101);
+        // 100 + 1: one grouped write holds at most 100 creates.
+        assert_eq!(resource_insert_statements(&client).await, 2);
         assert_eq!(observer.0.lock().unwrap()[0].len(), 101);
+        let index_rows: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM search_index WHERE tenant_id = $1",
+                &[&tenant.tenant_id().as_str()],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(index_rows, 0);
     }
 
     /// An observer that asks for committed resources keeps the individual path
@@ -24379,9 +24395,11 @@ mod postgres_integration {
         );
     }
 
-    /// The authoritative SearchParameter read now precedes the grouped-create
-    /// candidate query. If that read times out, the batch must leave its
-    /// resources untouched and must not start a replay on a second connection.
+    /// The authoritative SearchParameter read opens every batch that indexes
+    /// inline. If that read times out, the batch must leave its resources
+    /// untouched and must not start a replay on a second connection. (A
+    /// deferred batch indexes nothing and skips the read, #939, so this runs
+    /// with inline indexing.)
     #[tokio::test]
     async fn postgres_bulk_submit_authoritative_snapshot_failure_does_not_replay() {
         use helios_persistence::core::{BulkSubmitProvider, NdjsonEntry};
@@ -24441,7 +24459,8 @@ mod postgres_integration {
                     entries,
                     &grouped_create_options(std::sync::Arc::new(
                         RecordingBulkSubmitBatches::default(),
-                    )),
+                    ))
+                    .with_defer_indexing(false),
                 )
                 .await
         });
@@ -24457,6 +24476,57 @@ mod postgres_integration {
         let client = reindex_test_client_for(&dbname).await;
         assert_bulk_submit_table_count(&client, "resources", &tenant_id, 1).await;
         assert_bulk_submit_table_count(&client, "resource_history", &tenant_id, 1).await;
+    }
+
+    /// #939: after a full-corpus load the rebuild's per-type count outlived the
+    /// session `statement_timeout` and failed the deferred rebuild twice. The
+    /// count lifts the timeout for itself only; the session keeps it.
+    #[tokio::test]
+    async fn postgres_reindex_count_outlives_statement_timeout() {
+        use helios_persistence::search::ReindexSource;
+
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenant = create_tenant("reindex-count-timeout");
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"counted"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let pooled = backend.get_client().await.unwrap();
+        pooled
+            .batch_execute("SET statement_timeout = '300ms'")
+            .await
+            .unwrap();
+        drop(pooled);
+
+        // Hold the count past the timeout, then let it through.
+        let locker = reindex_test_client_for(&dbname).await;
+        locker
+            .batch_execute("BEGIN; LOCK TABLE resources IN ACCESS EXCLUSIVE MODE")
+            .await
+            .unwrap();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+            locker.batch_execute("ROLLBACK").await.unwrap();
+        });
+
+        let count = ReindexSource::count_resources(&backend, &tenant, "Patient")
+            .await
+            .unwrap();
+        release.await.unwrap();
+        assert_eq!(count, 1);
+
+        let pooled = backend.get_client().await.unwrap();
+        let timeout: String = pooled
+            .query_one("SHOW statement_timeout", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(timeout, "300ms");
     }
 
     #[tokio::test]

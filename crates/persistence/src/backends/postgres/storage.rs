@@ -926,7 +926,9 @@ impl ResourceStorage for PostgresBackend {
                 }));
             }
 
-            let extractor = self.authoritative_extractor(&transaction, tenant_id).await?;
+            let extractor = self
+                .write_extractor(&transaction, tenant_id, !self.is_search_offloaded())
+                .await?;
             self.index_resource_guarded(
                 &transaction,
                 &extractor,
@@ -1192,7 +1194,9 @@ impl ResourceStorage for PostgresBackend {
             // a second statement and a second round trip binding the same three
             // parameters. The `resource_fts` row stays either way:
             // `index_fts_content_guarded` upserts over it on the same connection.
-            let extractor = self.authoritative_extractor(&transaction, tenant_id).await?;
+            let extractor = self
+                .write_extractor(&transaction, tenant_id, !self.is_search_offloaded())
+                .await?;
             self.index_resource_guarded(
                 &transaction,
                 &extractor,
@@ -2095,7 +2099,9 @@ impl PostgresBackend {
             )
             .await
             .map_err(|e| internal_error(format!("Failed to insert restore history: {e}")))?;
-            let extractor = self.authoritative_extractor(&transaction, tenant_id).await?;
+            let extractor = self
+                .write_extractor(&transaction, tenant_id, !self.is_search_offloaded())
+                .await?;
             self.index_resource_guarded(
                 &transaction,
                 &extractor,
@@ -4783,7 +4789,31 @@ impl ReindexSource for PostgresBackend {
         tenant: &TenantContext,
         resource_type: &str,
     ) -> StorageResult<u64> {
-        self.count(tenant, Some(resource_type)).await
+        // The count only sizes the job's progress, yet a failed count fails the
+        // whole rebuild before it indexes anything. Right after a bulk load it
+        // visits every freshly written row (`is_deleted` is in no index), and at
+        // the #939 corpus (7.7 M Observation) that outlived the default 30 s
+        // `statement_timeout` on both attempts of the deferred rebuild. Lift the
+        // timeout for this one statement; the pages that follow keep it.
+        let mut client = self.get_client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .or_query_error("Failed to begin reindex count")?;
+        tx.batch_execute("SET LOCAL statement_timeout = 0")
+            .await
+            .or_query_error("Failed to lift statement timeout for reindex count")?;
+        let row = tx
+            .query_one(
+                "SELECT COUNT(*) FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE",
+                &[&tenant.tenant_id().as_str(), &resource_type],
+            )
+            .await
+            .or_query_error("Failed to count resources")?;
+        tx.commit()
+            .await
+            .or_query_error("Failed to finish reindex count")?;
+        Ok(row.get::<_, i64>(0) as u64)
     }
 
     async fn fetch_resources_page(

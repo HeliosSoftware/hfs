@@ -918,6 +918,31 @@ impl PostgresBackend {
         ))))
     }
 
+    /// The extractor a write hands to its index step.
+    ///
+    /// When `extracts` is false the write indexes nothing in PostgreSQL —
+    /// search is offloaded (#939) or deferred to a later rebuild (#903) — so
+    /// reading the persisted overlay would be pure cost: one query and one
+    /// JSONB decode per stored SearchParameter (1,375 seeded, ~1.5 MB) on
+    /// every call. The shared base stands in; nothing extracts with it.
+    pub(crate) async fn write_extractor<C>(
+        &self,
+        client: &C,
+        tenant_id: &str,
+        extracts: bool,
+    ) -> StorageResult<SearchParameterExtractor>
+    where
+        C: GenericClient + Sync + ?Sized,
+    {
+        if extracts {
+            self.authoritative_extractor(client, tenant_id).await
+        } else {
+            Ok(SearchParameterExtractor::new(
+                self.registries.base().clone(),
+            ))
+        }
+    }
+
     /// TTL-cache refresh (#235): reload the stored-param cache from storage and
     /// drop the cached per-tenant registries. Returns the stored-param count.
     /// PostgreSQL reindex reads authoritative definitions within its guarded

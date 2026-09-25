@@ -171,7 +171,11 @@ impl PostgresTransaction {
             }
             return Err(error);
         }
-        let extractor = match backend.authoritative_extractor(&*guarded, tenant_id).await {
+        let extracts = !backend.is_search_offloaded() && !options.defer_search_indexing;
+        let extractor = match backend
+            .write_extractor(&*guarded, tenant_id, extracts)
+            .await
+        {
             Ok(extractor) => extractor,
             Err(error) => {
                 if guarded.batch_execute("ROLLBACK").await.is_ok() {
@@ -551,9 +555,10 @@ impl PostgresTransaction {
     async fn refresh_search_snapshot_if_dirty(&mut self) -> StorageResult<()> {
         if self.search_snapshot_dirty {
             self.flush().await?;
+            let extracts = !self.search_offloaded && !self.defer_search_indexing;
             let extractor = match self
                 .backend
-                .authoritative_extractor(self.client()?, self.tenant.tenant_id().as_str())
+                .write_extractor(self.client()?, self.tenant.tenant_id().as_str(), extracts)
                 .await
             {
                 Ok(extractor) => extractor,
