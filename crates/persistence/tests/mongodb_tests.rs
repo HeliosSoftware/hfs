@@ -604,6 +604,283 @@ mod ap_prefix_suite;
 #[path = "search/ap_relations_suite.rs"]
 mod ap_relations_suite;
 
+/// #1407: composites under `_contained` are matched within one contained
+/// resource — a code pairs with the quantity of the *same* component, never
+/// across components or sibling contained resources. Strict: unlike the
+/// `criteria_are_applied_or_rejected` composite cases, which accept a refusal
+/// naming the parameter, these cases demand the answer. Mixed criteria must
+/// also match on the same contained resource.
+#[tokio::test]
+async fn mongodb_contained_composites_pair_within_one_resource() {
+    let Some(backend) = create_backend_with_full_registry("contained_comp").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    contained_suite::contained_composites_pair_within_one_resource(
+        &backend,
+        "contained-composites-1407",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mongodb_contained_repeated_type_composite_and_modifier() {
+    let Some(backend) = create_backend_with_full_registry("contained_comp_guard").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    contained_suite::repeated_type_composite_and_modifier(
+        &backend,
+        "contained-composite-guard-1407",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mongodb_repeated_type_composite_legacy_rows_require_reindex() {
+    use helios_persistence::search::{ReindexOperation, ReindexRequest, ReindexStatus};
+    use helios_persistence::types::ContainedMode;
+
+    let Some(backend) = create_backend_with_full_registry("repeated_slot_legacy").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    let tenant = create_tenant("repeated-slot-legacy");
+    let observation = json!({
+        "resourceType": "Observation", "id": "top", "status": "final",
+        "code": {"coding": [{"system": "http://loinc.org", "code": "A"}]},
+        "valueCodeableConcept": {"coding": [{"system": "http://example.org/value", "code": "B"}]}
+    });
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            observation.clone(),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let mut inside = observation;
+    inside["id"] = json!("inside");
+    backend
+        .create(
+            &tenant,
+            "DiagnosticReport",
+            json!({
+                "resourceType": "DiagnosticReport", "id": "report", "status": "final",
+                "code": {"coding": [{"system": "http://loinc.org", "code": "report"}]},
+                "contained": [inside]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let pair = |value: &str| SearchParameter {
+        name: "code-value-concept".to_string(),
+        param_type: SearchParamType::Composite,
+        values: vec![SearchValue::eq(value)],
+        components: vec![
+            CompositeSearchComponent {
+                param_type: SearchParamType::Token,
+                param_name: "code".to_string(),
+            },
+            CompositeSearchComponent {
+                param_type: SearchParamType::Token,
+                param_name: "value-concept".to_string(),
+            },
+        ],
+        ..Default::default()
+    };
+    let query = |value: &str, contained| {
+        let mut query = SearchQuery::new("Observation");
+        query.parameters.push(pair(value));
+        query.contained = contained;
+        query.count = Some(1);
+        query
+    };
+    assert_eq!(
+        backend
+            .search_count(&tenant, &query("A$B", ContainedMode::Off))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        backend
+            .search_count(&tenant, &query("B$A", ContainedMode::Off))
+            .await
+            .unwrap(),
+        0
+    );
+
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap();
+    let db = client.database(&backend.config().database_name);
+    let own = db.collection::<Document>("search_index");
+    let held = db.collection::<Document>("search_index_contained");
+    let own_key = doc! {"tenant_id": tenant.tenant_id().as_str(), "resource_type": "Observation", "resource_id": "top", "param_name": "code-value-concept"};
+    let held_key = doc! {"tenant_id": tenant.tenant_id().as_str(), "resource_type": "DiagnosticReport", "contained_type": "Observation", "param_name": "code-value-concept"};
+    assert_eq!(
+        own.update_many(own_key.clone(), doc! {"$unset": {"composite_slot": ""}})
+            .await
+            .unwrap()
+            .modified_count,
+        2
+    );
+    for outcome in [
+        backend
+            .search(&tenant, &query("A$B", ContainedMode::Off))
+            .await
+            .map(|_| ()),
+        backend
+            .search_count(&tenant, &query("A$B", ContainedMode::Off))
+            .await
+            .map(|_| ()),
+    ] {
+        let error = outcome.expect_err("legacy primary index must fail closed");
+        assert!(error.to_string().contains("$reindex"), "{error:?}");
+    }
+
+    let transaction_entry = |value: &str| BundleEntry {
+        method: BundleMethod::Post,
+        url: "Observation".to_string(),
+        resource: Some(
+            json!({"resourceType": "Observation", "status": "final", "code": {"coding": [{"code": "new"}]}}),
+        ),
+        if_match: None,
+        if_none_match: None,
+        if_none_exist: Some(format!("code-value-concept={value}")),
+        full_url: None,
+    };
+    let error = backend
+        .process_transaction(
+            &tenant,
+            vec![transaction_entry("A$B")],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("legacy transactional index must fail closed");
+    assert!(error.to_string().contains("$reindex"), "{error:?}");
+
+    assert_eq!(
+        held.update_many(held_key.clone(), doc! {"$unset": {"composite_slot": ""}})
+            .await
+            .unwrap()
+            .modified_count,
+        2
+    );
+    for mode in [ContainedMode::On, ContainedMode::Both] {
+        for outcome in [
+            backend
+                .search(&tenant, &query("A$B", mode))
+                .await
+                .map(|_| ()),
+            backend
+                .search_count(&tenant, &query("A$B", mode))
+                .await
+                .map(|_| ()),
+        ] {
+            let error = outcome.expect_err("legacy contained index must fail closed");
+            assert!(
+                error.to_string().contains("$reindex"),
+                "{mode:?}: {error:?}"
+            );
+        }
+    }
+    // A tenant-wide rebuild covers both the top-level Observation and the
+    // DiagnosticReport that owns the contained Observation.
+    let registries = backend.tenant_registries().clone();
+    let backend = Arc::new(backend);
+    let reindex = ReindexOperation::new(backend.clone(), registries);
+    let job = reindex
+        .start(
+            tenant.clone(),
+            ReindexRequest {
+                clear_existing: false,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let progress = tokio::time::timeout(tokio::time::Duration::from_secs(30), async {
+        loop {
+            let progress = reindex.get_progress(&job).await.unwrap();
+            if !progress.status.is_running() {
+                break progress;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("tenant reindex timed out");
+    assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+    assert!(progress.errors.is_empty(), "{progress:?}");
+    assert!(progress.processed_resources >= 2, "{progress:?}");
+
+    assert_eq!(
+        backend
+            .search_count(&tenant, &query("A$B", ContainedMode::Off))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        backend
+            .search_count(&tenant, &query("B$A", ContainedMode::Off))
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        backend
+            .search_count(&tenant, &query("A$B", ContainedMode::On))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        backend
+            .search_count(&tenant, &query("B$A", ContainedMode::On))
+            .await
+            .unwrap(),
+        0
+    );
+    let matched = backend
+        .process_transaction(
+            &tenant,
+            vec![transaction_entry("A$B")],
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(matched.entries[0].status, 200);
+    let swapped = backend
+        .process_transaction(
+            &tenant,
+            vec![transaction_entry("B$A")],
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(swapped.entries[0].status, 201);
+}
+
+// Strict `_contained=both` dedup (#1407): a container of the searched type
+// that also matches top-level is listed and counted once. Fails while the
+// overlap is deduped per top-level page and double-counted in `_total`.
+#[tokio::test]
+async fn mongodb_contained_both_dedups_container_also_matching_top_level() {
+    let Some(backend) = create_backend_with_full_registry("contained_both").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    contained_suite::both_dedups_container_also_matching_top_level(&backend, "contained-both-1407")
+        .await;
+}
+
 /// The backend-agnostic suite for exponent-form number and quantity search
 /// values (#1337). Same `#[path]` arrangement.
 #[path = "search/number_exponent_suite.rs"]
@@ -5285,11 +5562,31 @@ async fn mongodb_integration_contained_both_dedupes_a_container_that_is_also_a_t
         vec!["Patient/dual", "Observation/obs-holder"],
         "dual must appear once, top-level first"
     );
-    // total = top_total (1: dual) + contained_total (2: dual and
-    // obs-holder, both matched as containers before de-duplication) = 3.
-    // A dual match is counted in both sources — this is the documented
-    // trade-off of paging each source on the server independently.
-    assert_eq!(r.total, Some(3));
+    // The overlap contributes once to both the result set and its count.
+    assert_eq!(r.total, Some(2));
+    assert_eq!(backend.search_count(&tenant, &q).await.unwrap(), 2);
+
+    // Paging across the top-level/contained boundary must not return the
+    // overlapping container again or leave an empty slot on the second page.
+    q.count = Some(1);
+    for (offset, expected) in [
+        (0, vec!["Patient/dual"]),
+        (1, vec!["Observation/obs-holder"]),
+        (2, vec![]),
+    ] {
+        q.offset = Some(offset);
+        let page = backend.search(&tenant, &q).await.unwrap();
+        assert_eq!(
+            page.resources
+                .items
+                .iter()
+                .map(|x| x.url())
+                .collect::<Vec<_>>(),
+            expected,
+            "unexpected page at offset {offset}"
+        );
+        assert_eq!(page.total, Some(2), "wrong total at offset {offset}");
+    }
 }
 
 #[tokio::test]
@@ -7803,6 +8100,94 @@ async fn mongodb_integration_conditional_update_delete_and_no_match() {
         read_after_delete,
         Err(StorageError::Resource(ResourceError::Gone { .. }))
     ));
+}
+
+/// #1344: a criterion naming a search parameter the server does not know
+/// (`identifer` for `identifier`) used to match nothing, so a conditional
+/// create made a duplicate and a conditional delete answered as if there had
+/// been nothing to delete. It is refused, and nothing is written.
+#[tokio::test]
+async fn mongodb_integration_conditional_writes_refuse_an_unknown_parameter() {
+    let Some(backend) = create_backend_with_full_registry("conditional_unknown_parameter").await
+    else {
+        eprintln!(
+            "Skipping mongodb_integration_conditional_writes_refuse_an_unknown_parameter (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-conditional-unknown-parameter");
+    let criteria = "identifer=http://hospital.org/mrn|MRN-UNKNOWN-1";
+    let patient = json!({
+        "resourceType": "Patient",
+        "identifier": [{"system": "http://hospital.org/mrn", "value": "MRN-UNKNOWN-1"}],
+        "name": [{"family": "Original"}],
+    });
+
+    backend
+        .create(&tenant, "Patient", patient.clone(), FhirVersion::default())
+        .await
+        .unwrap();
+
+    let is_refused = |error: &StorageError, context: &str| {
+        assert!(
+            matches!(
+                error,
+                StorageError::Search(SearchError::QueryParseError { message })
+                    if message.contains("'identifer'")
+            ),
+            "{context}: expected a QueryParseError naming 'identifer', got {error:?}"
+        );
+    };
+
+    let created = backend
+        .conditional_create(
+            &tenant,
+            "Patient",
+            patient.clone(),
+            criteria,
+            FhirVersion::default(),
+        )
+        .await;
+    is_refused(
+        &created.expect_err("conditional create"),
+        "conditional create",
+    );
+
+    let updated = backend
+        .conditional_update(
+            &tenant,
+            "Patient",
+            patient,
+            criteria,
+            true,
+            FhirVersion::default(),
+            &helios_persistence::core::EntityTagPrecondition::Absent,
+        )
+        .await;
+    is_refused(
+        &updated.expect_err("conditional update"),
+        "conditional update",
+    );
+
+    let deleted = backend
+        .conditional_delete(
+            &tenant,
+            "Patient",
+            criteria,
+            &helios_persistence::core::EntityTagPrecondition::Absent,
+        )
+        .await;
+    is_refused(
+        &deleted.expect_err("conditional delete"),
+        "conditional delete",
+    );
+
+    assert_eq!(
+        backend.count(&tenant, Some("Patient")).await.unwrap(),
+        1,
+        "nothing was written or deleted"
+    );
 }
 
 #[tokio::test]
@@ -14230,21 +14615,11 @@ async fn mongodb_integration_boot_creates_only_inline_search_indexes_and_keeps_g
     let client = raw_test_client(&connection_string).await.unwrap();
     let db = client.database(&config.database_name);
     let names = search_index_names(&db).await;
-    assert_eq!(
-        names,
-        vec!["_id_", "idx_search_composite", "idx_search_resource"]
-    );
+    assert_eq!(names, expected_inline_names());
 
-    // Generation 3: the contained collection gets its two indexes inline too.
+    // Generation 3: the contained collection gets its three indexes inline too.
     let contained_names = index_names(&db, "search_index_contained").await;
-    assert_eq!(
-        contained_names,
-        vec![
-            "_id_",
-            "idx_search_contained",
-            "idx_search_contained_resource"
-        ]
-    );
+    assert_eq!(contained_names, expected_contained_names());
 
     // A record written by the builder must survive the next boot.
     db.collection::<Document>("schema_version")
@@ -14353,12 +14728,38 @@ const CURRENT_BACKGROUND_NAMES: [&str; 9] = [
     "idx_search_uri_v2",
 ];
 
+const CURRENT_INLINE_NAMES: [&str; 3] = [
+    "idx_search_composite",
+    "idx_search_composite_slot_probe",
+    "idx_search_resource",
+];
+
+const CURRENT_CONTAINED_NAMES: [&str; 3] = [
+    "idx_search_contained",
+    "idx_search_contained_composite_slot_probe",
+    "idx_search_contained_resource",
+];
+
+fn expected_inline_names() -> Vec<String> {
+    let mut names = vec!["_id_".to_string()];
+    names.extend(CURRENT_INLINE_NAMES.map(String::from));
+    names.sort();
+    names
+}
+
+fn expected_contained_names() -> Vec<String> {
+    let mut names = vec!["_id_".to_string()];
+    names.extend(CURRENT_CONTAINED_NAMES.map(String::from));
+    names.sort();
+    names
+}
+
 fn expected_current_names() -> Vec<String> {
     let mut all: Vec<String> = CURRENT_BACKGROUND_NAMES
         .iter()
         .map(|s| s.to_string())
         .collect();
-    all.extend(["_id_", "idx_search_composite", "idx_search_resource"].map(String::from));
+    all.extend(expected_inline_names());
     all.sort();
     all
 }
@@ -14439,15 +14840,11 @@ async fn mongodb_integration_builder_fresh_database_ends_with_generation2_set() 
     }
     let db = raw_test_client(&cs).await.unwrap().database(&db_name);
     assert_eq!(search_index_names(&db).await, expected_current_names());
-    // The contained collection's two inline indexes, built by
+    // The contained collection's three inline indexes, built by
     // `initialize_schema_async` (Task 3), independent of the builder.
     assert_eq!(
         index_names(&db, "search_index_contained").await,
-        vec![
-            "_id_",
-            "idx_search_contained",
-            "idx_search_contained_resource"
-        ]
+        expected_contained_names()
     );
     let record = db
         .collection::<Document>("schema_version")
@@ -14608,11 +15005,7 @@ async fn mongodb_integration_builder_moves_contained_rows_and_drops_the_old_part
     );
     assert_eq!(
         index_names(&db, "search_index_contained").await,
-        vec![
-            "_id_",
-            "idx_search_contained",
-            "idx_search_contained_resource"
-        ]
+        expected_contained_names()
     );
     let sv = db
         .collection::<Document>("schema_version")
@@ -14703,14 +15096,10 @@ async fn mongodb_integration_builder_off_mode_warns_and_changes_nothing() {
     missing.sort();
     assert_eq!(missing, CURRENT_BACKGROUND_NAMES.map(String::from).to_vec());
     // `off` mode changes nothing about the background (generation-2/v1)
-    // indexes the builder is responsible for; the two inline-class specs
-    // (`idx_search_composite`, `idx_search_resource`) are still created by
+    // indexes the builder is responsible for; the three inline specs are still created by
     // `initialize_schema_async` on every boot regardless of build mode (Task 3).
     let mut expected = before;
-    expected.extend([
-        "idx_search_composite".to_string(),
-        "idx_search_resource".to_string(),
-    ]);
+    expected.extend(CURRENT_INLINE_NAMES.map(String::from));
     expected.sort();
     assert_eq!(search_index_names(&db).await, expected);
 }
@@ -15099,6 +15488,97 @@ async fn mongodb_integration_missing_false_search_is_a_covered_v2_scan() {
 // so they need `create_backend_with_full_registry` only to make sure the
 // *extractor* decomposes composites into per-component rows the same way the
 // real R4 registry does on write.
+
+/// Both index collections retain the token component position for a registered
+/// token + token composite. Ordinary token rows have no composite slot.
+#[tokio::test]
+async fn mongodb_integration_composite_slots_written_to_both_index_collections() {
+    let Some(backend) = create_backend_with_full_registry("composite_slots").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-composite-slots");
+    let observation = json!({
+        "resourceType": "Observation",
+        "id": "own",
+        "status": "final",
+        "code": {"coding": [{"system": "http://example.org/code", "code": "A"}]},
+        "valueCodeableConcept": {
+            "coding": [{"system": "http://example.org/value", "code": "B"}]
+        }
+    });
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            observation.clone(),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed top-level Observation");
+    let mut contained_observation = observation;
+    contained_observation["id"] = json!("inside");
+    backend
+        .create(
+            &tenant,
+            "DiagnosticReport",
+            json!({
+                "resourceType": "DiagnosticReport",
+                "id": "holder",
+                "status": "final",
+                "code": {"text": "panel"},
+                "contained": [contained_observation]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed contained Observation");
+
+    let db = raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap()
+        .database(&backend.config().database_name);
+    for (collection, resource_type, resource_id) in [
+        ("search_index", "Observation", "own"),
+        ("search_index_contained", "DiagnosticReport", "holder"),
+    ] {
+        let index = db.collection::<Document>(collection);
+        let mut filter = doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": resource_type,
+            "resource_id": resource_id,
+            "param_name": "code-value-concept",
+        };
+        if collection == "search_index_contained" {
+            filter.insert("contained_type", "Observation");
+            filter.insert("contained_local_id", "inside");
+        }
+        assert_eq!(
+            index.count_documents(filter.clone()).await.unwrap(),
+            2,
+            "{collection} must have exactly two code-value-concept rows"
+        );
+        for (code, slot) in [("A", 1), ("B", 2)] {
+            let mut component_filter = filter.clone();
+            component_filter.insert("value_token_code", code);
+            let row = index
+                .find_one(component_filter)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("missing {code} row in {collection}"));
+            assert_eq!(row.get_i32("composite_group"), Ok(0));
+            assert_eq!(row.get_i32("composite_slot"), Ok(slot));
+        }
+
+        filter.insert("param_name", "code");
+        let ordinary = index
+            .find_one(filter)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("missing ordinary code row in {collection}"));
+        assert!(!ordinary.contains_key("composite_slot"));
+    }
+}
 
 /// Builds a `code-value-quantity` composite query with the component types
 /// the registry supplies for `Observation` (Token code, Quantity value).
@@ -15657,46 +16137,56 @@ async fn mongodb_integration_composite_conditional_create_matches_existing() {
     }
 }
 
-/// Fix 3 (blocking): `_contained` combined with a composite parameter must
-/// be a clear 400, not a silent partial filter -- `matching_contained`
-/// skips `Composite` params entirely, so `_contained=both` would otherwise
-/// filter only its top-level half by the composite and let the contained
-/// half ignore it.
+/// A supported token + quantity composite applies to contained resources
+/// under `_contained=both`, including the count path.
 #[tokio::test]
-async fn mongodb_integration_contained_rejects_composite_parameter() {
+async fn mongodb_integration_contained_matches_composite_parameter() {
     use helios_persistence::types::ContainedMode;
 
     let Some(backend) = create_backend_with_full_registry("contained_composite").await else {
         eprintln!(
-            "Skipping mongodb_integration_contained_rejects_composite_parameter (requires Docker or HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_contained_matches_composite_parameter (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
     let tenant = create_tenant("tenant-contained-composite");
+    backend
+        .create(
+            &tenant,
+            "DiagnosticReport",
+            json!({
+                "resourceType": "DiagnosticReport",
+                "id": "container",
+                "status": "final",
+                "code": {"text": "panel"},
+                "contained": [{
+                    "resourceType": "Observation",
+                    "id": "height",
+                    "status": "final",
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "8302-2"}]},
+                    "valueQuantity": {"value": 170, "system": "http://unitsofmeasure.org", "code": "cm"}
+                }]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed contained height");
 
     let mut query = code_value_quantity_query("http://loinc.org|8302-2$gt150");
     query.contained = ContainedMode::Both;
 
-    let err = backend
+    let found = backend
         .search(&tenant, &query)
         .await
-        .expect_err("composite + _contained=both must be rejected, not silently under-filtered");
-    assert!(
-        matches!(
-            err,
-            StorageError::Search(SearchError::InvalidComposite { .. })
-        ),
-        "expected InvalidComposite, got {err:?}"
-    );
+        .expect("supported composite under _contained=both");
+    assert_eq!(found.resources.items.len(), 1);
+    assert_eq!(found.resources.items[0].id(), "container");
 
-    let count_err = backend
+    let count = backend
         .search_count(&tenant, &query)
         .await
-        .expect_err("search_count must reject the same combination");
-    assert!(matches!(
-        count_err,
-        StorageError::Search(SearchError::InvalidComposite { .. })
-    ));
+        .expect("count supported composite under _contained=both");
+    assert_eq!(count, 1);
 }
 
 /// Fix 5 test gap: `:not` on a composite parameter must be rejected by

@@ -2309,7 +2309,7 @@ where
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
             .collect();
         let registry = state.storage().search_param_registry(tenant.context());
-        let mut query = {
+        let query = {
             let registry = registry.read();
             crate::extractors::build_search_query_from_pairs(
                 resource_type,
@@ -2321,6 +2321,12 @@ where
                 message: format!("Conditional reference '{reference}' is not a valid search: {e}"),
             })?
         };
+        // `search()` does not read a chain or `_has` (#1389): resolve them
+        // into an `_id` filter first, as a type search does.
+        let mut query =
+            helios_persistence::search::resolve_chains(state.storage(), tenant.context(), &query)
+                .await
+                .map_err(RestError::from)?;
         // Two is enough to prove the match is not unique.
         query.count = Some(2);
         let result = state

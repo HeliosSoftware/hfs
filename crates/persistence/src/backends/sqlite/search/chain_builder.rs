@@ -461,38 +461,7 @@ impl ChainQueryBuilder {
                     SqlParam::String(format!("%{}%", escaped)),
                 )
             }
-            SearchParamType::Token => {
-                // Handle system|code format
-                if let Some((system, code)) = value.value.split_once('|') {
-                    if system.is_empty() {
-                        (
-                            format!(
-                                "({}.value_token_system IS NULL OR {}.value_token_system IN ('', '{}')) \
-                                 AND {}.value_token_code = ?{}",
-                                alias, alias, IMPLICIT_TOKEN_SYSTEM, alias, param_num
-                            ),
-                            SqlParam::String(code.to_string()),
-                        )
-                    } else {
-                        (
-                            format!(
-                                "{}.value_token_system IN ('{}', '{}') AND {}.value_token_code = ?{}",
-                                alias,
-                                system.replace('\'', "''"),
-                                IMPLICIT_TOKEN_SYSTEM,
-                                alias,
-                                param_num
-                            ),
-                            SqlParam::String(code.to_string()),
-                        )
-                    }
-                } else {
-                    (
-                        format!("{}.value_token_code = ?{}", alias, param_num),
-                        SqlParam::String(value.value.clone()),
-                    )
-                }
-            }
+            SearchParamType::Token => build_token_condition(&alias, value, param_num),
             SearchParamType::Reference => (
                 format!("{}.value_reference LIKE ?{}", alias, param_num),
                 SqlParam::String(format!("%{}%", value.value)),
@@ -690,37 +659,7 @@ impl ChainQueryBuilder {
                     SqlParam::String(format!("%{}%", escaped)),
                 )
             }
-            SearchParamType::Token => {
-                if let Some((system, code)) = value.value.split_once('|') {
-                    if system.is_empty() {
-                        (
-                            format!(
-                                "({}.value_token_system IS NULL OR {}.value_token_system IN ('', '{}')) \
-                                 AND {}.value_token_code = ?{}",
-                                alias, alias, IMPLICIT_TOKEN_SYSTEM, alias, param_num
-                            ),
-                            SqlParam::String(code.to_string()),
-                        )
-                    } else {
-                        (
-                            format!(
-                                "{}.value_token_system IN ('{}', '{}') AND {}.value_token_code = ?{}",
-                                alias,
-                                system.replace('\'', "''"),
-                                IMPLICIT_TOKEN_SYSTEM,
-                                alias,
-                                param_num
-                            ),
-                            SqlParam::String(code.to_string()),
-                        )
-                    }
-                } else {
-                    (
-                        format!("{}.value_token_code = ?{}", alias, param_num),
-                        SqlParam::String(value.value.clone()),
-                    )
-                }
-            }
+            SearchParamType::Token => build_token_condition(&alias, value, param_num),
             SearchParamType::Reference => (
                 format!("{}.value_reference LIKE ?{}", alias, param_num),
                 SqlParam::String(format!("%{}%", value.value)),
@@ -766,6 +705,58 @@ fn build_date_condition(
         now,
     );
     (sql, SqlParam::String(bound))
+}
+
+/// The terminal `token` comparison, against `{alias}.value_token_*`.
+///
+/// Mirrors [`TokenHandler`](super::parameter_handlers::TokenHandler), the
+/// unchained `token` search's handler, for each `value` form:
+///
+/// - `code` matches the code in any system;
+/// - `|code` matches the code with no system (or the implicit-system marker a
+///   `code` element is indexed with);
+/// - `system|` matches every code in `system` — and, like the unchained
+///   handler, not the implicit-system marker (#1389: this form used to require
+///   an empty code, so it matched nothing);
+/// - `system|code` matches the code in `system` or in the implicit system
+///   (#1379).
+///
+/// Every form binds exactly one parameter, `?param_num`: `system|code` inlines
+/// its system as an escaped literal so the code can take the bind.
+fn build_token_condition(alias: &str, value: &SearchValue, param_num: usize) -> (String, SqlParam) {
+    let Some((system, code)) = value.value.split_once('|') else {
+        return (
+            format!("{}.value_token_code = ?{}", alias, param_num),
+            SqlParam::String(value.value.clone()),
+        );
+    };
+    if system.is_empty() {
+        (
+            format!(
+                "({}.value_token_system IS NULL OR {}.value_token_system IN ('', '{}')) \
+                 AND {}.value_token_code = ?{}",
+                alias, alias, IMPLICIT_TOKEN_SYSTEM, alias, param_num
+            ),
+            SqlParam::String(code.to_string()),
+        )
+    } else if code.is_empty() {
+        (
+            format!("{}.value_token_system = ?{}", alias, param_num),
+            SqlParam::String(system.to_string()),
+        )
+    } else {
+        (
+            format!(
+                "{}.value_token_system IN ('{}', '{}') AND {}.value_token_code = ?{}",
+                alias,
+                system.replace('\'', "''"),
+                IMPLICIT_TOKEN_SYSTEM,
+                alias,
+                param_num
+            ),
+            SqlParam::String(code.to_string()),
+        )
+    }
 }
 
 /// The terminal `number` comparison, against `{alias}.value_number`.
@@ -875,11 +866,20 @@ mod tests {
         )
         .with_base(vec!["Observation"]);
 
+        let patient_identifier = SearchParameterDefinition::new(
+            "http://hl7.org/fhir/SearchParameter/Patient-identifier",
+            "identifier",
+            SearchParamType::Token,
+            "Patient.identifier",
+        )
+        .with_base(vec!["Patient"]);
+
         registry.register(patient_subject).unwrap();
         registry.register(patient_org).unwrap();
         registry.register(org_name).unwrap();
         registry.register(patient_name).unwrap();
         registry.register(obs_code).unwrap();
+        registry.register(patient_identifier).unwrap();
 
         Arc::new(RwLock::new(registry))
     }
@@ -1009,6 +1009,63 @@ mod tests {
             let fragment = builder.build_reverse_chain_sql(&rc).unwrap();
             assert!(fragment.sql.contains(&expected), "{}", fragment.sql);
         }
+    }
+
+    /// #1389: `system|` means "any code in this system", as in `TokenHandler`.
+    /// Both terminals used to read it as `system|code` with an empty code and
+    /// bind `value_token_code = ''`, so the chain matched nothing.
+    fn assert_system_only_token(fragment: &SqlFragment) {
+        assert!(
+            fragment.sql.contains("value_token_system = ?"),
+            "{}",
+            fragment.sql
+        );
+        assert!(
+            !fragment.sql.contains("value_token_code"),
+            "{}",
+            fragment.sql
+        );
+        assert!(
+            !fragment.sql.contains(IMPLICIT_TOKEN_SYSTEM),
+            "{}",
+            fragment.sql
+        );
+        assert!(
+            matches!(
+                fragment.params.as_slice(),
+                [SqlParam::String(system)] if system == "http://loinc.org"
+            ),
+            "{:?}",
+            fragment.params
+        );
+    }
+
+    #[test]
+    fn a_chained_system_only_token_matches_any_code_in_the_system() {
+        let registry = create_test_registry();
+        let builder = ChainQueryBuilder::new("tenant1", "Observation", registry);
+
+        let chain = builder.parse_chain("subject.identifier").unwrap();
+        assert_eq!(chain.terminal_type, SearchParamType::Token);
+        let fragment = builder
+            .build_forward_chain_sql(&chain, &SearchValue::eq("http://loinc.org|"))
+            .unwrap();
+        assert_system_only_token(&fragment);
+    }
+
+    #[test]
+    fn a_reverse_chained_system_only_token_matches_any_code_in_the_system() {
+        let registry = create_test_registry();
+        let builder = ChainQueryBuilder::new("tenant1", "Patient", registry);
+
+        let rc = ReverseChainedParameter::terminal(
+            "Observation",
+            "subject",
+            "code",
+            SearchValue::eq("http://loinc.org|"),
+        );
+        let fragment = builder.build_reverse_chain_sql(&rc).unwrap();
+        assert_system_only_token(&fragment);
     }
 
     #[test]

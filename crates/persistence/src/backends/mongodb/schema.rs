@@ -247,10 +247,10 @@ async fn ensure_history_indexes(database: &Database) -> StorageResult<()> {
     Ok(())
 }
 
-/// Creates the `search_index` indexes whose build is cheap enough to await at
-/// boot; the generation-2 value indexes are built by `SearchIndexBuilder`
-/// after boot (see the catalog). The contained collection's two indexes are
-/// small enough to create here, inline, every boot.
+/// Creates the inline search indexes before serving; `SearchIndexBuilder`
+/// builds the generation-2 value indexes after boot. Both collections have a
+/// partial composite-slot probe index. Building either probe on a large
+/// existing collection can extend startup; operators can pre-build them.
 async fn ensure_search_indexes(database: &Database) -> StorageResult<()> {
     let search_index = database.collection::<Document>(SEARCH_INDEX_COLLECTION);
     for spec in current_specs()
@@ -259,8 +259,8 @@ async fn ensure_search_indexes(database: &Database) -> StorageResult<()> {
     {
         search_index.create_index(spec.index_model()).await?;
     }
-    // Contained rows live in their own, small collection (#1160); both of
-    // its indexes are cheap enough to await at boot.
+    // Contained rows live in their own collection (#1160). Create its three
+    // indexes here so the legacy-slot probe can always use its named hint.
     let contained = database.collection::<Document>(SEARCH_INDEX_CONTAINED_COLLECTION);
     for spec in contained_specs() {
         contained.create_index(spec.index_model()).await?;

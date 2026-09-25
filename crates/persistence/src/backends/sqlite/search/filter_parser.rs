@@ -889,6 +889,18 @@ mod date_filter_tests {
         assert_eq!(frag.params.len(), 1);
     }
 
+    #[test]
+    fn short_fraction_date_keeps_following_filter_bind() {
+        let expr =
+            FilterParser::parse("date eq 2024-01-01T10:00:00.55Z and status eq completed").unwrap();
+        let frag = FilterSqlGenerator::new(1).generate(&expr);
+        assert_eq!(frag.params.len(), 2);
+        assert!(frag.sql.contains("'+0.01 seconds'"), "{}", frag.sql);
+        assert!(frag.sql.contains("value_token_code = ?3"), "{}", frag.sql);
+        assert!(matches!(&frag.params[0], SqlParam::String(s) if s == "2024-01-01T10:00:00.550Z"));
+        assert!(matches!(&frag.params[1], SqlParam::String(s) if s == "completed"));
+    }
+
     /// Non-date columns keep the plain text operators.
     #[test]
     fn filter_strings_keep_text_operators() {

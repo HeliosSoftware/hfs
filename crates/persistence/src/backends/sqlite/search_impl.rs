@@ -4,7 +4,8 @@
 //! - Basic single-type search
 //! - Multi-type search
 //! - _include and _revinclude support
-//! - Chained search parameter support
+//! - Chained search (`ChainedSearchProvider`); `search()` itself refuses a
+//!   query whose chains were not resolved first (#1389)
 //! - Search parameter filtering using the search_index table
 
 use std::collections::HashSet;
@@ -55,7 +56,40 @@ fn reject_unsupported_metadata_modifier(query: &SearchQuery) -> StorageResult<()
     crate::search::validate_numeric_values(query)?;
     // And a value that is empty, or has an empty alternative: `family=Zzz,`
     // is a prefix match on `""`, which is every family name (#1380).
-    crate::search::validate_value_presence(query)
+    crate::search::validate_value_presence(query)?;
+    // And a chain nobody resolved (#1389).
+    reject_unresolved_chains(query)
+}
+
+/// Refuses a query that still carries chained or reverse-chained (`_has`)
+/// parameters (#1389). The query builder reads neither: an unresolved `_has`
+/// was silently dropped (every resource of the type matched) and a forward
+/// chain was read as a plain reference predicate on its first hop. Callers
+/// resolve chains first (`crate::search::resolve_chains`, as REST does), which
+/// strips both; anything that reaches here with one is an error, never a
+/// wrong answer. Runs after the `_contained` refusal so that path keeps its
+/// more specific error.
+fn reject_unresolved_chains(query: &SearchQuery) -> StorageResult<()> {
+    if let Some(param) = query.parameters.iter().find(|p| !p.chain.is_empty()) {
+        let mut chain = param.name.clone();
+        for link in &param.chain {
+            if let Some(target_type) = &link.target_type {
+                chain.push(':');
+                chain.push_str(target_type);
+            }
+            chain.push('.');
+            chain.push_str(&link.target_param);
+        }
+        return Err(StorageError::Search(
+            SearchError::ChainedSearchNotSupported {
+                chain: format!("{chain} (unresolved; resolve chains before search)"),
+            },
+        ));
+    }
+    if !query.reverse_chains.is_empty() {
+        return Err(StorageError::Search(SearchError::ReverseChainNotSupported));
+    }
+    Ok(())
 }
 
 /// Refuses what `_contained` matching cannot apply. `:missing` was once the
@@ -2843,6 +2877,93 @@ mod tests {
         assert!(matching_ids.contains(&"p1".to_string()));
     }
 
+    /// #1389, end to end on real rows: `system|` on a chained token terminal
+    /// matches every code in that system, forward and reverse. The SQL text
+    /// tests cannot show the predicate matches anything.
+    #[tokio::test]
+    async fn test_resolve_chain_system_only_token_matches_rows() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let tenant_id = tenant.tenant_id().as_str();
+
+        for (ty, id, body) in [
+            ("Patient", "p1", json!({"id": "p1"})),
+            ("Patient", "p2", json!({"id": "p2"})),
+            (
+                "Observation",
+                "o1",
+                json!({"id": "o1", "subject": {"reference": "Patient/p1"}}),
+            ),
+            (
+                "Observation",
+                "o2",
+                json!({"id": "o2", "subject": {"reference": "Patient/p2"}}),
+            ),
+        ] {
+            let _ = id;
+            backend
+                .create(&tenant, ty, body, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+        {
+            let conn = backend.get_connection().unwrap();
+            for (rt, rid, name, refv) in [
+                ("Observation", "o1", "subject", "Patient/p1"),
+                ("Observation", "o2", "subject", "Patient/p2"),
+            ] {
+                conn.execute(
+                    "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_reference)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![tenant_id, rt, rid, name, refv],
+                )
+                .unwrap();
+            }
+            for (rt, rid, name, sys, code) in [
+                ("Patient", "p1", "identifier", "http://ex.org/mrn", "MRN1"),
+                ("Patient", "p2", "identifier", "http://other.example", "X1"),
+                ("Observation", "o1", "code", "http://loinc.org", "8867-4"),
+                (
+                    "Observation",
+                    "o2",
+                    "code",
+                    "http://snomed.info/sct",
+                    "271649006",
+                ),
+            ] {
+                conn.execute(
+                    "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_token_system, value_token_code)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![tenant_id, rt, rid, name, sys, code],
+                )
+                .unwrap();
+            }
+        }
+
+        let forward = backend
+            .resolve_chain(
+                &tenant,
+                "Observation",
+                "subject.identifier",
+                "http://ex.org/mrn|",
+            )
+            .await
+            .unwrap();
+        assert_eq!(forward, vec!["o1".to_string()]);
+
+        let reverse_chain = ReverseChainedParameter::terminal(
+            "Observation",
+            "subject",
+            "code",
+            crate::types::SearchValue::eq("http://loinc.org|"),
+        );
+        let reverse = backend
+            .resolve_reverse_chain(&tenant, "Patient", &reverse_chain)
+            .await
+            .unwrap();
+        assert_eq!(reverse, vec!["p1".to_string()]);
+    }
+
     #[tokio::test]
     async fn test_resolve_chain_multi_level() {
         // Test 3-level chain: Observation?subject.organization.name=Hospital
@@ -2988,6 +3109,84 @@ mod tests {
 
         // Should return an error due to unknown parameter
         assert!(result.is_err());
+    }
+
+    /// `search()` reads neither `SearchParameter::chain` nor
+    /// `SearchQuery::reverse_chains`, so a query that still carries either
+    /// must be refused, not answered: an unresolved `_has` used to match every
+    /// Patient, and a forward chain was read as a reference to an id (#1389).
+    #[tokio::test]
+    async fn search_refuses_unresolved_chains() {
+        use crate::types::{ChainedParameter, SearchParamType};
+
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"id": "p1", "name": [{"family": "Smith"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({"id": "o1", "status": "final", "subject": {"reference": "Patient/p1"}}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        // Observation?subject:Patient.name=Smith
+        let forward = SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            values: vec![SearchValue::eq("Smith")],
+            chain: vec![ChainedParameter {
+                reference_param: "subject".to_string(),
+                target_type: Some("Patient".to_string()),
+                target_param: "name".to_string(),
+            }],
+            ..Default::default()
+        });
+        // Patient?_has:Observation:subject:status=cancelled — no match, yet
+        // it used to return p1.
+        let mut reverse = SearchQuery::new("Patient");
+        reverse
+            .reverse_chains
+            .push(ReverseChainedParameter::terminal(
+                "Observation",
+                "subject",
+                "status",
+                SearchValue::eq("cancelled"),
+            ));
+
+        for err in [
+            backend.search(&tenant, &forward).await.err(),
+            backend.search_count(&tenant, &forward).await.err(),
+        ] {
+            match err {
+                Some(StorageError::Search(SearchError::ChainedSearchNotSupported { chain })) => {
+                    assert!(chain.contains("subject:Patient.name"), "{chain}")
+                }
+                other => panic!("expected ChainedSearchNotSupported, got {other:?}"),
+            }
+        }
+        for err in [
+            backend.search(&tenant, &reverse).await.err(),
+            backend.search_count(&tenant, &reverse).await.err(),
+        ] {
+            assert!(
+                matches!(
+                    err,
+                    Some(StorageError::Search(SearchError::ReverseChainNotSupported))
+                ),
+                "expected ReverseChainNotSupported, got {err:?}"
+            );
+        }
     }
 
     // ========================================================================
