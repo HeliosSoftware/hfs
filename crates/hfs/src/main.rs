@@ -1214,6 +1214,8 @@ fn attach_login_sessions(
 /// `/_user/settings` unwired) keeps login sessions in process: fine on one
 /// node, but a cluster needs sticky sessions and a restart signs everyone
 /// out. Said once at startup so an operator knows which mode they are in.
+/// This binary only ever builds `PrefixPerTenant` from its environment, so
+/// the branch is reached through the library's configuration alone (#1514).
 #[cfg(feature = "s3")]
 fn warn_login_sessions_in_process(auth_state: Option<&Arc<AuthMiddlewareState>>) {
     if auth_state.is_some_and(|state| state.sessions.is_some()) {

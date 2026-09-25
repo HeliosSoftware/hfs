@@ -165,10 +165,12 @@ its own, now-superseded ones. Pending logins are consumed exactly once
 cluster-wide because the store's delete is the arbiter. Every primary store
 implements it — **SQLite**, **PostgreSQL**, **MongoDB** and **S3**, standalone
 and with Elasticsearch (on S3 under `_system.login-sessions/`, with the same
-conditional-`PutObject` compare-and-swap as `/_user/settings`). The one
-deployment that keeps sessions in process, and says so at startup, is S3
-bucket-per-tenant with no system bucket — the same case that leaves
-`/_user/settings` unwired — which then needs one node or sticky sessions. The user's access, refresh and ID tokens are
+conditional-`PutObject` compare-and-swap as `/_user/settings`). Every `hfs`
+deployment is therefore store-backed. The only way to end up with sessions
+held in process is an embedder building the S3 backend bucket-per-tenant
+with no system bucket — the same configuration that leaves `/_user/settings`
+unwired, and one the `hfs` binary's environment cannot express (#1514) —
+which is logged at startup and then needs one node or sticky sessions. The user's access, refresh and ID tokens are
 stored as they are: they never leave the server, and the IdP's own lifetimes
 bound them.
 
