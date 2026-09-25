@@ -760,3 +760,79 @@ async fn mongodb_integration_reindex_fetch_capped_page_never_spans_the_catch_up_
         assert_eq!(counts.get(id), Some(&1), "{id} must appear exactly once");
     }
 }
+
+/// S3 §4.5's round-page gap: every other test here builds its backend
+/// through [`create_id_phase_backend`], so every capped page it checks is an
+/// id-phase page (`v2|i|`). This test uses [`create_backend_with`] with the
+/// default 120 s margin instead: rows seeded moments ago are all newer than
+/// the walk's floor, so the id phase's first query comes back empty and the
+/// walker falls straight into catch-up round 1 within the same call
+/// (`WalkStep::IdPhase` -> `WalkStep::RoundStart` -> `WalkStep::Round`), and
+/// every page this test sees is a round page (`v2|c|1|`) built from more than
+/// one row — exercising the round arm's own continuation (`scanned.last()`
+/// before dedupe), its `walked` accounting, and the cap rule when a round
+/// page holds multiple rows, none of which the single-row round page in
+/// `..._page_never_spans_the_catch_up_boundary` reaches.
+#[tokio::test]
+async fn mongodb_integration_reindex_fetch_capped_round_page_bounds_multiple_rows() {
+    let Some(backend) = create_backend_with("reindex_capped_round_multi_row", |_| {}).await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant_id = "tenant-capped-round-multi-row";
+    let tenant = create_tenant(tenant_id);
+    // No `settle_into_id_phase` here: this test deliberately keeps the
+    // default margin so these rows land in round 1 instead.
+    for (id, k) in [("p01", 1usize), ("p02", 2), ("p03", 3), ("p04", 4)] {
+        backend
+            .create_or_update(
+                &tenant,
+                "Patient",
+                id,
+                json!({"resourceType": "Patient", "id": id, "name": [{"family": "X".repeat(200 * k)}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let db = raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap()
+        .database(&backend.config().database_name);
+    let sizes = reindex_resource_row_sizes(&db, tenant_id, "Patient").await;
+    let mut by_size = sizes.clone();
+    by_size.sort_by_key(|(_, size)| *size);
+    let cap: u64 = by_size.iter().take(2).map(|(_, size)| *size).sum();
+
+    let pages = walk_capped(&backend, &tenant, "Patient", 4, cap).await;
+    assert!(!pages.is_empty(), "must return at least one page");
+
+    let mut seen: Vec<String> = Vec::new();
+    for page in &pages {
+        let page_ids: Vec<String> = page.resources.iter().map(|r| r.id().to_string()).collect();
+        let page_bytes: u64 = page_ids
+            .iter()
+            .map(|id| sizes.iter().find(|(key, _)| key == id).unwrap().1)
+            .sum();
+        assert!(
+            page_bytes <= cap || page_ids.len() == 1,
+            "page {page_ids:?} totalled {page_bytes} bytes, over cap {cap}"
+        );
+        if let Some(next) = &page.next_cursor {
+            assert!(
+                next.starts_with("v2|c|1|"),
+                "a capped round-1 page's continuation cursor must stay in round 1, got {next}"
+            );
+        }
+        seen.extend(page_ids);
+    }
+
+    let mut counts = std::collections::HashMap::new();
+    for id in &seen {
+        *counts.entry(id.clone()).or_insert(0u32) += 1;
+    }
+    for id in ["p01", "p02", "p03", "p04"] {
+        assert_eq!(counts.get(id), Some(&1), "{id} must appear exactly once");
+    }
+}
