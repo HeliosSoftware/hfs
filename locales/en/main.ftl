@@ -795,6 +795,7 @@ bulk-export-field-since-custom = Custom instant
 bulk-export-since-invalid = Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z.
 bulk-export-field-until = Until
 bulk-export-field-until-hint = Optional upper bound. RFC 3339, e.g. 2026-08-01T00:00:00Z.
+bulk-export-until-before-since = Until must not be earlier than Since.
 bulk-export-window-since = Since
 bulk-export-window-until = Until
 bulk-export-start = Start Export
