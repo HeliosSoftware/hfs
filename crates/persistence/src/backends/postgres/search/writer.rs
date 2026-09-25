@@ -217,6 +217,38 @@ fn parse_index_date_lenient(value: &str) -> Option<DateTime<Utc>> {
         .ok()
 }
 
+/// The `[value_date, value_date_end)` range an extracted date is stored as
+/// (#1391).
+///
+/// A point value covers one unit of its own precision; a `Period` runs to the
+/// end of its `end`, or to [`open_end`](crate::search::open_end) when it has
+/// none. Both bounds are always set, so `value_date_end` is `NULL` only on a
+/// row no v43 writer or backfill has touched.
+///
+/// The start is read as [`parse_index_date`] reads it: the shared grammar
+/// first, then the lenient reading for values it does not take verbatim. For
+/// those the end is derived from the declared precision. `None` — the row is
+/// skipped — when either bound cannot be read: indexing a `Period` whose `end`
+/// is garbage as open-ended would over-match every later search.
+fn index_date_range(value: &IndexValue) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    use crate::search::{StorageResolution, indexed_end, indexed_range};
+
+    let IndexValue::Date {
+        value: raw,
+        precision,
+        end,
+    } = value
+    else {
+        return None;
+    };
+    if let Some(range) = indexed_range(value, StorageResolution::Micros) {
+        return Some(range);
+    }
+    let start = parse_index_date(raw)?;
+    let end = indexed_end(start, *precision, end, StorageResolution::Micros)?;
+    Some((start, end))
+}
+
 /// One `search_index` row, flattened to every column any write path can set.
 ///
 /// The three columns that identify the resource — `tenant_id`, `resource_type`,
@@ -243,6 +275,7 @@ pub(crate) struct IndexRow {
     value_token_system_2: Option<String>,
     value_token_code_2: Option<String>,
     value_date: Option<DateTime<Utc>>,
+    value_date_end: Option<DateTime<Utc>>,
     value_date_precision: Option<String>,
     value_number: Option<f64>,
     value_number_2: Option<f64>,
@@ -291,9 +324,9 @@ macro_rules! column {
 /// below never has to NULL-pad.
 fn insert_plan(rows: &[&IndexRow]) -> InsertPlan {
     let mut plan = InsertPlan {
-        columns: Vec::with_capacity(28),
-        casts: Vec::with_capacity(28),
-        params: Vec::with_capacity(28),
+        columns: Vec::with_capacity(29),
+        casts: Vec::with_capacity(29),
+        params: Vec::with_capacity(29),
     };
     let p = &mut plan;
 
@@ -334,6 +367,13 @@ fn insert_plan(rows: &[&IndexRow]) -> InsertPlan {
         .clone());
     column!(p, rows, "value_date", "timestamptz[]", |r: &&IndexRow| r
         .value_date);
+    column!(
+        p,
+        rows,
+        "value_date_end",
+        "timestamptz[]",
+        |r: &&IndexRow| r.value_date_end
+    );
     column!(
         p,
         rows,
@@ -428,7 +468,7 @@ fn insert_plan(rows: &[&IndexRow]) -> InsertPlan {
 /// crud run, and never once re-used, because the text changed with the row
 /// count and `execute(&str)` prepares a throwaway statement each call.
 ///
-/// Now there is a single text with 31 parameters — three scalars and 28 arrays —
+/// Now there is a single text with 32 parameters — three scalars and 29 arrays —
 /// whatever the row count, so it is prepared once per connection and every
 /// execution after the fifth runs on a cached generic plan.
 ///
@@ -515,7 +555,7 @@ const CLEAR_SQL: &str = "DELETE FROM search_index \
 /// So this form promotes those two to arrays and keeps only `tenant_id` scalar,
 /// which a transaction genuinely does hold constant (a `PostgresTransaction`
 /// carries exactly one `TenantContext`). Everything else — the column list, the
-/// bind order, the parameter *numbers* of the 28 value arrays — is shared with
+/// bind order, the parameter *numbers* of the 29 value arrays — is shared with
 /// [`INSERT_SQL`] by construction, because both are built from the same
 /// [`insert_plan`].
 static INSERT_SQL_MULTI: LazyLock<String> = LazyLock::new(|| {
@@ -538,7 +578,7 @@ static INSERT_SQL_MULTI: LazyLock<String> = LazyLock::new(|| {
 /// Rows per statement.
 ///
 /// With the `unnest` form this is no longer a bind-parameter limit — 128 rows
-/// cost the same 31 parameters as one row does — so it exists only to bound the
+/// cost the same 32 parameters as one row does — so it exists only to bound the
 /// array a single statement has to marshal. It is well above the 24.2 index rows
 /// an average resource produces; what it changes is the tail. `Provenance.target`
 /// alone writes 1,626 rows for one resource, which the old 128-row cap split
@@ -620,9 +660,11 @@ impl IndexRow {
                 row.value_identifier_type_system = identifier_type_system.clone();
                 row.value_identifier_type_code = identifier_type_code.clone();
             }
-            IndexValue::Date { value, precision } => {
+            IndexValue::Date {
+                value, precision, ..
+            } => {
                 row.value_date_precision = Some(precision.to_string());
-                let Some(timestamp) = parse_index_date(value) else {
+                let Some((start, end)) = index_date_range(&extracted.value) else {
                     tracing::warn!(
                         param_name = %extracted.param_name,
                         resource_type = %resource_type,
@@ -632,7 +674,8 @@ impl IndexRow {
                     );
                     return None;
                 };
-                row.value_date = Some(timestamp);
+                row.value_date = Some(start);
+                row.value_date_end = Some(end);
             }
             IndexValue::Number(n) => {
                 row.value_number = Some(*n);
@@ -713,6 +756,13 @@ impl IndexRow {
         row: &super::composite_rows::CompositeRow,
         last_updated: Option<DateTime<Utc>>,
     ) -> Self {
+        // A composite date component is compared as a point (`value_date`
+        // only), but its row still carries the end of its own precision so
+        // `value_date_end` is set wherever `value_date` is.
+        let date_range = row
+            .value_date
+            .as_deref()
+            .and_then(|value| index_date_range(&IndexValue::date(value)));
         IndexRow {
             last_updated,
             param_name: row.param_name.clone(),
@@ -722,7 +772,8 @@ impl IndexRow {
             value_token_system_2: row.value_token_system_2.clone(),
             value_token_code_2: row.value_token_code_2.clone(),
             value_string: row.value_string.clone(),
-            value_date: row.value_date.as_deref().and_then(parse_index_date),
+            value_date: date_range.map(|(start, _)| start),
+            value_date_end: date_range.map(|(_, end)| end),
             value_number: row.value_number,
             value_number_2: row.value_number_2,
             value_quantity_value: row.value_quantity_value,
@@ -740,7 +791,7 @@ impl IndexRow {
 ///
 /// Every column the table has, in borrowed form: the three that identify the
 /// resource (bound once per statement, so they are passed in rather than read
-/// off the row) plus all 28 of [`IndexRow`]'s. Two rows with equal keys are the
+/// off the row) plus all 29 of [`IndexRow`]'s. Two rows with equal keys are the
 /// same tuple, byte for byte, and Postgres would store both.
 ///
 /// `f64` is not `Eq`/`Hash`, so the five float columns are keyed on their IEEE
@@ -764,6 +815,7 @@ struct RowKey<'a> {
     value_token_system_2: Option<&'a String>,
     value_token_code_2: Option<&'a String>,
     value_date: Option<&'a DateTime<Utc>>,
+    value_date_end: Option<&'a DateTime<Utc>>,
     value_date_precision: Option<&'a String>,
     value_number: Option<u64>,
     value_number_2: Option<u64>,
@@ -805,6 +857,7 @@ impl IndexRow {
             value_token_system_2,
             value_token_code_2,
             value_date,
+            value_date_end,
             value_date_precision,
             value_number,
             value_number_2,
@@ -838,6 +891,7 @@ impl IndexRow {
             value_token_system_2: value_token_system_2.as_ref(),
             value_token_code_2: value_token_code_2.as_ref(),
             value_date: value_date.as_ref(),
+            value_date_end: value_date_end.as_ref(),
             value_date_precision: value_date_precision.as_ref(),
             value_number: value_number.map(f64::to_bits),
             value_number_2: value_number_2.map(f64::to_bits),
@@ -941,7 +995,7 @@ fn dedup_rows<'a>(
 
 /// The hasher [`dedup_rows`] uses, in place of the standard library's SipHash.
 ///
-/// A [`RowKey`] is 28 fields — most of them `Option<&String>` — so hashing one
+/// A [`RowKey`] is 29 fields — most of them `Option<&String>` — so hashing one
 /// feeds a few hundred bytes through the hasher, once per index row. SipHash is
 /// a keyed MAC chosen for resistance to collision attacks on hash maps whose
 /// keys an attacker controls; nothing here is a durable map, the keys live for
@@ -1695,6 +1749,7 @@ mod tests {
                 r.value_token_code_2 = Some("c".into())
             }),
             ("value_date", |r| r.value_date = Some(Utc::now())),
+            ("value_date_end", |r| r.value_date_end = Some(Utc::now())),
             ("value_date_precision", |r| {
                 r.value_date_precision = Some("day".into())
             }),
@@ -2214,6 +2269,7 @@ mod tests {
         let bad = || IndexValue::Date {
             value: "not-a-date".to_string(),
             precision: DatePrecision::Day,
+            end: crate::search::DateEnd::Precision,
         };
         assert!(
             IndexRow::from_extracted(&extracted(bad()), "Observation", "abc", Some(Utc::now()))
@@ -2221,6 +2277,65 @@ mod tests {
         );
         assert!(
             IndexRow::from_contained(&extracted(bad()), ("Observation", "abc"), ("Patient", "p1"))
+                .is_none()
+        );
+    }
+    /// One row per date value carrying both bounds (#1391): a point ends one
+    /// unit of its precision on, a `Period` at the end of its `end`, an open
+    /// end at the supported limit, and a `Period` whose `end` cannot be read
+    /// is not indexed at all.
+    #[test]
+    fn a_date_row_carries_its_range() {
+        use crate::search::{StorageResolution, open_end, open_start};
+        let at = |s: &str| {
+            DateTime::parse_from_rfc3339(s)
+                .expect("fixture instant")
+                .with_timezone(&Utc)
+        };
+        let range = |value: IndexValue| {
+            let row = row_of(value);
+            (
+                row.value_date.expect("start"),
+                row.value_date_end.expect("end"),
+            )
+        };
+
+        assert_eq!(
+            range(IndexValue::date("2020-06")),
+            (at("2020-06-01T00:00:00Z"), at("2020-07-01T00:00:00Z"))
+        );
+        assert_eq!(
+            range(IndexValue::date("2020-06-15T10:00:00.123456+02:00")),
+            (
+                at("2020-06-15T08:00:00.123456Z"),
+                at("2020-06-15T08:00:00.123457Z")
+            )
+        );
+        assert_eq!(
+            range(IndexValue::date_range(Some("2020-01-15"), Some("2020-06")).unwrap()),
+            (at("2020-01-15T00:00:00Z"), at("2020-07-01T00:00:00Z"))
+        );
+        assert_eq!(
+            range(IndexValue::date_range(Some("2020-01-15"), None).unwrap()),
+            (
+                at("2020-01-15T00:00:00Z"),
+                open_end(StorageResolution::Micros)
+            )
+        );
+        assert_eq!(
+            range(IndexValue::date_range(None, Some("2020")).unwrap()),
+            (open_start(), at("2021-01-01T00:00:00Z"))
+        );
+        // Outside the shared grammar but read leniently, as before: the end
+        // follows the declared precision.
+        assert_eq!(
+            range(IndexValue::date("2013-04-05T09:20:00+14:30")),
+            (at("2013-04-04T18:50:00Z"), at("2013-04-04T18:50:01Z"))
+        );
+
+        let bad_end = IndexValue::date_range(Some("2020-01-15"), Some("2020-02-30")).unwrap();
+        assert!(
+            IndexRow::from_extracted(&extracted(bad_end), "Encounter", "e1", Some(Utc::now()))
                 .is_none()
         );
     }

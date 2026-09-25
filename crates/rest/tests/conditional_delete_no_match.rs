@@ -15,6 +15,11 @@
 //! So the code was right and the comment wrong. Pinned here for the type-level
 //! endpoint and for a batch entry, which must agree; a transaction refuses a
 //! query-bearing `request.url` outright, so it has no no-match case.
+//!
+//! #1343: a bare `204` cannot tell "deleted" from "nothing matched". With
+//! `Prefer: return=OperationOutcome` both delete endpoints answer `200` and an
+//! informational OperationOutcome that says which it was; without it they stay
+//! `204` with no body.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,6 +33,8 @@ use helios_rest::config::{MultitenancyConfig, TenantRoutingMode};
 use serde_json::{Value, json};
 
 const X_TENANT_ID: HeaderName = HeaderName::from_static("x-tenant-id");
+const PREFER: HeaderName = HeaderName::from_static("prefer");
+const RETURN_OUTCOME: HeaderValue = HeaderValue::from_static("return=OperationOutcome");
 
 fn tenant() -> HeaderValue {
     HeaderValue::from_static("test-tenant")
@@ -106,17 +113,10 @@ async fn no_match_is_204_with_no_body_in_every_fhir_version() {
     seed(&server).await;
 
     for version in FhirVersion::enabled_versions() {
-        let accept = format!(
-            "application/fhir+json; fhirVersion={}",
-            version.as_mime_param()
-        );
         let response = server
             .delete("/Patient?identifier=nobody")
             .add_header(X_TENANT_ID, tenant())
-            .add_header(
-                axum::http::header::ACCEPT,
-                HeaderValue::from_str(&accept).expect("accept"),
-            )
+            .add_header(axum::http::header::ACCEPT, accept(version))
             .await;
         assert_eq!(
             response.status_code(),
@@ -145,6 +145,142 @@ async fn no_match_is_204_with_no_body_in_every_fhir_version() {
         .await
         .assert_status(StatusCode::PRECONDITION_FAILED);
     assert_eq!(ids(&server).await, ["a", "b"]);
+}
+
+fn accept(version: &FhirVersion) -> HeaderValue {
+    HeaderValue::from_str(&format!(
+        "application/fhir+json; fhirVersion={}",
+        version.as_mime_param()
+    ))
+    .expect("accept")
+}
+
+/// Asserts a `200` carrying a single informational issue, and returns its text.
+fn informational_text(response: &axum_test::TestResponse, context: &str) -> String {
+    assert_eq!(
+        response.status_code(),
+        StatusCode::OK,
+        "{context}: {}",
+        response.text()
+    );
+    let outcome: Value = response.json();
+    assert_eq!(
+        outcome["resourceType"], "OperationOutcome",
+        "{context}: {outcome}"
+    );
+    let issues = outcome["issue"].as_array().expect("issue array");
+    assert_eq!(issues.len(), 1, "{context}: {outcome}");
+    assert_eq!(issues[0]["severity"], "information", "{context}: {outcome}");
+    assert_eq!(issues[0]["code"], "informational", "{context}: {outcome}");
+    issues[0]["details"]["text"]
+        .as_str()
+        .expect("details.text")
+        .to_string()
+}
+
+/// With `Prefer: return=OperationOutcome` a client can tell a delete from a
+/// no-match: both are `200`, and the outcome names what happened.
+#[tokio::test]
+async fn prefer_operation_outcome_tells_deleted_from_no_match_in_every_fhir_version() {
+    let server = test_server().await;
+
+    for version in FhirVersion::enabled_versions() {
+        seed(&server).await;
+        let context = format!("{version:?}");
+
+        let response = server
+            .delete("/Patient?identifier=mrn-1")
+            .add_header(X_TENANT_ID, tenant())
+            .add_header(PREFER, RETURN_OUTCOME)
+            .add_header(axum::http::header::ACCEPT, accept(version))
+            .await;
+        assert_eq!(
+            informational_text(&response, &context),
+            "Resource deleted: Patient/a"
+        );
+        assert_eq!(ids(&server).await, ["b"], "{context}");
+
+        // The same criteria again now match nothing.
+        let response = server
+            .delete("/Patient?identifier=mrn-1")
+            .add_header(X_TENANT_ID, tenant())
+            .add_header(PREFER, RETURN_OUTCOME)
+            .add_header(axum::http::header::ACCEPT, accept(version))
+            .await;
+        assert_eq!(
+            informational_text(&response, &context),
+            "No Patient matched the search criteria; nothing was deleted"
+        );
+        assert_eq!(ids(&server).await, ["b"], "{context}");
+    }
+
+    // Other return preferences keep the default empty `204`.
+    seed(&server).await;
+    for prefer in ["return=minimal", "return=representation"] {
+        let response = server
+            .delete("/Patient?identifier=nobody")
+            .add_header(X_TENANT_ID, tenant())
+            .add_header(PREFER, HeaderValue::from_static(prefer))
+            .await;
+        assert_eq!(response.status_code(), StatusCode::NO_CONTENT, "{prefer}");
+        assert!(response.text().is_empty(), "{prefer}: a 204 has no body");
+    }
+}
+
+/// Control: the instance delete honours the preference the same way, and a
+/// missing resource is still `404` rather than an informational `200`.
+#[tokio::test]
+async fn instance_delete_honours_prefer_operation_outcome() {
+    let server = test_server().await;
+    seed(&server).await;
+
+    let response = server
+        .delete("/Patient/a")
+        .add_header(X_TENANT_ID, tenant())
+        .add_header(PREFER, RETURN_OUTCOME)
+        .await;
+    assert_eq!(
+        informational_text(&response, "instance"),
+        "Resource deleted: Patient/a"
+    );
+    assert_eq!(ids(&server).await, ["b"]);
+
+    for missing in ["/Patient/a", "/Patient/never-existed"] {
+        server
+            .delete(missing)
+            .add_header(X_TENANT_ID, tenant())
+            .add_header(PREFER, RETURN_OUTCOME)
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+    }
+
+    let response = server
+        .delete("/Patient/b")
+        .add_header(X_TENANT_ID, tenant())
+        .await;
+    assert_eq!(response.status_code(), StatusCode::NO_CONTENT);
+    assert!(response.text().is_empty(), "a 204 has no body");
+    assert!(ids(&server).await.is_empty());
+}
+
+/// A format the build cannot produce is refused as the formatter refuses it
+/// (`406`), not turned into a `500` — and nothing is lost: the delete ran.
+#[cfg(not(feature = "xml"))]
+#[tokio::test]
+async fn an_unproducible_format_is_406_not_500() {
+    let server = test_server().await;
+    seed(&server).await;
+
+    server
+        .delete("/Patient?identifier=mrn-1")
+        .add_header(X_TENANT_ID, tenant())
+        .add_header(PREFER, RETURN_OUTCOME)
+        .add_header(
+            axum::http::header::ACCEPT,
+            HeaderValue::from_static("application/fhir+xml"),
+        )
+        .await
+        .assert_status(StatusCode::NOT_ACCEPTABLE);
 }
 
 /// A batch entry answers what the endpoint answers, and its neighbours proceed.

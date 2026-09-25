@@ -95,9 +95,16 @@ async fn since_and_clinical_dates_filter_members_only() {
         m.contains(&"Condition/c1".to_string()),
         "onset-date 2020-01-15 in range"
     );
+    // Both encounters have a `period` with a start but no end, so each is an
+    // ongoing range with an unbounded end (#1391). e1 began in 2019 and is
+    // still running through 2020; e2 only begins in 2021.
     assert!(
-        !m.iter().any(|x| x.starts_with("Encounter/")),
-        "both encounters outside range"
+        m.contains(&"Encounter/e1".to_string()),
+        "open-ended period from 2019-06-01 overlaps 2020"
+    );
+    assert!(
+        !m.contains(&"Encounter/e2".to_string()),
+        "period starting 2021-06-01 is after 2020"
     );
 
     // _since: everything was created "now", so a far-future instant excludes all members.

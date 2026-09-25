@@ -10,7 +10,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 34;
+pub const SCHEMA_VERSION: i32 = 36;
 
 /// The `search_index` value indexes. Excludes `idx_search_composite`, which the
 /// delete-by-resource path needs at all times, and `idx_search_token_display`,
@@ -24,7 +24,7 @@ pub const SCHEMA_VERSION: i32 = 34;
 ///
 /// Keep each entry's SQL byte-for-byte what the migration ladder creates,
 /// normalised to one line, so the self-heal on startup and the ladder agree.
-pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 12] = [
+pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 13] = [
     (
         "idx_search_string",
         "CREATE INDEX IF NOT EXISTS idx_search_string ON search_index(tenant_id, resource_type, param_name, value_string) WHERE value_string IS NOT NULL",
@@ -36,6 +36,10 @@ pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 12] = [
     (
         "idx_search_date",
         "CREATE INDEX IF NOT EXISTS idx_search_date ON search_index(tenant_id, resource_type, param_name, value_date) WHERE value_date IS NOT NULL",
+    ),
+    (
+        "idx_search_date_end",
+        "CREATE INDEX IF NOT EXISTS idx_search_date_end ON search_index(tenant_id, resource_type, param_name, value_date_end, value_date) WHERE value_date_end IS NOT NULL",
     ),
     (
         "idx_search_number",
@@ -445,6 +449,8 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             31 => migrate_v31_to_v32(conn)?,
             32 => migrate_v32_to_v33(conn)?,
             33 => migrate_v33_to_v34(conn)?,
+            34 => migrate_v34_to_v35(conn)?,
+            35 => migrate_v35_to_v36(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -1594,6 +1600,174 @@ fn migrate_v33_to_v34(conn: &Connection) -> StorageResult<()> {
             ON secondary_sync_failures (last_failed_at);",
     )
     .map_err(|e| migration_err(format!("v34 create secondary_sync_failures: {e}")))?;
+    Ok(())
+}
+
+/// Migrate from schema version 34 to version 35 (#1391).
+///
+/// Adds `search_index.value_date_end`: every date row is a range
+/// `[value_date, value_date_end)`, so a `Period` is one row instead of its two
+/// ends as unrelated points, and the search prefixes compare ranges the way
+/// FHIR defines them. The end is fixed-width UTC text
+/// ([`super::search::writer::SQLITE_INSTANT_FORMAT`]); an open `Period` ends
+/// at the last instant of the supported years rather than NULL, so NULL only
+/// ever means "no end could be read".
+///
+/// Existing date rows were all indexed as points, so each is backfilled with
+/// the end of its own precision — the end the writer gives a point today. A
+/// `Period` indexed before this version stays two point rows until the
+/// resource is reindexed (`$reindex`).
+///
+/// **Known limitation: rows of unknown precision.** Rows written before
+/// `value_date_precision` existed, and those the hard-coded fallback indexer
+/// (`_lastUpdated`, `date`, `birthdate`) has always written without one, have
+/// a NULL precision. A date-only value in such a row was stored padded to
+/// `YYYY-MM-DDT00:00:00` (`2020`, `2020-06` and `2020-06-15` pad to a
+/// different midnight but nothing records which of the three it was), and a
+/// real `dateTime` at midnight without an offset looks the same. The history
+/// therefore does not say whether the range is a year, a month, a day or a
+/// second, and the backfill does not guess: it reads the precision from the
+/// text's shape, so such a padded row gets a one-second range. `ne` and `ap`
+/// on it can differ from a row indexed today until the resource is reindexed
+/// (`$reindex`), which records the true precision. The number of such padded,
+/// precision-less rows is logged at warn level when the migration fills them.
+///
+/// The backfill runs in Rust, in rowid batches, through the writer's own
+/// [`super::search::writer::stored_date_end`], so an old row gets exactly the
+/// end a new one would. The FTS triggers stay in place: their `WHEN` needs a
+/// `value_string` or `value_token_display`, which a date row never has.
+/// Replay-safe: the column is added only when missing, and only rows still
+/// without an end are visited.
+fn migrate_v34_to_v35(conn: &Connection) -> StorageResult<()> {
+    if !table_columns(conn, "search_index")?
+        .iter()
+        .any(|column| column == "value_date_end")
+    {
+        conn.execute(
+            "ALTER TABLE search_index ADD COLUMN value_date_end TEXT",
+            [],
+        )
+        .map_err(|e| migration_err(format!("v35 add value_date_end: {e}")))?;
+    }
+
+    let unknown_precision = backfill_value_date_end(conn)?;
+
+    // The range comparisons that bound the end (`eq`, `gt`, `sa`, `eb`, `ap`,
+    // `ge`) seek on this index instead of reading every date row of the type,
+    // and it carries `value_date` as its last column so that they never have to
+    // fetch the table row for the start either (measured on 2M date rows: `eq`
+    // 1.9 s -> 0.01 s, `ap` 2.2 s -> 0.4 s). It is built after the backfill,
+    // once, over final data.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_search_date_end ON search_index(tenant_id, resource_type, param_name, value_date_end, value_date) WHERE value_date_end IS NOT NULL",
+        [],
+    )
+    .map_err(|e| migration_err(format!("v35 create idx_search_date_end: {e}")))?;
+
+    if unknown_precision > 0 {
+        tracing::warn!(
+            rows = unknown_precision,
+            "schema v35: {unknown_precision} date index row(s) have no recorded precision and a \
+             padded midnight value (a date-only value, or a dateTime at midnight); their range \
+             end was filled as one second, so `ne`/`ap` searches on them may differ from a \
+             freshly indexed row until the resources are reindexed ($reindex)"
+        );
+    }
+    Ok(())
+}
+
+/// Fill `value_date_end` on every date row still without one, returning how
+/// many of them were rows of unknown precision: no `value_date_precision` and
+/// a `T00:00:00` value with no offset, the shape a padded date-only value has
+/// (see [`migrate_v34_to_v35`]).
+fn backfill_value_date_end(conn: &Connection) -> StorageResult<usize> {
+    use crate::search::converters::{DateEnd, IndexValue};
+    use crate::types::DatePrecision;
+
+    let mut unknown_precision = 0_usize;
+    const BATCH: i64 = 10_000;
+    let mut after = 0_i64;
+    loop {
+        let rows: Vec<(i64, String, Option<String>)> = {
+            let mut select = conn
+                .prepare_cached(
+                    "SELECT rowid, value_date, value_date_precision FROM search_index
+                      WHERE rowid > ?1 AND value_date IS NOT NULL AND value_date_end IS NULL
+                      ORDER BY rowid LIMIT ?2",
+                )
+                .map_err(|e| migration_err(format!("v35 read date rows: {e}")))?;
+            let rows = select
+                .query_map(rusqlite::params![after, BATCH], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .map_err(|e| migration_err(format!("v35 read date rows: {e}")))?;
+            rows.collect::<Result<_, _>>()
+                .map_err(|e| migration_err(format!("v35 read date rows: {e}")))?
+        };
+        let Some(&(last, _, _)) = rows.last() else {
+            break;
+        };
+        after = last;
+
+        let mut update = conn
+            .prepare_cached("UPDATE search_index SET value_date_end = ?2 WHERE rowid = ?1")
+            .map_err(|e| migration_err(format!("v35 backfill value_date_end: {e}")))?;
+        for (rowid, value, precision) in rows {
+            // Rows written without a precision (the `_lastUpdated` fallback)
+            // hold the instant as written, whose shape says it.
+            let precision = match precision.as_deref() {
+                Some("year") => DatePrecision::Year,
+                Some("month") => DatePrecision::Month,
+                Some("day") => DatePrecision::Day,
+                Some("hour") => DatePrecision::Hour,
+                Some("minute") => DatePrecision::Minute,
+                Some("second") => DatePrecision::Second,
+                Some("millisecond") => DatePrecision::Millisecond,
+                _ => {
+                    if precision.is_none() && value.len() == 19 && value.ends_with("T00:00:00") {
+                        unknown_precision += 1;
+                    }
+                    DatePrecision::from_date_string(&value)
+                }
+            };
+            let point = IndexValue::Date {
+                value,
+                precision,
+                end: DateEnd::Precision,
+            };
+            if let Some(end) = super::search::writer::stored_date_end(&point) {
+                update
+                    .execute(rusqlite::params![rowid, end])
+                    .map_err(|e| migration_err(format!("v35 backfill value_date_end: {e}")))?;
+            }
+        }
+    }
+    Ok(unknown_precision)
+}
+
+/// Migrate from schema version 35 to version 36.
+///
+/// Adds `login_sessions`: the web UI's interactive login sessions and the
+/// logins still pending at the identity provider (#1481), one JSON document
+/// per opaque id with a monotonic `version` for conditional writes, so a
+/// session established on one node resolves on every other and outlives a
+/// restart. `kind` keeps sessions and pending logins apart; `expires_at` is
+/// fixed-width RFC 3339 text and drives the sweep. Independent of the FHIR
+/// `resources` table, like `user_settings`.
+fn migrate_v35_to_v36(conn: &Connection) -> StorageResult<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS login_sessions (
+            id         TEXT NOT NULL PRIMARY KEY,
+            kind       TEXT NOT NULL,
+            data       TEXT NOT NULL,
+            version    INTEGER NOT NULL DEFAULT 1,
+            expires_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_login_sessions_expires
+            ON login_sessions (expires_at);",
+    )
+    .map_err(|e| migration_err(format!("v36 create login_sessions: {e}")))?;
     Ok(())
 }
 
@@ -3828,6 +4002,157 @@ mod tests {
                 .unwrap_or_else(|e| panic!("replay from v{from} failed: {e:?}"));
             assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
         }
+    }
+
+    /// #1391: v35 adds `value_date_end` and backfills every existing date row
+    /// with the end of its own precision, as the writer would; rows without a
+    /// readable date keep NULL, and a replay leaves ends already set alone.
+    #[test]
+    fn test_v35_backfills_value_date_end_by_precision() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        // Index rows without their resources: only the date columns matter.
+        conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        let rows = [
+            ("a", Some("2020-01-01T00:00:00"), Some("year")),
+            ("b", Some("2020-06-01T00:00:00"), Some("month")),
+            ("c", Some("2020-06-15T00:00:00"), Some("day")),
+            ("d", Some("2020-06-15T10:00:00+02:00"), Some("second")),
+            ("e", Some("2026-09-06T08:44:27.828123+00:00"), None),
+            ("f", Some("garbage"), Some("day")),
+            ("g", None, None),
+        ];
+        for (id, value, precision) in rows {
+            conn.execute(
+                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name,
+                     value_date, value_date_precision, value_string)
+                 VALUES ('t', 'Patient', ?1, 'date', ?2, ?3, ?4)",
+                rusqlite::params![id, value, precision, value.is_none().then_some("x")],
+            )
+            .unwrap();
+        }
+        set_schema_version(&conn, 34).unwrap();
+        initialize_schema(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        let end = |id: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT value_date_end FROM search_index WHERE resource_id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(end("a").as_deref(), Some("2021-01-01 00:00:00.000"));
+        assert_eq!(end("b").as_deref(), Some("2020-07-01 00:00:00.000"));
+        assert_eq!(end("c").as_deref(), Some("2020-06-16 00:00:00.000"));
+        assert_eq!(end("d").as_deref(), Some("2020-06-15 08:00:01.000"));
+        // No precision recorded: the instant's own shape, a microsecond.
+        assert_eq!(end("e").as_deref(), Some("2026-09-06 08:44:27.829"));
+        assert_eq!(end("f"), None);
+        assert_eq!(end("g"), None);
+
+        // A replay neither fails on the existing column nor rewrites an end.
+        conn.execute(
+            "UPDATE search_index SET value_date_end = 'kept' WHERE resource_id = 'a'",
+            [],
+        )
+        .unwrap();
+        migrate_v34_to_v35(&conn).unwrap();
+        assert_eq!(end("a").as_deref(), Some("kept"));
+    }
+
+    /// #1391: a row with no `value_date_precision` (written before the column,
+    /// or by the fallback indexer) whose value is a padded midnight cannot say
+    /// whether it was a year, a month, a day or a second. The backfill keeps
+    /// the shape-derived one-second range rather than guess, and counts those
+    /// rows so the migration can warn; a real instant with an offset, a row
+    /// with a precision, and an already-filled row are not counted.
+    #[test]
+    fn test_v35_counts_padded_rows_of_unknown_precision() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        let rows = [
+            // Padded date-only values of three different precisions.
+            ("year", "2020-01-01T00:00:00", None),
+            ("month", "2020-06-01T00:00:00", None),
+            ("day", "2020-06-15T00:00:00", None),
+            // A real instant: its shape says the precision, not unknown.
+            ("instant", "2020-06-15T00:00:00Z", None),
+            ("time", "2020-06-15T10:30:00", None),
+            // Precision recorded: not unknown.
+            ("known", "2020-06-15T00:00:00", Some("day")),
+        ];
+        for (id, value, precision) in rows {
+            conn.execute(
+                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name,
+                     value_date, value_date_precision)
+                 VALUES ('t', 'Patient', ?1, 'date', ?2, ?3)",
+                rusqlite::params![id, value, precision],
+            )
+            .unwrap();
+        }
+        // The v34 shape: no row has an end yet.
+        conn.execute("UPDATE search_index SET value_date_end = NULL", [])
+            .unwrap();
+
+        assert_eq!(backfill_value_date_end(&conn).unwrap(), 3);
+
+        let end = |id: &str| -> String {
+            conn.query_row(
+                "SELECT value_date_end FROM search_index WHERE resource_id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        // Unknown precision: one second, whatever the padded text was.
+        assert_eq!(end("year"), "2020-01-01 00:00:01.000");
+        assert_eq!(end("month"), "2020-06-01 00:00:01.000");
+        assert_eq!(end("day"), "2020-06-15 00:00:01.000");
+        assert_eq!(end("instant"), "2020-06-15 00:00:01.000");
+        assert_eq!(end("time"), "2020-06-15 10:30:01.000");
+        // The same text with its precision recorded is the whole day.
+        assert_eq!(end("known"), "2020-06-16 00:00:00.000");
+
+        // Every row now has an end: a replay visits nothing and counts nothing.
+        assert_eq!(backfill_value_date_end(&conn).unwrap(), 0);
+    }
+
+    /// #1481: the v36 login-sessions table exists on a fresh database and on
+    /// one migrated from v35, with the sweep index in place.
+    #[test]
+    fn test_v36_adds_login_sessions() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        let columns = table_columns(&conn, "login_sessions").unwrap();
+        for expected in ["id", "kind", "data", "version", "expires_at", "updated_at"] {
+            assert!(columns.iter().any(|c| c == expected), "missing {expected}");
+        }
+        let indexed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' \
+                 AND name = 'idx_login_sessions_expires'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 1);
+
+        let migrated = Connection::open_in_memory().unwrap();
+        initialize_schema(&migrated).unwrap();
+        migrated
+            .execute_batch("DROP INDEX idx_login_sessions_expires; DROP TABLE login_sessions;")
+            .unwrap();
+        set_schema_version(&migrated, 35).unwrap();
+        initialize_schema(&migrated).unwrap();
+        assert_eq!(get_schema_version(&migrated).unwrap(), SCHEMA_VERSION);
+        assert!(
+            !table_columns(&migrated, "login_sessions")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// #1127: the v32 file-progress table and skipped counter exist on a fresh

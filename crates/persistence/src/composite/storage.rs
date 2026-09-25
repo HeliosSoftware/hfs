@@ -47,16 +47,16 @@ use crate::core::{
     BundleEntry, BundleProvider, BundleResult, CapabilityProvider, ChainedSearchProvider,
     ConditionalCreateResult, ConditionalDeleteResult, ConditionalStorage, ConditionalUpdateResult,
     ExportDataProvider, ExportRequest, GroupExportProvider, IncludeProvider,
-    InstanceHistoryProvider, NdjsonBatch, PatientExportProvider, PurgableStorage, ResourceStorage,
-    RevincludeProvider, SearchProvider, SearchResult, SofRunner, StorageCapabilities,
-    SystemHistoryProvider, TerminologySearchProvider, TextSearchProvider, TypeHistoryProvider,
-    VersionedStorage,
+    InstanceHistoryProvider, NdjsonBatch, PatchCandidateValidator, PatientExportProvider,
+    PurgableStorage, ResourceStorage, RevincludeProvider, SearchProvider, SearchResult, SofRunner,
+    StorageCapabilities, SystemHistoryProvider, TerminologySearchProvider, TextSearchProvider,
+    TypeHistoryProvider, VersionedStorage,
 };
 use crate::error::{BackendError, ResourceError, StorageError, StorageResult, TransactionError};
 use crate::search::ChainResolveOptions;
 use crate::tenant::TenantContext;
 use crate::types::{
-    IncludeDirective, Pagination, ReverseChainedParameter, SearchParamType, SearchParameter,
+    IncludeDirective, Page, Pagination, ReverseChainedParameter, SearchParamType, SearchParameter,
     SearchQuery, SearchValue, StoredResource,
 };
 
@@ -1337,6 +1337,51 @@ impl SearchProvider for CompositeStorage {
         self.execute_routed_search(tenant, query).await
     }
 
+    async fn search_ids(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<Page<String>> {
+        // A merged search needs resource-level ordering and page information.
+        // Delegate id pages only when the normal route has one search provider.
+        if !self.has_dedicated_search_backend() {
+            let decision = self
+                .router
+                .route(query)
+                .map_err(|error| self.routing_error_to_storage_error(error))?;
+            if !decision.auxiliary_targets.is_empty() {
+                return Ok(self
+                    .search(tenant, query)
+                    .await?
+                    .resources
+                    .map(|resource| resource.id().to_string()));
+            }
+        }
+
+        let preferred_id = self
+            .config
+            .backends_with_role(super::config::BackendRole::Search)
+            .next()
+            .map(|backend| backend.id.as_str());
+        let primary_id = self.config.primary_id().unwrap_or("primary");
+        let backend_id = preferred_id
+            .filter(|id| self.search_providers.contains_key(*id))
+            .unwrap_or(primary_id);
+        let provider = self.search_providers.get(backend_id).ok_or_else(|| {
+            StorageError::Backend(BackendError::UnsupportedCapability {
+                backend_name: backend_id.to_string(),
+                capability: "SearchProvider".to_string(),
+            })
+        })?;
+        let result = provider.search_ids(tenant, query).await;
+        self.update_health(
+            backend_id,
+            result.is_ok(),
+            result.as_ref().err().map(|error| error.to_string()),
+        );
+        result
+    }
+
     async fn search_count(
         &self,
         tenant: &TenantContext,
@@ -2040,11 +2085,12 @@ impl BundleProvider for CompositeStorage {
             .is_some_and(|p| p.supports_atomic_transactions())
     }
 
-    async fn process_transaction(
+    async fn process_transaction_with_patch_validator(
         &self,
         tenant: &TenantContext,
         entries: Vec<BundleEntry>,
         fhir_version: helios_fhir::FhirVersion,
+        validator: Option<&dyn PatchCandidateValidator>,
     ) -> Result<BundleResult, TransactionError> {
         let provider =
             self.bundle_provider
@@ -2055,7 +2101,7 @@ impl BundleProvider for CompositeStorage {
                 })?;
 
         let result = provider
-            .process_transaction(tenant, entries, fhir_version)
+            .process_transaction_with_patch_validator(tenant, entries, fhir_version, validator)
             .await?;
 
         // Sync successful entries to secondaries by reading resources from primary
@@ -3570,6 +3616,54 @@ mod tests {
             .with_search_providers(search_providers);
 
         (composite, primary)
+    }
+
+    #[tokio::test]
+    async fn search_ids_uses_the_same_provider_fallback_as_search() {
+        let tenant = TenantContext::new(
+            TenantId::new("composite-test"),
+            TenantPermissions::full_access(),
+        );
+        let query = SearchQuery::new("Patient");
+        let (mut composite, primary, search) = make_composite_with_dedicated_search(
+            vec![fake_patient("primary-id")],
+            vec![fake_patient("search-id")],
+        );
+
+        let ids = composite.search_ids(&tenant, &query).await.unwrap().items;
+        assert_eq!(ids, ["search-id"]);
+        assert_eq!(primary.call_count(), 0);
+        assert_eq!(search.call_count(), 1);
+
+        composite.search_providers.remove("search");
+        let ids = composite.search_ids(&tenant, &query).await.unwrap().items;
+        assert_eq!(ids, ["primary-id"]);
+        assert_eq!(primary.call_count(), 1);
+
+        composite.search_providers.remove("primary");
+        let error = composite.search_ids(&tenant, &query).await.unwrap_err();
+        assert!(matches!(
+            error,
+            StorageError::Backend(BackendError::UnsupportedCapability { backend_name, .. })
+                if backend_name == "primary"
+        ));
+    }
+
+    #[tokio::test]
+    async fn search_ids_without_dedicated_backend_uses_primary() {
+        let tenant = TenantContext::new(
+            TenantId::new("composite-test"),
+            TenantPermissions::full_access(),
+        );
+        let (composite, primary) =
+            make_composite_no_search_backend(vec![fake_patient("primary-id")]);
+        let ids = composite
+            .search_ids(&tenant, &SearchQuery::new("Patient"))
+            .await
+            .unwrap()
+            .items;
+        assert_eq!(ids, ["primary-id"]);
+        assert_eq!(primary.call_count(), 1);
     }
 
     #[tokio::test]

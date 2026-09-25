@@ -16,9 +16,9 @@ use serde_json::Value;
 use crate::core::{
     BundleEntry, BundleEntryResult, BundleMethod, BundleProvider, BundleResult, BundleType,
     HistoryEntry, HistoryMethod, HistoryPage, HistoryParams, InstanceHistoryProvider,
-    PurgableStorage, ResourceStorage, SettingsStore, SystemHistoryProvider, TypeHistoryProvider,
-    VersionedStorage, bundle_if_match_gate, bundle_if_none_exist_gate, if_match_field_satisfied,
-    normalize_etag,
+    PatchCandidateValidator, PurgableStorage, ResourceStorage, SettingsStore,
+    SystemHistoryProvider, TypeHistoryProvider, VersionedStorage, bundle_if_match_gate,
+    bundle_if_none_exist_gate, if_match_field_satisfied, normalize_etag,
 };
 use crate::error::{
     BackendError, ConcurrencyError, QueryErrorExt, ResourceError, StorageError, StorageResult,
@@ -29,7 +29,8 @@ use crate::search::extractor::ExtractedValue;
 use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
 use crate::tenant::{Operation, TenantContext};
 use crate::types::{
-    CursorValue, Page, PageCursor, PageInfo, SearchParamType, SearchQuery, StoredResource,
+    CursorValue, Page, PageCursor, PageInfo, SearchParamType, SearchParameter, SearchPrefix,
+    SearchQuery, StoredResource,
 };
 
 use super::MongoBackend;
@@ -51,6 +52,13 @@ enum PendingSearchParameterChange {
     Create,
     Update,
     Delete,
+}
+
+/// Request context shared by every entry in one MongoDB Bundle transaction.
+struct BundleEntryContext<'a> {
+    tenant: &'a TenantContext,
+    fhir_version: helios_fhir::FhirVersion,
+    patch_validator: Option<&'a dyn PatchCandidateValidator>,
 }
 
 fn serialization_error(message: String) -> StorageError {
@@ -2812,6 +2820,7 @@ impl MongoBackend {
             IndexValue::Date {
                 value: date,
                 precision,
+                end,
             } => {
                 let normalized = match normalize_date_for_mongo(date) {
                     Some(v) => v,
@@ -2824,7 +2833,26 @@ impl MongoBackend {
                         return None;
                     }
                 };
+                // #1391: the row stores the range `[value_date, value_date_end)`
+                // a range-aware search compares against. The shared reading
+                // when the start is in the FHIR grammar; otherwise the end is
+                // derived from the lenient start read above.
+                let resolution = crate::search::StorageResolution::Millis;
+                let range_end = crate::search::indexed_range(&value.value, resolution)
+                    .map(|(_, end)| end)
+                    .or_else(|| {
+                        crate::search::indexed_end(normalized, *precision, end, resolution)
+                    });
+                let Some(range_end) = range_end else {
+                    tracing::warn!(
+                        "Skipping date index value '{}' for parameter '{}': its Period end is not a date",
+                        date,
+                        value.param_name
+                    );
+                    return None;
+                };
                 doc.insert("value_date", chrono_to_bson(normalized));
+                doc.insert("value_date_end", chrono_to_bson(range_end));
                 doc.insert("value_date_precision", precision.to_string());
             }
             IndexValue::Number(v) => {
@@ -2859,6 +2887,9 @@ impl MongoBackend {
 
         if let Some(group) = value.composite_group {
             doc.insert("composite_group", group as i32);
+        }
+        if let Some(slot) = value.composite_slot {
+            doc.insert("composite_slot", i32::from(slot));
         }
 
         Some(doc)
@@ -3400,11 +3431,12 @@ impl BundleProvider for MongoBackend {
         true
     }
 
-    async fn process_transaction(
+    async fn process_transaction_with_patch_validator(
         &self,
         tenant: &TenantContext,
         entries: Vec<BundleEntry>,
         fhir_version: helios_fhir::FhirVersion,
+        validator: Option<&dyn PatchCandidateValidator>,
     ) -> Result<BundleResult, TransactionError> {
         let db = self
             .get_database()
@@ -3417,6 +3449,7 @@ impl BundleProvider for MongoBackend {
 
         let mut results = Vec::with_capacity(entries.len());
         let mut error_info: Option<(usize, String)> = None;
+        let mut patch_error: Option<TransactionError> = None;
         let mut reference_map: HashMap<String, String> = HashMap::new();
         let mut pending_search_parameter_changes: Vec<PendingSearchParameterChange> = Vec::new();
         let mut entries = entries;
@@ -3430,9 +3463,12 @@ impl BundleProvider for MongoBackend {
                 .process_bundle_entry_transaction(
                     &db,
                     &mut session,
-                    tenant,
+                    BundleEntryContext {
+                        tenant,
+                        fhir_version,
+                        patch_validator: validator,
+                    },
                     entry,
-                    fhir_version,
                     &mut pending_search_parameter_changes,
                 )
                 .await;
@@ -3440,6 +3476,13 @@ impl BundleProvider for MongoBackend {
             match result {
                 Ok(entry_result) => {
                     if entry_result.status >= 400 {
+                        if entry.method == BundleMethod::Patch {
+                            patch_error = Some(TransactionError::PatchEntry {
+                                index: idx,
+                                status: entry_result.status,
+                                outcome: entry_result.outcome.clone().unwrap_or_default(),
+                            });
+                        }
                         error_info = Some((
                             idx,
                             format!("Entry failed with status {}", entry_result.status),
@@ -3471,7 +3514,7 @@ impl BundleProvider for MongoBackend {
 
         if let Some((index, message)) = error_info {
             let _ = session.abort_transaction().await;
-            return Err(TransactionError::BundleError { index, message });
+            return Err(patch_error.unwrap_or(TransactionError::BundleError { index, message }));
         }
 
         session
@@ -3502,11 +3545,15 @@ impl MongoBackend {
         &self,
         db: &mongodb::Database,
         session: &mut ClientSession,
-        tenant: &TenantContext,
+        context: BundleEntryContext<'_>,
         entry: &BundleEntry,
-        fhir_version: helios_fhir::FhirVersion,
         pending_search_parameter_changes: &mut Vec<PendingSearchParameterChange>,
     ) -> StorageResult<BundleEntryResult> {
+        let BundleEntryContext {
+            tenant,
+            fhir_version,
+            patch_validator: validator,
+        } = context;
         match entry.method {
             BundleMethod::Get => {
                 let (resource_type, id) = self.parse_url(&entry.url)?;
@@ -3689,13 +3736,60 @@ impl MongoBackend {
                     }
                 }
             }
-            BundleMethod::Patch => Ok(BundleEntryResult::error(
-                501,
-                serde_json::json!({
-                    "resourceType": "OperationOutcome",
-                    "issue": [{"severity": "error", "code": "not-supported", "diagnostics": "PATCH not implemented in transaction bundles"}]
-                }),
-            )),
+            BundleMethod::Patch => {
+                let (resource_type, id) = self.parse_url(&entry.url)?;
+                if resource_type == "AuditEvent" {
+                    return Ok(BundleEntryResult::error(
+                        405,
+                        serde_json::json!({
+                            "resourceType": "OperationOutcome",
+                            "issue": [{"severity": "error", "code": "not-supported", "details": {"text": "AuditEvent resources are immutable"}}]
+                        }),
+                    ));
+                }
+                let existing = self
+                    .read_resource_in_bundle_transaction(db, session, tenant, &resource_type, &id)
+                    .await?;
+                if let Some(failure) = bundle_if_match_gate(
+                    entry.if_match.as_deref(),
+                    existing.as_ref().map(|r| r.version_id()),
+                ) {
+                    return Ok(failure);
+                }
+                let Some(existing) = existing else {
+                    return Ok(BundleEntryResult::error(
+                        404,
+                        serde_json::json!({
+                            "resourceType": "OperationOutcome",
+                            "issue": [{"severity": "error", "code": "not-found", "details": {"text": format!("{resource_type}/{id} not found")}}]
+                        }),
+                    ));
+                };
+                let candidate = match crate::core::transaction::prepare_bundle_patch(
+                    tenant,
+                    &resource_type,
+                    &existing,
+                    entry.resource.as_ref(),
+                    fhir_version,
+                    validator,
+                )
+                .await
+                {
+                    Ok(candidate) => candidate,
+                    Err(failure) => return Ok(*failure),
+                };
+                let update_result = self
+                    .update_resource_in_bundle_transaction(
+                        db,
+                        session,
+                        tenant,
+                        &existing,
+                        candidate,
+                        pending_search_parameter_changes,
+                    )
+                    .await;
+                crate::core::transaction::patch_update_result(update_result)
+            }
         }
     }
 
@@ -4189,11 +4283,19 @@ impl MongoBackend {
         }
 
         if self.is_search_offloaded() {
-            // This path reads the pairs itself; an empty `identifier=` would
-            // add no condition and match the whole type (#1360).
-            crate::search::conditional::reject_empty_criterion_values(&parsed_params)?;
+            // Typed first: the shared builder applies registry validation,
+            // type-aware parsing, OR splitting and modifier rules (#1312,
+            // #1321, #1323, #1360, #1366), so this path accepts and rejects
+            // the same criteria as `If-None-Exist` on the resource endpoint.
+            let typed_params =
+                self.build_search_parameters(tenant, resource_type, &parsed_params)?;
+            // Result-shaping names (`_format`, …) are not criteria; with
+            // nothing left, an empty filter would match the whole type.
+            if typed_params.is_empty() {
+                return Ok(Vec::new());
+            }
             return self
-                .if_none_exist_offloaded_scan(db, session, tenant, resource_type, &parsed_params)
+                .if_none_exist_offloaded_scan(db, session, tenant, resource_type, &typed_params)
                 .await;
         }
 
@@ -4203,6 +4305,15 @@ impl MongoBackend {
         if typed_params.is_empty() {
             return Ok(Vec::new());
         }
+        self.preflight_legacy_composites(
+            db,
+            tenant.tenant_id().as_str(),
+            resource_type,
+            &typed_params,
+            false,
+            Some(&mut *session),
+        )
+        .await?;
         let index_params: Vec<_> = typed_params
             .iter()
             .filter(|p| !matches!(p.name.as_str(), "_id" | "_lastUpdated"))
@@ -4443,18 +4554,37 @@ impl MongoBackend {
         Ok(matches)
     }
 
+    /// Matches `ifNoneExist` criteria against the raw `resources` documents.
+    ///
+    /// Search is offloaded, so there are no `search_index` rows to consult;
+    /// the match runs inside the transaction session (read-your-writes).
+    /// Criteria arrive typed by the shared conditional builder
+    /// ([`MongoBackend::build_search_parameters`]), which already applied
+    /// registry, empty-value, modifier and `:[type]` validation. This scan
+    /// evaluates only the shapes provable against raw documents and fails
+    /// closed on everything else — never silently ignoring a criterion
+    /// (which widens the match) nor silently failing to match (which creates
+    /// duplicates).
+    ///
+    /// Supported: `_id` / `_lastUpdated` (via [`MongoBackend::build_resource_filter`],
+    /// the same predicates direct search uses) and plain `identifier` values
+    /// in `code`, `|code`, or `system|code` form with a nonempty code (`|code`
+    /// matches any system, same as Mongo direct search). Comma-separated
+    /// values OR within one parameter; repeated parameters AND.
     async fn if_none_exist_offloaded_scan(
         &self,
         db: &mongodb::Database,
         session: &mut ClientSession,
         tenant: &TenantContext,
         resource_type: &str,
-        parsed_params: &[(String, String)],
+        params: &[SearchParameter],
     ) -> StorageResult<Vec<StoredResource>> {
         let tenant_id = tenant.tenant_id().as_str();
 
-        for (name, _) in parsed_params {
-            match name.as_str() {
+        // Anything outside the evaluatable set is rejected, not ignored:
+        // silently dropping a criterion widens the match.
+        for param in params {
+            match param.name.as_str() {
                 "_id" | "_lastUpdated" | "identifier" => {}
                 other => {
                     return Err(StorageError::Search(
@@ -4462,8 +4592,8 @@ impl MongoBackend {
                             message: format!(
                                 "ifNoneExist parameter '{other}' cannot be evaluated \
                                  against the resource collection when search is offloaded; \
-                                 use a supported parameter (_id, identifier) or disable \
-                                 search offloading"
+                                 use a supported parameter (_id, _lastUpdated, identifier) \
+                                 or disable search offloading"
                             ),
                         },
                     ));
@@ -4471,35 +4601,96 @@ impl MongoBackend {
             }
         }
 
-        let mut conditions = vec![doc! {
-            "tenant_id": tenant_id,
-            "resource_type": resource_type,
-            "is_deleted": false,
-        }];
+        let mut conditions: Vec<Document> = Vec::new();
 
-        for (name, value) in parsed_params {
-            match name.as_str() {
-                "_id" => {
-                    conditions.push(doc! { "id": value.as_str() });
+        // `_id` / `_lastUpdated` reuse the resource-level predicates direct
+        // search builds (prefix-aware, dates validated); they carry the
+        // tenant / type / live-only base with them.
+        let resource_params: Vec<SearchParameter> = params
+            .iter()
+            .filter(|p| matches!(p.name.as_str(), "_id" | "_lastUpdated"))
+            .cloned()
+            .collect();
+        if resource_params.is_empty() {
+            conditions.push(doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "is_deleted": false,
+            });
+        } else {
+            let query = SearchQuery {
+                resource_type: resource_type.to_string(),
+                parameters: resource_params,
+                count: Some(2),
+                ..Default::default()
+            };
+            conditions.push(self.build_resource_filter(
+                tenant_id,
+                resource_type,
+                &query,
+                None,
+                None,
+            )?);
+        }
+
+        // Plain `identifier` values against the raw `data.identifier` array.
+        // One parameter's comma-separated values OR; repeated parameters AND
+        // through the top-level `$and`.
+        for param in params.iter().filter(|p| p.name.as_str() == "identifier") {
+            Self::validate_offloaded_identifier_param(param)?;
+            let mut branches: Vec<Bson> = Vec::with_capacity(param.values.len());
+            for value in &param.values {
+                if value.value.chars().filter(|c| *c == '|').count() > 1 {
+                    return Err(StorageError::Search(
+                        crate::error::SearchError::QueryParseError {
+                            message: format!(
+                                "Unsupported value '{}' for ifNoneExist parameter \
+                                 'identifier' when search is offloaded: supported forms \
+                                 are 'code', '|code' and 'system|code' with a single '|'",
+                                value.value
+                            ),
+                        },
+                    ));
                 }
-                "_lastUpdated" => {}
-                "identifier" => {
-                    let mut elem_match = Document::new();
-                    if let Some((system, val)) = value.split_once('|') {
-                        if !system.is_empty() {
-                            elem_match.insert("system", system);
-                        }
-                        if !val.is_empty() {
-                            elem_match.insert("value", val);
-                        }
-                    } else if !value.is_empty() {
-                        elem_match.insert("value", value.as_str());
-                    }
-                    if !elem_match.is_empty() {
-                        conditions.push(doc! { "data.identifier": { "$elemMatch": elem_match } });
-                    }
+                let (system, code) = match value.value.split_once('|') {
+                    Some((system, code)) => (system, code),
+                    None => ("", value.value.as_str()),
+                };
+                if code.is_empty() {
+                    return Err(StorageError::Search(
+                        crate::error::SearchError::QueryParseError {
+                            message: "Unsupported empty code for ifNoneExist parameter \
+                                      'identifier' when search is offloaded: supported \
+                                      forms are 'code', '|code' and 'system|code' with a \
+                                      nonempty code"
+                                .to_string(),
+                        },
+                    ));
                 }
-                _ => unreachable!("unsupported params are rejected above"),
+                let mut elem_match = Document::new();
+                if !system.is_empty() {
+                    elem_match.insert("system", system);
+                }
+                elem_match.insert("value", code);
+                branches.push(Bson::Document(
+                    doc! { "data.identifier": { "$elemMatch": elem_match } },
+                ));
+            }
+            if branches.is_empty() {
+                return Err(StorageError::Search(
+                    crate::error::SearchError::QueryParseError {
+                        message: "ifNoneExist parameter 'identifier' carries no value; \
+                                  nothing was written"
+                            .to_string(),
+                    },
+                ));
+            } else if branches.len() == 1 {
+                match branches.remove(0) {
+                    Bson::Document(condition) => conditions.push(condition),
+                    _ => unreachable!("identifier branches are documents"),
+                }
+            } else {
+                conditions.push(doc! { "$or": Bson::Array(branches) });
             }
         }
 
@@ -4539,6 +4730,45 @@ impl MongoBackend {
         }
 
         Ok(matches)
+    }
+
+    /// Keep the raw-document scan fail-closed if the conditional builder's
+    /// typed-parameter contract changes. This check needs no database session.
+    fn validate_offloaded_identifier_param(param: &SearchParameter) -> StorageResult<()> {
+        if param.param_type != SearchParamType::Token {
+            return Err(StorageError::Search(
+                crate::error::SearchError::QueryParseError {
+                    message: format!(
+                        "ifNoneExist parameter 'identifier' cannot be evaluated \
+                         against the resource collection when search is offloaded: \
+                         unsupported parameter type '{}'",
+                        param.param_type
+                    ),
+                },
+            ));
+        }
+        if let Some(modifier) = param.modifier.as_ref() {
+            return Err(StorageError::Search(
+                crate::error::SearchError::UnsupportedModifier {
+                    modifier: modifier.to_string(),
+                    param_type: param.param_type.to_string(),
+                },
+            ));
+        }
+        for value in &param.values {
+            if value.prefix != SearchPrefix::Eq {
+                return Err(StorageError::Search(
+                    crate::error::SearchError::QueryParseError {
+                        message: format!(
+                            "Unsupported prefix '{}' for ifNoneExist parameter \
+                             'identifier' when search is offloaded",
+                            value.prefix
+                        ),
+                    },
+                ));
+            }
+        }
+        Ok(())
     }
 
     async fn index_resource_in_bundle_transaction(
@@ -5249,6 +5479,59 @@ fn resolve_bundle_references(value: &mut Value, reference_map: &HashMap<String, 
 }
 
 #[cfg(test)]
+mod offloaded_identifier_guard_tests {
+    use super::*;
+    use crate::types::{SearchModifier, SearchValue};
+
+    fn identifier_param() -> SearchParameter {
+        SearchParameter {
+            name: "identifier".to_string(),
+            param_type: SearchParamType::Token,
+            values: vec![SearchValue::eq("MRN-1")],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rejects_non_token_type() {
+        let param = SearchParameter {
+            param_type: SearchParamType::String,
+            ..identifier_param()
+        };
+        let err = MongoBackend::validate_offloaded_identifier_param(&param).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unsupported parameter type 'string'")
+        );
+    }
+
+    #[test]
+    fn rejects_modifier() {
+        let param = SearchParameter {
+            modifier: Some(SearchModifier::Missing),
+            ..identifier_param()
+        };
+        let err = MongoBackend::validate_offloaded_identifier_param(&param).unwrap_err();
+        assert!(err.to_string().contains("missing"));
+    }
+
+    #[test]
+    fn rejects_non_eq_prefix() {
+        let param = SearchParameter {
+            values: vec![SearchValue::new(SearchPrefix::Ne, "MRN-1")],
+            ..identifier_param()
+        };
+        let err = MongoBackend::validate_offloaded_identifier_param(&param).unwrap_err();
+        assert!(err.to_string().contains("Unsupported prefix 'ne'"));
+    }
+
+    #[test]
+    fn accepts_plain_token() {
+        MongoBackend::validate_offloaded_identifier_param(&identifier_param()).unwrap();
+    }
+}
+
+#[cfg(test)]
 mod index_date_tests {
     use super::*;
 
@@ -5376,6 +5659,74 @@ mod index_date_tests {
             );
             assert_eq!(normalize_date_for_mongo(value), None, "{value:?}");
         }
+    }
+
+    fn date_document(value: IndexValue) -> Option<Document> {
+        let backend = MongoBackend::new(super::super::backend::MongoBackendConfig::default())
+            .expect("backend without a connection");
+        let extracted = ExtractedValue::new(
+            "date",
+            "http://hl7.org/fhir/SearchParameter/clinical-date",
+            crate::types::SearchParamType::Date,
+            value,
+        );
+        backend.build_search_index_document("t1", "Encounter", "e1", &extracted)
+    }
+
+    fn stored(doc: &Document, field: &str) -> String {
+        bson_to_chrono(doc.get_datetime(field).expect(field)).to_rfc3339()
+    }
+
+    /// #1391: every date row stores the range it covers — a point to the end
+    /// of its precision, a `Period` to the end of its own `end`, and an open
+    /// side at the edge of the supported years.
+    #[test]
+    fn date_rows_store_the_range_they_cover() {
+        let point = date_document(IndexValue::date("2020-06")).expect("point");
+        assert_eq!(stored(&point, "value_date"), "2020-06-01T00:00:00+00:00");
+        assert_eq!(
+            stored(&point, "value_date_end"),
+            "2020-07-01T00:00:00+00:00"
+        );
+
+        let period = date_document(
+            IndexValue::date_range(Some("2019-06-15"), Some("2020-03")).expect("period"),
+        )
+        .expect("period row");
+        assert_eq!(stored(&period, "value_date"), "2019-06-15T00:00:00+00:00");
+        assert_eq!(
+            stored(&period, "value_date_end"),
+            "2020-04-01T00:00:00+00:00"
+        );
+
+        let open_end = date_document(IndexValue::date_range(Some("2019"), None).expect("open"))
+            .expect("open-ended row");
+        assert_eq!(stored(&open_end, "value_date"), "2019-01-01T00:00:00+00:00");
+        assert_eq!(
+            *open_end.get_datetime("value_date_end").unwrap(),
+            chrono_to_bson(crate::search::open_end(
+                crate::search::StorageResolution::Millis
+            ))
+        );
+
+        let open_start = date_document(IndexValue::date_range(None, Some("2020")).expect("open"))
+            .expect("open-started row");
+        assert_eq!(
+            *open_start.get_datetime("value_date").unwrap(),
+            chrono_to_bson(crate::search::open_start())
+        );
+        assert_eq!(
+            stored(&open_start, "value_date_end"),
+            "2021-01-01T00:00:00+00:00"
+        );
+    }
+
+    /// A `Period` whose `end` is not a date is skipped whole, like any other
+    /// unparseable date: indexing it as open would over-match.
+    #[test]
+    fn a_period_with_a_bad_end_is_skipped() {
+        let bad = IndexValue::date_range(Some("2020-01-01"), Some("not-a-date")).expect("period");
+        assert!(date_document(bad).is_none());
     }
 
     /// What the strict grammar rejects still goes through the lenient reading,

@@ -19,7 +19,8 @@ use crate::search::{IMPLICIT_TOKEN_SYSTEM, SearchParameterRegistry};
 use crate::types::{ChainConfig, ReverseChainedParameter, SearchParamType, SearchValue};
 
 use super::query_builder::{
-    SqlFragment, SqlParam, date_predicate, match_nothing, number_predicate, quantity_predicate,
+    SqlFragment, SqlParam, date_predicate, date_range_predicate, match_nothing, number_predicate,
+    quantity_predicate,
 };
 
 /// A single link in a forward chain.
@@ -404,6 +405,21 @@ impl ChainQueryBuilder {
                             ),
                             vec![SqlParam::Text(code.to_string())],
                         )
+                    } else if code.is_empty() {
+                        // `system|`: any code in that system, as the direct
+                        // token handler does. Without this branch the empty
+                        // code was bound as `value_token_code = ''` and the
+                        // terminal matched nothing. The `IS NOT NULL` conjunct
+                        // excludes no rows; it lets the planner use the
+                        // code-leading token index (see `token_value_predicate`).
+                        (
+                            format!(
+                                "({alias}.value_token_code IS NOT NULL AND {alias}.value_token_system = ${pn})",
+                                alias = alias,
+                                pn = param_num,
+                            ),
+                            vec![SqlParam::Text(system.to_string())],
+                        )
                     } else {
                         // Both halves are bound. The system used to be
                         // interpolated into the SQL text with its quotes doubled:
@@ -436,8 +452,9 @@ impl ChainQueryBuilder {
                 vec![SqlParam::Text(format!("%{}%", value.value))],
             ),
             SearchParamType::Date => {
-                let date_col = format!("{}.value_date", alias);
-                build_date_condition(&date_col, value, param_num)
+                let start_col = format!("{}.value_date", alias);
+                let end_col = format!("{}.value_date_end", alias);
+                build_date_condition(&start_col, Some(&end_col), value, param_num)
             }
             SearchParamType::Number => build_number_condition(&alias, value, param_num),
             SearchParamType::Quantity => build_quantity_condition(&alias, value, param_num),
@@ -641,6 +658,21 @@ impl ChainQueryBuilder {
                             ),
                             vec![SqlParam::Text(code.to_string())],
                         )
+                    } else if code.is_empty() {
+                        // `system|`: any code in that system, as the direct
+                        // token handler does. Without this branch the empty
+                        // code was bound as `value_token_code = ''` and the
+                        // terminal matched nothing. The `IS NOT NULL` conjunct
+                        // excludes no rows; it lets the planner use the
+                        // code-leading token index (see `token_value_predicate`).
+                        (
+                            format!(
+                                "({alias}.value_token_code IS NOT NULL AND {alias}.value_token_system = ${pn})",
+                                alias = alias,
+                                pn = param_num,
+                            ),
+                            vec![SqlParam::Text(system.to_string())],
+                        )
                     } else {
                         // Both halves are bound. The system used to be
                         // interpolated into the SQL text with its quotes doubled:
@@ -673,8 +705,9 @@ impl ChainQueryBuilder {
                 vec![SqlParam::Text(format!("%{}%", value.value))],
             ),
             SearchParamType::Date => {
-                let date_col = format!("{}.value_date", alias);
-                build_date_condition(&date_col, value, param_num)
+                let start_col = format!("{}.value_date", alias);
+                let end_col = format!("{}.value_date_end", alias);
+                build_date_condition(&start_col, Some(&end_col), value, param_num)
             }
             SearchParamType::Number => build_number_condition(&alias, value, param_num),
             SearchParamType::Quantity => build_quantity_condition(&alias, value, param_num),
@@ -738,6 +771,7 @@ fn resources_backed_condition(
         )),
         "_lastUpdated" => Some(build_date_condition(
             &format!("{}.last_updated", alias),
+            None,
             value,
             param_num,
         )),
@@ -745,11 +779,13 @@ fn resources_backed_condition(
     }
 }
 
-/// The terminal date comparison, against `value_date` or `last_updated`.
+/// The terminal date comparison, against the indexed range
+/// `[value_date, value_date_end)` or the `last_updated` instant.
 ///
-/// Delegates to [`date_predicate`], the per-prefix table the unchained `date`
-/// and `_lastUpdated` searches use, so a chained date means what the unchained
-/// one does: `TIMESTAMPTZ` binds, precision ranges (`eq2020-01-01` is the whole
+/// With an `end_column` it delegates to [`date_range_predicate`], the unchained
+/// `date` search's range semantics (#1391); without one to [`date_predicate`],
+/// the point comparison `_lastUpdated` uses. Either way a chained date means
+/// what the unchained one does: `TIMESTAMPTZ` binds, precision ranges (`eq2020-01-01` is the whole
 /// day), zone offsets honored, and a non-date matching nothing.
 ///
 /// This used to be its own operator table binding the raw search string as
@@ -763,12 +799,18 @@ fn resources_backed_condition(
 /// no further accounting than returning these params in order.
 fn build_date_condition(
     column: &str,
+    end_column: Option<&str>,
     value: &SearchValue,
     param_num: usize,
 ) -> (String, Vec<SqlParam>) {
-    // `date_predicate` pre-increments: it numbers its first bind `next + 1`.
+    // Both predicates pre-increment: they number their first bind `next + 1`.
     let mut next = param_num - 1;
-    let (sql, params) = date_predicate(column, value.prefix, &value.value, &mut next);
+    let (sql, params) = match end_column {
+        Some(end_column) => {
+            date_range_predicate(column, end_column, value.prefix, &value.value, &mut next)
+        }
+        None => date_predicate(column, value.prefix, &value.value, &mut next),
+    };
     debug_assert_eq!(next, param_num - 1 + params.len());
     // Parenthesized: the predicate may be `a AND b`, and it is spliced after
     // an `AND` in the terminal subquery today but need not always be.
@@ -1052,43 +1094,65 @@ mod tests {
         let parsed = builder.parse_chain("subject.birthdate").unwrap();
         assert_eq!(parsed.terminal_type, SearchParamType::Date);
 
-        // (value, expected predicate, expected binds)
+        // (value, expected predicate, expected binds). The terminal row is a
+        // range `[value_date, value_date_end)` (#1391); `end <= b` also
+        // carries its implied `start < b`, sharing the bind.
         let cases: &[(&str, &str, &[&str])] = &[
             (
                 "2020-01-01",
-                "(si1.value_date >= $2 AND si1.value_date < $3)",
+                "(si1.value_date >= $2 AND si1.value_date < $3 AND si1.value_date_end <= $3)",
                 &["2020-01-01T00:00:00+00:00", "2020-01-02T00:00:00+00:00"],
             ),
             (
                 "ne2020-01",
-                "((si1.value_date < $2 OR si1.value_date >= $3))",
+                "((si1.value_date < $2 OR si1.value_date_end > $3))",
                 &["2020-01-01T00:00:00+00:00", "2020-02-01T00:00:00+00:00"],
             ),
             (
                 "ge1980-01-01",
-                "(si1.value_date >= $2)",
-                &["1980-01-01T00:00:00+00:00"],
+                "((si1.value_date_end > $2 OR (si1.value_date >= $3 AND si1.value_date < $4 \
+                 AND si1.value_date_end <= $4)))",
+                &[
+                    "1980-01-02T00:00:00+00:00",
+                    "1980-01-01T00:00:00+00:00",
+                    "1980-01-02T00:00:00+00:00",
+                ],
             ),
             (
                 "gt1980",
-                "(si1.value_date >= $2)",
+                "(si1.value_date_end > $2)",
                 &["1981-01-01T00:00:00+00:00"],
             ),
             (
                 "le1980-01-01",
-                "(si1.value_date < $2)",
-                &["1980-01-02T00:00:00+00:00"],
+                "((si1.value_date < $2 OR (si1.value_date >= $3 AND si1.value_date < $4 \
+                 AND si1.value_date_end <= $4)))",
+                &[
+                    "1980-01-01T00:00:00+00:00",
+                    "1980-01-01T00:00:00+00:00",
+                    "1980-01-02T00:00:00+00:00",
+                ],
             ),
             (
                 "lt1980-01-01",
                 "(si1.value_date < $2)",
                 &["1980-01-01T00:00:00+00:00"],
             ),
+            (
+                "sa1980",
+                "(si1.value_date >= $2)",
+                &["1981-01-01T00:00:00+00:00"],
+            ),
+            (
+                "eb1980",
+                "(si1.value_date < $2 AND si1.value_date_end <= $2)",
+                &["1980-01-01T00:00:00+00:00"],
+            ),
             // A value to the second is a range too (#1297): `gt` is past the
             // end of that second, with the offset folded into the bind.
             (
                 "gt2019-05-04T23:30:00-07:00",
-                "(si1.value_date >= $2)",
+                "(si1.value_date_end > $2)",
                 &["2019-05-05T06:30:01+00:00"],
             ),
         ];
@@ -1255,8 +1319,9 @@ mod tests {
         let frag = builder.build_reverse_chain_sql(&rc).unwrap();
 
         assert!(
-            frag.sql
-                .contains("(si2.value_date >= $2 AND si2.value_date < $3)"),
+            frag.sql.contains(
+                "(si2.value_date >= $2 AND si2.value_date < $3 AND si2.value_date_end <= $3)"
+            ),
             "{}",
             frag.sql
         );
@@ -1364,6 +1429,75 @@ mod tests {
             frag.sql
         );
         assert_eq!(frag.params.len(), 2);
+    }
+
+    /// `system|` (#1389) means "any code in this system". It used to fall into
+    /// the `system|code` branch with an empty code, binding
+    /// `value_token_code = ''` and matching nothing. It must bind only the
+    /// system, and must not accept the implicit system the way `system|code`
+    /// does.
+    #[test]
+    fn a_chained_system_only_token_matches_any_code_in_the_system() {
+        let registry = obs_subject_patient_org_code();
+        let builder = ChainQueryBuilder::new("t", "Observation", registry);
+        let parsed = builder.parse_chain("subject.identifier").unwrap();
+        let frag = builder
+            .build_forward_chain_sql(&parsed, &SearchValue::eq("http://ex.org/mrn|"))
+            .unwrap();
+
+        assert!(
+            frag.sql
+                .contains("(si1.value_token_code IS NOT NULL AND si1.value_token_system = $2)"),
+            "system-only predicate: {}",
+            frag.sql
+        );
+        assert!(
+            !frag.sql.contains("value_token_code = $"),
+            "no code equality: {}",
+            frag.sql
+        );
+        assert!(
+            !frag.sql.contains(IMPLICIT_TOKEN_SYSTEM),
+            "the implicit system is not accepted: {}",
+            frag.sql
+        );
+        assert_eq!(frag.params.len(), 1);
+        assert!(matches!(&frag.params[0], SqlParam::Text(v) if v == "http://ex.org/mrn"));
+    }
+
+    /// Same, on the reverse-chain terminal, which is a separate copy of the
+    /// same match.
+    #[test]
+    fn a_reverse_chained_system_only_token_matches_any_code_in_the_system() {
+        let registry = obs_subject_patient_org_code();
+        let builder = ChainQueryBuilder::new("t", "Patient", registry);
+        let rc = ReverseChainedParameter {
+            source_type: "Observation".to_string(),
+            reference_param: "subject".to_string(),
+            search_param: "code".to_string(),
+            value: Some(SearchValue::eq("http://loinc.org|")),
+            nested: None,
+        };
+        let frag = builder.build_reverse_chain_sql(&rc).unwrap();
+
+        assert!(
+            frag.sql.contains("value_token_code IS NOT NULL AND ")
+                && frag.sql.contains("value_token_system = $2)"),
+            "system-only predicate: {}",
+            frag.sql
+        );
+        assert!(
+            !frag.sql.contains("value_token_code = $"),
+            "no code equality: {}",
+            frag.sql
+        );
+        assert!(
+            !frag.sql.contains(IMPLICIT_TOKEN_SYSTEM),
+            "the implicit system is not accepted: {}",
+            frag.sql
+        );
+        assert_eq!(frag.params.len(), 1);
+        assert!(matches!(&frag.params[0], SqlParam::Text(v) if v == "http://loinc.org"));
     }
 
     #[test]

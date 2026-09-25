@@ -5,7 +5,7 @@
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use helios_persistence::core::{ConditionalStorage, ResourceStorage};
@@ -15,6 +15,9 @@ use tracing::debug;
 use crate::error::{RestError, RestResult};
 use crate::extractors::{FhirVersionExtractor, TenantExtractor};
 use crate::middleware::ConditionalHeaders;
+use crate::middleware::content_type::negotiate_format;
+use crate::middleware::prefer::PreferHeader;
+use crate::responses::format_resource_response;
 use crate::state::AppState;
 
 /// Handler for the delete interaction.
@@ -30,11 +33,14 @@ use crate::state::AppState;
 /// - `If-Match` — optional version precondition (RFC 9110 §13.1.1). The delete
 ///   is performed only if the supplied entity-tag matches the resource's current
 ///   version. See [`delete_handler`]'s precondition section below.
+/// - `Prefer: return=OperationOutcome` — answer a successful delete with `200`
+///   and an informational OperationOutcome instead of an empty `204` (#1343).
 ///
 /// # Response
 ///
 /// - `204 No Content` - Resource deleted successfully
-/// - `200 OK` - Resource deleted, returning OperationOutcome
+/// - `200 OK` - Resource deleted, and `Prefer: return=OperationOutcome` was sent;
+///   the body is an informational OperationOutcome
 /// - `404 Not Found` - Resource does not exist, or is already deleted
 /// - `412 Precondition Failed` - `If-Match` was supplied and is not satisfied
 /// - `409 Conflict` - `If-Match` was satisfied, but another writer changed the
@@ -79,6 +85,8 @@ pub async fn delete_handler<S>(
     tenant: TenantExtractor,
     version: FhirVersionExtractor,
     conditional: ConditionalHeaders,
+    prefer: PreferHeader,
+    req_headers: HeaderMap,
 ) -> RestResult<Response>
 where
     S: ResourceStorage + Send + Sync,
@@ -227,8 +235,12 @@ where
         )),
     );
 
-    // Return 204 No Content (or 200 with OperationOutcome)
-    let mut response = StatusCode::NO_CONTENT.into_response();
+    // 204 No Content, or 200 with an OperationOutcome when the client asked.
+    let mut response = delete_response(
+        &prefer,
+        &req_headers,
+        &format!("Resource deleted: {resource_type}/{id}"),
+    );
     response
         .extensions_mut()
         .insert(helios_audit::AuditResponseContext {
@@ -250,6 +262,8 @@ where
 /// # Response
 ///
 /// - `204 No Content` - the single match was deleted, **or nothing matched**
+/// - `200 OK` - as `204`, but `Prefer: return=OperationOutcome` was sent: the
+///   body is an informational OperationOutcome saying which of the two happened
 /// - `400 Bad Request` - criteria that cannot be evaluated (unknown parameter,
 ///   empty value, …); nothing is deleted
 /// - `405 Method Not Allowed` - `AuditEvent` resources are immutable
@@ -284,12 +298,21 @@ where
 /// same answer a batch `DELETE [type]?criteria` entry gives. It differs from
 /// conditional *patch*, where the same text says `404`: a delete that finds
 /// nothing has reached its goal, a patch has not.
+///
+/// The bare `204` cannot tell "deleted" from "nothing matched" — which once hid
+/// criteria that silently matched nothing (#1312). A client that needs to know
+/// sends `Prefer: return=OperationOutcome` and gets `200` with an informational
+/// OperationOutcome naming the deleted resource, or saying nothing matched
+/// (#1343). That is the "200 OK if the response contains a payload" branch of
+/// the same text, so the policy holds in every version.
 pub async fn conditional_delete_handler<S>(
     State(state): State<AppState<S>>,
     Path(resource_type): Path<String>,
     tenant: TenantExtractor,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     conditional: ConditionalHeaders,
+    prefer: PreferHeader,
+    req_headers: HeaderMap,
 ) -> RestResult<Response>
 where
     S: ResourceStorage + ConditionalStorage + Send + Sync,
@@ -345,7 +368,11 @@ where
             // Name the entity in the audit trail, as the instance delete does.
             // Before the result carried the snapshot, a delete-by-criteria
             // produced an AuditEvent with no entity at all.
-            let mut response = StatusCode::NO_CONTENT.into_response();
+            let mut response = delete_response(
+                &prefer,
+                &req_headers,
+                &format!("Resource deleted: {resource_type}/{}", deleted.id()),
+            );
             response
                 .extensions_mut()
                 .insert(helios_audit::AuditResponseContext {
@@ -362,11 +389,39 @@ where
             // "No matches or One Match: The server performs an ordinary
             // delete", which answers 204 "if the resource does not exist at
             // all" — see the handler doc.
-            Ok(StatusCode::NO_CONTENT.into_response())
+            Ok(delete_response(
+                &prefer,
+                &req_headers,
+                &format!("No {resource_type} matched the search criteria; nothing was deleted"),
+            ))
         }
         ConditionalDeleteResult::MultipleMatches(count) => Err(RestError::MultipleMatches {
             operation: "delete".to_string(),
             count,
         }),
     }
+}
+
+/// The success response of a delete: an empty `204`, or — when the client sent
+/// `Prefer: return=OperationOutcome` — `200` with an informational
+/// OperationOutcome carrying `message`, in the negotiated format. The same
+/// shape create, update and patch answer that preference with.
+///
+/// A format the server cannot produce (XML without the `xml` feature) is
+/// answered with the formatter's own refusal, `406`, not a generic `500`.
+fn delete_response(prefer: &PreferHeader, req_headers: &HeaderMap, message: &str) -> Response {
+    if !prefer.is_operation_outcome() {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    let outcome = serde_json::json!({
+        "resourceType": "OperationOutcome",
+        "issue": [{
+            "severity": "information",
+            "code": "informational",
+            "details": { "text": message }
+        }]
+    });
+    let format = negotiate_format(req_headers, None).format;
+    format_resource_response(StatusCode::OK, HeaderMap::new(), &outcome, format)
+        .unwrap_or_else(|refusal| refusal)
 }
