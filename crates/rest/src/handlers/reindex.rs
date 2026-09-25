@@ -67,10 +67,23 @@ fn reindex_unavailable() -> RestError {
     }
 }
 
-/// `batchSize` as a page size: at least 1, and saturating instead of wrapping
-/// (`4294967296 as u32` is 0, which reindexed nothing, #1499).
+/// Upper bound on `batchSize`. `HFS_REINDEX_BATCH_BYTES` caps a page's memory
+/// footprint, but only after a storage backend has already sized its page
+/// buffer to `batchSize` rows — SQLite's `fetch_resources_page_capped` does
+/// `Vec::with_capacity(limit as usize)` before a single row is read, so a
+/// `batchSize` anywhere near `u32::MAX` aborts the process with an allocation
+/// failure however small `batch_bytes` is. `10_000` rows is 100x the request
+/// default and far more than the byte cap alone would ever let through.
+const MAX_REINDEX_PAGE_SIZE: u32 = 10_000;
+
+/// `batchSize` as a page size: at least 1, saturating instead of wrapping
+/// (`4294967296 as u32` is 0, which reindexed nothing, #1499), and clamped to
+/// [`MAX_REINDEX_PAGE_SIZE`] so an oversized value cannot force a storage
+/// backend into a multi-gigabyte page preallocation.
 fn batch_size_param(size: u64) -> u32 {
-    u32::try_from(size).unwrap_or(u32::MAX).max(1)
+    u32::try_from(size)
+        .unwrap_or(u32::MAX)
+        .clamp(1, MAX_REINDEX_PAGE_SIZE)
 }
 
 /// Enforces the `system/reindex` operation scope. Auth disabled → allowed.
@@ -309,7 +322,15 @@ mod tests {
         assert_eq!(batch_size_param(0), 1);
         assert_eq!(batch_size_param(1), 1);
         assert_eq!(batch_size_param(1000), 1000);
-        assert_eq!(batch_size_param(4_294_967_296), u32::MAX);
-        assert_eq!(batch_size_param(u64::MAX), u32::MAX);
+        assert_eq!(
+            batch_size_param(MAX_REINDEX_PAGE_SIZE as u64),
+            MAX_REINDEX_PAGE_SIZE
+        );
+        assert_eq!(
+            batch_size_param(MAX_REINDEX_PAGE_SIZE as u64 + 1),
+            MAX_REINDEX_PAGE_SIZE
+        );
+        assert_eq!(batch_size_param(4_294_967_296), MAX_REINDEX_PAGE_SIZE);
+        assert_eq!(batch_size_param(u64::MAX), MAX_REINDEX_PAGE_SIZE);
     }
 }
