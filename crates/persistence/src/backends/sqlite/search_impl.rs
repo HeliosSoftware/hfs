@@ -422,16 +422,6 @@ impl SearchProvider for SqliteBackend {
         reject_contained_missing(query)?;
         reject_unsupported_metadata_modifier(query)?;
 
-        // The count below and the page after it must measure `ap` date
-        // windows from one instant (#1390): pin it if the caller did not.
-        let pinned;
-        let query = if query.now.is_none() {
-            pinned = query.clone().with_now(query.reference_now());
-            &pinned
-        } else {
-            query
-        };
-
         // `_contained` search uses a dedicated path (different index columns and
         // heterogeneous result types); standard search handles `_contained=false`.
         // This is the only entry point into that path, so the gate above is not

@@ -5,8 +5,6 @@
 
 use std::collections::HashSet;
 
-use chrono::{DateTime, Utc};
-
 use crate::error::SearchError;
 use crate::types::{
     CompartmentMembership, ContainedMode, SearchModifier, SearchParamType, SearchParameter,
@@ -216,8 +214,6 @@ impl QueryBuilder {
     /// Returns SQL that selects matching resource IDs from the search_index table.
     pub fn build(&self, query: &SearchQuery) -> SqlFragment {
         let mut conditions = Vec::new();
-        // Read once, so every `ap` date window in the query shares one instant.
-        let now = query.reference_now();
 
         // Base conditions: tenant and resource type
         // These always use ?1 and ?2 since they're shared with the outer query
@@ -246,7 +242,7 @@ impl QueryBuilder {
         // Build conditions for each parameter, tracking how many params we've added
         let mut current_offset = search_param_offset;
         for param in &query.parameters {
-            if let Some(condition) = self.build_parameter_condition(param, current_offset, now) {
+            if let Some(condition) = self.build_parameter_condition(param, current_offset) {
                 current_offset += condition.params.len();
                 conditions.push(condition);
             }
@@ -312,8 +308,6 @@ impl QueryBuilder {
     /// resource of the type (#1383), so this always returns `Some`. The rows
     /// are unordered; the caller sorts them before paging.
     pub fn build_contained(&self, query: &SearchQuery) -> Option<SqlFragment> {
-        // Read once, so every `ap` date window in the query shares one instant.
-        let now = query.reference_now();
         // (branch, negated)
         let mut branches: Vec<(String, bool)> = Vec::new();
         let mut entity_filters: Vec<String> = Vec::new();
@@ -357,7 +351,6 @@ impl QueryBuilder {
                         value,
                         &param.components,
                         offset,
-                        now,
                     ) {
                         Some(fragments) if !fragments.is_empty() => {
                             let havings: Vec<String> = fragments
@@ -390,7 +383,7 @@ impl QueryBuilder {
             let mut or_conditions = Vec::new();
             let mut local_offset = offset;
             for value in &param.values {
-                if let Some(cond) = self.build_value_condition(param, value, local_offset, now) {
+                if let Some(cond) = self.build_value_condition(param, value, local_offset) {
                     local_offset += cond.params.len();
                     or_conditions.push(cond);
                 }
@@ -652,7 +645,6 @@ impl QueryBuilder {
         &self,
         param: &SearchParameter,
         param_offset: usize,
-        now: DateTime<Utc>,
     ) -> Option<SqlFragment> {
         if param.values.is_empty() {
             return None;
@@ -694,12 +686,12 @@ impl QueryBuilder {
                 "_tag" | "_profile" | "_security" | "_source" | "_language"
             )
         {
-            return self.build_special_parameter_condition(param, param_offset, now);
+            return self.build_special_parameter_condition(param, param_offset);
         }
 
         // Composite parameters need a group-aware subquery (see below).
         if matches!(param.param_type, SearchParamType::Composite) {
-            return self.build_composite_parameter_condition(param, param_offset, now);
+            return self.build_composite_parameter_condition(param, param_offset);
         }
 
         // A plain multi-value reference search (all `Type/id`, no modifier)
@@ -742,7 +734,7 @@ impl QueryBuilder {
 
             for value in &param.values {
                 let condition =
-                    self.build_value_condition(param, value, param_offset + total_params, now);
+                    self.build_value_condition(param, value, param_offset + total_params);
                 if let Some(cond) = condition {
                     total_params += cond.params.len();
                     or_conditions.push(cond);
@@ -791,7 +783,6 @@ impl QueryBuilder {
         &self,
         param: &SearchParameter,
         param_offset: usize,
-        now: DateTime<Utc>,
     ) -> Option<SqlFragment> {
         if param.components.is_empty() {
             return None;
@@ -806,7 +797,6 @@ impl QueryBuilder {
                 value,
                 &param.components,
                 param_offset + total_params,
-                now,
             ) {
                 Some(fragments) if !fragments.is_empty() => {
                     let havings: Vec<String> = fragments
@@ -838,7 +828,6 @@ impl QueryBuilder {
         &self,
         param: &SearchParameter,
         param_offset: usize,
-        now: DateTime<Utc>,
     ) -> Option<SqlFragment> {
         match param.name.as_str() {
             "_id" => {
@@ -893,7 +882,7 @@ impl QueryBuilder {
             }
             "_lastUpdated" => {
                 // _lastUpdated is stored in the resources table
-                self.build_date_conditions_on_resources(&param.values, param_offset, now)
+                self.build_date_conditions_on_resources(&param.values, param_offset)
             }
             "_text" => {
                 // _text searches the narrative text (text.div) via FTS5
@@ -905,7 +894,7 @@ impl QueryBuilder {
             }
             "_filter" => {
                 // _filter uses advanced filter expression syntax
-                self.build_filter_condition(&param.values, param_offset, now)
+                self.build_filter_condition(&param.values, param_offset)
             }
             _ => {
                 // Not "fall through to regular handling", as this comment used
@@ -988,7 +977,6 @@ impl QueryBuilder {
         &self,
         values: &[SearchValue],
         param_offset: usize,
-        now: DateTime<Utc>,
     ) -> Option<SqlFragment> {
         let mut conditions = Vec::new();
 
@@ -996,7 +984,9 @@ impl QueryBuilder {
         // a value that is not a date binds none.
         let mut offset = param_offset;
         for value in values {
-            let cond = DateHandler::build_sql(value, offset, now);
+            // `_lastUpdated` is an instant on the resource row: a point
+            // comparison, not the range a date parameter's index row holds.
+            let cond = DateHandler::build_point_sql("last_updated", value, offset);
             if !cond.is_empty() {
                 offset += cond.params.len();
                 conditions.push(cond);
@@ -1015,7 +1005,7 @@ impl QueryBuilder {
         Some(SqlFragment::with_params(
             format!(
                 "resource_key IN (SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND ({}))",
-                combined.sql.replace("value_date", "last_updated")
+                combined.sql
             ),
             combined.params,
         ))
@@ -1037,7 +1027,6 @@ impl QueryBuilder {
         &self,
         values: &[SearchValue],
         param_offset: usize,
-        now: DateTime<Utc>,
     ) -> Option<SqlFragment> {
         use super::filter_parser::{FilterParser, FilterSqlGenerator};
 
@@ -1053,7 +1042,7 @@ impl QueryBuilder {
             match FilterParser::parse(&value.value) {
                 Ok(expr) => {
                     // Generate SQL from the parsed expression
-                    let mut generator = FilterSqlGenerator::new(current_offset).with_now(now);
+                    let mut generator = FilterSqlGenerator::new(current_offset);
                     let sql = generator.generate(&expr);
                     current_offset += sql.params.len();
                     conditions.push(sql);
@@ -1092,7 +1081,6 @@ impl QueryBuilder {
         param: &SearchParameter,
         value: &SearchValue,
         param_offset: usize,
-        now: DateTime<Utc>,
     ) -> Option<SqlFragment> {
         // Build condition based on parameter type
         let fragment = match param.param_type {
@@ -1102,7 +1090,7 @@ impl QueryBuilder {
             SearchParamType::Token => {
                 TokenHandler::build_sql(value, param.modifier.as_ref(), param_offset)
             }
-            SearchParamType::Date => DateHandler::build_sql(value, param_offset, now),
+            SearchParamType::Date => DateHandler::build_sql(value, param_offset),
             SearchParamType::Number => NumberHandler::build_sql(value, param_offset),
             SearchParamType::Quantity => QuantityHandler::build_sql(value, param_offset),
             SearchParamType::Reference => {
@@ -1122,7 +1110,6 @@ impl QueryBuilder {
                     &param.name,
                     &param.components,
                     param_offset,
-                    now,
                 )
             }
             SearchParamType::Special => {
@@ -1215,9 +1202,14 @@ impl QueryBuilder {
         let column = directive.param_type.and_then(sort_value_column);
         match column {
             Some(col) => {
-                let agg = match directive.direction {
-                    crate::types::SortDirection::Ascending => "MIN",
-                    crate::types::SortDirection::Descending => "MAX",
+                let (agg, col) = match directive.direction {
+                    crate::types::SortDirection::Ascending => ("MIN", col),
+                    // A date row is a range (#1391): descending sorts on where
+                    // the latest one ends, not where it starts.
+                    crate::types::SortDirection::Descending if col == "value_date" => {
+                        ("MAX", "value_date_end")
+                    }
+                    crate::types::SortDirection::Descending => ("MAX", col),
                 };
                 format!(
                     "(SELECT {}({}) FROM search_index si WHERE si.tenant_id = ?1 AND si.resource_type = ?2 AND si.resource_key = resources.rowid AND si.param_name = '{}')",
@@ -1343,7 +1335,7 @@ mod tests {
             };
 
             let fragment = builder
-                .build_parameter_condition(&param, 2, Utc::now())
+                .build_parameter_condition(&param, 2)
                 .unwrap_or_else(|| {
                     panic!("{name} produced no condition — the filter would be dropped")
                 });
@@ -1374,9 +1366,7 @@ mod tests {
         };
 
         assert!(
-            builder
-                .build_parameter_condition(&param, 2, Utc::now())
-                .is_none(),
+            builder.build_parameter_condition(&param, 2).is_none(),
             "_in must not be answered by the index; it is rejected at the REST layer"
         );
     }
@@ -1472,7 +1462,7 @@ mod tests {
         };
 
         let fragment = builder
-            .build_parameter_condition(&param, 2, Utc::now())
+            .build_parameter_condition(&param, 2)
             .expect("_id must produce a condition");
 
         assert_eq!(
@@ -1496,7 +1486,7 @@ mod tests {
         };
 
         let fragment = builder
-            .build_parameter_condition(&param, 2, Utc::now())
+            .build_parameter_condition(&param, 2)
             .expect("_id:not must produce a condition");
 
         assert_eq!(
@@ -1520,7 +1510,7 @@ mod tests {
         };
 
         let fragment = builder
-            .build_parameter_condition(&param, 2, Utc::now())
+            .build_parameter_condition(&param, 2)
             .expect("_id:not must produce a condition");
 
         assert_eq!(
@@ -1544,11 +1534,7 @@ mod tests {
             components: vec![],
         };
 
-        assert!(
-            builder
-                .build_parameter_condition(&param, 2, Utc::now())
-                .is_none()
-        );
+        assert!(builder.build_parameter_condition(&param, 2).is_none());
     }
 
     #[test]
@@ -2181,7 +2167,7 @@ mod tests {
                 components: vec![],
             };
             let fragment = QueryBuilder::new("tenant1", "Patient")
-                .build_parameter_condition(&param, 2, Utc::now())
+                .build_parameter_condition(&param, 2)
                 .unwrap_or_else(|| panic!("{context}: a dropped condition matches everything"));
             assert_eq!(fragment.sql, "1 = 0", "{context}");
             assert!(fragment.params.is_empty(), "{context}");

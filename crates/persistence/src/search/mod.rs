@@ -93,11 +93,13 @@ pub use conditional::{
     parse_conditional_criteria,
 };
 pub use converters::{
-    IMPLICIT_TOKEN_SYSTEM, IndexValue, ValueConverter, implicit_system_candidates,
+    DateEnd, IMPLICIT_TOKEN_SYSTEM, IndexValue, ValueConverter, implicit_system_candidates,
 };
 pub use date_value::{
-    DatePredicate, DateValueError, DateValueErrorReason, DateValuePrecision, FhirDateValue,
-    StorageResolution, validate_date_parameter, validate_date_values,
+    ApproxMargin, DatePredicate, DateValueError, DateValueErrorReason, DateValuePrecision,
+    FhirDateValue, OPEN_START, RangeCondition, RangePredicate, StorageResolution, indexed_end,
+    indexed_range, open_end, open_start, parse_stored_date, validate_date_parameter,
+    validate_date_values,
 };
 pub use errors::{ExtractionError, LoaderError, RegistryError, ReindexError};
 pub use extractor::{ContainedExtraction, ExtractedValue, SearchParameterExtractor};

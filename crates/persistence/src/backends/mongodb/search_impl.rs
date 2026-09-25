@@ -1,6 +1,5 @@
 //! Search and conditional-operation implementation for MongoDB backend.
 
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
@@ -18,7 +17,7 @@ use crate::core::{
     IncludeProvider, ResourceStorage, RevincludeProvider, SearchProvider, SearchResult,
 };
 use crate::error::{BackendError, QueryErrorExt, SearchError, StorageError, StorageResult};
-use crate::search::{DatePredicate, FhirDateValue, StorageResolution};
+use crate::search::{DatePredicate, FhirDateValue, RangeCondition, StorageResolution};
 use crate::tenant::TenantContext;
 use crate::types::{
     CompartmentMembership, CursorDirection, CursorValue, IncludeDirective, IncludeType, Page,
@@ -56,8 +55,30 @@ fn chrono_to_bson(dt: DateTime<Utc>) -> BsonDateTime {
     BsonDateTime::from_millis(dt.timestamp_millis())
 }
 
-/// The date filter document for one search value (#519). A free function so
-/// the range semantics are unit-testable without a live MongoDB.
+/// The `search_index` field a date row stores the end of its range in
+/// (#1391); `value_date` holds the start.
+const VALUE_DATE_END: &str = "value_date_end";
+
+/// Reads a date search value with the grammar every backend shares.
+///
+/// A value that is not a date is an error here, never a filter. The search
+/// gate (`validate_date_values`) reports it first on every ordinary path;
+/// this is what the in-transaction conditional paths, which build filters
+/// without passing the gate, fall back on.
+fn parse_date_search_value(value: &SearchValue, param: &str) -> StorageResult<FhirDateValue> {
+    FhirDateValue::parse(&value.value).map_err(|error| {
+        StorageError::Search(SearchError::InvalidDateValue {
+            param: param.to_string(),
+            value: value.value.clone(),
+            reason: error.to_string(),
+        })
+    })
+}
+
+/// The date filter document for one search value against a stored *point*
+/// in `field` (#519): `_lastUpdated` on the resources collection, and a date
+/// component of a composite parameter. A free function so the semantics are
+/// unit-testable without a live MongoDB.
 ///
 /// The value is read by [`FhirDateValue`], the grammar and precision range
 /// every backend shares. A search value names a *range*, never an instant:
@@ -68,42 +89,134 @@ fn chrono_to_bson(dt: DateTime<Utc>) -> BsonDateTime {
 /// milliseconds, so the range is clamped to that: a microsecond search value
 /// still finds the millisecond-truncated date stored for it.
 ///
-/// `ap` is the shared window (#1390): the range widened by a tenth of its gap
-/// to `now`, the instant the search fixed once for all of its values.
-///
-/// A value that is not a date is an error here, never a filter. The search
-/// gate (`validate_date_values`) reports it first on every ordinary path;
-/// this is what the in-transaction conditional paths, which build filters
-/// without passing the gate, fall back on.
-fn build_date_filter_doc(
-    value: &SearchValue,
-    param: &str,
-    field: &str,
-    now: DateTime<Utc>,
-) -> StorageResult<Document> {
-    let parsed = FhirDateValue::parse(&value.value).map_err(|error| {
-        StorageError::Search(SearchError::InvalidDateValue {
-            param: param.to_string(),
-            value: value.value.clone(),
-            reason: error.to_string(),
-        })
-    })?;
+/// `ap` accepts a point inside [`FhirDateValue::approx_window`], the window
+/// every backend shares (#1391; it used to be ±12h around the start here).
+fn build_date_filter_doc(value: &SearchValue, param: &str, field: &str) -> StorageResult<Document> {
+    let parsed = parse_date_search_value(value, param)?;
 
-    Ok(
-        match parsed.predicate(value.prefix, StorageResolution::Millis, now) {
-            DatePredicate::Within { ge, lt } => {
-                doc! { field: { "$gte": chrono_to_bson(ge), "$lt": chrono_to_bson(lt) } }
-            }
-            DatePredicate::Outside { lt, ge } => doc! {
-                "$or": [
-                    { field: { "$lt": chrono_to_bson(lt) } },
-                    { field: { "$gte": chrono_to_bson(ge) } },
-                ]
-            },
-            DatePredicate::AtOrAfter(bound) => doc! { field: { "$gte": chrono_to_bson(bound) } },
-            DatePredicate::Before(bound) => doc! { field: { "$lt": chrono_to_bson(bound) } },
+    let Some(predicate) = parsed.predicate(value.prefix, StorageResolution::Millis) else {
+        let (low, high) = parsed.approx_window(StorageResolution::Millis);
+        return Ok(doc! { field: { "$gte": chrono_to_bson(low), "$lt": chrono_to_bson(high) } });
+    };
+
+    Ok(match predicate {
+        DatePredicate::Within { ge, lt } => {
+            doc! { field: { "$gte": chrono_to_bson(ge), "$lt": chrono_to_bson(lt) } }
+        }
+        DatePredicate::Outside { lt, ge } => doc! {
+            "$or": [
+                { field: { "$lt": chrono_to_bson(lt) } },
+                { field: { "$gte": chrono_to_bson(ge) } },
+            ]
         },
-    )
+        DatePredicate::AtOrAfter(bound) => doc! { field: { "$gte": chrono_to_bson(bound) } },
+        DatePredicate::Before(bound) => doc! { field: { "$lt": chrono_to_bson(bound) } },
+    })
+}
+
+/// The date filter document for one search value against the *range* a
+/// `search_index` row stores, `[value_date, value_date_end)` (#1391): a
+/// `Period` is one row, not two unrelated points, and every prefix follows
+/// the FHIR rule for a range target ([`FhirDateValue::range_predicate`]).
+///
+/// A row indexed before #1391 has no `value_date_end` and fails every
+/// condition on the end until it is reindexed (`$reindex`); treating the
+/// missing end as open would make it match `gt` for any date.
+fn build_date_range_filter_doc(value: &SearchValue, param: &str) -> StorageResult<Document> {
+    let parsed = parse_date_search_value(value, param)?;
+    let predicate = parsed.range_predicate(value.prefix, StorageResolution::Millis);
+
+    let mut arms: Vec<Document> = predicate
+        .any_of
+        .iter()
+        .map(|group| {
+            let mut arm = Document::new();
+            let mut bound_on = |field: &str, op: &str, bound| {
+                if let Ok(ops) = arm.get_document_mut(field) {
+                    ops.insert(op, chrono_to_bson(bound));
+                } else {
+                    arm.insert(field, doc! { op: chrono_to_bson(bound) });
+                }
+            };
+            for condition in group {
+                match *condition {
+                    RangeCondition::StartAtOrAfter(bound) => bound_on("value_date", "$gte", bound),
+                    RangeCondition::StartBefore(bound) => bound_on("value_date", "$lt", bound),
+                    RangeCondition::EndAfter(bound) => bound_on(VALUE_DATE_END, "$gt", bound),
+                    RangeCondition::EndAtOrBefore(bound) => {
+                        // Implied, since every stored range is at least one
+                        // unit wide; it lets `eq` and `eb` seek on
+                        // `idx_search_date_v3`, which leads with `value_date`.
+                        bound_on("value_date", "$lt", bound);
+                        bound_on(VALUE_DATE_END, "$lte", bound);
+                    }
+                }
+            }
+            if arm.contains_key("value_date") {
+                arm
+            } else {
+                // `idx_search_date_v3` is partial on `value_date` existing; a
+                // filter on the end alone would not imply it and would scan
+                // every row of the resource type instead. `$ne: null` rather
+                // than `$exists: true`, which the index cannot answer without
+                // reading the document.
+                let mut with_start = doc! { "value_date": { "$ne": null } };
+                with_start.extend(arm);
+                with_start
+            }
+        })
+        .collect();
+
+    Ok(if arms.len() == 1 {
+        arms.remove(0)
+    } else {
+        doc! { "$or": arms }
+    })
+}
+
+/// Flattens the date filters of one parameter's values into a single
+/// top-level `$or` whose arms each repeat the `scope` conjuncts (tenant,
+/// resource type, parameter name), so that every arm is a plain conjunction
+/// the `idx_search_date_v3` index can seek on, covered (#1391).
+///
+/// A value filter is either one conjunction or `{ "$or": [conjunction, ..] }`
+/// (see [`build_date_range_filter_doc`]); comma-separated values are OR'd, so
+/// the union of all arms is the same set of rows as the nested form matched.
+fn scoped_date_alternatives(scope: &Document, value_filters: Vec<Document>) -> Document {
+    let mut arms: Vec<Bson> = Vec::new();
+    for value_filter in value_filters {
+        let alternatives = match value_filter.get_array("$or") {
+            Ok(alternatives) if value_filter.len() == 1 => alternatives.clone(),
+            _ => vec![Bson::Document(value_filter)],
+        };
+        for alternative in alternatives {
+            if let Bson::Document(conditions) = alternative {
+                let mut arm = scope.clone();
+                arm.extend(conditions);
+                arms.push(Bson::Document(arm));
+            }
+        }
+    }
+    doc! { "$or": arms }
+}
+
+/// Drops the `tenant_id` / `resource_type` scope from a filter built by
+/// `build_search_index_filter`: at the top and, for a date filter, in each arm
+/// of its top-level `$or` ([`scoped_date_alternatives`]).
+fn strip_index_scope(filter: &mut Document, param_type: SearchParamType) {
+    filter.remove("tenant_id");
+    filter.remove("resource_type");
+    if param_type != SearchParamType::Date {
+        return;
+    }
+    if let Ok(arms) = filter.get_array_mut("$or") {
+        for arm in arms {
+            if let Bson::Document(arm) = arm {
+                arm.remove("tenant_id");
+                arm.remove("resource_type");
+            }
+        }
+    }
 }
 
 /// The error for a number or quantity search value whose number is not one.
@@ -336,6 +449,18 @@ pub(super) fn value_field_for(param_type: SearchParamType) -> Option<&'static st
     }
 }
 
+/// What a parameter sort aggregates per resource: the value field, except
+/// that a descending date sort reads the end of each stored range (#1391) —
+/// a `Period` sorts by where it ends, as the SQL backends' `MAX` over the end
+/// column. A row indexed before #1391 has no end and falls back to its start.
+fn sort_key_expression(value_field: &str, direction: crate::types::SortDirection) -> Bson {
+    if value_field == "value_date" && direction == crate::types::SortDirection::Descending {
+        Bson::Document(doc! { "$ifNull": [format!("${VALUE_DATE_END}"), "$value_date"] })
+    } else {
+        Bson::String(format!("${value_field}"))
+    }
+}
+
 /// The envelope filter for a `:missing` presence check
 /// (`{tenant_id, resource_type, param_name}`, matching every row `search_index`
 /// carries for the parameter regardless of value), plus — when the parameter
@@ -366,17 +491,6 @@ pub(super) fn missing_presence_filter(
         filter.insert(value_field, doc! { "$ne": Bson::Null });
     }
     filter
-}
-
-/// `query` with the instant its `ap` date windows are measured from fixed
-/// (#1390), so the index filters, the resource filter and a search's count all
-/// see one instant even when the caller left [`SearchQuery::now`] unset.
-fn pin_now(query: &SearchQuery) -> Cow<'_, SearchQuery> {
-    if query.now.is_some() {
-        Cow::Borrowed(query)
-    } else {
-        Cow::Owned(query.clone().with_now(Utc::now()))
-    }
 }
 
 /// Rejects the `_contained=true|both` constraints that select *top-level*
@@ -573,7 +687,6 @@ impl SearchProvider for MongoBackend {
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
         reject_contained_composite(query)?;
-        let query = &*pin_now(query);
 
         // `_contained` search uses a dedicated path (separate index rows and
         // heterogeneous result types); standard search handles `_contained=false`
@@ -758,7 +871,6 @@ impl SearchProvider for MongoBackend {
         query: &SearchQuery,
     ) -> StorageResult<u64> {
         reject_contained_composite(query)?;
-        let query = &*pin_now(query);
         self.validate_query_support(query)?;
 
         // Under `_contained` the count is of what `search` returns (#1383),
@@ -1041,9 +1153,8 @@ impl MongoBackend {
         tenant_id: &str,
         contained_type: &str,
         param: &SearchParameter,
-        now: DateTime<Utc>,
     ) -> StorageResult<Vec<Vec<ContainedComponentFilter>>> {
-        let per_value = self.composite_component_filters(tenant_id, contained_type, param, now)?;
+        let per_value = self.composite_component_filters(tenant_id, contained_type, param)?;
         let mut result = Vec::with_capacity(per_value.len());
         for per_component in per_value {
             let mut rescoped = Vec::with_capacity(per_component.len());
@@ -1075,10 +1186,9 @@ impl MongoBackend {
         tenant_id: &str,
         contained_type: &str,
         param: &SearchParameter,
-        now: DateTime<Utc>,
     ) -> StorageResult<Vec<Document>> {
         let per_value =
-            self.contained_composite_component_filters(tenant_id, contained_type, param, now)?;
+            self.contained_composite_component_filters(tenant_id, contained_type, param)?;
         if per_value.is_empty() {
             return Err(StorageError::Search(SearchError::InvalidComposite {
                 message: format!("composite search parameter '{}' has no values", param.name),
@@ -1122,7 +1232,6 @@ impl MongoBackend {
             contained_type,
             &query.parameters,
             true,
-            query.reference_now(),
             None,
         )
         .await?;
@@ -1309,7 +1418,6 @@ impl MongoBackend {
         let mut composite_branches: Vec<Vec<Document>> = Vec::new();
         // `_id` is the contained resource's local id, a field of every row.
         let mut id_clauses: Vec<Bson> = Vec::new();
-        let now = query.reference_now();
         let mut composite_id_clauses: Vec<Bson> = Vec::new();
         for param in &query.parameters {
             if let Some(reason) = contained_unsupported_reason(param) {
@@ -1328,15 +1436,13 @@ impl MongoBackend {
                     tenant_id,
                     contained_type,
                     param,
-                    now,
                 )?);
                 continue;
             }
             // Reuse the standard per-param value filter, dropping the tenant /
             // resource_type scoping (handled by the pipeline's top `$match`).
-            let mut branch = self.build_search_index_filter_at("", "", param, now)?;
-            branch.remove("tenant_id");
-            branch.remove("resource_type");
+            let mut branch = self.build_search_index_filter("", "", param)?;
+            strip_index_scope(&mut branch, param.param_type);
             branches.push(branch);
             if !distinct_names.contains(&param.name) {
                 distinct_names.push(param.name.clone());
@@ -1991,6 +2097,7 @@ impl MongoBackend {
             SortDirection::Ascending => ("$min", 1),
             SortDirection::Descending => ("$max", -1),
         };
+        let sort_key = sort_key_expression(value_field, directive.direction);
         let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
 
         if let Some(allowed) = allowed {
@@ -2013,7 +2120,7 @@ impl MongoBackend {
                     }},
                     doc! { "$group": {
                         "_id": "$resource_id",
-                        "key": { accumulator: format!("${value_field}") },
+                        "key": { accumulator: sort_key.clone() },
                     }},
                 ];
                 let cursor = search_index
@@ -2056,7 +2163,7 @@ impl MongoBackend {
             }},
             doc! { "$group": {
                 "_id": "$resource_id",
-                "key": { accumulator: format!("${value_field}") },
+                "key": { accumulator: sort_key.clone() },
             }},
             doc! { "$sort": { "key": order, "_id": 1 } },
             doc! { "$project": { "_id": 1 } },
@@ -2102,7 +2209,6 @@ impl MongoBackend {
         if query.parameters.iter().any(crate::search::has_empty_value) {
             return Ok(Some(HashSet::new()));
         }
-        let now = query.reference_now();
 
         self.preflight_legacy_composites(
             db,
@@ -2110,7 +2216,6 @@ impl MongoBackend {
             resource_type,
             &query.parameters,
             false,
-            now,
             None,
         )
         .await?;
@@ -2177,7 +2282,7 @@ impl MongoBackend {
         let normal_filter = |i: usize| -> StorageResult<Document> {
             match identifier_filters.get(&i) {
                 Some(filter) => Ok(filter.clone()),
-                None => self.build_search_index_filter_at(tenant_id, resource_type, normal[i], now),
+                None => self.build_search_index_filter(tenant_id, resource_type, normal[i]),
             }
         };
 
@@ -2197,14 +2302,13 @@ impl MongoBackend {
             for (i, param) in normal.iter().enumerate() {
                 let count = if param.param_type == SearchParamType::Composite {
                     match self
-                        .composite_driver_probe_at(
+                        .composite_driver_probe(
                             &search_index,
                             tenant_id,
                             resource_type,
                             param,
                             PROBE_ROW_LIMIT,
                             None,
-                            now,
                         )
                         .await?
                     {
@@ -2277,14 +2381,13 @@ impl MongoBackend {
                 // same `composite_group` (#1206).
                 if param.param_type == SearchParamType::Composite {
                     let passing = self
-                        .composite_pair_check_at(
+                        .composite_pair_check(
                             &search_index,
                             tenant_id,
                             resource_type,
                             param,
                             &candidates,
                             None,
-                            now,
                         )
                         .await?;
                     candidates.retain(|id| passing.contains(id));
@@ -2351,7 +2454,7 @@ impl MongoBackend {
                 let mut positive = (*param).clone();
                 positive.modifier = None;
                 let pos_filter =
-                    self.build_search_index_filter_at(tenant_id, resource_type, &positive, now)?;
+                    self.build_search_index_filter(tenant_id, resource_type, &positive)?;
                 let bounded = doc! {
                     "$and": [
                         pos_filter,
@@ -2431,7 +2534,6 @@ impl MongoBackend {
             .compartment
             .as_ref()
             .is_some_and(|c| !c.params.is_empty() && !c.reference.is_empty());
-        let now = query.reference_now();
         let mut matched: Option<HashSet<String>> = None;
 
         for param in missing {
@@ -2467,8 +2569,7 @@ impl MongoBackend {
         for param in not_params {
             let mut positive = (*param).clone();
             positive.modifier = None;
-            let filter =
-                self.build_search_index_filter_at(tenant_id, resource_type, &positive, now)?;
+            let filter = self.build_search_index_filter(tenant_id, resource_type, &positive)?;
             let matching = self.distinct_resource_ids(search_index, filter).await?;
             let all = self.all_resource_ids(db, tenant_id, resource_type).await?;
             let ids = all.difference(&matching).cloned().collect::<HashSet<_>>();
@@ -2547,27 +2648,11 @@ impl MongoBackend {
         Ok(Some(ids))
     }
 
-    /// [`Self::build_search_index_filter_at`] with `ap` dates measured from
-    /// the current time, for tests that have no search query. Production
-    /// callers pass the instant they pinned for the whole search.
-    #[cfg(test)]
     pub(super) fn build_search_index_filter(
         &self,
         tenant_id: &str,
         resource_type: &str,
         param: &SearchParameter,
-    ) -> StorageResult<Document> {
-        self.build_search_index_filter_at(tenant_id, resource_type, param, Utc::now())
-    }
-
-    /// The search-index filter for one parameter, `ap` dates measured from
-    /// `now`.
-    pub(super) fn build_search_index_filter_at(
-        &self,
-        tenant_id: &str,
-        resource_type: &str,
-        param: &SearchParameter,
-        now: DateTime<Utc>,
     ) -> StorageResult<Document> {
         if param.param_type == SearchParamType::Composite {
             return Err(internal_error(format!(
@@ -2608,8 +2693,20 @@ impl MongoBackend {
         let value_filters = param
             .values
             .iter()
-            .map(|value| self.build_index_value_filter(param, value, &targets, now))
+            .map(|value| self.build_index_value_filter(param, value, &targets))
             .collect::<StorageResult<Vec<_>>>()?;
+
+        // #1391: a date value can be several alternatives of its own (`ge`,
+        // `le`, `ne`), and a comma list adds more. MongoDB 5.0 answers an
+        // `$or` nested under the shared tenant/type/param conjuncts by
+        // reading the documents, not as a covered scan; an `$or` at the top,
+        // every arm carrying the scope itself, plans one index scan per arm.
+        // The alternatives and their OR are unchanged; only where they sit.
+        if param.param_type == SearchParamType::Date
+            && (value_filters.len() > 1 || value_filters.iter().any(|f| f.contains_key("$or")))
+        {
+            return Ok(scoped_date_alternatives(&filter, value_filters));
+        }
 
         if value_filters.len() == 1 {
             if let Some(single) = value_filters.into_iter().next() {
@@ -2692,7 +2789,6 @@ impl MongoBackend {
         tenant_id: &str,
         resource_type: &str,
         param: &SearchParameter,
-        now: DateTime<Utc>,
     ) -> StorageResult<Vec<Vec<ComponentFilter>>> {
         if param.values.is_empty() {
             return Err(StorageError::Search(SearchError::QueryParseError {
@@ -2744,8 +2840,14 @@ impl MongoBackend {
                     component,
                     component_value.clone(),
                 );
-                let predicate =
-                    self.build_index_value_filter(&synthetic, &component_value, &targets, now)?;
+                // A composite's date component is compared as a point on
+                // `value_date`, as on every backend: only a standalone date
+                // parameter is range-aware (#1391).
+                let predicate = if component.param_type == SearchParamType::Date {
+                    self.build_date_filter(&component_value, &synthetic.name, "value_date")?
+                } else {
+                    self.build_index_value_filter(&synthetic, &component_value, &targets)?
+                };
 
                 let mut scoped = doc! {
                     "tenant_id": tenant_id,
@@ -2777,7 +2879,6 @@ impl MongoBackend {
     /// Reject a repeated-type composite if an older matching component row
     /// lacks its slot. Without this probe a slot-constrained query can report
     /// a false negative until the tenant's index is rebuilt with `$reindex`.
-    #[allow(clippy::too_many_arguments)]
     pub(super) async fn preflight_legacy_composites(
         &self,
         db: &mongodb::Database,
@@ -2785,7 +2886,6 @@ impl MongoBackend {
         resource_type: &str,
         parameters: &[SearchParameter],
         contained: bool,
-        now: DateTime<Utc>,
         mut session: Option<&mut mongodb::ClientSession>,
     ) -> StorageResult<()> {
         let collection = db.collection::<Document>(if contained {
@@ -2811,7 +2911,7 @@ impl MongoBackend {
                 continue;
             }
             let normal_filters =
-                self.composite_component_filters(tenant_id, resource_type, param, now)?;
+                self.composite_component_filters(tenant_id, resource_type, param)?;
             if !contained
                 && normal_filters
                     .iter()
@@ -2821,7 +2921,7 @@ impl MongoBackend {
                 continue;
             }
             let filters = if contained {
-                self.contained_composite_component_filters(tenant_id, resource_type, param, now)?
+                self.contained_composite_component_filters(tenant_id, resource_type, param)?
                     .into_iter()
                     .map(|value| value.into_iter().map(|c| c.filter).collect::<Vec<_>>())
                     .collect::<Vec<_>>()
@@ -2952,8 +3052,7 @@ impl MongoBackend {
     /// there is one); the returned count is the sum of their probe counts,
     /// used only to compete with other parameters for the driver slot in
     /// `matching_resource_ids`.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn composite_driver_probe_at(
+    pub(super) async fn composite_driver_probe(
         &self,
         search_index: &mongodb::Collection<Document>,
         tenant_id: &str,
@@ -2961,10 +3060,9 @@ impl MongoBackend {
         param: &SearchParameter,
         probe_limit: u64,
         mut session: Option<&mut mongodb::ClientSession>,
-        now: DateTime<Utc>,
     ) -> StorageResult<Option<(Document, u64)>> {
         let per_value_filters =
-            self.composite_component_filters(tenant_id, resource_type, param, now)?;
+            self.composite_component_filters(tenant_id, resource_type, param)?;
 
         let mut arms: Vec<Document> = Vec::new();
         let mut total: u64 = 0;
@@ -3034,8 +3132,7 @@ impl MongoBackend {
     /// `candidates` bounds every query issued here — this is the per-batch
     /// check reused by both `matching_resource_ids` (no session) and the
     /// ifNoneExist matcher in `storage.rs` (with a transaction session).
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn composite_pair_check_at(
+    pub(super) async fn composite_pair_check(
         &self,
         search_index: &mongodb::Collection<Document>,
         tenant_id: &str,
@@ -3043,14 +3140,13 @@ impl MongoBackend {
         param: &SearchParameter,
         candidates: &HashSet<String>,
         mut session: Option<&mut mongodb::ClientSession>,
-        now: DateTime<Utc>,
     ) -> StorageResult<HashSet<String>> {
         if candidates.is_empty() {
             return Ok(HashSet::new());
         }
 
         let per_value_filters =
-            self.composite_component_filters(tenant_id, resource_type, param, now)?;
+            self.composite_component_filters(tenant_id, resource_type, param)?;
         let candidate_ids: Vec<Bson> = candidates.iter().cloned().map(Bson::String).collect();
         let projection = doc! { "resource_id": 1, "composite_group": 1, "_id": 0 };
 
@@ -3125,7 +3221,6 @@ impl MongoBackend {
         param: &SearchParameter,
         value: &SearchValue,
         reference_targets: &[String],
-        now: DateTime<Utc>,
     ) -> StorageResult<Document> {
         match param.name.as_str() {
             "_text" | "_content" => {
@@ -3145,7 +3240,7 @@ impl MongoBackend {
         match param.param_type {
             SearchParamType::String => self.build_string_filter(param, value),
             SearchParamType::Token => self.build_token_filter(param, value),
-            SearchParamType::Date => self.build_date_filter(value, &param.name, "value_date", now),
+            SearchParamType::Date => build_date_range_filter_doc(value, &param.name),
             SearchParamType::Number => self.build_number_filter(&param.name, value),
             SearchParamType::Reference => {
                 self.build_reference_filter(param, value, reference_targets)
@@ -3669,9 +3764,8 @@ impl MongoBackend {
         value: &SearchValue,
         param: &str,
         field: &str,
-        now: DateTime<Utc>,
     ) -> StorageResult<Document> {
-        build_date_filter_doc(value, param, field, now)
+        build_date_filter_doc(value, param, field)
     }
 
     /// Builds a MongoDB filter for a quantity parameter.
@@ -3750,8 +3844,8 @@ impl MongoBackend {
 
     /// Maps a comparator prefix to its MongoDB query operator. The number and
     /// quantity filters only route `gt`/`lt`/`ge`/`le`/`sa`/`eb` through here:
-    /// `eq`/`ne` build the implicit-precision range and `ap` the shared
-    /// approximate range directly in `numeric_condition`.
+    /// `eq`/`ne` build the implicit-precision range and `ap` its delta range
+    /// directly in `build_number_filter` / `build_quantity_filter`.
     fn prefix_to_mongo_operator(prefix: SearchPrefix) -> StorageResult<&'static str> {
         match prefix {
             SearchPrefix::Eq => Ok("$eq"),
@@ -3800,9 +3894,7 @@ impl MongoBackend {
                     conditions.push(self.build_resource_id_condition(param)?);
                 }
                 "_lastUpdated" => {
-                    conditions.extend(
-                        self.build_resource_last_updated_conditions(param, query.reference_now())?,
-                    );
+                    conditions.extend(self.build_resource_last_updated_conditions(param)?);
                 }
                 _ => {}
             }
@@ -3874,14 +3966,13 @@ impl MongoBackend {
     fn build_resource_last_updated_conditions(
         &self,
         param: &SearchParameter,
-        now: DateTime<Utc>,
     ) -> StorageResult<Vec<Document>> {
         match &param.modifier {
             None => {
                 let mut conditions = param
                     .values
                     .iter()
-                    .map(|value| self.build_date_filter(value, &param.name, "last_updated", now))
+                    .map(|value| self.build_date_filter(value, &param.name, "last_updated"))
                     .collect::<StorageResult<Vec<_>>>()?;
 
                 // #1062: comma-separated `_lastUpdated` values are OR, the
@@ -4421,20 +4512,8 @@ impl RevincludeProvider for MongoBackend {
 mod date_filter_tests {
     use super::*;
 
-    /// The instant `ap` windows are measured from in these tests.
-    fn now() -> DateTime<Utc> {
-        instant("2026-01-01T00:00:00Z")
-    }
-
-    fn instant(rfc3339: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(rfc3339)
-            .expect("valid instant")
-            .with_timezone(&Utc)
-    }
-
     fn filter(raw: &str) -> Document {
-        build_date_filter_doc(&SearchValue::parse(raw), "date", "value_date", now())
-            .expect("valid date")
+        build_date_filter_doc(&SearchValue::parse(raw), "date", "value_date").expect("valid date")
     }
 
     fn bounds(d: &Document) -> &Document {
@@ -4602,22 +4681,121 @@ mod date_filter_tests {
         );
     }
 
-    /// ap: the shared window (#1390), the day widened by a tenth of its gap
-    /// to `now` — the day ends 3652 days before 2026-01-01, so 365.2 days.
+    /// ap on a point: the shared window, the range widened by one unit of a
+    /// date-only precision on each side (#1391; it was ±12h around the start).
     #[test]
-    fn ap_widens_the_range_by_a_tenth_of_its_gap_to_now() {
-        let ap = filter("ap2016-01-01");
-        let margin = chrono::Duration::milliseconds(3652 * 86_400_000 / 10);
+    fn ap_on_a_point_uses_the_shared_window() {
+        let ap = filter("ap1995-10-02");
         assert_eq!(
             bounds(&ap).get_datetime("$gte").unwrap(),
-            &chrono_to_bson(instant("2016-01-01T00:00:00Z") - margin)
+            &at("1995-10-01T00:00:00Z")
         );
         assert_eq!(
             bounds(&ap).get_datetime("$lt").unwrap(),
-            &chrono_to_bson(instant("2016-01-02T00:00:00Z") + margin)
+            &at("1995-10-04T00:00:00Z")
         );
-        // A range holding `now` has no gap: `ap` is `eq`.
-        assert_eq!(filter("ap2026-01-01"), filter("2026-01-01"));
+    }
+
+    fn range_filter(raw: &str) -> Document {
+        build_date_range_filter_doc(&SearchValue::parse(raw), "date").expect("valid date")
+    }
+
+    /// #1391: a standalone date parameter compares the stored range
+    /// `[value_date, value_date_end)` per the FHIR rules for a range target.
+    /// `2020` spans [2020-01-01, 2021-01-01).
+    #[test]
+    fn range_prefixes_compare_both_ends_of_the_stored_range() {
+        let (s, e) = (at("2020-01-01T00:00:00Z"), at("2021-01-01T00:00:00Z"));
+        let contained = doc! {
+            "value_date": { "$gte": s, "$lt": e },
+            "value_date_end": { "$lte": e },
+        };
+        let end_after = doc! {
+            "value_date": { "$ne": null },
+            "value_date_end": { "$gt": e },
+        };
+        assert_eq!(range_filter("2020"), contained);
+        assert_eq!(
+            range_filter("ne2020"),
+            doc! { "$or": [ { "value_date": { "$lt": s } }, end_after.clone() ] }
+        );
+        assert_eq!(range_filter("gt2020"), end_after);
+        assert_eq!(range_filter("lt2020"), doc! { "value_date": { "$lt": s } });
+        assert_eq!(
+            range_filter("ge2020"),
+            doc! { "$or": [ end_after.clone(), contained.clone() ] }
+        );
+        assert_eq!(
+            range_filter("le2020"),
+            doc! { "$or": [ { "value_date": { "$lt": s } }, contained.clone() ] }
+        );
+        assert_eq!(range_filter("sa2020"), doc! { "value_date": { "$gte": e } });
+        assert_eq!(
+            range_filter("eb2020"),
+            doc! {
+                "value_date": { "$lt": s },
+                "value_date_end": { "$lte": s },
+            }
+        );
+        assert_eq!(
+            range_filter("ap2020"),
+            doc! {
+                "value_date": { "$lt": at("2022-01-01T00:00:00Z") },
+                "value_date_end": { "$gt": at("2019-01-01T00:00:00Z") },
+            }
+        );
+    }
+
+    /// The filters agree with the shared predicate on the cases #1391 is
+    /// about: a Period straddling the search range, and open ends.
+    #[test]
+    fn range_filters_decide_the_issue_cases() {
+        let matches = |raw: &str, ts: &str, te: &str| {
+            let parsed = FhirDateValue::parse(&SearchValue::parse(raw).value).unwrap();
+            parsed
+                .range_predicate(SearchValue::parse(raw).prefix, StorageResolution::Millis)
+                .matches(bson_to_chrono(&at(ts)), bson_to_chrono(&at(te)))
+        };
+        let open_end = crate::search::open_end(StorageResolution::Millis).to_rfc3339();
+        let open_start = crate::search::open_start().to_rfc3339();
+        // A Period from 2019-06 to the end of 2020-03 is not "in" 2020.
+        assert!(!matches(
+            "2020",
+            "2019-06-01T00:00:00Z",
+            "2020-04-01T00:00:00Z"
+        ));
+        // One that only ends in 2021 does not start after 2020.
+        assert!(!matches(
+            "sa2020",
+            "2020-06-01T00:00:00Z",
+            "2021-06-01T00:00:00Z"
+        ));
+        // Open ends are unbounded.
+        assert!(matches("gt2030", "2019-01-01T00:00:00Z", &open_end));
+        assert!(matches("lt1900", &open_start, "2020-01-01T00:00:00Z"));
+        // Every prefix yields a filter.
+        for prefix in ["", "ne", "gt", "lt", "ge", "le", "sa", "eb", "ap"] {
+            range_filter(&format!("{prefix}2020-06-15T10:00Z"));
+        }
+    }
+
+    /// Descending date sorts read the end of the stored range; everything
+    /// else, and ascending date sorts, read the value field itself.
+    #[test]
+    fn descending_date_sort_reads_the_range_end() {
+        use crate::types::SortDirection;
+        assert_eq!(
+            sort_key_expression("value_date", SortDirection::Descending),
+            Bson::Document(doc! { "$ifNull": ["$value_date_end", "$value_date"] })
+        );
+        assert_eq!(
+            sort_key_expression("value_date", SortDirection::Ascending),
+            Bson::String("$value_date".to_string())
+        );
+        assert_eq!(
+            sort_key_expression("value_string", SortDirection::Descending),
+            Bson::String("$value_string".to_string())
+        );
     }
 
     /// Garbage stays an error, not a silent full scan — under every prefix,
@@ -4633,9 +4811,8 @@ mod date_filter_tests {
             "2013-04-05T09:20:00z",
             "",
         ] {
-            let error =
-                build_date_filter_doc(&SearchValue::parse(raw), "date", "value_date", now())
-                    .expect_err(raw);
+            let error = build_date_filter_doc(&SearchValue::parse(raw), "date", "value_date")
+                .expect_err(raw);
             assert!(
                 matches!(
                     &error,
@@ -4643,6 +4820,15 @@ mod date_filter_tests {
                         if param == "date"
                 ),
                 "{raw}: {error:?}"
+            );
+            let error =
+                build_date_range_filter_doc(&SearchValue::parse(raw), "date").expect_err(raw);
+            assert!(
+                matches!(
+                    &error,
+                    StorageError::Search(SearchError::InvalidDateValue { .. })
+                ),
+                "{raw} (range): {error:?}"
             );
         }
     }
@@ -5028,6 +5214,157 @@ mod value_list_tests {
         }
     }
 
+    fn date_param(values: &[&str]) -> SearchParameter {
+        SearchParameter {
+            name: "date".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: values.iter().map(|v| SearchValue::parse(v)).collect(),
+            chain: vec![],
+            components: vec![],
+        }
+    }
+
+    fn at_date(rfc3339: &str) -> BsonDateTime {
+        chrono_to_bson(
+            DateTime::parse_from_rfc3339(rfc3339)
+                .expect("test instant")
+                .with_timezone(&Utc),
+        )
+    }
+
+    /// The arms of a date filter's top-level `$or`, as documents.
+    fn top_level_arms(filter: &Document) -> Vec<Document> {
+        assert_eq!(filter.len(), 1, "only the $or at the top: {filter:?}");
+        filter
+            .get_array("$or")
+            .expect("top-level $or")
+            .iter()
+            .map(|arm| arm.as_document().expect("arm").clone())
+            .collect()
+    }
+
+    /// #1391: a date value with alternatives (`ge`, `le`, `ne`) puts its `$or`
+    /// at the top, each arm repeating tenant/type/param, so MongoDB plans one
+    /// covered `idx_search_date_v3` scan per arm; nested under the shared
+    /// conjuncts it reads the documents instead.
+    #[test]
+    fn two_branch_date_prefixes_scope_every_arm() {
+        let backend = backend();
+        let (s, e) = (
+            at_date("2020-01-01T00:00:00Z"),
+            at_date("2021-01-01T00:00:00Z"),
+        );
+        let scope = doc! { "tenant_id": "t1", "resource_type": "Patient", "param_name": "date" };
+        let expect = |arm: Document| {
+            let mut scoped = scope.clone();
+            scoped.extend(arm);
+            Bson::Document(scoped)
+        };
+        let end_after = doc! { "value_date": { "$ne": null }, "value_date_end": { "$gt": e } };
+        let contained = doc! {
+            "value_date": { "$gte": s, "$lt": e },
+            "value_date_end": { "$lte": e },
+        };
+        let before = doc! { "value_date": { "$lt": s } };
+
+        let cases = [
+            ("ge2020", vec![end_after.clone(), contained.clone()]),
+            ("le2020", vec![before.clone(), contained.clone()]),
+            ("ne2020", vec![before.clone(), end_after.clone()]),
+        ];
+        for (raw, arms) in cases {
+            let filter = backend
+                .build_search_index_filter("t1", "Patient", &date_param(&[raw]))
+                .expect(raw);
+            let expected = doc! { "$or": arms.into_iter().map(expect).collect::<Vec<_>>() };
+            assert_eq!(filter, expected, "date={raw}");
+        }
+    }
+
+    /// One-condition and both-end prefixes keep the flat shape: the
+    /// conjuncts and the value condition side by side, no `$or` at all.
+    #[test]
+    fn single_branch_date_prefixes_stay_flat() {
+        let backend = backend();
+        for raw in ["gt2020", "lt2020", "sa2020", "eb2020", "2020", "ap2020"] {
+            let filter = backend
+                .build_search_index_filter("t1", "Patient", &date_param(&[raw]))
+                .expect(raw);
+            assert!(!filter.contains_key("$or"), "date={raw}: {filter:?}");
+            assert_eq!(filter.get_str("tenant_id"), Ok("t1"), "date={raw}");
+            assert_eq!(filter.get_str("resource_type"), Ok("Patient"), "date={raw}");
+            assert_eq!(filter.get_str("param_name"), Ok("date"), "date={raw}");
+        }
+    }
+
+    /// A comma list is the OR of its values' alternatives, every one a
+    /// self-contained scoped arm at the top: `ge2020,lt2019` is
+    /// `[ge-end-arm, ge-contained-arm, lt-arm]`, not an `$or` of an `$or`.
+    #[test]
+    fn comma_list_of_date_values_flattens_into_one_top_level_or() {
+        let backend = backend();
+        let filter = backend
+            .build_search_index_filter("t1", "Patient", &date_param(&["ge2020", "lt2019"]))
+            .expect("filter");
+        let arms = top_level_arms(&filter);
+        assert_eq!(arms.len(), 3, "{arms:?}");
+        for arm in &arms {
+            assert_eq!(arm.get_str("tenant_id"), Ok("t1"), "{arm:?}");
+            assert_eq!(arm.get_str("resource_type"), Ok("Patient"), "{arm:?}");
+            assert_eq!(arm.get_str("param_name"), Ok("date"), "{arm:?}");
+            assert!(!arm.contains_key("$or"), "no nested $or: {arm:?}");
+            assert!(arm.contains_key("value_date"), "{arm:?}");
+        }
+        // The same alternatives, in the same order, as the values alone.
+        let alone: Vec<Document> = ["ge2020", "lt2019"]
+            .iter()
+            .flat_map(|raw| {
+                let one = backend
+                    .build_search_index_filter("t1", "Patient", &date_param(&[raw]))
+                    .unwrap();
+                if one.contains_key("$or") {
+                    top_level_arms(&one)
+                } else {
+                    vec![one]
+                }
+            })
+            .collect();
+        assert_eq!(arms, alone);
+    }
+
+    /// A repeated parameter (`date=ge2020&date=le2021`) is still two separate
+    /// filters, one per occurrence; nothing is merged across them.
+    #[test]
+    fn repeated_date_parameters_stay_separate_filters() {
+        let backend = backend();
+        let first = backend
+            .build_search_index_filter("t1", "Patient", &date_param(&["ge2020"]))
+            .unwrap();
+        let second = backend
+            .build_search_index_filter("t1", "Patient", &date_param(&["le2021"]))
+            .unwrap();
+        assert_eq!(top_level_arms(&first).len(), 2);
+        assert_eq!(top_level_arms(&second).len(), 2);
+        assert_ne!(first, second);
+    }
+
+    /// The contained-resource search reuses the filter under its own scope:
+    /// tenant and type come off every arm, the parameter name stays.
+    #[test]
+    fn stripping_the_scope_reaches_into_date_arms() {
+        let backend = backend();
+        let mut filter = backend
+            .build_search_index_filter("", "", &date_param(&["ge2020"]))
+            .unwrap();
+        strip_index_scope(&mut filter, SearchParamType::Date);
+        for arm in top_level_arms(&filter) {
+            assert!(!arm.contains_key("tenant_id"), "{arm:?}");
+            assert!(!arm.contains_key("resource_type"), "{arm:?}");
+            assert_eq!(arm.get_str("param_name"), Ok("date"), "{arm:?}");
+        }
+    }
+
     /// A regression a partial fix could pass: dropping only `Date` from the
     /// old `matches!` would leave `Number` ANDed and this test red.
     #[test]
@@ -5334,7 +5671,7 @@ mod composite_component_filter_tests {
         let backend = backend();
         let param = code_value_quantity_param("8302-2$150");
         let per_value = backend
-            .composite_component_filters("t1", "Observation", &param, Utc::now())
+            .composite_component_filters("t1", "Observation", &param)
             .expect("valid composite filters");
         assert_eq!(per_value.len(), 1, "one composite value");
         let components = &per_value[0];
@@ -5377,7 +5714,7 @@ mod composite_component_filter_tests {
         let backend = backend();
         let param = code_value_quantity_param("8302-2$ne150");
         let per_value = backend
-            .composite_component_filters("t1", "Observation", &param, Utc::now())
+            .composite_component_filters("t1", "Observation", &param)
             .expect("valid composite filters");
         assert!(
             per_value[0][1].negated,
@@ -5427,7 +5764,7 @@ mod composite_component_filter_tests {
 
         let ne_param = code_value_quantity_param("8302-2$ne150");
         let per_value = backend
-            .composite_component_filters("t1", "Observation", &ne_param, Utc::now())
+            .composite_component_filters("t1", "Observation", &ne_param)
             .expect("valid composite filters");
         assert!(
             !per_value[0][0].negated,
@@ -5440,7 +5777,7 @@ mod composite_component_filter_tests {
 
         let gt_param = code_value_quantity_param("8302-2$gt150");
         let per_value = backend
-            .composite_component_filters("t1", "Observation", &gt_param, Utc::now())
+            .composite_component_filters("t1", "Observation", &gt_param)
             .expect("valid composite filters");
         assert!(
             !per_value[0][0].negated,
@@ -5460,7 +5797,7 @@ mod composite_component_filter_tests {
             ..code_value_quantity_param("unused")
         };
         let err = backend
-            .composite_component_filters("t1", "Observation", &param, Utc::now())
+            .composite_component_filters("t1", "Observation", &param)
             .expect_err("empty values must error");
         assert!(
             matches!(
@@ -5493,7 +5830,7 @@ mod composite_component_filter_tests {
             ],
         };
         let filters = backend
-            .composite_component_filters("t1", "Observation", &param, Utc::now())
+            .composite_component_filters("t1", "Observation", &param)
             .unwrap();
         assert_eq!(filters[0][0].filter.get_i32("composite_slot"), Ok(1));
         assert_eq!(filters[0][1].filter.get_i32("composite_slot"), Ok(2));

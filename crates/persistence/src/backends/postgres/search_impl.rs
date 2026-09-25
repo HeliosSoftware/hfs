@@ -212,7 +212,9 @@ fn fast_index_pred(
 /// `Observation?date=gt2070-01-01T00:00:00` and `Patient?birthdate=gt2070-01-01`
 /// — both zero-match, one over a 689,080-row slice — and both stay at p99
 /// 17 ms because the planner correctly estimates zero and picks the value-first
-/// index. The same latent failure exists for date if a deployment ever mixes
+/// index. (Since #1391 a date `gt` compares the end of the indexed range,
+/// `value_date_end`, and v43's `idx_search_date_end` is that value-first index
+/// for it; this measurement predates the change and should be repeated.) The same latent failure exists for date if a deployment ever mixes
 /// wildly different date ranges under one column, but it is not present here
 /// and a guard is not free.
 ///
@@ -553,17 +555,6 @@ impl SearchProvider for PostgresBackend {
     ) -> StorageResult<SearchResult> {
         reject_contained_missing(query)?;
         reject_unsupported_metadata_modifier(query)?;
-
-        // One reference instant for the whole search, its `_total` count
-        // included: `ap` date windows are measured from it (#1390).
-        let resolved;
-        let query = match query.now {
-            Some(_) => query,
-            None => {
-                resolved = query.clone().with_now(Utc::now());
-                &resolved
-            }
-        };
 
         // `_contained` search uses a dedicated path (different index columns and
         // heterogeneous result types); standard search handles `_contained=false`.
@@ -1542,7 +1533,7 @@ mod fast_path_tests {
         let pred = fast_index_pred(&q, Some(&filter_of(&q)), IndexLayout::Denormalized, false);
         assert_eq!(
             pred.as_deref(),
-            Some("param_name = 'date' AND value_date >= $3")
+            Some("param_name = 'date' AND value_date_end > $3")
         );
     }
 

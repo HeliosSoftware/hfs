@@ -554,7 +554,6 @@ where
             .map(|ts_url| ChainTerminologyExpander { ts_url });
         let options = helios_persistence::search::ChainResolveOptions {
             terminology: expander.as_ref().map(|e| e as &dyn TerminologyExpander),
-            ..Default::default()
         };
         helios_persistence::search::resolve_chains_with(
             state.storage(),

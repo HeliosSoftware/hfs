@@ -292,7 +292,7 @@ async fn test_date_precision_and_validation_suite() {
     super::date_precision_suite::sub_day_precision_and_validation(&backend, "date-precision").await;
 }
 
-/// The shared `ap` prefix tables for number, quantity and date (#1390);
+/// The shared number/quantity `ap` tables (#1390);
 /// PostgreSQL, MongoDB and Elasticsearch run the same ones.
 #[cfg(feature = "sqlite")]
 #[tokio::test]
@@ -301,30 +301,13 @@ async fn test_ap_prefix_suite() {
     super::ap_prefix_suite::ap_prefix(&backend, "ap-prefix", true).await;
 }
 
-/// `ap` in the quantity and date components of a composite (#1390);
+/// `ap` in the quantity component of a composite (#1390);
 /// PostgreSQL, MongoDB and Elasticsearch run the same tables.
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn test_ap_composite_suite() {
     let backend = super::make_sqlite_backend();
     super::ap_relations_suite::ap_composite(&backend, "ap-composite").await;
-}
-
-/// `ap` on the terminal of a chain and of `_has` is measured from the outer
-/// query's `now` (#1390); PostgreSQL runs the same table.
-#[cfg(feature = "sqlite")]
-#[tokio::test]
-async fn test_ap_chained_suite() {
-    let backend = super::make_sqlite_backend();
-    super::ap_relations_suite::ap_chained(&backend, "ap-chained").await;
-}
-
-/// `_filter` date `ap` end to end (#1390). `_filter` is SQLite-only.
-#[cfg(feature = "sqlite")]
-#[tokio::test]
-async fn test_ap_filter_date_suite() {
-    let backend = super::make_sqlite_backend();
-    super::ap_relations_suite::ap_filter_date(&backend, "ap-filter").await;
 }
 
 /// `_filter` must keep the date range and the following token bind separate.

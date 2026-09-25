@@ -42,9 +42,10 @@ db.runCommand({
         "resource_type": 1,
         "param_name": 1,
         "value_date": 1,
+        "value_date_end": 1,
         "resource_id": 1
       },
-      "name": "idx_search_date_v2",
+      "name": "idx_search_date_v3",
       "partialFilterExpression": {
         "value_date": {
           "$exists": true

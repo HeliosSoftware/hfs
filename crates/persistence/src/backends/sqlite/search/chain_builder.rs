@@ -9,7 +9,6 @@
 
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 
 use crate::error::{BackendError, StorageResult};
@@ -149,8 +148,6 @@ pub struct ChainQueryBuilder {
     config: ChainConfig,
     /// Parameter offset for SQL placeholders.
     param_offset: usize,
-    /// The instant a terminal date's `ap` window is measured from.
-    now: DateTime<Utc>,
 }
 
 impl ChainQueryBuilder {
@@ -166,7 +163,6 @@ impl ChainQueryBuilder {
             registry,
             config: ChainConfig::default(),
             param_offset: 2, // Default: after ?1 (tenant) and ?2 (resource_type)
-            now: Utc::now(),
         }
     }
 
@@ -179,13 +175,6 @@ impl ChainQueryBuilder {
     /// Sets the parameter offset for SQL placeholders.
     pub fn with_param_offset(mut self, offset: usize) -> Self {
         self.param_offset = offset;
-        self
-    }
-
-    /// Measures terminal `ap` date windows from `now` rather than from the
-    /// time the builder was created.
-    pub fn with_now(mut self, now: DateTime<Utc>) -> Self {
-        self.now = now;
         self
     }
 
@@ -467,9 +456,7 @@ impl ChainQueryBuilder {
                 SqlParam::String(format!("%{}%", value.value)),
             ),
             SearchParamType::Date => {
-                // For date, use range comparison based on prefix
-                let date_col = format!("{}.value_date", alias);
-                build_date_condition(&date_col, value, param_num, self.now)
+                return Ok(build_date_condition(&alias, value, param_num));
             }
             SearchParamType::Number => {
                 return Ok(build_number_condition(&alias, value, param_num));
@@ -604,8 +591,7 @@ impl ChainQueryBuilder {
                 Arc::clone(&self.registry),
             )
             .with_config(self.config.clone())
-            .with_param_offset(param_num - 1)
-            .with_now(self.now);
+            .with_param_offset(param_num - 1);
 
             let (inner_sql, inner_params) =
                 inner_builder.build_reverse_chain_recursive(inner, depth + 1, param_num)?;
@@ -665,8 +651,7 @@ impl ChainQueryBuilder {
                 SqlParam::String(format!("%{}%", value.value)),
             ),
             SearchParamType::Date => {
-                let date_col = format!("{}.value_date", alias);
-                build_date_condition(&date_col, value, param_num, self.now)
+                return Ok(build_date_condition(&alias, value, param_num));
             }
             SearchParamType::Number => {
                 return Ok(build_number_condition(&alias, value, param_num));
@@ -688,23 +673,27 @@ impl ChainQueryBuilder {
     }
 }
 
-/// Builds a date comparison condition.
+/// The terminal `date` comparison, against the range `{alias}.value_date` to
+/// `{alias}.value_date_end` (#1391) — the comparison the unchained date search
+/// makes.
+///
+/// Binds one parameter per bound (up to three), numbered `?N` from
+/// `param_num` with no gaps, or none for a value that is not a date — which
+/// the search gate rejects before a chain is ever built — whose condition then
+/// matches nothing.
 fn build_date_condition(
-    column: &str,
+    alias: &str,
     value: &SearchValue,
     param_num: usize,
-    now: DateTime<Utc>,
-) -> (String, SqlParam) {
-    // Matches nothing, still binding `?param_num`, for a value that is not a
-    // date — which the search gate rejects before a chain is ever built.
-    let (sql, bound) = super::parameter_handlers::date::date_condition_or_nothing(
-        column,
+) -> (String, Vec<SqlParam>) {
+    let (sql, binds) = super::parameter_handlers::date::date_range_condition_or_nothing(
+        &format!("{alias}.value_date"),
+        &format!("{alias}.value_date_end"),
         value.prefix,
         &value.value,
         param_num,
-        now,
     );
-    (sql, SqlParam::String(bound))
+    (sql, binds.into_iter().map(SqlParam::String).collect())
 }
 
 /// The terminal `token` comparison, against `{alias}.value_token_*`.
@@ -764,9 +753,9 @@ fn build_token_condition(alias: &str, value: &SearchValue, param_num: usize) -> 
 /// Delegates to [`NumberHandler`](super::parameter_handlers::NumberHandler),
 /// the unchained `number` search's handler, so a chained number means what the
 /// unchained one does: the implicit-precision range for `eq`/`ne` (`100` is
-/// `[99.5, 100.5)`), the exact value for the comparators, for `ap` the shared
-/// window as a bound `BETWEEN` (in order for a negative value too), and
-/// `1 = 0` for a value that is not a number.
+/// `[99.5, 100.5)`), the exact value for the comparators, for `ap` a bound
+/// `BETWEEN` whose margin is taken from the magnitude (so a negative value has
+/// its bounds in order), and `1 = 0` for a value that is not a number.
 ///
 /// This used to be its own operator table. Its `ap` arm wrote both bounds into
 /// the SQL text and still returned a bind, so rusqlite refused the statement
@@ -1088,27 +1077,64 @@ mod date_condition_tests {
     use super::*;
     use crate::types::SearchPrefix;
 
-    /// #456: chained date terminals use the precision-aware normalized
-    /// comparison, not the raw text `=` this used to emit.
+    fn strings(params: &[SqlParam]) -> Vec<&str> {
+        params
+            .iter()
+            .map(|param| match param {
+                SqlParam::String(s) => s.as_str(),
+                other => panic!("expected a string param, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// #456, #1391: a chained date terminal compares the stored range the
+    /// way the unchained date search does, not the raw text `=` it once
+    /// emitted.
     #[test]
-    fn chained_dates_are_precision_aware() {
+    fn chained_dates_compare_the_stored_range() {
         let value = SearchValue::new(SearchPrefix::Eq, "1995-10-02");
-        let (sql, param) = build_date_condition("t2.value_date", &value, 7, Utc::now());
-        assert_eq!(
-            sql,
-            "(datetime(t2.value_date) >= datetime(?7) AND datetime(t2.value_date) < datetime(?7, '+1 day'))"
+        let (sql, params) = build_date_condition("t2", &value, 7);
+        assert!(
+            // The implied `end > start bound` comes first, so the end index
+            // can be sought (#1391).
+            sql.starts_with(
+                "(t2.value_date_end > ?7 AND strftime('%Y-%m-%d %H:%M:%f', CASE WHEN instr(t2.value_date, '.')"
+            ),
+            "{sql}"
         );
-        match param {
-            SqlParam::String(s) => assert_eq!(s, "1995-10-02T00:00:00"),
-            _ => panic!("expected string param"),
-        }
+        assert!(
+            sql.ends_with(") >= ?7 AND t2.value_date_end <= ?8)"),
+            "{sql}"
+        );
+        assert_eq!(
+            strings(&params),
+            ["1995-10-02 00:00:00.000", "1995-10-03 00:00:00.000"]
+        );
+    }
+
+    /// `ge` is two alternatives over three bounds, numbered without gaps.
+    #[test]
+    fn chained_ge_binds_every_bound_in_order() {
+        let value = SearchValue::new(SearchPrefix::Ge, "2016-01-23T13:07:42-04:00");
+        let (sql, params) = build_date_condition("t2", &value, 3);
+        assert!(sql.contains("t2.value_date_end > ?3) OR ("), "{sql}");
+        assert!(sql.contains(">= ?4 AND t2.value_date_end <= ?5))"), "{sql}");
+        assert_eq!(
+            strings(&params),
+            [
+                "2016-01-23 17:07:43.000",
+                "2016-01-23 17:07:42.000",
+                "2016-01-23 17:07:43.000"
+            ]
+        );
     }
 
     #[test]
-    fn chained_full_precision_is_equality() {
-        let value = SearchValue::new(SearchPrefix::Eq, "2016-01-23T13:07:42-04:00");
-        let (sql, _) = build_date_condition("t2.value_date", &value, 3, Utc::now());
-        assert_eq!(sql, "datetime(t2.value_date) = datetime(?3)");
+    fn a_chained_value_that_is_not_a_date_matches_nothing() {
+        let value = SearchValue::new(SearchPrefix::Eq, "2024-02-30");
+        let (sql, params) = build_date_condition("t2", &value, 3);
+        assert_eq!(sql, "1 = 0");
+        assert!(params.is_empty());
     }
 }
 
@@ -1180,8 +1206,6 @@ mod numeric_condition_tests {
                 "(si1.value_number BETWEEN ?3 AND ?4)",
                 &[-110.0, -90.0],
             ),
-            // Zero: the window never narrows below half the precision (#1390).
-            ("ap0", "(si1.value_number BETWEEN ?3 AND ?4)", &[-0.5, 0.5]),
         ];
         for (value, predicate, binds) in cases {
             let (sql, params) = build_number_condition("si1", &SearchValue::parse(value), 3);

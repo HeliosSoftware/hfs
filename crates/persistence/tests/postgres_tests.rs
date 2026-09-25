@@ -73,15 +73,20 @@ mod date_precision_suite;
 #[path = "search/date_minute_index_suite.rs"]
 mod date_minute_index_suite;
 
-/// The backend-agnostic `ap` prefix suite for number, quantity and date
+/// The backend-agnostic `ap` prefix suite for number and quantity
 /// (#1390). Same `#[path]` arrangement.
 #[path = "search/ap_prefix_suite.rs"]
 mod ap_prefix_suite;
 
-/// The backend-agnostic `ap` suite for composites, chains and `_filter`
+/// The backend-agnostic `ap` suite for quantity composites
 /// (#1390). Same `#[path]` arrangement.
 #[path = "search/ap_relations_suite.rs"]
 mod ap_relations_suite;
+
+/// The backend-agnostic suite for Period and Timing range targets (#1391).
+/// Same `#[path]` arrangement.
+#[path = "search/date_period_suite.rs"]
+mod date_period_suite;
 
 /// The backend-agnostic suite for exponent-form number and quantity search
 /// values (#1337). Same `#[path]` arrangement.
@@ -628,8 +633,13 @@ mod query_builder_tests {
         assert!(result.is_some());
         let fragment = result.unwrap();
         assert!(fragment.sql.contains("value_date"));
-        // gt now matches strictly after the day → value_date >= (next day).
-        assert!(fragment.sql.contains(">= $"));
+        // gt compares the end of the stored range (#1391): it must run past
+        // the end of the searched day.
+        assert!(
+            fragment.sql.contains("value_date_end > $"),
+            "{}",
+            fragment.sql
+        );
     }
 
     #[test]
@@ -27292,11 +27302,12 @@ mod postgres_integration {
             "birthdate=ge1990-06-06&birthdate=le1990-06-06"
         );
 
-        // The repeat is an intersection of *resources*, not of ranges. An
-        // Encounter period carries two date values, so its start can satisfy one
-        // arm and its end the other; the second and third Encounters fail one arm
-        // each, so a fold that read the two occurrences as one window — or that
-        // matched both arms against the same value — would return them.
+        // The repeat is an intersection of *resources*, each arm decided against
+        // the Encounter's whole period `[start, end)` (#1391): `ge` holds when
+        // the period reaches past the day searched, `le` when it starts before
+        // it. The first period spans both days and satisfies each arm; the
+        // second starts after the `le` day and the third ends before the `ge`
+        // one, so a fold that dropped either arm would return one of them.
         let mut encounters = Vec::new();
         for (label, start, end) in [
             ("one arm each", "2019-01-01", "2021-06-01"),
@@ -27545,6 +27556,16 @@ mod postgres_integration {
         .await;
     }
 
+    /// #1391: a Period was indexed as two unrelated points, so `eq`/`ap`
+    /// over-matched, `sa`/`eb` could match on the wrong end and an open end
+    /// was an instant. It is one `[value_date, value_date_end)` range now.
+    #[tokio::test]
+    async fn postgres_integration_date_period_targets_are_ranges() {
+        let backend = create_backend().await;
+        super::date_period_suite::period_targets_are_ranges(&backend, &unique_base("date_period"))
+            .await;
+    }
+
     /// #1336: a repeated parameter under `_contained` is a conjunction on one
     /// contained resource.
     #[tokio::test]
@@ -27618,26 +27639,18 @@ mod postgres_integration {
         .await;
     }
 
-    /// #1390: one `ap` window per parameter type, shared by every backend.
+    /// #1390: one number/quantity `ap` window, shared by every backend.
     #[tokio::test]
     async fn postgres_integration_ap_prefix_suite() {
         let backend = create_backend().await;
         super::ap_prefix_suite::ap_prefix(&backend, &unique_base("ap_prefix"), true).await;
     }
 
-    /// #1390: `ap` in the quantity and date components of a composite.
+    /// #1390: `ap` in the quantity component of a composite.
     #[tokio::test]
     async fn postgres_integration_ap_composite() {
         let backend = create_backend().await;
         super::ap_relations_suite::ap_composite(&backend, &unique_base("ap_composite")).await;
-    }
-
-    /// #1390: `ap` on the terminal of a chain and of `_has` is measured from
-    /// the outer query's `now`.
-    #[tokio::test]
-    async fn postgres_integration_ap_chained() {
-        let backend = create_backend().await;
-        super::ap_relations_suite::ap_chained(&backend, &unique_base("ap_chained")).await;
     }
 
     /// #1379: `gender=<system>|female` never matched a `code` element.

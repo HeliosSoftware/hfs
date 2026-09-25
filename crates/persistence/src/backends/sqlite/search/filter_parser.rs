@@ -27,8 +27,6 @@
 //! _filter=(status eq active or status eq pending) and category eq urgent
 //! ```
 
-use chrono::{DateTime, Utc};
-
 use super::query_builder::{SqlFragment, SqlParam};
 
 /// Comparison operators supported by _filter.
@@ -447,25 +445,12 @@ impl<'a> FilterParser<'a> {
 /// SQL generator for filter expressions.
 pub struct FilterSqlGenerator {
     param_offset: usize,
-    /// The instant a date comparison's `ap` window is measured from.
-    now: DateTime<Utc>,
 }
 
 impl FilterSqlGenerator {
-    /// Creates a new SQL generator with the given parameter offset, measuring
-    /// `ap` date windows from the current time.
+    /// Creates a new SQL generator with the given parameter offset.
     pub fn new(param_offset: usize) -> Self {
-        Self {
-            param_offset,
-            now: Utc::now(),
-        }
-    }
-
-    /// Measures `ap` date windows from `now`: the search's instant, so a
-    /// `_filter` date agrees with the query's other date parameters.
-    pub fn with_now(mut self, now: DateTime<Utc>) -> Self {
-        self.now = now;
-        self
+        Self { param_offset }
     }
 
     /// Generates SQL for a filter expression.
@@ -494,11 +479,20 @@ impl FilterSqlGenerator {
 
     /// Generates SQL for a comparison expression.
     fn generate_comparison(&mut self, param: &str, op: FilterOp, value: &str) -> SqlFragment {
-        self.param_offset += 1;
-        let param_num = self.param_offset;
+        let param_num = self.param_offset + 1;
 
-        // Determine the column and condition based on parameter and operator
-        let (_column, condition, sql_value) = self.build_condition(param, op, value, param_num);
+        // Determine the column and condition based on parameter and operator.
+        // A date binds one value per bound of its range comparison; every
+        // other comparison binds exactly one.
+        let (condition, binds) = match self.build_date_condition(param, op, value, param_num) {
+            Some(date) => date,
+            None => {
+                let (_column, condition, sql_value) =
+                    self.build_condition(param, op, value, param_num);
+                (condition, vec![sql_value])
+            }
+        };
+        self.param_offset += binds.len();
 
         // `tenant_id = ?1` is not optional — see the sibling non-`_filter` path
         // in `query_builder::build_parameter_condition`, which has always
@@ -514,7 +508,49 @@ impl FilterSqlGenerator {
                 "resource_key IN (SELECT resource_key FROM search_index WHERE tenant_id = ?1 AND param_name = '{}' AND {})",
                 param, condition
             ),
-            vec![SqlParam::string(&sql_value)],
+            binds.into_iter().map(SqlParam::String).collect(),
+        )
+    }
+
+    /// The comparison for a date parameter: the FHIR range comparison against
+    /// the stored `[value_date, value_date_end)` (#456, #1391), as the
+    /// unchained date search makes it. `None` when `param` is not a date or
+    /// `op` is not a date prefix; the generic text operators then apply.
+    fn build_date_condition(
+        &self,
+        param: &str,
+        op: FilterOp,
+        value: &str,
+        param_num: usize,
+    ) -> Option<(String, Vec<String>)> {
+        use crate::types::SearchPrefix;
+
+        if self.infer_column(param) != "value_date" {
+            return None;
+        }
+        let prefix = match op {
+            FilterOp::Eq => SearchPrefix::Eq,
+            FilterOp::Ne => SearchPrefix::Ne,
+            FilterOp::Gt => SearchPrefix::Gt,
+            FilterOp::Sa => SearchPrefix::Sa,
+            FilterOp::Lt => SearchPrefix::Lt,
+            FilterOp::Eb => SearchPrefix::Eb,
+            FilterOp::Ge => SearchPrefix::Ge,
+            FilterOp::Le => SearchPrefix::Le,
+            FilterOp::Ap => SearchPrefix::Ap,
+            _ => return None,
+        };
+        // A `_filter` date literal is not seen by the search gate; one that is
+        // not a date matches nothing rather than whatever `datetime()` would
+        // have made of it.
+        Some(
+            super::parameter_handlers::date::date_range_condition_or_nothing(
+                "value_date",
+                "value_date_end",
+                prefix,
+                value,
+                param_num,
+            ),
         )
     }
 
@@ -528,33 +564,6 @@ impl FilterSqlGenerator {
     ) -> (&'static str, String, String) {
         // Infer the likely column based on parameter name patterns
         let column = self.infer_column(param);
-
-        // Dates need precision-aware, normalized comparison (#456); the
-        // generic text operators below mis-order mixed-precision values.
-        if column == "value_date" {
-            use crate::types::SearchPrefix;
-            let prefix = match op {
-                FilterOp::Eq => Some(SearchPrefix::Eq),
-                FilterOp::Ne => Some(SearchPrefix::Ne),
-                FilterOp::Gt => Some(SearchPrefix::Gt),
-                FilterOp::Sa => Some(SearchPrefix::Sa),
-                FilterOp::Lt => Some(SearchPrefix::Lt),
-                FilterOp::Eb => Some(SearchPrefix::Eb),
-                FilterOp::Ge => Some(SearchPrefix::Ge),
-                FilterOp::Le => Some(SearchPrefix::Le),
-                FilterOp::Ap => Some(SearchPrefix::Ap),
-                _ => None,
-            };
-            if let Some(prefix) = prefix {
-                // A `_filter` date literal is not seen by the search gate; one
-                // that is not a date matches nothing rather than whatever
-                // `datetime()` would have made of it.
-                let (sql, bound) = super::parameter_handlers::date::date_condition_or_nothing(
-                    column, prefix, value, param_num, self.now,
-                );
-                return (column, sql, bound);
-            }
-        }
 
         match op {
             FilterOp::Eq => (
@@ -836,69 +845,64 @@ mod tests {
 mod date_filter_tests {
     use super::*;
 
-    /// #456: `_filter` date comparisons use the precision-aware normalized
-    /// path, not raw text operators.
+    /// #456, #1391: `_filter` date comparisons compare the stored range, not
+    /// raw text.
     #[test]
-    fn filter_dates_use_normalized_precision_ranges() {
+    fn filter_dates_compare_the_stored_range() {
         let expr = FilterParser::parse("birthdate eq 1995-10-02").unwrap();
         let frag = FilterSqlGenerator::new(1).generate(&expr);
         assert!(
-            frag.sql.contains("datetime(value_date) >= datetime(?2)"),
+            frag.sql.contains(">= ?2 AND value_date_end <= ?3)"),
             "{}",
             frag.sql
         );
-        assert!(frag.sql.contains("'+1 day'"), "{}", frag.sql);
+        assert_eq!(frag.params.len(), 2);
     }
 
     #[test]
     fn filter_date_bounds_honor_the_named_day() {
+        let bound = |sql: &SqlFragment, i: usize| match &sql.params[i] {
+            SqlParam::String(s) => s.clone(),
+            other => panic!("expected a string param, got {other:?}"),
+        };
         let ge = FilterSqlGenerator::new(1)
             .generate(&FilterParser::parse("birthdate ge 1995-10-02").unwrap());
-        assert!(
-            ge.sql.contains("datetime(value_date) >= datetime(?2)"),
-            "{}",
-            ge.sql
-        );
+        assert!(ge.sql.contains("value_date_end > ?2"), "{}", ge.sql);
+        assert_eq!(bound(&ge, 0), "1995-10-03 00:00:00.000");
         let le = FilterSqlGenerator::new(1)
             .generate(&FilterParser::parse("birthdate le 1995-10-02").unwrap());
-        assert!(le.sql.contains("'+1 day'"), "{}", le.sql);
+        assert!(le.sql.contains(" < ?2) OR ("), "{}", le.sql);
+        assert_eq!(bound(&le, 0), "1995-10-02 00:00:00.000");
         let sa = FilterSqlGenerator::new(1)
             .generate(&FilterParser::parse("birthdate sa 1995-10-02").unwrap());
-        assert!(sa.sql.contains("'+1 day'"), "{}", sa.sql);
+        assert!(sa.sql.ends_with(" >= ?2))"), "{}", sa.sql);
+        assert_eq!(bound(&sa, 0), "1995-10-03 00:00:00.000");
     }
 
-    /// #1390: a `_filter` date `ap` is the shared window, measured from the
-    /// generator's `now`, and still binds one parameter.
+    /// A date comparison binds several values, and the numbering after it
+    /// continues without a gap.
     #[test]
-    fn filter_date_ap_is_the_shared_window() {
-        let now = "2026-01-01T00:00:00Z".parse().unwrap();
+    fn filter_numbering_continues_after_a_date() {
         let frag = FilterSqlGenerator::new(1)
-            .with_now(now)
-            .generate(&FilterParser::parse("birthdate ap 2016").unwrap());
-        // 2016 ends 3287 days before `now`: 328.7 days either side.
-        assert!(
-            frag.sql.contains("?2, '-28399680.000 seconds'"),
-            "{}",
-            frag.sql
-        );
-        assert!(
-            frag.sql.contains("?2, '+60022080.000 seconds'"),
-            "{}",
-            frag.sql
-        );
-        assert_eq!(frag.params.len(), 1);
+            .generate(&FilterParser::parse("birthdate ge 1995-10-02 and name eq Smith").unwrap());
+        assert_eq!(frag.params.len(), 4);
+        assert!(frag.sql.contains("value_string = ?5"), "{}", frag.sql);
     }
 
+    /// #1392: a two-digit fraction denotes a hundredth of a second, not a
+    /// millisecond. Since #1391 the bounds are the searched range itself
+    /// rather than a SQL modifier, so the one after it still follows without
+    /// a gap.
     #[test]
     fn short_fraction_date_keeps_following_filter_bind() {
         let expr =
             FilterParser::parse("date eq 2024-01-01T10:00:00.55Z and status eq completed").unwrap();
         let frag = FilterSqlGenerator::new(1).generate(&expr);
-        assert_eq!(frag.params.len(), 2);
-        assert!(frag.sql.contains("'+0.01 seconds'"), "{}", frag.sql);
-        assert!(frag.sql.contains("value_token_code = ?3"), "{}", frag.sql);
-        assert!(matches!(&frag.params[0], SqlParam::String(s) if s == "2024-01-01T10:00:00.550Z"));
-        assert!(matches!(&frag.params[1], SqlParam::String(s) if s == "completed"));
+        assert_eq!(frag.params.len(), 3);
+        assert!(matches!(&frag.params[0], SqlParam::String(s) if s == "2024-01-01 10:00:00.550"));
+        assert!(matches!(&frag.params[1], SqlParam::String(s) if s == "2024-01-01 10:00:00.560"));
+        assert!(matches!(&frag.params[2], SqlParam::String(s) if s == "completed"));
+        assert!(frag.sql.contains("value_token_code = ?4"), "{}", frag.sql);
     }
 
     /// Non-date columns keep the plain text operators.

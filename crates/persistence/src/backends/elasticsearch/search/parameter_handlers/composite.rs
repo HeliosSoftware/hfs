@@ -1,6 +1,5 @@
 //! Composite parameter handler for Elasticsearch.
 
-use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
 use crate::search::FhirNumberValue;
@@ -13,9 +12,7 @@ use crate::types::{SearchParamType, SearchParameter};
 /// object under `search_params.composite` with the component values inline (as
 /// arrays), so a single nested query with one condition per component enforces
 /// same-instance matching. The value format is `value1$value2$...`.
-///
-/// `now` is the instant an `ap` date component is measured from.
-pub fn build_clause(param: &SearchParameter, value: &str, now: DateTime<Utc>) -> Option<Value> {
+pub fn build_clause(param: &SearchParameter, value: &str) -> Option<Value> {
     let name = &param.name;
     let parts: Vec<&str> = value.split('$').collect();
 
@@ -32,7 +29,7 @@ pub fn build_clause(param: &SearchParameter, value: &str, now: DateTime<Utc>) ->
     }
 
     for (part, component) in parts.iter().zip(param.components.iter()) {
-        match component_conditions(component.param_type, part, now) {
+        match component_conditions(component.param_type, part) {
             Some(conds) => must.extend(conds),
             None => return Some(nested(never_match(must))),
         }
@@ -58,11 +55,7 @@ fn never_match(mut must: Vec<Value>) -> Vec<Value> {
 }
 
 /// Builds the ES condition(s) for a single component value.
-fn component_conditions(
-    param_type: SearchParamType,
-    part: &str,
-    now: DateTime<Utc>,
-) -> Option<Vec<Value>> {
+fn component_conditions(param_type: SearchParamType, part: &str) -> Option<Vec<Value>> {
     let field = |f: &str| format!("search_params.composite.{}", f);
     match param_type {
         SearchParamType::Token => {
@@ -117,7 +110,7 @@ fn component_conditions(
             let (op, val) = split_prefix(part);
             let prefix = op.parse().unwrap_or_default();
             Some(vec![
-                match super::date::field_range(&field("date"), val, prefix, now)? {
+                match super::date::field_range(&field("date"), val, prefix)? {
                     super::date::DateRange::Within(range) => range,
                     super::date::DateRange::Outside(range) => {
                         json!({ "bool": { "must_not": [range] } })
@@ -180,12 +173,6 @@ fn numeric_condition(field: &str, op: &str, number: &FhirNumberValue) -> Value {
 mod tests {
     use super::*;
     use crate::types::{CompositeSearchComponent, SearchValue};
-    use chrono::TimeZone;
-
-    fn now() -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()
-    }
-
     fn composite_param(components: Vec<CompositeSearchComponent>) -> SearchParameter {
         SearchParameter {
             name: "code-value-quantity".to_string(),
@@ -199,7 +186,7 @@ mod tests {
 
     #[test]
     fn name_only_when_no_components() {
-        let clause = build_clause(&composite_param(vec![]), "8867-4$120", now()).unwrap();
+        let clause = build_clause(&composite_param(vec![]), "8867-4$120").unwrap();
         let s = clause.to_string();
         assert!(s.contains("search_params.composite.name"));
         assert!(!s.contains("token_code"));
@@ -217,7 +204,7 @@ mod tests {
                 param_name: "value-quantity".to_string(),
             },
         ]);
-        let clause = build_clause(&param, "http://loinc.org|8480-6$ge100", now()).unwrap();
+        let clause = build_clause(&param, "http://loinc.org|8480-6$ge100").unwrap();
         let s = clause.to_string();
         assert!(s.contains("token_system"));
         assert!(s.contains("token_code"));
@@ -226,7 +213,7 @@ mod tests {
         // The named system, or the marker of a `code` component (#1379).
         assert!(s.contains(crate::search::IMPLICIT_TOKEN_SYSTEM));
         // `system|` names the codes OF a system: no marker.
-        let clause = build_clause(&param, "http://loinc.org|$ge100", now()).unwrap();
+        let clause = build_clause(&param, "http://loinc.org|$ge100").unwrap();
         assert!(
             !clause
                 .to_string()
@@ -249,14 +236,14 @@ mod tests {
 
     #[test]
     fn date_component_is_a_precision_range() {
-        let clause = build_clause(&code_date_param(), "8867-4$ge2013-04-05T09:20", now()).unwrap();
+        let clause = build_clause(&code_date_param(), "8867-4$ge2013-04-05T09:20").unwrap();
         let must = &clause["nested"]["query"]["bool"]["must"];
         assert_eq!(
             must[2]["range"]["search_params.composite.date"],
             json!({ "gte": "2013-04-05T09:20:00.000Z" })
         );
 
-        let clause = build_clause(&code_date_param(), "8867-4$2024-01-15", now()).unwrap();
+        let clause = build_clause(&code_date_param(), "8867-4$2024-01-15").unwrap();
         let must = &clause["nested"]["query"]["bool"]["must"];
         assert_eq!(
             must[2]["range"]["search_params.composite.date"],
@@ -282,7 +269,7 @@ mod tests {
     #[test]
     fn quantity_component_uses_the_shared_ranges() {
         let value_range = |value: &str| {
-            let clause = build_clause(&code_quantity_param(), value, now()).unwrap();
+            let clause = build_clause(&code_quantity_param(), value).unwrap();
             clause["nested"]["query"]["bool"]["must"][2].clone()
         };
         assert_eq!(
@@ -303,20 +290,9 @@ mod tests {
 
     /// An `ap` date component is the shared window, as for a standalone date.
     #[test]
-    fn date_component_ap_is_the_shared_window() {
-        let clause = build_clause(&code_date_param(), "8867-4$ap2026", now()).unwrap();
-        let must = &clause["nested"]["query"]["bool"]["must"];
-        // A range that holds `now` is exactly `eq`.
-        assert_eq!(
-            must[2]["range"]["search_params.composite.date"],
-            json!({ "gte": "2026-01-01", "lt": "2027-01-01" })
-        );
-    }
-
-    #[test]
     fn date_component_that_is_not_a_date_never_matches() {
         for value in ["8867-4$2024-02-30", "8867-4$gtnot-a-date", "8867-4$"] {
-            let clause = build_clause(&code_date_param(), value, now()).unwrap();
+            let clause = build_clause(&code_date_param(), value).unwrap();
             assert!(clause.to_string().contains("group_id"), "{value}");
         }
     }
@@ -327,7 +303,7 @@ mod tests {
             param_type: SearchParamType::Token,
             param_name: "code".to_string(),
         }]);
-        let clause = build_clause(&param, "a$b", now()).unwrap();
+        let clause = build_clause(&param, "a$b").unwrap();
         assert!(clause.to_string().contains("group_id"));
     }
 }

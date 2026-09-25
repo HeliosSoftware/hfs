@@ -2812,6 +2812,7 @@ impl MongoBackend {
             IndexValue::Date {
                 value: date,
                 precision,
+                end,
             } => {
                 let normalized = match normalize_date_for_mongo(date) {
                     Some(v) => v,
@@ -2824,7 +2825,26 @@ impl MongoBackend {
                         return None;
                     }
                 };
+                // #1391: the row stores the range `[value_date, value_date_end)`
+                // a range-aware search compares against. The shared reading
+                // when the start is in the FHIR grammar; otherwise the end is
+                // derived from the lenient start read above.
+                let resolution = crate::search::StorageResolution::Millis;
+                let range_end = crate::search::indexed_range(&value.value, resolution)
+                    .map(|(_, end)| end)
+                    .or_else(|| {
+                        crate::search::indexed_end(normalized, *precision, end, resolution)
+                    });
+                let Some(range_end) = range_end else {
+                    tracing::warn!(
+                        "Skipping date index value '{}' for parameter '{}': its Period end is not a date",
+                        date,
+                        value.param_name
+                    );
+                    return None;
+                };
                 doc.insert("value_date", chrono_to_bson(normalized));
+                doc.insert("value_date_end", chrono_to_bson(range_end));
                 doc.insert("value_date_precision", precision.to_string());
             }
             IndexValue::Number(v) => {
@@ -4201,9 +4221,6 @@ impl MongoBackend {
         }
 
         let typed_params = self.build_search_parameters(tenant, resource_type, &parsed_params)?;
-        // One instant for every filter of this match, so an `ap` date window
-        // does not move between the driver probe and the checks (#1390).
-        let now = Utc::now();
         // Result-shaping names (`_format`, …) are not criteria; with nothing
         // left, an empty filter would match the whole type.
         if typed_params.is_empty() {
@@ -4215,7 +4232,6 @@ impl MongoBackend {
             resource_type,
             &typed_params,
             false,
-            now,
             Some(&mut *session),
         )
         .await?;
@@ -4267,14 +4283,13 @@ impl MongoBackend {
             for (i, param) in index_params.iter().enumerate() {
                 let count = if param.param_type == SearchParamType::Composite {
                     match self
-                        .composite_driver_probe_at(
+                        .composite_driver_probe(
                             &search_index,
                             tenant_id,
                             resource_type,
                             param,
                             PROBE_LIMIT as u64,
                             Some(&mut *session),
-                            now,
                         )
                         .await?
                     {
@@ -4286,8 +4301,7 @@ impl MongoBackend {
                         }
                     }
                 } else {
-                    let filter =
-                        self.build_search_index_filter_at(tenant_id, resource_type, param, now)?;
+                    let filter = self.build_search_index_filter(tenant_id, resource_type, param)?;
                     let pipeline = vec![
                         doc! { "$match": filter },
                         doc! { "$limit": PROBE_LIMIT },
@@ -4325,12 +4339,7 @@ impl MongoBackend {
         let driver_filter = if let Some((filter, _)) = composite_probes.remove(&driver_idx) {
             filter
         } else {
-            self.build_search_index_filter_at(
-                tenant_id,
-                resource_type,
-                index_params[driver_idx],
-                now,
-            )?
+            self.build_search_index_filter(tenant_id, resource_type, index_params[driver_idx])?
         };
 
         let mut last_index_id: Option<Bson> = None;
@@ -4390,14 +4399,13 @@ impl MongoBackend {
                 // still needs the grouped pair check (#1206).
                 if param.param_type == SearchParamType::Composite {
                     let passing = self
-                        .composite_pair_check_at(
+                        .composite_pair_check(
                             &search_index,
                             tenant_id,
                             resource_type,
                             param,
                             &candidate_ids,
                             Some(&mut *session),
-                            now,
                         )
                         .await?;
                     candidate_ids.retain(|id| passing.contains(id));
@@ -4407,7 +4415,7 @@ impl MongoBackend {
                     continue;
                 }
                 let param_filter =
-                    self.build_search_index_filter_at(tenant_id, resource_type, param, now)?;
+                    self.build_search_index_filter(tenant_id, resource_type, param)?;
                 let bounded_filter = doc! {
                     "$and": [
                         param_filter,
@@ -5400,6 +5408,74 @@ mod index_date_tests {
             );
             assert_eq!(normalize_date_for_mongo(value), None, "{value:?}");
         }
+    }
+
+    fn date_document(value: IndexValue) -> Option<Document> {
+        let backend = MongoBackend::new(super::super::backend::MongoBackendConfig::default())
+            .expect("backend without a connection");
+        let extracted = ExtractedValue::new(
+            "date",
+            "http://hl7.org/fhir/SearchParameter/clinical-date",
+            crate::types::SearchParamType::Date,
+            value,
+        );
+        backend.build_search_index_document("t1", "Encounter", "e1", &extracted)
+    }
+
+    fn stored(doc: &Document, field: &str) -> String {
+        bson_to_chrono(doc.get_datetime(field).expect(field)).to_rfc3339()
+    }
+
+    /// #1391: every date row stores the range it covers — a point to the end
+    /// of its precision, a `Period` to the end of its own `end`, and an open
+    /// side at the edge of the supported years.
+    #[test]
+    fn date_rows_store_the_range_they_cover() {
+        let point = date_document(IndexValue::date("2020-06")).expect("point");
+        assert_eq!(stored(&point, "value_date"), "2020-06-01T00:00:00+00:00");
+        assert_eq!(
+            stored(&point, "value_date_end"),
+            "2020-07-01T00:00:00+00:00"
+        );
+
+        let period = date_document(
+            IndexValue::date_range(Some("2019-06-15"), Some("2020-03")).expect("period"),
+        )
+        .expect("period row");
+        assert_eq!(stored(&period, "value_date"), "2019-06-15T00:00:00+00:00");
+        assert_eq!(
+            stored(&period, "value_date_end"),
+            "2020-04-01T00:00:00+00:00"
+        );
+
+        let open_end = date_document(IndexValue::date_range(Some("2019"), None).expect("open"))
+            .expect("open-ended row");
+        assert_eq!(stored(&open_end, "value_date"), "2019-01-01T00:00:00+00:00");
+        assert_eq!(
+            *open_end.get_datetime("value_date_end").unwrap(),
+            chrono_to_bson(crate::search::open_end(
+                crate::search::StorageResolution::Millis
+            ))
+        );
+
+        let open_start = date_document(IndexValue::date_range(None, Some("2020")).expect("open"))
+            .expect("open-started row");
+        assert_eq!(
+            *open_start.get_datetime("value_date").unwrap(),
+            chrono_to_bson(crate::search::open_start())
+        );
+        assert_eq!(
+            stored(&open_start, "value_date_end"),
+            "2021-01-01T00:00:00+00:00"
+        );
+    }
+
+    /// A `Period` whose `end` is not a date is skipped whole, like any other
+    /// unparseable date: indexing it as open would over-match.
+    #[test]
+    fn a_period_with_a_bad_end_is_skipped() {
+        let bad = IndexValue::date_range(Some("2020-01-01"), Some("not-a-date")).expect("period");
+        assert!(date_document(bad).is_none());
     }
 
     /// What the strict grammar rejects still goes through the lenient reading,

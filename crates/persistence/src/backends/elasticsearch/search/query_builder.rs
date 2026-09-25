@@ -2,7 +2,6 @@
 //!
 //! Translates FHIR `SearchQuery` into Elasticsearch Query DSL JSON.
 
-use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
 use crate::types::{
@@ -114,12 +113,9 @@ impl<'a> EsQueryBuilder<'a> {
             crate::types::ContainedMode::Both => {}
         }
 
-        // One instant for every `ap` date window in the query (#1390).
-        let now = query.reference_now();
-
         // Process each search parameter
         for param in &query.parameters {
-            if let Some(clause) = self.build_parameter_clause(param, now) {
+            if let Some(clause) = self.build_parameter_clause(param) {
                 must_clauses.push(clause);
             }
         }
@@ -250,9 +246,8 @@ impl<'a> EsQueryBuilder<'a> {
         }))
     }
 
-    /// Builds a clause for a single search parameter. `now` is the instant
-    /// `ap` date windows are measured from.
-    fn build_parameter_clause(&self, param: &SearchParameter, now: DateTime<Utc>) -> Option<Value> {
+    /// Builds a clause for a single search parameter.
+    fn build_parameter_clause(&self, param: &SearchParameter) -> Option<Value> {
         // Presence is independent of the parameter's ordinary value syntax.
         // Resolve it before `_id` and `_lastUpdated`, which would otherwise
         // interpret the boolean literal as an ID or date value.
@@ -272,7 +267,7 @@ impl<'a> EsQueryBuilder<'a> {
         // Handle special parameters
         match param.name.as_str() {
             "_id" => return self.build_id_clause(param),
-            "_lastUpdated" => return self.build_last_updated_clause(param, now),
+            "_lastUpdated" => return self.build_last_updated_clause(param),
             "_text" => return fts::build_text_clause(param),
             "_content" => return fts::build_content_clause(param),
             _ => {}
@@ -282,7 +277,7 @@ impl<'a> EsQueryBuilder<'a> {
         let clauses: Vec<Value> = param
             .values
             .iter()
-            .filter_map(|value| self.build_value_clause(param, &value.value, value.prefix, now))
+            .filter_map(|value| self.build_value_clause(param, &value.value, value.prefix))
             .collect();
 
         if clauses.is_empty() {
@@ -321,17 +316,16 @@ impl<'a> EsQueryBuilder<'a> {
         param: &SearchParameter,
         value: &str,
         prefix: SearchPrefix,
-        now: DateTime<Utc>,
     ) -> Option<Value> {
         match param.param_type {
             SearchParamType::String => string::build_clause(param, value),
             SearchParamType::Token => token::build_clause(param, value),
-            SearchParamType::Date => date::build_clause(&param.name, value, prefix, now),
+            SearchParamType::Date => date::build_clause(&param.name, value, prefix),
             SearchParamType::Number => number::build_clause(&param.name, value, prefix),
             SearchParamType::Quantity => quantity::build_clause(&param.name, value, prefix),
             SearchParamType::Reference => reference::build_clause(param, value),
             SearchParamType::Uri => uri::build_clause(param, value),
-            SearchParamType::Composite => composite::build_clause(param, value, now),
+            SearchParamType::Composite => composite::build_clause(param, value),
             SearchParamType::Special => None,
         }
     }
@@ -373,16 +367,12 @@ impl<'a> EsQueryBuilder<'a> {
     /// (#892). Previously every value was folded into one `range` map, so
     /// `ne`/`sa`/`eb`/`ap` degraded to `eq` and a second value overwrote the
     /// first.
-    fn build_last_updated_clause(
-        &self,
-        param: &SearchParameter,
-        now: DateTime<Utc>,
-    ) -> Option<Value> {
+    fn build_last_updated_clause(&self, param: &SearchParameter) -> Option<Value> {
         let mut clauses: Vec<Value> = param
             .values
             .iter()
             .map(
-                |value| match date::field_range("last_updated", &value.value, value.prefix, now) {
+                |value| match date::field_range("last_updated", &value.value, value.prefix) {
                     Some(date::DateRange::Within(range)) => range,
                     Some(date::DateRange::Outside(range)) => {
                         json!({ "bool": { "must_not": [range] } })
@@ -456,6 +446,17 @@ impl<'a> EsQueryBuilder<'a> {
                 // with a 200 (#883).
                 name => {
                     let (group, field) = match directive.param_type {
+                        // A date is a range `[value, end)` (#1391): an
+                        // ascending sort orders by where it starts, a
+                        // descending one by where it ends, so a `Period` sorts
+                        // by its end as it did when each end was its own
+                        // entry. Chosen by the requested direction, not the
+                        // paging one, so a `Previous` cursor keeps the key.
+                        Some(SearchParamType::Date)
+                            if matches!(directive.direction, SortDirection::Descending) =>
+                        {
+                            ("date", "search_params.date.end")
+                        }
                         Some(SearchParamType::Date) => ("date", "search_params.date.value"),
                         Some(SearchParamType::Number) => ("number", "search_params.number.value"),
                         Some(SearchParamType::Quantity) => {
@@ -474,19 +475,26 @@ impl<'a> EsQueryBuilder<'a> {
                     // orders an ascending sort, the largest a descending one
                     // (the SQL backends' MIN/MAX).
                     let mode = if order == "asc" { "min" } else { "max" };
-                    sort_clauses.push(json!({
-                        field: {
-                            "order": order,
-                            "mode": mode,
-                            "nested": {
-                                "path": format!("search_params.{group}"),
-                                "filter": {
-                                    "term": { format!("search_params.{group}.name"): name }
-                                }
-                            },
-                            "missing": if order == "asc" { "_last" } else { "_first" }
-                        }
-                    }));
+                    let mut clause = json!({
+                        "order": order,
+                        "mode": mode,
+                        "nested": {
+                            "path": format!("search_params.{group}"),
+                            "filter": {
+                                "term": { format!("search_params.{group}.name"): name }
+                            }
+                        },
+                        "missing": if order == "asc" { "_last" } else { "_first" }
+                    });
+                    // `search_params.date.end` exists only in indices at schema
+                    // version 2 (#1391). An index that has not been reconciled
+                    // yet (the mapping is brought up to date on the first write
+                    // to it) lacks the field, and Elasticsearch refuses to sort
+                    // on an unmapped one with a 400 unless told its type.
+                    if field == "search_params.date.end" {
+                        clause["unmapped_type"] = json!("date");
+                    }
+                    sort_clauses.push(json!({ field: clause }));
                 }
             }
         }
@@ -893,6 +901,36 @@ mod tests {
         );
     }
 
+    /// #1391: a descending date sort orders by where each range ends — the
+    /// end of a `Period` — and keeps that key under a `Previous` cursor.
+    #[test]
+    fn test_descending_date_sort_uses_the_range_end() {
+        let directive = SortDirective {
+            parameter: "date".to_string(),
+            direction: SortDirection::Descending,
+            param_type: Some(SearchParamType::Date),
+        };
+        let builder = EsQueryBuilder::new("acme", "Encounter", "hfs_acme_encounter".to_string());
+
+        let query = SearchQuery::new("Encounter").with_sort(directive.clone());
+        let sort = &builder.build(&query).body["sort"][0];
+        let clause = &sort["search_params.date.end"];
+        assert!(!clause.is_null(), "descending sorts on the end, got {sort}");
+        assert_eq!(clause["order"], "desc");
+        assert_eq!(clause["mode"], "max");
+        // An index not yet reconciled to schema version 2 has no `end`.
+        assert_eq!(clause["unmapped_type"], "date");
+
+        let query = SearchQuery::new("Encounter")
+            .with_sort(directive)
+            .with_cursor(previous_cursor("e-5"));
+        let sort = &builder.build(&query).body["sort"][0];
+        assert!(
+            !sort["search_params.date.end"].is_null(),
+            "a Previous cursor keeps the sort key, got {sort}"
+        );
+    }
+
     #[test]
     fn test_token_sort_descending_uses_max_mode() {
         let query = SearchQuery::new("Patient").with_sort(SortDirective {
@@ -1130,7 +1168,7 @@ mod tests {
                 components: vec![],
             };
             assert_eq!(
-                builder.build_parameter_clause(&param, Utc::now()),
+                builder.build_parameter_clause(&param),
                 Some(json!({ "match_none": {} })),
                 "{context}"
             );

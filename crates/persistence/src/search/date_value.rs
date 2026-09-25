@@ -45,10 +45,41 @@
 //!
 //! # Ranges and prefixes
 //!
-//! A search value is a half-open range `[start, end)` one unit of its own
-//! precision wide — a year, a month, a day, a minute, a second, or `10⁻ⁿ` s
-//! for `n` fraction digits. Every indexed date is a point `t` (a `Period` is
-//! indexed as two independent points), so the comparators reduce to:
+//! A search value is a half-open range `[s, e)` one unit of its own precision
+//! wide — a year, a month, a day, a minute, a second, or `10⁻ⁿ` s for `n`
+//! fraction digits.
+//!
+//! Every indexed date is a range `[ts, te)` too (#1391). A point value — a
+//! `date`, `dateTime` or `instant` — covers one unit of its own precision, so
+//! `birthDate: "2020"` is the whole of 2020. A `Period` (and a `Timing`'s
+//! `repeat.boundsPeriod`) is one range from its `start` to the end of its
+//! `end`, and a missing side is open: it is stored as [`OPEN_START`] or
+//! [`open_end`], the limits of the supported years, which no search range
+//! passes, so they behave as ±infinity. See [`indexed_range`].
+//!
+//! [`FhirDateValue::range_predicate`] implements the FHIR rules for a search
+//! range against a target range:
+//!
+//! | prefix | match | [`RangePredicate`] groups |
+//! |--------|-------|---------------------------|
+//! | `eq` | `s ≤ ts ∧ te ≤ e` | `[ts ≥ s, te ≤ e]` |
+//! | `ne` | `ts < s ∨ te > e` | `[ts < s] ∨ [te > e]` |
+//! | `gt` | `te > e` | `[te > e]` |
+//! | `lt` | `ts < s` | `[ts < s]` |
+//! | `ge` | `te > e ∨ eq` | `[te > e] ∨ [ts ≥ s, te ≤ e]` |
+//! | `le` | `ts < s ∨ eq` | `[ts < s] ∨ [ts ≥ s, te ≤ e]` |
+//! | `sa` | `ts ≥ e` | `[ts ≥ e]` |
+//! | `eb` | `te ≤ s` | `[te ≤ s]` |
+//! | `ap` | overlap with `[s − m, e + m)` | `[ts < e + m, te > s − m]` |
+//!
+//! The `ap` margin `m` is [`FhirDateValue::approx_margin`], the same on every
+//! backend.
+//!
+//! # Point comparisons
+//!
+//! `_lastUpdated` (an instant held in the resource row, not in the index) and
+//! the date component of a composite parameter are still compared as a point
+//! `t`, and [`FhirDateValue::predicate`] keeps that mapping:
 //!
 //! | prefix | match | [`DatePredicate`] |
 //! |--------|-------|-------------------|
@@ -58,21 +89,18 @@
 //! | `lt` / `eb` | `t < start` | `Before(start)` |
 //! | `ge` | `t ≥ start` | `AtOrAfter(start)` |
 //! | `le` | `t < end` | `Before(end)` |
-//! | `ap` | `start − m ≤ t < end + m` | `Within` |
 //!
-//! `ap` has one window on every backend (#1390). FHIR recommends a margin of
-//! 10% of the gap between now and the value, so `m` is a tenth of the distance
-//! from `now` to the nearest edge of the range, and `0` when `now` falls inside
-//! it: the window is never narrower than `eq`. Because the window depends on
-//! the current time, `now` is passed in, never read from a clock here; a
-//! request fixes it once ([`crate::types::SearchQuery::now`]) so every value
-//! of it, and its count, see the same instant. The page cursor does not carry
-//! `now`, so a later page measures the window from its own request's instant.
+//! `ap` is absent there: [`FhirDateValue::predicate`] returns `None` for it,
+//! and a point comparison builds its window from
+//! [`FhirDateValue::approx_window`].
 
-use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Duration, Months, NaiveDate, TimeZone, Utc};
 
+use super::converters::{DateEnd, IndexValue};
 use crate::error::{SearchError, StorageError, StorageResult};
-use crate::types::{SearchModifier, SearchParamType, SearchParameter, SearchPrefix, SearchQuery};
+use crate::types::{
+    DatePrecision, SearchModifier, SearchParamType, SearchParameter, SearchPrefix, SearchQuery,
+};
 
 /// The forms a date search value may take, for error messages.
 const EXPECTED: &str =
@@ -265,49 +293,275 @@ impl FhirDateValue {
     /// The comparison `prefix` makes against a stored point, per the table in
     /// the module docs.
     ///
-    /// `now` only matters for `ap`, whose margin is a tenth of the distance
-    /// from `now` to the range.
+    /// `None` for `ap`, whose window is each backend's own; it should be built
+    /// around [`Self::range_at`].
     pub fn predicate(
         &self,
         prefix: SearchPrefix,
         resolution: StorageResolution,
-        now: DateTime<Utc>,
-    ) -> DatePredicate {
+    ) -> Option<DatePredicate> {
         let (start, end) = self.range_at(resolution);
-        match prefix {
+        Some(match prefix {
             SearchPrefix::Eq => DatePredicate::Within { ge: start, lt: end },
             SearchPrefix::Ne => DatePredicate::Outside { lt: start, ge: end },
             SearchPrefix::Gt | SearchPrefix::Sa => DatePredicate::AtOrAfter(end),
             SearchPrefix::Lt | SearchPrefix::Eb => DatePredicate::Before(start),
             SearchPrefix::Ge => DatePredicate::AtOrAfter(start),
             SearchPrefix::Le => DatePredicate::Before(end),
+            SearchPrefix::Ap => return None,
+        })
+    }
+
+    /// The comparison `prefix` makes against a stored range `[ts, te)`, per
+    /// the range table in the module docs. Every prefix has one, `ap`
+    /// included: its window is [`Self::approx_window`], the same on every
+    /// backend.
+    pub fn range_predicate(
+        &self,
+        prefix: SearchPrefix,
+        resolution: StorageResolution,
+    ) -> RangePredicate {
+        use RangeCondition::*;
+        let (s, e) = self.range_at(resolution);
+        let any_of = match prefix {
+            SearchPrefix::Eq => vec![vec![StartAtOrAfter(s), EndAtOrBefore(e)]],
+            SearchPrefix::Ne => vec![vec![StartBefore(s)], vec![EndAfter(e)]],
+            SearchPrefix::Gt => vec![vec![EndAfter(e)]],
+            SearchPrefix::Lt => vec![vec![StartBefore(s)]],
+            SearchPrefix::Ge => vec![vec![EndAfter(e)], vec![StartAtOrAfter(s), EndAtOrBefore(e)]],
+            SearchPrefix::Le => vec![
+                vec![StartBefore(s)],
+                vec![StartAtOrAfter(s), EndAtOrBefore(e)],
+            ],
+            SearchPrefix::Sa => vec![vec![StartAtOrAfter(e)]],
+            SearchPrefix::Eb => vec![vec![EndAtOrBefore(s)]],
             SearchPrefix::Ap => {
-                let gap = if now < start {
-                    start - now
-                } else if now >= end {
-                    now - end
-                } else {
-                    Duration::zero()
-                };
-                // Rounded up to a whole millisecond: `now` carries
-                // nanoseconds, and a backend that stores milliseconds would
-                // otherwise truncate `end + m` and lose its last millisecond.
-                let tenth = gap / 10;
-                let mut margin = Duration::milliseconds(tenth.num_milliseconds());
-                if margin < tenth {
-                    margin += Duration::milliseconds(1);
-                }
-                DatePredicate::Within {
-                    ge: start
-                        .checked_sub_signed(margin)
-                        .unwrap_or(DateTime::<Utc>::MIN_UTC),
-                    lt: end
-                        .checked_add_signed(margin)
-                        .unwrap_or(DateTime::<Utc>::MAX_UTC),
-                }
+                let (low, high) = self.approx_window(resolution);
+                vec![vec![StartBefore(high), EndAfter(low)]]
+            }
+        };
+        RangePredicate { any_of }
+    }
+
+    /// The window `ap` accepts an overlap with: the range widened on both
+    /// sides by [`Self::approx_margin`], and kept inside the supported years.
+    pub fn approx_window(&self, resolution: StorageResolution) -> (DateTime<Utc>, DateTime<Utc>) {
+        let (s, e) = self.range_at(resolution);
+        let margin = self.approx_margin();
+        let low = margin
+            .before(s)
+            .unwrap_or_else(open_start)
+            .max(open_start());
+        let high = margin
+            .after(e)
+            .unwrap_or_else(|| open_end(resolution))
+            .min(open_end(resolution));
+        (low, high)
+    }
+
+    /// How far `ap` reaches past each side of the range: one unit of a
+    /// date-only precision (a year, a month, a day), ten minutes for a minute
+    /// and ten seconds for anything finer. The FHIR specification leaves the
+    /// width to the server ("the recommended value … is 10% of the gap between
+    /// now and the date"); a fixed window per precision is the same answer on
+    /// every backend and for every query.
+    pub fn approx_margin(&self) -> ApproxMargin {
+        match self.precision {
+            DateValuePrecision::Year => ApproxMargin::Months(12),
+            DateValuePrecision::Month => ApproxMargin::Months(1),
+            DateValuePrecision::Day => ApproxMargin::Fixed(Duration::days(1)),
+            DateValuePrecision::Minute => ApproxMargin::Fixed(Duration::minutes(10)),
+            DateValuePrecision::Second | DateValuePrecision::Fraction(_) => {
+                ApproxMargin::Fixed(Duration::seconds(10))
             }
         }
     }
+}
+
+/// The width of the `ap` window on each side of a search range. Months are
+/// kept apart from fixed durations because a month or a year is not a fixed
+/// number of seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApproxMargin {
+    /// A number of calendar months.
+    Months(u32),
+    /// A fixed duration.
+    Fixed(Duration),
+}
+
+impl ApproxMargin {
+    /// `t` moved back by the margin, or `None` past the calendar's reach.
+    pub fn before(self, t: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        match self {
+            ApproxMargin::Months(n) => t.checked_sub_months(Months::new(n)),
+            ApproxMargin::Fixed(d) => t.checked_sub_signed(d),
+        }
+    }
+
+    /// `t` moved forward by the margin, or `None` past the calendar's reach.
+    pub fn after(self, t: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        match self {
+            ApproxMargin::Months(n) => t.checked_add_months(Months::new(n)),
+            ApproxMargin::Fixed(d) => t.checked_add_signed(d),
+        }
+    }
+}
+
+/// One comparison against a stored range `[ts, te)`: a bound on the start
+/// column or on the end column. The four cover every prefix, so a backend
+/// needs `>=` and `<` for the start and `>` and `<=` for the end, nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeCondition {
+    /// `ts ≥ bound`.
+    StartAtOrAfter(DateTime<Utc>),
+    /// `ts < bound`.
+    StartBefore(DateTime<Utc>),
+    /// `te > bound`.
+    EndAfter(DateTime<Utc>),
+    /// `te ≤ bound`.
+    EndAtOrBefore(DateTime<Utc>),
+}
+
+impl RangeCondition {
+    /// Whether a stored range satisfies the condition.
+    pub fn matches(&self, ts: DateTime<Utc>, te: DateTime<Utc>) -> bool {
+        match *self {
+            RangeCondition::StartAtOrAfter(bound) => ts >= bound,
+            RangeCondition::StartBefore(bound) => ts < bound,
+            RangeCondition::EndAfter(bound) => te > bound,
+            RangeCondition::EndAtOrBefore(bound) => te <= bound,
+        }
+    }
+}
+
+/// A comparison against a stored range `[ts, te)`, in disjunctive normal
+/// form: it holds when every condition of at least one group holds. No prefix
+/// needs more than two groups of two, and a backend translates any of them
+/// with the same two nested loops (OR of ANDs).
+///
+/// Like [`DatePredicate`], it needs a stored range: a resource with no value
+/// for the parameter does not match, `ne` included.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RangePredicate {
+    /// The groups, OR-ed; the conditions inside a group are AND-ed. Never
+    /// empty, and no group is empty.
+    pub any_of: Vec<Vec<RangeCondition>>,
+}
+
+impl RangePredicate {
+    /// Whether a stored range satisfies the predicate.
+    pub fn matches(&self, ts: DateTime<Utc>, te: DateTime<Utc>) -> bool {
+        self.any_of
+            .iter()
+            .any(|group| group.iter().all(|condition| condition.matches(ts, te)))
+    }
+}
+
+/// The text a `Period` without a `start` is indexed with as its start: the
+/// first instant of the supported years, which no search range starts before,
+/// so it reads as "unbounded below" to every comparison (#1391).
+pub const OPEN_START: &str = "0001-01-01T00:00:00Z";
+
+/// The stored start of a range open below, as an instant: [`OPEN_START`].
+pub fn open_start() -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(1, 1, 1, 0, 0, 0)
+        .single()
+        .unwrap_or(DateTime::<Utc>::MIN_UTC)
+}
+
+/// The stored end of a range open above: the last instant of the supported
+/// years at `resolution`, which is where every search range is clamped, so
+/// no search range ends after it (#1391).
+///
+/// A sentinel rather than NULL, so that `value_date_end` is always set on a
+/// row indexed after #1391 and a missing end means only "indexed before it,
+/// reindex" — never "open", which would match `gt` for any date.
+pub fn open_end(resolution: StorageResolution) -> DateTime<Utc> {
+    let last = Utc
+        .with_ymd_and_hms(9999, 12, 31, 23, 59, 59)
+        .single()
+        .unwrap_or(DateTime::<Utc>::MAX_UTC)
+        + Duration::nanoseconds(999_999_999);
+    last - Duration::nanoseconds(i64::from(last.timestamp_subsec_nanos()) % resolution.nanos())
+}
+
+/// Reads a date as it is stored in a resource. Only the text as written
+/// counts: the search-side repairs (trimming, a space read as a form-decoded
+/// `+`, #1296) do not apply to a resource, where a space is simply not part of
+/// a date.
+pub fn parse_stored_date(raw: &str) -> Option<FhirDateValue> {
+    FhirDateValue::parse(raw)
+        .ok()
+        .filter(|parsed| parsed.canonical() == raw)
+}
+
+/// Where the stored range of a date index value ends — see
+/// [`crate::search::DateEnd`] — given where it starts.
+///
+/// For a backend that read the start itself (some are more lenient than the
+/// FHIR grammar about what they index): `start` is that instant and
+/// `precision` the one the value carries. A point ends one unit of its
+/// precision later, a `Period` at the end of its own `end` (so `end: "2020-06"`
+/// ends on July 1st), and an open `Period` at [`open_end`].
+///
+/// `None` when a `Period`'s `end` is not a date, and the row must be skipped
+/// like any other unparseable date: indexing it as open would over-match. The
+/// result is never earlier than one unit past `start`, so a `Period` whose
+/// `end` precedes its `start` (invalid FHIR, `per-1`) is still a non-empty
+/// range starting where it says.
+pub fn indexed_end(
+    start: DateTime<Utc>,
+    precision: DatePrecision,
+    end: &DateEnd,
+    resolution: StorageResolution,
+) -> Option<DateTime<Utc>> {
+    let unit = Duration::nanoseconds(resolution.nanos());
+    let end = match end {
+        DateEnd::Precision => match precision {
+            DatePrecision::Year => start.checked_add_months(Months::new(12)),
+            DatePrecision::Month => start.checked_add_months(Months::new(1)),
+            DatePrecision::Day => start.checked_add_signed(Duration::days(1)),
+            DatePrecision::Hour => start.checked_add_signed(Duration::hours(1)),
+            DatePrecision::Minute => start.checked_add_signed(Duration::minutes(1)),
+            DatePrecision::Second => start.checked_add_signed(Duration::seconds(1)),
+            DatePrecision::Millisecond => start.checked_add_signed(Duration::milliseconds(1)),
+        }
+        .unwrap_or_else(|| open_end(resolution)),
+        DateEnd::At(raw) => parse_stored_date(raw)?.range_at(resolution).1,
+        DateEnd::Open => open_end(resolution),
+    };
+    Some(end.min(open_end(resolution)).max(start + unit))
+}
+
+/// The range `[start, end)` an index row stores for a date value, both ends
+/// at `resolution`: the start of the value's own range, and the end
+/// [`indexed_end`] gives it. A point's range is exactly the range a search
+/// for the same text covers.
+///
+/// `None` for anything but [`IndexValue::Date`], and when either end is not a
+/// date the FHIR grammar accepts as written; a backend that indexes wider
+/// than the grammar falls back to [`indexed_end`] with its own start.
+pub fn indexed_range(
+    value: &IndexValue,
+    resolution: StorageResolution,
+) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    let IndexValue::Date {
+        value,
+        precision,
+        end,
+    } = value
+    else {
+        return None;
+    };
+    let parsed = parse_stored_date(value)?;
+    let (start, point_end) = parsed.range_at(resolution);
+    let end = match end {
+        // The parsed range is exact for every precision, fraction digits
+        // included, where `DatePrecision` only knows "millisecond".
+        DateEnd::Precision => point_end.min(open_end(resolution)),
+        other => indexed_end(start, *precision, other, resolution)?,
+    };
+    Some((start, end))
 }
 
 /// A cursor over the ASCII bytes of a value.
@@ -912,123 +1166,16 @@ mod tests {
             (SearchPrefix::Le, DatePredicate::Before(e)),
         ] {
             assert_eq!(
-                value.predicate(
-                    prefix,
-                    StorageResolution::Micros,
-                    utc("2026-01-01T00:00:00Z")
-                ),
-                expected,
+                value.predicate(prefix, StorageResolution::Micros),
+                Some(expected),
                 "{prefix}"
             );
         }
-    }
-
-    /// `ap` widens the range by a tenth of its distance from `now` (#1390).
-    #[test]
-    fn ap_widens_the_range_by_a_tenth_of_the_gap_to_now() {
-        let now = utc("2026-01-01T00:00:00Z");
-        let ap =
-            |raw: &str| parsed(raw).predicate(SearchPrefix::Ap, StorageResolution::Micros, now);
-        let tenth_of = |a: &str, b: &str| (utc(b) - utc(a)) / 10;
-
-        // Past: the gap runs from the end of 2016 to now, 9 years.
-        let m = tenth_of("2017-01-01T00:00:00Z", "2026-01-01T00:00:00Z");
+        // `ap` stays with the backend.
         assert_eq!(
-            ap("2016"),
-            DatePredicate::Within {
-                ge: utc("2016-01-01T00:00:00Z") - m,
-                lt: utc("2017-01-01T00:00:00Z") + m,
-            }
+            value.predicate(SearchPrefix::Ap, StorageResolution::Micros),
+            None
         );
-
-        // Future: the gap runs from now to the start of 2036, 10 years.
-        let m = tenth_of("2026-01-01T00:00:00Z", "2036-01-01T00:00:00Z");
-        assert_eq!(
-            ap("2036-01-01"),
-            DatePredicate::Within {
-                ge: utc("2036-01-01T00:00:00Z") - m,
-                lt: utc("2036-01-02T00:00:00Z") + m,
-            }
-        );
-
-        // Minute precision: the minute ends 59 minutes before now, so the
-        // margin is 5 minutes 54 seconds.
-        assert_eq!(
-            ap("2025-12-31T23:00Z"),
-            DatePredicate::Within {
-                ge: utc("2025-12-31T22:54:06Z"),
-                lt: utc("2025-12-31T23:06:54Z"),
-            }
-        );
-    }
-
-    /// A sub-millisecond `now` still gives a whole-millisecond margin, rounded
-    /// up, so millisecond storage cannot narrow the window.
-    #[test]
-    fn ap_margin_is_rounded_up_to_a_millisecond() {
-        // The second ends 9.001 s before `now`: a tenth is 900.1 ms, rounded
-        // up to 901 ms.
-        let now = utc("2026-01-01T00:00:10.001Z");
-        assert_eq!(
-            parsed("2026-01-01T00:00:00Z").predicate(
-                SearchPrefix::Ap,
-                StorageResolution::Millis,
-                now
-            ),
-            DatePredicate::Within {
-                ge: utc("2025-12-31T23:59:59.099Z"),
-                lt: utc("2026-01-01T00:00:01.901Z"),
-            }
-        );
-    }
-
-    /// With `now` inside the range, or on its start, the gap is zero and `ap`
-    /// is exactly `eq`.
-    #[test]
-    fn ap_is_eq_when_now_is_in_the_range() {
-        let now = utc("2026-01-01T00:00:00Z");
-        for raw in [
-            "2026",
-            "2026-01",
-            "2026-01-01",
-            "2026-01-01T00:00Z",
-            "2025-12-31T19:00:00-05:00",
-        ] {
-            let value = parsed(raw);
-            assert_eq!(
-                value.predicate(SearchPrefix::Ap, StorageResolution::Micros, now),
-                value.predicate(SearchPrefix::Eq, StorageResolution::Micros, now),
-                "{raw}"
-            );
-        }
-    }
-
-    /// Whatever `now` is, `ap` matches everything `eq` matches.
-    #[test]
-    fn ap_contains_eq() {
-        for now in [
-            "1900-01-01T00:00:00Z",
-            "2016-06-15T12:00:00Z",
-            "2100-01-01T00:00:00Z",
-        ] {
-            let now = utc(now);
-            for raw in [
-                "2016",
-                "2016-06",
-                "2016-06-15",
-                "2016-06-15T12:34Z",
-                "2016-06-15T12:34:56.789Z",
-            ] {
-                let value = parsed(raw);
-                let DatePredicate::Within { ge, lt } =
-                    value.predicate(SearchPrefix::Ap, StorageResolution::Millis, now)
-                else {
-                    panic!("ap must be a window: {raw}");
-                };
-                let (start, end) = value.range_at(StorageResolution::Millis);
-                assert!(ge <= start && end <= lt, "{raw} at {now}");
-            }
-        }
     }
 
     #[test]
@@ -1038,7 +1185,8 @@ mod tests {
         let value = parsed("2013-04-05T23:30:00-04:00");
         let hit = |prefix| {
             value
-                .predicate(prefix, StorageResolution::Millis, stored)
+                .predicate(prefix, StorageResolution::Millis)
+                .unwrap()
                 .matches(stored)
         };
         assert!(hit(SearchPrefix::Eq));
@@ -1049,6 +1197,269 @@ mod tests {
         assert!(!hit(SearchPrefix::Lt));
         assert!(!hit(SearchPrefix::Sa));
         assert!(!hit(SearchPrefix::Eb));
+    }
+
+    fn range_of(start: Option<&str>, end: Option<&str>) -> (DateTime<Utc>, DateTime<Utc>) {
+        let value = IndexValue::date_range(start, end).expect("a bound");
+        indexed_range(&value, StorageResolution::Millis).expect("a range")
+    }
+
+    fn point_range(value: &str) -> (DateTime<Utc>, DateTime<Utc>) {
+        indexed_range(&IndexValue::date(value), StorageResolution::Millis).expect("a range")
+    }
+
+    /// #1391: the FHIR table for a search range against a target range, every
+    /// prefix against Periods that sit inside, across, before and after the
+    /// searched year, and against open-ended ones.
+    #[test]
+    fn every_prefix_against_a_range_target() {
+        let search = parsed("2020");
+        let targets = [
+            // Starts before 2020 and ends inside it: `eq` used to match on the end.
+            ("across start", range_of(Some("2019-06"), Some("2020-03"))),
+            ("inside", range_of(Some("2020-02-01"), Some("2020-05"))),
+            ("before", range_of(Some("2018"), Some("2018-12-31"))),
+            ("after", range_of(Some("2021-02"), Some("2021-03"))),
+            // Covers the whole year: `sa2020` used to match on the end alone.
+            ("covering", range_of(Some("2019-06"), Some("2021-03"))),
+            ("open end", range_of(Some("2019-06-01"), None)),
+            ("open start", range_of(None, Some("2021-03"))),
+            ("point inside", point_range("2020-05-15")),
+        ];
+        // One column per target above, in order.
+        #[rustfmt::skip]
+        let expected = [
+            (SearchPrefix::Eq, [false, true,  false, false, false, false, false, true ]),
+            (SearchPrefix::Ne, [true,  false, true,  true,  true,  true,  true,  false]),
+            (SearchPrefix::Gt, [false, false, false, true,  true,  true,  true,  false]),
+            (SearchPrefix::Lt, [true,  false, true,  false, true,  true,  true,  false]),
+            (SearchPrefix::Ge, [false, true,  false, true,  true,  true,  true,  true ]),
+            (SearchPrefix::Le, [true,  true,  true,  false, true,  true,  true,  true ]),
+            (SearchPrefix::Sa, [false, false, false, true,  false, false, false, false]),
+            (SearchPrefix::Eb, [false, false, true,  false, false, false, false, false]),
+            // The window is 2019 to 2021; "before" ends exactly where it starts.
+            (SearchPrefix::Ap, [true,  true,  false, true,  true,  true,  true,  true ]),
+        ];
+        for (prefix, row) in expected {
+            let predicate = search.range_predicate(prefix, StorageResolution::Millis);
+            for ((name, (ts, te)), want) in targets.iter().zip(row) {
+                assert_eq!(predicate.matches(*ts, *te), want, "{prefix} against {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn range_predicates_have_the_documented_shape() {
+        use RangeCondition::*;
+        let value = parsed("2013-04-05T23:30:00-04:00");
+        let (s, e) = (utc("2013-04-06T03:30:00Z"), utc("2013-04-06T03:30:01Z"));
+        let contained = vec![StartAtOrAfter(s), EndAtOrBefore(e)];
+        for (prefix, any_of) in [
+            (SearchPrefix::Eq, vec![contained.clone()]),
+            (
+                SearchPrefix::Ne,
+                vec![vec![StartBefore(s)], vec![EndAfter(e)]],
+            ),
+            (SearchPrefix::Gt, vec![vec![EndAfter(e)]]),
+            (SearchPrefix::Lt, vec![vec![StartBefore(s)]]),
+            (SearchPrefix::Ge, vec![vec![EndAfter(e)], contained.clone()]),
+            (
+                SearchPrefix::Le,
+                vec![vec![StartBefore(s)], contained.clone()],
+            ),
+            (SearchPrefix::Sa, vec![vec![StartAtOrAfter(e)]]),
+            (SearchPrefix::Eb, vec![vec![EndAtOrBefore(s)]]),
+            (
+                SearchPrefix::Ap,
+                vec![vec![
+                    StartBefore(utc("2013-04-06T03:30:11Z")),
+                    EndAfter(utc("2013-04-06T03:29:50Z")),
+                ]],
+            ),
+        ] {
+            assert_eq!(
+                value.range_predicate(prefix, StorageResolution::Micros),
+                RangePredicate { any_of },
+                "{prefix}"
+            );
+        }
+    }
+
+    /// A point value's stored range is exactly the range a search for the same
+    /// text covers, so `eq` with the stored text always finds it.
+    #[test]
+    fn a_point_is_stored_as_its_own_precision_range() {
+        for (stored, start, end) in [
+            ("2020", "2020-01-01T00:00:00Z", "2021-01-01T00:00:00Z"),
+            ("2020-12", "2020-12-01T00:00:00Z", "2021-01-01T00:00:00Z"),
+            ("2020-06-15", "2020-06-15T00:00:00Z", "2020-06-16T00:00:00Z"),
+            (
+                "2020-06-15T10:00:00+02:00",
+                "2020-06-15T08:00:00Z",
+                "2020-06-15T08:00:01Z",
+            ),
+        ] {
+            assert_eq!(point_range(stored), (utc(start), utc(end)), "{stored}");
+            let search =
+                parsed(stored).range_predicate(SearchPrefix::Eq, StorageResolution::Millis);
+            let (ts, te) = point_range(stored);
+            assert!(search.matches(ts, te), "eq{stored}");
+        }
+        // Finer than the search: a whole stored day is not inside one minute.
+        let (ts, te) = point_range("2020-01-01");
+        assert!(
+            !parsed("2020-01-01T00:00")
+                .range_predicate(SearchPrefix::Eq, StorageResolution::Millis)
+                .matches(ts, te)
+        );
+    }
+
+    #[test]
+    fn a_period_ends_at_the_end_of_its_own_end() {
+        assert_eq!(
+            range_of(Some("2020-01-15"), Some("2020-06")),
+            (utc("2020-01-15T00:00:00Z"), utc("2020-07-01T00:00:00Z"))
+        );
+        assert_eq!(
+            range_of(Some("2020-01-15T10:00:00Z"), Some("2020-01-15T12:30:00Z")),
+            (utc("2020-01-15T10:00:00Z"), utc("2020-01-15T12:30:01Z"))
+        );
+        // `end` before `start` (invalid, `per-1`) still stores a non-empty
+        // range starting where the Period says.
+        let (ts, te) = range_of(Some("2020-06-01"), Some("2020-01-01"));
+        assert_eq!(ts, utc("2020-06-01T00:00:00Z"));
+        assert_eq!(te, ts + Duration::milliseconds(1));
+    }
+
+    #[test]
+    fn open_ends_are_stored_as_the_supported_limits() {
+        assert_eq!(
+            range_of(Some("2020"), None),
+            (
+                utc("2020-01-01T00:00:00Z"),
+                open_end(StorageResolution::Millis)
+            )
+        );
+        assert_eq!(
+            range_of(None, Some("2020")),
+            (open_start(), utc("2021-01-01T00:00:00Z"))
+        );
+        assert_eq!(open_start(), utc(OPEN_START));
+        assert_eq!(
+            open_end(StorageResolution::Millis),
+            utc("9999-12-31T23:59:59.999Z")
+        );
+        assert_eq!(
+            open_end(StorageResolution::Micros),
+            utc("9999-12-31T23:59:59.999999Z")
+        );
+
+        // No search range passes them, so they read as unbounded.
+        for resolution in [StorageResolution::Millis, StorageResolution::Micros] {
+            let (s, _) = parsed("0001").range_at(resolution);
+            let (_, e) = parsed("9999").range_at(resolution);
+            assert_eq!(s, open_start());
+            assert_eq!(e, open_end(resolution));
+        }
+        let (ts, te) = range_of(Some("2019-06-01"), None);
+        assert!(
+            parsed("2030")
+                .range_predicate(SearchPrefix::Gt, StorageResolution::Millis)
+                .matches(ts, te)
+        );
+        let (ts, te) = range_of(None, Some("2020"));
+        assert!(
+            parsed("1900")
+                .range_predicate(SearchPrefix::Lt, StorageResolution::Millis)
+                .matches(ts, te)
+        );
+    }
+
+    #[test]
+    fn indexed_range_refuses_what_it_cannot_read() {
+        let res = StorageResolution::Millis;
+        assert_eq!(indexed_range(&IndexValue::string("2020"), res), None);
+        assert_eq!(indexed_range(&IndexValue::date("not-a-date"), res), None);
+        // The stored text counts as written: no search-side repairs.
+        assert_eq!(indexed_range(&IndexValue::date(" 2020"), res), None);
+        let bad_end = IndexValue::Date {
+            value: "2020".to_string(),
+            precision: DatePrecision::Year,
+            end: DateEnd::At("2020-02-30".to_string()),
+        };
+        assert_eq!(indexed_range(&bad_end, res), None);
+    }
+
+    /// For a backend that read the start itself, more leniently than the
+    /// grammar: the end follows the precision the value carries.
+    #[test]
+    fn indexed_end_from_a_backend_start() {
+        let res = StorageResolution::Millis;
+        let start = utc("2020-02-29T00:00:00Z");
+        for (precision, end) in [
+            (DatePrecision::Year, "2021-02-28T00:00:00Z"),
+            (DatePrecision::Month, "2020-03-29T00:00:00Z"),
+            (DatePrecision::Day, "2020-03-01T00:00:00Z"),
+            (DatePrecision::Hour, "2020-02-29T01:00:00Z"),
+            (DatePrecision::Minute, "2020-02-29T00:01:00Z"),
+            (DatePrecision::Second, "2020-02-29T00:00:01Z"),
+            (DatePrecision::Millisecond, "2020-02-29T00:00:00.001Z"),
+        ] {
+            assert_eq!(
+                indexed_end(start, precision, &DateEnd::Precision, res),
+                Some(utc(end)),
+                "{precision:?}"
+            );
+        }
+        assert_eq!(
+            indexed_end(start, DatePrecision::Day, &DateEnd::Open, res),
+            Some(open_end(res))
+        );
+        assert_eq!(
+            indexed_end(
+                start,
+                DatePrecision::Day,
+                &DateEnd::At("2020-03".into()),
+                res
+            ),
+            Some(utc("2020-04-01T00:00:00Z"))
+        );
+        assert_eq!(
+            indexed_end(start, DatePrecision::Day, &DateEnd::At("nope".into()), res),
+            None
+        );
+    }
+
+    #[test]
+    fn approx_margin_follows_the_precision() {
+        let res = StorageResolution::Millis;
+        for (value, low, high) in [
+            ("2020", "2019-01-01T00:00:00Z", "2022-01-01T00:00:00Z"),
+            ("2020-03", "2020-02-01T00:00:00Z", "2020-05-01T00:00:00Z"),
+            ("2020-03-15", "2020-03-14T00:00:00Z", "2020-03-17T00:00:00Z"),
+            (
+                "2020-03-15T10:00Z",
+                "2020-03-15T09:50:00Z",
+                "2020-03-15T10:11:00Z",
+            ),
+            (
+                "2020-03-15T10:00:00Z",
+                "2020-03-15T09:59:50Z",
+                "2020-03-15T10:00:11Z",
+            ),
+        ] {
+            assert_eq!(
+                parsed(value).approx_window(res),
+                (utc(low), utc(high)),
+                "{value}"
+            );
+        }
+        // Kept inside the supported years.
+        assert_eq!(
+            parsed("0001").approx_window(res),
+            (open_start(), utc("0003-01-01T00:00:00Z"))
+        );
+        assert_eq!(parsed("9999").approx_window(res).1, open_end(res));
     }
 
     fn date_param(name: &str, value: &str) -> SearchParameter {
