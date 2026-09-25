@@ -5070,13 +5070,15 @@ mod count_routing_tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use chrono::{DateTime, Utc};
+    use chrono::{DateTime, NaiveDate, Utc};
     use helios_fhir::FhirVersion;
     use serde_json::Value;
 
     use super::{CompositeStorage, DynStorage};
     use crate::composite::config::CompositeConfig;
-    use crate::core::{BackendKind, ResourceStorage, WriteMarker};
+    use crate::core::{
+        BackendKind, DailyResourceCount, ResourceCountDelta, ResourceStorage, WriteMarker,
+    };
     use crate::error::{BackendError, StorageError, StorageResult};
     use crate::tenant::{TenantContext, TenantId, TenantPermissions};
     use crate::types::StoredResource;
@@ -5178,6 +5180,52 @@ mod count_routing_tests {
                 recent_writes: recent_since.map(|_| self.label.len() as u64),
             }))
         }
+
+        async fn count_by_day(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _since: DateTime<Utc>,
+        ) -> StorageResult<Vec<DailyResourceCount>> {
+            Ok(vec![DailyResourceCount {
+                day: NaiveDate::from_ymd_opt(2026, 9, 25).unwrap(),
+                count: self.label.len() as u64,
+            }])
+        }
+
+        async fn count_deltas_by_bucket(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            since: DateTime<Utc>,
+            _bucket_seconds: i64,
+        ) -> StorageResult<Vec<ResourceCountDelta>> {
+            Ok(vec![ResourceCountDelta {
+                bucket_start: since,
+                delta: self.label.len() as i64,
+            }])
+        }
+
+        async fn count_deltas_by_type_and_bucket(
+            &self,
+            _tenant: &TenantContext,
+            resource_types: &[&str],
+            since: DateTime<Utc>,
+            _bucket_seconds: i64,
+        ) -> StorageResult<Vec<(String, ResourceCountDelta)>> {
+            Ok(resource_types
+                .iter()
+                .map(|resource_type| {
+                    (
+                        resource_type.to_string(),
+                        ResourceCountDelta {
+                            bucket_start: since,
+                            delta: self.label.len() as i64,
+                        },
+                    )
+                })
+                .collect())
+        }
     }
 
     fn composite(primary_counts: bool, secondary_counts: bool) -> CompositeStorage {
@@ -5232,6 +5280,39 @@ mod count_routing_tests {
             .unwrap()
             .unwrap();
         assert_eq!(marker.recent_writes, Some("es".len() as u64));
+    }
+
+    #[tokio::test]
+    async fn the_time_series_follow_the_same_routing_as_the_totals() {
+        let since = Utc::now();
+        for (primary_counts, expected) in [(true, "primary"), (false, "es")] {
+            let composite = composite(primary_counts, true);
+            let days = composite
+                .count_by_day(&tenant(), "Patient", since)
+                .await
+                .unwrap();
+            assert_eq!(days[0].count, expected.len() as u64);
+            let deltas = composite
+                .count_deltas_by_bucket(&tenant(), "Patient", since, 3600)
+                .await
+                .unwrap();
+            assert_eq!(deltas[0].delta, expected.len() as i64);
+            let by_type = composite
+                .count_deltas_by_type_and_bucket(
+                    &tenant(),
+                    &["Patient", "Observation"],
+                    since,
+                    3600,
+                )
+                .await
+                .unwrap();
+            assert_eq!(by_type.len(), 2);
+            assert!(
+                by_type
+                    .iter()
+                    .all(|(_, delta)| delta.delta == expected.len() as i64)
+            );
+        }
     }
 
     #[tokio::test]
