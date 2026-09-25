@@ -27,6 +27,9 @@ pub(crate) const SEARCH_INDEX_COLLECTION: &str = "search_index";
 /// standard search never reads it, which is what excludes contained rows
 /// from a standard search by construction.
 pub(crate) const SEARCH_INDEX_CONTAINED_COLLECTION: &str = "search_index_contained";
+pub(crate) const COMPOSITE_SLOT_PROBE_INDEX: &str = "idx_search_composite_slot_probe";
+pub(crate) const CONTAINED_COMPOSITE_SLOT_PROBE_INDEX: &str =
+    "idx_search_contained_composite_slot_probe";
 
 /// Recorded in the `schema_version` document as `search_indexes.generation`
 /// once every [`IndexBuild::Background`] spec is present and the superseded
@@ -162,6 +165,19 @@ pub(crate) fn current_specs() -> Vec<SearchIndexSpec> {
             partial: None,
             build: IndexBuild::Inline,
         },
+        SearchIndexSpec {
+            name: COMPOSITE_SLOT_PROBE_INDEX,
+            keys: doc! {
+                "tenant_id": 1_i32,
+                "resource_type": 1_i32,
+                "param_name": 1_i32,
+                "composite_slot": 1_i32,
+            },
+            // Missing slots remain in this non-sparse index as null keys.
+            // Exclude ordinary search rows to keep the boot build small.
+            partial: Some(doc! { "composite_group": { "$exists": true } }),
+            build: IndexBuild::Inline,
+        },
     ]
 }
 
@@ -215,6 +231,17 @@ pub(crate) fn contained_specs() -> Vec<SearchIndexSpec> {
             name: "idx_search_contained_resource",
             keys: doc! { "tenant_id": 1_i32, "resource_type": 1_i32, "resource_id": 1_i32 },
             partial: None,
+            build: IndexBuild::Inline,
+        },
+        SearchIndexSpec {
+            name: CONTAINED_COMPOSITE_SLOT_PROBE_INDEX,
+            keys: doc! {
+                "tenant_id": 1_i32,
+                "contained_type": 1_i32,
+                "param_name": 1_i32,
+                "composite_slot": 1_i32,
+            },
+            partial: Some(doc! { "composite_group": { "$exists": true } }),
             build: IndexBuild::Inline,
         },
     ]
@@ -326,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn current_specs_are_nine_value_specs_plus_two_unchanged_and_no_contained() {
+    fn current_specs_include_inline_composite_slot_probe() {
         let names: Vec<&str> = current_specs().iter().map(|s| s.name).collect();
         assert_eq!(
             names,
@@ -342,20 +369,17 @@ mod tests {
                 "idx_search_identifier_type_v2",
                 "idx_search_composite",
                 "idx_search_resource",
+                COMPOSITE_SLOT_PROBE_INDEX,
             ]
         );
         assert_eq!(SEARCH_INDEX_GENERATION, 3);
     }
 
     #[test]
-    fn contained_specs_are_two_inline_plain_indexes_on_the_contained_collection() {
+    fn contained_specs_include_inline_composite_slot_probe() {
         let specs = contained_specs();
-        assert_eq!(specs.len(), 2);
-        assert!(
-            specs
-                .iter()
-                .all(|s| s.build == IndexBuild::Inline && s.partial.is_none())
-        );
+        assert_eq!(specs.len(), 3);
+        assert!(specs.iter().all(|s| s.build == IndexBuild::Inline));
         let by_name = |n: &str| specs.iter().find(|s| s.name == n).expect(n).clone();
         assert_eq!(
             by_name("idx_search_contained")
@@ -377,6 +401,20 @@ mod tests {
                 .keys()
                 .collect::<Vec<_>>(),
             vec!["tenant_id", "resource_type", "resource_id"]
+        );
+        let probe = by_name(CONTAINED_COMPOSITE_SLOT_PROBE_INDEX);
+        assert_eq!(
+            probe.keys.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec![
+                "tenant_id",
+                "contained_type",
+                "param_name",
+                "composite_slot"
+            ]
+        );
+        assert_eq!(
+            probe.partial,
+            Some(doc! { "composite_group": { "$exists": true } })
         );
         assert_eq!(SEARCH_INDEX_CONTAINED_COLLECTION, "search_index_contained");
     }
@@ -406,7 +444,7 @@ mod tests {
         let refs: Vec<&SearchIndexSpec> = specs.iter().collect();
         let cmd = create_indexes_command_for(SEARCH_INDEX_CONTAINED_COLLECTION, &refs);
         assert_eq!(cmd.get_str("createIndexes"), Ok("search_index_contained"));
-        assert_eq!(cmd.get_array("indexes").unwrap().len(), 2);
+        assert_eq!(cmd.get_array("indexes").unwrap().len(), 3);
     }
 
     #[test]
@@ -495,6 +533,19 @@ mod tests {
         );
         assert_eq!(resource.partial, None);
         assert_eq!(resource.build, IndexBuild::Inline);
+        let probe = specs
+            .iter()
+            .find(|s| s.name == COMPOSITE_SLOT_PROBE_INDEX)
+            .unwrap();
+        assert_eq!(
+            probe.keys.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["tenant_id", "resource_type", "param_name", "composite_slot"]
+        );
+        assert_eq!(
+            probe.partial,
+            Some(doc! { "composite_group": { "$exists": true } })
+        );
+        assert_eq!(probe.build, IndexBuild::Inline);
     }
 
     #[test]
