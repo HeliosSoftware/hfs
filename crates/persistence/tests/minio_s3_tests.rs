@@ -38,8 +38,8 @@ use uuid::Uuid;
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
 
-const DEFAULT_MINIO_IMAGE: &str = "quay.io/minio/minio";
-const DEFAULT_MINIO_TAG: &str = "RELEASE.2025-02-28T09-55-16Z";
+const DEFAULT_MINIO_IMAGE: &str = "ghcr.io/coollabsio/minio";
+const DEFAULT_MINIO_TAG: &str = "RELEASE.2025-10-15T17-29-55Z";
 const DEFAULT_MINIO_ROOT_USER: &str = "minioadmin";
 const DEFAULT_MINIO_ROOT_PASSWORD: &str = "minioadmin";
 

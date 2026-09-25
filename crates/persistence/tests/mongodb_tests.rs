@@ -541,6 +541,24 @@ async fn mongodb_minute_precision_stored_dates_are_indexed() {
     .await;
 }
 
+/// The backend-agnostic suite for Period and Timing range targets (#1391).
+/// Same `#[path]` arrangement.
+#[path = "search/date_period_suite.rs"]
+mod date_period_suite;
+
+/// #1391: a Period was indexed as two unrelated points, so `eq`/`ap`
+/// over-matched, `sa`/`eb` could match on the wrong end and an open end was
+/// an instant. It is one `[value_date, value_date_end)` range now. Needs the
+/// full registry so `Encounter.date` and friends extract.
+#[tokio::test]
+async fn mongodb_date_period_targets_are_ranges() {
+    let Some(backend) = create_backend_with_full_registry("date_period").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    date_period_suite::period_targets_are_ranges(&backend, "date-period-1391").await;
+}
+
 /// The backend-agnostic `_contained` suite (#1336, #1362, #1363). Same
 /// `#[path]` arrangement.
 #[path = "search/contained_suite.rs"]
@@ -592,6 +610,283 @@ async fn mongodb_contained_sort_and_id_only_contained() {
         return;
     };
     contained_suite::sort_and_id_only_contained(&backend, "contained-sort-1407").await;
+}
+
+/// #1407: composites under `_contained` are matched within one contained
+/// resource — a code pairs with the quantity of the *same* component, never
+/// across components or sibling contained resources. Strict: unlike the
+/// `criteria_are_applied_or_rejected` composite cases, which accept a refusal
+/// naming the parameter, these cases demand the answer. Mixed criteria must
+/// also match on the same contained resource.
+#[tokio::test]
+async fn mongodb_contained_composites_pair_within_one_resource() {
+    let Some(backend) = create_backend_with_full_registry("contained_comp").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    contained_suite::contained_composites_pair_within_one_resource(
+        &backend,
+        "contained-composites-1407",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mongodb_contained_repeated_type_composite_and_modifier() {
+    let Some(backend) = create_backend_with_full_registry("contained_comp_guard").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    contained_suite::repeated_type_composite_and_modifier(
+        &backend,
+        "contained-composite-guard-1407",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mongodb_repeated_type_composite_legacy_rows_require_reindex() {
+    use helios_persistence::search::{ReindexOperation, ReindexRequest, ReindexStatus};
+    use helios_persistence::types::ContainedMode;
+
+    let Some(backend) = create_backend_with_full_registry("repeated_slot_legacy").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    let tenant = create_tenant("repeated-slot-legacy");
+    let observation = json!({
+        "resourceType": "Observation", "id": "top", "status": "final",
+        "code": {"coding": [{"system": "http://loinc.org", "code": "A"}]},
+        "valueCodeableConcept": {"coding": [{"system": "http://example.org/value", "code": "B"}]}
+    });
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            observation.clone(),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let mut inside = observation;
+    inside["id"] = json!("inside");
+    backend
+        .create(
+            &tenant,
+            "DiagnosticReport",
+            json!({
+                "resourceType": "DiagnosticReport", "id": "report", "status": "final",
+                "code": {"coding": [{"system": "http://loinc.org", "code": "report"}]},
+                "contained": [inside]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let pair = |value: &str| SearchParameter {
+        name: "code-value-concept".to_string(),
+        param_type: SearchParamType::Composite,
+        values: vec![SearchValue::eq(value)],
+        components: vec![
+            CompositeSearchComponent {
+                param_type: SearchParamType::Token,
+                param_name: "code".to_string(),
+            },
+            CompositeSearchComponent {
+                param_type: SearchParamType::Token,
+                param_name: "value-concept".to_string(),
+            },
+        ],
+        ..Default::default()
+    };
+    let query = |value: &str, contained| {
+        let mut query = SearchQuery::new("Observation");
+        query.parameters.push(pair(value));
+        query.contained = contained;
+        query.count = Some(1);
+        query
+    };
+    assert_eq!(
+        backend
+            .search_count(&tenant, &query("A$B", ContainedMode::Off))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        backend
+            .search_count(&tenant, &query("B$A", ContainedMode::Off))
+            .await
+            .unwrap(),
+        0
+    );
+
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap();
+    let db = client.database(&backend.config().database_name);
+    let own = db.collection::<Document>("search_index");
+    let held = db.collection::<Document>("search_index_contained");
+    let own_key = doc! {"tenant_id": tenant.tenant_id().as_str(), "resource_type": "Observation", "resource_id": "top", "param_name": "code-value-concept"};
+    let held_key = doc! {"tenant_id": tenant.tenant_id().as_str(), "resource_type": "DiagnosticReport", "contained_type": "Observation", "param_name": "code-value-concept"};
+    assert_eq!(
+        own.update_many(own_key.clone(), doc! {"$unset": {"composite_slot": ""}})
+            .await
+            .unwrap()
+            .modified_count,
+        2
+    );
+    for outcome in [
+        backend
+            .search(&tenant, &query("A$B", ContainedMode::Off))
+            .await
+            .map(|_| ()),
+        backend
+            .search_count(&tenant, &query("A$B", ContainedMode::Off))
+            .await
+            .map(|_| ()),
+    ] {
+        let error = outcome.expect_err("legacy primary index must fail closed");
+        assert!(error.to_string().contains("$reindex"), "{error:?}");
+    }
+
+    let transaction_entry = |value: &str| BundleEntry {
+        method: BundleMethod::Post,
+        url: "Observation".to_string(),
+        resource: Some(
+            json!({"resourceType": "Observation", "status": "final", "code": {"coding": [{"code": "new"}]}}),
+        ),
+        if_match: None,
+        if_none_match: None,
+        if_none_exist: Some(format!("code-value-concept={value}")),
+        full_url: None,
+    };
+    let error = backend
+        .process_transaction(
+            &tenant,
+            vec![transaction_entry("A$B")],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("legacy transactional index must fail closed");
+    assert!(error.to_string().contains("$reindex"), "{error:?}");
+
+    assert_eq!(
+        held.update_many(held_key.clone(), doc! {"$unset": {"composite_slot": ""}})
+            .await
+            .unwrap()
+            .modified_count,
+        2
+    );
+    for mode in [ContainedMode::On, ContainedMode::Both] {
+        for outcome in [
+            backend
+                .search(&tenant, &query("A$B", mode))
+                .await
+                .map(|_| ()),
+            backend
+                .search_count(&tenant, &query("A$B", mode))
+                .await
+                .map(|_| ()),
+        ] {
+            let error = outcome.expect_err("legacy contained index must fail closed");
+            assert!(
+                error.to_string().contains("$reindex"),
+                "{mode:?}: {error:?}"
+            );
+        }
+    }
+    // A tenant-wide rebuild covers both the top-level Observation and the
+    // DiagnosticReport that owns the contained Observation.
+    let registries = backend.tenant_registries().clone();
+    let backend = Arc::new(backend);
+    let reindex = ReindexOperation::new(backend.clone(), registries);
+    let job = reindex
+        .start(
+            tenant.clone(),
+            ReindexRequest {
+                clear_existing: false,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let progress = tokio::time::timeout(tokio::time::Duration::from_secs(30), async {
+        loop {
+            let progress = reindex.get_progress(&job).await.unwrap();
+            if !progress.status.is_running() {
+                break progress;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("tenant reindex timed out");
+    assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+    assert!(progress.errors.is_empty(), "{progress:?}");
+    assert!(progress.processed_resources >= 2, "{progress:?}");
+
+    assert_eq!(
+        backend
+            .search_count(&tenant, &query("A$B", ContainedMode::Off))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        backend
+            .search_count(&tenant, &query("B$A", ContainedMode::Off))
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        backend
+            .search_count(&tenant, &query("A$B", ContainedMode::On))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        backend
+            .search_count(&tenant, &query("B$A", ContainedMode::On))
+            .await
+            .unwrap(),
+        0
+    );
+    let matched = backend
+        .process_transaction(
+            &tenant,
+            vec![transaction_entry("A$B")],
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(matched.entries[0].status, 200);
+    let swapped = backend
+        .process_transaction(
+            &tenant,
+            vec![transaction_entry("B$A")],
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(swapped.entries[0].status, 201);
+}
+
+// Strict `_contained=both` dedup (#1407): a container of the searched type
+// that also matches top-level is listed and counted once. Fails while the
+// overlap is deduped per top-level page and double-counted in `_total`.
+#[tokio::test]
+async fn mongodb_contained_both_dedups_container_also_matching_top_level() {
+    let Some(backend) = create_backend_with_full_registry("contained_both").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    contained_suite::both_dedups_container_also_matching_top_level(&backend, "contained-both-1407")
+        .await;
 }
 
 /// The backend-agnostic suite for exponent-form number and quantity search
@@ -5173,11 +5468,31 @@ async fn mongodb_integration_contained_both_dedupes_a_container_that_is_also_a_t
         vec!["Patient/dual", "Observation/obs-holder"],
         "dual must appear once, top-level first"
     );
-    // total = top_total (1: dual) + contained_total (2: dual and
-    // obs-holder, both matched as containers before de-duplication) = 3.
-    // A dual match is counted in both sources — this is the documented
-    // trade-off of paging each source on the server independently.
-    assert_eq!(r.total, Some(3));
+    // The overlap contributes once to both the result set and its count.
+    assert_eq!(r.total, Some(2));
+    assert_eq!(backend.search_count(&tenant, &q).await.unwrap(), 2);
+
+    // Paging across the top-level/contained boundary must not return the
+    // overlapping container again or leave an empty slot on the second page.
+    q.count = Some(1);
+    for (offset, expected) in [
+        (0, vec!["Patient/dual"]),
+        (1, vec!["Observation/obs-holder"]),
+        (2, vec![]),
+    ] {
+        q.offset = Some(offset);
+        let page = backend.search(&tenant, &q).await.unwrap();
+        assert_eq!(
+            page.resources
+                .items
+                .iter()
+                .map(|x| x.url())
+                .collect::<Vec<_>>(),
+            expected,
+            "unexpected page at offset {offset}"
+        );
+        assert_eq!(page.total, Some(2), "wrong total at offset {offset}");
+    }
 }
 
 #[tokio::test]
@@ -7691,6 +8006,94 @@ async fn mongodb_integration_conditional_update_delete_and_no_match() {
         read_after_delete,
         Err(StorageError::Resource(ResourceError::Gone { .. }))
     ));
+}
+
+/// #1344: a criterion naming a search parameter the server does not know
+/// (`identifer` for `identifier`) used to match nothing, so a conditional
+/// create made a duplicate and a conditional delete answered as if there had
+/// been nothing to delete. It is refused, and nothing is written.
+#[tokio::test]
+async fn mongodb_integration_conditional_writes_refuse_an_unknown_parameter() {
+    let Some(backend) = create_backend_with_full_registry("conditional_unknown_parameter").await
+    else {
+        eprintln!(
+            "Skipping mongodb_integration_conditional_writes_refuse_an_unknown_parameter (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-conditional-unknown-parameter");
+    let criteria = "identifer=http://hospital.org/mrn|MRN-UNKNOWN-1";
+    let patient = json!({
+        "resourceType": "Patient",
+        "identifier": [{"system": "http://hospital.org/mrn", "value": "MRN-UNKNOWN-1"}],
+        "name": [{"family": "Original"}],
+    });
+
+    backend
+        .create(&tenant, "Patient", patient.clone(), FhirVersion::default())
+        .await
+        .unwrap();
+
+    let is_refused = |error: &StorageError, context: &str| {
+        assert!(
+            matches!(
+                error,
+                StorageError::Search(SearchError::QueryParseError { message })
+                    if message.contains("'identifer'")
+            ),
+            "{context}: expected a QueryParseError naming 'identifer', got {error:?}"
+        );
+    };
+
+    let created = backend
+        .conditional_create(
+            &tenant,
+            "Patient",
+            patient.clone(),
+            criteria,
+            FhirVersion::default(),
+        )
+        .await;
+    is_refused(
+        &created.expect_err("conditional create"),
+        "conditional create",
+    );
+
+    let updated = backend
+        .conditional_update(
+            &tenant,
+            "Patient",
+            patient,
+            criteria,
+            true,
+            FhirVersion::default(),
+            &helios_persistence::core::EntityTagPrecondition::Absent,
+        )
+        .await;
+    is_refused(
+        &updated.expect_err("conditional update"),
+        "conditional update",
+    );
+
+    let deleted = backend
+        .conditional_delete(
+            &tenant,
+            "Patient",
+            criteria,
+            &helios_persistence::core::EntityTagPrecondition::Absent,
+        )
+        .await;
+    is_refused(
+        &deleted.expect_err("conditional delete"),
+        "conditional delete",
+    );
+
+    assert_eq!(
+        backend.count(&tenant, Some("Patient")).await.unwrap(),
+        1,
+        "nothing was written or deleted"
+    );
 }
 
 #[tokio::test]
@@ -14312,27 +14715,17 @@ async fn mongodb_integration_boot_creates_only_inline_search_indexes_and_keeps_g
     let client = raw_test_client(&connection_string).await.unwrap();
     let db = client.database(&config.database_name);
     let names = search_index_names(&db).await;
-    assert_eq!(
-        names,
-        vec!["_id_", "idx_search_composite", "idx_search_resource"]
-    );
+    assert_eq!(names, expected_inline_names());
 
-    // Generation 3: the contained collection gets its two indexes inline too.
+    // Generation 3: the contained collection gets its three indexes inline too.
     let contained_names = index_names(&db, "search_index_contained").await;
-    assert_eq!(
-        contained_names,
-        vec![
-            "_id_",
-            "idx_search_contained",
-            "idx_search_contained_resource"
-        ]
-    );
+    assert_eq!(contained_names, expected_contained_names());
 
     // A record written by the builder must survive the next boot.
     db.collection::<Document>("schema_version")
         .update_one(
             doc! { "_id": "schema_version" },
-            doc! { "$set": { "search_indexes": { "generation": 3_i32 } } },
+            doc! { "$set": { "search_indexes": { "generation": 4_i32 } } },
         )
         .await
         .unwrap();
@@ -14349,7 +14742,7 @@ async fn mongodb_integration_boot_creates_only_inline_search_indexes_and_keeps_g
         doc.get_document("search_indexes")
             .unwrap()
             .get_i32("generation"),
-        Ok(3)
+        Ok(4)
     );
 }
 
@@ -14423,8 +14816,9 @@ async fn seed_generation1_indexes(db: &mongodb::Database) {
 /// Generation 3: `idx_search_contained` is no longer a `search_index`
 /// background spec (#1160) — it now lives inline on `search_index_contained`
 /// (see [`index_names`] calls against that collection instead).
+/// Generation 4: `idx_search_date_v3` replaces `idx_search_date_v2` (#1391).
 const CURRENT_BACKGROUND_NAMES: [&str; 9] = [
-    "idx_search_date_v2",
+    "idx_search_date_v3",
     "idx_search_identifier_type_v2",
     "idx_search_number_v2",
     "idx_search_quantity_v2",
@@ -14435,12 +14829,38 @@ const CURRENT_BACKGROUND_NAMES: [&str; 9] = [
     "idx_search_uri_v2",
 ];
 
+const CURRENT_INLINE_NAMES: [&str; 3] = [
+    "idx_search_composite",
+    "idx_search_composite_slot_probe",
+    "idx_search_resource",
+];
+
+const CURRENT_CONTAINED_NAMES: [&str; 3] = [
+    "idx_search_contained",
+    "idx_search_contained_composite_slot_probe",
+    "idx_search_contained_resource",
+];
+
+fn expected_inline_names() -> Vec<String> {
+    let mut names = vec!["_id_".to_string()];
+    names.extend(CURRENT_INLINE_NAMES.map(String::from));
+    names.sort();
+    names
+}
+
+fn expected_contained_names() -> Vec<String> {
+    let mut names = vec!["_id_".to_string()];
+    names.extend(CURRENT_CONTAINED_NAMES.map(String::from));
+    names.sort();
+    names
+}
+
 fn expected_current_names() -> Vec<String> {
     let mut all: Vec<String> = CURRENT_BACKGROUND_NAMES
         .iter()
         .map(|s| s.to_string())
         .collect();
-    all.extend(["_id_", "idx_search_composite", "idx_search_resource"].map(String::from));
+    all.extend(expected_inline_names());
     all.sort();
     all
 }
@@ -14521,15 +14941,11 @@ async fn mongodb_integration_builder_fresh_database_ends_with_generation2_set() 
     }
     let db = raw_test_client(&cs).await.unwrap().database(&db_name);
     assert_eq!(search_index_names(&db).await, expected_current_names());
-    // The contained collection's two inline indexes, built by
+    // The contained collection's three inline indexes, built by
     // `initialize_schema_async` (Task 3), independent of the builder.
     assert_eq!(
         index_names(&db, "search_index_contained").await,
-        vec![
-            "_id_",
-            "idx_search_contained",
-            "idx_search_contained_resource"
-        ]
+        expected_contained_names()
     );
     let record = db
         .collection::<Document>("schema_version")
@@ -14542,7 +14958,7 @@ async fn mongodb_integration_builder_fresh_database_ends_with_generation2_set() 
             .get_document("search_indexes")
             .unwrap()
             .get_i32("generation"),
-        Ok(3)
+        Ok(4)
     );
 }
 
@@ -14612,6 +15028,62 @@ async fn mongodb_integration_builder_upgrades_a_generation1_database_and_drops_v
             .items
             .len(),
         5
+    );
+}
+
+/// #1391: a generation-3 database carries `idx_search_date_v2`, keyed on
+/// `value_date` alone. The builder must build `idx_search_date_v3` (and only
+/// that), then drop `idx_search_date_v2`, and record generation 4.
+#[tokio::test]
+async fn mongodb_integration_builder_upgrades_a_generation3_database_and_drops_date_v2() {
+    let Some(cs) = shared_mongo::connection_string().await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let db_name = build_test_database_name("builder_upgrade_g3");
+    let db = raw_test_client(&cs).await.unwrap().database(&db_name);
+    // Generation 4 fully built, then staged back to generation 3: drop the
+    // date index and put back the generation-2 one, exactly as it was.
+    let first = boot_with_mode(&cs, &db_name, IndexBuildMode::Inline).await;
+    assert!(matches!(
+        first.wait_for_search_index_build().await,
+        Some(BuildOutcome::Built { .. })
+    ));
+    let search_index = db.collection::<Document>("search_index");
+    search_index.drop_index("idx_search_date_v3").await.unwrap();
+    db.run_command(doc! { "createIndexes": "search_index", "indexes": [{
+        "key": { "tenant_id": 1, "resource_type": 1, "param_name": 1, "value_date": 1, "resource_id": 1 },
+        "name": "idx_search_date_v2",
+        "partialFilterExpression": { "value_date": { "$exists": true } },
+    }]})
+    .await
+    .unwrap();
+
+    let backend = boot_with_mode(&cs, &db_name, IndexBuildMode::Inline).await;
+    let outcome = backend
+        .wait_for_search_index_build()
+        .await
+        .expect("builder ran");
+    assert_eq!(
+        outcome,
+        BuildOutcome::Built {
+            created: vec!["idx_search_date_v3".to_string()],
+            dropped: vec!["idx_search_date_v2".to_string()],
+        }
+    );
+    assert_eq!(search_index_names(&db).await, expected_current_names());
+    let record = db
+        .collection::<Document>("schema_version")
+        .find_one(doc! { "_id": "schema_version" })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record
+            .get_document("search_indexes")
+            .unwrap()
+            .get_i32("generation"),
+        Ok(4)
     );
 }
 
@@ -14690,11 +15162,7 @@ async fn mongodb_integration_builder_moves_contained_rows_and_drops_the_old_part
     );
     assert_eq!(
         index_names(&db, "search_index_contained").await,
-        vec![
-            "_id_",
-            "idx_search_contained",
-            "idx_search_contained_resource"
-        ]
+        expected_contained_names()
     );
     let sv = db
         .collection::<Document>("schema_version")
@@ -14703,7 +15171,7 @@ async fn mongodb_integration_builder_moves_contained_rows_and_drops_the_old_part
         .unwrap()
         .unwrap();
     let si = sv.get_document("search_indexes").unwrap();
-    assert_eq!(si.get_i32("generation"), Ok(3));
+    assert_eq!(si.get_i32("generation"), Ok(4));
     assert_eq!(si.get_bool("contained_rows_moved"), Ok(true));
 
     // Second boot: nothing to move, nothing to build.
@@ -14732,7 +15200,7 @@ async fn mongodb_integration_builder_refuses_to_touch_a_conflicting_v2_name() {
     seed_generation1_indexes(&db).await;
     // A person built something under our name with different keys.
     db.run_command(doc! { "createIndexes": "search_index", "indexes": [
-        { "key": { "tenant_id": 1, "value_date": 1 }, "name": "idx_search_date_v2" }
+        { "key": { "tenant_id": 1, "value_date": 1 }, "name": "idx_search_date_v3" }
     ]})
     .await
     .unwrap();
@@ -14751,7 +15219,7 @@ async fn mongodb_integration_builder_refuses_to_touch_a_conflicting_v2_name() {
         .await
         .expect_err("a conflicting v2 index must fail inline boot");
     let message = format!("{err}");
-    assert!(message.contains("idx_search_date_v2"), "{message}");
+    assert!(message.contains("idx_search_date_v3"), "{message}");
     let names = search_index_names(&db).await;
     assert!(
         names.contains(&"idx_search_string".to_string()),
@@ -14785,14 +15253,10 @@ async fn mongodb_integration_builder_off_mode_warns_and_changes_nothing() {
     missing.sort();
     assert_eq!(missing, CURRENT_BACKGROUND_NAMES.map(String::from).to_vec());
     // `off` mode changes nothing about the background (generation-2/v1)
-    // indexes the builder is responsible for; the two inline-class specs
-    // (`idx_search_composite`, `idx_search_resource`) are still created by
+    // indexes the builder is responsible for; the three inline specs are still created by
     // `initialize_schema_async` on every boot regardless of build mode (Task 3).
     let mut expected = before;
-    expected.extend([
-        "idx_search_composite".to_string(),
-        "idx_search_resource".to_string(),
-    ]);
+    expected.extend(CURRENT_INLINE_NAMES.map(String::from));
     expected.sort();
     assert_eq!(search_index_names(&db).await, expected);
 }
@@ -14955,17 +15419,17 @@ async fn mongodb_integration_builder_second_boot_issues_no_create_indexes() {
          search_index); this assertion cannot be trusted until profiling is confirmed working"
     );
 
-    let generation2_created = db
+    let background_created = db
         .collection::<Document>("system.profile")
         .count_documents(doc! {
             "command.createIndexes": "search_index",
-            "command.indexes.name": { "$regex": "_v2$|^idx_search_contained$" },
+            "command.indexes.name": { "$regex": "_v2$|_v3$|^idx_search_contained$" },
         })
         .await
         .unwrap();
     assert_eq!(
-        generation2_created, 0,
-        "second boot must not issue createIndexes for any generation-2 search_index index"
+        background_created, 0,
+        "second boot must not issue createIndexes for any generation-2/-4 search_index index"
     );
 }
 
@@ -15026,8 +15490,12 @@ async fn assert_search_index_ops_are_covered(
     }
 }
 
+/// #1391: date rows are ranges `[value_date, value_date_end)`, so a date
+/// search bounds `value_date`, `value_date_end`, or both. Every prefix shape
+/// (`ge`, `le` and `ne` included) and a comma list must still be a covered
+/// scan on `idx_search_date_v3`, which carries both.
 #[tokio::test]
-async fn mongodb_integration_date_range_search_is_a_covered_v2_scan() {
+async fn mongodb_integration_date_range_search_is_a_covered_v3_scan() {
     let Some(backend) = create_backend_with_full_registry("covered_date").await else {
         eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
         return;
@@ -15052,23 +15520,230 @@ async fn mongodb_integration_date_range_search_is_a_covered_v2_scan() {
         .await
         .unwrap()
         .database(&backend.config().database_name);
-    let q = SearchQuery::new("Observation").with_parameter(SearchParameter {
-        name: "date".into(),
-        param_type: SearchParamType::Date,
-        modifier: None,
-        values: vec![SearchValue::parse("ge2016-01-10")],
-        chain: vec![],
-        components: vec![],
-    });
-    assert_search_index_ops_are_covered(
-        &db,
-        async {
-            let r = backend.search(&tenant, &q).await.unwrap();
-            assert_eq!(r.resources.items.len(), 11);
-        },
-        "idx_search_date_v2",
-    )
-    .await;
+    // `gt` bounds only the end, `eq` and `eb` both ends, and `ge`, `le`, `ne`
+    // have two alternatives, which are sent as an `$or` at the top of the
+    // filter so that each arm is a covered scan too. Comma lists ride the
+    // same top-level `$or`.
+    for (value, expected) in [
+        ("gt2016-01-10", 10),
+        ("2016-01-10", 1),
+        ("eb2016-01-10", 9),
+        ("ge2016-01-10", 11),
+        ("le2016-01-10", 10),
+        ("ne2016-01-10", 19),
+        ("ge2016-01-19,lt2016-01-03", 4),
+    ] {
+        let values: Vec<SearchValue> = value.split(',').map(SearchValue::parse).collect();
+        let q = SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "date".into(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values,
+            chain: vec![],
+            components: vec![],
+        });
+        // Each search is profiled on its own: the helper reads every
+        // `search_index` op in `system.profile`, so clear it between runs.
+        let _ = db.run_command(doc! { "profile": 0_i32 }).await;
+        let _ = db.collection::<Document>("system.profile").drop().await;
+        assert_search_index_ops_are_covered(
+            &db,
+            async {
+                let r = backend.search(&tenant, &q).await.unwrap();
+                assert_eq!(r.resources.items.len(), expected, "date={value}");
+            },
+            "idx_search_date_v3",
+        )
+        .await;
+    }
+}
+
+/// The ids a `date` search returns, sorted; each inner list is one occurrence
+/// of the parameter (`date=a,b&date=c` is `[[a, b], [c]]`).
+async fn date_search_ids(
+    backend: &MongoBackend,
+    tenant: &TenantContext,
+    occurrences: &[&str],
+) -> Vec<String> {
+    let mut q = SearchQuery::new("Observation");
+    for occurrence in occurrences {
+        q = q.with_parameter(SearchParameter {
+            name: "date".into(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: occurrence.split(',').map(SearchValue::parse).collect(),
+            chain: vec![],
+            components: vec![],
+        });
+    }
+    let mut ids: Vec<String> = backend
+        .search(tenant, &q)
+        .await
+        .unwrap()
+        .resources
+        .items
+        .iter()
+        .map(|r| r.id().to_string())
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// #1391: `ge`, `le` and `ne` moved their `$or` to the top of the filter to
+/// be covered scans. That must not change what a comma list (OR) or a
+/// repeated parameter (AND) return, nor how a Period is read.
+#[tokio::test]
+async fn mongodb_integration_date_or_and_semantics_survive_top_level_or() {
+    let Some(backend) = create_backend_with_full_registry("date_or_and").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-date-or-and");
+    for year in 2015..=2022 {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation", "id": format!("y{year}"), "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "8302-2" }] },
+                    "effectiveDateTime": year.to_string()
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    // A Period from mid-2019 to March 2020: in neither year, over both.
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation", "id": "period", "status": "final",
+                "code": { "coding": [{ "system": "http://loinc.org", "code": "8302-2" }] },
+                "effectivePeriod": { "start": "2019-06", "end": "2020-03" }
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let ids = |list: &[&str]| -> Vec<String> {
+        let mut v: Vec<String> = list.iter().map(|s| s.to_string()).collect();
+        v.sort();
+        v
+    };
+    let ge2020_or_lt2019 = ids(&[
+        "y2015", "y2016", "y2017", "y2018", "y2020", "y2021", "y2022",
+    ]);
+    // A comma list is an OR, in either order.
+    assert_eq!(
+        date_search_ids(&backend, &tenant, &["ge2020,lt2019"]).await,
+        ge2020_or_lt2019
+    );
+    assert_eq!(
+        date_search_ids(&backend, &tenant, &["lt2019,ge2020"]).await,
+        ge2020_or_lt2019
+    );
+    // Every value of the list is one of the alternatives: `ne2019` or `eq2019`
+    // is everything.
+    assert_eq!(
+        date_search_ids(&backend, &tenant, &["ne2019,2019"])
+            .await
+            .len(),
+        9
+    );
+    // Repeated parameters are an AND: `ge2018` and `lt2021`.
+    assert_eq!(
+        date_search_ids(&backend, &tenant, &["ge2018", "lt2021"]).await,
+        ids(&["period", "y2018", "y2019", "y2020"])
+    );
+    // A comma list ANDed with another occurrence.
+    assert_eq!(
+        date_search_ids(&backend, &tenant, &["ge2020,lt2019", "ne2016"]).await,
+        ids(&["y2015", "y2017", "y2018", "y2020", "y2021", "y2022"])
+    );
+    // The Period alone, per prefix: it is over 2019 and 2020 but neither
+    // starts after nor ends before them.
+    assert!(
+        date_search_ids(&backend, &tenant, &["ge2019"])
+            .await
+            .contains(&"period".to_string())
+    );
+    assert!(
+        !date_search_ids(&backend, &tenant, &["ge2020"])
+            .await
+            .contains(&"period".to_string())
+    );
+    assert!(
+        date_search_ids(&backend, &tenant, &["ne2019"])
+            .await
+            .contains(&"period".to_string())
+    );
+    assert!(
+        !date_search_ids(&backend, &tenant, &["le2019"])
+            .await
+            .contains(&"period".to_string())
+    );
+}
+
+/// #1391: a `Period` with an `end` that is not a valid date is dropped whole
+/// (the shared extractor's one rule for every backend), never indexed as open
+/// above; a readable one keeps the range it names.
+#[tokio::test]
+async fn mongodb_integration_period_with_unreadable_end_is_dropped_not_open() {
+    let Some(backend) = create_backend_with_full_registry("date_unreadable_end").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-date-unreadable-end");
+    for (id, end) in [
+        ("readable", "2020-06-01T10:00:00Z"),
+        ("garbage", "not-a-date"),
+    ] {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation", "id": id, "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "8302-2" }] },
+                    "effectivePeriod": { "start": "2020-01-01", "end": end }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    // The readable one ends where its text says: inside 2020, after 09:00 that
+    // day, not after the next day.
+    let eq2020 = date_search_ids(&backend, &tenant, &["2020"]).await;
+    assert!(eq2020.contains(&"readable".to_string()), "{eq2020:?}");
+    assert!(!eq2020.contains(&"garbage".to_string()), "{eq2020:?}");
+    assert_eq!(
+        date_search_ids(&backend, &tenant, &["gt2020-06-01T09:00:00Z"])
+            .await
+            .into_iter()
+            .filter(|id| id == "readable")
+            .count(),
+        1
+    );
+    assert!(
+        !date_search_ids(&backend, &tenant, &["gt2020-06-02"])
+            .await
+            .contains(&"readable".to_string())
+    );
+    // The unreadable end is not open above, and its Period is not found by
+    // its start either.
+    assert!(
+        date_search_ids(&backend, &tenant, &["gt2030"])
+            .await
+            .is_empty()
+    );
+    let lt2021 = date_search_ids(&backend, &tenant, &["lt2021"]).await;
+    assert!(lt2021.contains(&"readable".to_string()), "{lt2021:?}");
+    assert!(!lt2021.contains(&"garbage".to_string()), "{lt2021:?}");
 }
 
 #[tokio::test]
@@ -15181,6 +15856,97 @@ async fn mongodb_integration_missing_false_search_is_a_covered_v2_scan() {
 // so they need `create_backend_with_full_registry` only to make sure the
 // *extractor* decomposes composites into per-component rows the same way the
 // real R4 registry does on write.
+
+/// Both index collections retain the token component position for a registered
+/// token + token composite. Ordinary token rows have no composite slot.
+#[tokio::test]
+async fn mongodb_integration_composite_slots_written_to_both_index_collections() {
+    let Some(backend) = create_backend_with_full_registry("composite_slots").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-composite-slots");
+    let observation = json!({
+        "resourceType": "Observation",
+        "id": "own",
+        "status": "final",
+        "code": {"coding": [{"system": "http://example.org/code", "code": "A"}]},
+        "valueCodeableConcept": {
+            "coding": [{"system": "http://example.org/value", "code": "B"}]
+        }
+    });
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            observation.clone(),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed top-level Observation");
+    let mut contained_observation = observation;
+    contained_observation["id"] = json!("inside");
+    backend
+        .create(
+            &tenant,
+            "DiagnosticReport",
+            json!({
+                "resourceType": "DiagnosticReport",
+                "id": "holder",
+                "status": "final",
+                "code": {"text": "panel"},
+                "contained": [contained_observation]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed contained Observation");
+
+    let db = raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap()
+        .database(&backend.config().database_name);
+    for (collection, resource_type, resource_id) in [
+        ("search_index", "Observation", "own"),
+        ("search_index_contained", "DiagnosticReport", "holder"),
+    ] {
+        let index = db.collection::<Document>(collection);
+        let mut filter = doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": resource_type,
+            "resource_id": resource_id,
+            "param_name": "code-value-concept",
+        };
+        if collection == "search_index_contained" {
+            filter.insert("contained_type", "Observation");
+            filter.insert("contained_local_id", "inside");
+        }
+        assert_eq!(
+            index.count_documents(filter.clone()).await.unwrap(),
+            2,
+            "{collection} must have exactly two code-value-concept rows"
+        );
+        for (code, slot) in [("A", 1), ("B", 2)] {
+            let mut component_filter = filter.clone();
+            component_filter.insert("value_token_code", code);
+            let row = index
+                .find_one(component_filter)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("missing {code} row in {collection}"));
+            assert_eq!(row.get_i32("composite_group"), Ok(0));
+            assert_eq!(row.get_i32("composite_slot"), Ok(slot));
+        }
+
+        filter.insert("param_name", "code");
+        let ordinary = index
+            .find_one(filter)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("missing ordinary code row in {collection}"));
+        assert!(!ordinary.contains_key("composite_slot"));
+    }
+}
 
 /// Builds a `code-value-quantity` composite query with the component types
 /// the registry supplies for `Observation` (Token code, Quantity value).
@@ -15739,46 +16505,56 @@ async fn mongodb_integration_composite_conditional_create_matches_existing() {
     }
 }
 
-/// Fix 3 (blocking): `_contained` combined with a composite parameter must
-/// be a clear 400, not a silent partial filter -- `matching_contained`
-/// skips `Composite` params entirely, so `_contained=both` would otherwise
-/// filter only its top-level half by the composite and let the contained
-/// half ignore it.
+/// A supported token + quantity composite applies to contained resources
+/// under `_contained=both`, including the count path.
 #[tokio::test]
-async fn mongodb_integration_contained_rejects_composite_parameter() {
+async fn mongodb_integration_contained_matches_composite_parameter() {
     use helios_persistence::types::ContainedMode;
 
     let Some(backend) = create_backend_with_full_registry("contained_composite").await else {
         eprintln!(
-            "Skipping mongodb_integration_contained_rejects_composite_parameter (requires Docker or HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_contained_matches_composite_parameter (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
     let tenant = create_tenant("tenant-contained-composite");
+    backend
+        .create(
+            &tenant,
+            "DiagnosticReport",
+            json!({
+                "resourceType": "DiagnosticReport",
+                "id": "container",
+                "status": "final",
+                "code": {"text": "panel"},
+                "contained": [{
+                    "resourceType": "Observation",
+                    "id": "height",
+                    "status": "final",
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "8302-2"}]},
+                    "valueQuantity": {"value": 170, "system": "http://unitsofmeasure.org", "code": "cm"}
+                }]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed contained height");
 
     let mut query = code_value_quantity_query("http://loinc.org|8302-2$gt150");
     query.contained = ContainedMode::Both;
 
-    let err = backend
+    let found = backend
         .search(&tenant, &query)
         .await
-        .expect_err("composite + _contained=both must be rejected, not silently under-filtered");
-    assert!(
-        matches!(
-            err,
-            StorageError::Search(SearchError::InvalidComposite { .. })
-        ),
-        "expected InvalidComposite, got {err:?}"
-    );
+        .expect("supported composite under _contained=both");
+    assert_eq!(found.resources.items.len(), 1);
+    assert_eq!(found.resources.items[0].id(), "container");
 
-    let count_err = backend
+    let count = backend
         .search_count(&tenant, &query)
         .await
-        .expect_err("search_count must reject the same combination");
-    assert!(matches!(
-        count_err,
-        StorageError::Search(SearchError::InvalidComposite { .. })
-    ));
+        .expect("count supported composite under _contained=both");
+    assert_eq!(count, 1);
 }
 
 /// Fix 5 test gap: `:not` on a composite parameter must be rejected by
