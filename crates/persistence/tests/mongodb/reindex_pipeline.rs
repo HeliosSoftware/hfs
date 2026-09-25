@@ -1238,6 +1238,7 @@ async fn mongodb_integration_reindex_page_overlapped_keeps_rows_of_completed_sub
         .write_search_entries_page_timed(&tenant, &page, &mut stats)
         .await;
     failpoint.off().await;
+    assert!(stats.sub_batches >= 2, "{stats:?}");
 
     assert!(outcomes.iter().all(|o| o.is_err()), "{outcomes:?}");
 
