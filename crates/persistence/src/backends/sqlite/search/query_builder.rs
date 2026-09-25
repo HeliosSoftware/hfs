@@ -984,7 +984,9 @@ impl QueryBuilder {
         // a value that is not a date binds none.
         let mut offset = param_offset;
         for value in values {
-            let cond = DateHandler::build_sql(value, offset);
+            // `_lastUpdated` is an instant on the resource row: a point
+            // comparison, not the range a date parameter's index row holds.
+            let cond = DateHandler::build_point_sql("last_updated", value, offset);
             if !cond.is_empty() {
                 offset += cond.params.len();
                 conditions.push(cond);
@@ -1003,7 +1005,7 @@ impl QueryBuilder {
         Some(SqlFragment::with_params(
             format!(
                 "resource_key IN (SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND ({}))",
-                combined.sql.replace("value_date", "last_updated")
+                combined.sql
             ),
             combined.params,
         ))
@@ -1200,9 +1202,14 @@ impl QueryBuilder {
         let column = directive.param_type.and_then(sort_value_column);
         match column {
             Some(col) => {
-                let agg = match directive.direction {
-                    crate::types::SortDirection::Ascending => "MIN",
-                    crate::types::SortDirection::Descending => "MAX",
+                let (agg, col) = match directive.direction {
+                    crate::types::SortDirection::Ascending => ("MIN", col),
+                    // A date row is a range (#1391): descending sorts on where
+                    // the latest one ends, not where it starts.
+                    crate::types::SortDirection::Descending if col == "value_date" => {
+                        ("MAX", "value_date_end")
+                    }
+                    crate::types::SortDirection::Descending => ("MAX", col),
                 };
                 format!(
                     "(SELECT {}({}) FROM search_index si WHERE si.tenant_id = ?1 AND si.resource_type = ?2 AND si.resource_key = resources.rowid AND si.param_name = '{}')",
