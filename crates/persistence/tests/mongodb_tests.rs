@@ -10111,6 +10111,197 @@ async fn mongodb_integration_settings_delete_is_idempotent() {
     assert!(!backend.delete_settings(&user).await.unwrap());
 }
 
+// ── Web UI login sessions (#1481) ──────────────────────────────────────
+//
+// The `SessionPersistence` contract the auth crate's `SessionStore` relies
+// on: conditional writes by version, pending logins consumed exactly once,
+// kinds kept apart, and a sweep by `expires_at`.
+
+fn login_session(id: &str) -> helios_auth::PersistedSession {
+    let now = chrono::Utc::now();
+    helios_auth::PersistedSession {
+        id: id.to_string(),
+        principal: helios_auth::SessionPrincipal {
+            subject: "demo-sub".to_string(),
+            issuer: "https://idp".to_string(),
+            name: Some("Demo User".to_string()),
+            preferred_username: None,
+            email: None,
+            picture: None,
+        },
+        access_token: "at-1".to_string(),
+        access_expires_at: now + chrono::TimeDelta::minutes(5),
+        refresh_token: Some("rt-1".to_string()),
+        id_token: None,
+        last_seen: now,
+        created_at: now,
+        version: 0,
+    }
+}
+
+fn pending_login(id: &str) -> helios_auth::PersistedPending {
+    helios_auth::PersistedPending {
+        id: id.to_string(),
+        state: "state-1".to_string(),
+        code_verifier: "verifier-1".to_string(),
+        next: "/ui/resources".to_string(),
+        started_at: chrono::Utc::now(),
+    }
+}
+
+#[tokio::test]
+async fn mongodb_integration_login_session_round_trips_with_its_version() {
+    use helios_auth::{SaveOutcome, SessionPersistence};
+    let Some(backend) = settings_mongo::backend("login_round_trip").await else {
+        eprintln!(
+            "Skipping mongodb_integration_login_session_round_trips_with_its_version (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let id = unique_user_key("login-session");
+    assert!(backend.load_session(&id).await.unwrap().is_none());
+
+    let saved = backend
+        .save_session(&login_session(&id), Some(0))
+        .await
+        .unwrap();
+    assert_eq!(saved, SaveOutcome::Saved(1));
+
+    let loaded = backend.load_session(&id).await.unwrap().unwrap();
+    assert_eq!(loaded.version, 1);
+    assert_eq!(loaded.access_token, "at-1");
+    assert_eq!(loaded.principal.display(), "Demo User");
+
+    let mut newer = loaded.clone();
+    newer.access_token = "at-2".to_string();
+    assert_eq!(
+        backend.save_session(&newer, Some(1)).await.unwrap(),
+        SaveOutcome::Saved(2)
+    );
+    assert_eq!(
+        backend
+            .load_session(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .access_token,
+        "at-2"
+    );
+    backend.delete_session(&id).await.unwrap();
+    assert!(backend.load_session(&id).await.unwrap().is_none());
+    backend.delete_session(&id).await.unwrap();
+}
+
+#[tokio::test]
+async fn mongodb_integration_login_session_stale_version_is_a_conflict() {
+    use helios_auth::{SaveOutcome, SessionPersistence};
+    let Some(backend) = settings_mongo::backend("login_conflict").await else {
+        eprintln!(
+            "Skipping mongodb_integration_login_session_stale_version_is_a_conflict (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let id = unique_user_key("login-conflict");
+    backend
+        .save_session(&login_session(&id), Some(0))
+        .await
+        .unwrap();
+    let mut stale = login_session(&id);
+    stale.access_token = "at-stale".to_string();
+    assert_eq!(
+        backend.save_session(&stale, Some(0)).await.unwrap(),
+        SaveOutcome::Conflict { current: 1 }
+    );
+    assert_eq!(
+        backend.save_session(&stale, Some(7)).await.unwrap(),
+        SaveOutcome::Conflict { current: 1 }
+    );
+    assert_eq!(
+        backend
+            .load_session(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .access_token,
+        "at-1"
+    );
+    let missing = unique_user_key("login-missing");
+    assert_eq!(
+        backend
+            .save_session(&login_session(&missing), Some(1))
+            .await
+            .unwrap(),
+        SaveOutcome::Conflict { current: 0 }
+    );
+    assert_eq!(
+        backend.save_session(&stale, None).await.unwrap(),
+        SaveOutcome::Saved(2)
+    );
+    backend.delete_session(&id).await.unwrap();
+}
+
+#[tokio::test]
+async fn mongodb_integration_pending_login_is_consumed_exactly_once_and_kinds_do_not_cross() {
+    use helios_auth::SessionPersistence;
+    let Some(backend) = settings_mongo::backend("login_pending").await else {
+        eprintln!(
+            "Skipping mongodb_integration_pending_login_is_consumed_exactly_once_and_kinds_do_not_cross (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let id = unique_user_key("pending");
+    backend.save_pending(&pending_login(&id)).await.unwrap();
+    let loaded = backend.load_pending(&id).await.unwrap().unwrap();
+    assert_eq!(loaded.state, "state-1");
+    assert_eq!(loaded.next, "/ui/resources");
+    assert!(backend.load_session(&id).await.unwrap().is_none());
+    backend.delete_session(&id).await.unwrap();
+    assert!(backend.load_pending(&id).await.unwrap().is_some());
+
+    assert!(backend.delete_pending(&id).await.unwrap());
+    assert!(!backend.delete_pending(&id).await.unwrap());
+    assert!(backend.load_pending(&id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn mongodb_integration_login_sweep_drops_only_what_has_expired() {
+    use helios_auth::SessionPersistence;
+    let Some(backend) = settings_mongo::backend("login_sweep").await else {
+        eprintln!(
+            "Skipping mongodb_integration_login_sweep_drops_only_what_has_expired (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let idle_id = unique_user_key("sweep-idle");
+    let live_id = unique_user_key("sweep-live");
+    let old_id = unique_user_key("sweep-old");
+    let fresh_id = unique_user_key("sweep-fresh");
+    let mut idle = login_session(&idle_id);
+    idle.last_seen = chrono::Utc::now() - chrono::TimeDelta::hours(9);
+    backend.save_session(&idle, None).await.unwrap();
+    backend
+        .save_session(&login_session(&live_id), None)
+        .await
+        .unwrap();
+    let mut old = pending_login(&old_id);
+    old.started_at = chrono::Utc::now() - chrono::TimeDelta::minutes(11);
+    backend.save_pending(&old).await.unwrap();
+    backend
+        .save_pending(&pending_login(&fresh_id))
+        .await
+        .unwrap();
+
+    // Other tests share the collection, so only what this test planted is
+    // asserted on, not the count.
+    backend.sweep(chrono::Utc::now()).await.unwrap();
+    assert!(backend.load_session(&idle_id).await.unwrap().is_none());
+    assert!(backend.load_session(&live_id).await.unwrap().is_some());
+    assert!(backend.load_pending(&old_id).await.unwrap().is_none());
+    assert!(backend.load_pending(&fresh_id).await.unwrap().is_some());
+    backend.delete_session(&live_id).await.unwrap();
+    backend.delete_pending(&fresh_id).await.unwrap();
+}
+
 #[tokio::test]
 async fn mongodb_integration_settings_get_missing_is_none() {
     let Some(backend) = settings_mongo::backend("settings_missing").await else {
@@ -12768,7 +12959,10 @@ mod bulk_submit {
             .await
             .unwrap()
             .expect("schema version document");
-        assert_eq!(schema_version.get_i32("version").unwrap(), 10_i32);
+        assert_eq!(
+            schema_version.get_i32("version").unwrap(),
+            helios_persistence::backends::mongodb::SCHEMA_VERSION
+        );
 
         let receipt_indexes: Vec<_> = entry_results
             .list_indexes()

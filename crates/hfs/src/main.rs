@@ -750,6 +750,7 @@ async fn start_mongodb(
 
     backend.init_schema().await?;
     let backend = Arc::new(backend);
+    attach_login_sessions(auth_state.as_ref(), backend.clone());
     let observability = helios_rest::WriteObservability::new();
     seed_conformance_resources(&*backend, &config, Some(observability.observers.as_ref())).await;
     spawn_mongodb_search_param_refresh(backend.clone(), &config);
@@ -1193,7 +1194,12 @@ async fn init_login_sessions(
 /// restart. Called from a backend's `start_*` once its Arc exists: the store
 /// itself is built with the auth state, before any backend is. Nothing to
 /// attach when interactive login is off.
-#[cfg(feature = "sqlite")]
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "s3"
+))]
 fn attach_login_sessions(
     auth_state: Option<&Arc<AuthMiddlewareState>>,
     persistence: Arc<dyn helios_auth::SessionPersistence>,
@@ -1203,10 +1209,14 @@ fn attach_login_sessions(
     }
 }
 
-/// The backends without a [`helios_auth::SessionPersistence`] yet keep login
-/// sessions in process: fine on one node, but a cluster needs sticky sessions
-/// and a restart signs everyone out. Said once at startup so an operator
-/// knows which mode they are in.
+/// A deployment with nowhere tenant-independent to keep them (S3
+/// bucket-per-tenant with no system bucket — the same case that leaves
+/// `/_user/settings` unwired) keeps login sessions in process: fine on one
+/// node, but a cluster needs sticky sessions and a restart signs everyone
+/// out. Said once at startup so an operator knows which mode they are in.
+/// This binary only ever builds `PrefixPerTenant` from its environment, so
+/// the branch is reached through the library's configuration alone (#1514).
+#[cfg(feature = "s3")]
 fn warn_login_sessions_in_process(auth_state: Option<&Arc<AuthMiddlewareState>>) {
     if auth_state.is_some_and(|state| state.sessions.is_some()) {
         warn!(
@@ -1387,27 +1397,21 @@ async fn main() -> anyhow::Result<()> {
             start_sqlite_elasticsearch(config, auth_config, auth_state, audit_state).await?;
         }
         StorageBackendMode::Postgres => {
-            warn_login_sessions_in_process(auth_state.as_ref());
             start_postgres(config, auth_config, auth_state, audit_state).await?;
         }
         StorageBackendMode::PostgresElasticsearch => {
-            warn_login_sessions_in_process(auth_state.as_ref());
             start_postgres_elasticsearch(config, auth_config, auth_state, audit_state).await?;
         }
         StorageBackendMode::MongoDB => {
-            warn_login_sessions_in_process(auth_state.as_ref());
             start_mongodb(config, auth_config, auth_state, audit_state).await?;
         }
         StorageBackendMode::MongoDBElasticsearch => {
-            warn_login_sessions_in_process(auth_state.as_ref());
             start_mongodb_elasticsearch(config, auth_config, auth_state, audit_state).await?;
         }
         StorageBackendMode::S3 => {
-            warn_login_sessions_in_process(auth_state.as_ref());
             start_s3(config, auth_config, auth_state, audit_state).await?;
         }
         StorageBackendMode::S3Elasticsearch => {
-            warn_login_sessions_in_process(auth_state.as_ref());
             start_s3_elasticsearch(config, auth_config, auth_state, audit_state).await?;
         }
     }
@@ -2814,6 +2818,7 @@ async fn start_postgres(
 
     backend.init_schema().await?;
     let backend = Arc::new(backend);
+    attach_login_sessions(auth_state.as_ref(), backend.clone());
     let observability = helios_rest::WriteObservability::new();
     seed_conformance_resources(&*backend, &config, Some(observability.observers.as_ref())).await;
     spawn_postgres_search_param_refresh(backend.clone(), &config);
@@ -2907,6 +2912,7 @@ async fn start_postgres_elasticsearch(
     let mut backend = backend;
     backend.set_search_offloaded(true);
     let pg = Arc::new(backend);
+    attach_login_sessions(auth_state.as_ref(), pg.clone());
     info!("PostgreSQL search indexing disabled (offloaded to Elasticsearch)");
     // Refresh reads from the primary; the ES backend shares its registry Arc.
     // Seeding waits for the composite below, so the writes also index into ES.
@@ -3132,6 +3138,7 @@ async fn start_mongodb_elasticsearch(
 
     // Offload search to Elasticsearch
     let mongo = Arc::new(backend);
+    attach_login_sessions(auth_state.as_ref(), mongo.clone());
     info!("MongoDB search indexing disabled (offloaded to Elasticsearch)");
     // Refresh reads from the primary; the ES backend shares its registry Arc.
     // Seeding waits for the composite below, so the writes also index into ES.
@@ -3398,6 +3405,11 @@ async fn start_s3(
     })?;
 
     let backend = Arc::new(backend);
+    if backend.supports_user_settings() {
+        attach_login_sessions(auth_state.as_ref(), backend.clone());
+    } else {
+        warn_login_sessions_in_process(auth_state.as_ref());
+    }
     let serve_audit_state = audit_state.clone();
     // Standalone S3 seeds no conformance resources, but its REST writes, bulk
     // submit, and UI purges still report to the one write observer (#1078).
@@ -3567,6 +3579,11 @@ async fn start_s3_elasticsearch(
             e
         )
     })?);
+    if s3.supports_user_settings() {
+        attach_login_sessions(auth_state.as_ref(), s3.clone());
+    } else {
+        warn_login_sessions_in_process(auth_state.as_ref());
+    }
     // Refresh reads from the primary; the ES backend shares its registry Arc
     // (wired below, once it's populated). Seeding waits for the composite
     // further down, so the writes also index into ES.
