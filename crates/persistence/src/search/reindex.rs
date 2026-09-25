@@ -4840,6 +4840,11 @@ mod tests {
         gates: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Notify>>>,
         fail: parking_lot::Mutex<std::collections::HashSet<String>>,
         panic: parking_lot::Mutex<std::collections::HashSet<String>>,
+        /// The `(limit, max_bytes)` seen by every `fetch_resources_page_ahead`
+        /// call, in call order, regardless of whether the fetch went on to run
+        /// or was declined. Lets a test confirm the driver's own page limit and
+        /// byte cap reach the ahead fetch unchanged (#1403).
+        ahead_calls: parking_lot::Mutex<Vec<(u32, u64)>>,
     }
 
     impl PrefetchingSource {
@@ -4873,8 +4878,15 @@ mod tests {
                 gates: parking_lot::Mutex::new(HashMap::new()),
                 fail: parking_lot::Mutex::new(std::collections::HashSet::new()),
                 panic: parking_lot::Mutex::new(std::collections::HashSet::new()),
+                ahead_calls: parking_lot::Mutex::new(Vec::new()),
             });
             (source, events)
+        }
+
+        /// The `(limit, max_bytes)` recorded from every
+        /// `fetch_resources_page_ahead` call so far, in call order.
+        fn ahead_calls(&self) -> Vec<(u32, u64)> {
+            self.ahead_calls.lock().clone()
         }
 
         fn cursor_for(&self, resource_type: &str, page: usize) -> String {
@@ -5047,9 +5059,10 @@ mod tests {
             tenant: &TenantContext,
             resource_type: &str,
             cursor: &str,
-            _limit: u32,
-            _max_bytes: u64,
+            limit: u32,
+            max_bytes: u64,
         ) -> StorageResult<Option<ResourcePage>> {
+            self.ahead_calls.lock().push((limit, max_bytes));
             if cursor.starts_with("edge:") {
                 let page = Self::page_number(cursor);
                 self.events.lock().push(PrefetchEvent::AheadDeclined(
@@ -5232,6 +5245,31 @@ mod tests {
              strictly serial driver never starts it until page 1's write has returned, \
              so it would time out here"
         );
+    }
+
+    #[tokio::test]
+    async fn prefetch_ahead_fetch_carries_the_request_page_limit_and_byte_cap() {
+        let (source, events) =
+            PrefetchingSource::new(vec![("Patient", vec![vec!["p0"], vec!["p1"], vec!["p2"]])]);
+        let op = prefetch_fixture(source.clone(), events.clone());
+        let job = op
+            .start(
+                named_tenant("prefetch-limit-and-bytes"),
+                ReindexRequest::for_types(vec!["Patient".to_string()])
+                    .with_batch_size(2)
+                    .with_batch_bytes(4096),
+                None,
+            )
+            .await
+            .expect("start");
+        let progress = await_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Completed);
+
+        let calls = source.ahead_calls();
+        assert!(!calls.is_empty(), "expected at least one prefetched page");
+        for call in &calls {
+            assert_eq!(*call, (2, 4096), "{calls:?}");
+        }
     }
 
     #[tokio::test]
