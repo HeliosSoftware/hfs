@@ -1078,7 +1078,7 @@ async fn mongodb_integration_reindex_writer_configuration_log_line() {
 
     // A type's first page over `REINDEX_SUBBATCH_FIRST` (32) resources must
     // log the line; a second such page on the same backend must not log it
-    // again (#1403, F2).
+    // again (#1403).
     let page1 = build_test_patients(&tenant, "writerconfig1", 40);
     let mut stats1 = ReindexPageStats::default();
     let outcomes1 = target
@@ -1517,9 +1517,14 @@ async fn mongodb_integration_reindex_page_overlapped_fans_out_a_delete_failure()
     let page = build_test_patients(&tenant, "faildelete", 40);
 
     // Seed with a per-resource write, like the two failpoint tests above,
-    // rather than one page write: a single-resource-type page write seeds a
-    // single sub-batch, which would let the page below take the serial
-    // writer's path and still pass this test's assertions (#1403, F6).
+    // rather than one page write: seeding one resource at a time records no
+    // per-type size hint (a hint only changes how a later page is split into
+    // sub-batches), so it cannot affect which writer runs. The page below is
+    // routed to `write_page_overlapped` by configuration alone (overlap on,
+    // a multi-thread runtime, and more than `REINDEX_SUBBATCH_FIRST`
+    // resources); a delete failure is always joined right after the first
+    // sub-batch is extracted, so `sub_batches` cannot prove which writer ran
+    // in this test (#1403).
     let target: &dyn ReindexTarget = &*backend;
     for resource in &page {
         let seeded = target.write_search_entries(&tenant, resource).await;

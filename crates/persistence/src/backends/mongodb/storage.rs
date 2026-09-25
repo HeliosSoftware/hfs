@@ -5450,9 +5450,13 @@ impl ReindexTarget for MongoBackend {
     /// rows, each chunked into `SEARCH_INDEX_INSERT_CHUNK`-sized `insert_many`
     /// commands). The delete completes fully before the insert phase starts,
     /// but a chunked insert can still leave some rows behind even when it
-    /// goes on to fail: a chunk that already committed keeps its rows: only
-    /// the chunk that actually errored, and any chunk after it, ends up with
-    /// none. A larger page on a multi-thread runtime with the overlap
+    /// goes on to fail: an earlier chunk that already committed keeps its
+    /// rows, and the chunk that actually errored may keep some, all, or none
+    /// of its own — an unordered `insert_many` failure (for example a
+    /// write-concern error reported after the documents were written, or a
+    /// transport error after partial application) does not guarantee the
+    /// failing chunk inserted nothing. A larger page on a multi-thread
+    /// runtime with the overlap
     /// configuration on instead runs through the overlapped writer, which
     /// splits the page into several sub-batches and inserts one while
     /// extracting the next; there too, a sub-batch insert failure reports

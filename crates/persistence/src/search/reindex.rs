@@ -5084,10 +5084,11 @@ mod tests {
     /// numeric suffix of its id, plus one (`"p3"` -> page 4). Every fixture in
     /// this test module uses ids of the form `{letters}{digits}`, but this
     /// only agrees with [`PrefetchingSource::page_number`]'s cursor-derived
-    /// numbering when every page in the fixture holds the same fixed size: a
+    /// numbering when every page in the fixture holds exactly one resource: a
     /// fixture like `[["p0","p1"],["p2"]]` does not, because `p2`'s digit
     /// gives page 3 while the cursor puts it on page 2. A test built on a
-    /// mixed-size fixture must not assume the two numberings match (#1403).
+    /// fixture whose pages hold more than one resource must not assume the
+    /// two numberings match (#1403).
     fn resource_page_number(id: &str) -> usize {
         let digits: String = id.chars().skip_while(|c| !c.is_ascii_digit()).collect();
         digits.parse::<usize>().map(|n| n + 1).unwrap_or(0)

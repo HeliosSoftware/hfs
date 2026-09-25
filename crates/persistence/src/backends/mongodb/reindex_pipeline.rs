@@ -463,9 +463,11 @@ async fn delete_page(
 /// (`search_index`), then, if any, `docs.contained` into `contained`
 /// (`search_index_contained`), each via
 /// [`super::storage::insert_search_entries_chunk`]. A page-level error from
-/// either insert returns as `Err` immediately, without attempting the other
-/// collection; per-document write errors instead come back as
-/// [`InsertFailures`], attributable to individual resources (#1403).
+/// the own-collection insert returns as `Err` immediately, before the
+/// contained collection is ever attempted; a page-level error from the
+/// contained-collection insert instead returns only after the own insert has
+/// already run (and succeeded). Per-document write errors instead come back
+/// as [`InsertFailures`], attributable to individual resources (#1403).
 async fn insert_sub_batch(
     own: mongodb::Collection<Document>,
     contained: mongodb::Collection<Document>,
