@@ -64,7 +64,7 @@ are compressed when the client sends `Accept-Encoding`.
 | `HFS_ELASTICSEARCH_BULK_CONCURRENCY` | `1` | `_bulk` requests of one page in flight at once; splitting and back-off stay sequential per request |
 | `HFS_REINDEX_BATCH_BYTES` | `33554432` (32 MiB) | Byte cap on one page of the automatic rebuild (`0` = count only). Honoured by the SQLite source (a page may exceed the cap by one resource) and by the PostgreSQL and MongoDB sources (a page never exceeds the cap unless it holds a single resource); the Elasticsearch and S3 sources page by count only |
 | `HFS_ELASTICSEARCH_REINDEX_REFRESH` | *(unset)* | `refresh` parameter for `$reindex` and deferred-rebuild writes: `false`, `wait_for`, or `true`. Unset follows `HFS_ELASTICSEARCH_WRITE_REFRESH` |
-| `HFS_REINDEX_BATCH_SIZE` | `1000` | Page size of the automatic deferred rebuild after a bulk import (all backends). `POST $reindex` keeps its own `batchSize` |
+| `HFS_REINDEX_BATCH_SIZE` | `1000` | Page size of the automatic deferred rebuild after a bulk import (all backends). `POST $reindex` keeps its own `batchSize`, capped at 10,000 |
 | `HFS_S3_BUCKET` | `hfs` | S3 bucket name |
 | `HFS_S3_REGION` | *(AWS chain)* | AWS region override |
 | `HFS_S3_PREFIX` | *(none)* | Optional key prefix for all S3 object keys |

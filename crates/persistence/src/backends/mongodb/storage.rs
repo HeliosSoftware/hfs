@@ -4814,8 +4814,9 @@ impl MongoBackend {
         }
     }
 
-    /// One hinted, sorted, limited find, fully drained (#1403), stopping early
-    /// when `max_bytes` (`0` = no cap, #1499) admits no further row.
+    /// One hinted, sorted, limited find (#1403). The page is drained up to
+    /// `limit` rows, or until `max_bytes` (`0` = no cap, #1499) rejects the
+    /// next row — the first row is always admitted.
     async fn reindex_find_page(
         &self,
         resources: &Collection<Document>,
@@ -4860,9 +4861,9 @@ impl MongoBackend {
         })
     }
 
-    /// Pages `resource_type` in id order with catch-up rounds (PR1, #1403), bounded
-    /// by `max_bytes` as well as by `limit` (`max_bytes == 0` is PR1's uncapped
-    /// page, #1499). A page the byte cap stops before `limit` is still non-empty
+    /// Pages `resource_type` in id order with catch-up rounds (#1403), bounded
+    /// by `max_bytes` as well as by `limit` (`max_bytes == 0` is the id-order
+    /// walk's uncapped page, #1499). A page the byte cap stops before `limit` is still non-empty
     /// (the first row is always admitted), so it continues its current walk phase
     /// exactly as a full page would — it never ends a phase and never returns
     /// `None` on its own account. `fetch_resources_page` and

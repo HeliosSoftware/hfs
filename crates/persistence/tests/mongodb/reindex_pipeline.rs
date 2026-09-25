@@ -23,8 +23,9 @@ use helios_persistence::types::StoredResource;
 /// Builds a `MongoBackend` for this file's tests: same shape as
 /// `create_backend_with_search_offloaded` (`mongodb_tests.rs`), but
 /// lets the caller tweak the config first — used by [`create_id_phase_backend`]
-/// below, and directly by PR2b's own tests (S3 §5.13), so this helper stays a
-/// plain pass-through with no default catch-up-margin override of its own.
+/// below, and directly by other tests in this file that need an unmodified
+/// config, so this helper stays a plain pass-through with no default
+/// catch-up-margin override of its own.
 async fn create_backend_with(
     test_name: &str,
     configure: impl FnOnce(&mut MongoBackendConfig),
@@ -42,14 +43,14 @@ async fn create_backend_with(
 
 /// Builds a `MongoBackend` with the catch-up margin shortened to 1 s, so a
 /// walk over already-seeded fixture rows can be moved into its id phase by
-/// [`settle_into_id_phase`] (S3 §4.5's "id-phase fixture rule"). Every test
-/// that exercises the id phase specifically — as opposed to a resource just
-/// created, which the default 120 s margin would fold into catch-up round 1
-/// (S2 §3.2: `floor = min(newest_live + 1 ms, t0 - margin)`, which with a
-/// 120 s margin and resources seeded moments ago sits in the past relative to
-/// nothing, so every seeded row has `last_updated >= floor` and the id phase's
-/// first query comes back empty) — must use this instead of
-/// [`create_backend_with`] directly.
+/// [`settle_into_id_phase`] below. Every test that exercises the id phase
+/// specifically — as opposed to a resource just created, which the default
+/// 120 s margin would fold into catch-up round 1 (`floor = min(newest_live +
+/// 1 ms, t0 - margin)`) — must use this instead of [`create_backend_with`]
+/// directly: with the normal 120 s margin, `floor = t0 - 120 s` is earlier
+/// than every row the test just seeded, so the id phase (`last_updated <
+/// floor`) would come back empty; this helper shortens the margin so the
+/// seeded rows fall in the id phase instead.
 async fn create_id_phase_backend(test_name: &str) -> Option<Arc<MongoBackend>> {
     create_backend_with(test_name, |c| c.reindex_catch_up_margin_ms = 1_000).await
 }
@@ -98,9 +99,9 @@ async fn reindex_resource_row_sizes(
 }
 
 /// Walks `resource_type` to completion through `fetch_resources_page_capped`,
-/// returning every non-empty page in fetch order. PR1 guarantees exactly one
-/// trailing empty page per type (S2 D12), so more than 20 fetches means the
-/// walk is not terminating (S3 §4.5's guard).
+/// returning every non-empty page in fetch order. The id-order walk guarantees
+/// exactly one trailing empty page per type, so more than 20 fetches means the
+/// walk is not terminating.
 async fn walk_capped(
     backend: &MongoBackend,
     tenant: &TenantContext,
@@ -359,8 +360,7 @@ fn provenance_fixture(n: usize) -> Vec<(String, serde_json::Value)> {
 /// Seeds a 24-resource Provenance fixture, settles it into the id phase, and
 /// returns the raw database handle, each row's id-sorted stored size, and the
 /// byte cap that admits exactly the three smallest resources. Shared by the
-/// two Provenance-shaped tests below, which otherwise duplicated this setup
-/// verbatim (ledger Ruling R3).
+/// two Provenance-shaped tests below.
 async fn seed_provenance(
     backend: &MongoBackend,
     tenant: &TenantContext,
@@ -415,11 +415,21 @@ async fn mongodb_integration_reindex_fetch_capped_provenance_shaped() {
             .sum();
         assert!(bytes <= cap || page.resources.len() == 1);
     }
-    let seen: std::collections::BTreeSet<String> = pages
+    let seen: Vec<String> = pages
         .iter()
         .flat_map(|p| p.resources.iter().map(|r| r.id().to_string()))
         .collect();
-    assert_eq!(seen.len(), 24, "every resource must come back exactly once");
+    assert_eq!(
+        seen.len(),
+        24,
+        "every resource must come back at least once"
+    );
+    let deduped: std::collections::BTreeSet<&String> = seen.iter().collect();
+    assert_eq!(
+        deduped.len(),
+        24,
+        "every resource must come back exactly once"
+    );
 
     let unbounded = walk_capped(&backend, &tenant, "Provenance", 5, u64::MAX).await;
     let last_index = unbounded.len().saturating_sub(1);
@@ -531,10 +541,10 @@ impl ReindexTarget for RecordingWriter {
         self.inner.end_bulk_index_rebuild().await
     }
     // Delegates to `write_search_entries_page_timed` with a throwaway
-    // `ReindexPageStats`, per that method's trait contract (reindex.rs:379-386)
-    // that an override MUST route the untimed page method through it, so the
-    // two paths cannot diverge (ledger Ruling R5) — mirrors MongoBackend's own
-    // `ReindexTarget::write_search_entries_page` impl.
+    // `ReindexPageStats`, per `ReindexTarget::write_search_entries_page`'s
+    // trait contract that an override MUST route the untimed page method
+    // through it, so the two paths cannot diverge — mirrors MongoBackend's
+    // own `ReindexTarget::write_search_entries_page` impl.
     async fn write_search_entries_page(
         &self,
         tenant: &TenantContext,
@@ -607,7 +617,16 @@ async fn mongodb_integration_reindex_capped_run_bounds_every_page() {
     assert_eq!(progress.status, ReindexStatus::Completed);
     assert!(progress.errors.is_empty(), "{:?}", progress.errors);
     assert_eq!(progress.processed_resources, 24);
-    for (resources, bytes) in source.pages.lock().unwrap().iter() {
+    let recorded_pages = source.pages.lock().unwrap().clone();
+    assert_eq!(
+        recorded_pages
+            .iter()
+            .map(|(resources, _)| *resources)
+            .sum::<usize>(),
+        24,
+        "pages must have been recorded, so the per-page bound below cannot pass vacuously"
+    );
+    for (resources, bytes) in &recorded_pages {
         assert!(*resources <= 3, "page held {resources} resources");
         assert!(
             *bytes <= cap || *resources == 1,
@@ -761,9 +780,9 @@ async fn mongodb_integration_reindex_fetch_capped_page_never_spans_the_catch_up_
     }
 }
 
-/// S3 §4.5's round-page gap: every other test here builds its backend
-/// through [`create_id_phase_backend`], so every capped page it checks is an
-/// id-phase page (`v2|i|`). This test uses [`create_backend_with`] with the
+/// Covers the round-page gap left by every other test here: they all build
+/// their backend through [`create_id_phase_backend`], so every capped page
+/// they check is an id-phase page (`v2|i|`). This test uses [`create_backend_with`] with the
 /// default 120 s margin instead: rows seeded moments ago are all newer than
 /// the walk's floor, so the id phase's first query comes back empty and the
 /// walker falls straight into catch-up round 1 within the same call
@@ -827,6 +846,11 @@ async fn mongodb_integration_reindex_fetch_capped_round_page_bounds_multiple_row
         }
         seen.extend(page_ids);
     }
+    assert!(
+        pages.iter().any(|page| page.resources.len() > 1),
+        "at least one page must hold more than one resource, or this test cannot tell the \
+         round arm's multi-row cap rule apart from a page-per-row walk"
+    );
 
     let mut counts = std::collections::HashMap::new();
     for id in &seen {

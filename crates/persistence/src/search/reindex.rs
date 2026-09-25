@@ -440,8 +440,9 @@ pub struct ReindexRequest {
     ///
     /// A page of 1,000 Synthea `Provenance` resources of ~108 KB each is
     /// ~108 MB held in memory before a single document goes on the wire.
-    /// A source that honours the cap ends the page at the first resource
-    /// that crosses it, and always returns at least one (#1125).
+    /// SQLite may exceed the cap by one resource; PostgreSQL and MongoDB
+    /// never exceed it unless the page holds a single resource; every
+    /// source returns at least one resource per page (#1125).
     #[serde(default)]
     pub batch_bytes: u64,
 }
