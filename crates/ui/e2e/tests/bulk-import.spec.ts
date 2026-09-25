@@ -204,6 +204,10 @@ test("dismissing the New Submission dialog clears the typed form", async ({ page
   await toggle.click();
   const name = page.locator("input[name='name']");
   await name.fill("draft-i-abandoned");
+  // Since #1240 a dirty dialog asks before discarding; the tracker marks the
+  // form dirty on the next animation frame, so the confirm may or may not
+  // have fired by the time Escape lands. Accept it either way.
+  page.once("dialog", (d) => d.accept());
   await page.keyboard.press("Escape");
   await toggle.click();
   await expect(name).toHaveValue("");
