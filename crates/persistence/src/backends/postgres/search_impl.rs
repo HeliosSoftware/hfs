@@ -438,6 +438,7 @@ impl PostgresBackend {
         for param in &search_params {
             match param {
                 SqlParam::Text(s) => params.push(Box::new(s.clone())),
+                SqlParam::TextArray(ids) => params.push(Box::new(ids.clone())),
                 SqlParam::Float(f) => params.push(Box::new(*f)),
                 SqlParam::Integer(i) => params.push(Box::new(*i)),
                 SqlParam::Bool(b) => params.push(Box::new(*b)),
@@ -612,6 +613,7 @@ impl SearchProvider for PostgresBackend {
                 for param in &fragment.params {
                     match param {
                         SqlParam::Text(s) => params.push(Box::new(s.clone())),
+                        SqlParam::TextArray(ids) => params.push(Box::new(ids.clone())),
                         SqlParam::Float(f) => params.push(Box::new(*f)),
                         SqlParam::Integer(i) => params.push(Box::new(*i)),
                         SqlParam::Bool(b) => params.push(Box::new(*b)),
@@ -937,6 +939,7 @@ impl ChainedSearchProvider for PostgresBackend {
         for p in &fragment.params {
             match p {
                 SqlParam::Text(s) => params.push(Box::new(s.clone())),
+                SqlParam::TextArray(ids) => params.push(Box::new(ids.clone())),
                 SqlParam::Float(f) => params.push(Box::new(*f)),
                 SqlParam::Integer(i) => params.push(Box::new(*i)),
                 SqlParam::Bool(b) => params.push(Box::new(*b)),
@@ -993,6 +996,7 @@ impl ChainedSearchProvider for PostgresBackend {
         for p in &fragment.params {
             match p {
                 SqlParam::Text(s) => params.push(Box::new(s.clone())),
+                SqlParam::TextArray(ids) => params.push(Box::new(ids.clone())),
                 SqlParam::Float(f) => params.push(Box::new(*f)),
                 SqlParam::Integer(i) => params.push(Box::new(*i)),
                 SqlParam::Bool(b) => params.push(Box::new(*b)),
@@ -1358,6 +1362,7 @@ impl PostgresBackend {
                     for param in &fragment.params {
                         match param {
                             SqlParam::Text(s) => params.push(Box::new(s.clone())),
+                            SqlParam::TextArray(ids) => params.push(Box::new(ids.clone())),
                             SqlParam::Float(f) => params.push(Box::new(*f)),
                             SqlParam::Integer(i) => params.push(Box::new(*i)),
                             SqlParam::Bool(b) => params.push(Box::new(*b)),
