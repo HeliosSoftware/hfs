@@ -310,3 +310,161 @@ async fn transaction_entries_reach_the_secondary_as_a_batch() {
         "the secondary holds the committed content, references resolved"
     );
 }
+
+#[tokio::test]
+async fn transactional_instance_delete_reaches_the_secondary() {
+    use helios_persistence::core::{BundleEntry, BundleMethod, BundleProvider};
+    use serde_json::json;
+
+    let primary = Arc::new(SqliteBackend::in_memory().expect("primary"));
+    primary.init_schema().expect("primary schema");
+    let secondary = Arc::new(SqliteBackend::in_memory().expect("secondary"));
+    secondary.init_schema().expect("secondary schema");
+
+    let config = CompositeConfig::builder()
+        .primary("sqlite", BackendKind::Sqlite)
+        .search_backend("search", BackendKind::Sqlite)
+        .sync_mode(SyncMode::Synchronous)
+        .build()
+        .expect("composite config");
+    let mut backends: HashMap<String, DynStorage> = HashMap::new();
+    backends.insert("sqlite".to_string(), primary.clone() as DynStorage);
+    backends.insert("search".to_string(), secondary.clone() as DynStorage);
+    let composite = CompositeStorage::new(config, backends)
+        .expect("composite")
+        .with_full_primary(primary.clone());
+
+    let t = tenant();
+    composite
+        .process_transaction(
+            &t,
+            vec![BundleEntry {
+                method: BundleMethod::Put,
+                url: "Patient/del-p1".to_string(),
+                resource: Some(json!({"resourceType": "Patient", "id": "del-p1"})),
+                ..Default::default()
+            }],
+            FhirVersion::R4,
+        )
+        .await
+        .expect("create transaction");
+    assert!(
+        secondary
+            .read(&t, "Patient", "del-p1")
+            .await
+            .unwrap()
+            .is_some(),
+        "secondary holds del-p1 before the delete"
+    );
+
+    let result = composite
+        .process_transaction(
+            &t,
+            vec![BundleEntry {
+                method: BundleMethod::Delete,
+                url: "Patient/del-p1".to_string(),
+                ..Default::default()
+            }],
+            FhirVersion::R4,
+        )
+        .await
+        .expect("delete transaction");
+    assert_eq!(result.entries[0].status, 204);
+
+    assert!(
+        !matches!(primary.read(&t, "Patient", "del-p1").await, Ok(Some(_))),
+        "primary deleted del-p1"
+    );
+    assert!(
+        !matches!(secondary.read(&t, "Patient", "del-p1").await, Ok(Some(_))),
+        "secondary no longer holds del-p1 (#921)"
+    );
+}
+
+#[tokio::test]
+async fn mixed_transaction_syncs_creates_and_deletes() {
+    use helios_persistence::core::{BundleEntry, BundleMethod, BundleProvider};
+    use serde_json::json;
+
+    let primary = Arc::new(SqliteBackend::in_memory().expect("primary"));
+    primary.init_schema().expect("primary schema");
+    let secondary = Arc::new(SqliteBackend::in_memory().expect("secondary"));
+    secondary.init_schema().expect("secondary schema");
+
+    let config = CompositeConfig::builder()
+        .primary("sqlite", BackendKind::Sqlite)
+        .search_backend("search", BackendKind::Sqlite)
+        .sync_mode(SyncMode::Synchronous)
+        .build()
+        .expect("composite config");
+    let mut backends: HashMap<String, DynStorage> = HashMap::new();
+    backends.insert("sqlite".to_string(), primary.clone() as DynStorage);
+    backends.insert("search".to_string(), secondary.clone() as DynStorage);
+    let composite = CompositeStorage::new(config, backends)
+        .expect("composite")
+        .with_full_primary(primary.clone());
+
+    let t = tenant();
+    composite
+        .process_transaction(
+            &t,
+            vec![BundleEntry {
+                method: BundleMethod::Put,
+                url: "Patient/mx-p1".to_string(),
+                resource: Some(json!({"resourceType": "Patient", "id": "mx-p1"})),
+                ..Default::default()
+            }],
+            FhirVersion::R4,
+        )
+        .await
+        .expect("seed transaction");
+    assert!(
+        matches!(secondary.read(&t, "Patient", "mx-p1").await, Ok(Some(_))),
+        "secondary holds mx-p1 before the mixed bundle"
+    );
+
+    composite
+        .process_transaction(
+            &t,
+            vec![
+                BundleEntry {
+                    method: BundleMethod::Put,
+                    url: "Patient/mx-p2".to_string(),
+                    resource: Some(json!({"resourceType": "Patient", "id": "mx-p2"})),
+                    ..Default::default()
+                },
+                BundleEntry {
+                    method: BundleMethod::Delete,
+                    url: "Patient/mx-p1".to_string(),
+                    ..Default::default()
+                },
+                BundleEntry {
+                    method: BundleMethod::Put,
+                    url: "Patient/mx-p3".to_string(),
+                    resource: Some(json!({"resourceType": "Patient", "id": "mx-p3"})),
+                    ..Default::default()
+                },
+                BundleEntry {
+                    method: BundleMethod::Delete,
+                    url: "Patient/mx-p3".to_string(),
+                    ..Default::default()
+                },
+            ],
+            FhirVersion::R4,
+        )
+        .await
+        .expect("mixed transaction");
+
+    assert!(
+        matches!(secondary.read(&t, "Patient", "mx-p2").await, Ok(Some(_))),
+        "secondary holds the created mx-p2"
+    );
+    assert!(
+        !matches!(secondary.read(&t, "Patient", "mx-p1").await, Ok(Some(_))),
+        "secondary no longer holds the deleted mx-p1"
+    );
+    assert!(
+        !matches!(secondary.read(&t, "Patient", "mx-p3").await, Ok(Some(_))),
+        "secondary never holds mx-p3, created then deleted in the same bundle"
+    );
+}

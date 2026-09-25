@@ -44,13 +44,13 @@ use tracing::{debug, instrument, warn};
 
 use crate::core::history::HistoryParams;
 use crate::core::{
-    BundleEntry, BundleProvider, BundleResult, CapabilityProvider, ChainedSearchProvider,
-    ConditionalCreateResult, ConditionalDeleteResult, ConditionalStorage, ConditionalUpdateResult,
-    ExportDataProvider, ExportRequest, GroupExportProvider, IncludeProvider,
-    InstanceHistoryProvider, NdjsonBatch, PatientExportProvider, PurgableStorage, ResourceStorage,
-    RevincludeProvider, SearchProvider, SearchResult, SofRunner, StorageCapabilities,
-    SystemHistoryProvider, TerminologySearchProvider, TextSearchProvider, TypeHistoryProvider,
-    VersionedStorage,
+    BundleEntry, BundleEntryEffect, BundleProvider, BundleResult, CapabilityProvider,
+    ChainedSearchProvider, ConditionalCreateResult, ConditionalDeleteResult, ConditionalStorage,
+    ConditionalUpdateResult, ExportDataProvider, ExportRequest, GroupExportProvider,
+    IncludeProvider, InstanceHistoryProvider, NdjsonBatch, PatientExportProvider, PurgableStorage,
+    ResourceStorage, RevincludeProvider, SearchProvider, SearchResult, SofRunner,
+    StorageCapabilities, SystemHistoryProvider, TerminologySearchProvider, TextSearchProvider,
+    TypeHistoryProvider, VersionedStorage,
 };
 use crate::error::{BackendError, ResourceError, StorageError, StorageResult, TransactionError};
 use crate::search::ChainResolveOptions;
@@ -758,11 +758,29 @@ impl CompositeStorage {
     async fn sync_bundle_results(
         &self,
         tenant: &TenantContext,
+        entry_urls: &[String],
         result: &BundleResult,
         fhir_version: FhirVersion,
     ) {
         let mut by_type: Vec<(String, Vec<(String, Value)>)> = Vec::new();
-        for entry_result in &result.entries {
+        let mut deletes: Vec<(String, String)> = Vec::new();
+        for (entry_url, entry_result) in entry_urls.iter().zip(&result.entries) {
+            if entry_result.effect == BundleEntryEffect::Deleted {
+                let target = parse_type_and_id(entry_url)
+                    .or_else(|| entry_result.location.as_deref().and_then(parse_type_and_id));
+                let Some((resource_type, resource_id)) = target else {
+                    warn!(
+                        url = %entry_url,
+                        "Transactional delete target not parseable; secondaries not synced"
+                    );
+                    continue;
+                };
+                if let Some((_, group)) = by_type.iter_mut().find(|(t, _)| *t == resource_type) {
+                    group.retain(|(id, _)| *id != resource_id);
+                }
+                deletes.push((resource_type, resource_id));
+                continue;
+            }
             // Only sync successful mutating operations that have a resource body
             let Some(ref resource_json) = entry_result.resource else {
                 continue;
@@ -796,6 +814,18 @@ impl CompositeStorage {
             let _ = self
                 .sync_creates_to_secondaries(tenant, &resource_type, fhir_version, resources)
                 .await;
+        }
+        for (resource_type, resource_id) in deletes {
+            if let Err(e) = self
+                .sync_to_secondaries(SyncEvent::Delete {
+                    resource_type,
+                    resource_id,
+                    tenant_id: tenant.tenant_id().clone(),
+                })
+                .await
+            {
+                warn!(error = %e, "Failed to sync transactional delete to secondaries");
+            }
         }
     }
 
@@ -865,6 +895,16 @@ impl CompositeStorage {
             }
         }
     }
+}
+
+fn parse_type_and_id(url: &str) -> Option<(String, String)> {
+    let mut segments = url.split('/').filter(|s| !s.is_empty());
+    let resource_type = segments.next()?;
+    let resource_id = segments.next()?;
+    if resource_type.contains('?') || resource_id.contains('?') {
+        return None;
+    }
+    Some((resource_type.to_string(), resource_id.to_string()))
 }
 
 #[async_trait]
@@ -2054,12 +2094,13 @@ impl BundleProvider for CompositeStorage {
                     message: "BundleProvider not available on composite primary".to_string(),
                 })?;
 
+        let entry_urls: Vec<String> = entries.iter().map(|e| e.url.clone()).collect();
+
         let result = provider
             .process_transaction(tenant, entries, fhir_version)
             .await?;
 
-        // Sync successful entries to secondaries by reading resources from primary
-        self.sync_bundle_results(tenant, &result, fhir_version)
+        self.sync_bundle_results(tenant, &entry_urls, &result, fhir_version)
             .await;
 
         Ok(result)
