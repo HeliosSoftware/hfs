@@ -12,7 +12,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 43;
+pub const SCHEMA_VERSION: i32 = 44;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -406,6 +406,13 @@ async fn migrate_schema(
             42 => {
                 // Same as v42: the helper commits its own marker.
                 migrate_v42_to_v43(client).await?;
+                version += 1;
+                continue;
+            }
+            43 => {
+                // The helper writes the v44 marker inside its own transaction,
+                // like v43, so the common loop must not stamp it again.
+                migrate_v43_to_v44(client).await?;
                 version += 1;
                 continue;
             }
@@ -4003,6 +4010,48 @@ async fn analyze_search_index_with_timeout(
     tx.commit()
         .await
         .map_err(|e| pg_error(format!("commit post-migration analyze: {e}")))
+}
+
+/// v43 -> v44: add `login_sessions`, the web UI's interactive login sessions
+/// and the logins still pending at the identity provider (#1481). One JSONB
+/// document per opaque id with a monotonic `version` for conditional writes,
+/// so a session established on one node resolves on every other and outlives
+/// a restart. `kind` keeps sessions and pending logins apart; `expires_at`
+/// drives the sweep. Independent of the FHIR `resources` table, like
+/// `user_settings`.
+///
+/// Runs in its own transaction with `SET LOCAL statement_timeout = 0` and
+/// writes the v44 marker inside it, like v43: a deployment-wide statement
+/// timeout must not be able to cut a migration's DDL short, the setting
+/// reverts at commit, and a failure rolls the table and the marker back
+/// together so the next startup retries the whole step.
+async fn migrate_v43_to_v44(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|e| pg_error(format!("begin v44 migration: {e}")))?;
+    tx.execute("SET LOCAL statement_timeout = 0", &[])
+        .await
+        .map_err(|e| pg_error(format!("disable statement timeout for v44 migration: {e}")))?;
+    tx.batch_execute(
+        "CREATE TABLE IF NOT EXISTS login_sessions (
+            id         TEXT PRIMARY KEY,
+            kind       TEXT NOT NULL,
+            data       JSONB NOT NULL,
+            version    BIGINT NOT NULL DEFAULT 1,
+            expires_at TIMESTAMPTZ NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_login_sessions_expires
+            ON login_sessions (expires_at);",
+    )
+    .await
+    .map_err(|e| pg_error(format!("Migration v43->v44 failed: {e}")))?;
+    set_schema_version(&tx, 44).await?;
+    tx.commit()
+        .await
+        .map_err(|e| pg_error(format!("commit v44 migration: {e}")))?;
+    Ok(())
 }
 
 /// v23 -> v24: drop `fk_search_resource`.

@@ -3836,8 +3836,8 @@ impl MongoBackend {
         let parsed = number.value;
         Ok(match prefix {
             SearchPrefix::Ap => {
-                let delta = (parsed.abs() * 0.1).max(0.1);
-                doc! { "$gte": parsed - delta, "$lte": parsed + delta }
+                let (lo, hi) = number.approx_range();
+                doc! { "$gte": lo, "$lte": hi }
             }
             SearchPrefix::Eq => {
                 let (lo, hi) = number.implicit_range();
@@ -3866,7 +3866,10 @@ impl MongoBackend {
             SearchPrefix::Lt | SearchPrefix::Eb => Ok("$lt"),
             SearchPrefix::Ge => Ok("$gte"),
             SearchPrefix::Le => Ok("$lte"),
-            SearchPrefix::Ap => Ok("$eq"),
+            SearchPrefix::Ap => Err(internal_error(
+                "`ap` has no single MongoDB operator; numeric_condition builds its range"
+                    .to_string(),
+            )),
         }
     }
 

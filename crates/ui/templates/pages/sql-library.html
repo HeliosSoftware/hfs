@@ -312,8 +312,9 @@
      the order below is load-bearing: the vendored CodeMirror 6 bundle
      before its shared mount helper, before the guided form's shared loop,
      before the shared editor/form pairing, before either page-specific
-     editor script, before the sync that reaches both of them by their own
-     globals (`window.HfsSqlEditor`, set at the end of sql-editor.js;
+     editor script (editor-add.js, #1239, right before editor-form.js,
+     which reads window.HfsEditorAdd when it mounts), before the sync that
+     reaches both of them by their own globals (`window.HfsSqlEditor`, set at the end of sql-editor.js;
      `window.HfsSqlLibraryDetails`, set at the end of
      sql-library-details.js; `window.HfsEditorPair.minimalChange`, already
      loaded by then). editor-form.js and editor-pair.js are loaded here, not
@@ -334,6 +335,7 @@
      Views, which render no `#lib-params` at all. -->
 <script src="/ui/assets/vendor/codemirror.bundle.js" defer></script>
 <script src="/ui/assets/code-editor.js" defer></script>
+<script src="/ui/assets/editor-add.js" defer></script>
 <script src="/ui/assets/editor-form.js" defer></script>
 <script src="/ui/assets/editor-pair.js" defer></script>
 <script src="/ui/assets/sql-editor.js" defer></script>
