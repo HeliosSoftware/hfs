@@ -1030,11 +1030,14 @@ The suite is opt-in and env-gated:
 
 Optional overrides:
 
-- `MINIO_IMAGE` (default: `quay.io/minio/minio`)
-- `MINIO_TAG` (default: `RELEASE.2025-02-28T09-55-16Z`)
+- `MINIO_IMAGE` (default: `ghcr.io/coollabsio/minio`)
+- `MINIO_TAG` (default: `RELEASE.2025-10-15T17-29-55Z`)
 - `MINIO_ROOT_USER` (default: `minioadmin`)
 - `MINIO_ROOT_PASSWORD` (default: `minioadmin`)
 - `HFS_MINIO_TEST_BUCKET` (if unset, tests auto-generate a unique bucket)
+
+The default GHCR image replaces the Quay image after anonymous pulls from Quay
+started returning 401 in CI ([run 36024486722](https://github.com/HeliosSoftware/hfs/actions/runs/36024486722)).
 
 Example:
 

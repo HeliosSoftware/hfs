@@ -2860,6 +2860,9 @@ impl MongoBackend {
         if let Some(group) = value.composite_group {
             doc.insert("composite_group", group as i32);
         }
+        if let Some(slot) = value.composite_slot {
+            doc.insert("composite_slot", i32::from(slot));
+        }
 
         Some(doc)
     }
@@ -4203,6 +4206,15 @@ impl MongoBackend {
         if typed_params.is_empty() {
             return Ok(Vec::new());
         }
+        self.preflight_legacy_composites(
+            db,
+            tenant.tenant_id().as_str(),
+            resource_type,
+            &typed_params,
+            false,
+            Some(&mut *session),
+        )
+        .await?;
         let index_params: Vec<_> = typed_params
             .iter()
             .filter(|p| !matches!(p.name.as_str(), "_id" | "_lastUpdated"))
