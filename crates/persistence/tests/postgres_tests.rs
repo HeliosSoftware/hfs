@@ -73,6 +73,16 @@ mod date_precision_suite;
 #[path = "search/date_minute_index_suite.rs"]
 mod date_minute_index_suite;
 
+/// The backend-agnostic `ap` prefix suite for number and quantity
+/// (#1390). Same `#[path]` arrangement.
+#[path = "search/ap_prefix_suite.rs"]
+mod ap_prefix_suite;
+
+/// The backend-agnostic `ap` suite for quantity composites
+/// (#1390). Same `#[path]` arrangement.
+#[path = "search/ap_relations_suite.rs"]
+mod ap_relations_suite;
+
 /// The backend-agnostic suite for Period and Timing range targets (#1391).
 /// Same `#[path]` arrangement.
 #[path = "search/date_period_suite.rs"]
@@ -27709,6 +27719,20 @@ mod postgres_integration {
             true,
         )
         .await;
+    }
+
+    /// #1390: one number/quantity `ap` window, shared by every backend.
+    #[tokio::test]
+    async fn postgres_integration_ap_prefix_suite() {
+        let backend = create_backend().await;
+        super::ap_prefix_suite::ap_prefix(&backend, &unique_base("ap_prefix"), true).await;
+    }
+
+    /// #1390: `ap` in the quantity component of a composite.
+    #[tokio::test]
+    async fn postgres_integration_ap_composite() {
+        let backend = create_backend().await;
+        super::ap_relations_suite::ap_composite(&backend, &unique_base("ap_composite")).await;
     }
 
     /// #1379: `gender=<system>|female` never matched a `code` element.

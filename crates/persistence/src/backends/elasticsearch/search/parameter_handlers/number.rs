@@ -26,18 +26,14 @@ pub fn build_clause(name: &str, value: &str, prefix: SearchPrefix) -> Option<Val
         }
     };
     let num = number.value;
-    let implicit_precision = implicit_range(number.text());
+    // The implicit-precision range eq/ne match: 100 is [99.5, 100.5), 100.0
+    // is [99.95, 100.05).
+    let (lo, hi) = number.implicit_range();
 
     let range_condition = match prefix {
         SearchPrefix::Eq => {
-            // Implicit precision: 100 matches [99.5, 100.5), 100.0 matches [99.95, 100.05)
             json!({
-                "range": {
-                    "search_params.number.value": {
-                        "gte": num - implicit_precision,
-                        "lt": num + implicit_precision
-                    }
-                }
+                "range": { "search_params.number.value": { "gte": lo, "lt": hi } }
             })
         }
         SearchPrefix::Ne => {
@@ -52,10 +48,7 @@ pub fn build_clause(name: &str, value: &str, prefix: SearchPrefix) -> Option<Val
                             "must_not": [
                                 {
                                     "range": {
-                                        "search_params.number.value": {
-                                            "gte": num - implicit_precision,
-                                            "lt": num + implicit_precision
-                                        }
+                                        "search_params.number.value": { "gte": lo, "lt": hi }
                                     }
                                 }
                             ]
@@ -89,15 +82,11 @@ pub fn build_clause(name: &str, value: &str, prefix: SearchPrefix) -> Option<Val
             })
         }
         SearchPrefix::Ap => {
-            // Approximately ±10%
-            let margin = (num * 0.1).abs().max(0.5);
+            // The shared `ap` window: ±10% of the value, never narrower than
+            // the implicit-precision range (#1390).
+            let (lo, hi) = number.approx_range();
             json!({
-                "range": {
-                    "search_params.number.value": {
-                        "gte": num - margin,
-                        "lte": num + margin
-                    }
-                }
+                "range": { "search_params.number.value": { "gte": lo, "lte": hi } }
             })
         }
     };
@@ -117,32 +106,42 @@ pub fn build_clause(name: &str, value: &str, prefix: SearchPrefix) -> Option<Val
     }))
 }
 
-/// Determines the implicit precision based on string representation.
-///
-/// "100" has implicit precision of 0.5 (integer)
-/// "100.0" has implicit precision of 0.05
-/// "100.00" has implicit precision of 0.005
-pub(crate) fn implicit_range(value: &str) -> f64 {
-    crate::search::implicit_precision(value) / 2.0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_implicit_precision() {
-        assert!((implicit_range("100") - 0.5).abs() < f64::EPSILON);
-        assert!((implicit_range("100.0") - 0.05).abs() < f64::EPSILON);
-        assert!((implicit_range("100.00") - 0.005).abs() < f64::EPSILON);
+    fn value_range(clause: &Value) -> &Value {
+        &clause["nested"]["query"]["bool"]["must"][1]["range"]["search_params.number.value"]
     }
 
     #[test]
     fn test_eq_range() {
         let clause = build_clause("length", "100", SearchPrefix::Eq).unwrap();
-        let s = serde_json::to_string(&clause).unwrap();
-        assert!(s.contains("99.5"));
-        assert!(s.contains("100.5"));
+        assert_eq!(value_range(&clause), &json!({ "gte": 99.5, "lt": 100.5 }));
+        let clause = build_clause("length", "100.0", SearchPrefix::Eq).unwrap();
+        let range = value_range(&clause);
+        assert!((range["gte"].as_f64().unwrap() - 99.95).abs() < 1e-9);
+        assert!((range["lt"].as_f64().unwrap() - 100.05).abs() < 1e-9);
+    }
+
+    /// `ap` is the shared window (#1390): ±10% of the value, floored at the
+    /// implicit-precision range, closed at both ends.
+    #[test]
+    fn ap_uses_the_shared_approximate_window() {
+        for (raw, lo, hi) in [
+            ("100", 90.0, 110.0),
+            ("-100", -110.0, -90.0),
+            ("0", -0.5, 0.5),
+            ("1e2", 50.0, 150.0),
+            ("-5.4", -5.94, -4.86),
+        ] {
+            let clause = build_clause("length", raw, SearchPrefix::Ap).unwrap();
+            let range = value_range(&clause);
+            let gte = range["gte"].as_f64().expect("gte must be a number");
+            let lte = range["lte"].as_f64().expect("lte must be a number");
+            assert!((gte - lo).abs() < 1e-9, "ap{raw}: gte {gte}");
+            assert!((lte - hi).abs() < 1e-9, "ap{raw}: lte {lte}");
+        }
     }
 
     #[test]
@@ -160,9 +159,8 @@ mod tests {
 
         for (prefix, expected_key) in cases {
             let clause = build_clause("length", "100", prefix).unwrap();
-            let range = &clause["nested"]["query"]["bool"]["must"][1]["range"]["search_params.number.value"];
             assert_eq!(
-                range,
+                value_range(&clause),
                 &json!({ expected_key: 100.0 }),
                 "{prefix:?} must emit {{\"{expected_key}\": 100.0}}"
             );

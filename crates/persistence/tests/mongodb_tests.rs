@@ -612,6 +612,16 @@ async fn mongodb_contained_sort_and_id_only_contained() {
     contained_suite::sort_and_id_only_contained(&backend, "contained-sort-1407").await;
 }
 
+/// The backend-agnostic `ap` prefix suite for number and quantity
+/// (#1390). Same `#[path]` arrangement.
+#[path = "search/ap_prefix_suite.rs"]
+mod ap_prefix_suite;
+
+/// The backend-agnostic `ap` suite for quantity composites
+/// (#1390). Same `#[path]` arrangement.
+#[path = "search/ap_relations_suite.rs"]
+mod ap_relations_suite;
+
 /// #1407: composites under `_contained` are matched within one contained
 /// resource — a code pairs with the quantity of the *same* component, never
 /// across components or sibling contained resources. Strict: unlike the
@@ -909,6 +919,29 @@ async fn mongodb_exponent_values_use_significant_figures() {
         false,
     )
     .await;
+}
+
+/// #1390: one number/quantity `ap` window, shared by every backend. Needs the
+/// full registry so `factor-override` and `value-quantity` extract. No
+/// canonical-unit quantity match, hence `false`.
+#[tokio::test]
+async fn mongodb_ap_prefix_suite() {
+    let Some(backend) = create_backend_with_full_registry("ap_prefix").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    ap_prefix_suite::ap_prefix(&backend, "ap-prefix-1390", false).await;
+}
+
+/// #1390: `ap` in the quantity component of a composite. Needs the full
+/// registry so the composites and their components extract.
+#[tokio::test]
+async fn mongodb_ap_composite() {
+    let Some(backend) = create_backend_with_full_registry("ap_composite").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    ap_relations_suite::ap_composite(&backend, "ap-composite-1390").await;
 }
 
 /// The backend-agnostic number / quantity validation suite (#1319, #1340).
