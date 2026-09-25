@@ -1511,11 +1511,13 @@ impl SqliteBackend {
                             IndexValue::Date {
                                 value: d,
                                 precision,
+                                end,
                             } => {
                                 let mut n = v.clone();
                                 n.value = IndexValue::Date {
                                     value: Self::normalize_date_for_sqlite(d),
                                     precision: *precision,
+                                    end: end.clone(),
                                 };
                                 n
                             }
@@ -1549,11 +1551,13 @@ impl SqliteBackend {
                     IndexValue::Date {
                         value: d,
                         precision,
+                        end,
                     } => {
                         let mut n = value.clone();
                         n.value = IndexValue::Date {
                             value: Self::normalize_date_for_sqlite(d),
                             precision: *precision,
+                            end: end.clone(),
                         };
                         Some(n)
                     }
@@ -2013,10 +2017,15 @@ impl SqliteBackend {
             value.to_string()
         };
 
+        // The end of the value's range (#1391), read from the text as written.
+        let end = super::search::writer::stored_date_end(
+            &crate::search::converters::IndexValue::date(value),
+        );
+
         conn.execute(
-            "INSERT INTO search_index (tenant_id, resource_type, resource_id, resource_key, param_name, value_date)
-             VALUES (?1, ?2, ?3, (SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3), ?4, ?5)",
-            params![tenant_id, resource_type, resource_id, param_name, normalized],
+            "INSERT INTO search_index (tenant_id, resource_type, resource_id, resource_key, param_name, value_date, value_date_end)
+             VALUES (?1, ?2, ?3, (SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3), ?4, ?5, ?6)",
+            params![tenant_id, resource_type, resource_id, param_name, normalized, end],
         )
         .map_err(|e| internal_error(format!("Failed to insert date index: {}", e)))?;
         Ok(())

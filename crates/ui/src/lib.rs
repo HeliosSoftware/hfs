@@ -272,6 +272,13 @@ pub(crate) struct RequestTenant {
     /// Whether this install has any tenant beyond the server default â€” the
     /// sidebar tenant picker only renders when it does (#544).
     pub(crate) multi: bool,
+    /// Who is signed in through the web UI's interactive login, when a
+    /// session gate is installed and this request carries a valid session
+    /// (#1449, #738). `None` on a server without the login, or for the
+    /// login-flow routes that run outside the gate. Carried here, next to the
+    /// tenant, because it is the same per-request rendering context the
+    /// topbar draws from.
+    pub(crate) signed_in: Option<helios_auth::SessionPrincipal>,
 }
 
 impl<S> axum::extract::FromRequestParts<S> for RequestTenant
@@ -292,6 +299,7 @@ where
                 id: "default".to_string(),
                 display: None,
                 multi: false,
+                signed_in: None,
             }))
     }
 }
@@ -314,11 +322,18 @@ async fn resolve_prefs(
     }
 
     let user_key = settings_user_key(request.extensions().get::<helios_auth::Principal>());
+    // Stamped by the session gate (`login::require_session`), which runs
+    // before this middleware, when the request carries a valid session.
+    let signed_in = request
+        .extensions()
+        .get::<login::SignedIn>()
+        .map(|s| s.0.clone());
     let mut version = state.fhir_version;
     let mut tenant = RequestTenant {
         id: state.default_tenant.clone(),
         display: None,
         multi: false,
+        signed_in: signed_in.clone(),
     };
     // The single settings read every rail page's state (`rail_state::RequestSettings`,
     // stamped below) is built from too — reading it again per page would break
@@ -345,6 +360,7 @@ async fn resolve_prefs(
                 id: record.id,
                 display: record.display_name,
                 multi: false,
+                signed_in: signed_in.clone(),
             };
         }
     }
@@ -392,6 +408,44 @@ pub(crate) struct Status {
     /// The raw value is never exposed to templates unless it is a valid HTTP(S)
     /// base URL.
     terminology: TerminologyNavigation,
+    /// The signed-in user the topbar account menu shows (#738), from the
+    /// interactive login's session (#1449). `None` renders the signed-out,
+    /// local-operator shape.
+    user: Option<UserSummary>,
+}
+
+/// What the account menu shows for a signed-in user, derived once per request
+/// from the session's ID-token claims.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UserSummary {
+    /// Primary line: the IdP's `name`, else `preferred_username`, else
+    /// `email`, else the subject.
+    display: String,
+    /// Secondary line: the email when the IdP sent one, else the subject —
+    /// something that still identifies the account when the name is generic.
+    secondary: String,
+    /// One or two letters for the avatar when there is no photo: the first
+    /// letters of the first two words of the display name.
+    initials: String,
+    /// Avatar image URL, when the IdP sent a `picture` claim.
+    photo: Option<String>,
+}
+
+impl UserSummary {
+    fn from_session(principal: Option<&helios_auth::SessionPrincipal>) -> Option<Self> {
+        let principal = principal?;
+        let display = principal.display().to_string();
+        let secondary = principal
+            .email
+            .clone()
+            .unwrap_or_else(|| principal.subject.clone());
+        Some(Self {
+            initials: initials_of(&display),
+            display,
+            secondary,
+            photo: principal.picture.clone(),
+        })
+    }
 }
 
 enum TerminologyNavigation {
@@ -452,32 +506,35 @@ impl Status {
         self.show_tenant_picker
     }
 
-    /// The topbar avatar menu's identity (#725). `/ui` sits outside the auth
-    /// layer today (#320), so no request carries a signed-in principal — every
-    /// accessor returns the signed-out shape and the menu renders its
-    /// local-operator state. When the browser login flow lands, these become
-    /// the seam where the IdP's profile claims (#724) surface: display name,
-    /// secondary line (email or subject), initials, photo URL.
+    /// The topbar avatar menu's identity (#725, #738): the signed-in user's
+    /// profile claims from the interactive login's session (#1449) — display
+    /// name, secondary line (email or subject), initials, photo URL. Every
+    /// accessor returns the signed-out shape when no session is installed or
+    /// this request carries none, and the menu renders its local-operator
+    /// state exactly as before.
     pub(crate) fn user_display(&self) -> Option<&str> {
-        None
+        self.user.as_ref().map(|u| u.display.as_str())
     }
 
     pub(crate) fn user_secondary(&self) -> Option<&str> {
-        None
+        self.user.as_ref().map(|u| u.secondary.as_str())
     }
 
     pub(crate) fn user_initials(&self) -> Option<&str> {
-        None
+        self.user
+            .as_ref()
+            .map(|u| u.initials.as_str())
+            .filter(|s| !s.is_empty())
     }
 
     pub(crate) fn user_photo(&self) -> Option<&str> {
-        None
+        self.user.as_ref().and_then(|u| u.photo.as_deref())
     }
 
-    /// Whether the menu offers Sign out — requires an interactive session,
-    /// which does not exist yet (#320).
+    /// Whether the menu offers Sign out — only for an interactive session,
+    /// which `/ui/logout` ends (#1449).
     pub(crate) fn user_can_logout(&self) -> bool {
-        false
+        self.user.is_some()
     }
 
     /// The topbar account menu, rendered by `helios-ui-chrome` so HFS and HTS
@@ -8958,6 +9015,7 @@ pub(crate) fn current_status(
         tenant_display: tenant.display.clone(),
         show_tenant_picker: tenant.multi,
         terminology: TerminologyNavigation::from_config(state.terminology.as_deref()),
+        user: UserSummary::from_session(tenant.signed_in.as_ref()),
     }
 }
 
@@ -9108,6 +9166,7 @@ mod tests {
                 tenant_display: None,
                 show_tenant_picker: true,
                 terminology: TerminologyNavigation::Unconfigured,
+                user: None,
             },
             metrics: dash.metrics,
             chart: dash.chart,
@@ -9294,6 +9353,7 @@ mod tests {
                 tenant_display: None,
                 show_tenant_picker: true,
                 terminology: TerminologyNavigation::Unconfigured,
+                user: None,
             },
             i18n: i18n("en"),
         }
@@ -9449,6 +9509,7 @@ mod tests {
                 tenant_display: None,
                 show_tenant_picker: true,
                 terminology: TerminologyNavigation::Unconfigured,
+                user: None,
             },
             i18n: i18n("en"),
             active_page: "queries",
@@ -9515,6 +9576,7 @@ mod tests {
                 tenant_display: None,
                 show_tenant_picker: true,
                 terminology: TerminologyNavigation::Unconfigured,
+                user: None,
             },
             i18n: i18n("es"),
             active_page: "queries",
@@ -10342,5 +10404,111 @@ mod tests {
                 "y {y} escaped the plot"
             );
         }
+    }
+}
+
+/// The account menu's identity (#738), derived from the interactive login's
+/// session (#1449).
+#[cfg(test)]
+mod user_summary_tests {
+    use super::*;
+
+    fn principal() -> helios_auth::SessionPrincipal {
+        helios_auth::SessionPrincipal {
+            subject: "937f5c4f-demo".to_string(),
+            issuer: "https://idp.example.com/realms/fhir".to_string(),
+            name: Some("Demo User".to_string()),
+            preferred_username: Some("demo".to_string()),
+            email: Some("demo@example.org".to_string()),
+            picture: None,
+        }
+    }
+
+    fn status_with(user: Option<UserSummary>) -> Status {
+        Status {
+            version: "1.2.3",
+            checked_at: 42,
+            fhir_version: helios_fhir::FhirVersion::R4,
+            tenant_id: "default".to_string(),
+            tenant_display: None,
+            show_tenant_picker: false,
+            terminology: TerminologyNavigation::Unconfigured,
+            user,
+        }
+    }
+
+    #[test]
+    fn initials_take_the_first_letter_of_the_first_two_words() {
+        assert_eq!(initials_of("Demo User"), "DU");
+        assert_eq!(initials_of("Ada Byron Lovelace"), "AB");
+        assert_eq!(initials_of("demo"), "D");
+        assert_eq!(initials_of("  spaced   out  "), "SO");
+        // The shared helper marks an unlabelable input with "?" — never reached for
+        // a signed-in user, whose display name falls back to the subject.
+        assert_eq!(initials_of(""), "?");
+    }
+
+    #[test]
+    fn a_session_becomes_display_secondary_initials_and_photo() {
+        let summary = UserSummary::from_session(Some(&principal())).expect("signed in");
+        assert_eq!(summary.display, "Demo User");
+        assert_eq!(summary.secondary, "demo@example.org");
+        assert_eq!(summary.initials, "DU");
+        assert_eq!(summary.photo, None);
+
+        // No name and no email: the username is the display, the subject the
+        // secondary line — something still identifies the account.
+        let mut bare = principal();
+        bare.name = None;
+        bare.email = None;
+        bare.picture = Some("https://idp.example.com/avatar.png".to_string());
+        let summary = UserSummary::from_session(Some(&bare)).unwrap();
+        assert_eq!(summary.display, "demo");
+        assert_eq!(summary.secondary, "937f5c4f-demo");
+        assert_eq!(summary.initials, "D");
+        assert_eq!(
+            summary.photo.as_deref(),
+            Some("https://idp.example.com/avatar.png")
+        );
+
+        assert!(UserSummary::from_session(None).is_none());
+    }
+
+    #[test]
+    fn a_signed_in_status_feeds_the_menu_and_offers_sign_out() {
+        let status = status_with(UserSummary::from_session(Some(&principal())));
+        assert_eq!(status.user_display(), Some("Demo User"));
+        assert_eq!(status.user_secondary(), Some("demo@example.org"));
+        assert_eq!(status.user_initials(), Some("DU"));
+        assert_eq!(status.user_photo(), None);
+        assert!(status.user_can_logout());
+
+        let html = status
+            .user_menu(&I18n::from_tag("en").expect("supported locale"))
+            .unwrap();
+        assert!(html.contains("Demo User"), "{html}");
+        assert!(html.contains("demo@example.org"), "{html}");
+        assert!(
+            html.contains(
+                "<form class=\"user-menu__out-form\" method=\"post\" action=\"/ui/logout\">"
+            ),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn a_signed_out_status_keeps_the_local_operator_shape() {
+        let status = status_with(None);
+        assert_eq!(status.user_display(), None);
+        assert_eq!(status.user_secondary(), None);
+        assert_eq!(status.user_initials(), None);
+        assert_eq!(status.user_photo(), None);
+        assert!(!status.user_can_logout());
+
+        let html = status
+            .user_menu(&I18n::from_tag("en").expect("supported locale"))
+            .unwrap();
+        assert!(!html.contains("user-menu__out"), "{html}");
+        assert!(!html.contains("/ui/logout"), "{html}");
     }
 }

@@ -4,7 +4,8 @@
 //! - Basic single-type search
 //! - Multi-type search
 //! - _include and _revinclude support
-//! - Chained search parameter support
+//! - Chained search (`ChainedSearchProvider`); `search()` itself refuses a
+//!   query whose chains were not resolved first (#1389)
 //! - Full-text search using tsvector/tsquery
 
 use std::collections::HashSet;
@@ -74,7 +75,40 @@ fn reject_unsupported_metadata_modifier(query: &SearchQuery) -> StorageResult<()
     crate::search::validate_numeric_values(query)?;
     // And a value that is empty, or has an empty alternative: `family=Zzz,`
     // is a prefix match on `""`, which is every family name (#1380).
-    crate::search::validate_value_presence(query)
+    crate::search::validate_value_presence(query)?;
+    // And a chain nobody resolved (#1389).
+    reject_unresolved_chains(query)
+}
+
+/// Refuses a query that still carries chained or reverse-chained (`_has`)
+/// parameters (#1389). The query builder reads neither: an unresolved `_has`
+/// was silently dropped (every resource of the type matched) and a forward
+/// chain was read as a plain reference predicate on its first hop. Callers
+/// resolve chains first (`crate::search::resolve_chains`, as REST does), which
+/// strips both; anything that reaches here with one is an error, never a
+/// wrong answer. Runs after the `_contained` refusal so that path keeps its
+/// more specific error.
+fn reject_unresolved_chains(query: &SearchQuery) -> StorageResult<()> {
+    if let Some(param) = query.parameters.iter().find(|p| !p.chain.is_empty()) {
+        let mut chain = param.name.clone();
+        for link in &param.chain {
+            if let Some(target_type) = &link.target_type {
+                chain.push(':');
+                chain.push_str(target_type);
+            }
+            chain.push('.');
+            chain.push_str(&link.target_param);
+        }
+        return Err(StorageError::Search(
+            SearchError::ChainedSearchNotSupported {
+                chain: format!("{chain} (unresolved; resolve chains before search)"),
+            },
+        ));
+    }
+    if !query.reverse_chains.is_empty() {
+        return Err(StorageError::Search(SearchError::ReverseChainNotSupported));
+    }
+    Ok(())
 }
 
 /// Refuses what `_contained` matching cannot apply. `:missing` was once the
@@ -178,7 +212,9 @@ fn fast_index_pred(
 /// `Observation?date=gt2070-01-01T00:00:00` and `Patient?birthdate=gt2070-01-01`
 /// — both zero-match, one over a 689,080-row slice — and both stay at p99
 /// 17 ms because the planner correctly estimates zero and picks the value-first
-/// index. The same latent failure exists for date if a deployment ever mixes
+/// index. (Since #1391 a date `gt` compares the end of the indexed range,
+/// `value_date_end`, and v43's `idx_search_date_end` is that value-first index
+/// for it; this measurement predates the change and should be repeated.) The same latent failure exists for date if a deployment ever mixes
 /// wildly different date ranges under one column, but it is not present here
 /// and a guard is not free.
 ///
@@ -618,6 +654,8 @@ impl SearchProvider for PostgresBackend {
         Ok(count as u64)
     }
 
+    /// Returns the query-resolution cache. Guarded index writes derive their
+    /// definitions from persisted SearchParameters under the tenant gate.
     fn search_param_registry(
         &self,
         tenant: &crate::tenant::TenantContext,
@@ -911,15 +949,14 @@ impl ChainedSearchProvider for PostgresBackend {
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        // Deliberately NOT cached: `chain_builder` splices a token's *system*
-        // into the SQL as a literal (search/chain_builder.rs, the `Token` arms of
-        // `build_terminal_condition` and its reverse twin). The value is
-        // quote-escaped, so this is a cache-key problem rather than an injection
-        // one — but a client-supplied value in the text means a distinct
-        // statement per system, which is exactly the unbounded key to avoid.
-        // Binding it instead means renumbering the chain builder's placeholder
-        // accounting, which another seat is already inside; recorded rather than
-        // fixed here.
+        // Not cached. Every client-supplied value is bound, the token system
+        // included (the `Token` arms of `build_terminal_condition` and its
+        // reverse twin in search/chain_builder.rs); what the text still inlines
+        // is resource types and parameter names checked against the registry,
+        // and the chain's shape. That key is bounded, but a distinct statement
+        // per chain shape buys little here: REST resolves chains through the
+        // shared resolver, so this path is reached only through the
+        // `ChainedSearchProvider` API (#1341).
         let rows = client
             .query(&sql, &param_refs)
             .await
@@ -1496,7 +1533,7 @@ mod fast_path_tests {
         let pred = fast_index_pred(&q, Some(&filter_of(&q)), IndexLayout::Denormalized, false);
         assert_eq!(
             pred.as_deref(),
-            Some("param_name = 'date' AND value_date >= $3")
+            Some("param_name = 'date' AND value_date_end > $3")
         );
     }
 

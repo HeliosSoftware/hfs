@@ -12,7 +12,7 @@ use std::time::Duration;
 use futures::StreamExt;
 
 use async_trait::async_trait;
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use elasticsearch::params::Refresh;
 use elasticsearch::{BulkParts, DeleteByQueryParts, DeleteParts, IndexParts};
 use helios_fhir::FhirVersion;
@@ -23,9 +23,9 @@ use crate::error::{BackendError, ResourceError, StorageError, StorageResult};
 use crate::search::converters::IndexValue;
 use crate::search::extractor::ExtractedValue;
 use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
-use crate::search::{FhirDateValue, StorageResolution};
+use crate::search::{DateEnd, FhirDateValue, StorageResolution, indexed_end};
 use crate::tenant::{Operation, TenantContext};
-use crate::types::StoredResource;
+use crate::types::{DatePrecision, StoredResource};
 
 use super::backend::ElasticsearchBackend;
 use super::schema;
@@ -292,16 +292,20 @@ struct ValueOrigin<'a> {
 /// rest of the document indexes normally. Index-side code must never fail a
 /// write because of odd data.
 fn es_index_date(origin: ValueOrigin<'_>, raw: &str) -> Option<String> {
+    es_date_range(origin, raw).map(|(start, _)| es_instant(start))
+}
+
+/// The range `[start, end)` a stored date names at millisecond resolution,
+/// read as leniently as [`es_index_date`] reads it; `None`, with a warning,
+/// when it is not a date.
+fn es_date_range(origin: ValueOrigin<'_>, raw: &str) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
     let parsed = FhirDateValue::parse(raw).or_else(|error| {
         repair_iso_date(raw)
             .and_then(|repaired| FhirDateValue::parse(&repaired).ok())
             .ok_or(error)
     });
     match parsed {
-        Ok(parsed) => {
-            let (start, _) = parsed.range_at(StorageResolution::Millis);
-            Some(start.to_rfc3339_opts(SecondsFormat::Millis, true))
-        }
+        Ok(parsed) => Some(parsed.range_at(StorageResolution::Millis)),
         Err(error) => {
             tracing::warn!(
                 resource_type = origin.resource_type,
@@ -312,6 +316,44 @@ fn es_index_date(origin: ValueOrigin<'_>, raw: &str) -> Option<String> {
             None
         }
     }
+}
+
+/// The stored range of a standalone date index value: `(start, end)` as the
+/// `value` and `end` of a `search_params.date` entry (#1391). A point ends one
+/// unit of its own precision after it starts; a `Period` at the end of its own
+/// `end`, or at [`crate::search::open_end`] when it has none.
+///
+/// `None` when either end is not a date: the whole value is skipped, like a
+/// bad point, because indexing a `Period` with an unreadable `end` as open
+/// would match every later search range.
+fn es_index_range(
+    origin: ValueOrigin<'_>,
+    raw: &str,
+    precision: DatePrecision,
+    end: &DateEnd,
+) -> Option<(String, String)> {
+    let (start, point_end) = es_date_range(origin, raw)?;
+    let end = match end {
+        DateEnd::Precision => point_end,
+        other => match indexed_end(start, precision, other, StorageResolution::Millis) {
+            Some(end) => end,
+            None => {
+                tracing::warn!(
+                    resource_type = origin.resource_type,
+                    resource_id = origin.resource_id,
+                    param = origin.param,
+                    "Skipping a Period in the Elasticsearch index: its end is not a date"
+                );
+                return None;
+            }
+        },
+    };
+    Some((es_instant(start), es_instant(end)))
+}
+
+/// An instant as the `date` mapping stores it: RFC 3339 UTC, milliseconds.
+fn es_instant(instant: DateTime<Utc>) -> String {
+    instant.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
 /// Rewrites the ISO 8601 spellings that are not FHIR but that the `date`
@@ -462,11 +504,16 @@ pub(crate) fn build_es_document(
                 }
                 token_params.push(token);
             }
-            IndexValue::Date { value, precision } => {
-                if let Some(value) = es_index_date(origin, value) {
+            IndexValue::Date {
+                value,
+                precision,
+                end,
+            } => {
+                if let Some((start, end)) = es_index_range(origin, value, *precision, end) {
                     date_params.push(json!({
                         "name": ev.param_name,
-                        "value": value,
+                        "value": start,
+                        "end": end,
                         "precision": format!("{:?}", precision).to_lowercase(),
                     }));
                 }
@@ -2677,6 +2724,7 @@ mod tests {
             json!([{
                 "name": "death-date",
                 "value": "2024-03-15T05:00:00.000Z",
+                "end": "2024-03-15T05:00:01.000Z",
                 "precision": "second",
             }])
         );
@@ -2686,6 +2734,97 @@ mod tests {
                 { "name": "combo", "group_id": 0, "string": ["kept"] },
                 { "name": "combo", "group_id": 1, "date": ["2017-01-01T00:00:00.000Z"] },
             ])
+        );
+    }
+
+    /// #1391: a `Period` indexes as one range, its open ends at the edges of
+    /// the supported years, and a `Period` with an end that is not a date is
+    /// skipped whole rather than indexed as open.
+    #[test]
+    fn document_indexes_a_period_as_one_range() {
+        let period = |start: Option<&str>, end: Option<&str>| {
+            let value = IndexValue::date_range(start, end).expect("a Period with an end");
+            ExtractedValue::new(
+                "date",
+                "http://hl7.org/fhir/SearchParameter/clinical-date",
+                value.param_type(),
+                value,
+            )
+        };
+        let doc = build_es_document(
+            "t1",
+            "Encounter",
+            "e1",
+            "1",
+            &json!({ "resourceType": "Encounter", "id": "e1" }),
+            FhirVersion::default(),
+            &[
+                period(Some("2020-01-15"), Some("2020-06")),
+                period(Some("2021-03-01T10:00:00Z"), None),
+                period(None, Some("1999")),
+                period(Some("2022-01-01"), Some("not-a-date")),
+            ],
+        );
+
+        let ranges: Vec<(&str, &str)> = doc["search_params"]["date"]
+            .as_array()
+            .expect("date entries")
+            .iter()
+            .map(|entry| {
+                (
+                    entry["value"].as_str().unwrap(),
+                    entry["end"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            ranges,
+            vec![
+                ("2020-01-15T00:00:00.000Z", "2020-07-01T00:00:00.000Z"),
+                ("2021-03-01T10:00:00.000Z", "9999-12-31T23:59:59.999Z"),
+                ("0001-01-01T00:00:00.000Z", "2000-01-01T00:00:00.000Z"),
+            ]
+        );
+    }
+
+    /// A `Period` bound is read strictly: the extractor indexes a `Period` only
+    /// when both bounds are valid FHIR dates, and an `end` that is not one —
+    /// ISO 8601 spellings outside the grammar included — drops the whole
+    /// `Period` rather than being read as open.
+    #[test]
+    fn a_period_with_an_end_that_is_not_a_fhir_date_is_skipped_whole() {
+        let period = |start: &str, end: &str| {
+            let value = IndexValue::date_range(Some(start), Some(end)).expect("a Period");
+            ExtractedValue::new(
+                "date",
+                "http://hl7.org/fhir/SearchParameter/clinical-date",
+                value.param_type(),
+                value,
+            )
+        };
+        let doc = build_es_document(
+            "t1",
+            "Encounter",
+            "e1",
+            "1",
+            &json!({ "resourceType": "Encounter", "id": "e1" }),
+            FhirVersion::default(),
+            &[
+                period("2024-03-15", "2024-03-15T12:00:00+05:30"),
+                period("2024-03-15", "2024-03-15T12Z"),
+                period("2024-03-15", "2024-03-15T12:00:00+0530"),
+                period("2024-03-15", "not-a-date"),
+            ],
+        );
+        let ranges: Vec<(&str, &str)> = doc["search_params"]["date"]
+            .as_array()
+            .expect("date entries")
+            .iter()
+            .map(|e| (e["value"].as_str().unwrap(), e["end"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            ranges,
+            vec![("2024-03-15T00:00:00.000Z", "2024-03-15T06:30:01.000Z")]
         );
     }
 
