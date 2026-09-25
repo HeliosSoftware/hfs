@@ -8,8 +8,17 @@
 
 use super::*;
 
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use async_trait::async_trait;
 use futures::TryStreamExt;
-use helios_persistence::search::{ReindexSource, ResourcePage};
+use helios_persistence::error::StorageResult;
+use helios_persistence::search::{
+    ReindexOperation, ReindexPageStats, ReindexRequest, ReindexSource, ReindexStatus,
+    ReindexTarget, ResourcePage,
+};
+use helios_persistence::types::StoredResource;
 
 /// Builds a `MongoBackend` for this file's tests: same shape as
 /// `create_backend_with_search_offloaded` (`mongodb_tests.rs`), but
@@ -323,4 +332,431 @@ async fn mongodb_integration_reindex_fetch_capped_returns_a_resource_larger_than
         .flat_map(|p| p.resources.iter().map(|r| r.id().to_string()))
         .collect();
     assert_eq!(seen, ["p01", "p02"]);
+}
+
+/// `n` Provenance resources shaped like the #1403 corpus's extreme case: one
+/// agent and 1,600 `target` references each, ~70-100 KB of BSON per resource.
+fn provenance_fixture(n: usize) -> Vec<(String, serde_json::Value)> {
+    (0..n)
+        .map(|i| {
+            let id = format!("prov-{i:02}");
+            let targets: Vec<serde_json::Value> = (0..1600)
+                .map(|k| json!({ "reference": format!("Observation/{id}-{k:05}") }))
+                .collect();
+            (
+                id.clone(),
+                json!({
+                    "resourceType": "Provenance",
+                    "id": id,
+                    "agent": [{ "who": { "reference": "Practitioner/example" } }],
+                    "target": targets,
+                }),
+            )
+        })
+        .collect()
+}
+
+/// Seeds a 24-resource Provenance fixture, settles it into the id phase, and
+/// returns the raw database handle, each row's id-sorted stored size, and the
+/// byte cap that admits exactly the three smallest resources. Shared by the
+/// two Provenance-shaped tests below, which otherwise duplicated this setup
+/// verbatim (ledger Ruling R3).
+async fn seed_provenance(
+    backend: &MongoBackend,
+    tenant: &TenantContext,
+    tenant_id: &str,
+) -> (mongodb::Database, Vec<(String, u64)>, u64) {
+    let fixture = provenance_fixture(24);
+    for (id, resource) in &fixture {
+        backend
+            .create_or_update(
+                tenant,
+                "Provenance",
+                id,
+                resource.clone(),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    settle_into_id_phase().await;
+    let db = raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap()
+        .database(&backend.config().database_name);
+    let sizes = reindex_resource_row_sizes(&db, tenant_id, "Provenance").await;
+    let mut by_size = sizes.clone();
+    by_size.sort_by_key(|(_, size)| *size);
+    let cap: u64 = by_size.iter().take(3).map(|(_, size)| *size).sum();
+    (db, sizes, cap)
+}
+
+#[tokio::test]
+async fn mongodb_integration_reindex_fetch_capped_provenance_shaped() {
+    let Some(backend) = create_id_phase_backend("reindex_provenance_shaped").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant_id = "tenant-provenance-shaped";
+    let tenant = create_tenant(tenant_id);
+    let (_db, sizes, cap) = seed_provenance(&backend, &tenant, tenant_id).await;
+
+    let pages = walk_capped(&backend, &tenant, "Provenance", 24, cap).await;
+    for page in &pages {
+        assert!(
+            page.resources.len() <= 3,
+            "page held {} resources",
+            page.resources.len()
+        );
+        let bytes: u64 = page
+            .resources
+            .iter()
+            .map(|r| sizes.iter().find(|(id, _)| id == r.id()).unwrap().1)
+            .sum();
+        assert!(bytes <= cap || page.resources.len() == 1);
+    }
+    let seen: std::collections::BTreeSet<String> = pages
+        .iter()
+        .flat_map(|p| p.resources.iter().map(|r| r.id().to_string()))
+        .collect();
+    assert_eq!(seen.len(), 24, "every resource must come back exactly once");
+
+    let unbounded = walk_capped(&backend, &tenant, "Provenance", 5, u64::MAX).await;
+    let last_index = unbounded.len().saturating_sub(1);
+    for (i, page) in unbounded.iter().enumerate() {
+        assert!(
+            page.next_cursor
+                .as_deref()
+                .is_some_and(|c| c.starts_with("v2|i|"))
+                || i == last_index,
+            "page {i} of an id-only limit-5 walk must stay in the id phase"
+        );
+        if i == last_index {
+            assert!(page.resources.len() <= 5);
+        } else {
+            assert_eq!(
+                page.resources.len(),
+                5,
+                "page {i} of an id-only limit-5 walk"
+            );
+        }
+    }
+}
+
+struct RecordingSource {
+    inner: Arc<MongoBackend>,
+    sizes: std::collections::HashMap<String, u64>,
+    pages: Mutex<Vec<(usize, u64)>>,
+}
+
+#[async_trait]
+impl ReindexSource for RecordingSource {
+    async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
+        self.inner.list_resource_types(tenant).await
+    }
+    async fn count_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+    ) -> StorageResult<u64> {
+        self.inner.count_resources(tenant, resource_type).await
+    }
+    async fn fetch_resources_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> StorageResult<ResourcePage> {
+        self.inner
+            .fetch_resources_page(tenant, resource_type, cursor, limit)
+            .await
+    }
+    async fn fetch_resources_page_capped(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<ResourcePage> {
+        let page = self
+            .inner
+            .fetch_resources_page_capped(tenant, resource_type, cursor, limit, max_bytes)
+            .await?;
+        let bytes: u64 = page
+            .resources
+            .iter()
+            .map(|r| *self.sizes.get(r.id()).expect("fixture size"))
+            .sum();
+        self.pages
+            .lock()
+            .unwrap()
+            .push((page.resources.len(), bytes));
+        Ok(page)
+    }
+}
+
+struct RecordingWriter {
+    inner: Arc<MongoBackend>,
+    written: AtomicU64,
+}
+
+#[async_trait]
+impl ReindexTarget for RecordingWriter {
+    async fn delete_search_entries(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> StorageResult<u64> {
+        self.inner
+            .delete_search_entries(tenant, resource_type, resource_id)
+            .await
+    }
+    async fn write_search_entries(
+        &self,
+        tenant: &TenantContext,
+        resource: &StoredResource,
+    ) -> StorageResult<usize> {
+        self.inner.write_search_entries(tenant, resource).await
+    }
+    async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64> {
+        self.inner.clear_search_index(tenant).await
+    }
+    async fn begin_bulk_index_rebuild(&self) -> StorageResult<()> {
+        self.inner.begin_bulk_index_rebuild().await
+    }
+    async fn end_bulk_index_rebuild(&self) -> StorageResult<()> {
+        self.inner.end_bulk_index_rebuild().await
+    }
+    // Delegates to `write_search_entries_page_timed` with a throwaway
+    // `ReindexPageStats`, per that method's trait contract (reindex.rs:379-386)
+    // that an override MUST route the untimed page method through it, so the
+    // two paths cannot diverge (ledger Ruling R5) — mirrors MongoBackend's own
+    // `ReindexTarget::write_search_entries_page` impl.
+    async fn write_search_entries_page(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+    ) -> Vec<StorageResult<usize>> {
+        let mut stats = ReindexPageStats::default();
+        self.write_search_entries_page_timed(tenant, resources, &mut stats)
+            .await
+    }
+    async fn write_search_entries_page_timed(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+        stats: &mut ReindexPageStats,
+    ) -> Vec<StorageResult<usize>> {
+        let results = self
+            .inner
+            .write_search_entries_page_timed(tenant, resources, stats)
+            .await;
+        let ok: u64 = results
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .map(|n| *n as u64)
+            .sum();
+        self.written.fetch_add(ok, Ordering::SeqCst);
+        results
+    }
+}
+
+#[tokio::test]
+async fn mongodb_integration_reindex_capped_run_bounds_every_page() {
+    let Some(backend) = create_id_phase_backend("reindex_capped_run_bounds").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant_id = "tenant-capped-run-bounds";
+    let tenant = create_tenant(tenant_id);
+    let (db, sizes, cap) = seed_provenance(&backend, &tenant, tenant_id).await;
+
+    let source = Arc::new(RecordingSource {
+        inner: backend.clone(),
+        sizes: sizes.into_iter().collect(),
+        pages: Mutex::new(Vec::new()),
+    });
+    let writer = Arc::new(RecordingWriter {
+        inner: backend.clone(),
+        written: AtomicU64::new(0),
+    });
+    let operation = ReindexOperation::with_parts(
+        source.clone(),
+        vec![writer.clone()],
+        backend.tenant_registries().clone(),
+    );
+    let request = ReindexRequest::for_types(["Provenance"])
+        .with_batch_size(100)
+        .with_batch_bytes(cap);
+    let job_id = operation.start(tenant, request, None).await.unwrap();
+    let progress = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        loop {
+            let progress = operation.get_progress(&job_id).await.unwrap();
+            if progress.status.is_finished() {
+                break progress;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("reindex did not finish within 60s");
+
+    assert_eq!(progress.status, ReindexStatus::Completed);
+    assert!(progress.errors.is_empty(), "{:?}", progress.errors);
+    assert_eq!(progress.processed_resources, 24);
+    for (resources, bytes) in source.pages.lock().unwrap().iter() {
+        assert!(*resources <= 3, "page held {resources} resources");
+        assert!(
+            *bytes <= cap || *resources == 1,
+            "page held {resources} resources totalling {bytes} bytes, over cap {cap}"
+        );
+    }
+    let own = db
+        .collection::<Document>("search_index")
+        .count_documents(doc! { "tenant_id": tenant_id, "resource_type": "Provenance" })
+        .await
+        .unwrap();
+    let contained = db
+        .collection::<Document>("search_index_contained")
+        .count_documents(doc! { "tenant_id": tenant_id, "resource_type": "Provenance" })
+        .await
+        .unwrap();
+    assert_eq!(progress.entries_created, own + contained);
+    assert_eq!(
+        writer.written.load(Ordering::SeqCst),
+        progress.entries_created
+    );
+}
+
+#[tokio::test]
+async fn mongodb_integration_reindex_fetch_capped_page_never_spans_the_catch_up_boundary() {
+    let Some(backend) = create_id_phase_backend("reindex_capped_catch_up_boundary").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant_id = "tenant-capped-catch-up-boundary";
+    let tenant = create_tenant(tenant_id);
+    for (id, k) in [
+        ("p01", 1usize),
+        ("p02", 2),
+        ("p03", 3),
+        ("p04", 4),
+        ("p05", 5),
+        ("p06", 6),
+    ] {
+        backend
+            .create_or_update(
+                &tenant,
+                "Patient",
+                id,
+                json!({"resourceType": "Patient", "id": id, "name": [{"family": "X".repeat(100 * k)}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    // The id-phase fixture rule: sleep past the margin so every seeded row is
+    // walked by the id phase, not folded into round 1.
+    settle_into_id_phase().await;
+
+    let db = raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap()
+        .database(&backend.config().database_name);
+    let sizes = reindex_resource_row_sizes(&db, tenant_id, "Patient").await;
+    let cap: u64 = sizes
+        .iter()
+        .filter(|(id, _)| id != "p06")
+        .map(|(_, size)| *size)
+        .sum();
+
+    let page1 = backend
+        .fetch_resources_page_capped(&tenant, "Patient", None, 6, cap)
+        .await
+        .unwrap();
+    let page1_ids: Vec<String> = page1.resources.iter().map(|r| r.id().to_string()).collect();
+    assert_eq!(page1_ids, ["p01", "p02", "p03", "p04", "p05"]);
+    assert!(
+        page1
+            .next_cursor
+            .as_deref()
+            .is_some_and(|c| c.starts_with("v2|i|"))
+    );
+
+    // A racing update to a row already on page 1, after it was written.
+    backend
+        .create_or_update(
+            &tenant,
+            "Patient",
+            "p02",
+            json!({"resourceType": "Patient", "id": "p02", "name": [{"family": "Updated"}]}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let mut cursor = page1.next_cursor;
+    let mut saw_id_phase_p06 = false;
+    let mut p02_round_hits = 0u32;
+    let mut p02_round_family: Option<String> = None;
+    let mut seen_ids: Vec<String> = page1_ids.clone();
+    {
+        let unique: std::collections::HashSet<&String> = page1_ids.iter().collect();
+        assert_eq!(unique.len(), page1_ids.len(), "page 1 holds an id twice");
+    }
+    for _ in 0..20 {
+        let page = backend
+            .fetch_resources_page_capped(&tenant, "Patient", cursor.as_deref(), 6, cap)
+            .await
+            .unwrap();
+        let ids: Vec<String> = page.resources.iter().map(|r| r.id().to_string()).collect();
+        {
+            let unique: std::collections::HashSet<&String> = ids.iter().collect();
+            assert_eq!(unique.len(), ids.len(), "a page holds an id twice: {ids:?}");
+        }
+        if !ids.is_empty() {
+            if let Some(next) = &page.next_cursor {
+                if next.starts_with("v2|i|") {
+                    assert_eq!(ids, ["p06"], "the id phase's last page must be exactly p06");
+                    saw_id_phase_p06 = true;
+                } else if next.starts_with("v2|c|") {
+                    if let Some(p02) = page.resources.iter().find(|r| r.id() == "p02") {
+                        p02_round_hits += 1;
+                        p02_round_family = p02.content()["name"][0]["family"]
+                            .as_str()
+                            .map(str::to_string);
+                    }
+                }
+            }
+        }
+        seen_ids.extend(ids);
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    assert!(
+        saw_id_phase_p06,
+        "p06 must be walked by the id phase, not folded into a capped page"
+    );
+    assert_eq!(
+        p02_round_hits, 1,
+        "p02 must be re-walked by exactly one catch-up round page"
+    );
+    assert_eq!(
+        p02_round_family.as_deref(),
+        Some("Updated"),
+        "p02 must come back with its updated content"
+    );
+
+    let mut counts = std::collections::HashMap::new();
+    for id in &seen_ids {
+        *counts.entry(id.clone()).or_insert(0) += 1;
+    }
+    for id in ["p01", "p03", "p04", "p05", "p06"] {
+        assert_eq!(counts.get(id), Some(&1), "{id} must appear exactly once");
+    }
 }
