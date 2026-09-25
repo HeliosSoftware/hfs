@@ -22,6 +22,7 @@ mod bulk_ingest;
 pub(crate) mod bulk_provider;
 mod bulk_submit;
 mod composite_search;
+mod reindex_pipeline;
 mod retry;
 pub(crate) mod schema;
 mod search_impl;
