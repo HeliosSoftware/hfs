@@ -10253,7 +10253,7 @@ mod bulk_submit {
     static FAILPOINT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// A `failCommand` failpoint scoped to one client's `appName`.
-    struct FailPoint {
+    pub(super) struct FailPoint {
         admin: mongodb::Database,
         initial_count: i64,
         _lock: tokio::sync::MutexGuard<'static, ()>,
@@ -10264,7 +10264,11 @@ mod bulk_submit {
         /// Returns `None`, after printing why, when no Mongo is available or
         /// the server was not started with `enableTestCommands=1` (an
         /// external `HFS_TEST_MONGODB_URL`).
-        async fn enable(app_name: &str, mut data: Document, mode: Document) -> Option<FailPoint> {
+        pub(super) async fn enable(
+            app_name: &str,
+            mut data: Document,
+            mode: Document,
+        ) -> Option<FailPoint> {
             let lock = FAILPOINT_LOCK.lock().await;
             let Some(connection_string) = shared_mongo::connection_string().await else {
                 eprintln!("Skipping failpoint test (requires Docker or HFS_TEST_MONGODB_URL)");
@@ -10309,7 +10313,7 @@ mod bulk_submit {
         }
 
         /// Waits until this configuration has matched `additional` commands.
-        async fn wait_until_entered(&self, additional: i64) {
+        pub(super) async fn wait_until_entered(&self, additional: i64) {
             self.admin
                 .run_command(doc! {
                     "waitForFailPoint": "failCommand",
@@ -10323,7 +10327,7 @@ mod bulk_submit {
         /// Turns the failpoint off and releases the lock. Call at the end of
         /// every test; a `times`-bounded failpoint that is never turned off
         /// still only affects its own `appName`.
-        async fn off(self) {
+        pub(super) async fn off(self) {
             let _ = self
                 .admin
                 .run_command(doc! { "configureFailPoint": "failCommand", "mode": "off" })

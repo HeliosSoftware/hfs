@@ -11,6 +11,7 @@ use super::*;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::bulk_submit::FailPoint;
 use async_trait::async_trait;
 use futures::TryStreamExt;
 use helios_persistence::error::StorageResult;
@@ -887,6 +888,7 @@ fn build_test_patients(tenant: &TenantContext, prefix: &str, n: usize) -> Vec<St
 async fn mongodb_integration_reindex_page_serial_pipeline_writes_a_large_page() {
     let Some(backend) = create_backend_with("reindex_serial_pipeline_large_page", |c| {
         c.reindex_prepare_threads = 1;
+        c.reindex_overlap = false;
     })
     .await
     else {
@@ -915,6 +917,409 @@ async fn mongodb_integration_reindex_page_serial_pipeline_writes_a_large_page() 
         assert!(
             search_index_entry_count(&backend, &tenant, "Patient", resource.id()).await > 0,
             "resource {} must have a row",
+            resource.id()
+        );
+    }
+}
+
+/// Reads every row of `collection`, drops `_id` and `tenant_id`, and sorts a
+/// deterministic per-row string — so two backends' collections can be
+/// compared regardless of insert order or `_id` values (#1403).
+async fn rows_without_id_and_tenant(backend: &MongoBackend, collection: &str) -> Vec<String> {
+    use futures::stream::TryStreamExt;
+    let db = backend.get_database().await.expect("get_database");
+    let mut rows: Vec<String> = db
+        .collection::<Document>(collection)
+        .find(doc! {})
+        .await
+        .expect("find")
+        .try_collect::<Vec<Document>>()
+        .await
+        .expect("collect")
+        .into_iter()
+        .map(|mut d| {
+            d.remove("_id");
+            d.remove("tenant_id");
+            let mut keys: Vec<&String> = d.keys().collect();
+            keys.sort();
+            keys.into_iter()
+                .map(|k| format!("{k}={:?}", d.get(k)))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mongodb_integration_reindex_page_overlapped_matches_serial() {
+    let Some(serial) = create_backend_with("reindex_overlap_matches_serial", |c| {
+        c.reindex_overlap = false;
+        c.reindex_prepare_threads = 1;
+    })
+    .await
+    else {
+        eprintln!(
+            "Skipping mongodb_integration_reindex_page_overlapped_matches_serial (requires Docker)"
+        );
+        return;
+    };
+    let overlapped = create_backend_with("reindex_overlap_matches_serial", |c| {
+        c.reindex_overlap = true;
+        c.reindex_prepare_threads = 0;
+    })
+    .await
+    .expect(
+        "Docker was available for the serial backend, so it must be for the overlapped one too",
+    );
+
+    let ts = create_tenant("reindex-overlap-serial-tenant-s");
+    let to = create_tenant("reindex-overlap-serial-tenant-o");
+
+    let build_page = |tenant: &TenantContext| -> Vec<StoredResource> {
+        (0..300)
+            .map(|n| {
+                let mut resource = json!({
+                    "resourceType": "Observation",
+                    "id": format!("obs-{n}"),
+                    "status": "final",
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "1234-5"}]},
+                });
+                if n % 10 == 0 {
+                    resource["contained"] = json!([{
+                        "resourceType": "Patient",
+                        "id": "p1",
+                        "name": [{"family": format!("Contained{n}")}]
+                    }]);
+                }
+                StoredResource::from_storage(
+                    "Observation",
+                    format!("obs-{n}"),
+                    "1",
+                    tenant.tenant_id().clone(),
+                    resource,
+                    chrono::Utc::now(),
+                    chrono::Utc::now(),
+                    None,
+                    FhirVersion::default(),
+                )
+            })
+            .collect()
+    };
+
+    let page_s = build_page(&ts);
+    let page_o = build_page(&to);
+    let target_s: &dyn ReindexTarget = &*serial;
+    let target_o: &dyn ReindexTarget = &*overlapped;
+    let mut stats_s = ReindexPageStats::default();
+    let mut stats_o = ReindexPageStats::default();
+    let outcomes_s = target_s
+        .write_search_entries_page_timed(&ts, &page_s, &mut stats_s)
+        .await;
+    let outcomes_o = target_o
+        .write_search_entries_page_timed(&to, &page_o, &mut stats_o)
+        .await;
+
+    assert_eq!(outcomes_s.len(), outcomes_o.len());
+    for (a, b) in outcomes_s.iter().zip(&outcomes_o) {
+        assert_eq!(a.as_ref().ok(), b.as_ref().ok());
+    }
+    assert_eq!(
+        stats_s.sub_batches, 1,
+        "300 resources is one sub-batch serially"
+    );
+    assert!(
+        stats_o.sub_batches >= 2,
+        "300 resources must split on the overlapped path"
+    );
+    assert_eq!(stats_s.inserted_entries, stats_o.inserted_entries);
+
+    assert_eq!(
+        rows_without_id_and_tenant(&serial, "search_index").await,
+        rows_without_id_and_tenant(&overlapped, "search_index").await
+    );
+    assert_eq!(
+        rows_without_id_and_tenant(&serial, "search_index_contained").await,
+        rows_without_id_and_tenant(&overlapped, "search_index_contained").await
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mongodb_integration_reindex_page_overlapped_command_shape() {
+    let Some(backend) = create_backend_with("reindex_overlap_command_shape", |c| {
+        c.reindex_overlap = true;
+        c.reindex_prepare_threads = 1; // keep the assertions independent of pool scheduling
+    })
+    .await
+    else {
+        eprintln!(
+            "Skipping mongodb_integration_reindex_page_overlapped_command_shape (requires Docker)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("reindex-overlap-shape-tenant");
+    let page = build_test_patients(&tenant, "shape", 40);
+
+    let db = backend.get_database().await.unwrap();
+    let profiling_enabled = db.run_command(doc! { "profile": 2_i32 }).await.is_ok();
+    if !profiling_enabled {
+        eprintln!(
+            "mongodb_integration_reindex_page_overlapped_command_shape: server refused \
+             {{profile: 2}}; skipping"
+        );
+        return;
+    }
+
+    let target: &dyn ReindexTarget = &*backend;
+    let mut stats = ReindexPageStats::default();
+    let outcomes = target
+        .write_search_entries_page_timed(&tenant, &page, &mut stats)
+        .await;
+    assert!(outcomes.iter().all(|o| o.is_ok()), "{outcomes:?}");
+    assert!(
+        stats.sub_batches >= 2,
+        "a type's first page caps its first sub-batch at REINDEX_SUBBATCH_FIRST=32, so 40 must split"
+    );
+
+    db.run_command(doc! { "profile": 0_i32 })
+        .await
+        .expect("disable profiling");
+    let ns = format!("{}.search_index", db.name());
+    let entries: Vec<Document> = db
+        .collection::<Document>("system.profile")
+        .find(doc! { "ns": ns.as_str(), "op": { "$in": ["remove", "insert"] } })
+        .sort(doc! { "ts": 1 })
+        .await
+        .expect("read system.profile")
+        .try_collect()
+        .await
+        .expect("collect system.profile");
+
+    let removes: Vec<&Document> = entries
+        .iter()
+        .filter(|e| e.get_str("op").ok() == Some("remove"))
+        .collect();
+    let inserts: Vec<&Document> = entries
+        .iter()
+        .filter(|e| e.get_str("op").ok() == Some("insert"))
+        .collect();
+    assert_eq!(
+        removes.len(),
+        1,
+        "exactly one delete_many for the page: {entries:?}"
+    );
+    assert_eq!(inserts.len() as u64, stats.insert_commands, "{entries:?}");
+    assert!(inserts.len() >= 2);
+    let remove_ts = removes[0].get_datetime("ts").expect("remove ts");
+    for insert in &inserts {
+        let insert_ts = insert.get_datetime("ts").expect("insert ts");
+        assert!(
+            remove_ts <= insert_ts,
+            "the delete must happen at or before every insert"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mongodb_integration_reindex_page_overlapped_issues_no_insert_after_a_failed_one() {
+    let app_name = "reindex-overlap-fail-first-insert";
+    let Some(backend) = create_backend_with("reindex_overlap_fails_first_insert", |c| {
+        c.reindex_overlap = true;
+        c.reindex_prepare_threads = 1;
+        c.app_name = app_name.to_string();
+        c.connection_string = append_query_param(&c.connection_string, "retryWrites=false");
+    })
+    .await
+    else {
+        eprintln!(
+            "Skipping mongodb_integration_reindex_page_overlapped_issues_no_insert_after_a_failed_one (requires Docker)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("reindex-overlap-fail-first-tenant");
+    let page = build_test_patients(&tenant, "failfirst", 80);
+
+    // Seed the rows with the failpoint off, so the zero-row assertion below
+    // actually shows the page's delete removed something (#1403).
+    let target: &dyn ReindexTarget = &*backend;
+    for resource in &page {
+        let seeded = target.write_search_entries(&tenant, resource).await;
+        assert!(seeded.is_ok(), "{seeded:?}");
+    }
+    assert!(
+        search_index_entry_count(&backend, &tenant, "Patient", page[0].id()).await > 0,
+        "the seed write must have created rows, or the later zero-row assertion proves nothing"
+    );
+
+    let Some(failpoint) = FailPoint::enable(
+        app_name,
+        doc! { "failCommands": ["insert"], "errorCode": 2 },
+        doc! { "times": 1 },
+    )
+    .await
+    else {
+        eprintln!("Skipping: enableTestCommands unavailable");
+        return;
+    };
+
+    let mut stats = ReindexPageStats::default();
+    let outcomes = target
+        .write_search_entries_page_timed(&tenant, &page, &mut stats)
+        .await;
+    failpoint.off().await;
+
+    assert!(stats.sub_batches >= 2);
+    assert!(
+        outcomes
+            .iter()
+            .all(|o| matches!(o, Err(e) if e.to_string().contains("Failed to insert search index entries"))),
+        "{outcomes:?}"
+    );
+    for resource in &page {
+        let count = search_index_entry_count(&backend, &tenant, "Patient", resource.id()).await;
+        assert_eq!(
+            count,
+            0,
+            "resource {} must have zero rows: the delete removed them and sub-batch 1's insert \
+             failed before any row could be re-inserted",
+            resource.id()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mongodb_integration_reindex_page_overlapped_keeps_rows_of_completed_sub_batches() {
+    let app_name = "reindex-overlap-fail-later-insert";
+    let Some(backend) = create_backend_with("reindex_overlap_keeps_completed_rows", |c| {
+        c.reindex_overlap = true;
+        c.reindex_prepare_threads = 1;
+        c.app_name = app_name.to_string();
+        c.connection_string = append_query_param(&c.connection_string, "retryWrites=false");
+    })
+    .await
+    else {
+        eprintln!(
+            "Skipping mongodb_integration_reindex_page_overlapped_keeps_rows_of_completed_sub_batches (requires Docker)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("reindex-overlap-fail-later-tenant");
+    let page = build_test_patients(&tenant, "faillater", 80);
+
+    // Seed the rows with the failpoint off, so the "non-empty prefix" claim
+    // below shows real rows being kept, not an already-empty collection.
+    let target: &dyn ReindexTarget = &*backend;
+    for resource in &page {
+        let seeded = target.write_search_entries(&tenant, resource).await;
+        assert!(seeded.is_ok(), "{seeded:?}");
+    }
+    assert!(
+        search_index_entry_count(&backend, &tenant, "Patient", page[0].id()).await > 0,
+        "the seed write must have created rows, or the later prefix assertion proves nothing"
+    );
+
+    let Some(failpoint) = FailPoint::enable(
+        app_name,
+        doc! { "failCommands": ["insert"], "errorCode": 2 },
+        doc! { "skip": 1 },
+    )
+    .await
+    else {
+        eprintln!("Skipping: enableTestCommands unavailable");
+        return;
+    };
+
+    let mut stats = ReindexPageStats::default();
+    let outcomes = target
+        .write_search_entries_page_timed(&tenant, &page, &mut stats)
+        .await;
+    failpoint.off().await;
+
+    assert!(outcomes.iter().all(|o| o.is_err()), "{outcomes:?}");
+
+    let mut has_rows: Vec<bool> = Vec::with_capacity(page.len());
+    for resource in &page {
+        has_rows
+            .push(search_index_entry_count(&backend, &tenant, "Patient", resource.id()).await > 0);
+    }
+    let with_rows = has_rows.iter().filter(|b| **b).count();
+    assert!(
+        with_rows > 0 && with_rows < page.len(),
+        "the rows must form a non-empty, proper prefix: {has_rows:?}"
+    );
+    assert!(has_rows[..with_rows].iter().all(|b| *b), "{has_rows:?}");
+    assert!(has_rows[with_rows..].iter().all(|b| !*b), "{has_rows:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mongodb_integration_reindex_page_overlapped_fans_out_a_delete_failure() {
+    let app_name = "reindex-overlap-fail-delete";
+    let Some(backend) = create_backend_with("reindex_overlap_fans_out_delete_failure", |c| {
+        c.reindex_overlap = true;
+        c.reindex_prepare_threads = 1;
+        c.app_name = app_name.to_string();
+        c.connection_string = append_query_param(&c.connection_string, "retryWrites=false");
+    })
+    .await
+    else {
+        eprintln!(
+            "Skipping mongodb_integration_reindex_page_overlapped_fans_out_a_delete_failure (requires Docker)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("reindex-overlap-fail-delete-tenant");
+    let page = build_test_patients(&tenant, "faildelete", 40);
+
+    let target: &dyn ReindexTarget = &*backend;
+    let mut seed_stats = ReindexPageStats::default();
+    let seed_outcomes = target
+        .write_search_entries_page_timed(&tenant, &page, &mut seed_stats)
+        .await;
+    assert!(seed_outcomes.iter().all(|o| o.is_ok()));
+    let mut before_counts = Vec::with_capacity(page.len());
+    for resource in &page {
+        before_counts
+            .push(search_index_entry_count(&backend, &tenant, "Patient", resource.id()).await);
+    }
+
+    let Some(failpoint) = FailPoint::enable(
+        app_name,
+        doc! { "failCommands": ["delete"], "errorCode": 2 },
+        doc! { "times": 1 },
+    )
+    .await
+    else {
+        eprintln!("Skipping: enableTestCommands unavailable");
+        return;
+    };
+
+    let mut stats = ReindexPageStats::default();
+    let outcomes = target
+        .write_search_entries_page_timed(&tenant, &page, &mut stats)
+        .await;
+    failpoint.off().await;
+
+    assert!(
+        outcomes.iter().all(
+            |o| matches!(o, Err(e) if e.to_string().contains("Failed to delete search entries"))
+        ),
+        "{outcomes:?}"
+    );
+    assert_eq!(
+        stats.insert_commands, 0,
+        "no insert may be spawned once the delete has failed"
+    );
+    for (resource, before) in page.iter().zip(&before_counts) {
+        let after = search_index_entry_count(&backend, &tenant, "Patient", resource.id()).await;
+        assert_eq!(
+            after,
+            *before,
+            "resource {} row count must be unchanged",
             resource.id()
         );
     }

@@ -4,17 +4,13 @@
 //! thread extracts sub-batch *k+1* inside `tokio::task::block_in_place`, so
 //! HFS-side extraction overlaps MongoDB-side delete/insert instead of running
 //! strictly after it. This module holds the planner that sizes sub-batches,
-//! the `block_in_place` + rayon extraction helper, and, once added, the
-//! writer bodies that call them. `storage.rs` keeps only the dispatcher and
-//! the two `ReindexSource` prefetch methods.
+//! the `block_in_place` + rayon extraction helper, and the serial and
+//! overlapped writer bodies that call them; `storage.rs`'s
+//! `write_search_entries_page_timed` dispatches between the two and keeps
+//! the rest of the `ReindexTarget`/`ReindexSource` methods.
 //!
 //! See `docs/superpowers/specs/2026-09-23-mongodb-reindex-rebuild-design.md`
 //! §4.4.
-
-// Not yet called by production code: the overlapped writer that uses these
-// items lands in a later commit, which removes this allow once everything
-// below is used.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -348,6 +344,43 @@ fn join_failure(e: tokio::task::JoinError, what: &str) -> String {
     format!("search index {what} task ended without a result: {e}")
 }
 
+/// Joins a spawned sub-batch insert, absorbing its stats into `stats` and its
+/// wait time into `page_wait`, and folding its per-resource failures into
+/// `insert_failures`. Used both to finish the previous sub-batch's insert
+/// before starting the next one, and to drain the last one once every
+/// sub-batch has been extracted. Returns the page-level failure message on a
+/// join or insert error (#1403).
+async fn join_insert(
+    mut task: AbortOnDrop<DbTask<InsertFailures>>,
+    stats: &mut ReindexPageStats,
+    page_wait: &mut Duration,
+    insert_failures: &mut HashMap<usize, String>,
+) -> Result<(), String> {
+    let waited = std::time::Instant::now();
+    let joined = task.join().await;
+    add_db_wait(stats, page_wait, waited.elapsed());
+    let done = joined.map_err(|e| join_failure(e, "insert"))?;
+    absorb_db_task(stats, &done.stats);
+    match done.result {
+        Ok(failures) => {
+            merge_insert_failures(insert_failures, failures);
+            Ok(())
+        }
+        Err(msg) => Err(msg),
+    }
+}
+
+/// Records perf-phase durations and the inserted-document count for one
+/// *successful* page — both writers call this only after every delete and
+/// insert has succeeded, never on a page-level failure (#1403).
+fn record_page_perf(stats: &ReindexPageStats, db_wait: Duration, docs: u64) {
+    crate::perf::record_duration(crate::perf::Phase::ReindexExtract, stats.extract);
+    crate::perf::record_duration(crate::perf::Phase::ReindexSearchDelete, stats.delete);
+    crate::perf::record_duration(crate::perf::Phase::ReindexSearchInsert, stats.insert);
+    crate::perf::record_duration(crate::perf::Phase::ReindexDbWait, db_wait);
+    crate::perf::add_rows(crate::perf::Phase::ReindexSearchInsert, docs);
+}
+
 /// A spawned task aborted, not just dropped, when this wrapper goes away — so
 /// a run that stops mid-page (cancellation, a timeout on the composite ingest
 /// sink) never leaves an orphaned delete or insert running against the
@@ -540,14 +573,114 @@ impl super::MongoBackend {
         };
 
         let docs: u64 = doc_counts.iter().sum::<usize>() as u64;
-        crate::perf::record_duration(crate::perf::Phase::ReindexExtract, stats.extract);
-        crate::perf::record_duration(crate::perf::Phase::ReindexSearchDelete, stats.delete);
-        crate::perf::record_duration(crate::perf::Phase::ReindexSearchInsert, stats.insert);
-        crate::perf::record_duration(
-            crate::perf::Phase::ReindexDbWait,
-            stats.db_wait.unwrap_or_default(),
-        );
-        crate::perf::add_rows(crate::perf::Phase::ReindexSearchInsert, docs);
+        record_page_perf(stats, stats.db_wait.unwrap_or_default(), docs);
+        page_outcomes(extract_failures, insert_failures, &doc_counts)
+    }
+
+    /// Overlapped writer (#1403): while sub-batch k's insert runs on a
+    /// spawned task, the page's own thread extracts sub-batch k+1 inside
+    /// `block_in_place`; the page's delete runs on its own task while
+    /// sub-batch 1 is extracted. Caller guarantees a multi-thread runtime,
+    /// `resources.len() > REINDEX_SUBBATCH_FIRST`, and search not offloaded.
+    /// At most one insert is ever in flight: every loop iteration joins the
+    /// previous sub-batch's insert before spawning the next, and the
+    /// trailing drain after the loop joins the last one.
+    pub(super) async fn write_page_overlapped(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        resources: &[StoredResource],
+        stats: &mut ReindexPageStats,
+    ) -> Vec<StorageResult<usize>> {
+        let n = resources.len();
+        let own = db.collection::<Document>(Self::SEARCH_INDEX_COLLECTION);
+        let contained = db.collection::<Document>(Self::SEARCH_INDEX_CONTAINED_COLLECTION);
+        let pool = self.reindex_prepare_pool();
+        let env = PrepareEnv {
+            pool,
+            gate: self.reindex_prepare_gate(),
+        };
+        let min_size = if pool.is_some() {
+            resolve_prepare_width(self.config().reindex_prepare_threads)
+        } else {
+            1
+        };
+        let filters = delete_filters(tenant_id, resources);
+        let page_type: Option<&str> = (filters.len() == 1).then(|| resources[0].resource_type());
+        let seed = page_type.and_then(|t| self.reindex_docs_seed(t));
+        let prepare = |i: usize| self.extract_one(tenant_id, &resources[i]);
+
+        // The page's delete runs on its own task while sub-batch 1 is
+        // extracted below.
+        let mut delete = Some(AbortOnDrop::spawn(delete_page(
+            own.clone(),
+            contained.clone(),
+            filters,
+        )));
+        let mut planner = SubBatchPlanner::new(n, seed, min_size);
+        let mut extract_failures: Vec<Option<String>> = vec![None; n];
+        let mut doc_counts: Vec<usize> = vec![0; n];
+        let mut insert_failures: HashMap<usize, String> = HashMap::new();
+        let mut in_flight: Option<AbortOnDrop<DbTask<InsertFailures>>> = None;
+        let mut page_wait = Duration::ZERO;
+
+        while let Some(range) = planner.next_range() {
+            // Extract this sub-batch; it overlaps the delete, or the
+            // previous sub-batch's insert.
+            let started = std::time::Instant::now();
+            let (prepared, on_pool) = extract_range(&env, range.clone(), &prepare);
+            let batch = flatten_sub_batch(
+                range.start,
+                prepared,
+                &mut extract_failures,
+                &mut doc_counts,
+            );
+            stats.extract += started.elapsed();
+            stats.sub_batches += 1;
+            stats.pool_sub_batches += u64::from(on_pool);
+            planner.record(range.len(), batch.len());
+
+            // No insert may start before the page's delete has finished.
+            if let Some(mut task) = delete.take() {
+                let waited = std::time::Instant::now();
+                let joined = task.join().await;
+                add_db_wait(stats, &mut page_wait, waited.elapsed());
+                let done = match joined {
+                    Ok(done) => done,
+                    Err(e) => return fan_out(n, &join_failure(e, "delete")),
+                };
+                absorb_db_task(stats, &done.stats);
+                if let Err(msg) = done.result {
+                    return fan_out(n, &msg);
+                }
+            }
+            // At most one insert is ever in flight: finish the previous
+            // sub-batch's insert before starting this one.
+            if let Some(task) = in_flight.take()
+                && let Err(msg) =
+                    join_insert(task, stats, &mut page_wait, &mut insert_failures).await
+            {
+                return fan_out(n, &msg);
+            }
+            in_flight = Some(AbortOnDrop::spawn(insert_sub_batch(
+                own.clone(),
+                contained.clone(),
+                batch,
+            )));
+        }
+        // Drain the last sub-batch's insert the same way.
+        if let Some(task) = in_flight.take()
+            && let Err(msg) = join_insert(task, stats, &mut page_wait, &mut insert_failures).await
+        {
+            return fan_out(n, &msg);
+        }
+
+        // Success only: remember the type's documents per resource, forward to perf.
+        let docs: u64 = doc_counts.iter().sum::<usize>() as u64;
+        if let Some(t) = page_type {
+            self.record_reindex_docs(t, n as u64, docs);
+        }
+        record_page_perf(stats, page_wait, docs);
         page_outcomes(extract_failures, insert_failures, &doc_counts)
     }
 

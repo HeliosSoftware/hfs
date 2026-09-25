@@ -122,9 +122,6 @@ impl Debug for MongoBackend {
     }
 }
 
-// Removed once write_page_overlapped calls reindex_docs_seed and
-// record_reindex_docs (#1403).
-#[allow(dead_code)]
 impl MongoBackend {
     /// The rayon pool for `$reindex` sub-batch extraction, or `None` when the
     /// resolved width is below 2 or the pool failed to build (#1403). Built

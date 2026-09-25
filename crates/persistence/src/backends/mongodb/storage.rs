@@ -5356,13 +5356,27 @@ impl ReindexTarget for MongoBackend {
     ///
     /// A page-level failure — getting the database handle, the grouped
     /// delete, or an insert error the driver does not attribute to a specific
-    /// document — fans out to every resource as the same `Err`, because in
-    /// that case nothing was written for anybody (mirroring SQLite's
-    /// BEGIN/COMMIT fan-out and Elasticsearch's `ensure_index` fan-out for the
-    /// same reason). An unordered `insert_many` write error IS attributed to
-    /// just the document(s) it names, via the same per-op index mapping the
-    /// batched bulk-submit ingest uses (`bulk_ingest.rs`'s create-batch path)
-    /// and that Elasticsearch's `send_bulk_index` uses for the same purpose.
+    /// document — reports the same `Err` for every resource in the page,
+    /// because the failure cannot be attributed to individual documents
+    /// (mirroring SQLite's BEGIN/COMMIT fan-out and Elasticsearch's
+    /// `ensure_index` fan-out for the same reason). An unordered
+    /// `insert_many` write error IS attributed to just the document(s) it
+    /// names, via the same per-op index mapping the batched bulk-submit
+    /// ingest uses (`bulk_ingest.rs`'s create-batch path) and that
+    /// Elasticsearch's `send_bulk_index` uses for the same purpose.
+    ///
+    /// A page of `REINDEX_SUBBATCH_FIRST` resources or fewer, and every page
+    /// on a current-thread runtime, always runs through the serial writer:
+    /// one delete, then one insert. There the fan-out above really does mean
+    /// nothing was written for anybody, because the delete completes fully
+    /// before the single insert starts. A larger page on a multi-thread
+    /// runtime with the overlap configuration on instead runs through the
+    /// overlapped writer, which splits the page into several sub-batches and
+    /// inserts one while extracting the next; there, a sub-batch insert
+    /// failure still reports `Err` for every resource in the page, but rows
+    /// the earlier, already-completed sub-batches inserted remain in the
+    /// database — only the failed sub-batch and the ones after it end up
+    /// with no rows.
     async fn write_search_entries_page_timed(
         &self,
         tenant: &TenantContext,
@@ -5388,14 +5402,19 @@ impl ReindexTarget for MongoBackend {
         };
         let tenant_id = tenant.tenant_id().as_str();
         let multi_thread = super::reindex_pipeline::tokio_multi_thread_runtime();
+        let overlapped = self.config().reindex_overlap
+            && multi_thread
+            && resources.len() > super::reindex_pipeline::REINDEX_SUBBATCH_FIRST;
         if resources.len() > super::reindex_pipeline::REINDEX_SUBBATCH_FIRST {
-            // `overlapped` is always `false` here: a later commit adds
-            // `write_page_overlapped` and rewrites this dispatcher to choose
-            // between the two paths on `self.config().reindex_overlap`.
-            self.log_reindex_mode_once(multi_thread, false);
+            self.log_reindex_mode_once(multi_thread, overlapped);
         }
-        self.write_page_serial(&db, tenant_id, resources, stats, multi_thread)
-            .await
+        if overlapped {
+            self.write_page_overlapped(&db, tenant_id, resources, stats)
+                .await
+        } else {
+            self.write_page_serial(&db, tenant_id, resources, stats, multi_thread)
+                .await
+        }
     }
 
     /// Delegates to [`Self::write_search_entries_page_timed`] with a
