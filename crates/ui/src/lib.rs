@@ -9498,6 +9498,14 @@ mod tests {
         assert!(Assets::get("code-editor.js").is_some());
     }
 
+    /// #1239: `editor-add.js`, the "+ Add Element" picker module shared by
+    /// the three editor hosts (the standalone editor, the Resources modal and
+    /// the `pane=form` guided form), is embedded like every other page script.
+    #[test]
+    fn editor_add_helper_script_is_embedded() {
+        assert!(Assets::get("editor-add.js").is_some());
+    }
+
     /// The theme script persists the choice to the per-user settings document
     /// (#197): it must read the document on load and merge-patch `theme` on
     /// toggle, with localStorage kept as the first-paint cache. Guards the

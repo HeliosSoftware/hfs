@@ -104,25 +104,8 @@
         end: active.selectionEnd,
       };
     }
-    body.querySelectorAll("details.editor-add[open]").forEach(function (box) {
-      var row = box.closest("[data-path]");
-      var filter = box.querySelector(".editor-add__filter");
-      state.pickers.push({
-        path: row ? row.dataset.path : "",
-        filter: filter ? filter.value : "",
-        focusFilter: filter === document.activeElement,
-      });
-    });
+    state.pickers = window.HfsEditorAdd.capturePickers(body);
     return state;
-  }
-
-  function rowByPath(path) {
-    if (!path) return body;
-    var rows = body.querySelectorAll("[data-path]");
-    for (var i = 0; i < rows.length; i++) {
-      if (rows[i].dataset.path === path) return rows[i];
-    }
-    return null;
   }
 
   function inputByPath(path) {
@@ -147,24 +130,14 @@
         if (toggle) toggle.classList.add("editor-json__act--on");
       }
     }
-    state.pickers.forEach(function (saved) {
-      var row = rowByPath(saved.path);
-      if (!row) return;
-      var box = row.querySelector("details.editor-add");
-      if (!box) return;
-      box.setAttribute("open", "");
-      var filter = box.querySelector(".editor-add__filter");
-      if (filter && saved.filter) {
-        filter.value = saved.filter;
-        filter.dispatchEvent(new Event("input", { bubbles: true }));
-      }
-      if (saved.focusFilter && filter) filter.focus();
-    });
-
-    // The server names the node the mutation created; the caret goes there.
-    // Otherwise it returns to the field that was focused before the swap.
+    // The server names the node the mutation created; the picker that
+    // created it clears its filter and shows the added signal, #1239.
     var formEl = body.querySelector("#editor-form");
     var createdPath = formEl && formEl.dataset ? formEl.dataset.focus : null;
+    window.HfsEditorAdd.restorePickers(body, state.pickers, createdPath);
+
+    // The caret goes to the node the mutation created. Otherwise it
+    // returns to the field that was focused before the swap.
     var target = createdPath ? inputByPath(createdPath) : null;
     if (target) {
       target.focus();
@@ -398,8 +371,7 @@
 
     var extension = event.target.closest("[data-extension]");
     if (extension) {
-      var panel = extension.closest(".editor-add__ext");
-      var url = extension.dataset.url || (panel ? panel.querySelector(".editor-add__ext-url").value.trim() : "");
+      var url = window.HfsEditorAdd.extensionUrl(extension);
       send("extension", { path: extension.dataset.extension, url: url });
       return;
     }
@@ -482,17 +454,8 @@
     }, 300);
   });
 
-  /* Typeahead over the "add" list -- the only thing here that is purely
-   * cosmetic, and the only thing that would be silly to round-trip. */
-  root.addEventListener("input", function (event) {
-    var filter = event.target.closest(".editor-add__filter");
-    if (!filter) return;
-    var needle = filter.value.trim().toLowerCase();
-    var panel = filter.closest(".editor-add__panel");
-    panel.querySelectorAll("[data-add-name]").forEach(function (item) {
-      item.hidden = needle && item.dataset.addName.toLowerCase().indexOf(needle) === -1;
-    });
-  });
+  /* The add-picker's own typeahead over the "add" list (#1239). */
+  window.HfsEditorAdd.attach(root);
 
   /* ---- saving ---------------------------------------------------------- */
 

@@ -2751,7 +2751,7 @@ async fn editor_marks_the_created_node_for_focus() {
 async fn editor_opens_the_root_picker_on_an_empty_document() {
     let html = edit("doc=%7B%22resourceType%22%3A%22Patient%22%7D&op=").await;
     assert!(
-        html.contains(r#"<details class="editor-add" open>"#),
+        html.contains(r#"<details class="editor-add editor-add--picker" open>"#),
         "root picker auto-opens"
     );
 
@@ -2760,7 +2760,85 @@ async fn editor_opens_the_root_picker_on_an_empty_document() {
         "doc=%7B%22resourceType%22%3A%22Patient%22%2C%22birthDate%22%3A%222024-01-01%22%7D&op=",
     )
     .await;
-    assert!(!html.contains(r#"<details class="editor-add" open>"#));
+    assert!(!html.contains(r#"<details class="editor-add editor-add--picker" open>"#));
+}
+
+/* #1239: the picker panel gained a header close control, an inline "added"
+ * status (wired by the next change), and a two-group accordion — Elements
+ * open, Extensions folded with the ad-hoc extension URL row inside. */
+
+#[tokio::test]
+async fn editor_picker_renders_the_accordion_with_extensions_folded() {
+    let html = edit("doc=%7B%22resourceType%22%3A%22Patient%22%7D&op=").await;
+
+    assert!(
+        html.contains("editor-add__close") && html.contains(r#"aria-label="Close""#),
+        "close control present: {}",
+        &html[..400]
+    );
+    assert!(
+        html.contains(r#"<p class="editor-add__added" role="status" hidden>"#),
+        "added status present"
+    );
+
+    let elements_group = html
+        .find(r#"<details class="editor-add__group" open>"#)
+        .expect("Elements group present and open");
+    let elements_summary_end = html[elements_group..].find("</summary>").unwrap() + elements_group;
+    assert!(
+        html[elements_group..elements_summary_end].contains("Elements"),
+        "Elements group summary names the group"
+    );
+
+    let extensions_group = html
+        .find(r#"<details class="editor-add__group" data-add-group="extensions">"#)
+        .expect("Extensions group present and folded");
+    assert!(
+        !html[extensions_group..extensions_group + 80].contains(" open>"),
+        "Extensions group is not open"
+    );
+    let extensions_summary_end =
+        html[extensions_group..].find("</summary>").unwrap() + extensions_group;
+    assert!(
+        html[extensions_group..extensions_summary_end].contains("Extensions"),
+        "Extensions group summary names the group"
+    );
+
+    let ext_url = html
+        .find(r#"class="editor-add__ext-url""#)
+        .expect("extension URL input present");
+    assert!(
+        ext_url > extensions_group,
+        "extension URL input sits inside the Extensions group"
+    );
+
+    assert!(!html.contains("<script"), "fragment has no inline script");
+}
+
+#[tokio::test]
+async fn editor_picker_counts_match_the_options() {
+    let html = edit("doc=%7B%22resourceType%22%3A%22Patient%22%7D&op=").await;
+
+    let extensions_group = html
+        .find(r#"<details class="editor-add__group" data-add-group="extensions">"#)
+        .expect("Extensions group present");
+    let elements_section = &html[..extensions_group];
+    let option_count = elements_section.matches("data-add-name=").count();
+
+    let count_start = elements_section
+        .find(r#"<span class="editor-add__count">"#)
+        .expect("Elements count span present")
+        + r#"<span class="editor-add__count">"#.len();
+    let count_end = elements_section[count_start..].find("</span>").unwrap() + count_start;
+    let rendered_count: usize = elements_section[count_start..count_end]
+        .trim()
+        .parse()
+        .expect("count span holds a number");
+
+    assert_eq!(
+        rendered_count, option_count,
+        "Elements group count matches its addable options"
+    );
 }
 
 /// #649: SQL on FHIR is a top-level nav section whose four children are real
@@ -7355,5 +7433,40 @@ async fn the_account_menu_is_the_shared_component_verbatim() {
          `crates/ui/templates/layouts/base.html`, or the layout is passing a \
          different `UserIdentity` than the signed-out one.\n\n\
          Expected to find:\n{expected}",
+    );
+}
+
+/// #1239: `editor-add.js` — the shared add-picker module — must load before
+/// each host script that reads `window.HfsEditorAdd` at mount time.
+#[tokio::test]
+async fn editor_pages_load_the_shared_picker_script_before_their_own() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/editor?type=Patient&id=abc")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("/ui/assets/editor-add.js"));
+    assert!(html.contains("/ui/assets/editor.js"));
+    assert!(
+        html.find("/ui/assets/editor-add.js") < html.find("/ui/assets/editor.js"),
+        "editor-add.js must load before editor.js"
+    );
+
+    let response = app()
+        .oneshot(Request::get("/ui/resources").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("/ui/assets/editor-add.js"));
+    assert!(html.contains("/ui/assets/resources.js"));
+    assert!(
+        html.find("/ui/assets/editor-add.js") < html.find("/ui/assets/resources.js"),
+        "editor-add.js must load before resources.js"
     );
 }
