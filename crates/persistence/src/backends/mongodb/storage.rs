@@ -6594,12 +6594,13 @@ mod reindex_prefetch_tests {
     }
 
     fn round_cursor() -> String {
+        let t = chrono::Utc::now();
         ReindexWalkCursor::Round {
             round: 1,
-            floor: chrono::Utc::now(),
-            ceiling: chrono::Utc::now() + chrono::Duration::seconds(1),
+            floor: t,
+            ceiling: t + chrono::Duration::seconds(1),
             walked: 0,
-            after_last_updated: chrono::Utc::now(),
+            after_last_updated: t,
             after_id: "p1".to_string(),
         }
         .encode()
@@ -6607,6 +6608,10 @@ mod reindex_prefetch_tests {
 
     #[test]
     fn may_prefetch_page_accepts_only_id_cursors() {
+        assert!(matches!(
+            ReindexWalkCursor::parse(&round_cursor()),
+            Ok(ReindexWalkCursor::Round { .. })
+        ));
         let backend = MongoBackend::new(unreachable_config()).expect("lazy client");
         assert!(backend.may_prefetch_page(&id_cursor()));
         assert!(!backend.may_prefetch_page(&round_cursor()));
@@ -6629,10 +6634,15 @@ mod reindex_prefetch_tests {
 
     #[tokio::test]
     async fn fetch_ahead_declines_round_and_malformed_cursors() {
-        // Both cases return before any database call: `ReindexWalkCursor::parse`
-        // fails or does not match `Id` before `get_database` is ever reached, so
-        // `unreachable_config`'s bogus connection string is exercised only as a
-        // defensive belt-and-suspenders, not because either case connects.
+        // Both cases return before any database call: the Round cursor parses
+        // but does not match `Id`, and the malformed cursor fails to parse,
+        // before `get_database` is ever reached, so `unreachable_config`'s
+        // bogus connection string is exercised only as a defensive
+        // belt-and-suspenders, not because either case connects.
+        assert!(matches!(
+            ReindexWalkCursor::parse(&round_cursor()),
+            Ok(ReindexWalkCursor::Round { .. })
+        ));
         let backend = MongoBackend::new(unreachable_config()).expect("lazy client");
         let tenant = TenantContext::new(
             TenantId::new("prefetch-test-tenant"),
