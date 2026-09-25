@@ -4752,6 +4752,22 @@ impl PurgableStorage for MongoBackend {
 // both — it can reindex itself standalone.
 // ============================================================================
 
+/// Whether a reindex page that already holds `taken` rows totalling `bytes_taken`
+/// admits a next row of `row_bytes` under `max_bytes` (`0` = no cap, #1499). The
+/// first row is always admitted, so a page always advances; after it the page
+/// never grows past the cap (PostgreSQL's rule, `PostgresBackend::fetch_resources_page_capped`).
+fn reindex_page_admits(taken: usize, bytes_taken: u64, row_bytes: u64, max_bytes: u64) -> bool {
+    max_bytes == 0 || taken == 0 || bytes_taken.saturating_add(row_bytes) <= max_bytes
+}
+
+/// What [`MongoBackend::reindex_find_page`] read (#1499): the rows it took, in scan
+/// order, their raw BSON bytes, and whether the byte cap stopped it before `limit`.
+struct ReindexFoundPage {
+    docs: Vec<Document>,
+    bytes: u64,
+    capped: bool,
+}
+
 impl MongoBackend {
     /// The newest-live probe (#1403): a covered reverse scan of
     /// `idx_resources_type_scan` for the `last_updated` of the newest live
@@ -4784,7 +4800,8 @@ impl MongoBackend {
         }
     }
 
-    /// One hinted, sorted, limited find, fully drained (#1403).
+    /// One hinted, sorted, limited find, fully drained (#1403), stopping early
+    /// when `max_bytes` (`0` = no cap, #1499) admits no further row.
     async fn reindex_find_page(
         &self,
         resources: &Collection<Document>,
@@ -4792,7 +4809,8 @@ impl MongoBackend {
         sort: Document,
         hint: &str,
         limit: u32,
-    ) -> StorageResult<Vec<Document>> {
+        max_bytes: u64,
+    ) -> StorageResult<ReindexFoundPage> {
         let mut stream = resources
             .find(filter)
             .sort(sort)
@@ -4800,20 +4818,32 @@ impl MongoBackend {
             .hint(Hint::Name(hint.to_string()))
             .await
             .map_err(|e| internal_error(format!("Failed to fetch resources: {e}")))?;
-
-        let mut docs = Vec::new();
+        let mut docs: Vec<Document> = Vec::new();
+        let mut bytes: u64 = 0;
+        let mut capped = false;
         while stream
             .advance()
             .await
             .map_err(|e| internal_error(format!("Failed to advance cursor: {e}")))?
         {
+            let row_bytes = stream.current().as_bytes().len() as u64;
+            if !reindex_page_admits(docs.len(), bytes, row_bytes, max_bytes) {
+                capped = true;
+                break;
+            }
+            bytes = bytes.saturating_add(row_bytes);
             docs.push(
                 stream
                     .deserialize_current()
                     .map_err(|e| internal_error(format!("Failed to read resource: {e}")))?,
             );
         }
-        Ok(docs)
+        drop(stream); // a capped read leaves server-side results; dropping kills the cursor
+        Ok(ReindexFoundPage {
+            docs,
+            bytes,
+            capped,
+        })
     }
 }
 
@@ -4967,15 +4997,17 @@ impl ReindexSource for MongoBackend {
                         floor,
                         after_id.as_deref(),
                     );
-                    let docs = self
+                    let found = self
                         .reindex_find_page(
                             &resources,
                             filter,
                             doc! { "id": 1 },
                             RESOURCES_IDENTITY_INDEX,
                             limit,
+                            0,
                         )
                         .await?;
+                    let docs = found.docs;
                     if !docs.is_empty() {
                         let last_id = docs
                             .last()
@@ -5085,15 +5117,17 @@ impl ReindexSource for MongoBackend {
                         ceiling,
                         after.as_ref().map(|(lu, id)| (*lu, id.as_str())),
                     );
-                    let scanned = self
+                    let found = self
                         .reindex_find_page(
                             &resources,
                             filter,
                             doc! { "last_updated": 1, "id": 1 },
                             RESOURCES_TYPE_SCAN_INDEX,
                             limit,
+                            0,
                         )
                         .await?;
+                    let scanned = found.docs;
                     if scanned.is_empty() {
                         tracing::info!(
                             tenant = %tenant_id,
@@ -6521,5 +6555,31 @@ mod reindex_walk_tests {
         assert_eq!(deduped[1].get_str("id"), Ok("b"));
         assert_eq!(deduped[2].get_str("id"), Ok("a"));
         assert_eq!(deduped[2].get_i32("v"), Ok(2));
+    }
+}
+
+#[cfg(test)]
+mod reindex_page_cap_tests {
+    use super::*;
+
+    #[test]
+    fn admits_the_first_row_whatever_its_size() {
+        assert!(reindex_page_admits(0, 0, 10_000, 1));
+    }
+
+    #[test]
+    fn admits_up_to_and_including_the_cap() {
+        assert!(reindex_page_admits(1, 100, 50, 150));
+        assert!(!reindex_page_admits(1, 100, 50, 149));
+    }
+
+    #[test]
+    fn zero_cap_admits_everything() {
+        assert!(reindex_page_admits(7, u64::MAX, u64::MAX, 0));
+    }
+
+    #[test]
+    fn saturating_sum_does_not_overflow() {
+        assert!(reindex_page_admits(1, u64::MAX - 1, 10, u64::MAX));
     }
 }
