@@ -130,13 +130,11 @@ effectively a no-op.
 | `:iterate` on include | ✓¹ | ✓¹ | parsed | ✓ (inline) |
 | `_include=Type:*` wildcard | ✓ | ✓ | ✓ | ✓ |
 
-SQLite and PostgreSQL resolve chains natively, via nested `search_index` subqueries with
-configurable depth limits (✓). For all other backends (◐), the REST layer resolves chained and
-reverse-chained parameters before the backend search runs: `search::resolve_chains` issues one
-plain `search()` per chain hop against the same backend and folds the result into an `_id`
-filter — application-side joins. So chained and `_has` queries work end-to-end over HTTP on every
-searchable backend, including Elasticsearch and MongoDB; the per-backend distinction is whether the
-join is pushed into the backend (SQLite/PG) or performed by the REST layer.
+The REST layer resolves chained and reverse-chained parameters before backend search:
+`search::resolve_chains` issues one plain `search()` per chain hop and folds the result into an
+`_id` filter. SQLite and PostgreSQL also have native chain query builders for direct backend
+use. When the resolved `_id` set is large, SQLite binds one JSON array and expands it with
+`json_each`; PostgreSQL binds one `text[]` and tests membership with `ANY` or `ALL`.
 
 **Nested `_has`** (`_has:Observation:subject:_has:Provenance:target:agent=X`) is resolved
 recursively by `resolve_reverse_chain`: the inner chain selects the qualifying source resources by
@@ -268,7 +266,7 @@ handler now calls `search::resolve_chains` first: a backend-agnostic resolver th
 chain as application-side joins (one plain `search()` per hop, results folded into an `_id`
 filter), then runs the rewritten query. This works for any `SearchProvider`, so chained and `_has`
 queries are functional end-to-end on SQLite, PostgreSQL, MongoDB, and Elasticsearch. SQLite and PG
-additionally resolve chains natively in-backend.
+also expose native chain builders for direct backend use.
 
 SQLite is the most complete backend and serves as the reference for the others; PostgreSQL is now
 at near-parity (only `:text-advanced` remains).

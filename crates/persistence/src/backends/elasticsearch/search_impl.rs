@@ -902,7 +902,8 @@ impl ElasticsearchBackend {
         let window: Vec<&ContainedKey> = keys.iter().skip(offset).take(count).collect();
 
         // Top-level and contained documents are returned from their own
-        // `content`: fetch the window's documents in one request.
+        // `content`. Keep each materialization request within the index's
+        // result window even when the caller asks for a larger page.
         let doc_ids: Vec<&str> = window
             .iter()
             .filter_map(|key| match key {
@@ -911,10 +912,10 @@ impl ElasticsearchBackend {
             })
             .collect();
         let mut sources: HashMap<String, Value> = HashMap::new();
-        if !doc_ids.is_empty() {
+        for ids in doc_ids.chunks(self.config().max_result_window as usize) {
             let body = json!({
-                "query": { "ids": { "values": doc_ids } },
-                "size": doc_ids.len(),
+                "query": { "ids": { "values": ids } },
+                "size": ids.len(),
             });
             if let Some(found) = send_search_with_retry(self, &index, body).await? {
                 for hit in found["hits"]["hits"].as_array().into_iter().flatten() {
@@ -976,8 +977,8 @@ impl ElasticsearchBackend {
 
     /// The result list of a `_contained=true|both` search, unmaterialized and
     /// de-duplicated, in the query's sort order: every hit, reduced to the
-    /// fields that identify what it stands for. Bounded by the index's
-    /// `max_result_window`, like any single Elasticsearch request.
+    /// fields that identify what it stands for. Walks all matching hits in
+    /// batches bounded by the index's `max_result_window`.
     async fn contained_keys(
         &self,
         tenant: &TenantContext,
@@ -990,6 +991,12 @@ impl ElasticsearchBackend {
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
         let index = self.index_name(tenant_id, resource_type);
+        let batch_size = self.config().max_result_window as usize;
+        if batch_size == 0 {
+            return Err(internal_error(
+                "_contained search requires a positive max_result_window".to_string(),
+            ));
+        }
 
         // `_id` names a contained resource by its local id. The standard
         // clause is a term on `resource_id`, which for a contained document is
@@ -1047,80 +1054,126 @@ impl ElasticsearchBackend {
             obj.remove("search_after");
         }
 
-        let Some(body) = send_search_with_retry(self, &index, es_query.body).await? else {
-            return Ok(Vec::new());
-        };
-
-        // One request returns at most `max_result_window` hits, and the result
-        // list is de-duplicated from the hits, so past that bound the list —
-        // and with it `_total`, `search_count` and the pages beyond it — is
-        // truncated. It cannot be repaired from `hits.total`, which counts
-        // documents, not containers. Say so rather than report a short total
-        // as if it were exact (#1407).
-        let hit_count = body["hits"]["hits"].as_array().map_or(0, Vec::len);
-        if hit_count >= self.config().max_result_window as usize {
-            tracing::warn!(
-                resource_type = %resource_type,
-                max_result_window = self.config().max_result_window,
-                "_contained search reached max_result_window: the result list and its \
-                 _total are truncated to the first {hit_count} hits"
-            );
+        let sort_width = es_query.body["sort"].as_array().map_or(0, Vec::len);
+        if sort_width == 0 {
+            return Err(internal_error(
+                "_contained search query carries no sort order".to_string(),
+            ));
         }
-
+        let mut request = es_query.body;
+        let mut previous_cursor: Option<Value> = None;
+        let mut seen_cursors: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut keys: Vec<ContainedKey> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for hit in body["hits"]["hits"].as_array().into_iter().flatten() {
-            let (Some(doc_id), Some(source)) =
-                (hit.get("_id").and_then(Value::as_str), hit.get("_source"))
-            else {
-                continue;
+        loop {
+            let Some(body) = send_search_with_retry(self, &index, request.clone()).await? else {
+                if previous_cursor.is_some() {
+                    return Err(internal_error(
+                        "_contained search index disappeared during enumeration".to_string(),
+                    ));
+                }
+                return Ok(Vec::new());
             };
-            let text = |field: &str| source.get(field).and_then(Value::as_str);
-            let flag = |field: &str| source.get(field).and_then(Value::as_bool).unwrap_or(false);
-            if flag("is_deleted") {
-                continue;
+            let hits = body
+                .pointer("/hits/hits")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    internal_error("_contained search response carries no hits array".to_string())
+                })?;
+            if hits.len() > batch_size {
+                return Err(internal_error(
+                    "_contained search response exceeds the requested batch size".to_string(),
+                ));
             }
-
-            if !flag("is_contained") {
-                // Top-level hit (only in `both` mode) — stands for itself.
-                let (Some(rtype), Some(rid)) = (text("resource_type"), text("resource_id")) else {
+            for hit in hits {
+                let sort = hit.get("sort").and_then(Value::as_array).ok_or_else(|| {
+                    internal_error("_contained search hit carries no sort values".to_string())
+                })?;
+                if sort.len() != sort_width
+                    || sort.iter().any(Value::is_array)
+                    || sort.iter().any(Value::is_object)
+                {
+                    return Err(internal_error(
+                        "_contained search hit carries malformed sort values".to_string(),
+                    ));
+                }
+                if seen_cursors.contains(&Value::Array(sort.clone()).to_string()) {
+                    return Err(internal_error(
+                        "_contained search cursor did not advance".to_string(),
+                    ));
+                }
+                let (Some(doc_id), Some(source)) =
+                    (hit.get("_id").and_then(Value::as_str), hit.get("_source"))
+                else {
                     continue;
                 };
-                if seen.insert(format!("{rtype}/{rid}")) {
-                    keys.push(ContainedKey::Document {
-                        doc_id: doc_id.to_string(),
-                        local_id: None,
-                    });
+                let text = |field: &str| source.get(field).and_then(Value::as_str);
+                let flag =
+                    |field: &str| source.get(field).and_then(Value::as_bool).unwrap_or(false);
+                if flag("is_deleted") {
+                    continue;
                 }
-                continue;
-            }
 
-            let (Some(container_type), Some(container_id)) =
-                (text("container_type"), text("container_id"))
-            else {
-                continue;
-            };
-            match query.contained_return {
-                ContainedReturn::Container => {
-                    if seen.insert(format!("{container_type}/{container_id}")) {
-                        keys.push(ContainedKey::Container {
-                            container_type: container_type.to_string(),
-                            container_id: container_id.to_string(),
-                        });
-                    }
-                }
-                ContainedReturn::Contained => {
-                    let Some(local_id) = text("contained_local_id").or(text("resource_id")) else {
+                if !flag("is_contained") {
+                    // Top-level hit (only in `both` mode) — stands for itself.
+                    let (Some(rtype), Some(rid)) = (text("resource_type"), text("resource_id"))
+                    else {
                         continue;
                     };
-                    if seen.insert(format!("{container_type}/{container_id}#{local_id}")) {
+                    if seen.insert(format!("{rtype}/{rid}")) {
                         keys.push(ContainedKey::Document {
                             doc_id: doc_id.to_string(),
-                            local_id: Some(local_id.to_string()),
+                            local_id: None,
                         });
+                    }
+                    continue;
+                }
+
+                let (Some(container_type), Some(container_id)) =
+                    (text("container_type"), text("container_id"))
+                else {
+                    continue;
+                };
+                match query.contained_return {
+                    ContainedReturn::Container => {
+                        if seen.insert(format!("{container_type}/{container_id}")) {
+                            keys.push(ContainedKey::Container {
+                                container_type: container_type.to_string(),
+                                container_id: container_id.to_string(),
+                            });
+                        }
+                    }
+                    ContainedReturn::Contained => {
+                        let Some(local_id) = text("contained_local_id").or(text("resource_id"))
+                        else {
+                            continue;
+                        };
+                        if seen.insert(format!("{container_type}/{container_id}#{local_id}")) {
+                            keys.push(ContainedKey::Document {
+                                doc_id: doc_id.to_string(),
+                                local_id: Some(local_id.to_string()),
+                            });
+                        }
                     }
                 }
             }
+            if hits.len() < batch_size {
+                break;
+            }
+            let cursor = hits
+                .last()
+                .and_then(|hit| hit.get("sort"))
+                .cloned()
+                .ok_or_else(|| {
+                    internal_error("_contained search last hit carries no sort values".to_string())
+                })?;
+            if !seen_cursors.insert(cursor.to_string()) {
+                return Err(internal_error(
+                    "_contained search cursor repeated".to_string(),
+                ));
+            }
+            request["search_after"] = cursor.clone();
+            previous_cursor = Some(cursor);
         }
         Ok(keys)
     }
@@ -1677,5 +1730,27 @@ mod tests {
         assert!(matches!(&cursor_values[1], CursorValue::String(s) if s == "x"));
         assert!(matches!(cursor_values[2], CursorValue::Boolean(true)));
         assert!(matches!(cursor_values[3], CursorValue::Null));
+    }
+
+    #[test]
+    fn default_sort_cursor_round_trips_into_search_after() {
+        let resource = StoredResource::new(
+            "Patient",
+            "p-5",
+            crate::tenant::TenantId::new("t"),
+            json!({ "resourceType": "Patient", "id": "p-5" }),
+            helios_fhir::FhirVersion::default_enabled(),
+        );
+        let hit_sort = vec![json!(1_700_000_000_000_i64), json!("p-5")];
+        let cursor = page_cursor_for(&resource, Some(&hit_sort), CursorDirection::Next).unwrap();
+        let query = SearchQuery::new("Patient")
+            .with_count(1000)
+            .with_cursor(cursor);
+        let builder = EsQueryBuilder::new("t", "Patient", "hfs_t_patient".to_string());
+        let body = builder.build(&query).body;
+
+        assert_eq!(body["search_after"], json!(hit_sort));
+        assert_eq!(body["size"], json!(1001));
+        assert!(body.get("from").is_none());
     }
 }

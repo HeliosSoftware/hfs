@@ -1180,6 +1180,25 @@ pub enum ConditionalPatchResult {
     MultipleMatches(usize),
 }
 
+/// A conditional PATCH candidate resolved against the authoritative stored row.
+/// The caller may inspect or validate `patched` before passing `current` to
+/// `ResourceStorage::update`, whose version check closes the read/write race.
+#[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
+pub enum ConditionalPatchPreparation {
+    /// The selected current row and the patched content, before any write.
+    Ready {
+        /// The authoritative row whose version the subsequent update must match.
+        current: StoredResource,
+        /// The candidate content produced by applying the patch to `current`.
+        patched: Value,
+    },
+    /// No resource matched the condition.
+    NoMatch,
+    /// Multiple resources matched the condition.
+    MultipleMatches(usize),
+}
+
 /// Patch format for conditional patch operations.
 #[derive(Debug, Clone)]
 pub enum PatchFormat {
@@ -1428,8 +1447,8 @@ pub trait ConditionalStorage: ResourceStorage {
     /// # Errors
     ///
     /// * `StorageError::Validation(ValidationError::Patch(_))` - the patch is
-    ///   malformed, does not apply, changes `resourceType` / `id`, or is a
-    ///   FHIRPath Patch (not implemented); see [`PatchError`](super::PatchError)
+    ///   malformed, does not apply, or changes `resourceType` / `id`; see
+    ///   [`PatchError`](super::PatchError)
     /// * `StorageError::Concurrency(OptimisticLockFailure)` - `If-Match` was
     ///   supplied and is not satisfied
     /// * `StorageError::Concurrency(VersionConflict)` - the resource changed
@@ -1453,32 +1472,33 @@ pub trait ConditionalStorage: ResourceStorage {
     ///    still matches them is unknown. (Conditional update and delete reach
     ///    the same answer through the primary's compare-and-swap.)
     /// 3. [`conditional_if_match_gate`](super::conditional_if_match_gate).
-    /// 4. [`apply_patch`](super::apply_patch).
-    /// 5. `update(current, patched)`, which compares-and-swaps on `current`'s
-    ///    version: a writer landing after step 2 ends in `VersionConflict`.
-    async fn conditional_patch(
+    /// 4. [`apply_patch_for_version`](super::apply_patch_for_version).
+    /// The caller then runs `update(current, patched)`, which
+    /// compares-and-swaps on `current`'s version: a writer landing after the
+    /// authoritative read ends in `VersionConflict`.
+    async fn prepare_conditional_patch(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         search_params: &str,
         patch: &PatchFormat,
         if_match: &EntityTagPrecondition,
-    ) -> StorageResult<ConditionalPatchResult> {
+    ) -> StorageResult<ConditionalPatchPreparation> {
         let mut matches = self
             .resolve_conditional_matches(tenant, resource_type, search_params)
             .await?;
 
         let matched = match matches.len() {
-            0 => return Ok(ConditionalPatchResult::NoMatch),
+            0 => return Ok(ConditionalPatchPreparation::NoMatch),
             1 => matches.remove(0),
-            n => return Ok(ConditionalPatchResult::MultipleMatches(n)),
+            n => return Ok(ConditionalPatchPreparation::MultipleMatches(n)),
         };
 
         let current = match self.read(tenant, resource_type, matched.id()).await {
             Ok(Some(current)) => current,
             // Deleted since the index last saw it: there is no match any more.
             Ok(None) | Err(StorageError::Resource(crate::error::ResourceError::Gone { .. })) => {
-                return Ok(ConditionalPatchResult::NoMatch);
+                return Ok(ConditionalPatchPreparation::NoMatch);
             }
             Err(e) => return Err(e),
         };
@@ -1495,11 +1515,37 @@ pub trait ConditionalStorage: ResourceStorage {
 
         super::conditional_if_match_gate(if_match, resource_type, Some(&current))?;
 
-        let patched = super::apply_patch(current.content(), patch)
-            .map_err(crate::error::ValidationError::from)?;
+        let patched =
+            super::apply_patch_for_version(current.content(), patch, current.fhir_version())
+                .map_err(crate::error::ValidationError::from)?;
 
-        let updated = self.update(tenant, &current, patched).await?;
-        Ok(ConditionalPatchResult::Patched(updated))
+        Ok(ConditionalPatchPreparation::Ready { current, patched })
+    }
+
+    /// Applies a conditional PATCH without a caller-side validation step.
+    /// REST uses `prepare_conditional_patch` to validate the candidate first;
+    /// storage callers retain this operation and the same compare-and-swap.
+    async fn conditional_patch(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        search_params: &str,
+        patch: &PatchFormat,
+        if_match: &EntityTagPrecondition,
+    ) -> StorageResult<ConditionalPatchResult> {
+        match self
+            .prepare_conditional_patch(tenant, resource_type, search_params, patch, if_match)
+            .await?
+        {
+            ConditionalPatchPreparation::Ready { current, patched } => {
+                let updated = self.update(tenant, &current, patched).await?;
+                Ok(ConditionalPatchResult::Patched(updated))
+            }
+            ConditionalPatchPreparation::NoMatch => Ok(ConditionalPatchResult::NoMatch),
+            ConditionalPatchPreparation::MultipleMatches(n) => {
+                Ok(ConditionalPatchResult::MultipleMatches(n))
+            }
+        }
     }
 }
 

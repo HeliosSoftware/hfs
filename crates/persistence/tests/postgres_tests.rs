@@ -73,6 +73,11 @@ mod date_precision_suite;
 #[path = "search/date_minute_index_suite.rs"]
 mod date_minute_index_suite;
 
+/// The backend-agnostic suite for Period and Timing range targets (#1391).
+/// Same `#[path]` arrangement.
+#[path = "search/date_period_suite.rs"]
+mod date_period_suite;
+
 /// The backend-agnostic suite for exponent-form number and quantity search
 /// values (#1337). Same `#[path]` arrangement.
 #[path = "search/number_exponent_suite.rs"]
@@ -82,6 +87,9 @@ mod number_exponent_suite;
 /// values begin with comparator letters. Same `#[path]` arrangement.
 #[path = "search/conditional_criteria_suite.rs"]
 mod conditional_criteria_suite;
+
+#[path = "search/large_id_set_suite.rs"]
+mod large_id_set_suite;
 
 /// The backend-agnostic `_contained` suite (#1336, #1362, #1363). Same
 /// `#[path]` arrangement.
@@ -618,8 +626,13 @@ mod query_builder_tests {
         assert!(result.is_some());
         let fragment = result.unwrap();
         assert!(fragment.sql.contains("value_date"));
-        // gt now matches strictly after the day → value_date >= (next day).
-        assert!(fragment.sql.contains(">= $"));
+        // gt compares the end of the stored range (#1391): it must run past
+        // the end of the searched day.
+        assert!(
+            fragment.sql.contains("value_date_end > $"),
+            "{}",
+            fragment.sql
+        );
     }
 
     #[test]
@@ -900,6 +913,22 @@ mod postgres_integration {
     use testcontainers::runners::AsyncRunner;
     use testcontainers_modules::postgres::Postgres;
     use tokio::sync::{Mutex, OnceCell};
+
+    #[tokio::test]
+    async fn postgres_large_id_set_search_count_cursor_not_and_tenant() {
+        let backend = create_backend().await;
+        let tenant = create_tenant("large-id-set-postgres");
+        super::large_id_set_suite::large_id_set_search_count_cursor_not_and_tenant(
+            &backend,
+            tenant.tenant_id().as_str(),
+        )
+        .await;
+        super::large_id_set_suite::wide_chain_and_nested_has(
+            &backend,
+            &format!("{}-wide-chain", tenant.tenant_id().as_str()),
+        )
+        .await;
+    }
 
     #[tokio::test]
     async fn postgres_publication_exact_contract() {
@@ -4804,6 +4833,69 @@ mod postgres_integration {
         assert_eq!(result.resources.items[0].id(), "p1");
     }
 
+    #[tokio::test]
+    async fn postgres_integration_id_pages_keep_search_cursor_order() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::SearchQuery;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("id-pages");
+        for id in ["p1", "p2", "p3"] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({ "resourceType": "Patient", "id": id }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let query = SearchQuery::new("Patient").with_count(2);
+        let full_first = backend.search(&tenant, &query).await.unwrap();
+        let id_first = backend.search_ids(&tenant, &query).await.unwrap();
+        assert_eq!(
+            id_first.items,
+            full_first
+                .resources
+                .items
+                .iter()
+                .map(|resource| resource.id().to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            id_first.page_info.next_cursor,
+            full_first.resources.page_info.next_cursor
+        );
+
+        let next_query = query.with_cursor(id_first.page_info.next_cursor.unwrap());
+        let full_next = backend.search(&tenant, &next_query).await.unwrap();
+        let id_next = backend.search_ids(&tenant, &next_query).await.unwrap();
+        assert_eq!(
+            id_next.items,
+            full_next
+                .resources
+                .items
+                .iter()
+                .map(|resource| resource.id().to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(id_next.page_info.has_previous);
+        assert!(id_next.page_info.previous_cursor.is_some());
+
+        let mut offset_query = SearchQuery::new("Patient").with_count(2);
+        offset_query.offset = Some(0);
+        assert_eq!(
+            backend
+                .search_ids(&tenant, &offset_query)
+                .await
+                .unwrap()
+                .items,
+            id_first.items
+        );
+    }
+
     /// The backend-agnostic meta-parameter scenario (#523), shared verbatim
     /// with the SQLite suite that owns the file.
     #[tokio::test]
@@ -8172,6 +8264,85 @@ mod postgres_integration {
         assert!(
             matches!(result2, ConditionalCreateResult::Exists(_)),
             "Second conditional create should return existing resource"
+        );
+    }
+
+    /// #1344: a criterion naming a search parameter the server does not know
+    /// (`identifer` for `identifier`) used to match nothing, so a conditional
+    /// create made a duplicate and a conditional delete answered as if there
+    /// had been nothing to delete. It is refused, and nothing is written.
+    #[tokio::test]
+    async fn postgres_integration_conditional_writes_refuse_an_unknown_parameter() {
+        use helios_persistence::core::{ConditionalStorage, EntityTagPrecondition};
+        use helios_persistence::error::{SearchError, StorageError};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant-unknown-criterion");
+        let criteria = "identifer=http://hospital.org/mrn|MRN-UNKNOWN-1";
+        let patient = json!({
+            "resourceType": "Patient",
+            "identifier": [{"system": "http://hospital.org/mrn", "value": "MRN-UNKNOWN-1"}],
+            "name": [{"family": "Original"}]
+        });
+
+        backend
+            .create(&tenant, "Patient", patient.clone(), FhirVersion::default())
+            .await
+            .unwrap();
+
+        let is_refused = |error: &StorageError, context: &str| {
+            assert!(
+                matches!(
+                    error,
+                    StorageError::Search(SearchError::QueryParseError { message })
+                        if message.contains("'identifer'")
+                ),
+                "{context}: expected a QueryParseError naming 'identifer', got {error:?}"
+            );
+        };
+
+        let created = backend
+            .conditional_create(
+                &tenant,
+                "Patient",
+                patient.clone(),
+                criteria,
+                FhirVersion::default(),
+            )
+            .await;
+        is_refused(
+            &created.expect_err("conditional create"),
+            "conditional create",
+        );
+
+        let updated = backend
+            .conditional_update(
+                &tenant,
+                "Patient",
+                patient,
+                criteria,
+                true,
+                FhirVersion::default(),
+                &EntityTagPrecondition::Absent,
+            )
+            .await;
+        is_refused(
+            &updated.expect_err("conditional update"),
+            "conditional update",
+        );
+
+        let deleted = backend
+            .conditional_delete(&tenant, "Patient", criteria, &EntityTagPrecondition::Absent)
+            .await;
+        is_refused(
+            &deleted.expect_err("conditional delete"),
+            "conditional delete",
+        );
+
+        assert_eq!(
+            backend.count(&tenant, Some("Patient")).await.unwrap(),
+            1,
+            "nothing was written or deleted"
         );
     }
 
@@ -15667,6 +15838,201 @@ mod postgres_integration {
             .unwrap();
 
         assert_eq!(ids, vec!["o1".to_string()]);
+    }
+
+    /// #1389, end to end on real rows: `system|` on a chained token terminal
+    /// matches every code in that system, forward and reverse. The unit tests
+    /// only see the SQL text; this runs it. Before the fix the empty code was
+    /// bound as `value_token_code = ''` and both resolutions returned nothing.
+    #[tokio::test]
+    async fn postgres_integration_resolve_chain_system_only_token_matches_rows() {
+        use helios_persistence::core::ChainedSearchProvider;
+        use helios_persistence::types::{ReverseChainedParameter, SearchValue};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("chain-system-only");
+        let tenant_id = tenant.tenant_id().as_str();
+
+        for (ty, body) in [
+            ("Patient", json!({"id": "p1"})),
+            ("Patient", json!({"id": "p2"})),
+            (
+                "Observation",
+                json!({"id": "o1", "subject": {"reference": "Patient/p1"}}),
+            ),
+            (
+                "Observation",
+                json!({"id": "o2", "subject": {"reference": "Patient/p2"}}),
+            ),
+        ] {
+            backend
+                .create(&tenant, ty, body, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+
+        for (id, reference) in [("o1", "Patient/p1"), ("o2", "Patient/p2")] {
+            insert_search_index(
+                tenant_id,
+                "Observation",
+                id,
+                "subject",
+                "value_reference",
+                reference,
+            )
+            .await;
+        }
+
+        let pg = shared_pg().await;
+        let conn_str = format!(
+            "host={} port={} user=postgres password=postgres dbname=postgres",
+            pg.host, pg.port,
+        );
+        let (client, connection) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
+            .await
+            .expect("connect to shared pg");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        for (rt, id, param, system, code) in [
+            ("Patient", "p1", "identifier", "http://ex.org/mrn", "MRN1"),
+            ("Patient", "p2", "identifier", "http://other.example", "X1"),
+            ("Observation", "o1", "code", "http://loinc.org", "8867-4"),
+            (
+                "Observation",
+                "o2",
+                "code",
+                "http://snomed.info/sct",
+                "271649006",
+            ),
+        ] {
+            client
+                .execute(
+                    "INSERT INTO search_index \
+                     (tenant_id, resource_type, resource_id, param_name, value_token_system, value_token_code) \
+                     VALUES ($1, $2, $3, $4, $5, $6)",
+                    &[&tenant_id, &rt, &id, &param, &system, &code],
+                )
+                .await
+                .unwrap();
+        }
+
+        // Observation?subject.identifier=http://ex.org/mrn|
+        let forward = backend
+            .resolve_chain(
+                &tenant,
+                "Observation",
+                "subject.identifier",
+                "http://ex.org/mrn|",
+            )
+            .await
+            .unwrap();
+        assert_eq!(forward, vec!["o1".to_string()]);
+
+        // Patient?_has:Observation:subject:code=http://loinc.org|
+        let rc = ReverseChainedParameter::terminal(
+            "Observation",
+            "subject",
+            "code",
+            SearchValue::eq("http://loinc.org|"),
+        );
+        let reverse = backend
+            .resolve_reverse_chain(&tenant, "Patient", &rc)
+            .await
+            .unwrap();
+        assert_eq!(reverse, vec!["p1".to_string()]);
+    }
+
+    /// `backend.search()` reads neither `SearchParameter::chain` nor
+    /// `SearchQuery::reverse_chains`: an unresolved `_has` was dropped (every
+    /// Patient matched) and a forward chain was read as a reference to an id
+    /// named by the terminal value (#1389). Through the trait API, with no
+    /// resolver in front, both must now be refused by `search` and
+    /// `search_count` alike rather than answered wrongly.
+    #[tokio::test]
+    async fn postgres_integration_search_refuses_unresolved_chains() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::error::{SearchError, StorageError};
+        use helios_persistence::types::{
+            ChainedParameter, ReverseChainedParameter, SearchParamType, SearchParameter,
+            SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("unresolved-chains");
+
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p1", "name": [{"family": "Smith"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "o1",
+                    "status": "final",
+                    "code": {"text": "x"},
+                    "subject": {"reference": "Patient/p1"}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        // Observation?subject:Patient.name=Smith — o1 is the right answer.
+        let forward = SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: vec![SearchValue::eq("Smith")],
+            chain: vec![ChainedParameter {
+                reference_param: "subject".to_string(),
+                target_type: Some("Patient".to_string()),
+                target_param: "name".to_string(),
+            }],
+            components: vec![],
+        });
+        // Patient?_has:Observation:subject:status=cancelled — nothing matches.
+        let mut reverse = SearchQuery::new("Patient");
+        reverse
+            .reverse_chains
+            .push(ReverseChainedParameter::terminal(
+                "Observation",
+                "subject",
+                "status",
+                SearchValue::eq("cancelled"),
+            ));
+
+        for err in [
+            backend.search(&tenant, &forward).await.err(),
+            backend.search_count(&tenant, &forward).await.err(),
+        ] {
+            match err {
+                Some(StorageError::Search(SearchError::ChainedSearchNotSupported { chain })) => {
+                    assert!(chain.contains("subject:Patient.name"), "{chain}")
+                }
+                other => panic!("expected ChainedSearchNotSupported, got {other:?}"),
+            }
+        }
+        for err in [
+            backend.search(&tenant, &reverse).await.err(),
+            backend.search_count(&tenant, &reverse).await.err(),
+        ] {
+            assert!(
+                matches!(
+                    err,
+                    Some(StorageError::Search(SearchError::ReverseChainNotSupported))
+                ),
+                "expected ReverseChainNotSupported, got {err:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -27008,11 +27374,12 @@ mod postgres_integration {
             "birthdate=ge1990-06-06&birthdate=le1990-06-06"
         );
 
-        // The repeat is an intersection of *resources*, not of ranges. An
-        // Encounter period carries two date values, so its start can satisfy one
-        // arm and its end the other; the second and third Encounters fail one arm
-        // each, so a fold that read the two occurrences as one window — or that
-        // matched both arms against the same value — would return them.
+        // The repeat is an intersection of *resources*, each arm decided against
+        // the Encounter's whole period `[start, end)` (#1391): `ge` holds when
+        // the period reaches past the day searched, `le` when it starts before
+        // it. The first period spans both days and satisfies each arm; the
+        // second starts after the `le` day and the third ends before the `ge`
+        // one, so a fold that dropped either arm would return one of them.
         let mut encounters = Vec::new();
         for (label, start, end) in [
             ("one arm each", "2019-01-01", "2021-06-01"),
@@ -27261,6 +27628,16 @@ mod postgres_integration {
         .await;
     }
 
+    /// #1391: a Period was indexed as two unrelated points, so `eq`/`ap`
+    /// over-matched, `sa`/`eb` could match on the wrong end and an open end
+    /// was an instant. It is one `[value_date, value_date_end)` range now.
+    #[tokio::test]
+    async fn postgres_integration_date_period_targets_are_ranges() {
+        let backend = create_backend().await;
+        super::date_period_suite::period_targets_are_ranges(&backend, &unique_base("date_period"))
+            .await;
+    }
+
     /// #1336: a repeated parameter under `_contained` is a conjunction on one
     /// contained resource.
     #[tokio::test]
@@ -27341,7 +27718,6 @@ mod postgres_integration {
         super::token_code_system_suite::system_qualified_tokens_match_code_elements(
             &backend,
             &unique_base("token_code_system"),
-            false,
         )
         .await;
     }

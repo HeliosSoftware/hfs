@@ -535,28 +535,44 @@ fn public_status_url(
 }
 
 /// Forwards the caller's credentials and tenant onto a self-call, so the
-/// export runs as the user who asked for it. When the browser sent no
-/// `Authorization` the process's outbound service credential is used instead
-/// (#1438): every request here targets this server, never a third party.
+/// export runs as the user who asked for it: the browser's own
+/// `Authorization` when it sent one; else the signed-in session's bearer
+/// (#1480) — a browser signed in through the web UI carries the session
+/// cookie, not a header, and its exports must still run as that user; else
+/// the process's outbound service credential (#1438). Every request here
+/// targets this server, never a third party.
 pub(crate) async fn forward_identity(
     state: &WebState,
-    mut request: reqwest::RequestBuilder,
+    request: reqwest::RequestBuilder,
     headers: &HeaderMap,
     tenant: &str,
     audience: &str,
 ) -> Result<reqwest::RequestBuilder, String> {
-    match headers.get("authorization").and_then(|v| v.to_str().ok()) {
-        Some(auth) => request = request.header("Authorization", auth),
-        None => {
-            request = state
-                .outbound_auth
-                .authorize(request, audience)
-                .await
-                .map_err(|e| format!("outbound credential unavailable: {e}"))?;
-        }
+    let request = forward_credential(state, request, headers, audience).await?;
+    Ok(request.header("X-Tenant-ID", tenant))
+}
+
+/// The credential half of [`forward_identity`]: the browser's own
+/// `Authorization`, else the signed-in session's bearer, else the process's
+/// outbound service credential. Shared with the Import page, whose
+/// self-calls set their tenant themselves.
+pub(crate) async fn forward_credential(
+    state: &WebState,
+    request: reqwest::RequestBuilder,
+    headers: &HeaderMap,
+    audience: &str,
+) -> Result<reqwest::RequestBuilder, String> {
+    if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+        return Ok(request.header("Authorization", auth));
     }
-    request = request.header("X-Tenant-ID", tenant);
-    Ok(request)
+    if let Some(bearer) = crate::login::session_authorization(state, headers).await {
+        return Ok(request.header("Authorization", bearer));
+    }
+    state
+        .outbound_auth
+        .authorize(request, audience)
+        .await
+        .map_err(|e| format!("outbound credential unavailable: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -709,6 +725,7 @@ struct BulkExportPage {
     error: Option<String>,
     name_error: Option<String>,
     since_custom_error: Option<String>,
+    until_error: Option<String>,
     patients_error: Option<String>,
     form: StartForm,
     rejected: bool,
@@ -797,6 +814,7 @@ async fn bulk_export_page(
         error,
         name_error: errors.name,
         since_custom_error: errors.since_custom,
+        until_error: errors.until,
         patients_error: errors.patients,
         form,
         rejected,
@@ -856,6 +874,7 @@ impl StartForm {
 struct StartErrors {
     name: Option<String>,
     since_custom: Option<String>,
+    until: Option<String>,
     /// Set when the effective scope is `patient` and the reference list
     /// parsed cleanly but came out empty (no selection at all).
     patients: Option<String>,
@@ -912,6 +931,7 @@ pub async fn start(
         Ok(Vec::new())
     };
     let since = crate::lookup::since_instant(&form.since_preset, &form.since_custom);
+    let until = crate::lookup::optional_instant(&form.until);
     let i18n = I18n::new(locale);
     let errors = StartErrors {
         name: form
@@ -920,6 +940,13 @@ pub async fn start(
             .is_empty()
             .then(|| i18n.t("bulk-export-name-required")),
         since_custom: since.is_err().then(|| i18n.t("bulk-export-since-invalid")),
+        until: match (&since, &until) {
+            (_, Err(())) => Some(i18n.t("bulk-export-since-invalid")),
+            (Ok(since), Ok(until)) if crate::lookup::instant_before(until, since) => {
+                Some(i18n.t("bulk-export-until-before-since"))
+            }
+            _ => None,
+        },
         patients: (scope == "patient" && matches!(patient_refs, Ok(ref refs) if refs.is_empty()))
             .then(|| i18n.t("bulk-export-patients-required")),
         rejected: true,
@@ -929,6 +956,7 @@ pub async fn start(
         .then(|| i18n.t("bulk-export-patient-invalid"));
     if errors.name.is_some()
         || errors.since_custom.is_some()
+        || errors.until.is_some()
         || errors.patients.is_some()
         || patient_error.is_some()
     {
@@ -940,6 +968,7 @@ pub async fn start(
 
     let patient_refs = patient_refs.expect("patient references were validated");
     let since = since.expect("custom instant was validated");
+    let until = until.expect("until instant was validated");
     let user_key = settings_user_key(principal.as_deref());
     let snapshot = load_jobs(&state, &user_key, &rt.id).await;
     let mut job = ExportJob {
@@ -954,7 +983,7 @@ pub async fn start(
         elements: form.elements.trim().to_string(),
         type_filter: form.type_filter.trim().to_string(),
         since,
-        until: form.until.trim().to_string(),
+        until,
         patient_refs,
         fhir_version: Some(rv.0),
         status: "in-progress".to_string(),

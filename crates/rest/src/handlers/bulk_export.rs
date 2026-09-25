@@ -174,14 +174,21 @@ where
     let resource_types = collect_multi(&pairs, "_type");
 
     // _since / _until
-    let since = match first_value(&pairs, "_since") {
-        Some(s) => Some(parse_instant(&s)?),
-        None => None,
-    };
-    let until = match first_value(&pairs, "_until") {
-        Some(s) => Some(parse_instant(&s)?),
-        None => None,
-    };
+    let since_raw = first_value(&pairs, "_since");
+    let until_raw = first_value(&pairs, "_until");
+    let since = since_raw.as_deref().map(parse_instant).transpose()?;
+    let until = until_raw.as_deref().map(parse_instant).transpose()?;
+    // Both bounds are inclusive in storage, so `_until` strictly before
+    // `_since` is an always-empty window; reject it instead of creating a job
+    // that silently exports nothing. `_since == _until` stays valid.
+    if let (Some(s), Some(u), Some(since_raw), Some(until_raw)) =
+        (since, until, &since_raw, &until_raw)
+        && u < s
+    {
+        return Err(bad_request(format!(
+            "_until '{until_raw}' is earlier than _since '{since_raw}'"
+        )));
+    }
 
     // _elements
     let elements = collect_multi(&pairs, "_elements");

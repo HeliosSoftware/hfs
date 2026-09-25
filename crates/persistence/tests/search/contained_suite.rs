@@ -34,7 +34,7 @@ use serde_json::{Value, json};
 
 use helios_fhir::FhirVersion;
 use helios_persistence::core::{ResourceStorage, SearchProvider, SearchResult};
-use helios_persistence::error::StorageError;
+use helios_persistence::error::{SearchError, StorageError};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{
     ChainedParameter, CompartmentMembership, CompositeSearchComponent, ContainedMode,
@@ -58,6 +58,7 @@ struct Case {
     mode: ContainedMode,
     returns: ContainedReturn,
     parameters: Vec<SearchParameter>,
+    compartment: Option<CompartmentMembership>,
     expect: Expect,
 }
 
@@ -68,8 +69,17 @@ impl Case {
             mode: ContainedMode::On,
             returns: ContainedReturn::Container,
             parameters,
+            compartment: None,
             expect,
         }
+    }
+
+    fn in_patient_compartment(mut self, patient: &str) -> Self {
+        self.compartment = Some(CompartmentMembership {
+            params: vec!["subject".to_string(), "performer".to_string()],
+            reference: format!("Patient/{patient}"),
+        });
+        self
     }
 
     fn returning_contained(mut self) -> Self {
@@ -87,6 +97,7 @@ impl Case {
         query.contained = self.mode;
         query.contained_return = self.returns;
         query.parameters = self.parameters.clone();
+        query.compartment = self.compartment.clone();
         query
     }
 }
@@ -1587,4 +1598,824 @@ where
     ];
 
     assert_cases(backend, &tenant, &controls, &cases).await;
+}
+
+/// Strict `_contained` composite pairing for MongoDB (#1407).
+///
+/// Unlike `criteria_are_applied_or_rejected`, which lets a backend refuse a
+/// composite by naming it, these cases demand the answer from
+/// `search_index_contained`.
+///
+/// Containers (DiagnosticReport → contained Observations):
+/// - `c-single`: `c1` with components A = 1 mg and B = 9 mg — a composite
+///   must pair a code with the quantity of the *same* component, so `A$gt5`
+///   matches nothing even though A and a quantity > 5 both occur. Its code is
+///   Z and subject is Patient/p1.
+/// - `x-sib`: siblings `s1` (component A = 1 mg, code Z, Patient/p1) and
+///   `s2` (component B = 9 mg, code Y, Patient/p2). Both components carry
+///   `composite_group` 0 in the index, so an
+///   implementation that pairs by group alone — without scoping to one
+///   contained entity — would cross `s1`'s A with `s2`'s 9 mg and wrongly
+///   match `A$gt5`. The differing codes, subjects, and local ids also catch
+///   intersections that accidentally combine matches across siblings.
+pub async fn contained_composites_pair_within_one_resource<S>(backend: &S, tenant_base: &str)
+where
+    S: ResourceStorage + SearchProvider,
+{
+    let tenant = TenantContext::new(TenantId::new(tenant_base), TenantPermissions::full_access());
+    let quantity = |value: f64| {
+        json!({
+            "value": value,
+            "unit": "mg",
+            "system": "http://unitsofmeasure.org",
+            "code": "mg",
+        })
+    };
+    let mut single = observation("c1", "Z", "2020-06-15", &["cat1"]);
+    single["subject"] = json!({"reference": "Patient/p1"});
+    single["component"] = json!([
+        {
+            "code": {"coding": [{"system": "http://loinc.org", "code": "A"}]},
+            "valueQuantity": quantity(1.0),
+        },
+        {
+            "code": {"coding": [{"system": "http://loinc.org", "code": "B"}]},
+            "valueQuantity": quantity(9.0),
+        },
+    ]);
+    let mut sib_a = observation("s1", "Z", "2020-06-15", &["cat1"]);
+    sib_a["subject"] = json!({"reference": "Patient/p1"});
+    sib_a["component"] = json!([
+        {
+            "code": {"coding": [{"system": "http://loinc.org", "code": "A"}]},
+            "valueQuantity": quantity(1.0),
+        },
+    ]);
+    let mut sib_b = observation("s2", "Y", "2020-06-15", &["cat1"]);
+    sib_b["subject"] = json!({"reference": "Patient/p2"});
+    sib_b["component"] = json!([
+        {
+            "code": {"coding": [{"system": "http://loinc.org", "code": "B"}]},
+            "valueQuantity": quantity(9.0),
+        },
+    ]);
+
+    seed_containers(
+        backend,
+        &tenant,
+        vec![("c-single", vec![single]), ("x-sib", vec![sib_a, sib_b])],
+    )
+    .await;
+
+    let controls = [
+        Case::new(
+            "code=Z",
+            vec![token("code", "Z")],
+            Expect::Ids(&["c-single", "x-sib"]),
+        ),
+        Case::new("code=Y", vec![token("code", "Y")], Expect::Ids(&["x-sib"])),
+        Case::new(
+            "subject=Patient/p2",
+            vec![literal("subject", SearchParamType::Reference, "Patient/p2")],
+            Expect::Ids(&["x-sib"]),
+        ),
+    ];
+    let cases = [
+        Case::new(
+            "component-code-value-quantity=A$lt5",
+            vec![component_code_value_quantity("A$lt5")],
+            Expect::Ids(&["c-single", "x-sib"]),
+        ),
+        // Pairing: neither `c1`'s A (1 mg) nor `s1`'s A (1 mg) exceeds 5 mg,
+        // and `s2`'s 9 mg belongs to B — on another contained resource.
+        Case::new(
+            "component-code-value-quantity=A$gt5",
+            vec![component_code_value_quantity("A$gt5")],
+            Expect::Ids(&[]),
+        ),
+        Case::new(
+            "component-code-value-quantity=B$gt5",
+            vec![component_code_value_quantity("B$gt5")],
+            Expect::Ids(&["c-single", "x-sib"]),
+        ),
+        Case::new(
+            "component-code-value-quantity=B$lt5",
+            vec![component_code_value_quantity("B$lt5")],
+            Expect::Ids(&[]),
+        ),
+        // The ordinary code criterion must hold on the same contained entity
+        // as the composite, not merely elsewhere in its container.
+        Case::new(
+            "component-code-value-quantity=B$gt5&code=Z",
+            vec![component_code_value_quantity("B$gt5"), token("code", "Z")],
+            Expect::Ids(&["c-single"]),
+        ),
+        Case::new(
+            "component-code-value-quantity=A$lt5&code=Y",
+            vec![component_code_value_quantity("A$lt5"), token("code", "Y")],
+            Expect::Ids(&[]),
+        ),
+        // Repeated composites are ANDed per contained entity. The sibling
+        // container has both pairs, but in different contained Observations.
+        Case::new(
+            "component-code-value-quantity=A$lt5&component-code-value-quantity=B$gt5",
+            vec![
+                component_code_value_quantity("A$lt5"),
+                component_code_value_quantity("B$gt5"),
+            ],
+            Expect::Ids(&["c-single"]),
+        ),
+        Case::new(
+            "component-code-value-quantity=B$gt5&component-code-value-quantity=A$gt5",
+            vec![
+                component_code_value_quantity("B$gt5"),
+                component_code_value_quantity("A$gt5"),
+            ],
+            Expect::Ids(&[]),
+        ),
+        Case::new(
+            "Patient/p1/Observation?component-code-value-quantity=B$gt5",
+            vec![component_code_value_quantity("B$gt5")],
+            Expect::Ids(&["c-single"]),
+        )
+        .in_patient_compartment("p1"),
+        Case::new(
+            "Patient/p2/Observation?component-code-value-quantity=B$gt5",
+            vec![component_code_value_quantity("B$gt5")],
+            Expect::Ids(&["x-sib"]),
+        )
+        .in_patient_compartment("p2"),
+        Case::new(
+            "Patient/p2/Observation?component-code-value-quantity=A$lt5",
+            vec![component_code_value_quantity("A$lt5")],
+            Expect::Ids(&[]),
+        )
+        .in_patient_compartment("p2"),
+        Case::new(
+            "component-code-value-quantity=B$gt5&_id=c1",
+            vec![component_code_value_quantity("B$gt5"), token("_id", "c1")],
+            Expect::Ids(&["c-single"]),
+        ),
+        Case::new(
+            "component-code-value-quantity=B$gt5&_id=s2",
+            vec![component_code_value_quantity("B$gt5"), token("_id", "s2")],
+            Expect::Ids(&["x-sib"]),
+        ),
+        Case::new(
+            "component-code-value-quantity=B$gt5&_id=s1",
+            vec![component_code_value_quantity("B$gt5"), token("_id", "s1")],
+            Expect::Ids(&[]),
+        ),
+        // A comma list within one occurrence stays a disjunction: `B$gt5`
+        // holds for one component in each container.
+        Case::new(
+            "component-code-value-quantity=A$gt5,B$gt5",
+            vec![SearchParameter {
+                values: vec![
+                    SearchValue::new(SearchPrefix::Eq, "A$gt5"),
+                    SearchValue::new(SearchPrefix::Eq, "B$gt5"),
+                ],
+                ..component_code_value_quantity("")
+            }],
+            Expect::Ids(&["c-single", "x-sib"]),
+        ),
+    ];
+
+    assert_cases(backend, &tenant, &controls, &cases).await;
+}
+
+/// A repeated-type composite keeps its declared component order on both
+/// MongoDB index collections. Unsupported composite modifiers still fail.
+pub async fn repeated_type_composite_and_modifier<S>(backend: &S, tenant_base: &str)
+where
+    S: ResourceStorage + SearchProvider,
+{
+    let tenant = TenantContext::new(TenantId::new(tenant_base), TenantPermissions::full_access());
+    let mut observed = observation("top", "A", "2020-06-15", &["cat1"]);
+    observed["code"]["coding"] = json!([
+        {"system": "http://loinc.org", "code": "A"},
+        {"system": "http://loinc.org", "code": "X"}
+    ]);
+    observed["valueCodeableConcept"] = json!({"coding": [
+        {"system": "http://example.org/value", "code": "B"},
+        {"system": "http://example.org/value", "code": "Y"}
+    ]});
+    observed["component"] = json!([
+        {
+            "code": {"coding": [{"system": "http://loinc.org", "code": "A"}]},
+            "valueCodeableConcept": {"coding": [{"system": "http://example.org/value", "code": "B"}]}
+        },
+        {
+            "code": {"coding": [{"system": "http://loinc.org", "code": "C"}]},
+            "valueCodeableConcept": {"coding": [{"system": "http://example.org/value", "code": "D"}]}
+        }
+    ]);
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            observed.clone(),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed top-level composite control");
+    observed["id"] = json!("inside");
+    seed_containers(backend, &tenant, vec![("container", vec![observed])]).await;
+
+    // Confirm that the contained resource was indexed before checking errors.
+    let mut control = SearchQuery::new("Observation");
+    control.contained = ContainedMode::On;
+    control.parameters.push(token("code", "A"));
+    assert_eq!(
+        sorted_ids(
+            &backend
+                .search(&tenant, &control)
+                .await
+                .expect("control search")
+        ),
+        vec!["container"],
+    );
+
+    let mut indexed_pair = literal("code-value-concept", SearchParamType::Composite, "A$B");
+    indexed_pair.components = vec![
+        CompositeSearchComponent {
+            param_type: SearchParamType::Token,
+            param_name: "code".to_string(),
+        },
+        CompositeSearchComponent {
+            param_type: SearchParamType::Token,
+            param_name: "value-concept".to_string(),
+        },
+    ];
+    let mut pair_control = SearchQuery::new("Observation");
+    pair_control.parameters.push(indexed_pair.clone());
+    assert_eq!(
+        sorted_ids(
+            &backend
+                .search(&tenant, &pair_control)
+                .await
+                .expect("top-level code-value-concept=A$B control")
+        ),
+        vec!["top"],
+        "the composite pair must be indexed",
+    );
+
+    for (mode, returns, expected) in [
+        (ContainedMode::Off, ContainedReturn::Container, vec!["top"]),
+        (
+            ContainedMode::On,
+            ContainedReturn::Container,
+            vec!["container"],
+        ),
+        (
+            ContainedMode::On,
+            ContainedReturn::Contained,
+            vec!["inside"],
+        ),
+        (
+            ContainedMode::Both,
+            ContainedReturn::Container,
+            vec!["container", "top"],
+        ),
+        (
+            ContainedMode::Both,
+            ContainedReturn::Contained,
+            vec!["inside", "top"],
+        ),
+    ] {
+        for (value, want_match) in [
+            ("A$B", true),
+            ("X$Y", true),
+            ("X$B", true),
+            ("B$A", false),
+            ("Y$X", false),
+        ] {
+            let mut query = SearchQuery::new("Observation");
+            query.contained = mode;
+            query.contained_return = returns;
+            query.count = Some(1);
+            query.total = Some(TotalMode::Accurate);
+            let mut pair = indexed_pair.clone();
+            pair.values = vec![SearchValue::new(SearchPrefix::Eq, value)];
+            query.parameters.push(pair);
+            let result = backend
+                .search(&tenant, &query)
+                .await
+                .expect("repeated-type composite search");
+            let mut expected_ids = if want_match { expected.clone() } else { vec![] };
+            expected_ids.sort();
+            // A one-item page still has to report the full count.
+            assert_eq!(
+                result.total,
+                Some(expected_ids.len() as u64),
+                "{mode:?} {returns:?} {value}"
+            );
+            assert_eq!(
+                backend.search_count(&tenant, &query).await.unwrap(),
+                expected_ids.len() as u64,
+                "{mode:?} {returns:?} {value}"
+            );
+            let mut full = query.clone();
+            full.count = Some(10);
+            assert_eq!(
+                sorted_ids(&backend.search(&tenant, &full).await.unwrap()),
+                expected_ids,
+                "{mode:?} {returns:?} {value}"
+            );
+        }
+    }
+
+    let component_pair = SearchParameter {
+        name: "component-code-value-concept".to_string(),
+        components: indexed_pair.components.clone(),
+        ..indexed_pair.clone()
+    };
+    for mode in [ContainedMode::Off, ContainedMode::On, ContainedMode::Both] {
+        for (value, matched) in [
+            ("A$B", true),
+            ("C$D", true),
+            ("B$A", false),
+            ("D$C", false),
+            ("A$D", false),
+        ] {
+            let mut query = SearchQuery::new("Observation");
+            query.contained = mode;
+            let mut pair = component_pair.clone();
+            pair.values = vec![SearchValue::eq(value)];
+            query.parameters.push(pair);
+            let expected = match (mode, matched) {
+                (_, false) => vec![],
+                (ContainedMode::Off, true) => vec!["top"],
+                (ContainedMode::On, true) => vec!["container"],
+                (ContainedMode::Both, true) => vec!["container", "top"],
+            };
+            assert_eq!(
+                sorted_ids(&backend.search(&tenant, &query).await.unwrap()),
+                expected,
+                "{mode:?} {value}"
+            );
+        }
+    }
+
+    for mode in [ContainedMode::On, ContainedMode::Both] {
+        let mut modified = SearchQuery::new("Observation");
+        modified.contained = mode;
+        modified.count = Some(1);
+        modified.parameters.push(with_modifier(
+            code_value_quantity("A$gt5"),
+            SearchModifier::Exact,
+        ));
+        for result in [
+            backend.search(&tenant, &modified).await.map(|_| ()),
+            backend.search_count(&tenant, &modified).await.map(|_| ()),
+        ] {
+            let err = result.expect_err("composite :exact must not be ignored");
+            assert!(
+                matches!(
+                    &err,
+                    StorageError::Search(SearchError::InvalidComposite { .. })
+                ),
+                "expected InvalidComposite for {mode:?}, got {err:?}"
+            );
+            assert!(err.to_string().contains(":exact"));
+        }
+    }
+}
+
+/// `_contained=both` lists a container that also matches top-level once (#1407).
+///
+/// Strict: the overlap must be removed before pagination, so one query proves
+/// each resource appears exactly once, `_total` and `search_count` agree, and
+/// `_count`/`_offset` pages crossing the top-level/contained boundary come
+/// back full with no duplicates. MongoDB currently dedups against the
+/// top-level *page* only and double-counts the overlap in `_total`, so the
+/// `[both]` probes below fail until that changes.
+///
+/// Seeds (searched type: Observation, criterion: `code=X`):
+/// - top-level Observation `shared` (code X);
+/// - Observation `overlap` (own code X, so a top-level match itself) whose
+///   contained Observation is also `shared` — the same local id as the
+///   top-level resource, which is still a different resource;
+/// - DiagnosticReport `plain` with contained Observation `solo` (code X).
+///
+/// `code=X [both]` is then top-level `{overlap, shared}` plus contained
+/// `{overlap, plain}`, merged to `{overlap, plain, shared}` with total 3.
+/// The `[both, contained]` control proves the dedup never crosses the
+/// container/contained line: top-level `shared` and contained `shared` are
+/// both listed.
+pub async fn both_dedups_container_also_matching_top_level<S>(backend: &S, tenant_base: &str)
+where
+    S: ResourceStorage + SearchProvider,
+{
+    use ContainedMode::{Both, Off, On};
+    use ContainedReturn::{Contained, Container};
+
+    let tenant = TenantContext::new(TenantId::new(tenant_base), TenantPermissions::full_access());
+    fn code_x(q: &mut SearchQuery) {
+        q.parameters.push(token("code", "X"));
+    }
+
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            observation("shared", "X", "2020-06-15", &["cat1"]),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed top-level observation");
+    let mut overlap = observation("overlap", "X", "2020-06-15", &["cat1"]);
+    overlap["contained"] = json!([observation("shared", "X", "2020-06-15", &["cat1"])]);
+    backend
+        .create(&tenant, "Observation", overlap, FhirVersion::default())
+        .await
+        .expect("seed overlapping observation container");
+    seed_containers(
+        backend,
+        &tenant,
+        vec![(
+            "plain",
+            vec![observation("solo", "X", "2020-06-15", &["cat1"])],
+        )],
+    )
+    .await;
+
+    // Positive controls: the top-level rows and the contained rows are indexed.
+    let controls = [
+        probe(
+            "code=X [false]",
+            Off,
+            Container,
+            Ok(&["overlap", "shared"]),
+            code_x,
+        ),
+        probe(
+            "code=X [true]",
+            On,
+            Container,
+            Ok(&["overlap", "plain"]),
+            code_x,
+        ),
+    ];
+    for control in &controls {
+        let expected: Vec<String> = control
+            .expect
+            .expect("a control is not refused")
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+        for attempt in 0..60 {
+            let got = backend
+                .search(&tenant, &control.query)
+                .await
+                .map(|found| sorted_ids(&found));
+            if got.as_ref().ok() == Some(&expected) {
+                break;
+            }
+            assert!(
+                attempt < 59,
+                "positive control {} never held:\n       got {got:?}\n  expected {expected:?}\n                 is the backend built with the spec search parameters?",
+                control.label
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+
+    let probes = [
+        // The overlap is one result, counted once.
+        probe(
+            "code=X [both]",
+            Both,
+            Container,
+            Ok(&["overlap", "plain", "shared"]),
+            code_x,
+        ),
+        // A contained resource keeps its own identity even when its local id
+        // equals a top-level id: no dedup across that line.
+        probe(
+            "code=X [both, contained]",
+            Both,
+            Contained,
+            Ok(&["overlap", "shared", "shared", "solo"]),
+            code_x,
+        ),
+        probe(
+            "code=X [true, contained]",
+            On,
+            Contained,
+            Ok(&["shared", "solo"]),
+            code_x,
+        ),
+    ];
+
+    let mut failures = Vec::new();
+    for probe in controls.iter().chain(&probes) {
+        let got = run_probe(backend, &tenant, probe).await;
+        let (ok, expected) = match (&probe.expect, &got) {
+            (Ok(ids), Ok(outcome)) => {
+                let expected = expected_probe_outcome(ids);
+                (*outcome == expected, expected)
+            }
+            (Ok(ids), Err(_)) => (false, expected_probe_outcome(ids)),
+            (Err(name), Ok(_)) => (false, format!("an error naming '{name}'")),
+            (Err(name), Err(message)) => (
+                message.contains(name) && message.contains("_contained"),
+                format!("an error naming '{name}' and _contained"),
+            ),
+        };
+        eprintln!(
+            "[contained_suite] {} {} -> {got:?}",
+            if ok { "ok  " } else { "FAIL" },
+            probe.label
+        );
+        if !ok {
+            failures.push(format!(
+                "{}:\n       got {got:?}\n  expected {expected}",
+                probe.label
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+
+    // One more walk with `_count=1`, so every page boundary — including each
+    // side of the top-level/contained frontier at offset 2 — is crossed with
+    // no short page and no duplicate.
+    let mut query = SearchQuery::new("Observation");
+    query.contained = Both;
+    query.contained_return = Container;
+    query.total = Some(TotalMode::Accurate);
+    code_x(&mut query);
+    let mut walked = Vec::new();
+    for offset in 0..4u32 {
+        let mut page = query.clone();
+        page.count = Some(1);
+        page.offset = Some(offset);
+        let found = backend
+            .search(&tenant, &page)
+            .await
+            .expect("both page with _count=1");
+        assert_eq!(
+            found.total,
+            Some(3),
+            "offset {offset}: _total must count the overlap once"
+        );
+        walked.extend(sorted_ids(&found));
+    }
+    walked.sort();
+    assert_eq!(
+        walked,
+        vec![
+            "overlap".to_string(),
+            "plain".to_string(),
+            "shared".to_string()
+        ],
+        "walking _count=1 across the boundary must visit each resource once"
+    );
+}
+
+/// `_contained` lists every hit even past `max_result_window` (#1407).
+///
+/// Strict: with a window of 10 and 16 contained documents the list, `_total`,
+/// `search_count` and the `_count`/`_offset` pages must all describe the same
+/// 13 containers. `c-multi` holds four matching contained resources, so its
+/// hits land on both sides of the page boundary: deduping each round on its
+/// own drops it or lists it twice. Fails while the backend stops at one
+/// request — the list holds the first 10 hits only, and `_total` with it.
+///
+/// Seeds (searched type: Observation, criterion: `code=X`):
+/// - DiagnosticReports `c00`–`c11`, each with one contained Observation
+///   (local ids `k00`–`k11`, code X);
+/// - DiagnosticReport `c-multi` with four contained Observations (local ids
+///   `m-a`–`m-d`, code X): 16 contained documents, more than one window;
+/// - top-level Observations `top-a` and `top-b` (code X) for the `both` probes.
+///
+/// `code=X` is then 13 containers, 16 contained resources, and — with `both`
+/// — 15 entries with the two top-level resources mixed in.
+pub async fn past_window_lists_every_contained_hit<S>(backend: &S, tenant_base: &str)
+where
+    S: ResourceStorage + SearchProvider,
+{
+    use ContainedMode::{Both, On};
+    use ContainedReturn::{Contained, Container};
+
+    let tenant = TenantContext::new(TenantId::new(tenant_base), TenantPermissions::full_access());
+    for n in 0..12 {
+        let local = format!("k{n:02}");
+        backend
+            .create(
+                &tenant,
+                "DiagnosticReport",
+                json!({
+                    "resourceType": "DiagnosticReport",
+                    "id": format!("c{n:02}"),
+                    "status": "final",
+                    "code": {"text": "panel"},
+                    "contained": [observation(&local, "X", "2020-06-15", &["cat1"])],
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("seed single container");
+    }
+    seed_containers(
+        backend,
+        &tenant,
+        vec![(
+            "c-multi",
+            ["m-a", "m-b", "m-c", "m-d"]
+                .into_iter()
+                .map(|local| observation(local, "X", "2020-06-15", &["cat1"]))
+                .collect(),
+        )],
+    )
+    .await;
+    for id in ["top-a", "top-b"] {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                observation(id, "X", "2020-06-15", &["cat1"]),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("seed top-level observation");
+    }
+
+    let mut expected_containers: Vec<String> = (0..12).map(|n| format!("c{n:02}")).collect();
+    expected_containers.push("c-multi".to_string());
+    expected_containers.sort();
+    let mut expected_locals: Vec<String> = (0..12).map(|n| format!("k{n:02}")).collect();
+    expected_locals.extend(
+        ["m-a", "m-b", "m-c", "m-d"]
+            .iter()
+            .map(|id| (*id).to_string()),
+    );
+    expected_locals.sort();
+    let mut expected_both = expected_containers.clone();
+    expected_both.extend(["top-a".to_string(), "top-b".to_string()]);
+    expected_both.sort();
+    let mut expected_both_contained = expected_locals.clone();
+    expected_both_contained.extend(["top-a".to_string(), "top-b".to_string()]);
+    expected_both_contained.sort();
+
+    fn query(mode: ContainedMode, returns: ContainedReturn) -> SearchQuery {
+        let mut query = SearchQuery::new("Observation");
+        query.contained = mode;
+        query.contained_return = returns;
+        query.parameters.push(token("code", "X"));
+        query.total = Some(TotalMode::Accurate);
+        query
+    }
+
+    // Positive control: every container is indexed. Polls for the
+    // eventually-consistent backends; the strict probes below run once.
+    let control = query(On, Container);
+    for attempt in 0..60 {
+        let got = backend
+            .search(&tenant, &control)
+            .await
+            .map(|found| sorted_ids(&found));
+        if got.as_ref().ok() == Some(&expected_containers) {
+            break;
+        }
+        assert!(
+            attempt < 59,
+            "positive control code=X never held:\n       got {got:?}\n  expected {expected_containers:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    // The whole list, its `_total` and `search_count` agree on 13 containers.
+    let found = backend
+        .search(&tenant, &control)
+        .await
+        .expect("over-window contained search");
+    assert_eq!(
+        found.total,
+        Some(13),
+        "_total must count every container past the window"
+    );
+    assert_eq!(
+        sorted_ids(&found),
+        expected_containers,
+        "every container is listed once, from both rounds"
+    );
+    assert_eq!(
+        backend
+            .search_count(&tenant, &control)
+            .await
+            .expect("over-window contained search_count"),
+        13,
+        "search_count agrees with the list"
+    );
+
+    // `_count=5` pages cross the round boundary full and without duplicates.
+    let mut walked = Vec::new();
+    for page_no in 0..10u32 {
+        let mut page = control.clone();
+        page.count = Some(5);
+        page.offset = Some(page_no * 5);
+        let found = backend
+            .search(&tenant, &page)
+            .await
+            .expect("over-window contained page");
+        if found.resources.items.is_empty() {
+            break;
+        }
+        assert_eq!(
+            found.total,
+            Some(13),
+            "page {page_no}: _total stays 13 across the boundary"
+        );
+        walked.extend(sorted_ids(&found));
+    }
+    assert_eq!(
+        walked.len(),
+        expected_containers.len(),
+        "pages are full with no duplicates and stop at the end"
+    );
+    walked.sort();
+    assert_eq!(
+        walked, expected_containers,
+        "walking _count=5 visits each container exactly once"
+    );
+    assert_eq!(
+        walked.iter().filter(|id| id.as_str() == "c-multi").count(),
+        1,
+        "c-multi's four hits, split across rounds, collapse to one container"
+    );
+
+    // The contained form lists all 16 resources, one per document.
+    let contained = query(On, Contained);
+    let found = backend
+        .search(&tenant, &contained)
+        .await
+        .expect("over-window contained-resources search");
+    assert_eq!(
+        found.total,
+        Some(16),
+        "_total counts every contained resource"
+    );
+    assert_eq!(
+        sorted_ids(&found),
+        expected_locals,
+        "no contained resource is lost past the window"
+    );
+    assert_eq!(
+        backend
+            .search_count(&tenant, &contained)
+            .await
+            .expect("over-window contained-resources search_count"),
+        16,
+        "search_count agrees with the contained list"
+    );
+
+    // `both` mixes the two top-level matches into the same walked list.
+    let both = query(Both, Container);
+    let found = backend
+        .search(&tenant, &both)
+        .await
+        .expect("over-window both search");
+    assert_eq!(
+        found.total,
+        Some(15),
+        "_total mixes top-level and contained matches once each"
+    );
+    assert_eq!(
+        sorted_ids(&found),
+        expected_both,
+        "both lists the top-level matches beside the containers"
+    );
+    assert_eq!(
+        backend
+            .search_count(&tenant, &both)
+            .await
+            .expect("over-window both search_count"),
+        15,
+        "search_count agrees with the both list"
+    );
+
+    let both_contained = query(Both, Contained);
+    let found = backend
+        .search(&tenant, &both_contained)
+        .await
+        .expect("over-window both-contained search");
+    assert_eq!(
+        found.total,
+        Some(18),
+        "_total counts contained and top-level resources together"
+    );
+    assert_eq!(
+        sorted_ids(&found),
+        expected_both_contained,
+        "both in contained form lists every resource once"
+    );
+    assert_eq!(
+        backend
+            .search_count(&tenant, &both_contained)
+            .await
+            .expect("over-window both-contained search_count"),
+        18,
+        "search_count agrees with the both-contained list"
+    );
 }

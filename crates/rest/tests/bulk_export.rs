@@ -1006,6 +1006,71 @@ async fn test_invalid_since_rejected() {
 }
 
 #[tokio::test]
+async fn test_until_before_since_rejected() {
+    let (server, _backend, _output, _tmp) = create_bulk_export_server().await;
+
+    let resp = server
+        .get("/$export")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("prefer", "respond-async")
+        .add_query_param("_since", "2021-01-01T00:00:00Z")
+        .add_query_param("_until", "2020-01-01T00:00:00Z")
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST);
+    let text = resp.text();
+    assert!(
+        text.contains(
+            "_until '2020-01-01T00:00:00Z' is earlier than _since '2021-01-01T00:00:00Z'"
+        ),
+        "got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn test_until_before_since_rejected_in_post_parameters() {
+    let (server, _backend, _output, _tmp) = create_bulk_export_server().await;
+
+    let body = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "_since", "valueInstant": "2021-01-01T00:00:00Z"},
+            {"name": "_until", "valueInstant": "2020-12-31T23:59:59Z"}
+        ]
+    });
+    let resp = server
+        .post("/$export")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("prefer", "respond-async")
+        .json(&body)
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST);
+    let text = resp.text();
+    assert!(
+        text.contains(
+            "_until '2020-12-31T23:59:59Z' is earlier than _since '2021-01-01T00:00:00Z'"
+        ),
+        "got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn test_until_equal_to_since_accepted() {
+    let (server, backend, output, _tmp) = create_bulk_export_server().await;
+    seed_patients(&backend, 1).await;
+
+    let resp = server
+        .get("/$export")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("prefer", "respond-async")
+        .add_query_param("_since", "2020-01-01T00:00:00Z")
+        .add_query_param("_until", "2020-01-01T00:00:00Z")
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
+
+    drain_workers(&backend, &output).await;
+}
+
+#[tokio::test]
 async fn test_elements_parameter_accepted() {
     let (server, backend, output, _tmp) = create_bulk_export_server().await;
     seed_patients(&backend, 1).await;
@@ -1194,6 +1259,91 @@ async fn test_type_filter_is_applied_to_system_export() {
         !ids.contains(&"p-inactive"),
         "the inactive patient must not be in the filtered output"
     );
+}
+
+/// A `_typeFilter` carrying `_has` or a dotted chain is resolved by the worker
+/// before it filters (#1389). `search()` does not read chains, and the worker
+/// used to call it without resolving them: `_has` was dropped (every Patient
+/// exported) and a dotted chain was misread as a plain reference (none).
+#[tokio::test]
+async fn test_type_filter_with_a_chain_is_applied() {
+    for (filter, expected) in [
+        ("Patient?_has:Observation:subject:code=1234-5", "p-obs"),
+        ("Patient?organization.name=Acme", "p-acme"),
+    ] {
+        let (server, backend, output, _tmp) = create_bulk_export_server().await;
+        let tenant = test_tenant();
+        for (ty, body) in [
+            (
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p-plain"}),
+            ),
+            ("Patient", json!({"resourceType": "Patient", "id": "p-obs"})),
+            (
+                "Organization",
+                json!({"resourceType": "Organization", "id": "org-acme", "name": "Acme"}),
+            ),
+            (
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "p-acme",
+                    "managingOrganization": {"reference": "Organization/org-acme"}
+                }),
+            ),
+            (
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "o1",
+                    "status": "final",
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "1234-5"}]},
+                    "subject": {"reference": "Patient/p-obs"}
+                }),
+            ),
+        ] {
+            backend
+                .create(&tenant, ty, body, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+
+        let resp = server
+            .get("/$export")
+            .add_header("x-tenant-id", "test-tenant")
+            .add_header("prefer", "respond-async")
+            .add_query_param("_type", "Patient")
+            .add_query_param("_typeFilter", filter)
+            .await;
+        assert_eq!(resp.status_code(), StatusCode::ACCEPTED, "{filter}");
+        let status_url = resp
+            .headers()
+            .get("content-location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let status_path = status_url.strip_prefix("http://localhost:8080").unwrap();
+
+        drain_workers(&backend, &output).await;
+
+        let done = server
+            .get(status_path)
+            .add_header("x-tenant-id", "test-tenant")
+            .await;
+        assert_eq!(done.status_code(), StatusCode::OK, "{filter}");
+        let manifest: Value = done.json();
+        let output_files = manifest["output"].as_array().expect("output array");
+        assert_eq!(output_files.len(), 1, "{filter}: one Patient file");
+        let lines = fetch_ndjson_lines(
+            &server,
+            output_files[0]["url"].as_str().unwrap(),
+            "http://localhost:8080",
+        )
+        .await;
+        let ids: Vec<&str> = lines.iter().map(|v| v["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec![expected], "{filter}");
+    }
 }
 
 #[tokio::test]

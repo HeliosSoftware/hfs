@@ -402,6 +402,22 @@ pub trait SearchProvider: ResourceStorage {
         query: &SearchQuery,
     ) -> StorageResult<SearchResult>;
 
+    /// Returns one page of logical ids in `query.resource_type` for internal
+    /// chain resolution. The page retains the same cursor as `search`.
+    /// Backends may avoid loading resource bodies; the default keeps existing
+    /// search behavior for providers without an id-only query path.
+    async fn search_ids(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<Page<String>> {
+        Ok(self
+            .search(tenant, query)
+            .await?
+            .resources
+            .map(|resource| resource.id().to_string()))
+    }
+
     /// Counts resources matching the query without returning them.
     ///
     /// This is more efficient than search when you only need the count.
