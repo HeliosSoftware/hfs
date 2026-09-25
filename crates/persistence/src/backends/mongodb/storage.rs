@@ -4768,6 +4768,20 @@ struct ReindexFoundPage {
     capped: bool,
 }
 
+/// Logs a byte-capped reindex page read (#1499), in [`MongoBackend::fetch_reindex_page`]'s
+/// id-phase and catch-up-round arms alike, so the two call sites share one log
+/// line, one target and one field order instead of pasting the block twice.
+fn log_capped_page_read(tenant_id: &str, resource_type: &str, found: &ReindexFoundPage) {
+    tracing::debug!(
+        tenant = %tenant_id,
+        resource_type = %resource_type,
+        rows = found.docs.len(),
+        bytes = found.bytes,
+        capped = found.capped,
+        "mongodb reindex capped page read"
+    );
+}
+
 impl MongoBackend {
     /// The newest-live probe (#1403): a covered reverse scan of
     /// `idx_resources_type_scan` for the `last_updated` of the newest live
@@ -4845,118 +4859,21 @@ impl MongoBackend {
             capped,
         })
     }
-}
 
-/// One step of the walk inside a single call (#1403); never leaves the
-/// call — only `ReindexWalkCursor::Id`/`Round` do, as an encoded cursor.
-enum WalkStep {
-    Start,
-    IdPhase {
-        floor: DateTime<Utc>,
-        after_id: Option<String>,
-    },
-    RoundStart {
-        round: u8,
-        floor: DateTime<Utc>,
-    },
-    Round {
-        round: u8,
-        floor: DateTime<Utc>,
-        ceiling: DateTime<Utc>,
-        walked: u64,
-        after: Option<(DateTime<Utc>, String)>,
-    },
-}
-
-impl From<ReindexWalkCursor> for WalkStep {
-    fn from(cursor: ReindexWalkCursor) -> Self {
-        match cursor {
-            ReindexWalkCursor::Id { floor, after_id } => WalkStep::IdPhase {
-                floor,
-                after_id: Some(after_id),
-            },
-            ReindexWalkCursor::Round {
-                round,
-                floor,
-                ceiling,
-                walked,
-                after_last_updated,
-                after_id,
-            } => WalkStep::Round {
-                round,
-                floor,
-                ceiling,
-                walked,
-                after: Some((after_last_updated, after_id)),
-            },
-        }
-    }
-}
-
-/// Converts a returned page plus its next cursor into a [`ResourcePage`],
-/// exactly as HEAD's `fetch_resources_page` did (`:4851-4863` at c86d0f08b).
-fn reindex_page_from_docs(
-    docs: &[Document],
-    resource_type: &str,
-    tenant: &TenantContext,
-    next_cursor: ReindexWalkCursor,
-) -> StorageResult<ResourcePage> {
-    let resources = docs
-        .iter()
-        .map(|doc| {
-            parse_history_row(doc, Some(resource_type), None)
-                .map(|row| row.into_stored_resource(tenant))
-        })
-        .collect::<StorageResult<Vec<_>>>()?;
-    Ok(ResourcePage {
-        resources,
-        next_cursor: Some(next_cursor.encode()),
-        skipped: Vec::new(),
-    })
-}
-
-#[async_trait]
-impl ReindexSource for MongoBackend {
-    async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
-        let db = self.get_database().await?;
-        let resources: Collection<Document> = db.collection(MongoBackend::RESOURCES_COLLECTION);
-
-        let types = resources
-            .distinct(
-                "resource_type",
-                doc! { "tenant_id": tenant.tenant_id().as_str(), "is_deleted": false },
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to list resource types: {e}")))?;
-
-        Ok(types
-            .into_iter()
-            .filter_map(|b| b.as_str().map(str::to_string))
-            .collect())
-    }
-
-    async fn count_resources(
-        &self,
-        tenant: &TenantContext,
-        resource_type: &str,
-    ) -> StorageResult<u64> {
-        self.count(tenant, Some(resource_type)).await
-    }
-
-    /// Two phases per type (#1403): an id phase over live resources stamped
-    /// before the floor, keyset on id and hinted to idx_resources_identity,
-    /// then up to REINDEX_CATCH_UP_MAX_ROUNDS catch-up rounds over
-    /// [floor, ceiling) in (last_updated, id) order on idx_resources_type_scan.
-    /// A phase ends only on an empty query and the next phase starts in the
-    /// same call, so the driver sees non-empty pages with Some(cursor) and one
-    /// trailing empty page with None. The cursor is the versioned v2 grammar
-    /// of ReindexWalkCursor.
-    async fn fetch_resources_page(
+    /// Pages `resource_type` in id order with catch-up rounds (PR1, #1403), bounded
+    /// by `max_bytes` as well as by `limit` (`max_bytes == 0` is PR1's uncapped
+    /// page, #1499). A page the byte cap stops before `limit` is still non-empty
+    /// (the first row is always admitted), so it continues its current walk phase
+    /// exactly as a full page would — it never ends a phase and never returns
+    /// `None` on its own account. `fetch_resources_page` and
+    /// `fetch_resources_page_capped` are both thin calls to this method.
+    async fn fetch_reindex_page(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         cursor: Option<&str>,
         limit: u32,
+        max_bytes: u64,
     ) -> StorageResult<ResourcePage> {
         let db = self.get_database().await?;
         let resources: Collection<Document> = db.collection(MongoBackend::RESOURCES_COLLECTION);
@@ -5004,9 +4921,12 @@ impl ReindexSource for MongoBackend {
                             doc! { "id": 1 },
                             RESOURCES_IDENTITY_INDEX,
                             limit,
-                            0,
+                            max_bytes,
                         )
                         .await?;
+                    if max_bytes > 0 {
+                        log_capped_page_read(tenant_id, resource_type, &found);
+                    }
                     let docs = found.docs;
                     if !docs.is_empty() {
                         let last_id = docs
@@ -5124,9 +5044,12 @@ impl ReindexSource for MongoBackend {
                             doc! { "last_updated": 1, "id": 1 },
                             RESOURCES_TYPE_SCAN_INDEX,
                             limit,
-                            0,
+                            max_bytes,
                         )
                         .await?;
+                    if max_bytes > 0 {
+                        log_capped_page_read(tenant_id, resource_type, &found);
+                    }
                     let scanned = found.docs;
                     if scanned.is_empty() {
                         tracing::info!(
@@ -5171,6 +5094,140 @@ impl ReindexSource for MongoBackend {
                 }
             };
         }
+    }
+}
+
+/// One step of the walk inside a single call (#1403); never leaves the
+/// call — only `ReindexWalkCursor::Id`/`Round` do, as an encoded cursor.
+enum WalkStep {
+    Start,
+    IdPhase {
+        floor: DateTime<Utc>,
+        after_id: Option<String>,
+    },
+    RoundStart {
+        round: u8,
+        floor: DateTime<Utc>,
+    },
+    Round {
+        round: u8,
+        floor: DateTime<Utc>,
+        ceiling: DateTime<Utc>,
+        walked: u64,
+        after: Option<(DateTime<Utc>, String)>,
+    },
+}
+
+impl From<ReindexWalkCursor> for WalkStep {
+    fn from(cursor: ReindexWalkCursor) -> Self {
+        match cursor {
+            ReindexWalkCursor::Id { floor, after_id } => WalkStep::IdPhase {
+                floor,
+                after_id: Some(after_id),
+            },
+            ReindexWalkCursor::Round {
+                round,
+                floor,
+                ceiling,
+                walked,
+                after_last_updated,
+                after_id,
+            } => WalkStep::Round {
+                round,
+                floor,
+                ceiling,
+                walked,
+                after: Some((after_last_updated, after_id)),
+            },
+        }
+    }
+}
+
+/// Converts a returned page plus its next cursor into a [`ResourcePage`],
+/// exactly as HEAD's `fetch_resources_page` did (`:4851-4863` at c86d0f08b).
+fn reindex_page_from_docs(
+    docs: &[Document],
+    resource_type: &str,
+    tenant: &TenantContext,
+    next_cursor: ReindexWalkCursor,
+) -> StorageResult<ResourcePage> {
+    let resources = docs
+        .iter()
+        .map(|doc| {
+            parse_history_row(doc, Some(resource_type), None)
+                .map(|row| row.into_stored_resource(tenant))
+        })
+        .collect::<StorageResult<Vec<_>>>()?;
+    Ok(ResourcePage {
+        resources,
+        next_cursor: Some(next_cursor.encode()),
+        skipped: Vec::new(),
+    })
+}
+
+#[async_trait]
+impl ReindexSource for MongoBackend {
+    async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
+        let db = self.get_database().await?;
+        let resources: Collection<Document> = db.collection(MongoBackend::RESOURCES_COLLECTION);
+
+        let types = resources
+            .distinct(
+                "resource_type",
+                doc! { "tenant_id": tenant.tenant_id().as_str(), "is_deleted": false },
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to list resource types: {e}")))?;
+
+        Ok(types
+            .into_iter()
+            .filter_map(|b| b.as_str().map(str::to_string))
+            .collect())
+    }
+
+    async fn count_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+    ) -> StorageResult<u64> {
+        self.count(tenant, Some(resource_type)).await
+    }
+
+    /// Two phases per type (#1403): an id phase over live resources stamped
+    /// before the floor, keyset on id and hinted to idx_resources_identity,
+    /// then up to REINDEX_CATCH_UP_MAX_ROUNDS catch-up rounds over
+    /// [floor, ceiling) in (last_updated, id) order on idx_resources_type_scan.
+    /// A phase ends only on an empty query and the next phase starts in the
+    /// same call, so the driver sees non-empty pages with Some(cursor) and one
+    /// trailing empty page with None. The cursor is the versioned v2 grammar
+    /// of ReindexWalkCursor.
+    async fn fetch_resources_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> StorageResult<ResourcePage> {
+        self.fetch_reindex_page(tenant, resource_type, cursor, limit, 0)
+            .await
+    }
+
+    /// Pages by resource count and, when `max_bytes` is set, by the raw BSON
+    /// bytes of the `resources` rows the page reads: a page never exceeds
+    /// `max_bytes` unless it holds exactly one resource (PostgreSQL's strict
+    /// rule, not SQLite's overshoot-by-one, #1499). A byte-capped page continues
+    /// the walk's current phase — it is never empty, so it never ends a phase —
+    /// and its cursor names the last row it *took*, never a row the cap rejected.
+    async fn fetch_resources_page_capped(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<ResourcePage> {
+        self.fetch_reindex_page(tenant, resource_type, cursor, limit, max_bytes)
+            .await
     }
 }
 
