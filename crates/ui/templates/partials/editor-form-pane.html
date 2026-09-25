@@ -65,11 +65,14 @@
     undeclared constant, duplicate column names, ...) alongside the
     validator's own structural checks.
 
-    SQL Query / SQL View (#840) get their own two-line legend: "checked on
+    SQL Query / SQL View (#840) get their own three-line legend: "checked on
     save" there names the SQL on FHIR Library type and the SQL attachment —
     what actually gates Save on those pages — rather than the generic
     constraints/terminology promise below, which would be misleading with
-    `HFS_VALIDATION_MODE` off (the default).
+    `HFS_VALIDATION_MODE` off (the default). Its third line (#1233) says
+    where the SQL attachment itself is edited, since `hidden=["content"]`
+    (`render_lib_details_pane`, `crates/ui/src/lib.rs`) keeps this guided
+    form from ever listing it.
   -->
   <p class="editor-legend">
     {% match legend %}
@@ -78,6 +81,7 @@
     {% when Legend::SqlLibrary %}
     <span class="editor-legend__live">{{ i18n.t("lib-form-legend-live") }}</span>
     <span class="editor-legend__save">{{ i18n.t("lib-form-legend-save") }}</span>
+    <span class="editor-legend__save">{{ i18n.t("lib-form-legend-content") }}</span>
     {% when Legend::Resource %}
     <span class="editor-legend__live">{{ i18n.t("editor-legend-live") }}</span>
     <span class="editor-legend__save">{{ i18n.t("editor-legend-save") }}</span>
