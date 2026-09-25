@@ -2691,6 +2691,7 @@ async fn run_reindex(
             }
 
             // Process resources in batches
+            let page_limit = request.batch_size.max(1);
             let mut cursor: Option<String> = None;
             loop {
                 // Check for cancellation
@@ -2706,7 +2707,7 @@ async fn run_reindex(
                         &tenant,
                         resource_type,
                         cursor.as_deref(),
-                        request.batch_size,
+                        page_limit,
                         request.batch_bytes,
                     )
                     .await;
@@ -6006,5 +6007,109 @@ mod tests {
         assert_eq!(page_events[0].values["page"], "1");
         assert_eq!(page_events[0].values["resources"], "2");
         assert!(!events.iter().any(|e| e.message == "reindex progress"));
+    }
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod page_limit_tests {
+    use super::*;
+    use crate::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
+    use crate::core::ResourceStorage;
+    use crate::tenant::{TenantId, TenantPermissions};
+    use std::sync::Mutex;
+
+    struct LimitRecordingSource {
+        inner: Arc<SqliteBackend>,
+        limits: Mutex<Vec<u32>>,
+    }
+
+    #[async_trait]
+    impl ReindexSource for LimitRecordingSource {
+        async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
+            self.inner.list_resource_types(tenant).await
+        }
+        async fn count_resources(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+        ) -> StorageResult<u64> {
+            self.inner.count_resources(tenant, resource_type).await
+        }
+        async fn fetch_resources_page(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            cursor: Option<&str>,
+            limit: u32,
+        ) -> StorageResult<ResourcePage> {
+            self.limits.lock().unwrap().push(limit);
+            self.inner
+                .fetch_resources_page(tenant, resource_type, cursor, limit)
+                .await
+        }
+        async fn fetch_resources_page_capped(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            cursor: Option<&str>,
+            limit: u32,
+            max_bytes: u64,
+        ) -> StorageResult<ResourcePage> {
+            self.limits.lock().unwrap().push(limit);
+            self.inner
+                .fetch_resources_page_capped(tenant, resource_type, cursor, limit, max_bytes)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn paging_passes_at_least_one_as_the_page_limit() {
+        let backend = Arc::new(
+            SqliteBackend::with_config(":memory:", SqliteBackendConfig::default()).unwrap(),
+        );
+        backend.init_schema().unwrap();
+        let tenant = TenantContext::new(
+            TenantId::new("tenant-page-limit"),
+            TenantPermissions::full_access(),
+        );
+        for i in 0..3 {
+            backend
+                .create_or_update(
+                    &tenant,
+                    "Patient",
+                    &format!("p{i}"),
+                    serde_json::json!({"resourceType": "Patient", "id": format!("p{i}")}),
+                    helios_fhir::FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let source = Arc::new(LimitRecordingSource {
+            inner: backend.clone(),
+            limits: Mutex::new(Vec::new()),
+        });
+        let operation = ReindexOperation::with_parts(
+            source.clone(),
+            vec![backend.clone() as Arc<dyn ReindexTarget>],
+            backend.tenant_registries().clone(),
+        );
+        let request = ReindexRequest::for_types(["Patient"]).with_batch_size(0);
+        let job_id = operation.start(tenant, request, None).await.unwrap();
+        let progress = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let progress = operation.get_progress(&job_id).await.unwrap();
+                if progress.status.is_finished() {
+                    break progress;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("job did not finish");
+        assert_eq!(progress.status, ReindexStatus::Completed);
+        assert_eq!(progress.processed_resources, 3);
+        let limits = source.limits.lock().unwrap();
+        assert!(!limits.is_empty());
+        assert!(limits.iter().all(|&l| l == 1), "{limits:?}");
     }
 }

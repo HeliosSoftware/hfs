@@ -67,6 +67,12 @@ fn reindex_unavailable() -> RestError {
     }
 }
 
+/// `batchSize` as a page size: at least 1, and saturating instead of wrapping
+/// (`4294967296 as u32` is 0, which reindexed nothing, #1499).
+fn batch_size_param(size: u64) -> u32 {
+    u32::try_from(size).unwrap_or(u32::MAX).max(1)
+}
+
 /// Enforces the `system/reindex` operation scope. Auth disabled → allowed.
 fn check_reindex_scope(principal: Option<&Principal>) -> RestResult<()> {
     if let Some(p) = principal
@@ -129,7 +135,7 @@ where
                         .get("valueInteger")
                         .and_then(serde_json::Value::as_u64)
                     {
-                        request.batch_size = size.max(1) as u32;
+                        request.batch_size = batch_size_param(size);
                     }
                 }
                 _ => {}
@@ -296,5 +302,14 @@ mod tests {
     #[test]
     fn test_no_principal_allows_reindex() {
         assert!(check_reindex_scope(None).is_ok());
+    }
+
+    #[test]
+    fn batch_size_param_clamps_and_saturates() {
+        assert_eq!(batch_size_param(0), 1);
+        assert_eq!(batch_size_param(1), 1);
+        assert_eq!(batch_size_param(1000), 1000);
+        assert_eq!(batch_size_param(4_294_967_296), u32::MAX);
+        assert_eq!(batch_size_param(u64::MAX), u32::MAX);
     }
 }
