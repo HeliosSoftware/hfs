@@ -467,7 +467,7 @@ async fn mongodb_integration_reindex_fetch_ahead_matches_capped_id_phase() {
     };
     let tenant_id = "tenant-fetch-ahead-matches";
     let tenant = create_tenant(tenant_id);
-    let (_db, _sizes, cap) = seed_provenance(&backend, &tenant, tenant_id).await;
+    let (_db, sizes, cap) = seed_provenance(&backend, &tenant, tenant_id).await;
 
     let mut cursor = backend
         .fetch_resources_page_capped(&tenant, "Provenance", None, 24, cap)
@@ -509,10 +509,14 @@ async fn mongodb_integration_reindex_fetch_ahead_matches_capped_id_phase() {
             ahead_page.next_cursor, capped.next_cursor,
             "cursor {cursor}"
         );
+        let bytes: u64 = ahead_page
+            .resources
+            .iter()
+            .map(|r| sizes.iter().find(|(id, _)| id == r.id()).unwrap().1)
+            .sum();
         assert!(
-            ahead_page.resources.len() <= 3,
-            "page held {} resources over the 3-resource cap",
-            ahead_page.resources.len()
+            bytes <= cap || ahead_page.resources.len() == 1,
+            "page {ahead_ids:?} totalled {bytes} bytes, over cap {cap}"
         );
         let next = ahead_page
             .next_cursor
@@ -959,6 +963,36 @@ fn build_test_patients(tenant: &TenantContext, prefix: &str, n: usize) -> Vec<St
         .collect()
 }
 
+/// The set of `resource_id`s that currently have at least one `search_index`
+/// row for `tenant`/`resource_type`, via one client and one `distinct` query.
+/// Replaces a per-resource `search_index_entry_count` loop — a fresh MongoDB
+/// client per call — with a single round trip; a test compares the result
+/// against the ids it expects to find indexed (#1403).
+async fn indexed_resource_ids(
+    backend: &MongoBackend,
+    tenant: &TenantContext,
+    resource_type: &str,
+) -> std::collections::BTreeSet<String> {
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect MongoDB client for search_index assertions");
+    let database = client.database(&backend.config().database_name);
+    let search_index = database.collection::<Document>("search_index");
+    let ids: Vec<Bson> = search_index
+        .distinct(
+            "resource_id",
+            doc! {
+                "tenant_id": tenant.tenant_id().as_str(),
+                "resource_type": resource_type,
+            },
+        )
+        .await
+        .expect("failed to list distinct resource_id values");
+    ids.into_iter()
+        .filter_map(|b| b.as_str().map(str::to_string))
+        .collect()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mongodb_integration_reindex_page_serial_pipeline_writes_a_large_page() {
     let Some(backend) = create_backend_with("reindex_serial_pipeline_large_page", |c| {
@@ -988,13 +1022,142 @@ async fn mongodb_integration_reindex_page_serial_pipeline_writes_a_large_page() 
     );
     assert!(stats.inserted_entries as usize >= page.len());
 
-    for resource in &page {
-        assert!(
-            search_index_entry_count(&backend, &tenant, "Patient", resource.id()).await > 0,
-            "resource {} must have a row",
-            resource.id()
-        );
-    }
+    let indexed = indexed_resource_ids(&backend, &tenant, "Patient").await;
+    let expected: std::collections::BTreeSet<String> =
+        page.iter().map(|r| r.id().to_string()).collect();
+    assert_eq!(indexed, expected, "every resource must have a row");
+}
+
+/// A scoped (not global) tracing subscriber for one test, so it does not
+/// race `capture_walk_logs`'s own one-shot global subscriber for exclusive
+/// use of `tracing::dispatcher::set_global_default` (only the first caller
+/// in the whole `mongodb_tests` binary can win that race). `set_default`
+/// installs a thread-local override instead, which is safe to set up per
+/// test as long as the awaited work never leaves the calling OS thread — true
+/// here since the test driving it uses the default (current-thread) `#[tokio::test]`
+/// runtime (#1403).
+fn capture_writer_config_log() -> (&'static Mutex<Vec<u8>>, tracing::dispatcher::DefaultGuard) {
+    static BUF: std::sync::OnceLock<Mutex<Vec<u8>>> = std::sync::OnceLock::new();
+    let buf = BUF.get_or_init(|| Mutex::new(Vec::new()));
+    let writer = tracing_test::internal::MockWriter::new(buf);
+    let dispatch = tracing_test::internal::get_subscriber(
+        writer,
+        "helios_persistence::backends::mongodb::reindex_pipeline=info",
+    );
+    let guard = tracing::dispatcher::set_default(&dispatch);
+    (buf, guard)
+}
+
+/// The value substring `line` gives for `field=`, up to the next space:
+/// panics if the field is missing.
+fn log_field_value<'a>(line: &'a str, field: &str) -> &'a str {
+    let needle = format!(" {field}=");
+    let start = line
+        .find(&needle)
+        .unwrap_or_else(|| panic!("missing field {field}: {line}"))
+        + needle.len();
+    line[start..].split(' ').next().unwrap_or(&line[start..])
+}
+
+#[tokio::test]
+async fn mongodb_integration_reindex_writer_configuration_log_line() {
+    let Some(backend) = create_backend_with("reindex_writer_configuration_log", |c| {
+        c.reindex_overlap = true;
+        c.reindex_prefetch = true;
+        c.reindex_prepare_threads = 2;
+    })
+    .await
+    else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+
+    let (buf, _guard) = capture_writer_config_log();
+    let tenant = create_tenant("reindex-writer-config-log-tenant");
+    let target: &dyn ReindexTarget = &*backend;
+
+    // A type's first page over `REINDEX_SUBBATCH_FIRST` (32) resources must
+    // log the line; a second such page on the same backend must not log it
+    // again (#1403, F2).
+    let page1 = build_test_patients(&tenant, "writerconfig1", 40);
+    let mut stats1 = ReindexPageStats::default();
+    let outcomes1 = target
+        .write_search_entries_page_timed(&tenant, &page1, &mut stats1)
+        .await;
+    assert!(outcomes1.iter().all(|o| o.is_ok()), "{outcomes1:?}");
+
+    let page2 = build_test_patients(&tenant, "writerconfig2", 40);
+    let mut stats2 = ReindexPageStats::default();
+    let outcomes2 = target
+        .write_search_entries_page_timed(&tenant, &page2, &mut stats2)
+        .await;
+    assert!(outcomes2.iter().all(|o| o.is_ok()), "{outcomes2:?}");
+
+    let lines: Vec<String> = {
+        let buf = buf.lock().unwrap();
+        String::from_utf8_lossy(&buf)
+            .lines()
+            .filter(|l| l.contains("mongodb reindex writer configuration"))
+            .map(str::to_string)
+            .collect()
+    };
+    assert_eq!(
+        lines.len(),
+        1,
+        "the writer-configuration line must log once per backend instance: {lines:?}"
+    );
+    let line = &lines[0];
+    assert!(
+        line.contains("helios_persistence::backends::mongodb::reindex_pipeline"),
+        "target must be reindex_pipeline: {line}"
+    );
+
+    // The 7 fields, in the analyze_arm.py contract's order.
+    let fields = [
+        "overlap",
+        "prefetch",
+        "prepare_threads_configured",
+        "prepare_threads",
+        "pool",
+        "multi_thread_runtime",
+        "path",
+    ];
+    let positions: Vec<usize> = fields
+        .iter()
+        .map(|f| {
+            line.find(&format!(" {f}="))
+                .unwrap_or_else(|| panic!("missing field {f}: {line}"))
+        })
+        .collect();
+    assert!(
+        positions.windows(2).all(|w| w[0] < w[1]),
+        "fields out of order: {line}"
+    );
+
+    // `pool` and `path` use Display, so they print unquoted.
+    assert!(
+        !log_field_value(line, "pool").starts_with('"'),
+        "pool must print unquoted: {line}"
+    );
+    assert!(
+        !log_field_value(line, "path").starts_with('"'),
+        "path must print unquoted: {line}"
+    );
+    // This test's `#[tokio::test]` runtime is current-thread, so the driver
+    // always takes the serial writer path regardless of `reindex_overlap`.
+    assert_eq!(
+        log_field_value(line, "multi_thread_runtime"),
+        "false",
+        "{line}"
+    );
+    assert_eq!(log_field_value(line, "path"), "serial", "{line}");
+    assert_eq!(log_field_value(line, "overlap"), "true", "{line}");
+    assert_eq!(log_field_value(line, "prefetch"), "true", "{line}");
+    assert_eq!(
+        log_field_value(line, "prepare_threads_configured"),
+        "2",
+        "{line}"
+    );
 }
 
 /// Reads every row of `collection` matching `filter`, drops `_id` and
@@ -1102,6 +1265,10 @@ async fn mongodb_integration_reindex_page_overlapped_matches_serial() {
         .await;
 
     assert_eq!(outcomes_s.len(), outcomes_o.len());
+    assert!(
+        outcomes_s.iter().all(|o| o.is_ok()),
+        "the reference write must succeed, or matching failures below proves nothing: {outcomes_s:?}"
+    );
     for (a, b) in outcomes_s.iter().zip(&outcomes_o) {
         assert_eq!(a.as_ref().ok(), b.as_ref().ok());
     }
@@ -1258,16 +1425,12 @@ async fn mongodb_integration_reindex_page_overlapped_issues_no_insert_after_a_fa
             .all(|o| matches!(o, Err(e) if e.to_string().contains("Failed to insert search index entries"))),
         "{outcomes:?}"
     );
-    for resource in &page {
-        let count = search_index_entry_count(&backend, &tenant, "Patient", resource.id()).await;
-        assert_eq!(
-            count,
-            0,
-            "resource {} must have zero rows: the delete removed them and sub-batch 1's insert \
-             failed before any row could be re-inserted",
-            resource.id()
-        );
-    }
+    let indexed = indexed_resource_ids(&backend, &tenant, "Patient").await;
+    assert!(
+        indexed.is_empty(),
+        "every resource must have zero rows: the delete removed them and sub-batch 1's insert \
+         failed before any row could be re-inserted: {indexed:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1322,11 +1485,8 @@ async fn mongodb_integration_reindex_page_overlapped_keeps_rows_of_completed_sub
 
     assert!(outcomes.iter().all(|o| o.is_err()), "{outcomes:?}");
 
-    let mut has_rows: Vec<bool> = Vec::with_capacity(page.len());
-    for resource in &page {
-        has_rows
-            .push(search_index_entry_count(&backend, &tenant, "Patient", resource.id()).await > 0);
-    }
+    let indexed = indexed_resource_ids(&backend, &tenant, "Patient").await;
+    let has_rows: Vec<bool> = page.iter().map(|r| indexed.contains(r.id())).collect();
     let with_rows = has_rows.iter().filter(|b| **b).count();
     assert!(
         with_rows > 0 && with_rows < page.len(),
@@ -1356,17 +1516,19 @@ async fn mongodb_integration_reindex_page_overlapped_fans_out_a_delete_failure()
     let tenant = create_tenant("reindex-overlap-fail-delete-tenant");
     let page = build_test_patients(&tenant, "faildelete", 40);
 
+    // Seed with a per-resource write, like the two failpoint tests above,
+    // rather than one page write: a single-resource-type page write seeds a
+    // single sub-batch, which would let the page below take the serial
+    // writer's path and still pass this test's assertions (#1403, F6).
     let target: &dyn ReindexTarget = &*backend;
-    let mut seed_stats = ReindexPageStats::default();
-    let seed_outcomes = target
-        .write_search_entries_page_timed(&tenant, &page, &mut seed_stats)
-        .await;
-    assert!(seed_outcomes.iter().all(|o| o.is_ok()));
-    let mut before_counts = Vec::with_capacity(page.len());
     for resource in &page {
-        before_counts
-            .push(search_index_entry_count(&backend, &tenant, "Patient", resource.id()).await);
+        let seeded = target.write_search_entries(&tenant, resource).await;
+        assert!(seeded.is_ok(), "{seeded:?}");
     }
+    assert!(
+        search_index_entry_count(&backend, &tenant, "Patient", page[0].id()).await > 0,
+        "the seed write must have created rows, or the later unchanged-rows assertion proves nothing"
+    );
 
     let Some(failpoint) = FailPoint::enable(
         app_name,
@@ -1385,6 +1547,13 @@ async fn mongodb_integration_reindex_page_overlapped_fans_out_a_delete_failure()
         .await;
     failpoint.off().await;
 
+    // Unlike the two insert-failure tests below, `sub_batches` cannot prove
+    // the overlapped writer ran: both writers join the page's delete right
+    // after extracting only their first sub-batch, so a delete failure is
+    // always caught with `sub_batches == 1`, whichever writer is running.
+    // This test instead relies on its config (`reindex_overlap = true`, a
+    // multi-thread runtime, and a 40-resource page) to route it through
+    // `write_page_overlapped` (#1403).
     assert!(
         outcomes.iter().all(
             |o| matches!(o, Err(e) if e.to_string().contains("Failed to delete search entries"))
@@ -1395,22 +1564,21 @@ async fn mongodb_integration_reindex_page_overlapped_fans_out_a_delete_failure()
         stats.insert_commands, 0,
         "no insert may be spawned once the delete has failed"
     );
-    for (resource, before) in page.iter().zip(&before_counts) {
-        let after = search_index_entry_count(&backend, &tenant, "Patient", resource.id()).await;
-        assert_eq!(
-            after,
-            *before,
-            "resource {} row count must be unchanged",
-            resource.id()
-        );
-    }
+    let indexed = indexed_resource_ids(&backend, &tenant, "Patient").await;
+    let expected: std::collections::BTreeSet<String> =
+        page.iter().map(|r| r.id().to_string()).collect();
+    assert_eq!(
+        indexed, expected,
+        "the failed delete must leave every resource's rows exactly as seeded"
+    );
 }
 
 /// An in-memory, scripted `ReindexSource` that always allows prefetch
 /// (#1403) — used to prove that a page written from a resource seen on one
 /// fetch, followed by an update to the same resource seen on the next fetch,
-/// still ends with the later version's rows and no duplicates when the two
-/// pages' writes overlap with the driver's own paging.
+/// still ends with the later version's rows and no duplicates. The two
+/// pages' own writes must never overlap each other; what does overlap is the
+/// next page's fetch with the current page's write.
 struct ScriptedResourceSource {
     resource_type: &'static str,
     pages: Vec<Vec<StoredResource>>,
@@ -1518,6 +1686,20 @@ async fn mongodb_integration_reindex_resource_in_consecutive_pages_ends_with_the
         .await;
     assert!(outcome[0].is_ok());
 
+    let reference_rows = rows_without_id_and_tenant(
+        &backend,
+        "search_index",
+        doc! {
+            "tenant_id": fresh_tenant.tenant_id().as_str(),
+            "resource_type": "Patient",
+            "resource_id": "r",
+        },
+    )
+    .await;
+    assert!(
+        !reference_rows.is_empty(),
+        "the reference write must have produced rows, or the equality below proves nothing"
+    );
     assert_eq!(
         rows_without_id_and_tenant(
             &backend,
@@ -1529,16 +1711,7 @@ async fn mongodb_integration_reindex_resource_in_consecutive_pages_ends_with_the
             },
         )
         .await,
-        rows_without_id_and_tenant(
-            &backend,
-            "search_index",
-            doc! {
-                "tenant_id": fresh_tenant.tenant_id().as_str(),
-                "resource_type": "Patient",
-                "resource_id": "r",
-            },
-        )
-        .await,
+        reference_rows,
         "R must end with v2's rows and no duplicates"
     );
 }
@@ -1601,6 +1774,10 @@ async fn mongodb_integration_reindex_run_parity_across_knobs() {
         assert!(progress.errors.is_empty(), "{:?}", progress.errors);
         entries_created.push(progress.entries_created);
     }
+    assert!(
+        entries_created[0] > 0,
+        "the reindex must have created some entries, or the parity checks below prove nothing"
+    );
     assert_eq!(
         entries_created[0], entries_created[1],
         "entries_created must match across knobs"
@@ -1617,14 +1794,21 @@ async fn mongodb_integration_reindex_run_parity_across_knobs() {
         }
         v
     };
+    assert!(
+        !rows[0].is_empty(),
+        "the reindex must have written some rows, or the parity checks below prove nothing"
+    );
     assert_eq!(rows[0], rows[1]);
     assert_eq!(rows[1], rows[2]);
 }
 
-/// Wraps a real `MongoBackend` writer and, after each page write returns,
-/// checks whether `mongodb reindex id phase finished` is already in the
-/// capture buffer — proving whether the transition ran concurrently with, or
-/// only after, that page's write (#1403).
+/// Wraps a real `MongoBackend` writer and, around each page write, checks
+/// whether `mongodb reindex id phase finished` is present in the capture
+/// buffer before the write starts and again after it returns — flagging only
+/// a transition that was absent before and present after, i.e. one this
+/// write's own execution window could have raced. Checking only "present
+/// after" would also flag a page that runs after an earlier page already
+/// logged the transition, which is not a race at all (#1403).
 struct PhaseLogProbeTarget {
     backend: Arc<MongoBackend>,
     saw_transition_early: Arc<std::sync::atomic::AtomicBool>,
@@ -1671,11 +1855,6 @@ impl ReindexTarget for PhaseLogProbeTarget {
         resources: &[StoredResource],
         stats: &mut ReindexPageStats,
     ) -> Vec<StorageResult<usize>> {
-        let result = self
-            .backend
-            .write_search_entries_page_timed(tenant, resources, stats)
-            .await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
         // `capture_walk_logs`/`walk_log_lines` install ONE global subscriber
         // and ONE global buffer for the whole `mongodb_tests` binary, so
         // filtering on the message alone would also match every other walk's
@@ -1683,12 +1862,20 @@ impl ReindexTarget for PhaseLogProbeTarget {
         // this run's lines (walk lines log `tenant = %tenant_id`, which the
         // test log capture prints unquoted as `tenant=<id>`) (#1403).
         let tenant_needle = format!("tenant={}", tenant.tenant_id().as_str());
-        if !super::reindex_id_walk::walk_log_lines(&[
-            "mongodb reindex id phase finished",
-            &tenant_needle,
-        ])
-        .is_empty()
-        {
+        let transition_lines = || {
+            super::reindex_id_walk::walk_log_lines(&[
+                "mongodb reindex id phase finished",
+                &tenant_needle,
+            ])
+        };
+        let seen_before = !transition_lines().is_empty();
+        let result = self
+            .backend
+            .write_search_entries_page_timed(tenant, resources, stats)
+            .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let seen_after = !transition_lines().is_empty();
+        if seen_after && !seen_before {
             self.saw_transition_early
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
@@ -1703,7 +1890,15 @@ impl ReindexTarget for PhaseLogProbeTarget {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mongodb_integration_reindex_prefetch_logs_id_phase_finished_after_the_last_id_page_is_written()
  {
-    let Some(backend) = create_id_phase_backend("reindex_prefetch_logs_id_phase_finished").await
+    // Sets `reindex_prefetch` explicitly rather than relying on
+    // `create_id_phase_backend`'s default: prefetch is on by default today,
+    // but this test specifically exercises the prefetch path, so it must not
+    // start passing on the serial path if that default ever changes (#1403).
+    let Some(backend) = create_backend_with("reindex_prefetch_logs_id_phase_finished", |c| {
+        c.reindex_catch_up_margin_ms = 1_000;
+        c.reindex_prefetch = true;
+    })
+    .await
     else {
         eprintln!(
             "Skipping mongodb_integration_reindex_prefetch_logs_id_phase_finished_after_the_last_id_page_is_written (requires Docker)"
@@ -1725,9 +1920,6 @@ async fn mongodb_integration_reindex_prefetch_logs_id_phase_finished_after_the_l
     }
     settle_into_id_phase().await;
 
-    // `capture_walk_logs` returns `()`; binding it (`let _capture = ..`) is a
-    // unit value binding, which clippy's `let_unit_value` rejects under
-    // `-D warnings`. Call it as a plain statement instead.
     super::reindex_id_walk::capture_walk_logs();
     let saw_transition_early = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let probe = Arc::new(PhaseLogProbeTarget {

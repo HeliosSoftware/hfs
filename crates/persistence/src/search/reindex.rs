@@ -2530,7 +2530,10 @@ fn log_page(
 }
 
 /// A page fetch running ahead of the page being written. Dropping it aborts
-/// the fetch, so a run that stops never leaves one behind (#1403).
+/// the client-side future at its next yield point, so a run that stops does
+/// not keep polling a fetch it no longer needs — though a request the driver
+/// has already sent still runs to completion on the storage backend
+/// (#1403).
 struct PrefetchedPage {
     handle: tokio::task::JoinHandle<(StorageResult<Option<ResourcePage>>, Duration)>,
 }
@@ -5079,9 +5082,12 @@ mod tests {
 
     /// The 1-based page number a `PrefetchingSource` resource id encodes: the
     /// numeric suffix of its id, plus one (`"p3"` -> page 4). Every fixture in
-    /// this test module uses ids of the form `{letters}{digits}`, one page per
-    /// resource, or a fixed-size page per type, so this always agrees with
-    /// [`PrefetchingSource::page_number`]'s cursor-derived numbering (#1403).
+    /// this test module uses ids of the form `{letters}{digits}`, but this
+    /// only agrees with [`PrefetchingSource::page_number`]'s cursor-derived
+    /// numbering when every page in the fixture holds the same fixed size: a
+    /// fixture like `[["p0","p1"],["p2"]]` does not, because `p2`'s digit
+    /// gives page 3 while the cursor puts it on page 2. A test built on a
+    /// mixed-size fixture must not assume the two numberings match (#1403).
     fn resource_page_number(id: &str) -> usize {
         let digits: String = id.chars().skip_while(|c| !c.is_ascii_digit()).collect();
         digits.parse::<usize>().map(|n| n + 1).unwrap_or(0)
@@ -5266,7 +5272,11 @@ mod tests {
         assert_eq!(progress.status, ReindexStatus::Completed);
 
         let calls = source.ahead_calls();
-        assert!(!calls.is_empty(), "expected at least one prefetched page");
+        assert_eq!(
+            calls.len(),
+            2,
+            "a 3-page run makes exactly 2 ahead calls, for pages 1 and 2: {calls:?}"
+        );
         for call in &calls {
             assert_eq!(*call, (2, 4096), "{calls:?}");
         }
@@ -5523,6 +5533,10 @@ mod tests {
         assert_eq!(progress.processed_resources, 3);
 
         let log = events.lock();
+        assert!(
+            log.contains(&PrefetchEvent::AheadDeclined("Patient".to_string(), 2)),
+            "the ahead fetch for page 2 must have run and declined: {log:?}"
+        );
         let write_end_1 = log
             .iter()
             .position(|e| matches!(e, PrefetchEvent::WriteEnd(t, 1) if t == "Patient"))

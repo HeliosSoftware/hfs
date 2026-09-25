@@ -167,11 +167,16 @@ pub(super) fn resolve_prepare_width(configured: usize) -> usize {
     }
 }
 
-/// Whether `block_in_place` is legal on this thread: only inside a
-/// multi-thread Tokio runtime. Mirrors PostgreSQL's reindex prepare path;
-/// kept as MongoDB's own copy because this backend's extraction also needs
-/// `block_in_place` for the serial (non-pooled) path and a configurable
-/// prepare width, which PostgreSQL's reindex path does not.
+/// Whether this thread is running a multi-thread Tokio runtime, which is
+/// what lets `block_in_place` hand this worker's run queue to another worker
+/// instead of just blocking it. `block_in_place` panics only on a
+/// current-thread runtime; called with no runtime running at all, it just
+/// runs its closure inline — this backend never calls it in that case, since
+/// it always gates the pooled extraction path behind this check first.
+/// Mirrors PostgreSQL's reindex prepare path; kept as MongoDB's own copy
+/// because this backend's extraction also needs `block_in_place` for the
+/// serial (non-pooled) path and a configurable prepare width, which
+/// PostgreSQL's reindex path does not.
 pub(super) fn tokio_multi_thread_runtime() -> bool {
     tokio::runtime::Handle::try_current().is_ok_and(|handle| {
         matches!(
@@ -198,8 +203,9 @@ impl SubBatchDocs {
 
 /// Moves sub-batch `[start, start + prepared.len())`'s extracted documents
 /// into one [`SubBatchDocs`], recording each resource's extraction failure
-/// and document count at its **page-wide** index, and moving (never cloning)
-/// its documents so each one is written exactly once (#1403).
+/// and document count at its **page-wide** index. Moves (never clones) its
+/// documents, since each one is only needed here and copying it would be
+/// wasted work (#1403).
 fn flatten_sub_batch(
     start: usize,
     prepared: Vec<(SearchIndexDocuments, Option<String>)>,
@@ -370,9 +376,12 @@ async fn join_insert(
     }
 }
 
-/// Records perf-phase durations and the inserted-document count for one
-/// *successful* page — both writers call this only after every delete and
-/// insert has succeeded, never on a page-level failure (#1403).
+/// Records perf-phase durations and the inserted-document count for one page
+/// whose delete and insert commands all completed without a page-level
+/// error — both writers call this only then, never after a page-level
+/// failure. Individual resources can still show up as extraction or insert
+/// failures in the page's own returned outcomes; those per-resource
+/// failures do not stop this call (#1403).
 fn record_page_perf(stats: &ReindexPageStats, db_wait: Duration, docs: u64) {
     crate::perf::record_duration(crate::perf::Phase::ReindexExtract, stats.extract);
     crate::perf::record_duration(crate::perf::Phase::ReindexSearchDelete, stats.delete);
@@ -381,10 +390,12 @@ fn record_page_perf(stats: &ReindexPageStats, db_wait: Duration, docs: u64) {
     crate::perf::add_rows(crate::perf::Phase::ReindexSearchInsert, docs);
 }
 
-/// A spawned task aborted, not just dropped, when this wrapper goes away — so
-/// a run that stops mid-page (cancellation, a timeout on the composite ingest
-/// sink) never leaves an orphaned delete or insert running against the
-/// database (#1403).
+/// Aborts the spawned task, rather than merely dropping its handle, when this
+/// wrapper goes away, so a run that stops mid-page (cancellation, a timeout
+/// on the composite ingest sink) does not keep polling a delete or insert it
+/// no longer needs. `abort()` only cancels the future client-side, at its
+/// next yield point: a command the driver has already sent still runs to
+/// completion on the MongoDB server (#1403).
 pub(super) struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
 
 impl<T: Send + 'static> AbortOnDrop<T> {
@@ -404,6 +415,12 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
+/// Deletes a page's stale rows from both `search_index` and
+/// `search_index_contained`: one `delete_many` per resource type in the page
+/// (from `filters`), per collection. Runs before any insert is spawned for
+/// the page. A delete failure reports `Err` for the whole page — the caller
+/// cannot tell which resources' rows the delete would have reached, so it
+/// fans that failure out to every resource rather than guessing (#1403).
 async fn delete_page(
     own: mongodb::Collection<Document>,
     contained: mongodb::Collection<Document>,
@@ -442,6 +459,13 @@ async fn delete_page(
     }
 }
 
+/// Inserts one sub-batch's extracted documents: `docs.own` into `own`
+/// (`search_index`), then, if any, `docs.contained` into `contained`
+/// (`search_index_contained`), each via
+/// [`super::storage::insert_search_entries_chunk`]. A page-level error from
+/// either insert returns as `Err` immediately, without attempting the other
+/// collection; per-document write errors instead come back as
+/// [`InsertFailures`], attributable to individual resources (#1403).
 async fn insert_sub_batch(
     own: mongodb::Collection<Document>,
     contained: mongodb::Collection<Document>,
@@ -908,14 +932,24 @@ mod tests {
 
     #[test]
     fn page_outcomes_prefers_extract_then_insert_failures() {
-        let extract_failures = vec![Some("extract failed".to_string()), None, None];
+        let extract_failures = vec![
+            Some("extract failed".to_string()),
+            None,
+            None,
+            Some("extract failed too".to_string()),
+        ];
         let mut insert_failures = HashMap::new();
         insert_failures.insert(1, "insert failed".to_string());
-        let doc_counts = vec![0, 0, 4];
+        // Index 3 has both an extraction and an insert failure, so this
+        // proves precedence rather than just index 0 having no insert
+        // failure to prefer over.
+        insert_failures.insert(3, "insert failed too".to_string());
+        let doc_counts = vec![0, 0, 4, 0];
         let outcomes = page_outcomes(extract_failures, insert_failures, &doc_counts);
         assert!(matches!(&outcomes[0], Err(e) if e.to_string().contains("extract failed")));
         assert!(matches!(&outcomes[1], Err(e) if e.to_string().contains("insert failed")));
         assert!(matches!(outcomes[2], Ok(4)));
+        assert!(matches!(&outcomes[3], Err(e) if e.to_string().contains("extract failed too")));
     }
 
     #[test]

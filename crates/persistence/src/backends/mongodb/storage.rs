@@ -4863,11 +4863,13 @@ impl MongoBackend {
     /// Runs only the id-phase continuation query, for both the serial walk
     /// and the driver's ahead-of-time prefetch — so both paths build the same
     /// page from the same query (#1403). `Ok(None)` means the id phase is
-    /// over; it logs nothing else in that case, per
+    /// over; it logs nothing at all in that case (the empty check runs
+    /// before the capped-page debug line, so that line is never emitted for
+    /// an empty read, by either caller), per
     /// [`ReindexSource::fetch_resources_page_ahead`]'s doc contract that a
-    /// source must not log or change state when it returns `Ok(None)`,
-    /// leaving the capped-page debug line and the phase transition to
-    /// whichever caller runs the query when it is *not* prefetched.
+    /// source must not log or change state when it returns `Ok(None)`. The
+    /// phase transition itself is left to whichever caller runs the query
+    /// when it is *not* prefetched.
     async fn reindex_id_page(
         &self,
         tenant: &TenantContext,
@@ -5263,12 +5265,16 @@ impl ReindexSource for MongoBackend {
     }
 
     /// Only an id-phase continuation cursor may run ahead of the write in
-    /// flight (#1403): its query reads live resources stamped strictly
-    /// before a floor fixed when the walk started, so it observes nothing
-    /// the page being written could change. A catch-up round instead reads
-    /// up to "now", so running it early could race the very writes it is
-    /// meant to pick up; a cursor that fails to parse is rejected the same
-    /// way. `reindex_prefetch` and search offload gate it off entirely.
+    /// flight (#1403): its query reads the `resources` collection, which the
+    /// page being written never touches (only `search_index` and
+    /// `search_index_contained` do), so prefetching it changes nothing the
+    /// write could observe. A catch-up round's query instead reads up to a
+    /// ceiling fixed when the round started, not "now" — but prefetching a
+    /// round page before the previous page's write has ended could still let
+    /// a write that lands between the two reads be missed by both the
+    /// current round and the next one, so rounds are excluded too. A cursor
+    /// that fails to parse is rejected the same way. `reindex_prefetch` and
+    /// search offload gate all of this off entirely.
     fn may_prefetch_page(&self, cursor: &str) -> bool {
         self.config().reindex_prefetch
             && !self.is_search_offloaded()
@@ -5440,16 +5446,20 @@ impl ReindexTarget for MongoBackend {
     ///
     /// A page of `REINDEX_SUBBATCH_FIRST` resources or fewer, and every page
     /// on a current-thread runtime, always runs through the serial writer:
-    /// one delete, then one insert. There the fan-out above really does mean
-    /// nothing was written for anybody, because the delete completes fully
-    /// before the single insert starts. A larger page on a multi-thread
-    /// runtime with the overlap configuration on instead runs through the
-    /// overlapped writer, which splits the page into several sub-batches and
-    /// inserts one while extracting the next; there, a sub-batch insert
-    /// failure still reports `Err` for every resource in the page, but rows
-    /// the earlier, already-completed sub-batches inserted remain in the
-    /// database — only the failed sub-batch and the ones after it end up
-    /// with no rows.
+    /// one delete phase, then one insert phase (own rows, then contained
+    /// rows, each chunked into `SEARCH_INDEX_INSERT_CHUNK`-sized `insert_many`
+    /// commands). The delete completes fully before the insert phase starts,
+    /// but a chunked insert can still leave some rows behind even when it
+    /// goes on to fail: a chunk that already committed keeps its rows: only
+    /// the chunk that actually errored, and any chunk after it, ends up with
+    /// none. A larger page on a multi-thread runtime with the overlap
+    /// configuration on instead runs through the overlapped writer, which
+    /// splits the page into several sub-batches and inserts one while
+    /// extracting the next; there too, a sub-batch insert failure reports
+    /// `Err` for every resource in the page, but rows the earlier,
+    /// already-completed sub-batches — and any chunk of the failing
+    /// sub-batch that committed before the failure — inserted remain in the
+    /// database.
     async fn write_search_entries_page_timed(
         &self,
         tenant: &TenantContext,
@@ -5460,6 +5470,9 @@ impl ReindexTarget for MongoBackend {
             return Vec::new();
         }
         let _page_span = crate::perf::span(crate::perf::Phase::ReindexPage);
+        // Honors `is_search_offloaded()`: when Elasticsearch owns search,
+        // this backend keeps no index of its own, so there is nothing to
+        // delete or insert and every resource reports 0 entries written.
         if self.is_search_offloaded() {
             return resources.iter().map(|_| Ok(0)).collect();
         }
@@ -5503,21 +5516,21 @@ impl ReindexTarget for MongoBackend {
     }
 }
 
-/// Documents per `insert_many` when [`MongoBackend`]'s
-/// [`ReindexTarget::write_search_entries_page`] flattens a page's index
-/// documents into one insert. Mirrors `bulk_ingest.rs`'s
-/// `INSERT_DOCS_PER_COMMAND` (same value, same rationale: bound how much the
-/// driver serializes per command) without depending on that module, since a
-/// page's `search_index` documents are built the same way a batch's are.
+/// Documents per `insert_many` when the serial or overlapped writer's
+/// `insert_sub_batch` flattens a sub-batch's index documents into one
+/// insert. Mirrors `bulk_ingest.rs`'s `INSERT_DOCS_PER_COMMAND` (same value,
+/// same rationale: bound how much the driver serializes per command) without
+/// depending on that module, since a sub-batch's `search_index` documents
+/// are built the same way a batch's are.
 pub(super) const SEARCH_INDEX_INSERT_CHUNK: usize = 5_000;
 
 /// Chunked, unordered `insert_many` of `docs` into `collection`, attributing
 /// each document to the resource index at the same position in `owners`.
 ///
-/// Used by [`MongoBackend::write_search_entries_page`] once per destination
-/// collection (`search_index` for a page's own rows, `search_index_contained`
-/// for its contained rows) so a failed contained insert attributes back to
-/// its resource exactly like a failed own insert.
+/// Called by `insert_sub_batch` once per destination collection
+/// (`search_index` for a sub-batch's own rows, `search_index_contained` for
+/// its contained rows, if any) so a failed contained insert attributes back
+/// to its resource exactly like a failed own insert.
 ///
 /// Returns the per-resource write failures found, each message already
 /// carrying `error_context` (so a `search_index_contained` failure reads as
