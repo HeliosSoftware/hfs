@@ -500,6 +500,10 @@ editor-save = Guardar cambios
 editor-delete = Eliminar
 editor-remove = Quitar este nodo
 editor-saved = Guardado.
+# Shared unsaved-changes tracker (#1240): the pill next to a Save button and
+# the confirm shown for in-page closes (a modal, an addbox disclosure).
+unsaved-changes = Cambios sin guardar
+unsaved-discard-confirm = Hay cambios sin guardar. ¿Descartarlos y cerrar?
 editor-load-error = No se pudo cargar ese recurso.
 editor-confirm-delete = ¿Eliminar este recurso? No se puede deshacer.
 editor-invalid-json = Eso no es JSON válido, así que no puede editarse como formulario. Tu texto queda intacto.

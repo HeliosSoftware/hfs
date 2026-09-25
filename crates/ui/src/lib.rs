@@ -9395,6 +9395,13 @@ mod tests {
         assert!(Assets::get("logo.png").is_some());
     }
 
+    /// #1240: the shared unsaved-changes tracker (`window.HfsUnsaved`),
+    /// loaded from the layout like every other shared helper.
+    #[test]
+    fn unsaved_helper_is_embedded() {
+        assert!(Assets::get("unsaved.js").is_some());
+    }
+
     /// #753: the CodeMirror 6 + lezer-fhirpath vendoring ritual's
     /// one committed output (`crates/ui/vendor/codemirror/README.md`) is
     /// embedded exactly like any other subfolder asset — `assets/fonts/` is

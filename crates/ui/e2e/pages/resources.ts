@@ -4,6 +4,7 @@
 import type { Page, Locator } from "@playwright/test";
 import { Editor } from "./editor";
 import { SearchBuilder, SearchResults } from "./search-builder";
+import { armDialog, disarmDialog } from "./fixtures";
 
 export class ResourcesPage {
   readonly modal: ResourceModal;
@@ -116,6 +117,10 @@ export class ResourceModal {
   get deleteButton(): Locator {
     return this.page.locator("#resource-delete");
   }
+  /** The "Unsaved changes" pill next to Save/Delete/× (#1240). */
+  get unsavedCue(): Locator {
+    return this.page.locator("#resource-modal .tag--unsaved");
+  }
 
   tab(name: "edit" | "history"): Locator {
     return this.page.locator(`[data-modal-tab='${name}']`);
@@ -128,14 +133,22 @@ export class ResourceModal {
   }
 
   async close(): Promise<void> {
+    // Closing with unsaved changes asks a native confirm (#1240); arm
+    // "accept" so this helper keeps closing the modal unconditionally, as it
+    // did before that guard existed. A no-op when the modal is clean — no
+    // dialog fires, and the armed action is cleared right after anyway.
+    armDialog(this.page, "accept");
     // The × button, not the backdrop (which sits behind the editor grid).
     await this.page.locator(".modal__x").click();
     await this.root.waitFor({ state: "hidden" });
+    disarmDialog(this.page);
   }
 
   async closeWithEscape(): Promise<void> {
+    armDialog(this.page, "accept");
     await this.page.keyboard.press("Escape");
     await this.root.waitFor({ state: "hidden" });
+    disarmDialog(this.page);
   }
 
   async save(): Promise<void> {
