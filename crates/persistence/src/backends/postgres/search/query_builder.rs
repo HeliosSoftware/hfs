@@ -19,6 +19,9 @@ use crate::types::{
     SearchPrefix, SearchQuery, SearchValue, strip_reference_version,
 };
 
+// Keep generated SQL and bind counts small well before PostgreSQL's 65,535-parameter limit.
+const LARGE_ID_SET_THRESHOLD: usize = 1_000;
+
 /// Returns the implicit precision of a decimal search value from its string form
 /// (e.g. `"100"` → 1.0, `"100.0"` → 0.1), used to build `eq` ranges.
 fn quantity_implicit_precision(num_str: &str) -> f64 {
@@ -629,6 +632,8 @@ pub struct SqlFragment {
 pub enum SqlParam {
     /// Text parameter.
     Text(String),
+    /// Array of text values for large id sets.
+    TextArray(Vec<String>),
     /// Floating point parameter.
     Float(f64),
     /// Integer parameter.
@@ -1574,11 +1579,30 @@ impl PostgresQueryBuilder {
     ///
     /// A single value composes to `id = $n` (or `id <> $n` when negated).
     /// Several values compose to the flat predicates `id IN ($n, $m, ...)`
-    /// or `id NOT IN ($n, $m, ...)`, avoiding a left-deep `OR` tree that can
-    /// exhaust PostgreSQL's parser memory for wide chain-resolution rewrites.
+    /// or `id NOT IN ($n, $m, ...)`, avoiding a left-deep `OR` tree. Wide sets
+    /// use one `text[]` bind to stay within PostgreSQL's parameter limit.
     fn build_id_condition(param: &SearchParameter, offset: usize) -> Option<SqlFragment> {
         if param.values.is_empty() {
             return None;
+        }
+
+        // PostgreSQL limits bind parameters to 65,535. A resolved chain may
+        // contain more ids, so send wide sets in one typed array parameter.
+        if param.values.len() > LARGE_ID_SET_THRESHOLD {
+            let ids = param
+                .values
+                .iter()
+                .map(|value| value.value.clone())
+                .collect();
+            let sql = if matches!(param.modifier, Some(SearchModifier::Not)) {
+                format!("id <> ALL(${}::text[])", offset + 1)
+            } else {
+                format!("id = ANY(${}::text[])", offset + 1)
+            };
+            return Some(SqlFragment::with_params(
+                sql,
+                vec![SqlParam::TextArray(ids)],
+            ));
         }
 
         if matches!(param.modifier, Some(SearchModifier::Not)) {
@@ -2034,10 +2058,17 @@ impl PostgresQueryBuilder {
     fn token_value_predicate(value: &SearchValue, next: &mut usize) -> (String, Vec<SqlParam>) {
         if let Some((system, code)) = value.value.split_once('|') {
             if system.is_empty() {
-                // |code - match any system
+                // |code - match code with no system (#1388). A `code`
+                // element has no system property either; its row carries
+                // the marker (#1379). Same set as the SQLite, Elasticsearch
+                // and chain builders.
                 *next += 1;
                 (
-                    format!("value_token_code = ${}", next),
+                    format!(
+                        "((value_token_system IS NULL OR value_token_system IN ('', '{}')) \
+                         AND value_token_code = ${})",
+                        IMPLICIT_TOKEN_SYSTEM, next
+                    ),
                     vec![SqlParam::text(code)],
                 )
             } else if code.is_empty() {
@@ -2577,7 +2608,13 @@ impl PostgresQueryBuilder {
                 if let Some((system, code)) = value.value.split_once('|') {
                     if system.is_empty() {
                         Some((
-                            format!("{token_code} = ${}", offset + 1),
+                            // No system, or the marker of a `code` component
+                            // (#1388); see `token_value_predicate`.
+                            format!(
+                                "({token_system} IS NULL OR {token_system} IN ('', '{IMPLICIT_TOKEN_SYSTEM}')) \
+                                 AND {token_code} = ${}",
+                                offset + 1
+                            ),
                             vec![SqlParam::text(code)],
                         ))
                     } else if code.is_empty() {
@@ -6457,6 +6494,83 @@ mod tests {
         assert!(!pred.contains("value_token_system"));
     }
 
+    /// `|code` means "the code, with no system" (#1388), not "any system". A
+    /// `code` element's row carries the implicit marker (#1379) and has no
+    /// explicit system either, so it counts as "no system" too.
+    #[test]
+    fn empty_system_token_requires_no_system() {
+        let query =
+            SearchQuery::new("Observation").with_parameter(token_param("code", None, "|1234-5"));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("token condition");
+
+        let pred = PostgresQueryBuilder::single_index_predicate(&frag.sql)
+            .expect("a lone membership test is extractable");
+        assert_eq!(
+            pred,
+            format!(
+                "param_name = 'code' AND (((value_token_system IS NULL \
+                 OR value_token_system IN ('', '{IMPLICIT_TOKEN_SYSTEM}')) \
+                 AND value_token_code = $3))"
+            )
+        );
+        assert_eq!(frag.params.len(), 1);
+        match &frag.params[0] {
+            SqlParam::Text(code) => assert_eq!(code, "1234-5"),
+            other => panic!("expected a text param, got {:?}", other),
+        }
+    }
+
+    /// `:not` stays the exact negation of the positive `|code` predicate.
+    #[test]
+    fn not_empty_system_token_negates_the_no_system_predicate() {
+        let positive = PostgresQueryBuilder::build_search_query(
+            &SearchQuery::new("Observation").with_parameter(token_param("code", None, "|1234-5")),
+            2,
+        )
+        .expect("token condition");
+        let negated = PostgresQueryBuilder::build_search_query(
+            &SearchQuery::new("Observation").with_parameter(token_param(
+                "code",
+                Some(SearchModifier::Not),
+                "|1234-5",
+            )),
+            2,
+        )
+        .expect("token condition");
+
+        assert_eq!(negated.sql, format!("NOT ({})", positive.sql));
+        assert_eq!(negated.params.len(), 1);
+    }
+
+    /// The composite component builder (also used by contained-resource
+    /// search) gives `|code` the same "no system" meaning, in either slot.
+    #[test]
+    fn composite_empty_system_component_requires_no_system() {
+        let value = SearchValue::new(SearchPrefix::Eq, "|1234-5");
+        let (sql, params) =
+            PostgresQueryBuilder::build_composite_component(&value, SearchParamType::Token, 4, 1)
+                .expect("a token component");
+        assert_eq!(
+            sql,
+            format!(
+                "(value_token_system IS NULL OR value_token_system IN ('', '{IMPLICIT_TOKEN_SYSTEM}')) \
+                 AND value_token_code = $5"
+            )
+        );
+        assert_eq!(params.len(), 1);
+
+        let (sql, _) =
+            PostgresQueryBuilder::build_composite_component(&value, SearchParamType::Token, 4, 2)
+                .expect("a token component");
+        assert_eq!(
+            sql,
+            format!(
+                "(value_token_system_2 IS NULL OR value_token_system_2 IN ('', '{IMPLICIT_TOKEN_SYSTEM}')) \
+                 AND value_token_code_2 = $5"
+            )
+        );
+    }
+
     /// v31 replaced `idx_search_token` (2,283 MB, system-first, and unable to
     /// give this shape the sort key because `value_token_code` sat between the
     /// system and `last_updated`) with a seek-only `idx_search_token_system`;
@@ -6959,6 +7073,30 @@ mod tests {
         assert_eq!(fragment.sql, "id = $3");
         assert_eq!(fragment.params.len(), 1);
         assert_eq!(id_param_text(&fragment.params[0]), "a");
+    }
+
+    #[test]
+    fn large_id_set_uses_one_array_bind() {
+        let values: Vec<SearchValue> = (0..65_536)
+            .map(|i| SearchValue::eq(format!("id-{i}")))
+            .collect();
+        for (modifier, expected_sql) in [
+            (None, "id = ANY($3::text[])"),
+            (Some(SearchModifier::Not), "id <> ALL($3::text[])"),
+        ] {
+            let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+                name: "_id".to_string(),
+                param_type: SearchParamType::Token,
+                modifier,
+                values: values.clone(),
+                ..Default::default()
+            });
+            let fragment = PostgresQueryBuilder::build_search_query(&query, 2).unwrap();
+            assert_eq!(fragment.sql, expected_sql);
+            assert!(
+                matches!(fragment.params.as_slice(), [SqlParam::TextArray(ids)] if ids.len() == 65_536 && ids[65_535] == "id-65535")
+            );
+        }
     }
 
     #[test]

@@ -3352,7 +3352,19 @@ impl MongoBackend {
 
         if let Some((system, code)) = value.value.split_once('|') {
             if system.is_empty() {
-                Ok(doc! { "value_token_code": code })
+                // |code - match code with no system (#1388). An absent field
+                // matches `null`; a `code` element has no system property
+                // either, and its row carries the marker (#1379).
+                Ok(doc! {
+                    "value_token_system": {
+                        "$in": [
+                            Bson::Null,
+                            Bson::String(String::new()),
+                            crate::search::IMPLICIT_TOKEN_SYSTEM,
+                        ]
+                    },
+                    "value_token_code": code,
+                })
             } else if code.is_empty() {
                 Ok(doc! { "value_token_system": system })
             } else {
@@ -6959,6 +6971,42 @@ mod modifier_parity_filter_tests {
                 "value_token_system": { "$in": [Bson::Null, Bson::String(String::new())] },
                 "value_token_code": "12345",
             }
+        );
+    }
+
+    /// `|code` means "no system" (#1388): absent, empty, or the implicit
+    /// marker of a `code` element — never any system, as a bare `code` does.
+    #[test]
+    fn token_without_system_matches_only_rows_without_one() {
+        let backend = MongoBackend::new(MongoBackendConfig::default()).unwrap();
+        let param = SearchParameter {
+            name: "code".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![],
+            chain: vec![],
+            components: vec![],
+        };
+        assert_eq!(
+            backend
+                .build_token_filter(&param, &SearchValue::eq("|1234-5"))
+                .unwrap(),
+            doc! {
+                "value_token_system": {
+                    "$in": [
+                        Bson::Null,
+                        Bson::String(String::new()),
+                        crate::search::IMPLICIT_TOKEN_SYSTEM,
+                    ]
+                },
+                "value_token_code": "1234-5",
+            }
+        );
+        assert_eq!(
+            backend
+                .build_token_filter(&param, &SearchValue::eq("1234-5"))
+                .unwrap(),
+            doc! { "value_token_code": "1234-5" }
         );
     }
 

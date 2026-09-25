@@ -18,6 +18,20 @@ use helios_persistence::core::{
 use helios_persistence::error::{ResourceError, StorageError};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 
+#[path = "search/large_id_set_suite.rs"]
+mod large_id_set_suite;
+
+#[tokio::test]
+async fn sqlite_large_id_set_search_count_cursor_not_and_tenant() {
+    let backend = create_backend();
+    large_id_set_suite::large_id_set_search_count_cursor_not_and_tenant(
+        &backend,
+        "large-id-set-sqlite",
+    )
+    .await;
+    large_id_set_suite::wide_chain_and_nested_has(&backend, "wide-chain-sqlite").await;
+}
+
 /// The backend-agnostic conditional-criteria suite (#1312). `#[path]` resolves
 /// relative to this file, the same arrangement the other backends' binaries
 /// use for their shared suites.

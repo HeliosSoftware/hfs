@@ -429,7 +429,6 @@ async fn test_system_qualified_tokens_match_code_elements() {
     super::token_code_system_suite::system_qualified_tokens_match_code_elements(
         &backend,
         "token-code-system",
-        true,
     )
     .await;
 }
