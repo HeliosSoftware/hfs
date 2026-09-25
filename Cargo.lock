@@ -3655,6 +3655,7 @@ dependencies = [
  "form_urlencoded",
  "futures",
  "helios-audit",
+ "helios-auth",
  "helios-fhir",
  "helios-fhirpath",
  "helios-fhirpath-support",
