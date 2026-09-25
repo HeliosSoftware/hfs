@@ -70,11 +70,11 @@ part of T4.
 | Rust 1.90+ (edition 2024), `cargo` | build |
 | Python 3 with dev headers, `maturin` not required | `--workspace` includes `pysof` (PyO3 cdylib); the build needs a Python interpreter on `PATH` |
 | Docker | Postgres, Elasticsearch, MongoDB, MinIO |
-| `curl`, `jq` | T1 smoke check, the corpus checks in 7.1, the Elasticsearch counts in 7.5, trimming the import manifest |
-| `tar`, `python3` | unpack the corpora; `python3` runs the T8 webhook receiver, not the corpus server (7.1) |
-| An HTTP/1.1 keep-alive static file server | serves the corpus to the Import page in T3 unless the hosted manifest is used (7.1); `nginx:alpine` in Docker is enough |
+| `curl`, `jq` | T1 smoke check; T3 corpus and count checks (7.1, 7.5); `jq` optionally trims the import manifest in T3 |
+| `tar`, `python3` | unpack the corpora; `python3` runs the webhook receiver in T8 (not the corpus server, see 7.1) |
+| HTTP/1.1 keep-alive static server | serves the corpus to the Import page in T3 (7.1); `nginx:alpine` in Docker works |
 | ~45 GB free disk | corpus (3.6 GB tar.gz, 35 GB extracted) plus SQLite/Postgres data; the corpus share is not needed when T3 uses the hosted manifest (7.1) |
-| ≥ 16 GB RAM on `*-es` rows | T3 gives Elasticsearch an 8 GB heap (section 4) |
+| ≥ 16 GB RAM on `*-es` rows | 8 GB Elasticsearch heap (section 4) |
 | A modern browser with JavaScript on | every step from T2 on runs in `/ui`; the Batch / Transaction page needs JavaScript |
 
 Shell conventions used below:
@@ -136,8 +136,8 @@ Pass criteria: build exits 0; `hfs --help` prints usage.
 ## 4. Backend infrastructure
 
 Start only what the row under test needs. Ports below are the ones the start
-commands in section 5 assume. The images match CI's; the Elasticsearch heap does
-not, because T3 does not fit in CI's.
+commands in section 5 assume. These match the images CI uses, except the
+Elasticsearch heap, which is sized for T3.
 
 ```bash
 # PostgreSQL 16 (postgres, pg-es)
@@ -145,8 +145,7 @@ docker run -d --name hfs-pg -p 5432:5432 \
   -e POSTGRES_USER=helios -e POSTGRES_PASSWORD=helios -e POSTGRES_DB=helios postgres:16
 
 # Elasticsearch 8.15.0 (any *-es composite)
-# T3 settings: 8 GB heap (1 GiB is sized for T2), and a named volume so
-# `docker rm -fv` does not discard an index that cost 19M resources to build.
+# T3: 8 GB heap and a named volume (survives `docker rm -fv`)
 docker volume create hfs-es-data
 docker run -d --name hfs-es -p 9200:9200 \
   -e discovery.type=single-node -e xpack.security.enabled=false \
@@ -182,9 +181,8 @@ On a host with less than 16 GB of RAM use `-Xms4g -Xmx4g` and record the deviati
 
 Reset between backend rows: `docker rm -fv hfs-pg hfs-es hfs-mongo hfs-minio` and
 recreate. For SQLite delete `data/hfs.db*` and `data/bulk_export.db*`; on every
-backend also delete `data/submit` (bulk-import status artifacts). `-v` does **not**
-remove the named `hfs-es-data`, so the index survives a container recreate; discard
-it with `docker volume rm hfs-es-data` once the container is gone.
+backend also delete `data/submit` (bulk-import status artifacts). `hfs-es-data` survives
+`docker rm -fv`; for a clean index also run `docker volume rm hfs-es-data`.
 
 ### 4.1 Elasticsearch preparation for `*-es` rows
 
