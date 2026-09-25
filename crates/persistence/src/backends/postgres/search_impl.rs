@@ -578,6 +578,125 @@ impl SearchProvider for PostgresBackend {
         self.search_with_client(&client, tenant, query, total).await
     }
 
+    async fn search_ids(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<Page<String>> {
+        let cursor = query
+            .cursor
+            .as_ref()
+            .and_then(|value| PageCursor::decode(value).ok());
+        if !query.sort.is_empty()
+            || query.offset.is_some()
+            || query.contained != crate::types::ContainedMode::Off
+            || !query.includes.is_empty()
+            || query.total.is_some()
+            || query.summary.is_some()
+            || !query.elements.is_empty()
+            || query.compartment.is_some()
+            || !query.list.is_empty()
+            || !query.reverse_chains.is_empty()
+            || (query.cursor.is_some() && cursor.is_none())
+            || cursor
+                .as_ref()
+                .is_some_and(|value| value.direction() != CursorDirection::Next)
+        {
+            return Ok(self
+                .search(tenant, query)
+                .await?
+                .resources
+                .map(|resource| resource.id().to_string()));
+        }
+
+        reject_contained_missing(query)?;
+        reject_unsupported_metadata_modifier(query)?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let resource_type = &query.resource_type;
+        let param_offset = if cursor.is_some() { 4 } else { 2 };
+        let search_filter = if !query.parameters.is_empty() {
+            PostgresQueryBuilder::build_search_query_for(query, param_offset, self.index_layout())
+        } else {
+            None
+        };
+        let filter_clause = search_filter
+            .as_ref()
+            .map(|fragment| format!(" AND ({})", fragment.sql))
+            .unwrap_or_default();
+        let search_params = search_filter
+            .map(|fragment| fragment.params)
+            .unwrap_or_default();
+        let cursor_clause = if cursor.is_some() {
+            " AND (last_updated < $3 OR (last_updated = $3 AND id > $4))"
+        } else {
+            ""
+        };
+        let count = query.count.unwrap_or(100) as usize;
+        let sql = format!(
+            "SELECT id, last_updated FROM resources \
+             WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{filter_clause}{cursor_clause} \
+             ORDER BY last_updated DESC, id ASC LIMIT {}",
+            count + 1
+        );
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
+            Box::new(tenant_id.to_string()),
+            Box::new(resource_type.to_string()),
+        ];
+        if let Some(cursor) = &cursor {
+            Self::bind_cursor_value(&mut params, SortValueKind::Timestamp, cursor)?;
+            params.push(Box::new(cursor.resource_id().to_string()));
+        }
+        for param in &search_params {
+            match param {
+                SqlParam::Text(value) => params.push(Box::new(value.clone())),
+                SqlParam::Float(value) => params.push(Box::new(*value)),
+                SqlParam::Integer(value) => params.push(Box::new(*value)),
+                SqlParam::Bool(value) => params.push(Box::new(*value)),
+                SqlParam::Timestamp(value) => params.push(Box::new(*value)),
+                SqlParam::Null => params.push(Box::new(Option::<String>::None)),
+            }
+        }
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|param| param.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+        let client = self.get_client().await?;
+        let rows = query_dyn_cached(&client, &sql, &param_refs)
+            .await
+            .or_query_error("Failed to execute id-only search")?;
+        let mut rows: Vec<(String, chrono::DateTime<Utc>)> =
+            rows.iter().map(|row| (row.get(0), row.get(1))).collect();
+        let has_next = rows.len() > count;
+        if has_next {
+            rows.pop();
+        }
+        let has_previous = cursor.is_some();
+        let next_cursor = if has_next {
+            rows.last().map(|(id, updated)| {
+                PageCursor::new(vec![CursorValue::String(updated.to_rfc3339())], id).encode()
+            })
+        } else {
+            None
+        };
+        let previous_cursor = if has_previous {
+            rows.first().map(|(id, updated)| {
+                PageCursor::previous(vec![CursorValue::String(updated.to_rfc3339())], id).encode()
+            })
+        } else {
+            None
+        };
+        Ok(Page::new(
+            rows.into_iter().map(|(id, _)| id).collect(),
+            PageInfo {
+                next_cursor,
+                previous_cursor,
+                total: None,
+                has_next,
+                has_previous,
+            },
+        ))
+    }
+
     async fn search_count(
         &self,
         tenant: &TenantContext,
