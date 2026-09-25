@@ -47,10 +47,10 @@ use crate::core::{
     BundleEntry, BundleProvider, BundleResult, CapabilityProvider, ChainedSearchProvider,
     ConditionalCreateResult, ConditionalDeleteResult, ConditionalStorage, ConditionalUpdateResult,
     ExportDataProvider, ExportRequest, GroupExportProvider, IncludeProvider,
-    InstanceHistoryProvider, NdjsonBatch, PatientExportProvider, PurgableStorage, ResourceStorage,
-    RevincludeProvider, SearchProvider, SearchResult, SofRunner, StorageCapabilities,
-    SystemHistoryProvider, TerminologySearchProvider, TextSearchProvider, TypeHistoryProvider,
-    VersionedStorage,
+    InstanceHistoryProvider, NdjsonBatch, PatchCandidateValidator, PatientExportProvider,
+    PurgableStorage, ResourceStorage, RevincludeProvider, SearchProvider, SearchResult, SofRunner,
+    StorageCapabilities, SystemHistoryProvider, TerminologySearchProvider, TextSearchProvider,
+    TypeHistoryProvider, VersionedStorage,
 };
 use crate::error::{BackendError, ResourceError, StorageError, StorageResult, TransactionError};
 use crate::search::ChainResolveOptions;
@@ -2040,11 +2040,12 @@ impl BundleProvider for CompositeStorage {
             .is_some_and(|p| p.supports_atomic_transactions())
     }
 
-    async fn process_transaction(
+    async fn process_transaction_with_patch_validator(
         &self,
         tenant: &TenantContext,
         entries: Vec<BundleEntry>,
         fhir_version: helios_fhir::FhirVersion,
+        validator: Option<&dyn PatchCandidateValidator>,
     ) -> Result<BundleResult, TransactionError> {
         let provider =
             self.bundle_provider
@@ -2055,7 +2056,7 @@ impl BundleProvider for CompositeStorage {
                 })?;
 
         let result = provider
-            .process_transaction(tenant, entries, fhir_version)
+            .process_transaction_with_patch_validator(tenant, entries, fhir_version, validator)
             .await?;
 
         // Sync successful entries to secondaries by reading resources from primary

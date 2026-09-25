@@ -16,9 +16,9 @@ use serde_json::Value;
 use crate::core::{
     BundleEntry, BundleEntryResult, BundleMethod, BundleProvider, BundleResult, BundleType,
     HistoryEntry, HistoryMethod, HistoryPage, HistoryParams, InstanceHistoryProvider,
-    PurgableStorage, ResourceStorage, SettingsStore, SystemHistoryProvider, TypeHistoryProvider,
-    VersionedStorage, bundle_if_match_gate, bundle_if_none_exist_gate, if_match_field_satisfied,
-    normalize_etag,
+    PatchCandidateValidator, PurgableStorage, ResourceStorage, SettingsStore,
+    SystemHistoryProvider, TypeHistoryProvider, VersionedStorage, bundle_if_match_gate,
+    bundle_if_none_exist_gate, if_match_field_satisfied, normalize_etag,
 };
 use crate::error::{
     BackendError, ConcurrencyError, QueryErrorExt, ResourceError, StorageError, StorageResult,
@@ -52,6 +52,13 @@ enum PendingSearchParameterChange {
     Create,
     Update,
     Delete,
+}
+
+/// Request context shared by every entry in one MongoDB Bundle transaction.
+struct BundleEntryContext<'a> {
+    tenant: &'a TenantContext,
+    fhir_version: helios_fhir::FhirVersion,
+    patch_validator: Option<&'a dyn PatchCandidateValidator>,
 }
 
 fn serialization_error(message: String) -> StorageError {
@@ -3424,11 +3431,12 @@ impl BundleProvider for MongoBackend {
         true
     }
 
-    async fn process_transaction(
+    async fn process_transaction_with_patch_validator(
         &self,
         tenant: &TenantContext,
         entries: Vec<BundleEntry>,
         fhir_version: helios_fhir::FhirVersion,
+        validator: Option<&dyn PatchCandidateValidator>,
     ) -> Result<BundleResult, TransactionError> {
         let db = self
             .get_database()
@@ -3441,6 +3449,7 @@ impl BundleProvider for MongoBackend {
 
         let mut results = Vec::with_capacity(entries.len());
         let mut error_info: Option<(usize, String)> = None;
+        let mut patch_error: Option<TransactionError> = None;
         let mut reference_map: HashMap<String, String> = HashMap::new();
         let mut pending_search_parameter_changes: Vec<PendingSearchParameterChange> = Vec::new();
         let mut entries = entries;
@@ -3454,9 +3463,12 @@ impl BundleProvider for MongoBackend {
                 .process_bundle_entry_transaction(
                     &db,
                     &mut session,
-                    tenant,
+                    BundleEntryContext {
+                        tenant,
+                        fhir_version,
+                        patch_validator: validator,
+                    },
                     entry,
-                    fhir_version,
                     &mut pending_search_parameter_changes,
                 )
                 .await;
@@ -3464,6 +3476,13 @@ impl BundleProvider for MongoBackend {
             match result {
                 Ok(entry_result) => {
                     if entry_result.status >= 400 {
+                        if entry.method == BundleMethod::Patch {
+                            patch_error = Some(TransactionError::PatchEntry {
+                                index: idx,
+                                status: entry_result.status,
+                                outcome: entry_result.outcome.clone().unwrap_or_default(),
+                            });
+                        }
                         error_info = Some((
                             idx,
                             format!("Entry failed with status {}", entry_result.status),
@@ -3495,7 +3514,7 @@ impl BundleProvider for MongoBackend {
 
         if let Some((index, message)) = error_info {
             let _ = session.abort_transaction().await;
-            return Err(TransactionError::BundleError { index, message });
+            return Err(patch_error.unwrap_or(TransactionError::BundleError { index, message }));
         }
 
         session
@@ -3526,11 +3545,15 @@ impl MongoBackend {
         &self,
         db: &mongodb::Database,
         session: &mut ClientSession,
-        tenant: &TenantContext,
+        context: BundleEntryContext<'_>,
         entry: &BundleEntry,
-        fhir_version: helios_fhir::FhirVersion,
         pending_search_parameter_changes: &mut Vec<PendingSearchParameterChange>,
     ) -> StorageResult<BundleEntryResult> {
+        let BundleEntryContext {
+            tenant,
+            fhir_version,
+            patch_validator: validator,
+        } = context;
         match entry.method {
             BundleMethod::Get => {
                 let (resource_type, id) = self.parse_url(&entry.url)?;
@@ -3713,13 +3736,60 @@ impl MongoBackend {
                     }
                 }
             }
-            BundleMethod::Patch => Ok(BundleEntryResult::error(
-                501,
-                serde_json::json!({
-                    "resourceType": "OperationOutcome",
-                    "issue": [{"severity": "error", "code": "not-supported", "diagnostics": "PATCH not implemented in transaction bundles"}]
-                }),
-            )),
+            BundleMethod::Patch => {
+                let (resource_type, id) = self.parse_url(&entry.url)?;
+                if resource_type == "AuditEvent" {
+                    return Ok(BundleEntryResult::error(
+                        405,
+                        serde_json::json!({
+                            "resourceType": "OperationOutcome",
+                            "issue": [{"severity": "error", "code": "not-supported", "details": {"text": "AuditEvent resources are immutable"}}]
+                        }),
+                    ));
+                }
+                let existing = self
+                    .read_resource_in_bundle_transaction(db, session, tenant, &resource_type, &id)
+                    .await?;
+                if let Some(failure) = bundle_if_match_gate(
+                    entry.if_match.as_deref(),
+                    existing.as_ref().map(|r| r.version_id()),
+                ) {
+                    return Ok(failure);
+                }
+                let Some(existing) = existing else {
+                    return Ok(BundleEntryResult::error(
+                        404,
+                        serde_json::json!({
+                            "resourceType": "OperationOutcome",
+                            "issue": [{"severity": "error", "code": "not-found", "details": {"text": format!("{resource_type}/{id} not found")}}]
+                        }),
+                    ));
+                };
+                let candidate = match crate::core::transaction::prepare_bundle_patch(
+                    tenant,
+                    &resource_type,
+                    &existing,
+                    entry.resource.as_ref(),
+                    fhir_version,
+                    validator,
+                )
+                .await
+                {
+                    Ok(candidate) => candidate,
+                    Err(failure) => return Ok(*failure),
+                };
+                let update_result = self
+                    .update_resource_in_bundle_transaction(
+                        db,
+                        session,
+                        tenant,
+                        &existing,
+                        candidate,
+                        pending_search_parameter_changes,
+                    )
+                    .await;
+                crate::core::transaction::patch_update_result(update_result)
+            }
         }
     }
 
