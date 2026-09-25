@@ -144,17 +144,40 @@ pub struct ReindexPageStats {
     pub inserted_entries: u64,
     /// Insert commands issued, including any that failed.
     pub insert_commands: u64,
+    /// Time the page's own thread spent blocked on database work: the
+    /// overlapped path's join waits, or the serial path's awaited delete plus
+    /// awaited insert. `None` means the writer did not measure it separately
+    /// (#1403).
+    pub db_wait: Option<Duration>,
+    /// Extraction units the page ran; 1 on MongoDB's serial path (#1403).
+    pub sub_batches: u64,
+    /// Of `sub_batches`, how many ran on the rayon pool rather than inline (#1403).
+    pub pool_sub_batches: u64,
 }
 
 impl ReindexPageStats {
+    /// Time the page's thread waited on the database: the measured wait, or,
+    /// for a writer that does not measure it, its busy delete + insert time
+    /// (the serial case) (#1403).
+    pub fn db_wait_or_busy(&self) -> Duration {
+        self.db_wait.unwrap_or(self.delete + self.insert)
+    }
+
     /// Adds every duration and count of `other` to this one.
     pub fn accumulate(&mut self, other: &ReindexPageStats) {
+        let db_wait = match (self.db_wait, other.db_wait) {
+            (None, None) => None,
+            _ => Some(self.db_wait_or_busy() + other.db_wait_or_busy()),
+        };
         self.extract += other.extract;
         self.delete += other.delete;
         self.insert += other.insert;
         self.deleted_entries += other.deleted_entries;
         self.inserted_entries += other.inserted_entries;
         self.insert_commands += other.insert_commands;
+        self.sub_batches += other.sub_batches;
+        self.pool_sub_batches += other.pool_sub_batches;
+        self.db_wait = db_wait;
     }
 }
 
@@ -3051,6 +3074,7 @@ mod tests {
             deleted_entries: 4,
             inserted_entries: 5,
             insert_commands: 6,
+            ..ReindexPageStats::default()
         };
         let other = ReindexPageStats {
             extract: Duration::from_millis(10),
@@ -3059,6 +3083,7 @@ mod tests {
             deleted_entries: 40,
             inserted_entries: 50,
             insert_commands: 60,
+            ..ReindexPageStats::default()
         };
         total.accumulate(&other);
         assert_eq!(total.extract, Duration::from_millis(11));
@@ -6120,5 +6145,103 @@ mod page_limit_tests {
         let limits = source.limits.lock().unwrap();
         assert!(!limits.is_empty());
         assert!(limits.iter().all(|&l| l == 1), "{limits:?}");
+    }
+}
+
+#[cfg(test)]
+mod reindex_page_stats_tests {
+    use super::ReindexPageStats;
+    use std::time::Duration;
+
+    #[test]
+    fn db_wait_or_busy_falls_back_to_delete_plus_insert() {
+        let stats = ReindexPageStats {
+            delete: Duration::from_millis(12),
+            insert: Duration::from_millis(88),
+            ..ReindexPageStats::default()
+        };
+        assert_eq!(stats.db_wait_or_busy(), Duration::from_millis(100));
+
+        let measured = ReindexPageStats {
+            delete: Duration::from_millis(12),
+            insert: Duration::from_millis(88),
+            db_wait: Some(Duration::from_millis(40)),
+            ..ReindexPageStats::default()
+        };
+        assert_eq!(measured.db_wait_or_busy(), Duration::from_millis(40));
+    }
+
+    #[test]
+    fn accumulate_merges_db_wait_as_effective_waits_before_adding_delete_and_insert() {
+        // (None, None) stays None.
+        let mut a = ReindexPageStats::default();
+        let b = ReindexPageStats::default();
+        a.accumulate(&b);
+        assert_eq!(a.db_wait, None);
+
+        // Some(x) merged with a writer that never measured db_wait (its delete
+        // and insert are its effective wait) adds the two effective waits,
+        // computed BEFORE delete/insert themselves are added into `a`.
+        let mut a = ReindexPageStats {
+            db_wait: Some(Duration::from_millis(30)),
+            delete: Duration::from_millis(1),
+            insert: Duration::from_millis(2),
+            ..ReindexPageStats::default()
+        };
+        let b = ReindexPageStats {
+            db_wait: None,
+            delete: Duration::from_millis(5),
+            insert: Duration::from_millis(7),
+            ..ReindexPageStats::default()
+        };
+        a.accumulate(&b);
+        assert_eq!(a.db_wait, Some(Duration::from_millis(30 + 5 + 7)));
+        assert_eq!(a.delete, Duration::from_millis(1 + 5));
+        assert_eq!(a.insert, Duration::from_millis(2 + 7));
+
+        // The reverse pairing (self=None, other=Some) is not exercised by the
+        // case above, and it is the one where getting the order wrong is
+        // actually observable: self's effective wait must be read as its
+        // OWN delete+insert (1+2=3ms) BEFORE those fields are mutated by the
+        // `+=` lines below. Doing it the wrong way around (adding delete/
+        // insert into `a` first, then computing `db_wait_or_busy` from the
+        // already-mutated `self`) would give 25ms (6+9+10) instead of 13ms.
+        let mut a = ReindexPageStats {
+            db_wait: None,
+            delete: Duration::from_millis(1),
+            insert: Duration::from_millis(2),
+            ..ReindexPageStats::default()
+        };
+        let b = ReindexPageStats {
+            db_wait: Some(Duration::from_millis(10)),
+            delete: Duration::from_millis(5),
+            insert: Duration::from_millis(7),
+            ..ReindexPageStats::default()
+        };
+        a.accumulate(&b);
+        assert_eq!(
+            a.db_wait,
+            Some(Duration::from_millis(13)),
+            "3ms (a's own delete+insert) + 10ms (b's measured db_wait)"
+        );
+        assert_eq!(a.delete, Duration::from_millis(6));
+        assert_eq!(a.insert, Duration::from_millis(9));
+    }
+
+    #[test]
+    fn accumulate_still_adds_sub_batches_and_pool_sub_batches() {
+        let mut a = ReindexPageStats {
+            sub_batches: 3,
+            pool_sub_batches: 2,
+            ..ReindexPageStats::default()
+        };
+        let b = ReindexPageStats {
+            sub_batches: 4,
+            pool_sub_batches: 1,
+            ..ReindexPageStats::default()
+        };
+        a.accumulate(&b);
+        assert_eq!(a.sub_batches, 7);
+        assert_eq!(a.pool_sub_batches, 3);
     }
 }
