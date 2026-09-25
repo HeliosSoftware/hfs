@@ -2034,10 +2034,17 @@ impl PostgresQueryBuilder {
     fn token_value_predicate(value: &SearchValue, next: &mut usize) -> (String, Vec<SqlParam>) {
         if let Some((system, code)) = value.value.split_once('|') {
             if system.is_empty() {
-                // |code - match any system
+                // |code - match code with no system (#1388). A `code`
+                // element has no system property either; its row carries
+                // the marker (#1379). Same set as the SQLite, Elasticsearch
+                // and chain builders.
                 *next += 1;
                 (
-                    format!("value_token_code = ${}", next),
+                    format!(
+                        "((value_token_system IS NULL OR value_token_system IN ('', '{}')) \
+                         AND value_token_code = ${})",
+                        IMPLICIT_TOKEN_SYSTEM, next
+                    ),
                     vec![SqlParam::text(code)],
                 )
             } else if code.is_empty() {
@@ -2577,7 +2584,13 @@ impl PostgresQueryBuilder {
                 if let Some((system, code)) = value.value.split_once('|') {
                     if system.is_empty() {
                         Some((
-                            format!("{token_code} = ${}", offset + 1),
+                            // No system, or the marker of a `code` component
+                            // (#1388); see `token_value_predicate`.
+                            format!(
+                                "({token_system} IS NULL OR {token_system} IN ('', '{IMPLICIT_TOKEN_SYSTEM}')) \
+                                 AND {token_code} = ${}",
+                                offset + 1
+                            ),
                             vec![SqlParam::text(code)],
                         ))
                     } else if code.is_empty() {
@@ -6455,6 +6468,83 @@ mod tests {
             .expect("a lone membership test is extractable");
         assert_eq!(pred, "param_name = 'status' AND (value_token_code = $3)");
         assert!(!pred.contains("value_token_system"));
+    }
+
+    /// `|code` means "the code, with no system" (#1388), not "any system". A
+    /// `code` element's row carries the implicit marker (#1379) and has no
+    /// explicit system either, so it counts as "no system" too.
+    #[test]
+    fn empty_system_token_requires_no_system() {
+        let query =
+            SearchQuery::new("Observation").with_parameter(token_param("code", None, "|1234-5"));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("token condition");
+
+        let pred = PostgresQueryBuilder::single_index_predicate(&frag.sql)
+            .expect("a lone membership test is extractable");
+        assert_eq!(
+            pred,
+            format!(
+                "param_name = 'code' AND (((value_token_system IS NULL \
+                 OR value_token_system IN ('', '{IMPLICIT_TOKEN_SYSTEM}')) \
+                 AND value_token_code = $3))"
+            )
+        );
+        assert_eq!(frag.params.len(), 1);
+        match &frag.params[0] {
+            SqlParam::Text(code) => assert_eq!(code, "1234-5"),
+            other => panic!("expected a text param, got {:?}", other),
+        }
+    }
+
+    /// `:not` stays the exact negation of the positive `|code` predicate.
+    #[test]
+    fn not_empty_system_token_negates_the_no_system_predicate() {
+        let positive = PostgresQueryBuilder::build_search_query(
+            &SearchQuery::new("Observation").with_parameter(token_param("code", None, "|1234-5")),
+            2,
+        )
+        .expect("token condition");
+        let negated = PostgresQueryBuilder::build_search_query(
+            &SearchQuery::new("Observation").with_parameter(token_param(
+                "code",
+                Some(SearchModifier::Not),
+                "|1234-5",
+            )),
+            2,
+        )
+        .expect("token condition");
+
+        assert_eq!(negated.sql, format!("NOT ({})", positive.sql));
+        assert_eq!(negated.params.len(), 1);
+    }
+
+    /// The composite component builder (also used by contained-resource
+    /// search) gives `|code` the same "no system" meaning, in either slot.
+    #[test]
+    fn composite_empty_system_component_requires_no_system() {
+        let value = SearchValue::new(SearchPrefix::Eq, "|1234-5");
+        let (sql, params) =
+            PostgresQueryBuilder::build_composite_component(&value, SearchParamType::Token, 4, 1)
+                .expect("a token component");
+        assert_eq!(
+            sql,
+            format!(
+                "(value_token_system IS NULL OR value_token_system IN ('', '{IMPLICIT_TOKEN_SYSTEM}')) \
+                 AND value_token_code = $5"
+            )
+        );
+        assert_eq!(params.len(), 1);
+
+        let (sql, _) =
+            PostgresQueryBuilder::build_composite_component(&value, SearchParamType::Token, 4, 2)
+                .expect("a token component");
+        assert_eq!(
+            sql,
+            format!(
+                "(value_token_system_2 IS NULL OR value_token_system_2 IN ('', '{IMPLICIT_TOKEN_SYSTEM}')) \
+                 AND value_token_code_2 = $5"
+            )
+        );
     }
 
     /// v31 replaced `idx_search_token` (2,283 MB, system-first, and unable to
