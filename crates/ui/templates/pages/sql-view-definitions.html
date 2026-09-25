@@ -241,9 +241,12 @@
      window.HfsEditorForm, window.HfsEditorPair) at the top of its IIFE.
      editor-form.js and editor-pair.js are loaded here, not from base.html,
      the same as the other two: nothing outside this page drives the
-     guided-form pairing through them yet. Loaded only on this page. -->
+     guided-form pairing through them yet. editor-add.js (#1239) loads
+     right before editor-form.js, which reads window.HfsEditorAdd when it
+     mounts. Loaded only on this page. -->
 <script src="/ui/assets/vendor/codemirror.bundle.js" defer></script>
 <script src="/ui/assets/code-editor.js" defer></script>
+<script src="/ui/assets/editor-add.js" defer></script>
 <script src="/ui/assets/editor-form.js" defer></script>
 <script src="/ui/assets/editor-pair.js" defer></script>
 <script src="/ui/assets/vd-editor.js" defer></script>
