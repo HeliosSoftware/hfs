@@ -2266,21 +2266,27 @@ fn log_type_started(tenant: &str, job_id: &str, s: &TypeStarted) {
 /// type_resources, type_total, type_elapsed_ms, type_resources_per_s,
 /// elapsed_ms, entries, failed, pages, fetch_ms, write_ms, extract_ms,
 /// delete_ms, insert_ms, writer_other_ms, yield_ms, other_ms, deleted,
-/// inserted, insert_commands`. `outcome` is this type's own exit path — a
-/// type that finished all its pages is always `completed`, even if a later
-/// type or the job as a whole fails or is cancelled. Every counter and phase
-/// field (`entries` through `insert_commands`) is scoped to this type only,
-/// since its L2. `type_elapsed_ms` is this type's own clock; `elapsed_ms` is
-/// always the job clock. `writer_other_ms = write_ms − (extract_ms +
-/// delete_ms + insert_ms)`, and `other_ms = type_elapsed − (fetch + write +
-/// yield)`: both are computed by subtracting on `Duration`s, saturating at
-/// zero, and truncating to whole milliseconds only afterward (never
-/// truncate-then-subtract). `deleted`/`inserted`/`insert_commands` come from
-/// the type's accumulated `ReindexPageStats` (writer-reported; zero for a
-/// writer that does not measure — MongoDB-only in PR0). Fields are appended
-/// only, never renamed, removed or reordered — the one sanctioned exception
-/// is PR2b's redefinition of `other_ms`/`writer_other_ms` on the critical
-/// path (S3 D11), documented here when that PR lands (#1403).
+/// inserted, insert_commands, fetch_wait_ms, db_wait_ms, sub_batches,
+/// pool_sub_batches`. `outcome` is this type's own exit path — a type that
+/// finished all its pages is always `completed`, even if a later type or the
+/// job as a whole fails or is cancelled. Every counter and phase field
+/// (`entries` through `pool_sub_batches`) is scoped to this type only, since
+/// its L2. `type_elapsed_ms` is this type's own clock; `elapsed_ms` is always
+/// the job clock. `writer_other_ms = write − (extract + db_wait_or_busy)` and
+/// `other_ms = type_elapsed − (fetch_wait + write + yield)`, both computed by
+/// subtracting on `Duration`s, saturating at zero, and truncating to whole
+/// milliseconds only afterward (never truncate-then-subtract). They equal
+/// this type's fetch/delete/insert-based values whenever nothing was
+/// prefetched and no writer measured a separate database wait.
+/// `fetch_wait_ms` is the driver's wait for its page (equal to `fetch_ms`
+/// unless the source prefetched it); `db_wait_ms` is
+/// `writer.db_wait_or_busy()`; `sub_batches`/`pool_sub_batches` are the
+/// extraction units this type's pages ran, and how many of those ran on the
+/// rayon pool. `deleted`/`inserted`/`insert_commands` come from the type's
+/// accumulated `ReindexPageStats` (writer-reported; zero for a writer that
+/// does not measure). Fields are appended only, never renamed, removed or
+/// reordered — the one sanctioned exception is the redefinition of
+/// `other_ms`/`writer_other_ms` on the critical path (#1403).
 fn log_type_finished(tenant: &str, job_id: &str, s: &TypeSummary) {
     let phases = PhaseMillis::of(&s.counters, s.type_elapsed);
     tracing::info!(
@@ -2308,6 +2314,10 @@ fn log_type_finished(tenant: &str, job_id: &str, s: &TypeSummary) {
         deleted = s.counters.writer.deleted_entries,
         inserted = s.counters.writer.inserted_entries,
         insert_commands = s.counters.writer.insert_commands,
+        fetch_wait_ms = phases.fetch_wait_ms,
+        db_wait_ms = phases.db_wait_ms,
+        sub_batches = s.counters.writer.sub_batches,
+        pool_sub_batches = s.counters.writer.pool_sub_batches,
         "reindex type finished"
     );
 }
@@ -2319,20 +2329,26 @@ fn log_type_finished(tenant: &str, job_id: &str, s: &TypeSummary) {
 /// type_resources_per_s, processed, total, elapsed_ms, interval_ms,
 /// interval_resources, interval_resources_per_s, entries, failed, pages,
 /// fetch_ms, write_ms, extract_ms, delete_ms, insert_ms, writer_other_ms,
-/// yield_ms, other_ms, deleted, inserted, insert_commands`. **Scope is the
-/// open type, not the whole job**: `type_resources`, `type_total`,
-/// `type_elapsed_ms`, `type_resources_per_s`, and every counter and phase
-/// field from `entries` through `insert_commands`, describe only the type
-/// open since its own `reindex type started` line — Observation running
-/// after Patient must never inherit Patient's counts. `processed`, `total`
-/// and `elapsed_ms` are job-scoped. `interval_ms`/`interval_resources`/
-/// `interval_resources_per_s` are job-level, measured since the previous L4
-/// (an interval can span a type boundary). When no type is open,
-/// `resource_type` is the sentinel `-` (`NO_TYPE`) and every type-scoped
-/// field is zero — no logged value is ever empty. `writer_other_ms` and
-/// `other_ms` use the same saturating-subtract-then-truncate formulas as L3
-/// (see [`log_type_finished`]). Fields are appended only, never renamed,
-/// removed or reordered (#1403).
+/// yield_ms, other_ms, deleted, inserted, insert_commands, fetch_wait_ms,
+/// db_wait_ms`. L4 does **not** carry `sub_batches`/`pool_sub_batches`, to
+/// stay within the log line's field budget. **Scope is the open type, not
+/// the whole job**: `type_resources`, `type_total`, `type_elapsed_ms`,
+/// `type_resources_per_s`, and every counter and phase field from `entries`
+/// through `db_wait_ms`, describe only the type open since its own `reindex
+/// type started` line — Observation running after Patient must never inherit
+/// Patient's counts. `processed`, `total` and `elapsed_ms` are job-scoped.
+/// `interval_ms`/`interval_resources`/`interval_resources_per_s` are
+/// job-level, measured since the previous L4 (an interval can span a type
+/// boundary). When no type is open, `resource_type` is the sentinel `-`
+/// (`NO_TYPE`) and every type-scoped field is zero — no logged value is ever
+/// empty. `writer_other_ms = write − (extract + db_wait_or_busy)` and
+/// `other_ms = type_elapsed − (fetch_wait + write + yield)`, both
+/// saturating-subtract-then-truncate on `Duration`s, as in L3: they equal
+/// this type's fetch/delete/insert-based values whenever nothing was
+/// prefetched and no writer measured a separate database wait.
+/// `fetch_wait_ms` is the driver's wait for its page (equal to `fetch_ms`
+/// unless prefetched); `db_wait_ms` is `writer.db_wait_or_busy()`. Fields are
+/// appended only, never renamed, removed or reordered (#1403).
 fn log_progress(tenant: &str, job_id: &str, s: &ProgressSnapshot) {
     let phases = PhaseMillis::of(&s.type_counters, s.type_elapsed);
     tracing::info!(
@@ -2364,6 +2380,8 @@ fn log_progress(tenant: &str, job_id: &str, s: &ProgressSnapshot) {
         deleted = s.type_counters.writer.deleted_entries,
         inserted = s.type_counters.writer.inserted_entries,
         insert_commands = s.type_counters.writer.insert_commands,
+        fetch_wait_ms = phases.fetch_wait_ms,
+        db_wait_ms = phases.db_wait_ms,
         "reindex progress"
     );
 }
@@ -2371,19 +2389,26 @@ fn log_progress(tenant: &str, job_id: &str, s: &ProgressSnapshot) {
 /// Logs L5 `reindex job finished` (INFO), once per run that logged L1, on
 /// every path on which `run_reindex` returns after L1, and always **before**
 /// `run_reindex` writes the terminal status (the one exception: a synchronous
-/// `cancel()` may write `Cancelled` first — see [`job_outcome`], D10). Field
+/// `cancel()` may write `Cancelled` first — see [`job_outcome`]). Field
 /// order: `tenant, job_id, outcome, types_done, types, processed, total,
 /// elapsed_ms, resources_per_s, entries, failed, pages, fetch_ms, write_ms,
 /// extract_ms, delete_ms, insert_ms, writer_other_ms, yield_ms, other_ms,
-/// deleted, inserted, insert_commands`. `outcome` is the job's already-
-/// written terminal status if one exists, otherwise the exit path's outcome
+/// deleted, inserted, insert_commands, fetch_wait_ms, db_wait_ms,
+/// sub_batches, pool_sub_batches`. `outcome` is the job's already-written
+/// terminal status if one exists, otherwise the exit path's outcome
 /// (`job_outcome`). `types_done` counts types whose L3 said `completed`.
-/// Every counter and phase field (`entries` through `insert_commands`) is
+/// Every counter and phase field (`entries` through `pool_sub_batches`) is
 /// job-scoped (summed over every type), unlike L3/L4's type scope.
-/// `elapsed_ms` is the job clock. `writer_other_ms = write_ms − (extract_ms +
-/// delete_ms + insert_ms)` and `other_ms = elapsed_ms − (fetch + write +
-/// yield)`, both saturating-subtract-then-truncate on `Duration`s, as in L3.
-/// Fields are appended only, never renamed, removed or reordered (#1403).
+/// `elapsed_ms` is the job clock. `writer_other_ms = write − (extract +
+/// db_wait_or_busy)` and `other_ms = elapsed_ms − (fetch_wait + write +
+/// yield)`, both saturating-subtract-then-truncate on `Duration`s, as in L3:
+/// they equal the job's fetch/delete/insert-based values whenever nothing
+/// was prefetched and no writer measured a separate database wait.
+/// `fetch_wait_ms` is the driver's wait for its page (equal to `fetch_ms`
+/// unless prefetched); `db_wait_ms` is `writer.db_wait_or_busy()`;
+/// `sub_batches`/`pool_sub_batches` are the extraction units the job ran, and
+/// how many of those ran on the rayon pool. Fields are appended only, never
+/// renamed, removed or reordered (#1403).
 fn log_job_finished(tenant: &str, job_id: &str, s: &JobSummary) {
     let phases = PhaseMillis::of(&s.counters, s.elapsed);
     tracing::info!(
@@ -2410,6 +2435,10 @@ fn log_job_finished(tenant: &str, job_id: &str, s: &JobSummary) {
         deleted = s.counters.writer.deleted_entries,
         inserted = s.counters.writer.inserted_entries,
         insert_commands = s.counters.writer.insert_commands,
+        fetch_wait_ms = phases.fetch_wait_ms,
+        db_wait_ms = phases.db_wait_ms,
+        sub_batches = s.counters.writer.sub_batches,
+        pool_sub_batches = s.counters.writer.pool_sub_batches,
         "reindex job finished"
     );
 }
@@ -2418,14 +2447,19 @@ fn log_job_finished(tenant: &str, job_id: &str, s: &JobSummary) {
 /// `RUST_LOG=…,helios_persistence::search::reindex=debug`), after every page
 /// or id batch. Field order: `tenant, job_id, resource_type, page, resources,
 /// type_elapsed_ms, entries, failed, fetch_ms, write_ms, extract_ms,
-/// delete_ms, insert_ms, deleted, inserted, insert_commands`. Every counter
-/// and phase field describes only this one page — `page` is the 1-based page
-/// number within the open type, `resources` is this page's own count. L6 has
-/// no derived fields: `fetch_ms`/`write_ms` are the driver's own timings for
-/// this page, and `extract_ms`/`delete_ms`/`insert_ms`/`deleted`/`inserted`/
-/// `insert_commands` come straight from this page's `ReindexPageStats`
-/// (writer-reported; zero for a writer that does not measure). Fields are
-/// appended only, never renamed, removed or reordered (#1403).
+/// delete_ms, insert_ms, deleted, inserted, insert_commands, fetch_wait_ms,
+/// db_wait_ms, sub_batches, pool_sub_batches`. Every counter and phase field
+/// describes only this one page — `page` is the 1-based page number within
+/// the open type, `resources` is this page's own count. L6 has no derived
+/// `other_ms`/`writer_other_ms` fields: `fetch_ms`/`write_ms` are the
+/// driver's own timings for this page, and `extract_ms`/`delete_ms`/
+/// `insert_ms`/`deleted`/`inserted`/`insert_commands` come straight from
+/// this page's `ReindexPageStats` (writer-reported; zero for a writer that
+/// does not measure). `fetch_wait_ms` is the driver's wait for this page
+/// (equal to `fetch_ms` unless it was prefetched); `db_wait_ms` is this
+/// page's `writer.db_wait_or_busy()`; `sub_batches`/`pool_sub_batches` are
+/// this page's own extraction units, and how many ran on the rayon pool.
+/// Fields are appended only, never renamed, removed or reordered (#1403).
 fn log_page(
     tenant: &str,
     job_id: &str,
@@ -2450,6 +2484,10 @@ fn log_page(
         deleted = r.writer.deleted_entries,
         inserted = r.writer.inserted_entries,
         insert_commands = r.writer.insert_commands,
+        fetch_wait_ms = millis(r.fetch_wait),
+        db_wait_ms = millis(r.writer.db_wait_or_busy()),
+        sub_batches = r.writer.sub_batches,
+        pool_sub_batches = r.writer.pool_sub_batches,
         "reindex page"
     );
 }
@@ -2703,6 +2741,7 @@ async fn run_reindex(
                             entries: batch_outcome.entries,
                             failed: batch_outcome.failed,
                             fetch: fetch_time,
+                            fetch_wait: fetch_time,
                             write: batch_outcome.write,
                             writer: batch_outcome.writer,
                         },
@@ -2782,6 +2821,7 @@ async fn run_reindex(
                         entries: batch_outcome.entries,
                         failed: page.skipped.len() as u64 + batch_outcome.failed,
                         fetch: fetch_time,
+                        fetch_wait: fetch_time,
                         write: batch_outcome.write,
                         writer: batch_outcome.writer,
                     },
@@ -5332,6 +5372,10 @@ mod tests {
         "deleted",
         "inserted",
         "insert_commands",
+        "fetch_wait_ms",
+        "db_wait_ms",
+        "sub_batches",
+        "pool_sub_batches",
     ];
     const PROGRESS_FIELDS: &[&str] = &[
         "tenant",
@@ -5362,6 +5406,8 @@ mod tests {
         "deleted",
         "inserted",
         "insert_commands",
+        "fetch_wait_ms",
+        "db_wait_ms",
     ];
     const JOB_FINISHED_FIELDS: &[&str] = &[
         "tenant",
@@ -5387,6 +5433,10 @@ mod tests {
         "deleted",
         "inserted",
         "insert_commands",
+        "fetch_wait_ms",
+        "db_wait_ms",
+        "sub_batches",
+        "pool_sub_batches",
     ];
     const PAGE_FIELDS: &[&str] = &[
         "tenant",
@@ -5405,6 +5455,10 @@ mod tests {
         "deleted",
         "inserted",
         "insert_commands",
+        "fetch_wait_ms",
+        "db_wait_ms",
+        "sub_batches",
+        "pool_sub_batches",
     ];
 
     /// One captured `reindex ...` event: field names in printed (macro) order,
@@ -5516,6 +5570,45 @@ mod tests {
             assert_eq!(event.names, expected_names, "{}", event.message);
             assert_eq!(event.level, expected_level, "{}", event.message);
         }
+    }
+
+    #[test]
+    fn field_lists_append_fetch_wait_and_db_wait() {
+        assert_eq!(
+            &TYPE_FINISHED_FIELDS[TYPE_FINISHED_FIELDS.len() - 4..],
+            [
+                "fetch_wait_ms",
+                "db_wait_ms",
+                "sub_batches",
+                "pool_sub_batches"
+            ]
+        );
+        assert_eq!(
+            &PROGRESS_FIELDS[PROGRESS_FIELDS.len() - 2..],
+            ["fetch_wait_ms", "db_wait_ms"]
+        );
+        assert!(
+            !PROGRESS_FIELDS.contains(&"sub_batches"),
+            "L4 must not carry sub_batches or pool_sub_batches (#1403)"
+        );
+        assert_eq!(
+            &JOB_FINISHED_FIELDS[JOB_FINISHED_FIELDS.len() - 4..],
+            [
+                "fetch_wait_ms",
+                "db_wait_ms",
+                "sub_batches",
+                "pool_sub_batches"
+            ]
+        );
+        assert_eq!(
+            &PAGE_FIELDS[PAGE_FIELDS.len() - 4..],
+            [
+                "fetch_wait_ms",
+                "db_wait_ms",
+                "sub_batches",
+                "pool_sub_batches"
+            ]
+        );
     }
 
     #[test]
