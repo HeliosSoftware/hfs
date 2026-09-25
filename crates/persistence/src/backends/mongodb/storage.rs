@@ -4860,6 +4860,62 @@ impl MongoBackend {
         })
     }
 
+    /// Runs only the id-phase continuation query, for both the serial walk
+    /// and the driver's ahead-of-time prefetch — so both paths build the same
+    /// page from the same query (#1403). `Ok(None)` means the id phase is
+    /// over; it logs nothing else in that case, per
+    /// [`ReindexSource::fetch_resources_page_ahead`]'s doc contract that a
+    /// source must not log or change state when it returns `Ok(None)`,
+    /// leaving the capped-page debug line and the phase transition to
+    /// whichever caller runs the query when it is *not* prefetched.
+    async fn reindex_id_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        floor: DateTime<Utc>,
+        after_id: Option<&str>,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<Option<ResourcePage>> {
+        let db = self.get_database().await?;
+        let resources = db.collection::<Document>(Self::RESOURCES_COLLECTION);
+        let tenant_id = tenant.tenant_id().as_str();
+        let found = self
+            .reindex_find_page(
+                &resources,
+                reindex_id_page_filter(tenant_id, resource_type, floor, after_id),
+                doc! { "id": 1 },
+                RESOURCES_IDENTITY_INDEX,
+                limit,
+                max_bytes,
+            )
+            .await?;
+        if found.docs.is_empty() {
+            return Ok(None);
+        }
+        if max_bytes > 0 {
+            log_capped_page_read(tenant_id, resource_type, &found);
+        }
+        let last_id = found
+            .docs
+            .last()
+            .and_then(|d| d.get_str("id").ok())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                internal_error("Missing id on the last row of an id-phase page".to_string())
+            })?;
+        reindex_page_from_docs(
+            &found.docs,
+            resource_type,
+            tenant,
+            ReindexWalkCursor::Id {
+                floor,
+                after_id: last_id,
+            },
+        )
+        .map(Some)
+    }
+
     /// Pages `resource_type` in id order with catch-up rounds (#1403), bounded
     /// by `max_bytes` as well as by `limit` (`max_bytes == 0` is the id-order
     /// walk's uncapped page, #1499). A page the byte cap stops before `limit` is still non-empty
@@ -4908,42 +4964,18 @@ impl MongoBackend {
                     }
                 }
                 WalkStep::IdPhase { floor, after_id } => {
-                    let filter = reindex_id_page_filter(
-                        tenant_id,
-                        resource_type,
-                        floor,
-                        after_id.as_deref(),
-                    );
-                    let found = self
-                        .reindex_find_page(
-                            &resources,
-                            filter,
-                            doc! { "id": 1 },
-                            RESOURCES_IDENTITY_INDEX,
+                    if let Some(page) = self
+                        .reindex_id_page(
+                            tenant,
+                            resource_type,
+                            floor,
+                            after_id.as_deref(),
                             limit,
                             max_bytes,
                         )
-                        .await?;
-                    if max_bytes > 0 {
-                        log_capped_page_read(tenant_id, resource_type, &found);
-                    }
-                    let docs = found.docs;
-                    if !docs.is_empty() {
-                        let last_id = docs
-                            .last()
-                            .expect("non-empty")
-                            .get_str("id")
-                            .map_err(|e| internal_error(format!("Missing id: {e}")))?
-                            .to_string();
-                        return reindex_page_from_docs(
-                            &docs,
-                            resource_type,
-                            tenant,
-                            ReindexWalkCursor::Id {
-                                floor,
-                                after_id: last_id,
-                            },
-                        );
+                        .await?
+                    {
+                        return Ok(page);
                     }
                     tracing::info!(
                         tenant = %tenant_id,
@@ -5228,6 +5260,47 @@ impl ReindexSource for MongoBackend {
     ) -> StorageResult<ResourcePage> {
         self.fetch_reindex_page(tenant, resource_type, cursor, limit, max_bytes)
             .await
+    }
+
+    /// Only an id-phase continuation cursor may run ahead of the write in
+    /// flight (#1403): its query reads live resources stamped strictly
+    /// before a floor fixed when the walk started, so it observes nothing
+    /// the page being written could change. A catch-up round instead reads
+    /// up to "now", so running it early could race the very writes it is
+    /// meant to pick up; a cursor that fails to parse is rejected the same
+    /// way. `reindex_prefetch` and search offload gate it off entirely.
+    fn may_prefetch_page(&self, cursor: &str) -> bool {
+        self.config().reindex_prefetch
+            && !self.is_search_offloaded()
+            && matches!(
+                ReindexWalkCursor::parse(cursor),
+                Ok(ReindexWalkCursor::Id { .. })
+            )
+    }
+
+    async fn fetch_resources_page_ahead(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: &str,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<Option<ResourcePage>> {
+        // Only an id continuation runs ahead. Everything else, including the
+        // end of the id phase, is fetched serially after the page in flight
+        // is written.
+        let Ok(ReindexWalkCursor::Id { floor, after_id }) = ReindexWalkCursor::parse(cursor) else {
+            return Ok(None);
+        };
+        self.reindex_id_page(
+            tenant,
+            resource_type,
+            floor,
+            Some(&after_id),
+            limit.max(1),
+            max_bytes,
+        )
+        .await
     }
 }
 
@@ -6488,5 +6561,100 @@ mod reindex_page_cap_tests {
     #[test]
     fn saturating_sum_does_not_overflow() {
         assert!(reindex_page_admits(1, u64::MAX - 1, 10, u64::MAX));
+    }
+}
+
+#[cfg(test)]
+mod reindex_prefetch_tests {
+    use super::*;
+    use crate::backends::mongodb::MongoBackendConfig;
+    use crate::search::reindex::ReindexSource;
+    use crate::tenant::{TenantId, TenantPermissions};
+
+    /// A config that can never reach a real server. `MongoBackendConfig::default()`'s
+    /// connection string is `mongodb://localhost:27017`, which is a long-lived
+    /// corpus container that must never be touched by a unit test — so every
+    /// backend built in this module uses this instead, even where the code
+    /// path never actually calls the database today, in case a future change
+    /// moves a database call earlier (#1403).
+    fn unreachable_config() -> MongoBackendConfig {
+        MongoBackendConfig {
+            connection_string: "mongodb://127.0.0.1:1".to_string(),
+            server_selection_timeout_ms: 500,
+            ..Default::default()
+        }
+    }
+
+    fn id_cursor() -> String {
+        ReindexWalkCursor::Id {
+            floor: chrono::Utc::now(),
+            after_id: "p1".to_string(),
+        }
+        .encode()
+    }
+
+    fn round_cursor() -> String {
+        ReindexWalkCursor::Round {
+            round: 1,
+            floor: chrono::Utc::now(),
+            ceiling: chrono::Utc::now() + chrono::Duration::seconds(1),
+            walked: 0,
+            after_last_updated: chrono::Utc::now(),
+            after_id: "p1".to_string(),
+        }
+        .encode()
+    }
+
+    #[test]
+    fn may_prefetch_page_accepts_only_id_cursors() {
+        let backend = MongoBackend::new(unreachable_config()).expect("lazy client");
+        assert!(backend.may_prefetch_page(&id_cursor()));
+        assert!(!backend.may_prefetch_page(&round_cursor()));
+        assert!(!backend.may_prefetch_page("garbage"));
+
+        let no_prefetch = MongoBackend::new(MongoBackendConfig {
+            reindex_prefetch: false,
+            ..unreachable_config()
+        })
+        .expect("lazy client");
+        assert!(!no_prefetch.may_prefetch_page(&id_cursor()));
+
+        let offloaded = MongoBackend::new(MongoBackendConfig {
+            search_offloaded: true,
+            ..unreachable_config()
+        })
+        .expect("lazy client");
+        assert!(!offloaded.may_prefetch_page(&id_cursor()));
+    }
+
+    #[tokio::test]
+    async fn fetch_ahead_declines_round_and_malformed_cursors() {
+        // Both cases return before any database call: `ReindexWalkCursor::parse`
+        // fails or does not match `Id` before `get_database` is ever reached, so
+        // `unreachable_config`'s bogus connection string is exercised only as a
+        // defensive belt-and-suspenders, not because either case connects.
+        let backend = MongoBackend::new(unreachable_config()).expect("lazy client");
+        let tenant = TenantContext::new(
+            TenantId::new("prefetch-test-tenant"),
+            TenantPermissions::full_access(),
+        );
+
+        let result = backend
+            .fetch_resources_page_ahead(&tenant, "Patient", &round_cursor(), 10, 0)
+            .await
+            .expect("no database error");
+        assert!(
+            result.is_none(),
+            "a Round cursor must never be fetched ahead"
+        );
+
+        let result = backend
+            .fetch_resources_page_ahead(&tenant, "Patient", "garbage", 10, 0)
+            .await
+            .expect("no database error");
+        assert!(
+            result.is_none(),
+            "a cursor that fails to parse must never be fetched ahead"
+        );
     }
 }

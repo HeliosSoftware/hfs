@@ -454,6 +454,80 @@ async fn mongodb_integration_reindex_fetch_capped_provenance_shaped() {
     }
 }
 
+/// `fetch_resources_page_ahead` must build the exact same page as
+/// `fetch_resources_page_capped` for every id-phase cursor, and must decline
+/// (`Ok(None)`) the one cursor whose query is empty, where the walk leaves
+/// the id phase for its first catch-up round (#1403).
+#[tokio::test]
+async fn mongodb_integration_reindex_fetch_ahead_matches_capped_id_phase() {
+    let Some(backend) = create_id_phase_backend("reindex_fetch_ahead_matches").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant_id = "tenant-fetch-ahead-matches";
+    let tenant = create_tenant(tenant_id);
+    let (_db, _sizes, cap) = seed_provenance(&backend, &tenant, tenant_id).await;
+
+    let mut cursor = backend
+        .fetch_resources_page_capped(&tenant, "Provenance", None, 24, cap)
+        .await
+        .unwrap()
+        .next_cursor
+        .expect("the first page of a freshly seeded type must continue");
+    assert!(
+        cursor.starts_with("v2|i|"),
+        "first page must stay in the id phase: {cursor}"
+    );
+
+    let mut declined_at_the_end = false;
+    for _ in 0..20 {
+        let ahead = backend
+            .fetch_resources_page_ahead(&tenant, "Provenance", &cursor, 24, cap)
+            .await
+            .unwrap();
+        let Some(ahead_page) = ahead else {
+            declined_at_the_end = true;
+            break;
+        };
+        let capped = backend
+            .fetch_resources_page_capped(&tenant, "Provenance", Some(&cursor), 24, cap)
+            .await
+            .unwrap();
+        let ahead_ids: Vec<_> = ahead_page
+            .resources
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        let capped_ids: Vec<_> = capped
+            .resources
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        assert_eq!(ahead_ids, capped_ids, "cursor {cursor}");
+        assert_eq!(
+            ahead_page.next_cursor, capped.next_cursor,
+            "cursor {cursor}"
+        );
+        assert!(
+            ahead_page.resources.len() <= 3,
+            "page held {} resources over the 3-resource cap",
+            ahead_page.resources.len()
+        );
+        let next = ahead_page
+            .next_cursor
+            .expect("a non-empty id-phase page must continue");
+        assert!(
+            next.starts_with("v2|i|"),
+            "an ahead-fetched page must stay in the id phase: {next}"
+        );
+        cursor = next;
+    }
+    assert!(
+        declined_at_the_end,
+        "the id phase's final cursor must decline the ahead fetch"
+    );
+}
+
 struct RecordingSource {
     inner: Arc<MongoBackend>,
     sizes: std::collections::HashMap<String, u64>,
