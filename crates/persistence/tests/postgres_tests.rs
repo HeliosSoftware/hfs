@@ -73,6 +73,16 @@ mod date_precision_suite;
 #[path = "search/date_minute_index_suite.rs"]
 mod date_minute_index_suite;
 
+/// The backend-agnostic `ap` prefix suite for number and quantity
+/// (#1390). Same `#[path]` arrangement.
+#[path = "search/ap_prefix_suite.rs"]
+mod ap_prefix_suite;
+
+/// The backend-agnostic `ap` suite for quantity composites
+/// (#1390). Same `#[path]` arrangement.
+#[path = "search/ap_relations_suite.rs"]
+mod ap_relations_suite;
+
 /// The backend-agnostic suite for Period and Timing range targets (#1391).
 /// Same `#[path]` arrangement.
 #[path = "search/date_period_suite.rs"]
@@ -87,6 +97,9 @@ mod number_exponent_suite;
 /// values begin with comparator letters. Same `#[path]` arrangement.
 #[path = "search/conditional_criteria_suite.rs"]
 mod conditional_criteria_suite;
+
+#[path = "search/large_id_set_suite.rs"]
+mod large_id_set_suite;
 
 /// The backend-agnostic `_contained` suite (#1336, #1362, #1363). Same
 /// `#[path]` arrangement.
@@ -910,6 +923,22 @@ mod postgres_integration {
     use testcontainers::runners::AsyncRunner;
     use testcontainers_modules::postgres::Postgres;
     use tokio::sync::{Mutex, OnceCell};
+
+    #[tokio::test]
+    async fn postgres_large_id_set_search_count_cursor_not_and_tenant() {
+        let backend = create_backend().await;
+        let tenant = create_tenant("large-id-set-postgres");
+        super::large_id_set_suite::large_id_set_search_count_cursor_not_and_tenant(
+            &backend,
+            tenant.tenant_id().as_str(),
+        )
+        .await;
+        super::large_id_set_suite::wide_chain_and_nested_has(
+            &backend,
+            &format!("{}-wide-chain", tenant.tenant_id().as_str()),
+        )
+        .await;
+    }
 
     #[tokio::test]
     async fn postgres_publication_exact_contract() {
@@ -4812,6 +4841,69 @@ mod postgres_integration {
             "Search by name should find the patient"
         );
         assert_eq!(result.resources.items[0].id(), "p1");
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_id_pages_keep_search_cursor_order() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::SearchQuery;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("id-pages");
+        for id in ["p1", "p2", "p3"] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({ "resourceType": "Patient", "id": id }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let query = SearchQuery::new("Patient").with_count(2);
+        let full_first = backend.search(&tenant, &query).await.unwrap();
+        let id_first = backend.search_ids(&tenant, &query).await.unwrap();
+        assert_eq!(
+            id_first.items,
+            full_first
+                .resources
+                .items
+                .iter()
+                .map(|resource| resource.id().to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            id_first.page_info.next_cursor,
+            full_first.resources.page_info.next_cursor
+        );
+
+        let next_query = query.with_cursor(id_first.page_info.next_cursor.unwrap());
+        let full_next = backend.search(&tenant, &next_query).await.unwrap();
+        let id_next = backend.search_ids(&tenant, &next_query).await.unwrap();
+        assert_eq!(
+            id_next.items,
+            full_next
+                .resources
+                .items
+                .iter()
+                .map(|resource| resource.id().to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(id_next.page_info.has_previous);
+        assert!(id_next.page_info.previous_cursor.is_some());
+
+        let mut offset_query = SearchQuery::new("Patient").with_count(2);
+        offset_query.offset = Some(0);
+        assert_eq!(
+            backend
+                .search_ids(&tenant, &offset_query)
+                .await
+                .unwrap()
+                .items,
+            id_first.items
+        );
     }
 
     /// The backend-agnostic meta-parameter scenario (#523), shared verbatim
@@ -18817,6 +18909,181 @@ mod postgres_integration {
         assert!(backend.get_settings(&user).await.unwrap().is_none());
     }
 
+    // ── Web UI login sessions (#1481) ──────────────────────────────────
+    //
+    // The `SessionPersistence` contract the auth crate's `SessionStore` relies
+    // on: conditional writes by version, pending logins consumed exactly once,
+    // kinds kept apart, and a sweep by `expires_at`.
+
+    fn login_session(id: &str) -> helios_auth::PersistedSession {
+        let now = chrono::Utc::now();
+        helios_auth::PersistedSession {
+            id: id.to_string(),
+            principal: helios_auth::SessionPrincipal {
+                subject: "demo-sub".to_string(),
+                issuer: "https://idp".to_string(),
+                name: Some("Demo User".to_string()),
+                preferred_username: None,
+                email: None,
+                picture: None,
+            },
+            access_token: "at-1".to_string(),
+            access_expires_at: now + chrono::TimeDelta::minutes(5),
+            refresh_token: Some("rt-1".to_string()),
+            id_token: None,
+            last_seen: now,
+            created_at: now,
+            version: 0,
+        }
+    }
+
+    fn pending_login(id: &str) -> helios_auth::PersistedPending {
+        helios_auth::PersistedPending {
+            id: id.to_string(),
+            state: "state-1".to_string(),
+            code_verifier: "verifier-1".to_string(),
+            next: "/ui/resources".to_string(),
+            started_at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_login_session_round_trips_with_its_version() {
+        use helios_auth::{SaveOutcome, SessionPersistence};
+        let backend = create_backend().await;
+        let id = unique_user_key("login-session");
+        assert!(backend.load_session(&id).await.unwrap().is_none());
+
+        let saved = backend
+            .save_session(&login_session(&id), Some(0))
+            .await
+            .unwrap();
+        assert_eq!(saved, SaveOutcome::Saved(1));
+
+        let loaded = backend.load_session(&id).await.unwrap().unwrap();
+        assert_eq!(loaded.version, 1);
+        assert_eq!(loaded.access_token, "at-1");
+        assert_eq!(loaded.principal.display(), "Demo User");
+
+        let mut newer = loaded.clone();
+        newer.access_token = "at-2".to_string();
+        assert_eq!(
+            backend.save_session(&newer, Some(1)).await.unwrap(),
+            SaveOutcome::Saved(2)
+        );
+        assert_eq!(
+            backend
+                .load_session(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .access_token,
+            "at-2"
+        );
+        backend.delete_session(&id).await.unwrap();
+        assert!(backend.load_session(&id).await.unwrap().is_none());
+        backend.delete_session(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_login_session_stale_version_is_a_conflict() {
+        use helios_auth::{SaveOutcome, SessionPersistence};
+        let backend = create_backend().await;
+        let id = unique_user_key("login-conflict");
+        backend
+            .save_session(&login_session(&id), Some(0))
+            .await
+            .unwrap();
+        let mut stale = login_session(&id);
+        stale.access_token = "at-stale".to_string();
+        // "Must not exist yet" against an existing row.
+        assert_eq!(
+            backend.save_session(&stale, Some(0)).await.unwrap(),
+            SaveOutcome::Conflict { current: 1 }
+        );
+        // The wrong version against an existing row.
+        assert_eq!(
+            backend.save_session(&stale, Some(7)).await.unwrap(),
+            SaveOutcome::Conflict { current: 1 }
+        );
+        assert_eq!(
+            backend
+                .load_session(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .access_token,
+            "at-1"
+        );
+        // A version against a row that is not there.
+        let missing = unique_user_key("login-missing");
+        assert_eq!(
+            backend
+                .save_session(&login_session(&missing), Some(1))
+                .await
+                .unwrap(),
+            SaveOutcome::Conflict { current: 0 }
+        );
+        // Unconditional writes still land and bump the version.
+        assert_eq!(
+            backend.save_session(&stale, None).await.unwrap(),
+            SaveOutcome::Saved(2)
+        );
+        backend.delete_session(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_pending_login_is_consumed_exactly_once_and_kinds_do_not_cross() {
+        use helios_auth::SessionPersistence;
+        let backend = create_backend().await;
+        let id = unique_user_key("pending");
+        backend.save_pending(&pending_login(&id)).await.unwrap();
+        let loaded = backend.load_pending(&id).await.unwrap().unwrap();
+        assert_eq!(loaded.state, "state-1");
+        assert_eq!(loaded.next, "/ui/resources");
+        assert!(backend.load_session(&id).await.unwrap().is_none());
+        backend.delete_session(&id).await.unwrap();
+        assert!(backend.load_pending(&id).await.unwrap().is_some());
+
+        assert!(backend.delete_pending(&id).await.unwrap());
+        assert!(!backend.delete_pending(&id).await.unwrap());
+        assert!(backend.load_pending(&id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_login_sweep_drops_only_what_has_expired() {
+        use helios_auth::SessionPersistence;
+        let backend = create_backend().await;
+        let idle_id = unique_user_key("sweep-idle");
+        let live_id = unique_user_key("sweep-live");
+        let old_id = unique_user_key("sweep-old");
+        let fresh_id = unique_user_key("sweep-fresh");
+        let mut idle = login_session(&idle_id);
+        idle.last_seen = chrono::Utc::now() - chrono::TimeDelta::hours(9);
+        backend.save_session(&idle, None).await.unwrap();
+        backend
+            .save_session(&login_session(&live_id), None)
+            .await
+            .unwrap();
+        let mut old = pending_login(&old_id);
+        old.started_at = chrono::Utc::now() - chrono::TimeDelta::minutes(11);
+        backend.save_pending(&old).await.unwrap();
+        backend
+            .save_pending(&pending_login(&fresh_id))
+            .await
+            .unwrap();
+
+        // Other tests share the table, so only what this test planted is
+        // asserted on, not the count.
+        backend.sweep(chrono::Utc::now()).await.unwrap();
+        assert!(backend.load_session(&idle_id).await.unwrap().is_none());
+        assert!(backend.load_session(&live_id).await.unwrap().is_some());
+        assert!(backend.load_pending(&old_id).await.unwrap().is_none());
+        assert!(backend.load_pending(&fresh_id).await.unwrap().is_some());
+        backend.delete_session(&live_id).await.unwrap();
+        backend.delete_pending(&fresh_id).await.unwrap();
+    }
+
     #[tokio::test]
     async fn postgres_integration_settings_put_get_and_version() {
         let backend = create_backend().await;
@@ -27733,6 +28000,20 @@ mod postgres_integration {
         .await;
     }
 
+    /// #1390: one number/quantity `ap` window, shared by every backend.
+    #[tokio::test]
+    async fn postgres_integration_ap_prefix_suite() {
+        let backend = create_backend().await;
+        super::ap_prefix_suite::ap_prefix(&backend, &unique_base("ap_prefix"), true).await;
+    }
+
+    /// #1390: `ap` in the quantity component of a composite.
+    #[tokio::test]
+    async fn postgres_integration_ap_composite() {
+        let backend = create_backend().await;
+        super::ap_relations_suite::ap_composite(&backend, &unique_base("ap_composite")).await;
+    }
+
     /// #1379: `gender=<system>|female` never matched a `code` element.
     #[tokio::test]
     async fn postgres_integration_system_qualified_tokens_match_code_elements() {
@@ -27740,7 +28021,6 @@ mod postgres_integration {
         super::token_code_system_suite::system_qualified_tokens_match_code_elements(
             &backend,
             &unique_base("token_code_system"),
-            false,
         )
         .await;
     }

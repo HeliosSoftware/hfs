@@ -366,7 +366,7 @@ async fn reload_version(
     Ok(row.and_then(|d| d.get_i64("version").ok()).unwrap_or(0))
 }
 
-fn is_duplicate_key_error(err: &MongoError) -> bool {
+pub(super) fn is_duplicate_key_error(err: &MongoError) -> bool {
     err.to_string().contains("E11000")
 }
 

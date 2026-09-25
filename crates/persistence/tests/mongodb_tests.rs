@@ -612,6 +612,16 @@ async fn mongodb_contained_sort_and_id_only_contained() {
     contained_suite::sort_and_id_only_contained(&backend, "contained-sort-1407").await;
 }
 
+/// The backend-agnostic `ap` prefix suite for number and quantity
+/// (#1390). Same `#[path]` arrangement.
+#[path = "search/ap_prefix_suite.rs"]
+mod ap_prefix_suite;
+
+/// The backend-agnostic `ap` suite for quantity composites
+/// (#1390). Same `#[path]` arrangement.
+#[path = "search/ap_relations_suite.rs"]
+mod ap_relations_suite;
+
 /// #1407: composites under `_contained` are matched within one contained
 /// resource — a code pairs with the quantity of the *same* component, never
 /// across components or sibling contained resources. Strict: unlike the
@@ -911,6 +921,29 @@ async fn mongodb_exponent_values_use_significant_figures() {
     .await;
 }
 
+/// #1390: one number/quantity `ap` window, shared by every backend. Needs the
+/// full registry so `factor-override` and `value-quantity` extract. No
+/// canonical-unit quantity match, hence `false`.
+#[tokio::test]
+async fn mongodb_ap_prefix_suite() {
+    let Some(backend) = create_backend_with_full_registry("ap_prefix").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    ap_prefix_suite::ap_prefix(&backend, "ap-prefix-1390", false).await;
+}
+
+/// #1390: `ap` in the quantity component of a composite. Needs the full
+/// registry so the composites and their components extract.
+#[tokio::test]
+async fn mongodb_ap_composite() {
+    let Some(backend) = create_backend_with_full_registry("ap_composite").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    ap_relations_suite::ap_composite(&backend, "ap-composite-1390").await;
+}
+
 /// The backend-agnostic number / quantity validation suite (#1319, #1340).
 /// Same `#[path]` arrangement.
 #[path = "search/numeric_validation_suite.rs"]
@@ -969,7 +1002,6 @@ async fn mongodb_system_qualified_tokens_match_code_elements() {
     token_code_system_suite::system_qualified_tokens_match_code_elements(
         &backend,
         "token-code-system-1379",
-        false,
     )
     .await;
 }
@@ -10079,6 +10111,197 @@ async fn mongodb_integration_settings_delete_is_idempotent() {
     assert!(!backend.delete_settings(&user).await.unwrap());
 }
 
+// ── Web UI login sessions (#1481) ──────────────────────────────────────
+//
+// The `SessionPersistence` contract the auth crate's `SessionStore` relies
+// on: conditional writes by version, pending logins consumed exactly once,
+// kinds kept apart, and a sweep by `expires_at`.
+
+fn login_session(id: &str) -> helios_auth::PersistedSession {
+    let now = chrono::Utc::now();
+    helios_auth::PersistedSession {
+        id: id.to_string(),
+        principal: helios_auth::SessionPrincipal {
+            subject: "demo-sub".to_string(),
+            issuer: "https://idp".to_string(),
+            name: Some("Demo User".to_string()),
+            preferred_username: None,
+            email: None,
+            picture: None,
+        },
+        access_token: "at-1".to_string(),
+        access_expires_at: now + chrono::TimeDelta::minutes(5),
+        refresh_token: Some("rt-1".to_string()),
+        id_token: None,
+        last_seen: now,
+        created_at: now,
+        version: 0,
+    }
+}
+
+fn pending_login(id: &str) -> helios_auth::PersistedPending {
+    helios_auth::PersistedPending {
+        id: id.to_string(),
+        state: "state-1".to_string(),
+        code_verifier: "verifier-1".to_string(),
+        next: "/ui/resources".to_string(),
+        started_at: chrono::Utc::now(),
+    }
+}
+
+#[tokio::test]
+async fn mongodb_integration_login_session_round_trips_with_its_version() {
+    use helios_auth::{SaveOutcome, SessionPersistence};
+    let Some(backend) = settings_mongo::backend("login_round_trip").await else {
+        eprintln!(
+            "Skipping mongodb_integration_login_session_round_trips_with_its_version (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let id = unique_user_key("login-session");
+    assert!(backend.load_session(&id).await.unwrap().is_none());
+
+    let saved = backend
+        .save_session(&login_session(&id), Some(0))
+        .await
+        .unwrap();
+    assert_eq!(saved, SaveOutcome::Saved(1));
+
+    let loaded = backend.load_session(&id).await.unwrap().unwrap();
+    assert_eq!(loaded.version, 1);
+    assert_eq!(loaded.access_token, "at-1");
+    assert_eq!(loaded.principal.display(), "Demo User");
+
+    let mut newer = loaded.clone();
+    newer.access_token = "at-2".to_string();
+    assert_eq!(
+        backend.save_session(&newer, Some(1)).await.unwrap(),
+        SaveOutcome::Saved(2)
+    );
+    assert_eq!(
+        backend
+            .load_session(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .access_token,
+        "at-2"
+    );
+    backend.delete_session(&id).await.unwrap();
+    assert!(backend.load_session(&id).await.unwrap().is_none());
+    backend.delete_session(&id).await.unwrap();
+}
+
+#[tokio::test]
+async fn mongodb_integration_login_session_stale_version_is_a_conflict() {
+    use helios_auth::{SaveOutcome, SessionPersistence};
+    let Some(backend) = settings_mongo::backend("login_conflict").await else {
+        eprintln!(
+            "Skipping mongodb_integration_login_session_stale_version_is_a_conflict (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let id = unique_user_key("login-conflict");
+    backend
+        .save_session(&login_session(&id), Some(0))
+        .await
+        .unwrap();
+    let mut stale = login_session(&id);
+    stale.access_token = "at-stale".to_string();
+    assert_eq!(
+        backend.save_session(&stale, Some(0)).await.unwrap(),
+        SaveOutcome::Conflict { current: 1 }
+    );
+    assert_eq!(
+        backend.save_session(&stale, Some(7)).await.unwrap(),
+        SaveOutcome::Conflict { current: 1 }
+    );
+    assert_eq!(
+        backend
+            .load_session(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .access_token,
+        "at-1"
+    );
+    let missing = unique_user_key("login-missing");
+    assert_eq!(
+        backend
+            .save_session(&login_session(&missing), Some(1))
+            .await
+            .unwrap(),
+        SaveOutcome::Conflict { current: 0 }
+    );
+    assert_eq!(
+        backend.save_session(&stale, None).await.unwrap(),
+        SaveOutcome::Saved(2)
+    );
+    backend.delete_session(&id).await.unwrap();
+}
+
+#[tokio::test]
+async fn mongodb_integration_pending_login_is_consumed_exactly_once_and_kinds_do_not_cross() {
+    use helios_auth::SessionPersistence;
+    let Some(backend) = settings_mongo::backend("login_pending").await else {
+        eprintln!(
+            "Skipping mongodb_integration_pending_login_is_consumed_exactly_once_and_kinds_do_not_cross (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let id = unique_user_key("pending");
+    backend.save_pending(&pending_login(&id)).await.unwrap();
+    let loaded = backend.load_pending(&id).await.unwrap().unwrap();
+    assert_eq!(loaded.state, "state-1");
+    assert_eq!(loaded.next, "/ui/resources");
+    assert!(backend.load_session(&id).await.unwrap().is_none());
+    backend.delete_session(&id).await.unwrap();
+    assert!(backend.load_pending(&id).await.unwrap().is_some());
+
+    assert!(backend.delete_pending(&id).await.unwrap());
+    assert!(!backend.delete_pending(&id).await.unwrap());
+    assert!(backend.load_pending(&id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn mongodb_integration_login_sweep_drops_only_what_has_expired() {
+    use helios_auth::SessionPersistence;
+    let Some(backend) = settings_mongo::backend("login_sweep").await else {
+        eprintln!(
+            "Skipping mongodb_integration_login_sweep_drops_only_what_has_expired (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let idle_id = unique_user_key("sweep-idle");
+    let live_id = unique_user_key("sweep-live");
+    let old_id = unique_user_key("sweep-old");
+    let fresh_id = unique_user_key("sweep-fresh");
+    let mut idle = login_session(&idle_id);
+    idle.last_seen = chrono::Utc::now() - chrono::TimeDelta::hours(9);
+    backend.save_session(&idle, None).await.unwrap();
+    backend
+        .save_session(&login_session(&live_id), None)
+        .await
+        .unwrap();
+    let mut old = pending_login(&old_id);
+    old.started_at = chrono::Utc::now() - chrono::TimeDelta::minutes(11);
+    backend.save_pending(&old).await.unwrap();
+    backend
+        .save_pending(&pending_login(&fresh_id))
+        .await
+        .unwrap();
+
+    // Other tests share the collection, so only what this test planted is
+    // asserted on, not the count.
+    backend.sweep(chrono::Utc::now()).await.unwrap();
+    assert!(backend.load_session(&idle_id).await.unwrap().is_none());
+    assert!(backend.load_session(&live_id).await.unwrap().is_some());
+    assert!(backend.load_pending(&old_id).await.unwrap().is_none());
+    assert!(backend.load_pending(&fresh_id).await.unwrap().is_some());
+    backend.delete_session(&live_id).await.unwrap();
+    backend.delete_pending(&fresh_id).await.unwrap();
+}
+
 #[tokio::test]
 async fn mongodb_integration_settings_get_missing_is_none() {
     let Some(backend) = settings_mongo::backend("settings_missing").await else {
@@ -12736,7 +12959,10 @@ mod bulk_submit {
             .await
             .unwrap()
             .expect("schema version document");
-        assert_eq!(schema_version.get_i32("version").unwrap(), 10_i32);
+        assert_eq!(
+            schema_version.get_i32("version").unwrap(),
+            helios_persistence::backends::mongodb::SCHEMA_VERSION
+        );
 
         let receipt_indexes: Vec<_> = entry_results
             .list_indexes()
@@ -16763,6 +16989,605 @@ async fn mongodb_integration_composite_multi_batch_driver_paging() {
         .await
         .expect("search_count must agree with search on the same multi-batch query");
     assert_eq!(count as usize, MATCHING);
+}
+
+/// #1394: `ifNoneExist` inside a MongoDB transaction with search offloaded
+/// goes through the shared conditional builder, exactly like `If-None-Exist`
+/// on the resource endpoint. The scan only evaluates `_id`, `_lastUpdated`
+/// and plain `identifier` values against the raw `resources` documents; every
+/// other shape is rejected, never silently ignored or silently unmatched.
+///
+/// All tests below run on an offloaded backend against the harness's own
+/// single-node replica-set container, so multi-document transactions really
+/// execute (see [`process_transaction_or_skip`]).
+/// Builds an offloaded backend: no `search_index` rows, so the in-transaction
+/// resolver takes the raw-document scan.
+async fn i1394r1_offloaded_backend(test_name: &str) -> Option<MongoBackend> {
+    create_backend_with_search_offloaded(test_name, true).await
+}
+
+fn i1394r1_tenant(label: &str) -> TenantContext {
+    create_tenant(&format!("i1394r1-{label}"))
+}
+
+fn i1394r1_patient(family: &str, identifier_value: &str) -> serde_json::Value {
+    json!({
+        "resourceType": "Patient",
+        "identifier": [{"system": "http://example.org/mrn", "value": identifier_value}],
+        "name": [{"family": family}]
+    })
+}
+
+fn i1394r1_create_entry(family: &str, identifier_value: &str, criteria: &str) -> BundleEntry {
+    BundleEntry {
+        method: BundleMethod::Post,
+        url: "Patient".to_string(),
+        resource: Some(i1394r1_patient(family, identifier_value)),
+        if_match: None,
+        if_none_match: None,
+        if_none_exist: Some(criteria.to_string()),
+        full_url: Some(format!("urn:uuid:i1394r1-{family}")),
+    }
+}
+
+async fn i1394r1_seed(
+    backend: &MongoBackend,
+    tenant: &TenantContext,
+    family: &str,
+    identifier_value: &str,
+) {
+    backend
+        .create(
+            tenant,
+            "Patient",
+            i1394r1_patient(family, identifier_value),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed patient");
+}
+
+async fn i1394r1_patient_count(backend: &MongoBackend, tenant: &TenantContext) -> u64 {
+    // `count` reads the raw `resources` documents; `search` would consult the
+    // local `search_index`, which stays empty when search is offloaded.
+    backend
+        .count(tenant, Some("Patient"))
+        .await
+        .expect("count patients")
+}
+
+/// A `_lastUpdated` criterion with a future prefix matches nothing, so the
+/// entry is created. Before the fix the scan silently ignored `_lastUpdated`,
+/// matched the whole type and answered 200 without creating.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_prefixed_last_updated_creates() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_last_updated").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_prefixed_last_updated_creates (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("last-updated");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![i1394r1_create_entry(
+            "New",
+            "MRN-NEW-1",
+            "_lastUpdated=ge9999-01-01",
+        )],
+        "i1394r1_offloaded_if_none_exist_prefixed_last_updated_creates",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 201);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 2);
+}
+
+/// An OR-list over `identifier` matches when any alternative does, so the
+/// entry is answered from the match. Before the fix the raw comma string
+/// matched nothing and the entry was duplicated.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_identifier_or_list_matches() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_or_list").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_identifier_or_list_matches (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("or-list");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![i1394r1_create_entry(
+            "Duplicate",
+            "MRN-OTHER",
+            "identifier=MRN-BASE-1,OTHER",
+        )],
+        "i1394r1_offloaded_if_none_exist_identifier_or_list_matches",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 200);
+    assert_eq!(result.entries[0].effect, BundleEntryEffect::NoOp);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// A system-less `|code` criterion matches an identifier carrying any system,
+/// so the entry is answered from the seeded match instead of being created.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_identifier_any_system_matches() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_any_system").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_identifier_any_system_matches (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("any-system");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![i1394r1_create_entry(
+            "Duplicate",
+            "MRN-OTHER",
+            "identifier=|MRN-BASE-1",
+        )],
+        "i1394r1_offloaded_if_none_exist_identifier_any_system_matches",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 200);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// An unknown parameter rolls the bundle back instead of being ignored.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_unknown_parameter_fails() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_unknown").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_unknown_parameter_fails (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("unknown");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let err = backend
+        .process_transaction(
+            &tenant,
+            vec![i1394r1_create_entry("New", "MRN-NEW-1", "nickname=Seeded")],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("an unknown ifNoneExist parameter must fail the bundle");
+    assert!(
+        matches!(err, TransactionError::BundleError { index: 0, .. }),
+        "the failure must surface as a BundleError at entry 0, got: {err}"
+    );
+    assert!(
+        err.to_string().contains("'nickname'"),
+        "the error must name the parameter, got: {err}"
+    );
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// A modifier the raw scan cannot evaluate rolls the bundle back. A bare
+/// modifier on `identifier` is rejected by the shared builder with the same
+/// rule direct search applies.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_modifier_fails() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_modifier").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_modifier_fails (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("modifier");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let err = backend
+        .process_transaction(
+            &tenant,
+            vec![i1394r1_create_entry(
+                "New",
+                "MRN-NEW-1",
+                "identifier:missing=true",
+            )],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("an unscoped :missing modifier must fail the bundle");
+    assert!(
+        matches!(err, TransactionError::BundleError { index: 0, .. }),
+        "the failure must surface as a BundleError at entry 0, got: {err}"
+    );
+    assert!(
+        err.to_string()
+            .contains("unsupported modifier 'missing' for parameter type 'token'"),
+        "the error must name the modifier and parameter type, got: {err}"
+    );
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// An empty criterion value rolls the bundle back instead of widening the
+/// match to the whole type.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_empty_value_fails() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_empty").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_empty_value_fails (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("empty");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let err = backend
+        .process_transaction(
+            &tenant,
+            vec![i1394r1_create_entry("New", "MRN-NEW-1", "identifier=")],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("an empty ifNoneExist value must fail the bundle");
+    assert!(
+        matches!(err, TransactionError::BundleError { index: 0, .. }),
+        "the failure must surface as a BundleError at entry 0, got: {err}"
+    );
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// Result-shaping parameters are not criteria: with nothing else left, the
+/// entry is created (no match), exactly as on the endpoint path.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_result_only_creates() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_result_only").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_result_only_creates (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("result-only");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![i1394r1_create_entry("New", "MRN-NEW-1", "_format=json")],
+        "i1394r1_offloaded_if_none_exist_result_only_creates",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 201);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 2);
+}
+
+/// Repeated parameters AND: both must hold for a match, so a half-matching
+/// entry is created.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_repeated_params_and() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_and").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_repeated_params_and (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("and");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![i1394r1_create_entry(
+            "New",
+            "MRN-NEW-1",
+            "identifier=MRN-BASE-1&identifier=MRN-ABSENT",
+        )],
+        "i1394r1_offloaded_if_none_exist_repeated_params_and",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 201);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 2);
+}
+
+/// Positive control: a supported `system|code` identifier criterion matches
+/// and the entry is answered from the existing resource.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_identifier_matches() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_identifier").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_identifier_matches (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("identifier");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![i1394r1_create_entry(
+            "Duplicate",
+            "MRN-OTHER",
+            "identifier=http://example.org/mrn|MRN-BASE-1",
+        )],
+        "i1394r1_offloaded_if_none_exist_identifier_matches",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 200);
+    assert_eq!(result.entries[0].effect, BundleEntryEffect::NoOp);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// An invalid `_lastUpdated` value rolls the bundle back with a
+/// `BundleError` instead of matching or creating: the date parses nowhere,
+/// so nothing is written.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_invalid_last_updated_fails() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_bad_date").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_invalid_last_updated_fails (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("bad-date");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let err = backend
+        .process_transaction(
+            &tenant,
+            vec![i1394r1_create_entry(
+                "New",
+                "MRN-NEW-1",
+                "_lastUpdated=not-a-date",
+            )],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("an invalid _lastUpdated value must fail the bundle");
+    assert!(
+        matches!(err, TransactionError::BundleError { index: 0, .. }),
+        "the failure must surface as a BundleError at entry 0, got: {err}"
+    );
+    assert!(
+        err.to_string().contains("_lastUpdated"),
+        "the error must name the parameter, got: {err}"
+    );
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// A registered but unevaluatable parameter rolls the bundle back instead of
+/// being ignored: `family` never widens into a whole-type match.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_registered_string_fails() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_family").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_registered_string_fails (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("family");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let err = backend
+        .process_transaction(
+            &tenant,
+            vec![i1394r1_create_entry("New", "MRN-NEW-1", "family=Seeded")],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("a registered but unevaluatable parameter must fail the bundle");
+    assert!(
+        matches!(err, TransactionError::BundleError { index: 0, .. }),
+        "the failure must surface as a BundleError at entry 0, got: {err}"
+    );
+    assert!(
+        err.to_string().contains("'family'"),
+        "the error must name the parameter, got: {err}"
+    );
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// A `system|` value with an empty code is not a usable identifier criterion,
+/// so the bundle rolls back instead of matching or creating.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_identifier_empty_code_fails() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_empty_code").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_identifier_empty_code_fails (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("empty-code");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let err = backend
+        .process_transaction(
+            &tenant,
+            vec![i1394r1_create_entry(
+                "New",
+                "MRN-NEW-1",
+                "identifier=http://example.org/mrn|",
+            )],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("an identifier with an empty code must fail the bundle");
+    assert!(
+        matches!(err, TransactionError::BundleError { index: 0, .. }),
+        "the failure must surface as a BundleError at entry 0, got: {err}"
+    );
+    assert!(
+        err.to_string().contains("'identifier'"),
+        "the error must name the parameter, got: {err}"
+    );
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// A value with more than one pipe is not a `system|code` pair the raw scan
+/// can evaluate, so the bundle rolls back.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_identifier_multi_pipe_fails() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_multi_pipe").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_identifier_multi_pipe_fails (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("multi-pipe");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let err = backend
+        .process_transaction(
+            &tenant,
+            vec![i1394r1_create_entry("New", "MRN-NEW-1", "identifier=a|b|c")],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("an identifier with more than one pipe must fail the bundle");
+    assert!(
+        matches!(err, TransactionError::BundleError { index: 0, .. }),
+        "the failure must surface as a BundleError at entry 0, got: {err}"
+    );
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// Tenant isolation: an identifier living in another tenant must not
+/// suppress a create. The scan filters on `tenant_id`, so the entry in
+/// tenant B is created even though tenant A holds the same identifier.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_tenant_isolation_creates() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_tenant_iso").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_tenant_isolation_creates (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant_a = i1394r1_tenant("iso-a");
+    let tenant_b = i1394r1_tenant("iso-b");
+    i1394r1_seed(&backend, &tenant_a, "Seeded", "MRN-BASE-1").await;
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant_b,
+        vec![i1394r1_create_entry(
+            "New",
+            "MRN-NEW-1",
+            "identifier=MRN-BASE-1",
+        )],
+        "i1394r1_offloaded_if_none_exist_tenant_isolation_creates",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 201);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant_b).await, 1);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant_a).await, 1);
+}
+
+/// Read-your-writes: two entries in one bundle, where the second entry's
+/// `ifNoneExist` matches the resource the first entry created. The scan
+/// runs inside the transaction session, so it sees the pending write and
+/// answers the second entry from it instead of creating a duplicate.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_read_your_writes_matches() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_ryw").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_read_your_writes_matches (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("ryw");
+
+    let create = BundleEntry {
+        method: BundleMethod::Post,
+        url: "Patient".to_string(),
+        resource: Some(i1394r1_patient("First", "MRN-NEW-1")),
+        if_match: None,
+        if_none_match: None,
+        if_none_exist: None,
+        full_url: Some("urn:uuid:i1394r1-ryw-first".to_string()),
+    };
+    let conditional = i1394r1_create_entry("Second", "MRN-OTHER", "identifier=MRN-NEW-1");
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![create, conditional],
+        "i1394r1_offloaded_if_none_exist_read_your_writes_matches",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 201);
+    assert_eq!(result.entries[1].status, 200);
+    assert_eq!(result.entries[1].effect, BundleEntryEffect::NoOp);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// A comma-separated `_id` list matches when any alternative does: the
+/// seeded id is present, so the entry is answered from the match instead
+/// of creating a duplicate. `_id` reuses the resource-level predicate
+/// direct search builds (`$in`), evaluated against the raw documents.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_id_or_list_matches() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_id_list").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_id_or_list_matches (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("id-list");
+    let seeded = backend
+        .create(
+            &tenant,
+            "Patient",
+            i1394r1_patient("Seeded", "MRN-BASE-1"),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed patient");
+    let real_id = seeded.id().to_string();
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![i1394r1_create_entry(
+            "Duplicate",
+            "MRN-OTHER",
+            &format!("_id=absent,{real_id}"),
+        )],
+        "i1394r1_offloaded_if_none_exist_id_or_list_matches",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 200);
+    assert_eq!(result.entries[0].effect, BundleEntryEffect::NoOp);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
 }
 
 /// The backend-agnostic contract of the secondary sync failure ledger
