@@ -2926,6 +2926,14 @@ impl ReindexOnFinish {
         self
     }
 
+    /// The byte cap this hook's rebuild runs use (`0` = count only). Exposed
+    /// so a caller — or a test, without downcasting the `Arc<dyn
+    /// DeferredReindexHook>` this type is usually erased behind — can confirm
+    /// what `with_batch_bytes` actually set (#1499).
+    pub fn batch_bytes(&self) -> u64 {
+        self.options.batch_bytes
+    }
+
     async fn enqueue(
         &self,
         tenant: &crate::tenant::TenantContext,
