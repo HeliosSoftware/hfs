@@ -1076,6 +1076,65 @@ async fn test_minio_pending_login_is_consumed_exactly_once() {
     assert!(backend.load_pending(&id).await.unwrap().is_none());
 }
 
+// ── Identifier-scoped conditional create (#1435) ─────────────────────────
+
+/// Against a real store: the first `If-None-Exist` on an identifier creates,
+/// the next answers the resource it created, two live matches are a
+/// `MultipleMatches`, and a criterion the scan cannot evaluate is refused.
+#[tokio::test]
+async fn test_minio_conditional_create_by_identifier() {
+    use helios_persistence::core::{ConditionalCreateResult, ConditionalStorage};
+
+    if skip_if_disabled("test_minio_conditional_create_by_identifier") {
+        return;
+    }
+    let harness = make_prefix_backend("conditional-create").await;
+    let backend = &harness.backend;
+    let t = tenant("tenant-cc");
+    let mrn = format!("mrn-{}", Uuid::new_v4().simple());
+    let patient = json!({
+        "resourceType": "Patient",
+        "identifier": [{"system": "http://example.org/mrn", "value": mrn}],
+        "active": true
+    });
+    let criteria = format!("identifier=http%3A%2F%2Fexample.org%2Fmrn%7C{mrn}");
+
+    let created = match backend
+        .conditional_create(&t, "Patient", patient.clone(), &criteria, FhirVersion::R4)
+        .await
+        .unwrap()
+    {
+        ConditionalCreateResult::Created(stored) => stored,
+        other => panic!("expected Created, got {other:?}"),
+    };
+    match backend
+        .conditional_create(&t, "Patient", patient.clone(), &criteria, FhirVersion::R4)
+        .await
+        .unwrap()
+    {
+        ConditionalCreateResult::Exists(stored) => assert_eq!(stored.id(), created.id()),
+        other => panic!("expected Exists, got {other:?}"),
+    }
+
+    backend
+        .create(&t, "Patient", patient.clone(), FhirVersion::R4)
+        .await
+        .unwrap();
+    assert!(matches!(
+        backend
+            .conditional_create(&t, "Patient", patient.clone(), &criteria, FhirVersion::R4)
+            .await
+            .unwrap(),
+        ConditionalCreateResult::MultipleMatches(2)
+    ));
+
+    let err = backend
+        .conditional_create(&t, "Patient", patient, "active=true", FhirVersion::R4)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StorageError::Search(_)), "{err:?}");
+}
+
 #[tokio::test]
 async fn test_minio_settings_round_trip() {
     if skip_if_disabled("test_minio_settings_round_trip") {
