@@ -99,6 +99,18 @@ pub struct MongoBackend {
     /// `&self`; never held across an `.await`.
     search_index_tx:
         Arc<tokio::sync::Mutex<Option<tokio::sync::watch::Sender<Option<BuildOutcome>>>>>,
+    /// Rayon pool for `$reindex` sub-batch extraction; built lazily and only
+    /// on a multi-thread runtime (#1403). `Err` remembers a failed build so
+    /// the one warning fires once.
+    prepare_pool: std::sync::OnceLock<Result<rayon::ThreadPool, String>>,
+    /// The one-permit admission gate for `prepare_pool` (#1403).
+    prepare_gate: tokio::sync::Semaphore,
+    /// Whether `mongodb reindex writer configuration` has already been logged
+    /// for this instance (#1403).
+    reindex_mode_logged: std::sync::atomic::AtomicBool,
+    /// `(resources, docs)` of each resource type's previous successful
+    /// overlapped page, for the sub-batch planner's seed (#1403).
+    reindex_docs_per_resource: std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>>,
 }
 
 impl Debug for MongoBackend {
@@ -107,6 +119,67 @@ impl Debug for MongoBackend {
             .field("config", &self.config)
             .field("base_registry_len", &self.registries.base().read().len())
             .finish_non_exhaustive()
+    }
+}
+
+impl MongoBackend {
+    /// The rayon pool for `$reindex` sub-batch extraction, or `None` when the
+    /// resolved width is below 2 or the pool failed to build (#1403). Built
+    /// lazily, once per backend instance. Callers must only call this on a
+    /// multi-thread Tokio runtime.
+    pub(super) fn reindex_prepare_pool(&self) -> Option<&rayon::ThreadPool> {
+        if super::reindex_pipeline::resolve_prepare_width(self.config.reindex_prepare_threads) < 2 {
+            return None;
+        }
+        self.prepare_pool
+            .get_or_init(|| {
+                let width = super::reindex_pipeline::resolve_prepare_width(
+                    self.config.reindex_prepare_threads,
+                );
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(width)
+                    .thread_name(|i| format!("hfs-mongo-reindex-{i}"))
+                    .build()
+                    .map_err(|e| {
+                        let message = format!(
+                            "Failed to build the MongoDB reindex prepare pool; reindex sub-batches will be extracted on the calling thread: {e}"
+                        );
+                        tracing::warn!("{message}");
+                        message
+                    })
+            })
+            .as_ref()
+            .ok()
+    }
+
+    /// The one-permit admission gate for [`Self::reindex_prepare_pool`] (#1403).
+    pub(super) fn reindex_prepare_gate(&self) -> &tokio::sync::Semaphore {
+        &self.prepare_gate
+    }
+
+    /// `(resources, docs)` of this type's previous successful overlapped
+    /// page, if any (#1403).
+    pub(super) fn reindex_docs_seed(&self, resource_type: &str) -> Option<(u64, u64)> {
+        self.reindex_docs_per_resource
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(resource_type)
+            .copied()
+    }
+
+    /// Records `(resources, docs)` for a successful single-type overlapped
+    /// page (#1403).
+    pub(super) fn record_reindex_docs(&self, resource_type: &str, resources: u64, docs: u64) {
+        self.reindex_docs_per_resource
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(resource_type.to_string(), (resources, docs));
+    }
+
+    /// Whether `mongodb reindex writer configuration` has already been logged
+    /// for this backend instance (#1403).
+    pub(super) fn reindex_mode_logged(&self) -> &std::sync::atomic::AtomicBool {
+        &self.reindex_mode_logged
     }
 }
 
@@ -191,6 +264,67 @@ pub struct MongoBackendConfig {
     /// tests construct a shorter one directly.
     #[serde(default = "default_reindex_catch_up_margin_ms")]
     pub reindex_catch_up_margin_ms: u64,
+
+    /// Overlaps search-parameter extraction with `search_index` inserts
+    /// inside a `$reindex` page (#1403; `HFS_MONGODB_REINDEX_OVERLAP`).
+    /// `false` restores the serial writer.
+    #[serde(default = "default_reindex_overlap")]
+    pub reindex_overlap: bool,
+    /// Extraction threads for `$reindex` pages (#1403;
+    /// `HFS_MONGODB_REINDEX_PREPARE_THREADS`); `0` = cores − 1 clamped to
+    /// 1..=4, `1` = the page's own thread, `N` = `min(N, 64)`.
+    #[serde(default)]
+    pub reindex_prepare_threads: usize,
+    /// Lets the reindex driver fetch the next id-phase page while it writes
+    /// the current one (#1403; `HFS_MONGODB_REINDEX_PREFETCH`). Never used
+    /// when search is offloaded.
+    #[serde(default = "default_reindex_prefetch")]
+    pub reindex_prefetch: bool,
+}
+
+impl MongoBackendConfig {
+    /// Applies `HFS_MONGODB_REINDEX_{OVERLAP,PREPARE_THREADS,PREFETCH}` from
+    /// `env` (#1403). Each value is trimmed; an unset variable, or one empty
+    /// after trimming, leaves its field unchanged. Booleans accept
+    /// `true|1|yes|on` / `false|0|no|off`, case-insensitively; anything else
+    /// is an `Err` naming the variable. The thread count parses as `usize`;
+    /// values above 64 are accepted here and clamped later by
+    /// `resolve_prepare_width`.
+    pub fn apply_reindex_env(
+        &mut self,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<(), String> {
+        fn parse_bool(name: &str, raw: &str) -> Result<bool, String> {
+            match raw.to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" | "on" => Ok(true),
+                "false" | "0" | "no" | "off" => Ok(false),
+                _ => Err(format!("{name} must be true or false; got {raw:?}")),
+            }
+        }
+        if let Some(raw) = env("HFS_MONGODB_REINDEX_OVERLAP") {
+            let raw = raw.trim();
+            if !raw.is_empty() {
+                self.reindex_overlap = parse_bool("HFS_MONGODB_REINDEX_OVERLAP", raw)?;
+            }
+        }
+        if let Some(raw) = env("HFS_MONGODB_REINDEX_PREPARE_THREADS") {
+            let raw = raw.trim();
+            if !raw.is_empty() {
+                self.reindex_prepare_threads = raw.parse::<usize>().map_err(|_| {
+                    format!(
+                        "HFS_MONGODB_REINDEX_PREPARE_THREADS must be a non-negative integer; got {raw:?}"
+                    )
+                })?;
+            }
+        }
+        if let Some(raw) = env("HFS_MONGODB_REINDEX_PREFETCH") {
+            let raw = raw.trim();
+            if !raw.is_empty() {
+                self.reindex_prefetch = parse_bool("HFS_MONGODB_REINDEX_PREFETCH", raw)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn default_connection_string() -> String {
@@ -225,6 +359,14 @@ fn default_reindex_catch_up_margin_ms() -> u64 {
     120_000
 }
 
+fn default_reindex_overlap() -> bool {
+    true
+}
+
+fn default_reindex_prefetch() -> bool {
+    true
+}
+
 impl Default for MongoBackendConfig {
     fn default() -> Self {
         Self {
@@ -240,6 +382,9 @@ impl Default for MongoBackendConfig {
             app_name: default_app_name(),
             index_build: IndexBuildMode::default(),
             reindex_catch_up_margin_ms: default_reindex_catch_up_margin_ms(),
+            reindex_overlap: default_reindex_overlap(),
+            reindex_prepare_threads: 0,
+            reindex_prefetch: default_reindex_prefetch(),
         }
     }
 }
@@ -329,6 +474,10 @@ impl MongoBackend {
             stored_by_tenant,
             search_index_rx,
             search_index_tx: Arc::new(tokio::sync::Mutex::new(Some(search_index_tx))),
+            prepare_pool: std::sync::OnceLock::new(),
+            prepare_gate: tokio::sync::Semaphore::new(1),
+            reindex_mode_logged: std::sync::atomic::AtomicBool::new(false),
+            reindex_docs_per_resource: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -352,6 +501,9 @@ impl MongoBackend {
     /// - `HFS_MONGODB_CONNECT_TIMEOUT_MS` (default: `5000`)
     /// - `HFS_MONGODB_MAX_INCLUDED_RESOURCES` (default: `1000`)
     /// - `HFS_MONGODB_INDEX_BUILD` (default: `background`; `inline` | `off`)
+    /// - `HFS_MONGODB_REINDEX_OVERLAP` (default: `true`)
+    /// - `HFS_MONGODB_REINDEX_PREPARE_THREADS` (default: `0` = cores − 1, 1–4)
+    /// - `HFS_MONGODB_REINDEX_PREFETCH` (default: `true`)
     pub fn from_env() -> StorageResult<Self> {
         let connection_string = std::env::var("HFS_MONGODB_URL")
             .or_else(|_| std::env::var("HFS_MONGODB_URI"))
@@ -385,7 +537,7 @@ impl MongoBackend {
             })
         })?;
 
-        let config = MongoBackendConfig {
+        let mut config = MongoBackendConfig {
             connection_string,
             database_name,
             max_connections,
@@ -394,6 +546,16 @@ impl MongoBackend {
             index_build,
             ..Default::default()
         };
+
+        config
+            .apply_reindex_env(|n| std::env::var(n).ok())
+            .map_err(|message| {
+                StorageError::Backend(BackendError::Internal {
+                    backend_name: "mongodb".to_string(),
+                    message,
+                    source: None,
+                })
+            })?;
 
         Self::new(config)
     }
@@ -1225,5 +1387,70 @@ mod tests {
         let err = MongoBackend::from_env().expect_err("invalid mode must be rejected");
         assert!(format!("{err}").contains("HFS_MONGODB_INDEX_BUILD"));
         unsafe { std::env::remove_var("HFS_MONGODB_INDEX_BUILD") };
+    }
+
+    #[test]
+    fn config_reindex_pipeline_defaults() {
+        let default = MongoBackendConfig::default();
+        assert!(default.reindex_overlap);
+        assert_eq!(default.reindex_prepare_threads, 0);
+        assert!(default.reindex_prefetch);
+
+        let from_empty: MongoBackendConfig =
+            serde_json::from_str("{}").expect("every field must have a serde default");
+        assert!(from_empty.reindex_overlap);
+        assert_eq!(from_empty.reindex_prepare_threads, 0);
+        assert!(from_empty.reindex_prefetch);
+    }
+
+    #[test]
+    fn apply_reindex_env_reads_and_rejects() {
+        let mut config = MongoBackendConfig::default();
+        config
+            .apply_reindex_env(|name| match name {
+                "HFS_MONGODB_REINDEX_OVERLAP" => Some(" On ".to_string()),
+                "HFS_MONGODB_REINDEX_PREPARE_THREADS" => Some("8".to_string()),
+                _ => None,
+            })
+            .expect("valid values");
+        assert!(
+            config.reindex_overlap,
+            "\" On \" trims and parses case-insensitively"
+        );
+        assert_eq!(config.reindex_prepare_threads, 8);
+        assert!(
+            config.reindex_prefetch,
+            "an unset variable leaves the default"
+        );
+
+        let mut config = MongoBackendConfig {
+            reindex_prepare_threads: 3,
+            ..Default::default()
+        };
+        config
+            .apply_reindex_env(|name| match name {
+                "HFS_MONGODB_REINDEX_PREPARE_THREADS" => Some(String::new()),
+                _ => None,
+            })
+            .expect("an empty value leaves the field unchanged");
+        assert_eq!(config.reindex_prepare_threads, 3);
+
+        let mut config = MongoBackendConfig::default();
+        let err = config
+            .apply_reindex_env(|name| match name {
+                "HFS_MONGODB_REINDEX_PREPARE_THREADS" => Some("x".to_string()),
+                _ => None,
+            })
+            .expect_err("a non-integer must be rejected");
+        assert!(err.contains("HFS_MONGODB_REINDEX_PREPARE_THREADS"));
+
+        let mut config = MongoBackendConfig::default();
+        let err = config
+            .apply_reindex_env(|name| match name {
+                "HFS_MONGODB_REINDEX_OVERLAP" => Some("sideways".to_string()),
+                _ => None,
+            })
+            .expect_err("a non-boolean must be rejected");
+        assert!(err.contains("HFS_MONGODB_REINDEX_OVERLAP"));
     }
 }
