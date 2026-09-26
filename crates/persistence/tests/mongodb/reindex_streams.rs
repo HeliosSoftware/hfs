@@ -126,33 +126,16 @@ async fn mongodb_plan_type_walk_ranges_cover_the_id_phase() {
     assert!(catch_up.starts_with("v2|d|"), "{catch_up}");
 
     // A 1-byte cap takes exactly one resource per page; every page of a range
-    // continues that range, and each range ends on one empty page.
+    // continues that range, and each range ends on one empty page (checked by
+    // `walk_ids` itself).
     let mut seen = BTreeSet::new();
     for (i, range) in ranges.iter().enumerate() {
-        let mut cursor = range.clone();
-        let mut in_range: Vec<String> = Vec::new();
-        let mut ended = false;
-        for _ in 0..1_000 {
-            let page = backend
-                .fetch_resources_page_capped(&tenant, "Observation", Some(&cursor), 100, 1)
-                .await
-                .unwrap();
-            let page_ids = ids_of(&page);
-            match page.next_cursor {
-                Some(next) => {
-                    assert_eq!(page_ids.len(), 1, "range {i}: {page_ids:?}");
-                    in_range.extend(page_ids);
-                    cursor = next;
-                }
-                None => {
-                    assert!(page_ids.is_empty(), "range {i} ends on one empty page");
-                    ended = true;
-                    break;
-                }
-            }
+        let pages = walk_ids(&backend, &tenant, range, 100, 1).await;
+        assert!(!pages.is_empty(), "range {i} is empty");
+        for page in &pages {
+            assert_eq!(page.len(), 1, "range {i}: {page:?}");
         }
-        assert!(ended, "range {i} did not end within 1,000 pages");
-        assert!(!in_range.is_empty(), "range {i} is empty");
+        let in_range = pages.concat();
         assert!(
             in_range.windows(2).all(|w| w[0] < w[1]),
             "range {i} is not in id order"
@@ -220,10 +203,10 @@ async fn mongodb_plan_type_walk_fits_the_pool_and_the_type_size() {
                 "plan_ms"
             ]
         );
-        let tokens: Vec<&str> = line.split_whitespace().collect();
-        for expected in ["requested=4", "allowed=1", "resources=0", "streams=1"] {
-            assert!(tokens.contains(&expected), "{line}");
-        }
+        assert_eq!(log_field_value(line, "requested"), "4", "{line}");
+        assert_eq!(log_field_value(line, "allowed"), "1", "{line}");
+        assert_eq!(log_field_value(line, "resources"), "0", "{line}");
+        assert_eq!(log_field_value(line, "streams"), "1", "{line}");
     }
 
     // A pool of 10 shared by two rebuilds admits (10 - 2) / (2 * 2) = 2 streams.
@@ -264,14 +247,42 @@ async fn mongodb_plan_type_walk_fits_the_pool_and_the_type_size() {
     let needle = format!("tenant={}", tenant.tenant_id().as_str());
     let planned = walk_log_lines(&["mongodb reindex streams planned", &needle]);
     assert_eq!(planned.len(), 2, "{planned:?}");
-    let first: Vec<&str> = planned[0].split_whitespace().collect();
-    for expected in ["allowed=2", "resources=200", "streams=2"] {
-        assert!(first.contains(&expected), "{}", planned[0]);
-    }
-    let second: Vec<&str> = planned[1].split_whitespace().collect();
-    for expected in ["allowed=4", "resources=200", "streams=1"] {
-        assert!(second.contains(&expected), "{}", planned[1]);
-    }
+    assert_eq!(
+        log_field_value(&planned[0], "allowed"),
+        "2",
+        "{}",
+        planned[0]
+    );
+    assert_eq!(
+        log_field_value(&planned[0], "resources"),
+        "200",
+        "{}",
+        planned[0]
+    );
+    assert_eq!(
+        log_field_value(&planned[0], "streams"),
+        "2",
+        "{}",
+        planned[0]
+    );
+    assert_eq!(
+        log_field_value(&planned[1], "allowed"),
+        "4",
+        "{}",
+        planned[1]
+    );
+    assert_eq!(
+        log_field_value(&planned[1], "resources"),
+        "200",
+        "{}",
+        planned[1]
+    );
+    assert_eq!(
+        log_field_value(&planned[1], "streams"),
+        "1",
+        "{}",
+        planned[1]
+    );
 }
 
 #[tokio::test]
