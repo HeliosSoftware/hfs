@@ -725,6 +725,8 @@ impl ReindexProgress {
     /// [`MAX_REPORTED_RESOURCE_ERRORS`] failing resources, each with its error
     /// and whether it is retryable, so an operator can find the resources that
     /// are stored but not searchable without reading server logs.
+    /// `startedAt` and `completedAt` appear once set; their difference is how
+    /// long the rebuild took.
     pub fn to_parameters(&self) -> serde_json::Value {
         let mut parameter = vec![
             serde_json::json!({"name": "jobId", "valueString": self.job_id}),
@@ -735,6 +737,13 @@ impl ReindexProgress {
             serde_json::json!({"name": "errorCount", "valueInteger": self.errors.len()}),
             serde_json::json!({"name": "percentage", "valueDecimal": self.percentage()}),
         ];
+        if let Some(started_at) = &self.started_at {
+            parameter.push(serde_json::json!({"name": "startedAt", "valueDateTime": started_at}));
+        }
+        if let Some(completed_at) = &self.completed_at {
+            parameter
+                .push(serde_json::json!({"name": "completedAt", "valueDateTime": completed_at}));
+        }
         if let Some(message) = &self.error_message {
             parameter.push(serde_json::json!({"name": "errorMessage", "valueString": message}));
         }
@@ -4594,6 +4603,37 @@ mod tests {
 
         assert_eq!(params["resourceType"], "Parameters");
         assert!(params["parameter"].is_array());
+    }
+
+    #[test]
+    fn test_progress_to_parameters_reports_timestamps_once_set() {
+        let value = |params: &serde_json::Value, name: &str| {
+            params["parameter"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|parameter| parameter["name"] == name)
+                .map(|parameter| parameter["valueDateTime"].clone())
+        };
+        let mut progress = ReindexProgress::new("job-123");
+        let params = progress.to_parameters();
+        assert_eq!(value(&params, "startedAt"), None);
+        assert_eq!(value(&params, "completedAt"), None);
+
+        progress.started_at = Some("2026-09-25T10:00:00+00:00".to_string());
+        let params = progress.to_parameters();
+        assert_eq!(
+            value(&params, "startedAt"),
+            Some(serde_json::json!("2026-09-25T10:00:00+00:00"))
+        );
+        assert_eq!(value(&params, "completedAt"), None);
+
+        progress.completed_at = Some("2026-09-25T10:02:25+00:00".to_string());
+        let params = progress.to_parameters();
+        assert_eq!(
+            value(&params, "completedAt"),
+            Some(serde_json::json!("2026-09-25T10:02:25+00:00"))
+        );
     }
 
     #[test]
