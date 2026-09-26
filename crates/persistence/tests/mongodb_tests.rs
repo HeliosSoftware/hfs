@@ -14416,6 +14416,26 @@ mongodb_conditional_url_test!(
     mongodb_integration_conditional_put_honours_if_match,
     conditional_put_honours_if_match
 );
+mongodb_conditional_url_test!(
+    mongodb_integration_conditional_patch_updates_the_single_match,
+    conditional_patch_updates_the_single_match
+);
+mongodb_conditional_url_test!(
+    mongodb_integration_conditional_patch_with_no_match_fails_the_bundle,
+    conditional_patch_with_no_match_fails_the_bundle
+);
+mongodb_conditional_url_test!(
+    mongodb_integration_conditional_patch_with_several_matches_rolls_back,
+    conditional_patch_with_several_matches_rolls_back
+);
+mongodb_conditional_url_test!(
+    mongodb_integration_conditional_patch_honours_if_match,
+    conditional_patch_honours_if_match
+);
+mongodb_conditional_url_test!(
+    mongodb_integration_conditional_patch_overlapping_an_instance_entry_fails,
+    conditional_patch_overlapping_an_instance_entry_fails
+);
 
 /// A modifier is evaluated, not refused: the session-scoped matcher builds the
 /// same index filter direct search does, so `family:exact` finds the seeded

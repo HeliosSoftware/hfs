@@ -114,7 +114,11 @@ pub fn conditional_target(
         });
     }
     let resolved = matches.into_iter().next();
-    if let Some(raw) = entry.if_match.as_deref() {
+    // A conditional patch that matched nothing answers `404` whatever its
+    // `ifMatch`, as `PATCH [type]/[id]` and `ConditionalStorage::conditional_patch`
+    // do; the executor raises it (#1535).
+    let patch_without_match = matches!(entry.method, BundleMethod::Patch) && resolved.is_none();
+    if let Some(raw) = entry.if_match.as_deref().filter(|_| !patch_without_match) {
         let precondition_failed = |message: String| TransactionError::PreconditionFailed {
             index: entry_index,
             message,
@@ -281,7 +285,8 @@ pub fn unsupported_conditional_entry(index: usize, diagnostics: &str) -> Transac
 
 fn conditional_operation(method: BundleMethod) -> &'static str {
     match method {
-        BundleMethod::Put | BundleMethod::Patch => "update",
+        BundleMethod::Put => "update",
+        BundleMethod::Patch => "patch",
         BundleMethod::Delete => "delete",
         BundleMethod::Post => "create",
         BundleMethod::Get => "read",
@@ -729,7 +734,7 @@ mod tests {
         let matches = || vec![stored("Patient", "a"), stored("Patient", "b")];
         for (method, operation) in [
             (BundleMethod::Put, "update"),
-            (BundleMethod::Patch, "update"),
+            (BundleMethod::Patch, "patch"),
             (BundleMethod::Delete, "delete"),
             (BundleMethod::Post, "create"),
             (BundleMethod::Get, "read"),

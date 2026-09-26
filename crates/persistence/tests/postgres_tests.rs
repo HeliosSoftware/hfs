@@ -27188,6 +27188,26 @@ mod postgres_integration {
         postgres_integration_conditional_put_honours_if_match,
         conditional_put_honours_if_match
     );
+    pg_conditional_url_test!(
+        postgres_integration_conditional_patch_updates_the_single_match,
+        conditional_patch_updates_the_single_match
+    );
+    pg_conditional_url_test!(
+        postgres_integration_conditional_patch_with_no_match_fails_the_bundle,
+        conditional_patch_with_no_match_fails_the_bundle
+    );
+    pg_conditional_url_test!(
+        postgres_integration_conditional_patch_with_several_matches_rolls_back,
+        conditional_patch_with_several_matches_rolls_back
+    );
+    pg_conditional_url_test!(
+        postgres_integration_conditional_patch_honours_if_match,
+        conditional_patch_honours_if_match
+    );
+    pg_conditional_url_test!(
+        postgres_integration_conditional_patch_overlapping_an_instance_entry_fails,
+        conditional_patch_overlapping_an_instance_entry_fails
+    );
 
     pg_if_match_test!(
         postgres_integration_multi_valued_if_match_matches_any_member,

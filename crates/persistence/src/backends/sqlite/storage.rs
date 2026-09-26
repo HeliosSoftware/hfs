@@ -3764,7 +3764,28 @@ impl SqliteBackend {
                 Ok(BundleEntryResult::deleted())
             }
             BundleMethod::Patch => {
-                let (resource_type, id) = self.parse_url(&entry.url)?;
+                // A conditional patch (`PATCH [type]?[criteria]`) was resolved,
+                // and its `ifMatch` gated, in the pre-pass (#1535); an instance
+                // patch reads its row and gates here.
+                let (resource_type, existing, missing) = match target {
+                    Some(target) => (
+                        target.resource_type.clone(),
+                        target.resolved.clone(),
+                        format!("no {} matches {}", target.resource_type, entry.url),
+                    ),
+                    None => {
+                        let (resource_type, id) = self.parse_url(&entry.url)?;
+                        let existing = tx.read(&resource_type, &id).await?;
+                        if let Some(failure) = bundle_if_match_gate(
+                            entry.if_match.as_deref(),
+                            existing.as_ref().map(|r| r.version_id()),
+                        ) {
+                            return Ok(failure);
+                        }
+                        let missing = format!("{resource_type}/{id} not found");
+                        (resource_type, existing, missing)
+                    }
+                };
                 if resource_type == "AuditEvent" {
                     return Ok(BundleEntryResult::error(
                         405,
@@ -3774,19 +3795,12 @@ impl SqliteBackend {
                         }),
                     ));
                 }
-                let existing = tx.read(&resource_type, &id).await?;
-                if let Some(failure) = bundle_if_match_gate(
-                    entry.if_match.as_deref(),
-                    existing.as_ref().map(|r| r.version_id()),
-                ) {
-                    return Ok(failure);
-                }
                 let Some(existing) = existing else {
                     return Ok(BundleEntryResult::error(
                         404,
                         serde_json::json!({
                             "resourceType": "OperationOutcome",
-                            "issue": [{"severity": "error", "code": "not-found", "details": {"text": format!("{resource_type}/{id} not found")}}]
+                            "issue": [{"severity": "error", "code": "not-found", "details": {"text": missing}}]
                         }),
                     ));
                 };
