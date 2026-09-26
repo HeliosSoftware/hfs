@@ -272,9 +272,12 @@ Use these settings for the whole pass; do not restart HFS between T3 and T4:
 
 Without `REINDEX_REFRESH=false` the search rebuild in 7.4 is several times slower.
 
-Leave `HFS_BULK_SUBMIT_DEFER_INDEXING` at its default (`true`): the import stores first
-and the search index is rebuilt afterwards (7.4). If a row runs with `false`, record
-it in the matrix cell, because it changes what 7.4 and §14 measure.
+Leave `HFS_BULK_SUBMIT_DEFER_INDEXING` at its default (`true`) on rows without
+Elasticsearch: the import stores first and the search index is rebuilt afterwards
+(7.4). On `*-es` rows set `HFS_BULK_SUBMIT_DEFER_INDEXING=false` with
+`HFS_BULK_SUBMIT_INDEX_QUEUE=64`, `HFS_BULK_SUBMIT_INDEX_CONCURRENCY=8` and
+`HFS_BULK_SUBMIT_INDEX_COALESCE=4`, the settings of the #937 reference run (§14).
+Record the mode in the matrix cell, because it changes what 7.4 and §14 measure.
 
 ### Cost of the status page during T3
 
@@ -613,13 +616,13 @@ it — re-check `HFS_BASE_URL` against `HFS_SERVER_PORT` before filing.
 
 ### 7.4 Wait for the deferred search rebuild
 
-With `HFS_BULK_SUBMIT_DEFER_INDEXING=true` (this pass, section 5) the submission
-reports **Completed** once the resources are stored, and a separate job builds the
-search index afterwards. In the #1126 campaign it reported Completed with the index
-about 9 % built. Every count check belongs after this step.
+With `HFS_BULK_SUBMIT_DEFER_INDEXING=true` (rows without Elasticsearch, section 5) the
+submission reports **Completed** once the resources are stored, and a separate job
+builds the search index afterwards. In the #1126 campaign it reported Completed with
+the index about 9 % built. Every count check belongs after this step.
 
-With `DEFER_INDEXING=false` on a `*-es` backend the batches were indexed during ingest
-and the log says `bulk-submit indexed every resource during ingest; no deferred
+On `*-es` rows (`DEFER_INDEXING=false`, section 5) the batches were indexed during
+ingest and the log says `bulk-submit indexed every resource during ingest; no deferred
 reindex needed`; this step then only confirms there is nothing to wait for. Record
 which mode ran. The rest describes the default.
 
@@ -1302,6 +1305,8 @@ For each backend row, attach to the release issue:
   *Processing finished at …* (7.3).
 - **The T3 searchable time**: from the same start to the rebuild reaching `completed`
   (7.4), plus the rebuild's own elapsed time and its `$reindex-status` summary.
+- Reference (#937, `sqlite-es`): 18,955,865 resources in 4 h 36 m 47 s from creation
+  to Completed, searchable at that point, with the section 5 `*-es` settings.
 - **The final database size** and the resource count it holds:
 
   ```bash
