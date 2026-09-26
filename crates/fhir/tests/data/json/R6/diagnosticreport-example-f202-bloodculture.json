@@ -10,7 +10,7 @@
         "id": "f202",
         "text": {
           "status": "generated",
-          "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: DiagnosticReport f202\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"f202\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcf202\"\u003e \u003c/a\u003e\u003ch2\u003e\u003cspan title\u003d\"Codes:{http://snomed.info/sct 104177005}\"\u003eBlood culture for bacteria, including anaerobic screen\u003c/span\u003e (\u003cspan title\u003d\"Codes:{http://snomed.info/sct 15220000}, {http://terminology.hl7.org/CodeSystem/v2-0074 LAB}\"\u003eLaboratory test\u003c/span\u003e) \u003c/h2\u003e\u003ctable class\u003d\"grid\"\u003e\u003ctr\u003e\u003ctd\u003eSubject\u003c/td\u003e\u003ctd\u003eRoel(official) Male, DoB: 1960-03-13 ( BSN: 123456789 (use: official, ))\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003eReported\u003c/td\u003e\u003ctd\u003e2013-03-11T10:28:00+01:00\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003ePerformer\u003c/td\u003e\u003ctd\u003e \u003ca href\u003d\"organization-example-f201-aumc.html\"\u003eAUMC\u003c/a\u003e\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003cp\u003e\u003cb\u003eReport Details\u003c/b\u003e\u003c/p\u003e\u003ctable class\u003d\"grid\"\u003e\u003ctr\u003e\u003ctd\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eValue\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eFlags\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"observation-example-f206-staphylococcus.html\"\u003e\u003cspan title\u003d\"Codes:{http://acmelabs.org 104177}, {http://loinc.org 600-7}\"\u003eBlood culture\u003c/span\u003e\u003c/a\u003e\u003c/td\u003e\u003ctd\u003e\u003cspan title\u003d\"Codes:{http://snomed.info/sct 3092008}\"\u003eStaphylococcus aureus\u003c/span\u003e\u003c/td\u003e\u003ctd\u003eFinal, \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/v3-ObservationInterpretation POS}\"\u003ePositive\u003c/span\u003e\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003cdiv\u003e\u003cp\u003eBlood culture tested positive on staphylococcus aureus\u003c/p\u003e\n\u003c/div\u003e\u003cp\u003e\u003cb\u003eCoded Conclusions:\u003c/b\u003e\u003c/p\u003e\u003cul\u003e\u003cli/\u003e\u003c/ul\u003e\u003c/div\u003e"
+          "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: DiagnosticReport f202\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"f202\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcf202\"\u003e \u003c/a\u003e\u003ch2\u003e\u003cspan title\u003d\"Codes:{http://snomed.info/sct 104177005}\"\u003eBlood culture for bacteria, including anaerobic screen\u003c/span\u003e (\u003cspan title\u003d\"Codes:{http://snomed.info/sct 15220000}, {http://terminology.hl7.org/CodeSystem/v2-0074 LAB}\"\u003eLaboratory test\u003c/span\u003e) \u003c/h2\u003e\u003ctable class\u003d\"grid\"\u003e\u003ctr\u003e\u003ctd\u003eSubject\u003c/td\u003e\u003ctd\u003eRoel(official) Male, DoB: 1960-03-13 ( BSN: 123456789 (use: official, ))\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003eReported\u003c/td\u003e\u003ctd\u003e2013-03-11T10:28:00+01:00\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003ePerformer\u003c/td\u003e\u003ctd\u003e \u003ca href\u003d\"organization-example-f201-aumc.html\"\u003eAUMC\u003c/a\u003e\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003cp\u003e\u003cb\u003eReport Details\u003c/b\u003e\u003c/p\u003e\u003ctable class\u003d\"grid\"\u003e\u003ctr\u003e\u003ctd\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eValue\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eFlags\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"observation-example-f206-staphylococcus.html\"\u003e\u003cspan title\u003d\"Codes:{http://acmelabs.org 104177}, {http://loinc.org 600-7}\"\u003eBlood culture\u003c/span\u003e\u003c/a\u003e\u003c/td\u003e\u003ctd\u003e\u003cspan title\u003d\"Codes:{http://snomed.info/sct 3092008}\"\u003eStaphylococcus aureus\u003c/span\u003e\u003c/td\u003e\u003ctd\u003eFinal, \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/v3-ObservationInterpretation POS}\"\u003ePositive\u003c/span\u003e\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003cdiv\u003e\u003cp\u003eBlood culture tested positive on staphylococcus aureus\u003c/p\u003e\n\u003c/div\u003e\u003cp\u003e\u003cb\u003eCoded Conclusions:\u003c/b\u003e\u003c/p\u003e\u003cul\u003e\u003cli\u003e\u003cspan title\u003d\"Codes:{http://snomed.info/sct 428763004}\"\u003eBacteremia caused by Staphylococcus aureus\u003c/span\u003e\u003c/li\u003e\u003c/ul\u003e\u003c/div\u003e"
         },
         "basedOn": [
           {
@@ -61,7 +61,17 @@
         ],
         "conclusion": "Blood culture tested positive on staphylococcus aureus",
         "conclusionCode": [
-          null
+          {
+            "concept": {
+              "coding": [
+                {
+                  "system": "http://snomed.info/sct",
+                  "code": "428763004",
+                  "display": "Bacteremia caused by Staphylococcus aureus"
+                }
+              ]
+            }
+          }
         ]
       }
     },

@@ -36,6 +36,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::core::ResourceStorage;
+use crate::error::{BackendError, StorageError};
 
 use super::config::HealthConfig;
 
@@ -322,14 +323,47 @@ impl HealthMonitor {
             Ok(Ok(_)) => HealthCheckResult::Healthy {
                 response_time_ms: start.elapsed().as_millis() as u64,
             },
-            Ok(Err(_e)) => {
-                // Count might fail for non-existent resource type, but that's OK
-                // The important thing is that the backend responded
-                HealthCheckResult::Healthy {
-                    response_time_ms: start.elapsed().as_millis() as u64,
-                }
-            }
+            // The backend could not be reached or could not answer. Every
+            // error used to read as healthy here, on the theory that an error
+            // is still a response — but an unreachable or failing backend
+            // answers the probe with exactly this (#1382).
+            Ok(Err(e)) if Self::probe_error_is_outage(&e) => HealthCheckResult::Unhealthy {
+                error: match &e {
+                    // `Unavailable` does not display its detail.
+                    StorageError::Backend(BackendError::Unavailable { message, .. }) => {
+                        format!("{e}: {message}")
+                    }
+                    _ => e.to_string(),
+                },
+            },
+            // Anything else is the backend (or its configuration) declining
+            // this particular question, which takes a working backend: no
+            // backend counts a type that does not exist as an error, but one
+            // may have no place for the system tenant, or no `count` at all.
+            Ok(Err(_)) => HealthCheckResult::Healthy {
+                response_time_ms: start.elapsed().as_millis() as u64,
+            },
             Err(_) => HealthCheckResult::Timeout,
+        }
+    }
+
+    /// Whether a failed probe says the backend is down, rather than that it
+    /// would not answer this question.
+    ///
+    /// Backends retry transient failures themselves before reporting one —
+    /// Elasticsearch for up to ~300 ms of back-off over three attempts — which
+    /// stays well inside the default 5 s probe timeout, and a backend is only
+    /// marked unhealthy after `failure_threshold` consecutive failed probes, so
+    /// a slow but working backend is not taken for a failed one.
+    fn probe_error_is_outage(error: &StorageError) -> bool {
+        match error {
+            // A statement-level deadline or a missing capability is an answer
+            // from a backend that is up.
+            StorageError::Backend(
+                BackendError::Timeout { .. } | BackendError::UnsupportedCapability { .. },
+            ) => false,
+            StorageError::Backend(_) => true,
+            _ => false,
         }
     }
 
@@ -530,6 +564,54 @@ mod tests {
         assert_eq!(status.healthy_count(), 1);
         assert_eq!(status.unhealthy_count(), 1);
         assert!(status.degraded_backends.contains(&"unhealthy".to_string()));
+    }
+
+    /// What a failed probe says about the backend (#1382). The probe itself is
+    /// exercised against a stubbed cluster in
+    /// `tests/elasticsearch_storage_write_wiremock.rs`.
+    #[test]
+    fn test_probe_error_is_outage() {
+        let backend = |e: BackendError| StorageError::Backend(e);
+        let name = || "test".to_string();
+
+        assert!(HealthMonitor::probe_error_is_outage(&backend(
+            BackendError::Unavailable {
+                backend_name: name(),
+                message: "connection refused".to_string(),
+            }
+        )));
+        assert!(HealthMonitor::probe_error_is_outage(&backend(
+            BackendError::Internal {
+                backend_name: name(),
+                message: "Count failed after 3 attempts (status 503)".to_string(),
+                source: None,
+            }
+        )));
+        assert!(HealthMonitor::probe_error_is_outage(&backend(
+            BackendError::PoolExhausted {
+                backend_name: name(),
+            }
+        )));
+
+        // The backend is up; it declined the question.
+        assert!(!HealthMonitor::probe_error_is_outage(&backend(
+            BackendError::UnsupportedCapability {
+                backend_name: name(),
+                capability: "count".to_string(),
+            }
+        )));
+        assert!(!HealthMonitor::probe_error_is_outage(&backend(
+            BackendError::Timeout {
+                backend_name: name(),
+                message: "statement timeout".to_string(),
+            }
+        )));
+        // S3 in bucket-per-tenant mode with no system bucket configured.
+        assert!(!HealthMonitor::probe_error_is_outage(
+            &StorageError::Tenant(crate::error::TenantError::InvalidTenant {
+                tenant_id: crate::tenant::TenantId::system(),
+            })
+        ));
     }
 
     #[test]

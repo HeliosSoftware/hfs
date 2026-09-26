@@ -293,6 +293,12 @@ pub struct BulkExportConfig {
     pub disable_local_worker: bool,
     /// Cap on simultaneous in-flight jobs per tenant.
     pub max_concurrent_per_tenant: u32,
+    /// Cap on how many times one job may be claimed by a worker.
+    ///
+    /// A job whose lease expires mid-run is reclaimable; once its claims would
+    /// exceed this cap the claim path retires it with an error instead of
+    /// handing it to yet another worker (#1041).
+    pub max_attempts: u32,
     /// Resources per `fetch_export_batch` call.
     pub batch_size: u32,
     /// Initial lease length issued at claim, in seconds.
@@ -323,6 +329,7 @@ impl Default for BulkExportConfig {
             worker_concurrency: 2,
             disable_local_worker: false,
             max_concurrent_per_tenant: 4,
+            max_attempts: 3,
             batch_size: 1000,
             lease_duration_secs: 60,
             heartbeat_interval_secs: 20,
@@ -375,6 +382,7 @@ impl BulkExportConfig {
                 "HFS_BULK_EXPORT_MAX_CONCURRENT_PER_TENANT",
                 d.max_concurrent_per_tenant,
             ),
+            max_attempts: env_u32("HFS_BULK_EXPORT_MAX_ATTEMPTS", d.max_attempts),
             batch_size: env_u32("HFS_BULK_EXPORT_BATCH_SIZE", d.batch_size),
             lease_duration_secs: env_u64("HFS_BULK_EXPORT_LEASE_DURATION", d.lease_duration_secs),
             heartbeat_interval_secs: env_u64(
@@ -429,6 +437,9 @@ impl BulkExportConfig {
         }
         if self.max_concurrent_per_tenant == 0 {
             errors.push("HFS_BULK_EXPORT_MAX_CONCURRENT_PER_TENANT must be >= 1".to_string());
+        }
+        if self.max_attempts == 0 {
+            errors.push("HFS_BULK_EXPORT_MAX_ATTEMPTS must be >= 1".to_string());
         }
         if self.batch_size == 0 {
             errors.push("HFS_BULK_EXPORT_BATCH_SIZE must be >= 1".to_string());
@@ -615,9 +626,14 @@ pub struct BulkSubmitConfig {
     /// Maximum manifests this pod ingests concurrently.
     pub worker_concurrency: u32,
     /// How many of a single manifest's `output` files a worker ingests at once
-    /// (fan-out). `1` keeps the historical sequential behavior. Higher values
-    /// overlap per-file fetch, parse, and write, which a concurrent-writer
-    /// backend (PostgreSQL) turns into near-linear throughput. Set with
+    /// (fan-out). `1` keeps sequential inline scheduling. On standalone
+    /// PostgreSQL, an effective value above `1` runs each admitted output file
+    /// in an independent Tokio task. This changes scheduling for existing
+    /// standalone PostgreSQL deployments configured above `1`; setting `1`
+    /// restores inline scheduling and reduces file concurrency to one. There is
+    /// no switch that retains inline scheduling above `1`. Every other storage
+    /// mode, including PostgreSQL plus Elasticsearch, keeps inline scheduling
+    /// at its current effective concurrency. Set with
     /// `HFS_BULK_SUBMIT_FILE_CONCURRENCY`.
     ///
     /// This is the *configured* value. SQLite ignores it and always ingests one
@@ -637,8 +653,9 @@ pub struct BulkSubmitConfig {
     ///   `true` measured ~1.2x faster, winning all 15 interleaved rounds on an
     ///   idle machine. Stopping the clock at the `200` instead gives 3.3x, but
     ///   that instant is before search works. The ~6.7x sometimes quoted comes
-    ///   from `bulk_submit_bench`, which runs no reindex and so measures
-    ///   ingestion with the indexing work removed.
+    ///   from `bulk_submit_bench` without its `--reindex` stage, which then
+    ///   measures ingestion with the indexing work removed; with `--reindex`
+    ///   it runs the same rebuild the worker's hook does and reports both.
     /// - Durability: the rebuild starts only after the manifest is already
     ///   terminal and is fire-and-forget, so `$bulk-submit-status` reports
     ///   `200` while search is still incomplete; the job exists only in an
@@ -652,13 +669,63 @@ pub struct BulkSubmitConfig {
     ///
     /// Set `HFS_BULK_SUBMIT_DEFER_INDEXING=false` to give up the speed and
     /// close that window.
+    ///
+    /// This is the single switch for *when* indexing happens; HFS picks the
+    /// *mechanism* from the deployment (#1242). When the primary owns search,
+    /// `false` writes the index in the batch's own transaction. When search is
+    /// offloaded to an Elasticsearch secondary, `false` selects the
+    /// `IngestIndexSink` that indexes batch by batch (#1127), and the four
+    /// `HFS_BULK_SUBMIT_INDEX_*` knobs apply. The former
+    /// `HFS_BULK_SUBMIT_INDEX_DURING_INGEST` flag, which named that mechanism
+    /// explicitly and produced a dead flag combination, is gone.
     pub defer_indexing: bool,
+    /// Bulk index rebuild for the deferred reindex (SQLite): drop the
+    /// `search_index` value indexes for the duration of each rebuild and
+    /// build them once, sorted, when it finishes. Measured 27% faster on a
+    /// 72k-resource rebuild with everything in memory; the sorted build is
+    /// sequential I/O, so the gap widens on loads whose b-trees outgrow the
+    /// page cache. The cost: while a rebuild runs, search on that database is
+    /// unindexed for **every** tenant and type, and the final index build
+    /// holds the write lock for as long as it takes. Meant for the initial
+    /// load of a large corpus on a server that is not serving traffic; `false`
+    /// by default. Ignored when search is offloaded to a secondary. Set with
+    /// `HFS_BULK_SUBMIT_BULK_INDEX_REBUILD`.
+    pub bulk_index_rebuild: bool,
     /// When `true`, this pod does not run in-process submit workers.
     pub disable_local_worker: bool,
     /// Cap on simultaneous in-flight submissions per tenant.
     pub max_concurrent_per_tenant: u32,
-    /// Resources per ingestion batch.
+    /// Resources per ingestion batch — one database transaction per batch.
+    /// Defaults to `100`, the size the engine has always used; a larger batch
+    /// measured slower with index-during-ingest on (382 s at 1000 against
+    /// 252 s at 100, #1127). Set with `HFS_BULK_SUBMIT_BATCH_SIZE`.
     pub batch_size: u32,
+    /// How long the input-file fetcher waits for the next bytes of a
+    /// response before treating the body as broken and resuming it with a
+    /// `Range` request, in seconds (#1127). Set with
+    /// `HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT`.
+    pub fetch_read_timeout_secs: u64,
+    /// Leave an existing resource untouched when a submitted resource is
+    /// identical to it (ignoring `meta.versionId`/`meta.lastUpdated`), so
+    /// replaying a manifest writes no new versions (#1127). Off by default.
+    /// Set with `HFS_BULK_SUBMIT_SKIP_UNCHANGED`.
+    pub skip_unchanged: bool,
+    /// Batches each index-during-ingest writer may hold queued before the
+    /// ingest waits for it. Set with `HFS_BULK_SUBMIT_INDEX_QUEUE`.
+    pub index_queue: u32,
+    /// Index-during-ingest writer tasks; a resource always goes to the same
+    /// writer so its versions are indexed in order. Set with
+    /// `HFS_BULK_SUBMIT_INDEX_CONCURRENCY`.
+    pub index_concurrency: u32,
+    /// Queued batches an index-during-ingest writer merges into one write to
+    /// the secondary. Measured: raising it from 4 to 16 made ingest 34 %
+    /// slower. Set with `HFS_BULK_SUBMIT_INDEX_COALESCE`.
+    pub index_coalesce: u32,
+    /// Longest the ingest waits for room in an index-during-ingest queue, in
+    /// seconds; past it the batch is marked unindexed and repaired by the
+    /// deferred reindex instead of stalling the writer and the lease. Set with
+    /// `HFS_BULK_SUBMIT_INDEX_MAX_WAIT`.
+    pub index_max_wait_secs: u64,
     /// Initial lease length issued at manifest claim, in seconds.
     pub lease_duration_secs: u64,
     /// Worker heartbeat cadence, in seconds.
@@ -682,8 +749,16 @@ pub struct BulkSubmitConfig {
     pub decryption_key: Option<String>,
     /// Read scope requested for the outbound file-retrieval token.
     pub outbound_scope: String,
-    /// `Retry-After` (seconds) advertised on an in-progress status poll.
+    /// `Retry-After` (seconds) advertised on an in-progress status poll once
+    /// ingestion is under way.
     pub retry_after_secs: u64,
+    /// `Retry-After` (seconds) advertised while a submission is still
+    /// *pre-ingest*: queued for a worker, reading the remote manifest, or
+    /// sizing/downloading its files (#953). Those phases turn over in seconds,
+    /// so a poller honouring the ingest-phase cadence would sleep through all
+    /// of them and only ever see the first one. Clamped at read time by
+    /// [`Self::effective_pre_ingest_retry_after_secs`].
+    pub pre_ingest_retry_after_secs: u64,
     /// Maximum `output` + `outcome` + `deleted` entries per status-manifest page.
     ///
     /// Larger result sets are split across pages chained by the manifest's
@@ -710,8 +785,15 @@ impl Default for BulkSubmitConfig {
             file_concurrency: 1,
             disable_local_worker: false,
             defer_indexing: true,
+            bulk_index_rebuild: false,
             max_concurrent_per_tenant: 4,
-            batch_size: 1000,
+            batch_size: 100,
+            fetch_read_timeout_secs: 60,
+            skip_unchanged: false,
+            index_queue: 16,
+            index_concurrency: 4,
+            index_coalesce: 4,
+            index_max_wait_secs: 30,
             lease_duration_secs: 60,
             heartbeat_interval_secs: 20,
             cleanup_interval_secs: 300,
@@ -722,6 +804,7 @@ impl Default for BulkSubmitConfig {
             decryption_key: None,
             outbound_scope: "system/*.rs".to_string(),
             retry_after_secs: 120,
+            pre_ingest_retry_after_secs: 10,
             manifest_page_size: 1000,
             // A client honouring the advertised Retry-After polls twice an
             // hour, so 10 polls a minute is far above any well-behaved cadence
@@ -732,7 +815,45 @@ impl Default for BulkSubmitConfig {
     }
 }
 
+/// The startup error for a set-but-removed `HFS_BULK_SUBMIT_INDEX_DURING_INGEST`,
+/// or `None` when it is unset. `true`/`1` mapped to indexing during ingest, now
+/// `HFS_BULK_SUBMIT_DEFER_INDEXING=false`; anything else mapped to the deferred
+/// rebuild, now `=true` (the default). Split from `validate` so it is testable
+/// without mutating the process environment (#1242).
+fn removed_index_during_ingest_error(raw: Option<&str>) -> Option<String> {
+    let raw = raw?;
+    let equivalent = if matches!(raw.trim().to_ascii_lowercase().as_str(), "true" | "1") {
+        "false"
+    } else {
+        "true"
+    };
+    Some(format!(
+        "HFS_BULK_SUBMIT_INDEX_DURING_INGEST has been removed; set \
+         HFS_BULK_SUBMIT_DEFER_INDEXING={equivalent} instead (it now selects the \
+         index-during-ingest mechanism from the deployment)"
+    ))
+}
+
 impl BulkSubmitConfig {
+    /// The `Retry-After` to advertise while a submission is pre-ingest.
+    ///
+    /// Two clamps keep the configured value honest. It never exceeds
+    /// [`Self::retry_after_secs`]: an operator who shortened the ingest-phase
+    /// cadence did not mean for the pre-ingest phases to poll *slower*. And
+    /// when poll rate limiting is on it never drops below one poll per
+    /// `window / limit` seconds (rounded up), so a client that does exactly
+    /// what the header says can never be answered with a `429` for it.
+    pub fn effective_pre_ingest_retry_after_secs(&self) -> u64 {
+        let mut secs = self.pre_ingest_retry_after_secs.min(self.retry_after_secs);
+        if self.poll_rate_limit > 0 {
+            let floor = self
+                .poll_rate_window_secs
+                .div_ceil(u64::from(self.poll_rate_limit));
+            secs = secs.max(floor);
+        }
+        secs.max(1)
+    }
+
     /// Returns the file fan-out this pod should actually use on `backend`.
     ///
     /// The configured [`Self::file_concurrency`] is honoured on every
@@ -787,6 +908,10 @@ impl BulkSubmitConfig {
             worker_concurrency: env_u32("HFS_BULK_SUBMIT_WORKER_CONCURRENCY", d.worker_concurrency),
             file_concurrency: env_u32("HFS_BULK_SUBMIT_FILE_CONCURRENCY", d.file_concurrency),
             defer_indexing: env_bool("HFS_BULK_SUBMIT_DEFER_INDEXING", d.defer_indexing),
+            bulk_index_rebuild: env_bool(
+                "HFS_BULK_SUBMIT_BULK_INDEX_REBUILD",
+                d.bulk_index_rebuild,
+            ),
             disable_local_worker: env_bool(
                 "HFS_BULK_SUBMIT_DISABLE_LOCAL_WORKER",
                 d.disable_local_worker,
@@ -796,6 +921,15 @@ impl BulkSubmitConfig {
                 d.max_concurrent_per_tenant,
             ),
             batch_size: env_u32("HFS_BULK_SUBMIT_BATCH_SIZE", d.batch_size),
+            fetch_read_timeout_secs: env_u64(
+                "HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT",
+                d.fetch_read_timeout_secs,
+            ),
+            skip_unchanged: env_bool("HFS_BULK_SUBMIT_SKIP_UNCHANGED", d.skip_unchanged),
+            index_queue: env_u32("HFS_BULK_SUBMIT_INDEX_QUEUE", d.index_queue),
+            index_concurrency: env_u32("HFS_BULK_SUBMIT_INDEX_CONCURRENCY", d.index_concurrency),
+            index_coalesce: env_u32("HFS_BULK_SUBMIT_INDEX_COALESCE", d.index_coalesce),
+            index_max_wait_secs: env_u64("HFS_BULK_SUBMIT_INDEX_MAX_WAIT", d.index_max_wait_secs),
             lease_duration_secs: env_u64("HFS_BULK_SUBMIT_LEASE_DURATION", d.lease_duration_secs),
             heartbeat_interval_secs: env_u64(
                 "HFS_BULK_SUBMIT_HEARTBEAT_INTERVAL",
@@ -818,6 +952,10 @@ impl BulkSubmitConfig {
             outbound_scope: std::env::var("HFS_BULK_SUBMIT_OUTBOUND_SCOPE")
                 .unwrap_or(d.outbound_scope),
             retry_after_secs: env_u64("HFS_BULK_SUBMIT_RETRY_AFTER", d.retry_after_secs),
+            pre_ingest_retry_after_secs: env_u64(
+                "HFS_BULK_SUBMIT_PRE_INGEST_RETRY_AFTER",
+                d.pre_ingest_retry_after_secs,
+            ),
             manifest_page_size: env_u32("HFS_BULK_SUBMIT_MANIFEST_PAGE_SIZE", d.manifest_page_size),
             poll_rate_limit: env_u32("HFS_BULK_SUBMIT_POLL_RATE_LIMIT", d.poll_rate_limit),
             poll_rate_window_secs: env_u64(
@@ -830,6 +968,16 @@ impl BulkSubmitConfig {
     /// Validates the bulk-submit configuration.
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
+        // `HFS_BULK_SUBMIT_INDEX_DURING_INGEST` was folded into
+        // `HFS_BULK_SUBMIT_DEFER_INDEXING` (#1242). Fail loudly rather than
+        // ignore a value the operator set expecting an effect.
+        if let Some(e) = removed_index_during_ingest_error(
+            std::env::var("HFS_BULK_SUBMIT_INDEX_DURING_INGEST")
+                .ok()
+                .as_deref(),
+        ) {
+            errors.push(e);
+        }
         if !matches!(self.output_backend.as_str(), "local-fs" | "s3") {
             errors.push(format!(
                 "HFS_BULK_SUBMIT_OUTPUT_BACKEND '{}' invalid (expected local-fs|s3)",
@@ -869,6 +1017,21 @@ impl BulkSubmitConfig {
         if self.batch_size == 0 {
             errors.push("HFS_BULK_SUBMIT_BATCH_SIZE must be >= 1".to_string());
         }
+        if self.fetch_read_timeout_secs == 0 {
+            errors.push("HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT must be > 0".to_string());
+        }
+        if self.index_queue == 0 {
+            errors.push("HFS_BULK_SUBMIT_INDEX_QUEUE must be >= 1".to_string());
+        }
+        if self.index_concurrency == 0 {
+            errors.push("HFS_BULK_SUBMIT_INDEX_CONCURRENCY must be >= 1".to_string());
+        }
+        if self.index_coalesce == 0 {
+            errors.push("HFS_BULK_SUBMIT_INDEX_COALESCE must be >= 1".to_string());
+        }
+        if self.index_max_wait_secs == 0 {
+            errors.push("HFS_BULK_SUBMIT_INDEX_MAX_WAIT must be > 0".to_string());
+        }
         if self.heartbeat_interval_secs == 0 {
             errors.push("HFS_BULK_SUBMIT_HEARTBEAT_INTERVAL must be > 0".to_string());
         }
@@ -906,8 +1069,15 @@ impl BulkSubmitConfig {
 /// This struct can be constructed from environment variables using [`ServerConfig::from_env`],
 /// from command line arguments using [`ServerConfig::parse`], or programmatically.
 #[derive(Debug, Clone, Parser)]
-#[command(name = "rest-server")]
-#[command(about = "FHIR RESTful API Server")]
+// `long_about = None` keeps `--help` on the one-line `about`: clap would
+// otherwise print this struct's Rust doc comment (a note about constructors
+// that means nothing to an operator) at the top of the help text.
+#[command(name = "hfs", long_about = None)]
+#[command(about = "Helios FHIR Server — FHIR RESTful API")]
+// `-V`/`--version` prints `hfs <version> (git <sha>)` — the only way to
+// identify a downloaded release binary (#992). The string is assembled at
+// compile time in `build_info`.
+#[command(version = crate::build_info::VERSION_STRING)]
 pub struct ServerConfig {
     /// Port to listen on.
     #[arg(short, long, env = "HFS_SERVER_PORT", default_value = "8080")]
@@ -1040,6 +1210,12 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_MAX_PAGE_SIZE", default_value = "1000")]
     pub max_page_size: usize,
 
+    /// Ceiling on `match` entries returned by an unpaged `Patient/$everything`
+    /// (no `_count`). When reached, the response switches to paged mode and
+    /// carries a `next` link plus an informational `OperationOutcome`.
+    #[arg(long, env = "HFS_EVERYTHING_MAX_UNPAGED", default_value = "10000")]
+    pub everything_max_unpaged: usize,
+
     /// Storage backend mode: sqlite (default), sqlite-elasticsearch, postgres,
     /// postgres-elasticsearch, mongodb, mongodb-elasticsearch, s3, or s3-elasticsearch.
     #[arg(long, env = "HFS_STORAGE_BACKEND", default_value = "sqlite")]
@@ -1080,6 +1256,75 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_ELASTICSEARCH_WRITE_REFRESH", default_value = "false")]
     pub elasticsearch_write_refresh: String,
 
+    /// Maximum nested objects one Elasticsearch document may contain, summed
+    /// across every nested search-parameter field. Elasticsearch's default of
+    /// 10000 rejects larger documents outright, leaving those resources stored
+    /// but unsearchable (#1050). New indices take the value from the index
+    /// template; existing indices below it are raised at startup (the setting
+    /// is dynamic, so no reindex of already-indexed resources is needed).
+    #[arg(
+        long,
+        env = "HFS_ELASTICSEARCH_NESTED_OBJECTS_LIMIT",
+        default_value = "50000"
+    )]
+    pub elasticsearch_nested_objects_limit: u32,
+
+    /// Per-request timeout, in milliseconds, of the Elasticsearch HTTP client.
+    /// Applies to every request, including each `_bulk` request of a rebuild;
+    /// a request that outlives it fails as a transient error (#1125).
+    #[arg(
+        long,
+        env = "HFS_ELASTICSEARCH_REQUEST_TIMEOUT_MS",
+        default_value = "30000"
+    )]
+    pub elasticsearch_request_timeout_ms: u64,
+
+    /// Upper bound, in bytes, on the documents one Elasticsearch `_bulk`
+    /// request carries, on top of the per-request operation count. Keeps a page
+    /// of large resources (Synthea `Provenance` averages ~108 KB) from becoming
+    /// one oversized request that outlives the client timeout (#1125). A single
+    /// document larger than the cap is still sent, alone.
+    #[arg(
+        long,
+        env = "HFS_ELASTICSEARCH_BULK_MAX_BYTES",
+        default_value = "10485760"
+    )]
+    pub elasticsearch_bulk_max_bytes: usize,
+
+    /// How many Elasticsearch `_bulk` requests of one page may be in flight
+    /// at once. `1` (the default) sends them one at a time, as every release
+    /// before #1125 did; raising it shortens a rebuild when the cluster is not
+    /// the bottleneck. Splitting after a `413` or a timeout, and `429`
+    /// back-off, stay sequential within the request that caused them.
+    #[arg(long, env = "HFS_ELASTICSEARCH_BULK_CONCURRENCY", default_value = "1")]
+    pub elasticsearch_bulk_concurrency: usize,
+
+    /// Refresh behavior for `$reindex` and the deferred post-import rebuild:
+    /// "false", "wait_for" or "true". Unset follows
+    /// `HFS_ELASTICSEARCH_WRITE_REFRESH`, so "false" lets a rebuild skip the
+    /// per-request refresh wait while ordinary writes keep `wait_for`.
+    #[arg(long, env = "HFS_ELASTICSEARCH_REINDEX_REFRESH")]
+    pub elasticsearch_reindex_refresh: Option<String>,
+
+    /// Page size of the automatic search-index rebuild that runs after a
+    /// deferred-indexing bulk import. `POST $reindex` keeps its own
+    /// `batchSize` parameter.
+    #[arg(long, env = "HFS_REINDEX_BATCH_SIZE", default_value = "1000")]
+    pub reindex_batch_size: u32,
+
+    /// Byte cap of one page of the automatic rebuild, on top of
+    /// `HFS_REINDEX_BATCH_SIZE`. `0` means count only; with a cap set, a page
+    /// of ~108 KB `Provenance` resources stays near the cap instead of
+    /// holding ~108 MB in memory (#1125). Honoured by the SQLite source (a
+    /// page may exceed the cap by one resource) and by the PostgreSQL and
+    /// MongoDB sources (a page never exceeds the cap unless it holds a single
+    /// resource, #1499); the Elasticsearch and S3 sources page by count only.
+    /// Defaults to 32 MiB so an automatic rebuild is bounded even when an
+    /// operator never sets it; `ReindexRequest` and `AutomaticRunOptions`
+    /// keep a library default of `0`, so manual `$reindex` is unchanged.
+    #[arg(long, env = "HFS_REINDEX_BATCH_BYTES", default_value = "33554432")]
+    pub reindex_batch_bytes: u64,
+
     /// Enable SQL-on-FHIR operations ($sql-run, $sql-export).
     /// When enabled, the configured storage backend MUST provide an in-DB
     /// SOF runner (sqlite or postgres) — there is no in-process fallback.
@@ -1100,6 +1345,38 @@ pub struct ServerConfig {
     /// is not compiled in at all and `/ui` always answers `404`.
     #[arg(long, env = "HFS_UI_ENABLED", default_value = "true")]
     pub ui_enabled: bool,
+
+    /// Seconds between the web UI dashboard's background reconcile passes
+    /// (#1078).
+    ///
+    /// Each pass re-reads the per-type totals of the tenants that are due and
+    /// re-seeds their charted history, so the dashboard's in-memory counters
+    /// converge on storage. A tenant's totals query is additionally held back
+    /// to a small duty cycle of its own duration, so a short interval does not
+    /// by itself make a large store scan more often; it is also how soon a
+    /// failed seed is retried. Must be greater than 0.
+    #[arg(long, env = "HFS_DASHBOARD_RECONCILE_SECS", default_value = "30")]
+    pub dashboard_reconcile_interval_secs: u64,
+
+    /// Seconds between two refreshes of a web UI Home dashboard whose figures
+    /// are still moving — approximate, or with an import running (#1078).
+    ///
+    /// The refresh re-reads the in-memory counter snapshot, never storage, so
+    /// a short cadence adds no storage load. Must be greater than 0 and not
+    /// greater than [`Self::dashboard_idle_refresh_secs`].
+    #[arg(long, env = "HFS_DASHBOARD_REFRESH_SECS", default_value = "5")]
+    pub dashboard_refresh_secs: u64,
+
+    /// Seconds between two watch ticks of a web UI Home dashboard whose
+    /// figures are settled — exact, and no import running (#1078).
+    ///
+    /// The watch is how a tab opened before an import starts notices it
+    /// without a reload; a tick whose figures did not change is answered
+    /// `204` and swaps nothing. Must be greater than 0 and at least
+    /// [`Self::dashboard_refresh_secs`]: a settled page never polls faster
+    /// than a moving one.
+    #[arg(long, env = "HFS_DASHBOARD_IDLE_REFRESH_SECS", default_value = "10")]
+    pub dashboard_idle_refresh_secs: u64,
 
     /// Natural-language search master switch. When false the feature is
     /// completely off: the endpoint 404s and the UI renders nothing.
@@ -1308,6 +1585,7 @@ impl Default for ServerConfig {
             search_param_cache_ttl: 3600,
             default_page_size: 20,
             max_page_size: 1000,
+            everything_max_unpaged: 10000,
             storage_backend: "sqlite".to_string(),
             elasticsearch_nodes: "http://localhost:9200".to_string(),
             elasticsearch_index_prefix: "hfs".to_string(),
@@ -1315,8 +1593,18 @@ impl Default for ServerConfig {
             elasticsearch_password: None,
             elasticsearch_refresh_interval: "1s".to_string(),
             elasticsearch_write_refresh: "false".to_string(),
+            elasticsearch_nested_objects_limit: 50_000,
+            elasticsearch_request_timeout_ms: 30_000,
+            elasticsearch_bulk_max_bytes: 10 * 1024 * 1024,
+            elasticsearch_bulk_concurrency: 1,
+            elasticsearch_reindex_refresh: None,
+            reindex_batch_size: 1000,
+            reindex_batch_bytes: 32 * 1024 * 1024,
             sof_enabled: true,
             ui_enabled: true,
+            dashboard_reconcile_interval_secs: 30,
+            dashboard_refresh_secs: 5,
+            dashboard_idle_refresh_secs: 10,
             nl_search_enabled: true,
             nl_search_api_key: None,
             nl_search_model: "claude-opus-4-8".to_string(),
@@ -1450,6 +1738,42 @@ impl ServerConfig {
             errors.push("Batch max concurrency cannot be 0".to_string());
         }
 
+        if self.elasticsearch_nested_objects_limit == 0 {
+            errors.push("Elasticsearch nested objects limit cannot be 0".to_string());
+        }
+
+        if self.elasticsearch_request_timeout_ms == 0 {
+            errors.push("Elasticsearch request timeout cannot be 0".to_string());
+        }
+
+        if self.elasticsearch_bulk_max_bytes == 0 {
+            errors.push("Elasticsearch bulk max bytes cannot be 0".to_string());
+        }
+
+        if self.elasticsearch_bulk_concurrency == 0 {
+            errors.push("Elasticsearch bulk concurrency cannot be 0".to_string());
+        }
+        if self.reindex_batch_size == 0 {
+            errors.push("Reindex batch size cannot be 0".to_string());
+        }
+
+        if self.dashboard_reconcile_interval_secs == 0 {
+            errors.push("Dashboard reconcile interval cannot be 0".to_string());
+        }
+
+        if self.dashboard_refresh_secs == 0 {
+            errors.push("Dashboard refresh interval cannot be 0".to_string());
+        }
+
+        if self.dashboard_idle_refresh_secs == 0 {
+            errors.push("Dashboard idle refresh interval cannot be 0".to_string());
+        } else if self.dashboard_idle_refresh_secs < self.dashboard_refresh_secs {
+            errors.push(format!(
+                "Dashboard idle refresh interval ({}) must be greater than or equal to the dashboard refresh interval ({})",
+                self.dashboard_idle_refresh_secs, self.dashboard_refresh_secs
+            ));
+        }
+
         if self.default_page_size == 0 {
             errors.push("Default page size cannot be 0".to_string());
         }
@@ -1531,6 +1855,7 @@ impl ServerConfig {
             search_param_cache_ttl: 3600,
             default_page_size: 10,
             max_page_size: 100,
+            everything_max_unpaged: 10000,
             storage_backend: "sqlite".to_string(),
             elasticsearch_nodes: "http://localhost:9200".to_string(),
             elasticsearch_index_prefix: "hfs".to_string(),
@@ -1538,8 +1863,18 @@ impl ServerConfig {
             elasticsearch_password: None,
             elasticsearch_refresh_interval: "1s".to_string(),
             elasticsearch_write_refresh: "false".to_string(),
+            elasticsearch_nested_objects_limit: 50_000,
+            elasticsearch_request_timeout_ms: 30_000,
+            elasticsearch_bulk_max_bytes: 10 * 1024 * 1024,
+            elasticsearch_bulk_concurrency: 1,
+            elasticsearch_reindex_refresh: None,
+            reindex_batch_size: 1000,
+            reindex_batch_bytes: 32 * 1024 * 1024,
             sof_enabled: true,
             ui_enabled: true,
+            dashboard_reconcile_interval_secs: 30,
+            dashboard_refresh_secs: 5,
+            dashboard_idle_refresh_secs: 10,
             nl_search_enabled: true,
             nl_search_api_key: None,
             nl_search_model: "claude-opus-4-8".to_string(),
@@ -1671,6 +2006,12 @@ mod tests {
         assert_eq!(config.port, 0);
         assert!(!config.enable_cors);
         assert_eq!(config.default_tenant, "test-tenant");
+    }
+
+    #[test]
+    fn everything_max_unpaged_defaults_to_10000() {
+        let config = ServerConfig::for_testing();
+        assert_eq!(config.everything_max_unpaged, 10000);
     }
 
     #[test]
@@ -1953,6 +2294,141 @@ mod tests {
         assert!(errors.iter().any(|e| e.contains("Batch max concurrency")));
     }
 
+    // ── dashboard_reconcile_interval_secs (#1078) ────────────────
+
+    /// A zero interval would spin the dashboard's reconcile loop, so it is
+    /// rejected at startup; the defaults agree with the CLI default.
+    #[test]
+    fn test_validate_dashboard_reconcile_interval_zero() {
+        assert_eq!(
+            ServerConfig::default().dashboard_reconcile_interval_secs,
+            30
+        );
+        assert_eq!(
+            ServerConfig::for_testing().dashboard_reconcile_interval_secs,
+            30
+        );
+        let config = ServerConfig {
+            dashboard_reconcile_interval_secs: 0,
+            ..Default::default()
+        };
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e == "Dashboard reconcile interval cannot be 0")
+        );
+    }
+
+    #[test]
+    fn test_cli_dashboard_reconcile_interval_parses() {
+        let parsed = ServerConfig::try_parse_from(["rest-server"]).unwrap();
+        assert_eq!(parsed.dashboard_reconcile_interval_secs, 30);
+        let parsed = ServerConfig::try_parse_from([
+            "rest-server",
+            "--dashboard-reconcile-interval-secs",
+            "5",
+        ])
+        .unwrap();
+        assert_eq!(parsed.dashboard_reconcile_interval_secs, 5);
+        assert!(
+            ServerConfig::try_parse_from([
+                "rest-server",
+                "--dashboard-reconcile-interval-secs",
+                "soon"
+            ])
+            .is_err()
+        );
+    }
+
+    // ── dashboard_refresh_secs / dashboard_idle_refresh_secs (#1078) ──
+
+    /// The defaults agree with the CLI defaults, and validate.
+    #[test]
+    fn test_dashboard_refresh_defaults() {
+        for config in [ServerConfig::default(), ServerConfig::for_testing()] {
+            assert_eq!(config.dashboard_refresh_secs, 5);
+            assert_eq!(config.dashboard_idle_refresh_secs, 10);
+        }
+        assert!(ServerConfig::default().validate().is_ok());
+        // Equal cadences are allowed.
+        let config = ServerConfig {
+            dashboard_refresh_secs: 1,
+            dashboard_idle_refresh_secs: 1,
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    /// A zero moving cadence would have the page poll continuously.
+    #[test]
+    fn test_validate_dashboard_refresh_zero() {
+        let config = ServerConfig {
+            dashboard_refresh_secs: 0,
+            ..Default::default()
+        };
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e == "Dashboard refresh interval cannot be 0")
+        );
+    }
+
+    /// A zero settled cadence is rejected on its own, not as an ordering error.
+    #[test]
+    fn test_validate_dashboard_idle_refresh_zero() {
+        let config = ServerConfig {
+            dashboard_idle_refresh_secs: 0,
+            ..Default::default()
+        };
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e == "Dashboard idle refresh interval cannot be 0")
+        );
+        assert!(!errors.iter().any(|e| e.contains("greater than or equal")));
+    }
+
+    /// A settled page must never poll faster than a moving one.
+    #[test]
+    fn test_validate_dashboard_idle_refresh_below_moving() {
+        let config = ServerConfig {
+            dashboard_refresh_secs: 10,
+            dashboard_idle_refresh_secs: 5,
+            ..Default::default()
+        };
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e
+            == "Dashboard idle refresh interval (5) must be greater than or equal to the dashboard refresh interval (10)"));
+    }
+
+    #[test]
+    fn test_cli_dashboard_refresh_parses() {
+        let parsed = ServerConfig::try_parse_from(["rest-server"]).unwrap();
+        assert_eq!(parsed.dashboard_refresh_secs, 5);
+        assert_eq!(parsed.dashboard_idle_refresh_secs, 10);
+        let parsed = ServerConfig::try_parse_from([
+            "rest-server",
+            "--dashboard-refresh-secs",
+            "1",
+            "--dashboard-idle-refresh-secs",
+            "2",
+        ])
+        .unwrap();
+        assert_eq!(parsed.dashboard_refresh_secs, 1);
+        assert_eq!(parsed.dashboard_idle_refresh_secs, 2);
+        assert!(
+            ServerConfig::try_parse_from(["rest-server", "--dashboard-refresh-secs", "soon"])
+                .is_err()
+        );
+        assert!(
+            ServerConfig::try_parse_from(["rest-server", "--dashboard-idle-refresh-secs", "-1"])
+                .is_err()
+        );
+    }
+
     // ── validate() – default_page_size == 0 ──────────────────────
 
     #[test]
@@ -1983,6 +2459,100 @@ mod tests {
         let errors = result.unwrap_err();
         // At least the three errors above should be present
         assert!(errors.len() >= 3);
+    }
+
+    // ── Elasticsearch client / rebuild knobs (#1125) ──────────────
+
+    /// Every default reproduces today's behavior, except the reindex byte cap
+    /// (32 MiB, #1499 — the new default is intentional, not a regression): a
+    /// 30 s client timeout, the 1000-row deferred rebuild page, and a rebuild
+    /// refresh that follows `HFS_ELASTICSEARCH_WRITE_REFRESH`.
+    #[test]
+    fn test_elasticsearch_rebuild_knob_defaults() {
+        let parsed = ServerConfig::try_parse_from(["rest-server"]).unwrap();
+        for config in [parsed, ServerConfig::default(), ServerConfig::for_testing()] {
+            assert_eq!(config.elasticsearch_request_timeout_ms, 30_000);
+            assert_eq!(config.elasticsearch_bulk_max_bytes, 10 * 1024 * 1024);
+            assert_eq!(config.elasticsearch_reindex_refresh, None);
+            assert_eq!(config.reindex_batch_size, 1000);
+            assert_eq!(config.reindex_batch_bytes, 32 * 1024 * 1024);
+            assert_eq!(config.elasticsearch_bulk_concurrency, 1);
+        }
+    }
+
+    /// The CLI default of the rebuild page is the persistence constant the
+    /// deferred rebuild used before it was configurable.
+    #[test]
+    fn test_reindex_batch_size_default_matches_the_deferred_rebuild_page() {
+        assert_eq!(
+            ServerConfig::default().reindex_batch_size,
+            helios_persistence::search::DEFERRED_REINDEX_BATCH_SIZE
+        );
+    }
+
+    #[test]
+    fn test_cli_elasticsearch_rebuild_knobs_parse() {
+        let parsed = ServerConfig::try_parse_from([
+            "rest-server",
+            "--elasticsearch-request-timeout-ms",
+            "120000",
+            "--elasticsearch-bulk-max-bytes",
+            "1048576",
+            "--elasticsearch-reindex-refresh",
+            "false",
+            "--reindex-batch-size",
+            "250",
+        ])
+        .unwrap();
+        assert_eq!(parsed.elasticsearch_request_timeout_ms, 120_000);
+        assert_eq!(parsed.elasticsearch_bulk_max_bytes, 1_048_576);
+        assert_eq!(
+            parsed.elasticsearch_reindex_refresh.as_deref(),
+            Some("false")
+        );
+        assert_eq!(parsed.reindex_batch_size, 250);
+        assert!(parsed.validate().is_ok());
+
+        for (flag, value) in [
+            ("--elasticsearch-request-timeout-ms", "soon"),
+            ("--elasticsearch-bulk-max-bytes", "-1"),
+            ("--reindex-batch-size", "many"),
+        ] {
+            assert!(
+                ServerConfig::try_parse_from(["rest-server", flag, value]).is_err(),
+                "{flag} {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_elasticsearch_rebuild_knobs() {
+        for (config, message) in [
+            (
+                ServerConfig {
+                    elasticsearch_request_timeout_ms: 0,
+                    ..Default::default()
+                },
+                "Elasticsearch request timeout cannot be 0",
+            ),
+            (
+                ServerConfig {
+                    elasticsearch_bulk_max_bytes: 0,
+                    ..Default::default()
+                },
+                "Elasticsearch bulk max bytes cannot be 0",
+            ),
+            (
+                ServerConfig {
+                    reindex_batch_size: 0,
+                    ..Default::default()
+                },
+                "Reindex batch size cannot be 0",
+            ),
+        ] {
+            let errors = config.validate().unwrap_err();
+            assert!(errors.iter().any(|e| e == message), "{errors:?}");
+        }
     }
 
     // ── full_base_url() ───────────────────────────────────────────
@@ -2255,6 +2825,16 @@ mod tests {
     }
 
     #[test]
+    fn test_bulk_export_config_zero_heartbeat_interval() {
+        let cfg = BulkExportConfig {
+            heartbeat_interval_secs: 0,
+            ..BulkExportConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("HEARTBEAT_INTERVAL")));
+    }
+
+    #[test]
     fn test_bulk_export_config_lease_must_exceed_heartbeat() {
         let cfg = BulkExportConfig {
             lease_duration_secs: 10,
@@ -2373,6 +2953,67 @@ mod tests {
         assert!(errs.iter().any(|e| e.contains("MAX_CONCURRENT_PER_TENANT")));
     }
 
+    /// #1127: the batch size the engine has always used stays the default
+    /// now that the knob reaches it, and the ingest-tuning knobs keep the
+    /// measured defaults with index-during-ingest and skip-unchanged off.
+    #[test]
+    fn removed_index_during_ingest_maps_to_the_defer_flag() {
+        // Unset: no error.
+        assert!(removed_index_during_ingest_error(None).is_none());
+        // `true`/`1` meant index during ingest → DEFER_INDEXING=false.
+        for raw in ["true", "1", " TRUE "] {
+            let e = removed_index_during_ingest_error(Some(raw)).expect("removed var errors");
+            assert!(
+                e.contains("HFS_BULK_SUBMIT_DEFER_INDEXING=false"),
+                "{raw}: {e}"
+            );
+        }
+        // anything else meant the deferred rebuild → DEFER_INDEXING=true (default).
+        for raw in ["false", "0", "no"] {
+            let e = removed_index_during_ingest_error(Some(raw)).expect("removed var errors");
+            assert!(
+                e.contains("HFS_BULK_SUBMIT_DEFER_INDEXING=true"),
+                "{raw}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bulk_submit_config_ingest_tuning_defaults() {
+        let cfg = BulkSubmitConfig::default();
+        assert_eq!(cfg.batch_size, 100);
+        assert_eq!(cfg.fetch_read_timeout_secs, 60);
+        assert!(!cfg.skip_unchanged);
+        assert_eq!(
+            (cfg.index_queue, cfg.index_concurrency, cfg.index_coalesce),
+            (16, 4, 4)
+        );
+        assert_eq!(cfg.index_max_wait_secs, 30);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_bulk_submit_config_zero_ingest_tuning_knobs_rejected() {
+        let cfg = BulkSubmitConfig {
+            fetch_read_timeout_secs: 0,
+            index_queue: 0,
+            index_concurrency: 0,
+            index_coalesce: 0,
+            index_max_wait_secs: 0,
+            ..BulkSubmitConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        for knob in [
+            "FETCH_READ_TIMEOUT",
+            "INDEX_QUEUE",
+            "INDEX_CONCURRENCY",
+            "INDEX_COALESCE",
+            "INDEX_MAX_WAIT",
+        ] {
+            assert!(errs.iter().any(|e| e.contains(knob)), "{knob}: {errs:?}");
+        }
+    }
+
     #[test]
     fn test_bulk_submit_config_zero_batch_size() {
         let cfg = BulkSubmitConfig {
@@ -2391,6 +3032,53 @@ mod tests {
         };
         let errs = cfg.validate().unwrap_err();
         assert!(errs.iter().any(|e| e.contains("HEARTBEAT_INTERVAL")));
+    }
+
+    #[test]
+    fn test_bulk_submit_pre_ingest_retry_after_defaults_short_and_inside_the_rate_limit() {
+        let cfg = BulkSubmitConfig::default();
+        assert_eq!(cfg.effective_pre_ingest_retry_after_secs(), 10);
+        assert!(cfg.effective_pre_ingest_retry_after_secs() < cfg.retry_after_secs);
+        // 10 polls per 60s window: one poll every 6s is the fastest allowed.
+        assert!(cfg.effective_pre_ingest_retry_after_secs() >= 6);
+    }
+
+    #[test]
+    fn test_bulk_submit_pre_ingest_retry_after_never_exceeds_the_ingest_cadence() {
+        let cfg = BulkSubmitConfig {
+            retry_after_secs: 5,
+            pre_ingest_retry_after_secs: 10,
+            poll_rate_limit: 0,
+            ..BulkSubmitConfig::default()
+        };
+        assert_eq!(cfg.effective_pre_ingest_retry_after_secs(), 5);
+    }
+
+    #[test]
+    fn test_bulk_submit_pre_ingest_retry_after_respects_the_poll_rate_floor() {
+        let cfg = BulkSubmitConfig {
+            pre_ingest_retry_after_secs: 1,
+            poll_rate_limit: 7,
+            poll_rate_window_secs: 60,
+            ..BulkSubmitConfig::default()
+        };
+        // ceil(60 / 7) = 9 — rounded up so an obedient client never lands
+        // an 8th poll inside the window.
+        assert_eq!(cfg.effective_pre_ingest_retry_after_secs(), 9);
+
+        let unlimited = BulkSubmitConfig {
+            pre_ingest_retry_after_secs: 1,
+            poll_rate_limit: 0,
+            ..BulkSubmitConfig::default()
+        };
+        assert_eq!(unlimited.effective_pre_ingest_retry_after_secs(), 1);
+
+        let zero = BulkSubmitConfig {
+            pre_ingest_retry_after_secs: 0,
+            poll_rate_limit: 0,
+            ..BulkSubmitConfig::default()
+        };
+        assert_eq!(zero.effective_pre_ingest_retry_after_secs(), 1, "never 0");
     }
 
     #[test]
@@ -2488,5 +3176,10 @@ mod tests {
         };
         assert_eq!(cfg.effective_file_concurrency(BackendKind::Sqlite), 1);
         assert_eq!(cfg.effective_file_concurrency(BackendKind::Postgres), 1);
+    }
+
+    #[test]
+    fn bulk_submit_file_concurrency_default_is_one() {
+        assert_eq!(BulkSubmitConfig::default().file_concurrency, 1);
     }
 }

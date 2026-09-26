@@ -124,6 +124,13 @@ struct MockExport {
     group_identifier_results: Arc<Mutex<Vec<serde_json::Value>>>,
     /// What `POST /Group/_search?name=` answers (R5+ only — #836).
     group_name_results: Arc<Mutex<Vec<serde_json::Value>>>,
+    /// When set, status polls answer 500 with this body instead of the
+    /// default 202-then-manifest sequence.
+    status_failure_body: Arc<Mutex<Option<String>>>,
+    /// When set, the first status poll answers `202` with this `Parameters`
+    /// body (and `x-progress: 33%`) instead of the default bare `18%
+    /// complete` header with no body (#961).
+    status_progress_body: Arc<Mutex<Option<String>>>,
 }
 
 impl Default for MockExport {
@@ -170,6 +177,8 @@ impl Default for MockExport {
             groups: Default::default(),
             group_identifier_results: Default::default(),
             group_name_results: Default::default(),
+            status_failure_body: Default::default(),
+            status_progress_body: Default::default(),
         }
     }
 }
@@ -239,9 +248,28 @@ fn mock_fhir_app(state: MockExport) -> Router {
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string),
         ));
+        if let Some(body) = s.status_failure_body.lock().unwrap().clone() {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [("content-type", "application/fhir+json")],
+                body,
+            )
+                .into_response();
+        }
         let mut polls = s.polls.lock().unwrap();
         *polls += 1;
         if *polls == 1 {
+            if let Some(body) = s.status_progress_body.lock().unwrap().clone() {
+                return (
+                    StatusCode::ACCEPTED,
+                    [
+                        ("x-progress", "33%"),
+                        ("content-type", "application/fhir+json"),
+                    ],
+                    body,
+                )
+                    .into_response();
+            }
             (StatusCode::ACCEPTED, [("x-progress", "18% complete")], "").into_response()
         } else {
             let advertised_base = s.advertised_base.lock().unwrap().clone();
@@ -705,7 +733,9 @@ async fn serve_with_runtime(
         tenant_path_routing,
         None,
         base.clone(),
+        Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
         patient_name_search,
+        None,
     )
     .layer(axum::middleware::from_fn(inject_test_principal));
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -745,6 +775,7 @@ async fn serve_with_separate_public_base(
         tenant_path_routing,
         None,
         helios_ui::PatientNameSearchSupport::Enabled,
+        None,
     )
     .layer(axum::middleware::from_fn(inject_test_principal));
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -1044,6 +1075,39 @@ async fn the_export_page_uses_form_panels_with_name_and_all_resources_up_top() {
     ));
     assert!(!html.contains("Used when Since is Custom"));
     assert!(!html.contains("bulk-export-field-since-custom-hint"));
+
+    // Until carries the same app-owned instant pattern as Custom instant
+    // (#1271), described by its hint and with a hidden inline error channel.
+    let until = input_tag(&html, "until");
+    assert!(until.contains(r#"data-pattern="([0-9]([0-9]"#), "{until}");
+    assert!(until.contains(r#"([0-5][0-9]|60)"#), "{until}");
+    assert!(until.contains(r#"|14:00))"#), "{until}");
+    assert!(!until.contains(" pattern="), "{until}");
+    assert!(!until.contains("aria-invalid"), "{until}");
+    assert!(!until.contains("autofocus"), "{until}");
+    assert!(
+        until.contains(r#"aria-describedby="bulk-export-until-hint""#),
+        "{until}"
+    );
+    assert!(html.contains(
+        r#"id="bulk-export-until-error" class="field__hint field__hint--error" role="alert" hidden>Enter a valid FHIR instant"#
+    ));
+}
+
+/// The opening `<input ...>` tag of the form control named `name`.
+fn input_tag<'a>(html: &'a str, name: &str) -> &'a str {
+    let needle = format!(r#"name="{name}""#);
+    let pos = html
+        .find(&needle)
+        .unwrap_or_else(|| panic!("{name} input present"));
+    let start = html[..pos]
+        .rfind("<input")
+        .unwrap_or_else(|| panic!("{name} input starts"));
+    let end = pos
+        + html[pos..]
+            .find('>')
+            .unwrap_or_else(|| panic!("{name} input ends"));
+    &html[start..=end]
 }
 
 #[tokio::test]
@@ -1324,6 +1388,137 @@ async fn starting_a_system_export_kicks_off_and_tracks_the_job() {
     assert!(!html.contains("every 5s"));
 }
 
+/// #961: a `202` whose body is a `Parameters` resource carrying
+/// `typesTotal`/`typesDone`/`currentType` drives "Writing Observation · 1 of
+/// 3 types" on the card, the bar still reads the `X-Progress` percentage,
+/// and the counts persist on the job record.
+#[tokio::test]
+async fn an_in_progress_card_shows_the_type_in_flight_and_types_progress() {
+    let (base, mock, backend) = serve().await;
+    *mock.status_progress_body.lock().unwrap() = Some(
+        serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "typesTotal", "valueInteger": 3},
+                {"name": "typesDone", "valueInteger": 1},
+                {"name": "currentType", "valueString": "Observation"}
+            ]
+        })
+        .to_string(),
+    );
+
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Everything"), ("scope", "system")],
+    )
+    .await;
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    let card_path = html
+        .split("hx-get=\"")
+        .map(|s| s.split('"').next().unwrap_or(""))
+        .find(|s| s.starts_with("/ui/bulk-export/active/"))
+        .expect("card poll url")
+        .to_string();
+    let id = card_path
+        .trim_end_matches("/card")
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let (_, html) = get_text(&base, &card_path).await;
+    assert!(html.contains("Writing Observation"), "{html}");
+    assert!(html.contains("1 of 3 types"), "{html}");
+    assert!(html.contains(r#"aria-valuenow="33""#), "{html}");
+    assert!(html.contains("every 5s"), "{html}");
+
+    let current = backend.get_settings("l2:").await.unwrap().unwrap();
+    let jobs = current.document["byTenant"]["default"]["bulkExport"]["jobs"]
+        .as_object()
+        .unwrap();
+    assert_eq!(jobs[&id]["typesDone"], 1);
+    assert_eq!(jobs[&id]["typesTotal"], 3);
+    assert_eq!(jobs[&id]["currentType"], "Observation");
+}
+
+/// #961: against a server that answers `202` with no body (or one that
+/// isn't a `Parameters` resource), the card keeps showing the raw
+/// `X-Progress` text and never claims a type count it was never given.
+#[tokio::test]
+async fn an_in_progress_card_without_a_parameters_body_keeps_the_raw_progress() {
+    let (base, _mock, _backend) = serve().await;
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Everything"), ("scope", "system")],
+    )
+    .await;
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    let card_path = html
+        .split("hx-get=\"")
+        .map(|s| s.split('"').next().unwrap_or(""))
+        .find(|s| s.starts_with("/ui/bulk-export/active/"))
+        .expect("card poll url")
+        .to_string();
+
+    let (_, html) = get_text(&base, &card_path).await;
+    assert!(html.contains("18% complete"), "{html}");
+    assert!(!html.contains("types"), "{html}");
+}
+
+/// #961: once a job completes, the stale type counts from the last
+/// in-progress poll must not linger on the persisted record.
+#[tokio::test]
+async fn a_completed_card_clears_the_types_progress() {
+    let (base, mock, backend) = serve().await;
+    *mock.status_progress_body.lock().unwrap() = Some(
+        serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "typesTotal", "valueInteger": 3},
+                {"name": "typesDone", "valueInteger": 1},
+                {"name": "currentType", "valueString": "Observation"}
+            ]
+        })
+        .to_string(),
+    );
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Everything"), ("scope", "system")],
+    )
+    .await;
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    let card_path = html
+        .split("hx-get=\"")
+        .map(|s| s.split('"').next().unwrap_or(""))
+        .find(|s| s.starts_with("/ui/bulk-export/active/"))
+        .expect("card poll url")
+        .to_string();
+    let id = card_path
+        .trim_end_matches("/card")
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_string();
+
+    // First fetch: 202 with type counts.
+    get_text(&base, &card_path).await;
+    // Second: the mock flips to 200 -> complete.
+    let (_, html) = get_text(&base, &card_path).await;
+    assert!(html.contains("Complete"), "{html}");
+
+    let current = backend.get_settings("l2:").await.unwrap().unwrap();
+    let jobs = current.document["byTenant"]["default"]["bulkExport"]["jobs"]
+        .as_object()
+        .unwrap();
+    let job = &jobs[&id];
+    assert!(job.get("typesDone").is_none(), "{job}");
+    assert!(job.get("typesTotal").is_none(), "{job}");
+    assert!(job.get("currentType").is_none(), "{job}");
+}
+
 #[tokio::test]
 async fn invalid_start_fields_return_one_400_without_a_job_or_kickoff() {
     let (base, mock, backend) = serve().await;
@@ -1361,6 +1556,87 @@ async fn invalid_start_fields_return_one_400_without_a_job_or_kickoff() {
     );
     assert!(mock.kickoffs.lock().unwrap().is_empty());
     assert_no_default_user_jobs(&backend).await;
+}
+
+#[tokio::test]
+async fn patient_scope_without_a_selection_returns_400_without_a_job_or_kickoff() {
+    let (base, mock, backend) = serve().await;
+    let (status, html) = post_form_body(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Everyone by accident"), ("scope", "patient")],
+    )
+    .await;
+
+    assert_eq!(status, 400);
+    assert!(html.contains("Select at least one patient"), "{html}");
+    assert!(
+        html.contains(
+            r#"id="bulk-export-patients-error" class="field__hint field__hint--error" role="alert">"#
+        ),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"novalidate data-validation-started="true""#),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"name="scope" value="patient" checked"#),
+        "{html}"
+    );
+    assert!(mock.kickoffs.lock().unwrap().is_empty());
+    assert_no_default_user_jobs(&backend).await;
+}
+
+#[tokio::test]
+async fn patient_scope_with_only_blank_patient_values_is_rejected_the_same_way() {
+    let (base, mock, backend) = serve().await;
+    let (status, html) = post_form_body(
+        &base,
+        "/ui/bulk-export",
+        &[
+            ("name", "Everyone by accident"),
+            ("scope", "patient"),
+            ("patient", "  \n , "),
+        ],
+    )
+    .await;
+
+    assert_eq!(status, 400);
+    assert!(html.contains("Select at least one patient"), "{html}");
+    assert!(
+        html.contains(
+            r#"id="bulk-export-patients-error" class="field__hint field__hint--error" role="alert">"#
+        ),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"novalidate data-validation-started="true""#),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"name="scope" value="patient" checked"#),
+        "{html}"
+    );
+    assert!(mock.kickoffs.lock().unwrap().is_empty());
+    assert_no_default_user_jobs(&backend).await;
+}
+
+#[tokio::test]
+async fn the_builder_renders_the_patients_error_hidden_by_default() {
+    let (base, _, _) = serve().await;
+    let (status, html) = get_text(&base, "/ui/bulk-export/new").await;
+    assert_eq!(status, 200);
+    assert!(
+        html.contains(
+            r#"id="bulk-export-patients-error" class="field__hint field__hint--error" role="alert" hidden>Select at least one patient"#
+        ),
+        "{html}"
+    );
+    assert!(
+        !html.contains("Leave empty to export every patient"),
+        "{html}"
+    );
 }
 
 #[tokio::test]
@@ -1535,6 +1811,167 @@ async fn fhir_r4_lexically_invalid_instants_fail_without_a_job_or_kickoff() {
     assert_no_default_user_jobs(&backend).await;
 }
 
+/// A malformed Until is rejected in the form like Custom instant (#1271):
+/// 400, the field marked invalid with its inline error, the typed value
+/// round-tripped for correction, and no kick-off or job. Until is validated
+/// on its own, whatever the Since preset.
+#[tokio::test]
+async fn an_invalid_until_is_rejected_inline_without_a_job_or_kickoff() {
+    let (base, mock, backend) = serve().await;
+
+    for until in [
+        // Three-digit year: the dropped-leading-character typo from the issue.
+        "026-09-17T10:38:49Z",
+        // Lexically fine but not a calendar date.
+        "2026-02-31T00:00:00Z",
+    ] {
+        let (status, html) = post_form_body(
+            &base,
+            "/ui/bulk-export",
+            &[
+                ("name", "until-import"),
+                ("scope", "system"),
+                ("types", "Patient"),
+                ("since_preset", ""),
+                ("until", until),
+            ],
+        )
+        .await;
+
+        assert_eq!(status, 400, "{until}: {html}");
+        assert!(
+            html.contains(r#"novalidate data-validation-started="true""#),
+            "{html}"
+        );
+        let input = input_tag(&html, "until");
+        assert!(input.contains(&format!(r#"value="{until}""#)), "{input}");
+        assert!(
+            input.contains(
+                r#"autofocus aria-invalid="true" aria-describedby="bulk-export-until-hint bulk-export-until-error""#
+            ),
+            "{input}"
+        );
+        assert_eq!(html.matches(r#"aria-invalid="true""#).count(), 1, "{html}");
+        assert_eq!(html.matches("autofocus").count(), 1, "{html}");
+        assert!(
+            html.contains(
+                r#"id="bulk-export-until-error" class="field__hint field__hint--error" role="alert">Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z.</span>"#
+            ),
+            "{html}"
+        );
+        // Custom instant is untouched: its error stays hidden.
+        assert!(
+            html.contains(r#"id="bulk-export-since-custom-error" class="field__hint field__hint--error" role="alert" hidden>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"name="types" value="Patient" checked"#),
+            "{html}"
+        );
+    }
+
+    assert!(mock.kickoffs.lock().unwrap().is_empty());
+    assert_no_default_user_jobs(&backend).await;
+}
+
+/// Autofocus goes to the first invalid field: with a blank name and a bad
+/// Until, the name keeps focus and Until is only marked invalid.
+#[tokio::test]
+async fn an_invalid_until_yields_autofocus_to_an_earlier_invalid_field() {
+    let (base, mock, backend) = serve().await;
+    let (status, html) = post_form_body(
+        &base,
+        "/ui/bulk-export",
+        &[
+            ("name", "   "),
+            ("scope", "system"),
+            ("since_preset", "custom"),
+            ("since_custom", "not-a-date"),
+            ("until", "026-09-17T10:38:49Z"),
+        ],
+    )
+    .await;
+
+    assert_eq!(status, 400, "{html}");
+    assert_eq!(html.matches(r#"aria-invalid="true""#).count(), 3, "{html}");
+    assert_eq!(html.matches("autofocus").count(), 1, "{html}");
+    assert!(
+        html.contains(r#"autofocus aria-invalid="true" aria-describedby="bulk-export-name-error""#),
+        "{html}"
+    );
+    let input = input_tag(&html, "until");
+    assert!(!input.contains("autofocus"), "{input}");
+    assert!(
+        input.contains(
+            r#"aria-invalid="true" aria-describedby="bulk-export-until-hint bulk-export-until-error""#
+        ),
+        "{input}"
+    );
+    assert!(mock.kickoffs.lock().unwrap().is_empty());
+    assert_no_default_user_jobs(&backend).await;
+}
+
+/// An Until earlier than Since is a well-formed but empty window: `$export`
+/// bounds are inclusive, so nothing could ever match. The form rejects it on
+/// Until with its own message, for a custom Since and for a preset alike,
+/// while an equal pair is still a valid (one-instant) window.
+#[tokio::test]
+async fn an_until_before_since_is_rejected_inline_without_a_job_or_kickoff() {
+    let (base, mock, backend) = serve().await;
+
+    for (preset, custom) in [("custom", "2026-09-17T10:38:49Z"), ("day", "")] {
+        let (status, html) = post_form_body(
+            &base,
+            "/ui/bulk-export",
+            &[
+                ("name", "until-before-since"),
+                ("scope", "system"),
+                ("since_preset", preset),
+                ("since_custom", custom),
+                ("until", "2026-01-01T00:00:00Z"),
+            ],
+        )
+        .await;
+
+        assert_eq!(status, 400, "{preset}: {html}");
+        let input = input_tag(&html, "until");
+        assert!(input.contains(r#"value="2026-01-01T00:00:00Z""#), "{input}");
+        assert!(
+            input.contains(
+                r#"autofocus aria-invalid="true" aria-describedby="bulk-export-until-hint bulk-export-until-error""#
+            ),
+            "{input}"
+        );
+        assert!(
+            html.contains(
+                r#"id="bulk-export-until-error" class="field__hint field__hint--error" role="alert">Until must not be earlier than Since.</span>"#
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"id="bulk-export-since-custom-error" class="field__hint field__hint--error" role="alert" hidden>"#),
+            "{html}"
+        );
+    }
+    assert!(mock.kickoffs.lock().unwrap().is_empty());
+    assert_no_default_user_jobs(&backend).await;
+
+    let (status, _) = post_form(
+        &base,
+        "/ui/bulk-export",
+        &[
+            ("name", "one-instant window"),
+            ("scope", "system"),
+            ("since_preset", "custom"),
+            ("since_custom", "2026-01-01T00:00:00Z"),
+            ("until", "2026-01-01T00:00:00Z"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 303);
+    assert_eq!(mock.kickoffs.lock().unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn all_resources_omits_type_even_when_a_hostile_form_sends_types() {
     let (base, mock, _) = serve().await;
@@ -1706,7 +2143,11 @@ async fn patient_and_group_scopes_hit_their_export_paths() {
     post_form(
         &base,
         "/ui/bulk-export",
-        &[("name", "Patient export"), ("scope", "patient")],
+        &[
+            ("name", "Patient export"),
+            ("scope", "patient"),
+            ("patient", "p-1"),
+        ],
     )
     .await;
     post_form(
@@ -1772,6 +2213,67 @@ async fn a_rejected_kickoff_lands_as_failed_and_retry_reruns_it() {
             "retry should preserve the empty all-resources type list: {query}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_failed_status_poll_shows_the_operation_outcome_diagnostics() {
+    let (base, mock, _) = serve().await;
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Diabetes registry 2024"), ("scope", "system")],
+    )
+    .await;
+
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    let card_path = html
+        .split("hx-get=\"")
+        .map(|s| s.split('"').next().unwrap_or(""))
+        .find(|s| s.starts_with("/ui/bulk-export/active/"))
+        .expect("card poll url")
+        .to_string();
+
+    *mock.status_failure_body.lock().unwrap() = Some(
+        serde_json::json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{
+                "severity": "error",
+                "code": "not-found",
+                "diagnostics": "Group/no-such-group not found"
+            }]
+        })
+        .to_string(),
+    );
+
+    let (_, html) = get_text(&base, &card_path).await;
+    assert!(html.contains("Group/no-such-group not found"), "{html}");
+    assert!(html.contains("500:"), "{html}");
+    assert!(!html.contains("\"resourceType\""), "{html}");
+    assert!(html.contains("Retry"), "{html}");
+}
+
+#[tokio::test]
+async fn a_failed_status_poll_without_operation_outcome_keeps_the_raw_body() {
+    let (base, mock, _) = serve().await;
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Diabetes registry 2024"), ("scope", "system")],
+    )
+    .await;
+
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    let card_path = html
+        .split("hx-get=\"")
+        .map(|s| s.split('"').next().unwrap_or(""))
+        .find(|s| s.starts_with("/ui/bulk-export/active/"))
+        .expect("card poll url")
+        .to_string();
+
+    *mock.status_failure_body.lock().unwrap() = Some("boom".to_string());
+
+    let (_, html) = get_text(&base, &card_path).await;
+    assert!(html.contains("500: boom"), "{html}");
 }
 
 #[tokio::test]

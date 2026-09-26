@@ -7,13 +7,115 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
+use crate::error::{ConcurrencyError, StorageError};
 use crate::error::{StorageResult, TransactionError};
 use crate::tenant::TenantContext;
 use crate::types::{SearchParameter, StoredResource};
 
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
+use super::patch::PatchError;
 use super::storage::{
     ConditionalCreateResult, ConditionalDeleteResult, ConditionalUpdateResult, ResourceStorage,
 };
+
+/// Checks the exact content a Bundle PATCH would write, while the target is
+/// still inside its transaction. An error carries the complete FHIR outcome.
+#[async_trait]
+pub trait PatchCandidateValidator: Send + Sync {
+    /// Return the full OperationOutcome when the candidate cannot be stored.
+    async fn validate_patch_candidate(
+        &self,
+        tenant: &TenantContext,
+        version: helios_fhir::FhirVersion,
+        resource_type: &str,
+        candidate: &Value,
+    ) -> Result<(), Value>;
+}
+
+/// Render an unapplied Bundle PATCH as a typed entry refusal. The transaction
+/// executors use its status and outcome after rolling back every sibling.
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
+pub(crate) fn patch_failure_entry(error: PatchError) -> Box<BundleEntryResult> {
+    let (status, code) = match error {
+        PatchError::TestFailed { .. } => (422, "processing"),
+        PatchError::UnsupportedFormat { .. } => (501, "not-supported"),
+        _ => (400, "invalid"),
+    };
+    Box::new(BundleEntryResult::error(
+        status,
+        serde_json::json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{
+                "severity": "error",
+                "code": code,
+                "details": {"text": error.to_string()}
+            }]
+        }),
+    ))
+}
+
+/// Keep a PATCH update's concurrency refusal attached to its Bundle entry so
+/// the transaction rolls back and returns the same status as a direct PATCH.
+/// Other storage errors retain their normal backend error path.
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
+pub(crate) fn patch_update_result(
+    result: StorageResult<StoredResource>,
+) -> StorageResult<BundleEntryResult> {
+    match result {
+        Ok(updated) => Ok(BundleEntryResult::updated(updated)),
+        Err(error) => {
+            let status = match &error {
+                StorageError::Concurrency(ConcurrencyError::VersionConflict { .. }) => 409,
+                StorageError::Concurrency(ConcurrencyError::OptimisticLockFailure { .. }) => 412,
+                _ => return Err(error),
+            };
+            Ok(BundleEntryResult::error(
+                status,
+                serde_json::json!({
+                    "resourceType": "OperationOutcome",
+                    "issue": [{
+                        "severity": "error",
+                        "code": "conflict",
+                        "details": {"text": error.to_string()}
+                    }]
+                }),
+            ))
+        }
+    }
+}
+
+/// Decode, apply and validate the candidate while its transaction remains
+/// open. The wire format follows the Bundle version; path evaluation and
+/// resource validation follow the stored target's FHIR version.
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
+pub(crate) async fn prepare_bundle_patch(
+    tenant: &TenantContext,
+    resource_type: &str,
+    current: &StoredResource,
+    document: Option<&Value>,
+    bundle_version: helios_fhir::FhirVersion,
+    validator: Option<&dyn PatchCandidateValidator>,
+) -> Result<Value, Box<BundleEntryResult>> {
+    let document = document.ok_or_else(|| {
+        patch_failure_entry(PatchError::MalformedDocument {
+            format: "Bundle PATCH",
+            message: "entry.resource is required".to_string(),
+        })
+    })?;
+    let patch = super::decode_bundle_patch_resource(document, bundle_version)
+        .map_err(patch_failure_entry)?;
+    let candidate =
+        super::apply_patch_for_version(current.content(), &patch, current.fhir_version())
+            .map_err(patch_failure_entry)?;
+    if let Some(validator) = validator {
+        validator
+            .validate_patch_candidate(tenant, current.fhir_version(), resource_type, &candidate)
+            .await
+            .map_err(|outcome| Box::new(BundleEntryResult::error(422, outcome)))?;
+    }
+    Ok(candidate)
+}
 
 /// Transaction isolation levels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -430,6 +532,52 @@ impl std::fmt::Display for BundleMethod {
     }
 }
 
+/// What a bundle entry actually did to stored state, independent of its HTTP
+/// `status` (#1078).
+///
+/// The status alone cannot say it: a `200` is both a read and an update, and a
+/// `204` is both a delete and — on some backends — a delete of a resource that
+/// was not there. Consumers that count live resources read this instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BundleEntryEffect {
+    /// A new live resource was stored.
+    Created,
+    /// A new version of an existing live resource was stored.
+    Updated,
+    /// A live resource was deleted.
+    Deleted,
+    /// A delete found nothing to delete (absent or already deleted, or a
+    /// conditional delete without a match).
+    NotFound,
+    /// Nothing was written: a conditional create matched an existing resource.
+    NoOp,
+    /// The entry only read (a read or a search).
+    #[default]
+    Read,
+    /// The entry failed.
+    Failed,
+}
+
+impl BundleEntryEffect {
+    /// Net change in live resources: `+1` created, `-1` deleted, else `0`.
+    pub fn live_count_delta(self) -> i64 {
+        match self {
+            BundleEntryEffect::Created => 1,
+            BundleEntryEffect::Deleted => -1,
+            _ => 0,
+        }
+    }
+
+    /// Whether stored state changed.
+    pub fn is_write(self) -> bool {
+        matches!(
+            self,
+            BundleEntryEffect::Created | BundleEntryEffect::Updated | BundleEntryEffect::Deleted
+        )
+    }
+}
+
 /// Result of a bundle entry execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BundleEntryResult {
@@ -445,6 +593,9 @@ pub struct BundleEntryResult {
     pub resource: Option<Value>,
     /// OperationOutcome for errors.
     pub outcome: Option<Value>,
+    /// What the entry actually did to stored state; see [`BundleEntryEffect`].
+    #[serde(default)]
+    pub effect: BundleEntryEffect,
 }
 
 impl BundleEntryResult {
@@ -457,6 +608,7 @@ impl BundleEntryResult {
             last_modified: Some(resource.last_modified().to_rfc3339()),
             resource: Some(resource.content_with_meta()),
             outcome: None,
+            effect: BundleEntryEffect::Created,
         }
     }
 
@@ -469,10 +621,38 @@ impl BundleEntryResult {
             last_modified: Some(resource.last_modified().to_rfc3339()),
             resource: Some(resource.content_with_meta()),
             outcome: None,
+            effect: BundleEntryEffect::Read,
         }
     }
 
-    /// Creates a result for a delete operation.
+    /// Creates a successful result for an update that stored a new version of
+    /// an existing live resource.
+    ///
+    /// Same `200` shape as [`ok`](Self::ok); only the effect differs.
+    pub fn updated(resource: StoredResource) -> Self {
+        Self {
+            effect: BundleEntryEffect::Updated,
+            ..Self::ok(resource)
+        }
+    }
+
+    /// Creates the result for a conditional create (`ifNoneExist`) that
+    /// matched exactly one existing resource, so nothing was written.
+    ///
+    /// Answers `200` with the match, and sets `location` to its versioned URL
+    /// even though nothing was created: transaction loops map a POST entry's
+    /// `fullUrl` to `Type/id` from `location`, and references to a
+    /// conditionally created entry must resolve to the match.
+    pub fn matched_existing(resource: StoredResource) -> Self {
+        let location = resource.versioned_url();
+        Self {
+            location: Some(location),
+            effect: BundleEntryEffect::NoOp,
+            ..Self::ok(resource)
+        }
+    }
+
+    /// Creates a result for a delete operation that removed a live resource.
     pub fn deleted() -> Self {
         Self {
             status: 204,
@@ -481,6 +661,19 @@ impl BundleEntryResult {
             last_modified: None,
             resource: None,
             outcome: None,
+            effect: BundleEntryEffect::Deleted,
+        }
+    }
+
+    /// Creates the result for a delete that found nothing to delete (the
+    /// resource is absent or already deleted).
+    ///
+    /// Same `204` as [`deleted`](Self::deleted) — deletes are idempotent on
+    /// the wire — but the effect records that no live resource went away.
+    pub fn delete_not_found() -> Self {
+        Self {
+            effect: BundleEntryEffect::NotFound,
+            ..Self::deleted()
         }
     }
 
@@ -493,6 +686,7 @@ impl BundleEntryResult {
             last_modified: None,
             resource: None,
             outcome: Some(outcome),
+            effect: BundleEntryEffect::Failed,
         }
     }
 }
@@ -600,6 +794,19 @@ pub trait BundleProvider: ResourceStorage {
         tenant: &TenantContext,
         entries: Vec<BundleEntry>,
         fhir_version: helios_fhir::FhirVersion,
+    ) -> Result<BundleResult, TransactionError> {
+        self.process_transaction_with_patch_validator(tenant, entries, fhir_version, None)
+            .await
+    }
+
+    /// Transaction execution with a write-path check on each patched
+    /// candidate, after the in-transaction read and before the update.
+    async fn process_transaction_with_patch_validator(
+        &self,
+        tenant: &TenantContext,
+        entries: Vec<BundleEntry>,
+        fhir_version: helios_fhir::FhirVersion,
+        validator: Option<&dyn PatchCandidateValidator>,
     ) -> Result<BundleResult, TransactionError>;
 }
 
@@ -666,5 +873,162 @@ mod tests {
         assert_eq!(result.status, 404);
         assert!(result.outcome.is_some());
         assert!(result.resource.is_none());
+        assert_eq!(result.effect, BundleEntryEffect::Failed);
+    }
+
+    #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
+    #[test]
+    fn patch_update_result_preserves_conflicts_and_other_errors() {
+        let version = patch_update_result(Err(StorageError::Concurrency(
+            ConcurrencyError::VersionConflict {
+                resource_type: "Patient".to_string(),
+                id: "123".to_string(),
+                expected_version: "1".to_string(),
+                actual_version: "2".to_string(),
+            },
+        )))
+        .unwrap();
+        assert_eq!(version.status, 409);
+        assert_eq!(version.effect, BundleEntryEffect::Failed);
+        assert_eq!(
+            version.outcome.as_ref().unwrap()["issue"][0]["code"],
+            "conflict"
+        );
+        assert!(
+            version.outcome.unwrap()["issue"][0]["details"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("expected 1, found 2")
+        );
+
+        let etag = patch_update_result(Err(StorageError::Concurrency(
+            ConcurrencyError::OptimisticLockFailure {
+                resource_type: "Patient".to_string(),
+                id: "123".to_string(),
+                expected_etag: "W/\"1\"".to_string(),
+                actual_etag: Some("W/\"2\"".to_string()),
+            },
+        )))
+        .unwrap();
+        assert_eq!(etag.status, 412);
+        assert_eq!(etag.outcome.unwrap()["issue"][0]["code"], "conflict");
+
+        let other = patch_update_result(Err(StorageError::Resource(
+            crate::error::ResourceError::NotFound {
+                resource_type: "Patient".to_string(),
+                id: "123".to_string(),
+            },
+        )));
+        assert!(matches!(
+            other,
+            Err(StorageError::Resource(
+                crate::error::ResourceError::NotFound { .. }
+            ))
+        ));
+    }
+
+    fn stored_patient() -> StoredResource {
+        StoredResource::new(
+            "Patient",
+            "123",
+            crate::tenant::TenantId::new("t1"),
+            serde_json::json!({"resourceType": "Patient", "id": "123"}),
+            FhirVersion::default(),
+        )
+    }
+
+    #[test]
+    fn test_bundle_entry_result_constructor_effects() {
+        let created = BundleEntryResult::created(stored_patient());
+        assert_eq!(
+            (created.status, created.effect),
+            (201, BundleEntryEffect::Created)
+        );
+
+        let read = BundleEntryResult::ok(stored_patient());
+        assert_eq!((read.status, read.effect), (200, BundleEntryEffect::Read));
+        assert!(read.location.is_none());
+
+        let deleted = BundleEntryResult::deleted();
+        assert_eq!(
+            (deleted.status, deleted.effect),
+            (204, BundleEntryEffect::Deleted)
+        );
+
+        let failed = BundleEntryResult::error(412, serde_json::json!({}));
+        assert_eq!(
+            (failed.status, failed.effect),
+            (412, BundleEntryEffect::Failed)
+        );
+    }
+
+    #[test]
+    fn test_bundle_entry_result_updated_matches_ok_shape() {
+        let read = BundleEntryResult::ok(stored_patient());
+        let updated = BundleEntryResult::updated(stored_patient());
+        assert_eq!(updated.status, 200);
+        assert_eq!(updated.effect, BundleEntryEffect::Updated);
+        assert!(updated.location.is_none());
+        assert_eq!(updated.etag, read.etag);
+        assert_eq!(updated.resource, read.resource);
+        assert!(updated.last_modified.is_some());
+        assert!(updated.outcome.is_none());
+    }
+
+    #[test]
+    fn test_bundle_entry_result_matched_existing() {
+        let resource = stored_patient();
+        let expected_location = resource.versioned_url();
+        let matched = BundleEntryResult::matched_existing(resource);
+        assert_eq!(matched.status, 200);
+        assert_eq!(matched.effect, BundleEntryEffect::NoOp);
+        assert_eq!(matched.location, Some(expected_location));
+        assert!(matched.etag.is_some());
+        assert!(matched.resource.is_some());
+        assert!(matched.outcome.is_none());
+    }
+
+    #[test]
+    fn test_bundle_entry_result_delete_not_found() {
+        let result = BundleEntryResult::delete_not_found();
+        assert_eq!(result.status, 204);
+        assert_eq!(result.effect, BundleEntryEffect::NotFound);
+        assert!(result.location.is_none());
+        assert!(result.etag.is_none());
+        assert!(result.last_modified.is_none());
+        assert!(result.resource.is_none());
+        assert!(result.outcome.is_none());
+    }
+
+    #[test]
+    fn test_bundle_entry_effect_delta_and_is_write() {
+        let table = [
+            (BundleEntryEffect::Created, 1, true),
+            (BundleEntryEffect::Updated, 0, true),
+            (BundleEntryEffect::Deleted, -1, true),
+            (BundleEntryEffect::NotFound, 0, false),
+            (BundleEntryEffect::NoOp, 0, false),
+            (BundleEntryEffect::Read, 0, false),
+            (BundleEntryEffect::Failed, 0, false),
+        ];
+        for (effect, delta, is_write) in table {
+            assert_eq!(effect.live_count_delta(), delta, "{effect:?} delta");
+            assert_eq!(effect.is_write(), is_write, "{effect:?} is_write");
+        }
+        assert_eq!(BundleEntryEffect::default(), BundleEntryEffect::Read);
+    }
+
+    #[test]
+    fn test_bundle_entry_result_effect_defaults_when_absent() {
+        let result: BundleEntryResult = serde_json::from_value(serde_json::json!({
+            "status": 200,
+            "location": null,
+            "etag": null,
+            "last_modified": null,
+            "resource": null,
+            "outcome": null
+        }))
+        .unwrap();
+        assert_eq!(result.effect, BundleEntryEffect::Read);
     }
 }

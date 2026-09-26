@@ -44,6 +44,90 @@ pub(crate) struct CurrentResourceWithMeta {
 }
 
 impl S3Backend {
+    /// Soft-deletes a resource, optionally only at `expected_version`
+    /// ([`ResourceStorage::delete`] / [`ResourceStorage::delete_versioned`]).
+    ///
+    /// The tombstone is a conditional PUT on the ETag of the object loaded
+    /// here, and `expected_version` is compared on that same object — so a
+    /// writer landing after the comparison changes the ETag and the PUT is
+    /// refused (`OptimisticLockFailure`) rather than deleting a version the
+    /// caller never saw (#1404). That guarantee is the object store's
+    /// conditional write: a store that ignores `If-Match` on PUT gives none.
+    async fn soft_delete(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: Option<&str>,
+    ) -> StorageResult<()> {
+        tenant.check_permission(Operation::Delete, resource_type)?;
+
+        let location = self.tenant_location(tenant)?;
+        let current_key = location.keyspace.current_resource_key(resource_type, id);
+
+        let Some(actual) = self
+            .load_current_with_meta(tenant, resource_type, id)
+            .await?
+        else {
+            return Err(StorageError::Resource(ResourceError::NotFound {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+            }));
+        };
+
+        if actual.resource.is_deleted() {
+            return Err(StorageError::Resource(ResourceError::Gone {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+                deleted_at: actual.resource.deleted_at(),
+            }));
+        }
+
+        if let Some(expected) = expected_version
+            && expected != actual.resource.version_id()
+        {
+            return Err(StorageError::Concurrency(
+                ConcurrencyError::VersionConflict {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                    expected_version: expected.to_string(),
+                    actual_version: actual.resource.version_id().to_string(),
+                },
+            ));
+        }
+
+        let deleted = actual.resource.mark_deleted();
+        let payload = self.serialize_json(&deleted)?;
+
+        match self
+            .put_json_object(
+                &location.bucket,
+                &current_key,
+                &payload,
+                actual.etag.as_deref(),
+                None,
+            )
+            .await
+        {
+            Ok(_) => {
+                self.put_history_and_indexes(&location, &deleted, HistoryMethod::Delete)
+                    .await?;
+                self.maybe_reload_search_param_cache(tenant, resource_type, None)
+                    .await;
+                Ok(())
+            }
+            Err(StorageError::Backend(BackendError::QueryError { .. })) => Err(
+                StorageError::Concurrency(ConcurrencyError::OptimisticLockFailure {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                    expected_etag: actual.etag.unwrap_or_default(),
+                    actual_etag: None,
+                }),
+            ),
+            Err(err) => Err(err),
+        }
+    }
+
     /// Serialises `value` to a JSON byte vector.
     pub(crate) fn serialize_json<T: Serialize>(&self, value: &T) -> StorageResult<Vec<u8>> {
         serde_json::to_vec(value).map_err(|e| {
@@ -339,6 +423,21 @@ impl S3Backend {
         tenant: &TenantContext,
         resource_type: &str,
     ) -> StorageResult<Vec<Value>> {
+        Ok(self
+            .scan_live_stored(tenant, resource_type)
+            .await?
+            .into_iter()
+            .map(|resource| resource.content().clone())
+            .collect())
+    }
+
+    /// [`Self::scan_live_resources`] with the storage envelope kept (version,
+    /// timestamps), for callers that hand the resources back as search matches.
+    pub(crate) async fn scan_live_stored(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+    ) -> StorageResult<Vec<StoredResource>> {
         use futures::stream::{self, StreamExt};
 
         let location = self.tenant_location(tenant)?;
@@ -364,9 +463,56 @@ impl S3Backend {
             if resource.is_deleted() {
                 continue;
             }
-            resources.push(resource.content().clone());
+            resources.push(resource);
         }
         Ok(resources)
+    }
+
+    /// The live resources `criteria` select, at most two — one match and
+    /// "more than one" are all a conditional create distinguishes. `_id`
+    /// criteria alone read the objects they name; an `identifier` criterion
+    /// walks the type's prefix the way [`Self::scan_live_stored`] does, but
+    /// stops fetching at the second match.
+    async fn conditional_matches(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        criteria: &super::conditional::ScanCriteria,
+    ) -> StorageResult<Vec<StoredResource>> {
+        use futures::stream::{self, StreamExt};
+
+        if criteria.is_empty() {
+            return Ok(Vec::new());
+        }
+        let location = self.tenant_location(tenant)?;
+        let keys = match criteria.candidate_ids() {
+            Some(ids) => ids
+                .iter()
+                .map(|id| location.keyspace.current_resource_key(resource_type, id))
+                .collect(),
+            None => {
+                self.list_current_keys(&location, Some(resource_type))
+                    .await?
+            }
+        };
+        let bucket = &location.bucket;
+        let mut fetched = stream::iter(keys)
+            .map(|key| async move { self.get_json_object::<StoredResource>(bucket, &key).await })
+            .buffer_unordered(self.bulk_write_concurrency());
+        let mut matches = Vec::with_capacity(2);
+        while let Some(result) = fetched.next().await {
+            let Some((stored, _)) = result? else {
+                continue;
+            };
+            if stored.is_deleted() || !criteria.matches(stored.content()) {
+                continue;
+            }
+            matches.push(stored);
+            if matches.len() >= 2 {
+                break;
+            }
+        }
+        Ok(matches)
     }
 
     /// Reloads one tenant's stored active SearchParameters into the sync
@@ -385,7 +531,7 @@ impl S3Backend {
     ) -> StorageResult<usize> {
         use crate::search::registry::{SearchParameterSource, SearchParameterStatus};
 
-        let loader = SearchParameterLoader::new(FhirVersion::default());
+        let loader = SearchParameterLoader::new(FhirVersion::default_enabled());
         let resources = self.scan_live_resources(tenant, "SearchParameter").await?;
 
         let mut defs = Vec::new();
@@ -707,6 +853,10 @@ impl ResourceStorage for S3Backend {
         ))
     }
 
+    fn resource_scan(&self) -> Option<std::sync::Arc<dyn crate::sof::in_process::ResourceScan>> {
+        Some(std::sync::Arc::new(self.clone()))
+    }
+
     async fn create(
         &self,
         tenant: &TenantContext,
@@ -920,59 +1070,18 @@ impl ResourceStorage for S3Backend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<()> {
-        tenant.check_permission(Operation::Delete, resource_type)?;
+        self.soft_delete(tenant, resource_type, id, None).await
+    }
 
-        let location = self.tenant_location(tenant)?;
-        let current_key = location.keyspace.current_resource_key(resource_type, id);
-
-        let Some(actual) = self
-            .load_current_with_meta(tenant, resource_type, id)
-            .await?
-        else {
-            return Err(StorageError::Resource(ResourceError::NotFound {
-                resource_type: resource_type.to_string(),
-                id: id.to_string(),
-            }));
-        };
-
-        if actual.resource.is_deleted() {
-            return Err(StorageError::Resource(ResourceError::Gone {
-                resource_type: resource_type.to_string(),
-                id: id.to_string(),
-                deleted_at: actual.resource.deleted_at(),
-            }));
-        }
-
-        let deleted = actual.resource.mark_deleted();
-        let payload = self.serialize_json(&deleted)?;
-
-        match self
-            .put_json_object(
-                &location.bucket,
-                &current_key,
-                &payload,
-                actual.etag.as_deref(),
-                None,
-            )
+    async fn delete_versioned(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: &str,
+    ) -> StorageResult<()> {
+        self.soft_delete(tenant, resource_type, id, Some(expected_version))
             .await
-        {
-            Ok(_) => {
-                self.put_history_and_indexes(&location, &deleted, HistoryMethod::Delete)
-                    .await?;
-                self.maybe_reload_search_param_cache(tenant, resource_type, None)
-                    .await;
-                Ok(())
-            }
-            Err(StorageError::Backend(BackendError::QueryError { .. })) => Err(
-                StorageError::Concurrency(ConcurrencyError::OptimisticLockFailure {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                    expected_etag: actual.etag.unwrap_or_default(),
-                    actual_etag: None,
-                }),
-            ),
-            Err(err) => Err(err),
-        }
     }
 
     async fn count(
@@ -1387,7 +1496,11 @@ impl VersionedStorage for S3Backend {
             ));
         }
 
-        self.delete(tenant, resource_type, id).await
+        // Delete exactly the version the precondition was evaluated against,
+        // not whatever is current by the time `delete` loads it again (#1404).
+        let actual_version = actual_version.to_string();
+        self.delete_versioned(tenant, resource_type, id, &actual_version)
+            .await
     }
 
     async fn list_versions(
@@ -1594,13 +1707,68 @@ use crate::core::storage::{
 use crate::types::IncludeDirective;
 use crate::types::SearchQuery;
 
+/// The SQL-on-FHIR definition types, which standalone S3 lists by scanning.
+///
+/// S3 has no search index, and answering a search by reading every object of a
+/// type is not something to do quietly for `Patient` or `Observation`: those
+/// stay `501`. These two are different in kind — a handful of
+/// operator-authored definitions — and without a way to list them the SQL
+/// Views, SQL Queries and SQL Export pages render empty, as if nothing had
+/// been saved (#1228).
+const SCAN_LISTED_TYPES: [&str; 2] = ["ViewDefinition", "Library"];
+
+/// Whether `query` is the plain "everything of this type" listing of one of
+/// [`SCAN_LISTED_TYPES`]: no filter of any kind, so that a scan returns
+/// exactly what a search would.
+fn lists_by_scan(query: &SearchQuery) -> bool {
+    SCAN_LISTED_TYPES.contains(&query.resource_type.as_str())
+        && query.parameters.is_empty()
+        && query.compartment.is_none()
+        && query.includes.is_empty()
+        && query.cursor.is_none()
+}
+
+impl S3Backend {
+    /// Serves a filterless listing of a definition type from a scan, newest
+    /// first like every other backend's default order. One page: `_count`
+    /// bounds it, and the reported total is what the scan found.
+    async fn list_definitions_by_scan(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<SearchResult> {
+        let mut resources = self.scan_live_stored(tenant, &query.resource_type).await?;
+        resources.sort_by(|a, b| {
+            b.last_modified()
+                .cmp(&a.last_modified())
+                .then_with(|| a.id().cmp(b.id()))
+        });
+        let total = resources.len() as u64;
+        let offset = query.offset.unwrap_or(0) as usize;
+        let count = query.count.unwrap_or(100) as usize;
+        let page: Vec<StoredResource> = resources.into_iter().skip(offset).take(count).collect();
+        let mut page_info = crate::types::PageInfo::end();
+        page_info.total = Some(total);
+        page_info.has_previous = offset > 0;
+        Ok(SearchResult {
+            resources: crate::types::Page::new(page, page_info),
+            included: Vec::new(),
+            total: Some(total),
+            scores: std::collections::HashMap::new(),
+        })
+    }
+}
+
 #[async_trait]
 impl SearchProvider for S3Backend {
     async fn search(
         &self,
-        _tenant: &TenantContext,
-        _query: &SearchQuery,
+        tenant: &TenantContext,
+        query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
+        if lists_by_scan(query) {
+            return self.list_definitions_by_scan(tenant, query).await;
+        }
         Err(StorageError::Backend(BackendError::UnsupportedCapability {
             backend_name: "S3".to_string(),
             capability: "search".to_string(),
@@ -1669,20 +1837,39 @@ impl RevincludeProvider for S3Backend {
 
 #[async_trait]
 impl ConditionalStorage for S3Backend {
-    async fn conditional_create(
-        &self,
-        _tenant: &TenantContext,
-        _resource_type: &str,
-        _resource: Value,
-        _search_params: &str,
-        _fhir_version: FhirVersion,
-    ) -> StorageResult<ConditionalCreateResult> {
-        Err(StorageError::Backend(BackendError::UnsupportedCapability {
-            backend_name: "S3".to_string(),
-            capability: "conditional_create".to_string(),
-        }))
+    fn supports_conditional(&self, interaction: crate::core::ConditionalInteraction) -> bool {
+        // One declaration: the capability list the contract test pins (#1384).
+        crate::core::Backend::supports(self, interaction.capability())
     }
 
+    /// Identifier-scoped (#1435): `_id` and `identifier` criteria, decided
+    /// against the stored objects — see [`super::conditional`]. A create that
+    /// matched nothing is an ordinary [`ResourceStorage::create`].
+    async fn conditional_create(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resource: Value,
+        search_params: &str,
+        fhir_version: FhirVersion,
+    ) -> StorageResult<ConditionalCreateResult> {
+        let criteria = super::conditional::ScanCriteria::parse(search_params)?;
+        let matches = self
+            .conditional_matches(tenant, resource_type, &criteria)
+            .await?;
+        match matches.len() {
+            0 => Ok(ConditionalCreateResult::Created(
+                self.create(tenant, resource_type, resource, fhir_version)
+                    .await?,
+            )),
+            1 => Ok(ConditionalCreateResult::Exists(
+                matches.into_iter().next().expect("one match"),
+            )),
+            n => Ok(ConditionalCreateResult::MultipleMatches(n)),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn conditional_update(
         &self,
         _tenant: &TenantContext,
@@ -1691,6 +1878,7 @@ impl ConditionalStorage for S3Backend {
         _search_params: &str,
         _upsert: bool,
         _fhir_version: FhirVersion,
+        _if_match: &crate::core::EntityTagPrecondition,
     ) -> StorageResult<ConditionalUpdateResult> {
         Err(StorageError::Backend(BackendError::UnsupportedCapability {
             backend_name: "S3".to_string(),
@@ -1703,6 +1891,7 @@ impl ConditionalStorage for S3Backend {
         _tenant: &TenantContext,
         _resource_type: &str,
         _search_params: &str,
+        _if_match: &crate::core::EntityTagPrecondition,
     ) -> StorageResult<ConditionalDeleteResult> {
         Err(StorageError::Backend(BackendError::UnsupportedCapability {
             backend_name: "S3".to_string(),
@@ -1717,10 +1906,90 @@ impl crate::sof::in_process::ResourceScan for S3Backend {
         &self,
         tenant: &TenantContext,
         resource_type: &str,
-    ) -> Result<Vec<Value>, crate::core::sof_runner::SofError> {
-        self.scan_live_resources(tenant, resource_type)
+    ) -> Result<crate::sof::in_process::ResourceStream, crate::core::sof_runner::SofError> {
+        use crate::core::sof_runner::SofError;
+        use futures::stream::{self, StreamExt};
+
+        let location = self
+            .tenant_location(tenant)
+            .map_err(|e| SofError::Storage(e.to_string()))?;
+
+        // S3 LIST is key-only (cheap strings), so collecting keys upfront is
+        // unavoidable. The expensive per-object GETs are pipelined via
+        // buffer_unordered and yielded one at a time rather than accumulated.
+        let keys = self
+            .list_current_keys(&location, Some(resource_type))
             .await
-            .map_err(|e| crate::core::sof_runner::SofError::Storage(e.to_string()))
+            .map_err(|e| SofError::Storage(e.to_string()))?;
+
+        let backend = self.clone();
+        let bucket = location.bucket.clone();
+        let concurrency = self.bulk_write_concurrency();
+
+        let scan_stream = stream::iter(keys)
+            .map(move |key| {
+                let backend = backend.clone();
+                let bucket = bucket.clone();
+                async move {
+                    backend
+                        .get_json_object::<StoredResource>(&bucket, &key)
+                        .await
+                        .map_err(|e| SofError::Storage(e.to_string()))
+                }
+            })
+            .buffer_unordered(concurrency)
+            .filter_map(|result| async move {
+                match result {
+                    Err(e) => Some(Err(e)),
+                    Ok(None) => None,
+                    Ok(Some((resource, _))) if resource.is_deleted() => None,
+                    Ok(Some((resource, _))) => Some(Ok(resource.into_content_with_meta())),
+                }
+            });
+
+        Ok(Box::pin(scan_stream))
+    }
+
+    async fn read_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[String],
+    ) -> Result<Vec<Value>, crate::core::sof_runner::SofError> {
+        use crate::core::sof_runner::SofError;
+        use futures::stream::{self, StreamExt};
+
+        // One GET per id against the `current.json` key — no LIST, so the cost
+        // is the number of ids rather than the size of the type's keyspace.
+        let loaded: Vec<Result<Option<StoredResource>, SofError>> =
+            stream::iter(ids.iter().cloned())
+                .map(|id| {
+                    let backend = self.clone();
+                    let tenant = tenant.clone();
+                    let resource_type = resource_type.to_string();
+                    async move {
+                        backend
+                            .load_current_with_meta(&tenant, &resource_type, &id)
+                            .await
+                            .map(|current| {
+                                current
+                                    .map(|c| c.resource)
+                                    .filter(|resource| !resource.is_deleted())
+                            })
+                            .map_err(|e| SofError::Storage(e.to_string()))
+                    }
+                })
+                .buffer_unordered(self.bulk_write_concurrency())
+                .collect()
+                .await;
+
+        let mut out = Vec::with_capacity(ids.len());
+        for result in loaded {
+            if let Some(resource) = result? {
+                out.push(resource.into_content_with_meta());
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -1972,6 +2241,7 @@ impl ReindexSource for S3Backend {
         Ok(ResourcePage {
             resources,
             next_cursor,
+            skipped: Vec::new(),
         })
     }
 }

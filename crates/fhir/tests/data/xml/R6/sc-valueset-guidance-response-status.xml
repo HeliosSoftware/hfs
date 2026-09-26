@@ -34,42 +34,42 @@
         <tr>
           <td>entered-in-error</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>error</td>
         </tr>
         <tr>
           <td>data-requested</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>draft</td>
         </tr>
         <tr>
           <td>data-required</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>declined</td>
         </tr>
         <tr>
           <td>in-progress</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>active</td>
         </tr>
         <tr>
           <td>failure</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>failed</td>
         </tr>
         <tr>
           <td>success</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>complete</td>
         </tr>
@@ -77,7 +77,7 @@
     </div>
   </text>
   <url value="http://hl7.org/fhir/ConceptMap/sc-guidance-response-status"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-snapshot1"/>
   <name value="GuidanceResponseStatusCanonicalMap"/>
   <title value="Canonical Mapping for &quot;Guidance Response Status&quot;"/>
   <status value="draft"/>

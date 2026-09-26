@@ -859,7 +859,13 @@ mod resource_type_admission {
         .await;
 
         assert_eq!(body["entry"][0]["response"]["status"], "201 Created");
-        assert_eq!(body["entry"][1]["response"]["status"], "400 Bad Request");
+        // "Resource type not supported" is a `404` inside a Bundle exactly as
+        // it is at `PUT [base]/NoLongerValid/bad` (#504, #989).
+        assert_eq!(body["entry"][1]["response"]["status"], "404 Not Found");
+        assert_eq!(
+            body["entry"][1]["response"]["outcome"]["issue"][0]["code"],
+            "not-supported"
+        );
         assert!(
             backend
                 .read(&test_tenant(), "Patient", "good")
@@ -950,9 +956,12 @@ mod resource_type_admission {
             }))
             .await;
 
-        response.assert_status(StatusCode::BAD_REQUEST);
+        // The transaction is declined whole with the failing entry's own
+        // status: an unsupported resource type is a `404` (#989).
+        response.assert_status(StatusCode::NOT_FOUND);
         let outcome: Value = response.json();
         assert_eq!(outcome["resourceType"], "OperationOutcome");
+        assert_eq!(outcome["issue"][0]["code"], "not-supported");
         assert!(
             backend
                 .read(&test_tenant(), "Patient", "sibling")
@@ -1214,6 +1223,103 @@ mod conditional_references {
         response.assert_status(StatusCode::BAD_REQUEST);
     }
 
+    /// Seeds `p1` and `p2`; only `p2` has an Observation with code 1234-5
+    /// and only `p2` is managed by the Organization named Acme.
+    async fn seed_chain_targets(backend: &SqliteBackend) {
+        let tenant = test_tenant();
+        seed_patient(backend, "p1", "CondRef").await;
+        for (ty, body) in [
+            (
+                "Organization",
+                json!({"resourceType": "Organization", "id": "org-acme", "name": "Acme"}),
+            ),
+            (
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "p2",
+                    "name": [{"family": "Chained"}],
+                    "managingOrganization": {"reference": "Organization/org-acme"}
+                }),
+            ),
+            (
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "o2",
+                    "status": "final",
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "1234-5"}]},
+                    "subject": {"reference": "Patient/p2"}
+                }),
+            ),
+        ] {
+            backend
+                .create(&tenant, ty, body, FhirVersion::R4)
+                .await
+                .expect("seed chain target");
+        }
+    }
+
+    /// Posts the Immunization bundle with `patient` set to `reference`.
+    async fn post_with_patient_reference(
+        server: &TestServer,
+        reference: &str,
+    ) -> axum_test::TestResponse {
+        let mut bundle = immunization_bundle();
+        bundle["entry"][0]["resource"]["location"] = Value::Null;
+        bundle["entry"][0]["resource"]["patient"] = json!({ "reference": reference });
+        server
+            .post("/")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .json(&bundle)
+            .await
+    }
+
+    /// A chained or `_has` conditional reference is resolved like a type
+    /// search (#1389). `search()` does not read chains, and this path used to
+    /// call it without resolving them: `_has` was dropped (so the reference
+    /// bound to whichever Patient happened to be unique) and a dotted chain
+    /// was misread as a plain reference (so it matched nothing).
+    #[tokio::test]
+    async fn chained_conditional_references_resolve_to_the_matching_resource() {
+        for reference in [
+            "Patient?_has:Observation:subject:code=1234-5",
+            "Patient?organization.name=Acme",
+        ] {
+            let (server, backend) = create_test_server().await;
+            seed_chain_targets(&backend).await;
+
+            let response = post_with_patient_reference(&server, reference).await;
+            response.assert_status_ok();
+
+            let stored = server
+                .get("/Immunization?_count=5")
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            let body: Value = stored.json();
+            let imm = &body["entry"][0]["resource"];
+            assert_eq!(
+                imm["patient"]["reference"], "Patient/p2",
+                "{reference} must resolve to the chained match: {imm}"
+            );
+        }
+    }
+
+    /// With no Observation behind it, a `_has` reference matches nothing and
+    /// the bundle is rejected. It used to bind to the only Patient present.
+    #[tokio::test]
+    async fn a_has_conditional_reference_with_no_match_rejects_the_bundle() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "CondRef").await;
+
+        let response =
+            post_with_patient_reference(&server, "Patient?_has:Observation:subject:code=1234-5")
+                .await;
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let text = response.text();
+        assert!(text.contains("matches no existing resource"), "got: {text}");
+    }
+
     #[tokio::test]
     async fn an_ambiguous_match_rejects_the_bundle() {
         let (server, backend) = create_test_server().await;
@@ -1427,20 +1533,30 @@ mod conditional_entries {
         assert_eq!(family_of(&backend, "p1").await, "Decoded");
     }
 
+    /// `ifMatch` on a conditional entry is evaluated against the resource the
+    /// criteria resolve to (#1381; it was a `400` before). The full matrix is
+    /// `tests/conditional_if_match.rs`.
     #[tokio::test]
-    async fn if_match_on_a_conditional_entry_is_400_and_writes_nothing() {
+    async fn if_match_on_a_conditional_entry_is_honoured() {
         let (server, backend) = create_test_server().await;
         seed_patient_with_identifier(&backend, "p1", "Nguyen").await;
 
         let mut bundle = conditional_put("Patient?identifier=http://example.org|12345", "Stale");
-        bundle["entry"][0]["request"]["ifMatch"] = json!("W/\"1\"");
+        bundle["entry"][0]["request"]["ifMatch"] = json!("W/\"7\"");
         let body = post_batch(&server, bundle).await;
 
         assert_eq!(
-            body["entry"][0]["response"]["status"], "400 Bad Request",
+            body["entry"][0]["response"]["status"], "412 Precondition Failed",
             "{body}"
         );
         assert_eq!(family_of(&backend, "p1").await, "Nguyen");
+
+        let mut bundle = conditional_put("Patient?identifier=http://example.org|12345", "Fresh");
+        bundle["entry"][0]["request"]["ifMatch"] = json!("W/\"1\"");
+        let body = post_batch(&server, bundle).await;
+
+        assert_eq!(body["entry"][0]["response"]["status"], "200 OK", "{body}");
+        assert_eq!(family_of(&backend, "p1").await, "Fresh");
     }
 
     // ── DELETE [type]?[criteria] ─────────────────────────────────────────────
@@ -2116,6 +2232,48 @@ mod conditional_entries {
         assert_eq!(patient_count(&backend).await, before);
     }
 
+    /// A conditional patch has no transaction-scoped resolution; it is
+    /// declined intact before anything executes, not stripped of its
+    /// criteria and dispatched against the type.
+    #[tokio::test]
+    async fn a_transaction_conditional_patch_is_declined_intact() {
+        let (server, backend) = create_test_server().await;
+        seed_patient_with_identifier(&backend, "p1", "Nguyen").await;
+        let before = patient_count(&backend).await;
+
+        let patch = json!({
+            "request": { "method": "PATCH", "url": CRITERIA_URL },
+            "resource": {
+                "resourceType": "Parameters",
+                "parameter": [{
+                    "name": "operation",
+                    "part": [
+                        { "name": "type", "valueCode": "add" },
+                        { "name": "path", "valueString": "Patient" },
+                        { "name": "name", "valueString": "active" },
+                        { "name": "value", "valueBoolean": true }
+                    ]
+                }]
+            }
+        });
+        let response = post_bundle(&server, transaction(vec![sibling_post(), patch])).await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let body: Value = response.json();
+        assert_eq!(body["issue"][0]["code"], "not-supported", "{body}");
+        assert!(
+            body["issue"][0]["details"]["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("conditional patch")),
+            "{body}"
+        );
+        assert_eq!(
+            patient_count(&backend).await,
+            before,
+            "sibling POST not applied"
+        );
+    }
+
     /// An instance URL's query is a control parameter, not criteria; it is
     /// dropped rather than reaching the backend as part of the id (#503).
     #[tokio::test]
@@ -2212,10 +2370,9 @@ mod entry_methods {
         json!({ "resourceType": "Bundle", "type": "batch", "entry": entries })
     }
 
-    /// PATCH is declined at 501 — the status all three backends already return
-    /// from inside a transaction, and the one both READMEs already claimed.
+    /// A malformed PATCH payload fails only its batch entry and changes nothing.
     #[tokio::test]
-    async fn batch_patch_is_declined_at_501_and_changes_nothing() {
+    async fn malformed_batch_patch_is_400_and_changes_nothing() {
         let (server, backend) = create_test_server().await;
         seed_patient(&backend, "p1", "Nguyen").await;
 
@@ -2228,10 +2385,7 @@ mod entry_methods {
         )
         .await;
 
-        assert_eq!(
-            body["entry"][0]["response"]["status"],
-            "501 Not Implemented"
-        );
+        assert_eq!(body["entry"][0]["response"]["status"], "400 Bad Request");
         let stored = backend
             .read(&test_tenant(), "Patient", "p1")
             .await
@@ -2310,11 +2464,11 @@ mod entry_methods {
         );
     }
 
-    /// A PATCH transaction is declined before anything executes, so a sibling
-    /// create in the same bundle must not have landed.
+    /// A malformed PATCH rolls back a preceding create in the transaction.
     #[tokio::test]
-    async fn a_transaction_patch_is_declined_intact_at_501() {
+    async fn a_malformed_transaction_patch_rolls_back_at_400() {
         let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Nguyen").await;
         let before = patient_count(&backend).await;
 
         let response = post_bundle(
@@ -2336,10 +2490,10 @@ mod entry_methods {
         )
         .await;
 
-        response.assert_status(StatusCode::NOT_IMPLEMENTED);
+        response.assert_status(StatusCode::BAD_REQUEST);
         let body: Value = response.json();
         assert_eq!(body["resourceType"], "OperationOutcome");
-        assert_eq!(body["issue"][0]["code"], "not-supported");
+        assert_eq!(body["issue"][0]["code"], "invalid");
         assert!(
             body["issue"][0]["details"]["text"]
                 .as_str()
@@ -2353,8 +2507,14 @@ mod entry_methods {
     /// whether it arrives per-entry in a batch or as a whole-bundle transaction
     /// failure. Flattening the refusal at the transaction boundary would have
     /// made this 400 and re-created the divergence in a new place.
+    ///
+    /// They now agree on the issue code and the message too. #502 closed the
+    /// status half and named the rest as #504's: the batch entry said
+    /// `processing` while the transaction body said `not-supported`, and the
+    /// batch arm printed HEAD guidance the transaction arm dropped, because
+    /// `into_rest_error` computed a message and discarded it on that arm.
     #[tokio::test]
-    async fn the_two_arms_agree_on_the_refusal_status() {
+    async fn the_two_arms_agree_on_the_refusal_status_and_code() {
         let (server, _backend) = create_test_server().await;
 
         let batch = post_batch(
@@ -2368,6 +2528,7 @@ mod entry_methods {
             batch["entry"][0]["response"]["status"],
             "405 Method Not Allowed"
         );
+        let batch_issue = &batch["entry"][0]["response"]["outcome"]["issue"][0];
 
         let transaction = post_bundle(
             &server,
@@ -2379,6 +2540,24 @@ mod entry_methods {
         )
         .await;
         transaction.assert_status(StatusCode::METHOD_NOT_ALLOWED);
+        let transaction_body: Value = transaction.json();
+        let transaction_issue = &transaction_body["issue"][0];
+
+        assert_eq!(batch_issue["code"], transaction_issue["code"]);
+        assert_eq!(
+            batch_issue["details"]["text"], transaction_issue["details"]["text"],
+            "one refusal, one sentence"
+        );
+
+        // Pinned literally: equality alone is satisfied by both arms being
+        // wrong in the same way.
+        assert_eq!(batch_issue["code"], "not-supported");
+        assert!(
+            batch_issue["details"]["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("send HEAD to the instance endpoint")),
+            "both arms must keep the guidance: {batch_issue}"
+        );
     }
 }
 

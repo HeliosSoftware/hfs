@@ -10,6 +10,7 @@ import {
   createResource,
   createResources,
   createSqlQueryLibrary,
+  deleteByNamePrefix,
   deleteResources,
   waitSearchable,
 } from "../pages/api";
@@ -27,6 +28,13 @@ const POLL_TIMEOUT = 30_000;
 // happens to follow this one against the same shared server.
 let seededViewDefinitionIds: string[] = [];
 
+// The per-run name prefix of every padding `ViewDefinition` batch a test
+// below seeds, swept by name in this file's own `afterEach` (below) on top of
+// the ids above: `createResources` reports each chunk's ids as it lands, but a
+// chunk whose request fails outright (a 408 on the ES composites) never
+// reports its ids while the server may still commit it (#1070).
+let seededViewDefinitionPrefixes: string[] = [];
+
 // Same reasoning as `seededViewDefinitionIds` above, for the `Library`
 // sql-query/sql-view subjects the builder-enhancement tests below seed: left
 // behind, a `Library` becomes `/ui/sql/queries`' or `/ui/sql/views`' default
@@ -37,6 +45,12 @@ test.afterEach(async ({ request }) => {
   const ids = seededViewDefinitionIds;
   seededViewDefinitionIds = [];
   await deleteResources(request, "ViewDefinition", ids);
+
+  const prefixes = seededViewDefinitionPrefixes;
+  seededViewDefinitionPrefixes = [];
+  for (const prefix of prefixes) {
+    await deleteByNamePrefix(request, "ViewDefinition", prefix);
+  }
 
   const libraryIds = seededLibraryIds;
   seededLibraryIds = [];
@@ -93,6 +107,10 @@ test.describe.serial("Active SQL Exports", () => {
     await waitSearchable(request, "Patient", patientId);
 
     const prefix = `e2e_sql_export_slow_${Date.now()}`;
+    // Registered before the batch starts and per chunk as it lands, so a
+    // failure partway through still leaves `afterEach` able to clean up
+    // every padding row that did (or may yet) commit.
+    seededViewDefinitionPrefixes.push(`${prefix}_`);
     const ids = await createResources(
       request,
       Array.from({ length: PADDING_SUBJECTS }, (_, i) => ({
@@ -104,8 +122,9 @@ test.describe.serial("Active SQL Exports", () => {
           select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
         },
       })),
+      undefined,
+      (chunkIds) => seededViewDefinitionIds.push(...chunkIds),
     );
-    seededViewDefinitionIds.push(...ids);
 
     await sqlExport.gotoNew();
     const checkboxes = ids

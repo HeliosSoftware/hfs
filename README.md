@@ -240,6 +240,9 @@ AWS_REGION=us-east-1 \
 | `HFS_DEFAULT_FHIR_VERSION` | `R4` | FHIR version (R4, R4B, R5, R6) |
 | `HFS_LOG_LEVEL` | `info` | Log level (error, warn, info, debug, trace) |
 | `HFS_UI_ENABLED` | `true` | Serve the web UI at `/ui`. Set `false` for headless deployments; `/ui` then returns `404` + OperationOutcome. Has no effect on a binary built without the `ui` feature. |
+| `HFS_DASHBOARD_RECONCILE_SECS` | `30` | Seconds between Home dashboard reconcile passes against storage (CLI `--dashboard-reconcile-interval-secs`). Whole seconds, must be `> 0`; `0` or a non-numeric value is a startup error. A tenant's full recount is additionally spaced to at most every max(interval, 10 × its last recount duration); also how soon a failed background seed is retried. |
+| `HFS_DASHBOARD_REFRESH_SECS` | `5` | Seconds between refreshes of a Home dashboard whose figures are moving (approximate, or an import running) (CLI `--dashboard-refresh-secs`). Re-reads in-memory counters only, never storage. Whole seconds, must be `> 0` and `<=` `HFS_DASHBOARD_IDLE_REFRESH_SECS`; otherwise a startup error. |
+| `HFS_DASHBOARD_IDLE_REFRESH_SECS` | `10` | Seconds between watch ticks of a Home dashboard whose figures are settled (exact, no import running), so an open tab notices an import starting (CLI `--dashboard-idle-refresh-secs`). Whole seconds, must be `> 0` and `>=` `HFS_DASHBOARD_REFRESH_SECS`; otherwise a startup error. |
 
 Set `HFS_BASE_URL` to the URL clients use, including any reverse-proxy path
 prefix, for example `https://fhir.example.com/fhir`. HFS accepts only absolute
@@ -255,6 +258,7 @@ removes trailing slashes at startup. HFS does not derive this value from
 | `HFS_REQUEST_TIMEOUT` | `30` | Request timeout (seconds) |
 | `HFS_DEFAULT_PAGE_SIZE` | `20` | Default search result page size |
 | `HFS_MAX_PAGE_SIZE` | `1000` | Maximum search result page size |
+| `HFS_EVERYTHING_MAX_UNPAGED` | `10000` | Ceiling on `match` entries for an unpaged `Patient/$everything`; when reached the response is paged and carries a `next` link. |
 | `HFS_ENABLE_REQUEST_ID` | `true` | Enable request ID tracking |
 | `HFS_ENABLE_VERSIONING` | `true` | Enable ETag versioning |
 | `HFS_RETURN_GONE` | `true` | Return `410 Gone` for deleted resources (vs `404`) |
@@ -298,6 +302,13 @@ compressed when the client sends `Accept-Encoding`.
 | `HFS_ELASTICSEARCH_PASSWORD` | *(none)* | ES basic auth password |
 | `HFS_ELASTICSEARCH_REFRESH_INTERVAL` | `1s` | Index `refresh_interval` applied when an index is created (`-1` disables periodic refresh) |
 | `HFS_ELASTICSEARCH_WRITE_REFRESH` | `false` | `refresh` parameter on index/delete writes: `false`, `wait_for`, or `true` |
+| `HFS_ELASTICSEARCH_NESTED_OBJECTS_LIMIT` | `50000` | Index `mapping.nested_objects.limit`: max nested objects per document across all nested search-parameter fields. Set on new indices; raised at startup on existing indices below it |
+| `HFS_ELASTICSEARCH_REQUEST_TIMEOUT_MS` | `30000` | ES request timeout in milliseconds, including `_bulk`. A `_bulk` request that times out is split in half and resent |
+| `HFS_ELASTICSEARCH_BULK_MAX_BYTES` | `10485760` | Byte cap per `_bulk` request body (10 MiB), applied together with the 500-operation cap |
+| `HFS_ELASTICSEARCH_BULK_CONCURRENCY` | `1` | `_bulk` requests of one page in flight at once; splitting and back-off stay sequential per request |
+| `HFS_REINDEX_BATCH_BYTES` | `33554432` (32 MiB) | Byte cap on one page of the automatic rebuild (`0` = count only). Honoured by the SQLite source (a page may exceed the cap by one resource) and by the PostgreSQL and MongoDB sources (a page never exceeds the cap unless it holds a single resource); the Elasticsearch and S3 sources page by count only |
+| `HFS_ELASTICSEARCH_REINDEX_REFRESH` | *(unset)* | `refresh` parameter for `$reindex` and deferred-rebuild writes: `false`, `wait_for`, or `true`. Unset follows `HFS_ELASTICSEARCH_WRITE_REFRESH` |
+| `HFS_REINDEX_BATCH_SIZE` | `1000` | Page size of the automatic deferred rebuild after a bulk import (all backends). `POST $reindex` keeps its own `batchSize`, capped at 10,000 |
 
 **PostgreSQL** (used to assemble a connection when `HFS_DATABASE_URL` is not set)
 
@@ -322,6 +333,7 @@ compressed when the client sends `Accept-Encoding`.
 | `HFS_MONGODB_MAX_CONNECTIONS` | `10` | Connection pool size |
 | `HFS_MONGODB_CONNECT_TIMEOUT_MS` | `5000` | TCP handshake timeout (ms) |
 | `HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS` | `15000` | How long an operation waits for a usable server before failing (ms). This, not the connect timeout, bounds how quickly an unreachable MongoDB surfaces an error. |
+| `HFS_MONGODB_INDEX_BUILD` | `background` | When the generation-2 `search_index` indexes are built: `background` serves immediately and builds after boot, `inline` waits for the build before serving, `off` only warns so an operator can pre-build (see `docs/mongodb/search-indexes.md`). |
 
 **S3**
 

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ### Workspace Structure
 
-The project is a Rust workspace with 20 crates (19 default-members; `pysof` excluded from the default build):
+The project is a Rust workspace with 22 crates (21 default-members; `pysof` excluded from the default build). Counted by hand from `crates/*/Cargo.toml` and the root `Cargo.toml`'s `[workspace] default-members`, cross-checked with `cargo metadata --no-deps --offline` — no build required. This table has drifted from the workspace twice already (missing `helios-ui-chrome` and `helios-hts-ui`); prefer deriving the count over trusting this prose, see `.hfs-monitor/project.md`.
 
 | Crate | Description |
 |-------|-------------|
@@ -29,6 +29,8 @@ The project is a Rust workspace with 20 crates (19 default-members; `pysof` excl
 | **`helios-cds-hooks`** | CDS Hooks protocol types and async service trait (HL7 CDS Hooks v3.0.0-ballot). Standalone library. |
 | **`helios-observability`** | Shared observability wiring (uptime, Prometheus `/metrics`, OTLP traces) for Helios servers. |
 | **`helios-ui`** (`crates/ui`) | Optional server-rendered HTMX web UI for HFS — Askama templates, vendored/pinned htmx, vanilla JS assets, no SPA framework and no runtime CDN. |
+| **`helios-ui-chrome`** (`crates/ui-chrome`) | Shared Askama chrome partials for the HFS and HTS web UIs — the topbar account menu and Capability Statement projection, so `helios-ui` and `helios-hts-ui` link the same markup instead of each keeping a copy. |
+| **`helios-hts-ui`** (`crates/hts-ui`) | Optional server-rendered HTMX administrative UI for the Helios Terminology Server (HTS), built on `helios-ui-chrome`. |
 | **`pysof`** | Python bindings (PyO3/maturin) for SQL-on-FHIR. Excluded from default workspace build. |
 
 ### Binaries
@@ -123,6 +125,25 @@ export CARGO_BUILD_JOBS=4
 - Enable trace logging: `RUST_LOG=trace cargo run`
 - FHIRPath expressions can be tested independently via CLI
 - HFS server: `HFS_LOG_LEVEL=debug cargo run --bin hfs`
+
+### Windows and worktree notes
+
+Pitfalls found running agent sessions (Claude Code / Agent SDK) against a `git
+worktree` of this repository on Windows. This is the only place these live —
+don't duplicate them elsewhere; cite this section instead.
+
+- **`cargo fmt --all` fails when run from a worktree.** Run it from the main
+  checkout, or format explicit paths (`cargo fmt -- <path>...`) from the
+  worktree instead.
+- **Compiling anything here leaves ~3,500 R6 spec files dirty, `stat`-only,**
+  even when nothing was actually edited. Never `git add -A` or
+  `git commit -a` inside a worktree — stage explicit paths.
+- **`> nul` does not discard output — it creates a real file named `nul`.**
+  The shell for these sessions is bash, also on Windows, so `nul` is not the
+  null device. From then on `git worktree remove` fails partway (it
+  deregisters the worktree, deletes what it tracks, then errors with
+  "Directory not empty" on that file) and git reports "is not a working
+  tree" for that path forever after (#942, #969). Redirect to `/dev/null`.
 
 ## Important Notes
 

@@ -56,6 +56,10 @@ pub enum IssueType {
     LockError,
     /// Not supported.
     NotSupported,
+    /// Content that would have been returned was truncated/limited (e.g. a
+    /// searchset's `_include`/`_revinclude` resolution hit a resource-count
+    /// cap).
+    Incomplete,
     /// Duplicate resource.
     Duplicate,
     /// Processing error.
@@ -90,6 +94,7 @@ impl IssueType {
             IssueType::Conflict => "conflict",
             IssueType::LockError => "lock-error",
             IssueType::NotSupported => "not-supported",
+            IssueType::Incomplete => "incomplete",
             IssueType::Duplicate => "duplicate",
             IssueType::Processing => "processing",
             IssueType::Transient => "transient",

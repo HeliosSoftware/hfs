@@ -32,24 +32,50 @@
   ],
   "dosage": {
     "renderedInstruction": "One capsule three times daily by mouth.",
-    "safety": {
-      "doseLimit": [
-        {
-          "valueQuantity": {
-            "value": 3,
-            "unit": "capsules",
-            "system": "http://snomed.info/sct",
-            "code": "385055001"
-          },
-          "scope": "period",
-          "period": {
-            "value": 1,
-            "system": "http://unitsofmeasure.org",
-            "code": "d"
+    "step": [
+      {
+        "component": [
+          {
+            "text": "one capsule three times daily",
+            "timing": {
+              "repeat": {
+                "frequency": 3,
+                "period": 1,
+                "periodUnit": "d"
+              }
+            },
+            "asNeeded": false,
+            "route": {
+              "coding": [
+                {
+                  "system": "http://snomed.info/sct",
+                  "code": "260548002",
+                  "display": "Oral"
+                }
+              ]
+            },
+            "safety": {
+              "doseLimit": [
+                {
+                  "valueQuantity": {
+                    "value": 3,
+                    "unit": "capsules",
+                    "system": "http://snomed.info/sct",
+                    "code": "385055001"
+                  },
+                  "scope": "period",
+                  "period": {
+                    "value": 1,
+                    "system": "http://unitsofmeasure.org",
+                    "code": "d"
+                  }
+                }
+              ]
+            }
           }
-        }
-      ]
-    }
+        ]
+      }
+    ]
   },
   "adherence": {
     "code": {

@@ -10,7 +10,111 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 26;
+pub const SCHEMA_VERSION: i32 = 36;
+
+/// The `search_index` value indexes. Excludes `idx_search_composite`, which the
+/// delete-by-resource path needs at all times, and `idx_search_token_display`,
+/// dropped in v29 for write volume (#945): `value_token_display` is populated on
+/// most Coding rows but its only reader is the uncommon token `:text` /
+/// `:code-text` modifier, which is a `COLLATE NOCASE` scan rather than an index
+/// seek — `:text-advanced` uses the FTS table instead. This is the canonical set
+/// — a test asserts a fresh schema carries exactly these — and the list the bulk
+/// index rebuild drops and recreates (see [`drop_search_value_indexes`] /
+/// [`ensure_search_value_indexes`]).
+///
+/// Keep each entry's SQL byte-for-byte what the migration ladder creates,
+/// normalised to one line, so the self-heal on startup and the ladder agree.
+pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 13] = [
+    (
+        "idx_search_string",
+        "CREATE INDEX IF NOT EXISTS idx_search_string ON search_index(tenant_id, resource_type, param_name, value_string) WHERE value_string IS NOT NULL",
+    ),
+    (
+        "idx_search_token",
+        "CREATE INDEX IF NOT EXISTS idx_search_token ON search_index(tenant_id, resource_type, param_name, value_token_system, value_token_code) WHERE value_token_system IS NOT NULL OR value_token_code IS NOT NULL",
+    ),
+    (
+        "idx_search_date",
+        "CREATE INDEX IF NOT EXISTS idx_search_date ON search_index(tenant_id, resource_type, param_name, value_date) WHERE value_date IS NOT NULL",
+    ),
+    (
+        "idx_search_date_end",
+        "CREATE INDEX IF NOT EXISTS idx_search_date_end ON search_index(tenant_id, resource_type, param_name, value_date_end, value_date) WHERE value_date_end IS NOT NULL",
+    ),
+    (
+        "idx_search_number",
+        "CREATE INDEX IF NOT EXISTS idx_search_number ON search_index(tenant_id, resource_type, param_name, value_number) WHERE value_number IS NOT NULL",
+    ),
+    (
+        "idx_search_quantity",
+        "CREATE INDEX IF NOT EXISTS idx_search_quantity ON search_index(tenant_id, resource_type, param_name, value_quantity_value, value_quantity_unit) WHERE value_quantity_value IS NOT NULL",
+    ),
+    (
+        "idx_search_reference",
+        "CREATE INDEX IF NOT EXISTS idx_search_reference ON search_index(tenant_id, resource_type, param_name, value_reference) WHERE value_reference IS NOT NULL",
+    ),
+    (
+        "idx_search_uri",
+        "CREATE INDEX IF NOT EXISTS idx_search_uri ON search_index(tenant_id, resource_type, param_name, value_uri) WHERE value_uri IS NOT NULL",
+    ),
+    (
+        "idx_search_identifier_type",
+        "CREATE INDEX IF NOT EXISTS idx_search_identifier_type ON search_index(tenant_id, resource_type, param_name, value_identifier_type_system, value_identifier_type_code) WHERE value_identifier_type_system IS NOT NULL OR value_identifier_type_code IS NOT NULL",
+    ),
+    (
+        "idx_search_reference_display",
+        "CREATE INDEX IF NOT EXISTS idx_search_reference_display ON search_index(tenant_id, resource_type, param_name, value_reference_display) WHERE value_reference_display IS NOT NULL",
+    ),
+    (
+        "idx_search_quantity_canonical",
+        "CREATE INDEX IF NOT EXISTS idx_search_quantity_canonical ON search_index(tenant_id, resource_type, param_name, value_quantity_canonical_unit, value_quantity_canonical_value) WHERE value_quantity_canonical_value IS NOT NULL",
+    ),
+    (
+        "idx_search_string_folded",
+        "CREATE INDEX IF NOT EXISTS idx_search_string_folded ON search_index(tenant_id, resource_type, param_name, value_string_folded) WHERE value_string_folded IS NOT NULL",
+    ),
+    (
+        "idx_search_contained",
+        "CREATE INDEX IF NOT EXISTS idx_search_contained ON search_index(tenant_id, contained_type, is_contained, param_name) WHERE is_contained = 1",
+    ),
+];
+
+/// Creates every missing [`SEARCH_VALUE_INDEXES`] entry and returns how many
+/// were missing. Runs on every startup: a bulk index rebuild drops these
+/// indexes for the duration of the load, and a process that died inside that
+/// window would otherwise come back with a `search_index` no search can use.
+/// A no-op on a healthy database.
+pub(crate) fn ensure_search_value_indexes(conn: &Connection) -> StorageResult<usize> {
+    let mut created = 0;
+    for (name, sql) in SEARCH_VALUE_INDEXES {
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                [name],
+                |_| Ok(()),
+            )
+            .is_ok();
+        if !exists {
+            conn.execute(sql, [])
+                .map_err(|e| migration_err(format!("recreate {name}: {e}")))?;
+            created += 1;
+        }
+    }
+    Ok(created)
+}
+
+/// Drops every [`SEARCH_VALUE_INDEXES`] entry. The bulk index rebuild's first
+/// half: with the value indexes gone, a rebuild's rows land in the table
+/// (an append) and `idx_search_composite` alone, and the indexes are then
+/// built once, sorted, by [`ensure_search_value_indexes`] — instead of one
+/// random b-tree insertion per row per index.
+pub(crate) fn drop_search_value_indexes(conn: &Connection) -> StorageResult<()> {
+    for (name, _) in SEARCH_VALUE_INDEXES {
+        conn.execute(&format!("DROP INDEX IF EXISTS {name}"), [])
+            .map_err(|e| migration_err(format!("drop {name}: {e}")))?;
+    }
+    Ok(())
+}
 
 /// Initialize the database schema.
 pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
@@ -35,6 +139,16 @@ pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
     // `IF NOT EXISTS` and idempotent, so ensuring it here every startup
     // self-heals such databases and is a no-op for correctly-migrated ones.
     ensure_tenants_table(conn)?;
+
+    // Self-heal after a bulk index rebuild that never finished (see
+    // `ensure_search_value_indexes`). A healthy database creates nothing.
+    let recreated = ensure_search_value_indexes(conn)?;
+    if recreated > 0 {
+        tracing::warn!(
+            recreated,
+            "search_index value indexes were missing at startup and have been rebuilt"
+        );
+    }
 
     Ok(())
 }
@@ -327,6 +441,16 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             23 => migrate_v23_to_v24(conn)?,
             24 => migrate_v24_to_v25(conn)?,
             25 => migrate_v25_to_v26(conn)?,
+            26 => migrate_v26_to_v27(conn)?,
+            27 => migrate_v27_to_v28(conn)?,
+            28 => migrate_v28_to_v29(conn)?,
+            29 => migrate_v29_to_v30(conn)?,
+            30 => migrate_v30_to_v31(conn)?,
+            31 => migrate_v31_to_v32(conn)?,
+            32 => migrate_v32_to_v33(conn)?,
+            33 => migrate_v33_to_v34(conn)?,
+            34 => migrate_v34_to_v35(conn)?,
+            35 => migrate_v35_to_v36(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -764,6 +888,7 @@ fn migrate_v5_to_v6(conn: &Connection) -> StorageResult<()> {
             total_entries INTEGER DEFAULT 0,
             processed_entries INTEGER DEFAULT 0,
             failed_entries INTEGER DEFAULT 0,
+            index_pending INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (tenant_id, submitter, submission_id, manifest_id),
             FOREIGN KEY (tenant_id, submitter, submission_id)
                 REFERENCES bulk_submissions(tenant_id, submitter, submission_id) ON DELETE CASCADE
@@ -1224,6 +1349,428 @@ fn migrate_v9_to_v10(conn: &Connection) -> StorageResult<()> {
     Ok(())
 }
 
+/// Migrate from schema version 27 to version 28.
+///
+/// Makes `idx_search_string_folded` partial (`WHERE value_string_folded IS NOT
+/// NULL`), the last full index over a value column. Only string rows carry a
+/// folded value — 13% of the rows of a Synthea load — so every other row paid
+/// a b-tree insertion into an index it could never be found by. Measured on
+/// the deferred-index rebuild of a 72k-resource mixed load: 21.1s -> 18.9s
+/// (-10%), database 3% smaller.
+///
+/// v22 kept this index full on purpose: it was the only index leading with
+/// `(tenant_id, resource_type, param_name)` that covered every row, and the
+/// planner fell back to it for `LIKE`-shaped searches (`:contains`, `:text`,
+/// `:code-text`, `:below`, `:above`, a bare reference id) whose predicate
+/// SQLite cannot prove implies `IS NOT NULL`. Those predicates now say so
+/// themselves — every `LIKE` fragment leads with `<column> IS NOT NULL` —
+/// which qualifies the family's own partial index (`idx_search_string`,
+/// `idx_search_token_display`, `idx_search_reference`, …) and narrows the
+/// scan to the parameter's rows. That is a better plan than the old one,
+/// which for the reference, token-display and uri shapes was already a
+/// type-wide walk of `idx_search_composite`, folded index or not.
+fn migrate_v27_to_v28(conn: &Connection) -> StorageResult<()> {
+    let statements = [
+        "DROP INDEX IF EXISTS idx_search_string_folded",
+        "CREATE INDEX idx_search_string_folded
+         ON search_index(tenant_id, resource_type, param_name, value_string_folded)
+         WHERE value_string_folded IS NOT NULL",
+    ];
+    for sql in &statements {
+        conn.execute(sql, [])
+            .map_err(|e| migration_err(format!("v28 partial folded index: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Migrate from schema version 28 to version 29.
+///
+/// Drops `idx_search_token_display` (#945). The column stays and keeps feeding
+/// the FTS trigger; only the b-tree index goes. Token `:text` / `:code-text`
+/// (the index's only readers, and already `COLLATE NOCASE` scans rather than
+/// seeks) fall back to a partition scan over the parameter's rows, while every
+/// bulk-ingested Coding-with-display row stops paying an index insertion.
+fn migrate_v28_to_v29(conn: &Connection) -> StorageResult<()> {
+    conn.execute("DROP INDEX IF EXISTS idx_search_token_display", [])
+        .map_err(|e| migration_err(format!("v29 drop token_display index: {e}")))?;
+    Ok(())
+}
+
+/// Migrate from schema version 29 to version 30.
+///
+/// Adds `bulk_manifests.index_pending` — a manifest whose resources were
+/// ingested with indexing deferred owes a search-index rebuild. Set in the same
+/// transaction that publishes the manifest, cleared when the rebuild finishes,
+/// so a restart mid-rebuild can find the outstanding work instead of losing it
+/// with the in-process job map (#1125).
+fn migrate_v29_to_v30(conn: &Connection) -> StorageResult<()> {
+    let has_column = conn
+        .prepare("SELECT 1 FROM pragma_table_info('bulk_manifests') WHERE name = 'index_pending'")
+        .and_then(|mut stmt| stmt.exists([]))
+        .unwrap_or(false);
+    if !has_column {
+        conn.execute(
+            "ALTER TABLE bulk_manifests ADD COLUMN index_pending INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|e| migration_err(format!("v30 index_pending column: {e}")))?;
+    }
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_bulk_manifests_index_pending
+         ON bulk_manifests(tenant_id, submitter, submission_id, manifest_id)
+         WHERE index_pending = 1",
+        [],
+    )
+    .map_err(|e| migration_err(format!("v30 index_pending index: {e}")))?;
+    Ok(())
+}
+
+/// Migrate from schema version 30 to version 31.
+///
+/// Introduces an integer surrogate for the owning resource on `search_index`
+/// (#945). `resource_key` mirrors `resources.rowid`; `idx_search_composite` is
+/// rekeyed to carry that 3–4 byte varint in place of the 36-byte `resource_id`
+/// UUID it repeated on every row, which was ~44% of the table's index bytes and
+/// the dominant per-batch write during bulk ingest.
+///
+/// `resource_id` stays on the table: the chained-search / `_has` / `:identifier`
+/// paths concatenate `Type/resource_id` to match `value_reference` and cannot
+/// use the key, so only the composite index and the equality read paths move to
+/// `resource_key` in this step.
+///
+/// Backfill is a single-pass `UPDATE ... FROM resources` (a JOIN, not a
+/// correlated subquery per row) with the FTS triggers dropped for the duration.
+/// A full table rebuild is deliberately avoided: the FTS triggers key on
+/// `search_index.rowid`, so renumbering rowids would orphan every FTS row. The
+/// backfill only sets a new column — no rowid and no FTS-indexed column changes
+/// — so the existing FTS content stays valid and the triggers are restored
+/// verbatim afterwards.
+fn migrate_v30_to_v31(conn: &Connection) -> StorageResult<()> {
+    // SQLite has no `ADD COLUMN IF NOT EXISTS`; ignore a duplicate-column error
+    // so the ladder is replay-safe (see `migrate_v10_to_v11`).
+    let _ = conn.execute(
+        "ALTER TABLE search_index ADD COLUMN resource_key INTEGER",
+        [],
+    );
+
+    // The FTS triggers fire on every UPDATE of a row carrying `value_string` /
+    // `value_token_display` (their `WHEN` matches the column's presence, not
+    // which column changed), so the backfill would re-run the full-text
+    // delete+reinsert on most rows. Capture their exact DDL from the catalog,
+    // drop them across the backfill, and restore verbatim — drift-proof, and a
+    // no-op on an FTS5-less build that has none.
+    let saved_triggers: Vec<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT sql FROM sqlite_master
+                  WHERE type = 'trigger'
+                    AND name IN ('search_index_fts_insert', 'search_index_fts_delete', 'search_index_fts_update')
+                    AND sql IS NOT NULL",
+            )
+            .map_err(|e| migration_err(format!("v31 read FTS triggers: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| migration_err(format!("v31 read FTS triggers: {e}")))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| migration_err(format!("v31 read FTS triggers: {e}")))?
+    };
+
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS search_index_fts_insert;
+         DROP TRIGGER IF EXISTS search_index_fts_delete;
+         DROP TRIGGER IF EXISTS search_index_fts_update;
+         UPDATE search_index
+            SET resource_key = r.rowid
+            FROM resources r
+            WHERE r.tenant_id = search_index.tenant_id
+              AND r.resource_type = search_index.resource_type
+              AND r.id = search_index.resource_id;
+         DROP INDEX IF EXISTS idx_search_composite;
+         CREATE INDEX idx_search_composite
+            ON search_index(tenant_id, resource_type, resource_key, param_name, composite_group);",
+    )
+    .map_err(|e| migration_err(format!("v31 resource_key surrogate: {e}")))?;
+
+    for sql in &saved_triggers {
+        conn.execute(sql, [])
+            .map_err(|e| migration_err(format!("v31 restore FTS trigger: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Migrate from schema version 31 to version 32 (#1127).
+///
+/// Makes the bulk-submit manifest counters describe the manifest rather than
+/// the sum over every pass that walked it:
+///
+/// - `bulk_manifest_file_progress`: one row per input file of a manifest, with
+///   the highest line already charged to the manifest counters (`max_line`)
+///   and what that file contributed. A batch charges only the lines beyond
+///   `max_line`, so a reclaimed manifest re-walking a file neither
+///   double-counts it nor reports less progress than it had (#969).
+/// - `bulk_manifests.skipped_entries`: deliberate skips, so the submission
+///   summary can be served from the manifest counters instead of aggregating
+///   one receipt row per ingested resource on every status poll.
+///
+/// Replay-safe: the column is added only when missing and the table is
+/// `IF NOT EXISTS`. Manifests counted before this version have no file rows,
+/// so a later re-walk of one of their files counts it once more.
+fn migrate_v31_to_v32(conn: &Connection) -> StorageResult<()> {
+    if !table_columns(conn, "bulk_manifests")?
+        .iter()
+        .any(|column| column == "skipped_entries")
+    {
+        conn.execute(
+            "ALTER TABLE bulk_manifests ADD COLUMN skipped_entries INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|e| migration_err(format!("v32 add skipped_entries: {e}")))?;
+    }
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS bulk_manifest_file_progress (
+            tenant_id TEXT NOT NULL,
+            submitter TEXT NOT NULL,
+            submission_id TEXT NOT NULL,
+            manifest_id TEXT NOT NULL,
+            file_url TEXT NOT NULL,
+            max_line INTEGER NOT NULL DEFAULT 0,
+            total_entries INTEGER NOT NULL DEFAULT 0,
+            processed_entries INTEGER NOT NULL DEFAULT 0,
+            failed_entries INTEGER NOT NULL DEFAULT 0,
+            skipped_entries INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, submitter, submission_id, manifest_id, file_url),
+            FOREIGN KEY (tenant_id, submitter, submission_id, manifest_id)
+                REFERENCES bulk_manifests(tenant_id, submitter, submission_id, manifest_id)
+                ON DELETE CASCADE
+        )",
+        [],
+    )
+    .map_err(|e| migration_err(format!("v32 create bulk_manifest_file_progress: {e}")))?;
+    Ok(())
+}
+
+/// Migrate from schema version 32 to version 33.
+///
+/// Adds `bulk_export_jobs.attempts` — how many times the job has been claimed
+/// by a worker (#1041). A job whose lease expires mid-run is reclaimable, so
+/// without a count of past claims a job that keeps dying the same way is handed
+/// to worker after worker forever, never reaching a terminal state and never
+/// giving its tenant's concurrency slot back. `claim_next` bumps the column on
+/// every claim and retires the job once the count would exceed the configured
+/// cap.
+fn migrate_v32_to_v33(conn: &Connection) -> StorageResult<()> {
+    let has_column = conn
+        .prepare("SELECT 1 FROM pragma_table_info('bulk_export_jobs') WHERE name = 'attempts'")
+        .and_then(|mut stmt| stmt.exists([]))
+        .unwrap_or(false);
+    if !has_column {
+        conn.execute(
+            "ALTER TABLE bulk_export_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|e| migration_err(format!("v33 attempts column: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Migrate from schema version 33 to version 34.
+///
+/// Adds `secondary_sync_failures`: the durable "needs reindex" ledger for a
+/// composite whose secondary refused a change the primary had already
+/// committed (#1334). One row per (tenant, resource, secondary), so a repeat
+/// failure folds into the existing row instead of growing the table.
+/// `last_failed_at` orders the repair queue; both timestamps are fixed-width
+/// RFC 3339 text, which sorts chronologically.
+fn migrate_v33_to_v34(conn: &Connection) -> StorageResult<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS secondary_sync_failures (
+            tenant_id TEXT NOT NULL,
+            resource_type TEXT NOT NULL,
+            resource_id TEXT NOT NULL,
+            backend_id TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            first_failed_at TEXT NOT NULL,
+            last_failed_at TEXT NOT NULL,
+            last_error TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (tenant_id, resource_type, resource_id, backend_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_secondary_sync_failures_queue
+            ON secondary_sync_failures (last_failed_at);",
+    )
+    .map_err(|e| migration_err(format!("v34 create secondary_sync_failures: {e}")))?;
+    Ok(())
+}
+
+/// Migrate from schema version 34 to version 35 (#1391).
+///
+/// Adds `search_index.value_date_end`: every date row is a range
+/// `[value_date, value_date_end)`, so a `Period` is one row instead of its two
+/// ends as unrelated points, and the search prefixes compare ranges the way
+/// FHIR defines them. The end is fixed-width UTC text
+/// ([`super::search::writer::SQLITE_INSTANT_FORMAT`]); an open `Period` ends
+/// at the last instant of the supported years rather than NULL, so NULL only
+/// ever means "no end could be read".
+///
+/// Existing date rows were all indexed as points, so each is backfilled with
+/// the end of its own precision — the end the writer gives a point today. A
+/// `Period` indexed before this version stays two point rows until the
+/// resource is reindexed (`$reindex`).
+///
+/// **Known limitation: rows of unknown precision.** Rows written before
+/// `value_date_precision` existed, and those the hard-coded fallback indexer
+/// (`_lastUpdated`, `date`, `birthdate`) has always written without one, have
+/// a NULL precision. A date-only value in such a row was stored padded to
+/// `YYYY-MM-DDT00:00:00` (`2020`, `2020-06` and `2020-06-15` pad to a
+/// different midnight but nothing records which of the three it was), and a
+/// real `dateTime` at midnight without an offset looks the same. The history
+/// therefore does not say whether the range is a year, a month, a day or a
+/// second, and the backfill does not guess: it reads the precision from the
+/// text's shape, so such a padded row gets a one-second range. `ne` and `ap`
+/// on it can differ from a row indexed today until the resource is reindexed
+/// (`$reindex`), which records the true precision. The number of such padded,
+/// precision-less rows is logged at warn level when the migration fills them.
+///
+/// The backfill runs in Rust, in rowid batches, through the writer's own
+/// [`super::search::writer::stored_date_end`], so an old row gets exactly the
+/// end a new one would. The FTS triggers stay in place: their `WHEN` needs a
+/// `value_string` or `value_token_display`, which a date row never has.
+/// Replay-safe: the column is added only when missing, and only rows still
+/// without an end are visited.
+fn migrate_v34_to_v35(conn: &Connection) -> StorageResult<()> {
+    if !table_columns(conn, "search_index")?
+        .iter()
+        .any(|column| column == "value_date_end")
+    {
+        conn.execute(
+            "ALTER TABLE search_index ADD COLUMN value_date_end TEXT",
+            [],
+        )
+        .map_err(|e| migration_err(format!("v35 add value_date_end: {e}")))?;
+    }
+
+    let unknown_precision = backfill_value_date_end(conn)?;
+
+    // The range comparisons that bound the end (`eq`, `gt`, `sa`, `eb`, `ap`,
+    // `ge`) seek on this index instead of reading every date row of the type,
+    // and it carries `value_date` as its last column so that they never have to
+    // fetch the table row for the start either (measured on 2M date rows: `eq`
+    // 1.9 s -> 0.01 s, `ap` 2.2 s -> 0.4 s). It is built after the backfill,
+    // once, over final data.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_search_date_end ON search_index(tenant_id, resource_type, param_name, value_date_end, value_date) WHERE value_date_end IS NOT NULL",
+        [],
+    )
+    .map_err(|e| migration_err(format!("v35 create idx_search_date_end: {e}")))?;
+
+    if unknown_precision > 0 {
+        tracing::warn!(
+            rows = unknown_precision,
+            "schema v35: {unknown_precision} date index row(s) have no recorded precision and a \
+             padded midnight value (a date-only value, or a dateTime at midnight); their range \
+             end was filled as one second, so `ne`/`ap` searches on them may differ from a \
+             freshly indexed row until the resources are reindexed ($reindex)"
+        );
+    }
+    Ok(())
+}
+
+/// Fill `value_date_end` on every date row still without one, returning how
+/// many of them were rows of unknown precision: no `value_date_precision` and
+/// a `T00:00:00` value with no offset, the shape a padded date-only value has
+/// (see [`migrate_v34_to_v35`]).
+fn backfill_value_date_end(conn: &Connection) -> StorageResult<usize> {
+    use crate::search::converters::{DateEnd, IndexValue};
+    use crate::types::DatePrecision;
+
+    let mut unknown_precision = 0_usize;
+    const BATCH: i64 = 10_000;
+    let mut after = 0_i64;
+    loop {
+        let rows: Vec<(i64, String, Option<String>)> = {
+            let mut select = conn
+                .prepare_cached(
+                    "SELECT rowid, value_date, value_date_precision FROM search_index
+                      WHERE rowid > ?1 AND value_date IS NOT NULL AND value_date_end IS NULL
+                      ORDER BY rowid LIMIT ?2",
+                )
+                .map_err(|e| migration_err(format!("v35 read date rows: {e}")))?;
+            let rows = select
+                .query_map(rusqlite::params![after, BATCH], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .map_err(|e| migration_err(format!("v35 read date rows: {e}")))?;
+            rows.collect::<Result<_, _>>()
+                .map_err(|e| migration_err(format!("v35 read date rows: {e}")))?
+        };
+        let Some(&(last, _, _)) = rows.last() else {
+            break;
+        };
+        after = last;
+
+        let mut update = conn
+            .prepare_cached("UPDATE search_index SET value_date_end = ?2 WHERE rowid = ?1")
+            .map_err(|e| migration_err(format!("v35 backfill value_date_end: {e}")))?;
+        for (rowid, value, precision) in rows {
+            // Rows written without a precision (the `_lastUpdated` fallback)
+            // hold the instant as written, whose shape says it.
+            let precision = match precision.as_deref() {
+                Some("year") => DatePrecision::Year,
+                Some("month") => DatePrecision::Month,
+                Some("day") => DatePrecision::Day,
+                Some("hour") => DatePrecision::Hour,
+                Some("minute") => DatePrecision::Minute,
+                Some("second") => DatePrecision::Second,
+                Some("millisecond") => DatePrecision::Millisecond,
+                _ => {
+                    if precision.is_none() && value.len() == 19 && value.ends_with("T00:00:00") {
+                        unknown_precision += 1;
+                    }
+                    DatePrecision::from_date_string(&value)
+                }
+            };
+            let point = IndexValue::Date {
+                value,
+                precision,
+                end: DateEnd::Precision,
+            };
+            if let Some(end) = super::search::writer::stored_date_end(&point) {
+                update
+                    .execute(rusqlite::params![rowid, end])
+                    .map_err(|e| migration_err(format!("v35 backfill value_date_end: {e}")))?;
+            }
+        }
+    }
+    Ok(unknown_precision)
+}
+
+/// Migrate from schema version 35 to version 36.
+///
+/// Adds `login_sessions`: the web UI's interactive login sessions and the
+/// logins still pending at the identity provider (#1481), one JSON document
+/// per opaque id with a monotonic `version` for conditional writes, so a
+/// session established on one node resolves on every other and outlives a
+/// restart. `kind` keeps sessions and pending logins apart; `expires_at` is
+/// fixed-width RFC 3339 text and drives the sweep. Independent of the FHIR
+/// `resources` table, like `user_settings`.
+fn migrate_v35_to_v36(conn: &Connection) -> StorageResult<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS login_sessions (
+            id         TEXT NOT NULL PRIMARY KEY,
+            kind       TEXT NOT NULL,
+            data       TEXT NOT NULL,
+            version    INTEGER NOT NULL DEFAULT 1,
+            expires_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_login_sessions_expires
+            ON login_sessions (expires_at);",
+    )
+    .map_err(|e| migration_err(format!("v36 create login_sessions: {e}")))?;
+    Ok(())
+}
+
 /// Migrate from schema version 10 to version 11.
 ///
 /// Adds columns supporting `_contained` search: index rows extracted from a
@@ -1552,16 +2099,18 @@ fn migrate_v20_to_v21(conn: &Connection) -> StorageResult<()> {
 /// ```
 ///
 /// Every row therefore paid three b-tree insertions it could never be found
-/// by. `idx_search_string_folded` is deliberately **not** in this list: it is
-/// also the only index leading with `(tenant_id, resource_type, param_name)`
-/// that covers every row, and the query planner falls back to it for the
-/// `LIKE`-shaped modifier searches (`:text`, `:contains`) whose predicate
-/// SQLite cannot prove implies `IS NOT NULL`. Making it partial pushed those
-/// onto `idx_search_composite`'s `(tenant_id, resource_type)` prefix, and
-/// replacing it with a narrow `(tenant_id, resource_type, param_name)` index
-/// made the planner prefer that for token searches too — a selective
-/// `code=…` lookup went from 2.9 ms to 22.1 ms because the value could no
-/// longer be filtered inside the index.
+/// by. `idx_search_string_folded` was deliberately **not** in this list: it
+/// was also the only index leading with `(tenant_id, resource_type,
+/// param_name)` that covered every row, and the query planner fell back to
+/// it for the `LIKE`-shaped modifier searches (`:text`, `:contains`) whose
+/// predicate SQLite cannot prove implies `IS NOT NULL`. Making it partial
+/// pushed those onto `idx_search_composite`'s `(tenant_id, resource_type)`
+/// prefix, and replacing it with a narrow `(tenant_id, resource_type,
+/// param_name)` index made the planner prefer that for token searches too —
+/// a selective `code=…` lookup went from 2.9 ms to 22.1 ms because the value
+/// could no longer be filtered inside the index. v28 finally made it partial
+/// by giving those predicates an explicit `IS NOT NULL` instead (see
+/// [`migrate_v27_to_v28`]).
 ///
 /// `EXPLAIN QUERY PLAN` over 15 representative search shapes (token, token
 /// `:text`, reference, reference `:text`, string prefix and exact, quantity
@@ -2040,6 +2589,44 @@ fn create_publication_partial_indexes(conn: &Connection) -> StorageResult<()> {
     Ok(())
 }
 
+/// v26 -> v27: types_done/types_total on bulk_export_jobs (#961).
+///
+/// The `current_type` column existed since v6 but nothing wrote it, so a
+/// status poll could never name the resource type an export was currently
+/// writing. `types_done`/`types_total` accompany it so the poll can also show
+/// how far through the type list the worker is — both are `0` on a job the
+/// worker has not yet started.
+fn migrate_v26_to_v27(conn: &Connection) -> StorageResult<()> {
+    let job_columns: Vec<String> = {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(bulk_export_jobs)")
+            .map_err(|e| migration_err(format!("pragma bulk_export_jobs: {e}")))?;
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| migration_err(format!("pragma rows: {e}")))?
+            .filter_map(|r| r.ok())
+            .collect();
+        cols
+    };
+    let adds = [
+        (
+            "types_done",
+            "ALTER TABLE bulk_export_jobs ADD COLUMN types_done INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "types_total",
+            "ALTER TABLE bulk_export_jobs ADD COLUMN types_total INTEGER NOT NULL DEFAULT 0",
+        ),
+    ];
+    for (col, sql) in &adds {
+        if !job_columns.iter().any(|c| c == col) {
+            conn.execute(sql, [])
+                .map_err(|e| migration_err(format!("add {col}: {e}")))?;
+        }
+    }
+    Ok(())
+}
+
 /// Drop all tables (for testing).
 #[cfg(test)]
 #[allow(dead_code)]
@@ -2052,6 +2639,7 @@ pub fn drop_all_tables(conn: &Connection) -> StorageResult<()> {
     // Drop bulk tables (order matters due to foreign keys)
     let _ = conn.execute("DROP TABLE IF EXISTS bulk_submission_changes", []);
     let _ = conn.execute("DROP TABLE IF EXISTS bulk_entry_results", []);
+    let _ = conn.execute("DROP TABLE IF EXISTS bulk_manifest_file_progress", []);
     let _ = conn.execute("DROP TABLE IF EXISTS bulk_manifests", []);
     let _ = conn.execute("DROP TABLE IF EXISTS bulk_submissions", []);
     let _ = conn.execute("DROP TABLE IF EXISTS bulk_export_files", []);
@@ -2457,12 +3045,12 @@ mod tests {
     ///   column almost every row leaves NULL takes an entry per row for
     ///   nothing.
     ///
-    /// `idx_search_string_folded` is asserted to be *non*-partial on purpose:
-    /// it is also the only full index leading with
-    /// `(tenant_id, resource_type, param_name)`, and the planner falls back to
-    /// it for the `LIKE`-shaped modifier searches whose predicate SQLite
-    /// cannot prove implies `IS NOT NULL`. Making it partial silently pushes
-    /// `:text` and `:contains` onto a `(tenant_id, resource_type)` scan.
+    /// `idx_search_string_folded` joined the partial set in v28; the
+    /// `LIKE`-shaped searches that used to depend on it being full now carry
+    /// their own `IS NOT NULL` (see [`migrate_v27_to_v28`]).
+    ///
+    /// In v31 (#945) the composite index swapped the 36-byte `resource_id` UUID
+    /// for the integer `resource_key` (see [`migrate_v30_to_v31`]).
     #[test]
     fn search_index_carries_no_redundant_or_full_value_indexes() {
         let conn = Connection::open_in_memory().unwrap();
@@ -2485,11 +3073,16 @@ mod tests {
         assert!(
             index_sql("idx_search_composite")
                 .expect("composite index")
-                .contains("resource_id"),
-            "idx_search_composite must still lead with the resource key"
+                .contains("resource_key"),
+            "idx_search_composite must carry the integer resource_key (v31, #945), \
+             not the resource_id UUID it replaced"
         );
 
         for (name, predicate) in [
+            (
+                "idx_search_string_folded",
+                "value_string_folded IS NOT NULL",
+            ),
             (
                 "idx_search_reference_display",
                 "value_reference_display IS NOT NULL",
@@ -2506,13 +3099,85 @@ mod tests {
                 "{name} must be partial on `{predicate}`, got: {sql}"
             );
         }
+    }
 
-        let folded = index_sql("idx_search_string_folded").expect("folded index");
+    /// Delete-by-resource must seek `idx_search_composite`, never full-scan
+    /// `search_index`. The composite leads with `(tenant_id, resource_type,
+    /// resource_key, …)`, so the DELETE has to carry the `tenant_id` /
+    /// `resource_type` equality prefix; a predicate on `resource_key` alone
+    /// scans the whole table — O(rows) on every resource UPDATE and re-index
+    /// (#1197). This guards against dropping the prefix again.
+    #[test]
+    fn delete_by_resource_key_seeks_the_composite_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        let plan: Vec<String> = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 DELETE FROM search_index
+                  WHERE tenant_id = ?1 AND resource_type = ?2
+                    AND resource_key = (
+                        SELECT rowid FROM resources
+                         WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3
+                    )",
+            )
+            .unwrap()
+            .query_map(["t1", "Patient", "p1"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let joined = plan.join(" | ");
         assert!(
-            !folded.to_ascii_uppercase().contains("WHERE"),
-            "idx_search_string_folded must stay full: it is the fallback index for \
-             LIKE-shaped modifier searches. Got: {folded}"
+            joined.contains("idx_search_composite"),
+            "delete-by-resource must seek idx_search_composite; plan was: {joined}"
         );
+        assert!(
+            !joined.contains("SCAN search_index"),
+            "delete-by-resource must not full-scan search_index; plan was: {joined}"
+        );
+    }
+
+    /// The canonical value-index list must be exactly what a fresh schema
+    /// carries, name and definition alike — it is what a bulk index rebuild
+    /// recreates and what startup self-heals from, so drift here would
+    /// silently change the indexes of a database that went through either.
+    #[test]
+    fn search_value_indexes_match_the_fresh_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        let normalise = |sql: &str| {
+            sql.replace("IF NOT EXISTS ", "")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let mut actual: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT name, sql FROM sqlite_master
+                 WHERE type = 'index' AND tbl_name = 'search_index' AND name != 'idx_search_composite'",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .map(|(n, s)| (n, normalise(&s)))
+            .collect();
+        actual.sort();
+        let mut expected: Vec<(String, String)> = SEARCH_VALUE_INDEXES
+            .iter()
+            .map(|(n, s)| (n.to_string(), normalise(s)))
+            .collect();
+        expected.sort();
+        assert_eq!(actual, expected);
+
+        // Drop, then self-heal: every entry comes back, and a second pass
+        // finds nothing to do.
+        drop_search_value_indexes(&conn).unwrap();
+        assert_eq!(
+            ensure_search_value_indexes(&conn).unwrap(),
+            SEARCH_VALUE_INDEXES.len()
+        );
+        assert_eq!(ensure_search_value_indexes(&conn).unwrap(), 0);
     }
 
     /// A database upgraded through the ladder must end up with exactly the
@@ -3339,6 +4004,176 @@ mod tests {
         }
     }
 
+    /// #1391: v35 adds `value_date_end` and backfills every existing date row
+    /// with the end of its own precision, as the writer would; rows without a
+    /// readable date keep NULL, and a replay leaves ends already set alone.
+    #[test]
+    fn test_v35_backfills_value_date_end_by_precision() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        // Index rows without their resources: only the date columns matter.
+        conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        let rows = [
+            ("a", Some("2020-01-01T00:00:00"), Some("year")),
+            ("b", Some("2020-06-01T00:00:00"), Some("month")),
+            ("c", Some("2020-06-15T00:00:00"), Some("day")),
+            ("d", Some("2020-06-15T10:00:00+02:00"), Some("second")),
+            ("e", Some("2026-09-06T08:44:27.828123+00:00"), None),
+            ("f", Some("garbage"), Some("day")),
+            ("g", None, None),
+        ];
+        for (id, value, precision) in rows {
+            conn.execute(
+                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name,
+                     value_date, value_date_precision, value_string)
+                 VALUES ('t', 'Patient', ?1, 'date', ?2, ?3, ?4)",
+                rusqlite::params![id, value, precision, value.is_none().then_some("x")],
+            )
+            .unwrap();
+        }
+        set_schema_version(&conn, 34).unwrap();
+        initialize_schema(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        let end = |id: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT value_date_end FROM search_index WHERE resource_id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(end("a").as_deref(), Some("2021-01-01 00:00:00.000"));
+        assert_eq!(end("b").as_deref(), Some("2020-07-01 00:00:00.000"));
+        assert_eq!(end("c").as_deref(), Some("2020-06-16 00:00:00.000"));
+        assert_eq!(end("d").as_deref(), Some("2020-06-15 08:00:01.000"));
+        // No precision recorded: the instant's own shape, a microsecond.
+        assert_eq!(end("e").as_deref(), Some("2026-09-06 08:44:27.829"));
+        assert_eq!(end("f"), None);
+        assert_eq!(end("g"), None);
+
+        // A replay neither fails on the existing column nor rewrites an end.
+        conn.execute(
+            "UPDATE search_index SET value_date_end = 'kept' WHERE resource_id = 'a'",
+            [],
+        )
+        .unwrap();
+        migrate_v34_to_v35(&conn).unwrap();
+        assert_eq!(end("a").as_deref(), Some("kept"));
+    }
+
+    /// #1391: a row with no `value_date_precision` (written before the column,
+    /// or by the fallback indexer) whose value is a padded midnight cannot say
+    /// whether it was a year, a month, a day or a second. The backfill keeps
+    /// the shape-derived one-second range rather than guess, and counts those
+    /// rows so the migration can warn; a real instant with an offset, a row
+    /// with a precision, and an already-filled row are not counted.
+    #[test]
+    fn test_v35_counts_padded_rows_of_unknown_precision() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        let rows = [
+            // Padded date-only values of three different precisions.
+            ("year", "2020-01-01T00:00:00", None),
+            ("month", "2020-06-01T00:00:00", None),
+            ("day", "2020-06-15T00:00:00", None),
+            // A real instant: its shape says the precision, not unknown.
+            ("instant", "2020-06-15T00:00:00Z", None),
+            ("time", "2020-06-15T10:30:00", None),
+            // Precision recorded: not unknown.
+            ("known", "2020-06-15T00:00:00", Some("day")),
+        ];
+        for (id, value, precision) in rows {
+            conn.execute(
+                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name,
+                     value_date, value_date_precision)
+                 VALUES ('t', 'Patient', ?1, 'date', ?2, ?3)",
+                rusqlite::params![id, value, precision],
+            )
+            .unwrap();
+        }
+        // The v34 shape: no row has an end yet.
+        conn.execute("UPDATE search_index SET value_date_end = NULL", [])
+            .unwrap();
+
+        assert_eq!(backfill_value_date_end(&conn).unwrap(), 3);
+
+        let end = |id: &str| -> String {
+            conn.query_row(
+                "SELECT value_date_end FROM search_index WHERE resource_id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        // Unknown precision: one second, whatever the padded text was.
+        assert_eq!(end("year"), "2020-01-01 00:00:01.000");
+        assert_eq!(end("month"), "2020-06-01 00:00:01.000");
+        assert_eq!(end("day"), "2020-06-15 00:00:01.000");
+        assert_eq!(end("instant"), "2020-06-15 00:00:01.000");
+        assert_eq!(end("time"), "2020-06-15 10:30:01.000");
+        // The same text with its precision recorded is the whole day.
+        assert_eq!(end("known"), "2020-06-16 00:00:00.000");
+
+        // Every row now has an end: a replay visits nothing and counts nothing.
+        assert_eq!(backfill_value_date_end(&conn).unwrap(), 0);
+    }
+
+    /// #1481: the v36 login-sessions table exists on a fresh database and on
+    /// one migrated from v35, with the sweep index in place.
+    #[test]
+    fn test_v36_adds_login_sessions() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        let columns = table_columns(&conn, "login_sessions").unwrap();
+        for expected in ["id", "kind", "data", "version", "expires_at", "updated_at"] {
+            assert!(columns.iter().any(|c| c == expected), "missing {expected}");
+        }
+        let indexed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' \
+                 AND name = 'idx_login_sessions_expires'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 1);
+
+        let migrated = Connection::open_in_memory().unwrap();
+        initialize_schema(&migrated).unwrap();
+        migrated
+            .execute_batch("DROP INDEX idx_login_sessions_expires; DROP TABLE login_sessions;")
+            .unwrap();
+        set_schema_version(&migrated, 35).unwrap();
+        initialize_schema(&migrated).unwrap();
+        assert_eq!(get_schema_version(&migrated).unwrap(), SCHEMA_VERSION);
+        assert!(
+            !table_columns(&migrated, "login_sessions")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// #1127: the v32 file-progress table and skipped counter exist on a fresh
+    /// database, and replaying the migration on one that has them is a no-op.
+    #[test]
+    fn test_v32_adds_file_progress_and_skipped_entries() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        assert!(
+            table_columns(&conn, "bulk_manifests")
+                .unwrap()
+                .iter()
+                .any(|column| column == "skipped_entries")
+        );
+        let file_columns = table_columns(&conn, "bulk_manifest_file_progress").unwrap();
+        for column in ["file_url", "max_line", "total_entries", "skipped_entries"] {
+            assert!(file_columns.iter().any(|c| c == column), "missing {column}");
+        }
+        migrate_v31_to_v32(&conn).unwrap();
+    }
+
     #[test]
     fn test_bulk_tables_exist() {
         let conn = Connection::open_in_memory().unwrap();
@@ -3544,5 +4379,28 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_worker_id, 1);
+    }
+
+    #[test]
+    fn test_initialize_schema_adds_types_done_and_types_total_to_bulk_export_jobs() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(bulk_export_jobs)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        assert!(
+            columns.iter().any(|c| c == "types_done"),
+            "bulk_export_jobs must have a types_done column"
+        );
+        assert!(
+            columns.iter().any(|c| c == "types_total"),
+            "bulk_export_jobs must have a types_total column"
+        );
     }
 }

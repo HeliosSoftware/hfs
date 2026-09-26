@@ -17,16 +17,20 @@
 use askama::Template;
 use axum::{
     Extension,
-    extract::{Path, State},
-    http::StatusCode,
+    extract::{Path, Query, State},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Redirect, Response},
 };
 use chrono::{SecondsFormat, Utc};
+use helios_observability::dashboard::{DashboardWindow, ReindexActivity};
+use helios_persistence::error::{BackendError, ConcurrencyError, StorageError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::i18n::{I18n, RequestLocale};
-use crate::{RequestTenant, RequestVersion, WebState, current_status, render};
+use crate::{
+    RequestTenant, RequestVersion, WebState, current_status, render, upstream_failure_detail,
+};
 
 fn public_url_with_segments<'a>(
     public_base_url: &str,
@@ -70,6 +74,10 @@ fn recipient_base_url_value(
 /// 256 KiB server-side, so the log must stay bounded.
 const LOG_CAP: usize = 100;
 
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
 // ---------------------------------------------------------------------------
 // Model
 // ---------------------------------------------------------------------------
@@ -111,6 +119,37 @@ pub struct Submission {
     /// Abort/Complete can close it out.
     #[serde(default)]
     pub status: String,
+    /// Why the last status change (Abort / Mark completed) did not reach the
+    /// recipient — kept on the submission so a failed Abort is visible on the
+    /// import itself and not only in the log (#968). Named for the operation,
+    /// not for Abort: both buttons go through `set_status` and both leave the
+    /// submission running when the kick-off fails. The value is the
+    /// recipient's or transport's own untranslated diagnosis; the sentence
+    /// around it is localized at render time (`status_error_message`), so the
+    /// banner reads in the *viewer's* language rather than in the language of
+    /// whoever pressed the button. Cleared by the next successful status
+    /// change; `serde(default)` keeps submissions stored before #968
+    /// deserializing.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status_error: String,
+    /// A status change (`stopped` | `completed`) the operator asked for that
+    /// the recipient has not *answered* — the kick-off timed out or never
+    /// connected, as distinct from a refusal (#998). Before this field the
+    /// transition was simply dropped: `set_status` assigned the status only on
+    /// a 2xx, so a recipient too busy to answer inside the kick-off budget
+    /// turned *Mark completed* into a log line and nothing else. Now the
+    /// request is kept here and re-sent by the status fragment on its next
+    /// due tick, until the recipient answers one way or the other or the
+    /// attempt budget runs out.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pending_status: String,
+    /// No re-send of `pending_status` goes out before this instant.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pending_status_retry_at: String,
+    /// Unanswered kick-offs so far for `pending_status`, against
+    /// [`STATUS_CHANGE_MAX_ATTEMPTS`].
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub pending_status_attempts: u32,
     #[serde(default)]
     pub created_at: String,
     #[serde(default)]
@@ -191,22 +230,92 @@ async fn save(
     id: &str,
     submission: &Submission,
     expected: Option<i64>,
-) -> Result<i64, String> {
+) -> Result<i64, StorageError> {
     let Some(store) = &state.bulk_provider else {
-        return Err("bulk provider store unavailable".to_string());
+        return Err(BackendError::Unavailable {
+            backend_name: "bulk-provider".to_string(),
+            message: "bulk provider store unavailable".to_string(),
+        }
+        .into());
     };
-    let document = serde_json::to_value(submission).map_err(|e| e.to_string())?;
+    let document = serde_json::to_value(submission).map_err(|e| BackendError::Unavailable {
+        backend_name: "bulk-provider".to_string(),
+        message: format!("submission does not serialize: {e}"),
+    })?;
     store
         .put_provider_submission(&tenant_ctx(rt), id, document, expected)
         .await
         .map(|stored| stored.version)
-        .map_err(|e| e.to_string())
+}
+
+/// Whether a save lost the optimistic-versioning race to another writer.
+fn is_version_conflict(e: &StorageError) -> bool {
+    matches!(
+        e,
+        StorageError::Concurrency(
+            ConcurrencyError::OptimisticLockFailure { .. }
+                | ConcurrencyError::VersionConflict { .. }
+        )
+    )
+}
+
+/// How many times a write is re-derived and re-tried after losing the
+/// version race. The competing writer is the status fragment's 5s tick, which
+/// holds a version for as long as one recipient poll takes; two re-loads
+/// cover a tick that lands between the load and the save twice over.
+const CAS_ATTEMPTS: u32 = 3;
+
+/// Loads the submission, applies `mutate`, and saves under optimistic
+/// versioning — re-loading and re-applying when another writer got in first.
+///
+/// The operator's own actions go through here. The status fragment rewrites
+/// the same document on every 5s tick, so a *Mark completed* pressed during
+/// a live ingest used to lose the compare-and-swap to a poll more often than
+/// not: `optimistic lock failure ... BulkProviderSubmission/...` in the log,
+/// and the press gone (#998). The poll's own writes still use [`save_or_warn`]
+/// and stay lossy — a lost poll is re-derived on the next tick, a lost press
+/// is not.
+///
+/// `mutate` returns `false` to leave the document alone (its precondition no
+/// longer holds on the fresh copy); the result is then `Ok(false)`. It may
+/// run more than once and must not carry state across runs.
+async fn commit<F>(
+    state: &WebState,
+    rt: &RequestTenant,
+    id: &str,
+    mut mutate: F,
+) -> Result<bool, StorageError>
+where
+    F: FnMut(&mut Submission) -> bool,
+{
+    let mut attempt = 1;
+    loop {
+        let Some((mut submission, version)) = load_one(state, rt, id).await else {
+            return Ok(false);
+        };
+        if !mutate(&mut submission) {
+            return Ok(false);
+        }
+        match save(state, rt, id, &submission, Some(version)).await {
+            Ok(_) => return Ok(true),
+            Err(e) if is_version_conflict(&e) && attempt < CAS_ATTEMPTS => {
+                tracing::debug!(
+                    submission = %id,
+                    attempt,
+                    "bulk-import submission changed under a status change; re-applying"
+                );
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Saves and, on failure, logs — for the paths whose response is a redirect
 /// either way. A version conflict here means another handler (usually the 5s
 /// status poller) wrote first; the caller's state is stale and the next
 /// load/poll re-derives it, so the lost write is benign but still logged.
+/// Operator actions that must not be lost go through [`commit`] instead.
 async fn save_or_warn(
     state: &WebState,
     rt: &RequestTenant,
@@ -250,6 +359,32 @@ struct LogLine {
     message: String,
 }
 
+/// The banner text for a submission whose last Abort / Mark completed never
+/// reached the recipient (#968), or an empty string when the last status
+/// change went through. The stored value is a technical diagnosis in whatever
+/// words the recipient or the transport used; only the sentence around it is
+/// translated, the same split the ViewDefinition lint catalog uses.
+fn status_error_message(i18n: &I18n, submission: &Submission) -> String {
+    if submission.status_error.is_empty() {
+        String::new()
+    } else if submission.pending_status.is_empty() {
+        i18n.t_arg(
+            "bulk-import-status-error",
+            "detail",
+            submission.status_error.clone(),
+        )
+    } else {
+        // The recipient never answered, so the change is still queued and
+        // re-sent from the status fragment (#998) — a different sentence from
+        // the refusal above, whose only remedy is another press.
+        i18n.t_arg(
+            "bulk-import-status-pending",
+            "detail",
+            submission.status_error.clone(),
+        )
+    }
+}
+
 /// The submission's log as `partials/bulk_import_log.html` wants it:
 /// newest-first, so the detail page's first paint and the status fragment's
 /// out-of-band refresh agree on the order (#955).
@@ -283,6 +418,86 @@ fn status_label(i18n: &I18n, status: &str) -> String {
     }
 }
 
+/// `data-rebuild-state` of the region while the tenant has no rebuild line.
+const REBUILD_IDLE: &str = "idle";
+
+/// The tenant's search-index rebuild line as the Import pages show it (#1245):
+/// `partials/bulk_import_rebuild.html`, included by both pages and rendered
+/// alone by [`rebuild_fragment`].
+///
+/// A submission turns Completed when ingest finishes. With indexing deferred
+/// that is the moment the rebuild that makes its resources searchable
+/// *starts*, so "Completed" alone told the operator the import was done while
+/// searches kept missing most of it. The line is the tenant's, not the
+/// submission's: the recipient is this server's own tenant, generations of one
+/// tenant merge, and a rebuild that left resources unindexed concerns every
+/// submission on the page.
+struct RebuildRegion {
+    line: Option<RebuildLine>,
+    /// `running`, `failed`, or [`REBUILD_IDLE`].
+    state: &'static str,
+    /// Seconds to the region's next refresh.
+    secs: u32,
+    /// What a refresh sends back; an unchanged one is answered `204`.
+    digest: String,
+}
+
+struct RebuildLine {
+    text: String,
+    aria_live: &'static str,
+}
+
+impl RebuildRegion {
+    /// The region for `activity`. `seen` is the state the requesting render
+    /// shows (`None` on a page load): the line is announced when it appears
+    /// or changes state, not on the refreshes that only move its percentage.
+    fn new(i18n: &I18n, activity: Option<&ReindexActivity>, seen: Option<&str>) -> Self {
+        use std::hash::{Hash, Hasher};
+
+        let state = activity.map_or(REBUILD_IDLE, crate::rebuild_state);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        activity.hash(&mut hasher);
+        i18n.lang().hash(&mut hasher);
+        Self {
+            line: activity.map(|activity| RebuildLine {
+                text: crate::rebuild_text(i18n, activity),
+                aria_live: if seen == Some(state) { "off" } else { "polite" },
+            }),
+            state,
+            // Only a running rebuild moves; a failed one is a settled fact.
+            secs: crate::dashboard_refresh()
+                .secs(activity.is_some_and(ReindexActivity::is_running)),
+            digest: format!("{:016x}", hasher.finish()),
+        }
+    }
+
+    /// The region for the request's tenant. Reads the same cached,
+    /// counter-backed snapshot Resources does, so following it adds no
+    /// storage load.
+    async fn read(i18n: &I18n, rt: &RequestTenant, seen: Option<&str>) -> Self {
+        let snapshot = helios_observability::dashboard::snapshot(
+            DashboardWindow::default(),
+            &rt.id,
+            &[],
+            false,
+        )
+        .await;
+        Self::new(
+            i18n,
+            snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.reindex_active.as_ref()),
+            seen,
+        )
+    }
+}
+
+#[derive(Template)]
+#[template(path = "partials/bulk_import_rebuild.html")]
+struct RebuildFragment {
+    rebuild: RebuildRegion,
+}
+
 #[derive(Template)]
 #[template(path = "pages/bulk-import.html")]
 struct BulkImportPage {
@@ -290,6 +505,7 @@ struct BulkImportPage {
     i18n: I18n,
     active_page: &'static str,
     available: bool,
+    rebuild: RebuildRegion,
     rows: Vec<SubmissionRow>,
     error: Option<String>,
 }
@@ -307,6 +523,11 @@ struct BulkImportDetailPage {
     submitter_display: String,
     created_at: String,
     status_label: String,
+    /// The persistent failed-status-change banner (#968), already localized;
+    /// empty renders the bare out-of-band host the status card swaps into.
+    /// Distinct from `error`, which is the edit dialog's one-shot failure.
+    status_error: String,
+    rebuild: RebuildRegion,
     auth: String,
     client_id: String,
     token_url: String,
@@ -362,6 +583,7 @@ pub async fn page(
 
     render(BulkImportPage {
         status,
+        rebuild: RebuildRegion::read(&i18n, &rt, None).await,
         i18n,
         active_page: "bulk-import",
         available,
@@ -398,6 +620,7 @@ pub async fn create(
     State(state): State<WebState>,
     rt: RequestTenant,
     _principal: Option<Extension<helios_auth::Principal>>,
+    headers: HeaderMap,
     axum::Form(form): axum::Form<CreateForm>,
 ) -> Response {
     let id = uuid::Uuid::new_v4().to_string();
@@ -421,6 +644,10 @@ pub async fn create(
         client_id: form.client_id.trim().to_string(),
         token_url: form.token_url.trim().to_string(),
         status: "not-started".to_string(),
+        status_error: String::new(),
+        pending_status: String::new(),
+        pending_status_retry_at: String::new(),
+        pending_status_attempts: 0,
         created_at: now_stamp(),
         manifests: serde_json::Map::new(),
         log: Vec::new(),
@@ -439,10 +666,10 @@ pub async fn create(
         mid.clone(),
         serde_json::to_value(&manifest).unwrap_or(Value::Null),
     );
-    submit_one_with_id(&mut submission, &id, &mid, &rt.id).await;
+    submit_one_with_id(&state, &mut submission, &headers, &id, &mid, &rt.id).await;
     match save(&state, &rt, &id, &submission, Some(0)).await {
         Ok(_) => Redirect::to(&format!("/ui/bulk-import/{id}")).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
     }
 }
 
@@ -462,12 +689,40 @@ pub async fn detail(
         return Redirect::to("/ui/bulk-import").into_response();
     };
 
-    render_detail_page(i18n, status, id, s, None, false)
+    let rebuild = RebuildRegion::read(&i18n, &rt, None).await;
+    render_detail_page(i18n, status, rebuild, id, s, None, false)
+}
+
+#[derive(Deserialize)]
+pub struct RebuildQuery {
+    /// The [`RebuildRegion::digest`] the requesting region shows.
+    #[serde(default)]
+    digest: String,
+    /// The `data-rebuild-state` the requesting region shows.
+    #[serde(default)]
+    seen: String,
+}
+
+/// `GET /ui/bulk-import/rebuild` — the rebuild region's own refresh (#1245).
+/// `204` while the line it would render is the one the page already shows.
+pub async fn rebuild_fragment(
+    locale: RequestLocale,
+    rt: RequestTenant,
+    _principal: Option<Extension<helios_auth::Principal>>,
+    Query(query): Query<RebuildQuery>,
+) -> Response {
+    let i18n = I18n::new(locale);
+    let rebuild = RebuildRegion::read(&i18n, &rt, Some(&query.seen)).await;
+    if rebuild.digest == query.digest {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    render(RebuildFragment { rebuild })
 }
 
 fn render_detail_page(
     i18n: I18n,
     status: crate::Status,
+    rebuild: RebuildRegion,
     id: String,
     s: Submission,
     error: Option<String>,
@@ -485,6 +740,7 @@ fn render_detail_page(
 
     let log = log_lines(&s);
     let label = status_label(&i18n, &s.status);
+    let status_error = status_error_message(&i18n, &s);
     render(BulkImportDetailPage {
         status,
         i18n,
@@ -508,6 +764,8 @@ fn render_detail_page(
         manifest_url,
         created_at: s.created_at,
         status_label: label,
+        status_error,
+        rebuild,
         auth: s.auth.clone(),
         client_id: s.client_id,
         token_url: s.token_url,
@@ -580,12 +838,14 @@ pub async fn edit(
         Ok(_) => Redirect::to(&format!("/ui/bulk-import/{id}")).into_response(),
         Err(e) => {
             let i18n = I18n::new(locale);
+            let rebuild = RebuildRegion::read(&i18n, &rt, None).await;
             let mut response = render_detail_page(
                 i18n,
                 current_status(&state, rv.0, &rt),
+                rebuild,
                 id,
                 s,
-                Some(e),
+                Some(e.to_string()),
                 true,
             );
             *response.status_mut() = StatusCode::BAD_GATEWAY;
@@ -693,10 +953,108 @@ fn signing_kid(pem: &str, alg: &str) -> Option<String> {
     }
 }
 
+/// Which credential a self-call on a submission's behalf carries (#1436).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelfCallCredential {
+    /// The submission's own SMART Backend Services client: mint a token.
+    BackendServices,
+    /// The recipient is this server: the same identity every other page's
+    /// self-call carries — the browser's own `Authorization`, else the
+    /// signed-in session's bearer, else the process's outbound service
+    /// credential (#1480). The recipient's `$bulk-submit` then wants
+    /// `system/bulk-submit` on whichever token that is.
+    Outbound,
+    /// The recipient is another server and the submission has no client of
+    /// its own: send nothing rather than leak this server's token.
+    None,
+}
+
+/// Picks the credential for a request to `recipient_base_url`. A recipient is
+/// "this server" when its origin matches the public base URL the UI
+/// advertises or the loopback address it calls itself at.
+fn self_call_credential(
+    auth: &str,
+    recipient_base_url: &str,
+    public_base_url: &str,
+    self_base_url: &str,
+) -> SelfCallCredential {
+    if auth == "backend-services" {
+        return SelfCallCredential::BackendServices;
+    }
+    let origin = |url: &str| {
+        reqwest::Url::parse(url).ok().map(|u| {
+            (
+                u.scheme().to_string(),
+                u.host_str().unwrap_or_default().to_ascii_lowercase(),
+                u.port_or_known_default(),
+            )
+        })
+    };
+    let Some(recipient) = origin(recipient_base_url) else {
+        return SelfCallCredential::None;
+    };
+    if [public_base_url, self_base_url]
+        .iter()
+        .any(|base| origin(base).as_ref() == Some(&recipient))
+    {
+        SelfCallCredential::Outbound
+    } else {
+        SelfCallCredential::None
+    }
+}
+
+/// Applies the submission's credential to a self-call bound for `target`;
+/// `headers` are the browser request's, which carry the signed-in user's
+/// identity when the recipient is this server.
+pub(crate) async fn authorize_self_call(
+    state: &WebState,
+    submission: &Submission,
+    headers: &HeaderMap,
+    request: reqwest::RequestBuilder,
+    target: &str,
+) -> Result<reqwest::RequestBuilder, String> {
+    match self_call_credential(
+        &submission.auth,
+        &submission.recipient_base_url,
+        &state.public_base_url,
+        &state.self_base_url,
+    ) {
+        SelfCallCredential::BackendServices => {
+            let token =
+                backend_services_token(&submission.client_id, &submission.token_url).await?;
+            Ok(request.bearer_auth(token))
+        }
+        SelfCallCredential::Outbound => {
+            crate::bulk_export::forward_credential(state, request, headers, target).await
+        }
+        SelfCallCredential::None => Ok(request),
+    }
+}
+
 /// Mints a SMART Backend Services access token (`client_credentials` +
 /// `private_key_jwt`) against the submission's token endpoint. The signing key
 /// is the server-wide `HFS_BULK_SUBMIT_PRIVATE_KEY`, shared with the consumer
 /// side's protected-file fetches; the client id is per-submission.
+/// Builds the SMART Backend Services `private_key_jwt` client-assertion claims.
+///
+/// `iat` is required: Keycloak (and any RFC 7523 verifier following its
+/// guidance) rejects a client assertion whose `exp` is more than ~60s out
+/// unless it also carries `iat` ("Token expiration is too far in the future and
+/// iat claim not present"). The consumer-side assertion in
+/// `crates/rest/src/bulk_submit_oauth.rs` already sets it; this one did not, so
+/// the Import page's backend-services submit failed against Keycloak with a 400
+/// (#1437). `iat` and `exp` come off one `now` so they stay consistent.
+fn client_assertion_claims(client_id: &str, token_url: &str, now: i64) -> serde_json::Value {
+    json!({
+        "iss": client_id,
+        "sub": client_id,
+        "aud": token_url,
+        "iat": now,
+        "exp": now + 300,
+        "jti": uuid::Uuid::new_v4().to_string(),
+    })
+}
+
 async fn backend_services_token(client_id: &str, token_url: &str) -> Result<String, String> {
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 
@@ -716,13 +1074,7 @@ async fn backend_services_token(client_id: &str, token_url: &str) -> Result<Stri
             EncodingKey::from_ec_pem(pem.as_bytes()).map_err(|e| e.to_string())?,
         ),
     };
-    let claims = json!({
-        "iss": client_id,
-        "sub": client_id,
-        "aud": token_url,
-        "exp": Utc::now().timestamp() + 300,
-        "jti": uuid::Uuid::new_v4().to_string(),
-    });
+    let claims = client_assertion_claims(client_id, token_url, Utc::now().timestamp());
     let mut header = Header::new(algorithm);
     header.kid = signing_kid(&pem, &alg);
     let assertion = encode(&header, &claims, &key).map_err(|e| e.to_string())?;
@@ -743,7 +1095,9 @@ async fn backend_services_token(client_id: &str, token_url: &str) -> Result<Stri
         .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            upstream_failure_detail(&e, 10, "the token endpoint did not answer in time")
+        })?;
     let status = response.status();
     let body: Value = response.json().await.map_err(|e| e.to_string())?;
     if !status.is_success() {
@@ -764,12 +1118,14 @@ fn kickoff_target(submission: &Submission) -> String {
 /// POSTs a kick-off to the recipient, returning
 /// `(status, content-type, body-excerpt)`.
 async fn post_kickoff(
+    state: &WebState,
     submission: &Submission,
+    headers: &HeaderMap,
     parameters: &Value,
     tenant: &str,
 ) -> Result<(u16, String, String), String> {
     let target = kickoff_target(submission);
-    let mut request = with_tenant(
+    let request = with_tenant(
         http_client()
             .post(&target)
             .header("Content-Type", "application/fhir+json")
@@ -778,14 +1134,11 @@ async fn post_kickoff(
             .json(parameters),
         tenant,
     );
-    if submission.auth == "backend-services" {
-        let token = backend_services_token(&submission.client_id, &submission.token_url).await?;
-        request = request.bearer_auth(token);
-    }
+    let request = authorize_self_call(state, submission, headers, request, &target).await?;
     let response = request
         .send()
         .await
-        .map_err(|e| format!("POST {target} failed: {e}"))?;
+        .map_err(|e| format!("POST {target} failed: {}", kickoff_failure_detail(&e)))?;
     let status = response.status().as_u16();
     let content_type = response
         .headers()
@@ -837,7 +1190,13 @@ fn summarize_error_body(content_type: &str, body: &str) -> String {
 /// Kicks off recipient-side status tracking: `POST $bulk-submit-status`
 /// (submitter + submissionId, `Prefer: respond-async`), returning the poll
 /// URL the recipient hands back in `Content-Location`.
-async fn status_kickoff(submission: &Submission, id: &str, tenant: &str) -> Result<String, String> {
+async fn status_kickoff(
+    state: &WebState,
+    submission: &Submission,
+    headers: &HeaderMap,
+    id: &str,
+    tenant: &str,
+) -> Result<String, String> {
     let target = public_url_with_segments(&submission.recipient_base_url, ["$bulk-submit-status"]);
     // Only the identifying parameters ride the status kick-off.
     let parameters = kickoff_parameters(submission, id, "", None);
@@ -850,7 +1209,7 @@ async fn status_kickoff(submission: &Submission, id: &str, tenant: &str) -> Resu
         .collect();
     let body = json!({ "resourceType": "Parameters", "parameter": identifying });
 
-    let mut request = with_tenant(
+    let request = with_tenant(
         http_client()
             .post(&target)
             .header("Content-Type", "application/fhir+json")
@@ -859,11 +1218,11 @@ async fn status_kickoff(submission: &Submission, id: &str, tenant: &str) -> Resu
             .json(&body),
         tenant,
     );
-    if submission.auth == "backend-services" {
-        let token = backend_services_token(&submission.client_id, &submission.token_url).await?;
-        request = request.bearer_auth(token);
-    }
-    let response = request.send().await.map_err(|e| e.to_string())?;
+    let request = authorize_self_call(state, submission, headers, request, &target).await?;
+    let response = request
+        .send()
+        .await
+        .map_err(|e| kickoff_failure_detail(&e))?;
     let status = response.status().as_u16();
     response
         .headers()
@@ -899,30 +1258,28 @@ fn http_client() -> &'static reqwest::Client {
 /// Stamps the selected tenant onto a self-call. The recipient is this HFS
 /// process (#689): under header routing the tenant travels only here, and
 /// under `both` the URL prefix already agrees with it. `Authorization` is
-/// deliberately not forwarded — `/ui` sits outside the auth layer (#320)
-/// and backend-services kick-offs mint their own bearer (#1006).
+/// deliberately not forwarded — `/ui` sits outside the auth layer (#320);
+/// the credential comes from [`authorize_self_call`] (#1006, #1436).
 fn with_tenant(request: reqwest::RequestBuilder, tenant: &str) -> reqwest::RequestBuilder {
     request.header("X-Tenant-ID", tenant)
 }
 
-/// Renders a poll transport failure with its cause. `reqwest::Error`'s
-/// `Display` stops at the URL and hides the reason in `source()`, which made
-/// a timeout, a refused connection, and a reset log byte-identically (#957).
+/// Renders a poll transport failure with its cause (#957). The rendering
+/// itself is shared with the export workspace's kick-off (#1185); what is
+/// specific here is the cap and why a status poll can sit at it.
 fn poll_failure_detail(e: &reqwest::Error) -> String {
-    if e.is_timeout() {
-        return format!(
-            "timed out after {STATUS_POLL_TIMEOUT_SECS}s — the recipient's status \
-             endpoint can be slow while it is ingesting"
-        );
-    }
-    let mut detail = e.to_string();
-    let mut src = std::error::Error::source(e);
-    while let Some(cause) = src {
-        detail.push_str(": ");
-        detail.push_str(&cause.to_string());
-        src = cause.source();
-    }
-    detail
+    upstream_failure_detail(
+        e,
+        STATUS_POLL_TIMEOUT_SECS,
+        "the recipient's status endpoint can be slow while it is ingesting",
+    )
+}
+
+/// Renders a kick-off transport failure with its cause: without the
+/// `source()` chain a DNS failure, a refused connection, and a TLS error all
+/// read as `error sending request for url (...)`.
+fn kickoff_failure_detail(e: &reqwest::Error) -> String {
+    upstream_failure_detail(e, 15, "the recipient did not answer the kick-off in time")
 }
 
 /// Whether the recipient asked us to hold off: a stored `next_poll_at` still
@@ -932,6 +1289,15 @@ fn poll_due(submission: &Submission) -> bool {
         || chrono::DateTime::parse_from_rfc3339(&submission.next_poll_at)
             .map(|t| Utc::now() >= t.with_timezone(&Utc))
             .unwrap_or(true)
+}
+
+/// Whether the Data Provider has closed the submission out (Abort / Mark
+/// completed). Recipient polls no longer decide its status: HFS answers an
+/// aborted submission's status poll with a clean `200`, which would otherwise
+/// read as a finished import (#1069). `failed` is not terminal — it can still
+/// be resubmitted, aborted, or completed.
+fn is_terminal(status: &str) -> bool {
+    matches!(status, "stopped" | "completed")
 }
 
 /// Materializes a `Retry-After` delta (seconds) into `next_poll_at`.
@@ -948,23 +1314,80 @@ fn retry_after_seconds(response: &reqwest::Response) -> Option<u64> {
         .and_then(|v| v.trim().parse().ok())
 }
 
+/// Totals the counts recorded for `codes` in one `outcome` entry's
+/// `countSeverity`, which reaches us in two shapes.
+///
+/// HFS's own status handler emits the STU4 array of `{"code":…,"count":…}`
+/// objects (`severity_array` in `crates/rest/src/handlers/bulk_submit.rs`),
+/// while other recipients — and the older fixtures written against them —
+/// send a plain object keyed by severity (`{"error":1}`). Reading only the
+/// object shape scored every manifest HFS itself produces as zero errors,
+/// because `Value::get("error")` on an array is always `None`: a manifest
+/// that really failed showed up in the UI as a clean completion with no
+/// error files (#1127). Both shapes are accepted so neither recipient is
+/// misread.
+///
+/// Anything else yields `None`. An unrecognised `countSeverity` says nothing
+/// about the file, so the caller treats it exactly like a missing one and
+/// counts the entry as an error rather than assuming it was clean.
+fn severity_total(cs: &Value, codes: [&str; 2]) -> Option<u64> {
+    if let Some(entries) = cs.as_array() {
+        return Some(
+            entries
+                .iter()
+                .filter(|entry| {
+                    entry
+                        .get("code")
+                        .and_then(Value::as_str)
+                        .is_some_and(|code| codes.contains(&code))
+                })
+                .filter_map(|entry| entry.get("count").and_then(Value::as_u64))
+                .sum(),
+        );
+    }
+    if cs.is_object() {
+        return Some(
+            codes
+                .iter()
+                .filter_map(|code| cs.get(code).and_then(Value::as_u64))
+                .sum(),
+        );
+    }
+    None
+}
+
 /// One poll of the recipient's status URL: `202` records `X-Progress`, `200`
 /// records the status manifest as the submission's result, anything else is
-/// logged and polling stops (the poll URL is cleared). `202` and `429` carry
-/// `Retry-After`; both push `next_poll_at` out so the card's refresh cadence
-/// never turns into a poll the recipient would reject (#790).
-async fn poll_status(submission: &mut Submission, tenant: &str) {
+/// logged and polling stops (the poll URL is cleared). Neither `200` nor a
+/// failure changes a closed-out submission's status (#1069). `202` and `429`
+/// carry `Retry-After`; both push `next_poll_at` out so the card's refresh
+/// cadence never turns into a poll the recipient would reject (#790).
+async fn poll_status(
+    state: &WebState,
+    submission: &mut Submission,
+    headers: &HeaderMap,
+    tenant: &str,
+) {
     let poll_url = submission.poll_url.clone();
-    let response = match with_tenant(
+    let request = with_tenant(
         http_client()
             .get(&poll_url)
             .header("Accept", "application/json")
             .timeout(std::time::Duration::from_secs(STATUS_POLL_TIMEOUT_SECS)),
         tenant,
-    )
-    .send()
-    .await
-    {
+    );
+    // The poll authenticates like the kick-offs it follows (#1436); a
+    // credential that cannot be produced is reported and backed off like a
+    // transport failure, never sent as an unauthenticated request.
+    let request = match authorize_self_call(state, submission, headers, request, &poll_url).await {
+        Ok(request) => request,
+        Err(e) => {
+            push_log(submission, format!("Status poll failed: {e}"));
+            hold_polls_for(submission, STATUS_POLL_FAILURE_BACKOFF_SECS);
+            return;
+        }
+    };
+    let response = match request.send().await {
         Ok(r) => r,
         Err(e) => {
             push_log(
@@ -993,7 +1416,7 @@ async fn poll_status(submission: &mut Submission, tenant: &str) {
                 .headers()
                 .get("x-progress")
                 .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
-                .unwrap_or_else(|| "in progress".to_string());
+                .unwrap_or_else(|| "In progress".to_string());
             if submission.progress != progress {
                 push_log(submission, format!("Status: {progress}"));
             }
@@ -1014,18 +1437,21 @@ async fn poll_status(submission: &mut Submission, tenant: &str) {
                     files
                         .iter()
                         .filter(|file| {
-                            file.get("countSeverity").is_none_or(|cs| {
-                                cs.get("error").and_then(Value::as_u64).unwrap_or(0)
-                                    + cs.get("fatal").and_then(Value::as_u64).unwrap_or(0)
-                                    > 0
-                            })
+                            file.get("countSeverity")
+                                .and_then(|cs| severity_total(cs, ["error", "fatal"]))
+                                .is_none_or(|count| count > 0)
                         })
                         .count()
                 })
                 .unwrap_or(0);
             let errors = manifest["error"].as_array().map(Vec::len).unwrap_or(0) + outcome_errors;
+            // A closed-out submission keeps the instant it was closed out.
+            let completed_at = match submission.result["completedAt"].as_str() {
+                Some(at) if is_terminal(&submission.status) && !at.is_empty() => at.to_string(),
+                _ => now_stamp(),
+            };
             submission.result = json!({
-                "completedAt": now_stamp(),
+                "completedAt": completed_at,
                 "outputs": outputs,
                 "errors": errors,
             });
@@ -1036,8 +1462,17 @@ async fn poll_status(submission: &mut Submission, tenant: &str) {
             // verdict is the submission's (#764, #765): errors mark it
             // failed; a clean completion completes it. Complete remains
             // available for closing out early by hand, and a later submit
-            // returns a failed submission to in-progress.
-            if errors > 0 {
+            // returns a failed submission to in-progress. A submission the
+            // provider already closed out keeps its status (#1069).
+            if is_terminal(&submission.status) {
+                let status = submission.status.clone();
+                push_log(
+                    submission,
+                    format!(
+                        "Status: got 200 OK ({outputs} outputs, {errors} error file(s)); submission stays {status}."
+                    ),
+                );
+            } else if errors > 0 {
                 submission.status = "failed".to_string();
                 push_log(
                     submission,
@@ -1064,16 +1499,28 @@ async fn poll_status(submission: &mut Submission, tenant: &str) {
         other => {
             // Polling can never resume (the URL is dropped), so the submission
             // must not keep reading In Progress (#764). completedAt keeps the
-            // status card rendered; the log carries the diagnosis.
+            // status card rendered; the log carries the diagnosis. A
+            // closed-out submission is not reopened as failed, and keeps the
+            // result it was closed out with (#1069).
+            submission.progress = String::new();
+            submission.poll_url = String::new();
+            submission.next_poll_at = String::new();
+            if is_terminal(&submission.status) {
+                let status = submission.status.clone();
+                push_log(
+                    submission,
+                    format!(
+                        "Status poll answered {other}; polling stopped; submission stays {status}."
+                    ),
+                );
+                return;
+            }
             submission.status = "failed".to_string();
             submission.result = json!({
                 "completedAt": now_stamp(),
                 "outputs": 0,
                 "errors": 0,
             });
-            submission.progress = String::new();
-            submission.poll_url = String::new();
-            submission.next_poll_at = String::new();
             push_log(
                 submission,
                 format!(
@@ -1086,7 +1533,14 @@ async fn poll_status(submission: &mut Submission, tenant: &str) {
 
 /// Fires the kick-off for one manifest and records the outcome on the
 /// submission (status, log, poll URL).
-async fn submit_one_with_id(submission: &mut Submission, id: &str, mid: &str, tenant: &str) {
+async fn submit_one_with_id(
+    state: &WebState,
+    submission: &mut Submission,
+    headers: &HeaderMap,
+    id: &str,
+    mid: &str,
+    tenant: &str,
+) {
     let Some(m) = submission
         .manifests
         .get(mid)
@@ -1099,7 +1553,7 @@ async fn submit_one_with_id(submission: &mut Submission, id: &str, mid: &str, te
         format!("Submitting manifest \"{}\"...", m.manifest_url),
     );
     let parameters = kickoff_parameters(submission, id, "in-progress", Some(&m));
-    match post_kickoff(submission, &parameters, tenant).await {
+    match post_kickoff(state, submission, headers, &parameters, tenant).await {
         Ok((status, _, _)) if (200..300).contains(&status) => {
             push_log(
                 submission,
@@ -1112,7 +1566,7 @@ async fn submit_one_with_id(submission: &mut Submission, id: &str, mid: &str, te
             // Start recipient-side status tracking on the first accepted
             // manifest; later submissions reuse the same poll URL.
             if submission.poll_url.is_empty() {
-                match status_kickoff(submission, id, tenant).await {
+                match status_kickoff(state, submission, headers, id, tenant).await {
                     Ok(poll_url) => {
                         push_log(submission, "Bulk status kick-off request".to_string());
                         submission.poll_url = poll_url;
@@ -1156,9 +1610,10 @@ pub async fn abort(
     State(state): State<WebState>,
     rt: RequestTenant,
     _principal: Option<Extension<helios_auth::Principal>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    set_status(state, rt, _principal, id, "stopped").await
+    set_status(state, rt, headers, id, "stopped").await
 }
 
 /// `POST /ui/bulk-import/{id}/complete` — status-only kick-off, `completed`:
@@ -1169,51 +1624,227 @@ pub async fn complete(
     State(state): State<WebState>,
     rt: RequestTenant,
     _principal: Option<Extension<helios_auth::Principal>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    set_status(state, rt, _principal, id, "completed").await
+    set_status(state, rt, headers, id, "completed").await
+}
+
+/// Whether a submission can still be closed out by hand.
+fn can_change_status(status: &str) -> bool {
+    matches!(status, "in-progress" | "failed")
 }
 
 async fn set_status(
     state: WebState,
     rt: RequestTenant,
-    _principal: Option<Extension<helios_auth::Principal>>,
+    headers: HeaderMap,
     id: String,
     status: &str,
 ) -> Response {
-    let Some((mut s, sv)) = load_one(&state, &rt, &id).await else {
+    let Some((s, _)) = load_one(&state, &rt, &id).await else {
         return Redirect::to("/ui/bulk-import").into_response();
     };
-    if !matches!(s.status.as_str(), "in-progress" | "failed") {
+    if !can_change_status(&s.status) {
         return conflict("only in-progress or failed submissions can change terminal status");
     }
-    push_log(&mut s, format!("Marking submission {status}..."));
-    let parameters = kickoff_parameters(&s, &id, status, None);
-    match post_kickoff(&s, &parameters, &rt.id).await {
-        Ok((code, _, _)) if (200..300).contains(&code) => {
-            push_log(&mut s, format!("Recipient acknowledged ({code})."));
-            s.status = status.to_string();
+    // The network call happens once, against the copy just loaded — the
+    // recipient, auth and identity it needs are immutable on a submission.
+    // Recording its outcome is what races the status fragment's own writes,
+    // so that part is re-derived on a fresh copy for as long as it loses.
+    let outcome = request_status_change(&state, &s, &headers, &id, status, &rt.id).await;
+    let committed = commit(&state, &rt, &id, |fresh| {
+        // The precondition is re-checked on the fresh copy: a poll that
+        // landed a `200` meanwhile has closed the submission out already.
+        if !can_change_status(&fresh.status) {
+            return false;
         }
-        Ok((code, content_type, body)) => {
-            push_log(
-                &mut s,
-                format!(
-                    "Recipient rejected the status change: {code}: {}",
-                    summarize_error_body(&content_type, &body)
-                ),
-            );
-        }
+        push_log(fresh, format!("Marking submission {status}..."));
+        // A press is a fresh request with a fresh attempt budget, whatever an
+        // earlier unanswered one had used up.
+        fresh.pending_status_attempts = 0;
+        apply_status_change(fresh, status, &outcome);
+        true
+    })
+    .await;
+    match committed {
+        Ok(_) => {}
         Err(e) => {
-            push_log(&mut s, format!("Status change failed: {e}"));
+            tracing::warn!(submission = %id, error = %e, "failed to persist bulk-import status change");
         }
     }
-    save_or_warn(&state, &rt, &id, &s, Some(sv)).await;
     Redirect::to(&format!("/ui/bulk-import/{id}")).into_response()
 }
 
+/// What a status-only kick-off came back with. The two failure shapes are
+/// kept apart because they call for opposite reactions (#998): a refusal is
+/// the recipient's answer and only another press can change it; no answer at
+/// all leaves the change queued and re-sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KickoffOutcome {
+    /// A 2xx: the recipient applied the change.
+    Acknowledged(u16),
+    /// The recipient answered, and said no — its status and explanation.
+    Refused(String),
+    /// No answer: a timeout, a refused connection, a reset, or a token the
+    /// authorization server would not mint.
+    Unreachable(String),
+}
+
+/// POSTs the status-only kick-off and classifies the result.
+async fn request_status_change(
+    state: &WebState,
+    submission: &Submission,
+    headers: &HeaderMap,
+    id: &str,
+    status: &str,
+    tenant: &str,
+) -> KickoffOutcome {
+    let parameters = kickoff_parameters(submission, id, status, None);
+    match post_kickoff(state, submission, headers, &parameters, tenant).await {
+        Ok((code, _, _)) if (200..300).contains(&code) => KickoffOutcome::Acknowledged(code),
+        Ok((code, content_type, body)) => KickoffOutcome::Refused(format!(
+            "{code}: {}",
+            summarize_error_body(&content_type, &body)
+        )),
+        Err(e) => KickoffOutcome::Unreachable(e),
+    }
+}
+
+/// How long to wait before re-sending an unanswered status change. Longer
+/// than the fragment's 5s cadence on purpose: a recipient that just spent the
+/// whole kick-off budget not answering is not back five seconds later.
+const STATUS_CHANGE_RETRY_SECS: u64 = 15;
+
+/// Unanswered kick-offs after which a queued status change is dropped and
+/// the banner falls back to "try again". Ten attempts at the kick-off budget
+/// plus the retry hold is roughly five minutes of a recipient not answering,
+/// which is an outage, not load — and the page keeps re-sending only while
+/// it is open, so an unbounded queue would also be a surprise to come back
+/// to.
+const STATUS_CHANGE_MAX_ATTEMPTS: u32 = 10;
+
+/// Records the outcome of a requested status change on the submission.
+///
+/// Only an acknowledgement changes the status. A refusal leaves the
+/// submission as it was, with the recipient's answer on the banner. No
+/// answer keeps the change *queued*: `pending_status` is set, the attempt is
+/// counted, and the status fragment re-sends it once
+/// `pending_status_retry_at` has passed — the recipient accepts the same
+/// close-out twice (a restated terminal status answers `200`), so a first
+/// attempt that landed server-side but timed out client-side is resolved by
+/// the re-send rather than reported as a refusal (#998).
+fn apply_status_change(submission: &mut Submission, status: &str, outcome: &KickoffOutcome) {
+    match outcome {
+        KickoffOutcome::Acknowledged(code) => {
+            push_log(submission, format!("Recipient acknowledged ({code})."));
+            submission.status = status.to_string();
+            // The change landed, so any banner from an earlier attempt is
+            // stale (#968), and so is a queued re-send of it.
+            submission.status_error = String::new();
+            clear_pending_status(submission);
+            // A closed-out submission stops polling the recipient, which
+            // answers an aborted submission's status poll with a clean `200`
+            // that would otherwise flip Stopped to Completed (#1069). The
+            // result stamps the close-out so the card shows its Result form,
+            // keeping any counts an earlier `200` manifest recorded.
+            if is_terminal(status) {
+                submission.poll_url = String::new();
+                submission.next_poll_at = String::new();
+                submission.progress = String::new();
+                submission.result = json!({
+                    "completedAt": now_stamp(),
+                    "outputs": submission.result["outputs"].as_u64().unwrap_or(0),
+                    "errors": submission.result["errors"].as_u64().unwrap_or(0),
+                });
+            }
+        }
+        KickoffOutcome::Refused(detail) => {
+            push_log(
+                submission,
+                format!("Recipient rejected the status change: {detail}"),
+            );
+            // The submission keeps its own status, so the press left no trace
+            // anywhere but the log until #968 — a saturated recipient that
+            // rejects the kick-off must not look like a successful Abort.
+            // `can_abort` is unchanged, so the retry stays one click away.
+            // An answer, even a no, settles any queued re-send.
+            submission.status_error = detail.clone();
+            clear_pending_status(submission);
+        }
+        KickoffOutcome::Unreachable(detail) => {
+            submission.status_error = detail.clone();
+            submission.pending_status_attempts += 1;
+            let attempt = submission.pending_status_attempts;
+            if attempt >= STATUS_CHANGE_MAX_ATTEMPTS {
+                push_log(
+                    submission,
+                    format!(
+                        "Status change failed: {detail} — giving up after {attempt} unanswered \
+                         attempts; press the button again to retry."
+                    ),
+                );
+                clear_pending_status(submission);
+            } else {
+                push_log(
+                    submission,
+                    format!(
+                        "Status change failed: {detail} — the request is kept and will be \
+                         re-sent in {STATUS_CHANGE_RETRY_SECS}s while this page is open \
+                         (attempt {attempt} of {STATUS_CHANGE_MAX_ATTEMPTS})."
+                    ),
+                );
+                submission.pending_status = status.to_string();
+                submission.pending_status_retry_at = (Utc::now()
+                    + chrono::Duration::seconds(STATUS_CHANGE_RETRY_SECS as i64))
+                .to_rfc3339_opts(SecondsFormat::Millis, true);
+            }
+        }
+    }
+}
+
+fn clear_pending_status(submission: &mut Submission) {
+    submission.pending_status = String::new();
+    submission.pending_status_retry_at = String::new();
+    submission.pending_status_attempts = 0;
+}
+
+/// Whether a queued status change should be re-sent now: one is queued, the
+/// submission can still take it, and the retry hold has passed (an empty or
+/// unparseable hold counts as passed, like `poll_due`).
+fn pending_status_due(submission: &Submission) -> bool {
+    !submission.pending_status.is_empty()
+        && can_change_status(&submission.status)
+        && (submission.pending_status_retry_at.is_empty()
+            || chrono::DateTime::parse_from_rfc3339(&submission.pending_status_retry_at)
+                .map(|t| Utc::now() >= t.with_timezone(&Utc))
+                .unwrap_or(true))
+}
+
+/// Re-sends the queued status change and records what came back.
+async fn retry_pending_status(
+    state: &WebState,
+    submission: &mut Submission,
+    headers: &HeaderMap,
+    id: &str,
+    tenant: &str,
+) {
+    let status = submission.pending_status.clone();
+    push_log(
+        submission,
+        format!(
+            "Re-sending: marking submission {status} (attempt {} of {STATUS_CHANGE_MAX_ATTEMPTS})...",
+            submission.pending_status_attempts + 1
+        ),
+    );
+    let outcome = request_status_change(state, submission, headers, id, &status, tenant).await;
+    apply_status_change(submission, &status, &outcome);
+}
+
 /// The recipient-status card fragment, polled by htmx while a poll URL is
-/// live. Each fetch performs at most one poll against the recipient, so the
-/// cadence is the page's `every 5s` trigger — no background tasks.
+/// live and the submission is not closed out (#1069). Each fetch performs at
+/// most one poll against the recipient, so the cadence is the page's
+/// `every 5s` trigger — no background tasks.
 #[derive(Template)]
 #[template(path = "partials/bulk_import_status.html")]
 struct StatusCard {
@@ -1230,6 +1861,11 @@ struct StatusCard {
     completed_at: String,
     /// Rides out-of-band into the summary card's STATUS cell.
     status_label: String,
+    /// Rides out-of-band into the detail page's `#submission-error` host, the
+    /// same way `status_label` does (#968): the card is re-fetched every 5s
+    /// with `outerHTML`, so a banner rendered beside it would either be wiped
+    /// by the next swap or duplicated by it. Empty clears the host.
+    status_error: String,
     /// Rides out-of-band into the Submission Log section, whose lines this
     /// poll may have just written (#955).
     log: Vec<LogLine>,
@@ -1246,20 +1882,50 @@ pub async fn status_fragment(
     locale: RequestLocale,
     rt: RequestTenant,
     _principal: Option<Extension<helios_auth::Principal>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
     let i18n = I18n::new(locale);
     let Some((mut s, sv)) = load_one(&state, &rt, &id).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if !s.poll_url.is_empty() && poll_due(&s) {
-        poll_status(&mut s, &rt.id).await;
+    let mut changed = false;
+    // A closed-out submission is never polled, even if it was stored with a
+    // poll URL before #1069 — the recipient's answer no longer decides it.
+    if !s.poll_url.is_empty() && !is_terminal(&s.status) && poll_due(&s) {
+        poll_status(&state, &mut s, &headers, &rt.id).await;
+        changed = true;
+    }
+    // A status change the recipient never answered is re-sent from here, on
+    // the same tick that polls (#998): the fragment is the one thing that
+    // runs while the operator watches the page, and the press must not
+    // depend on them pressing again. A poll that just closed the submission
+    // out (a clean `200`) settles the queue instead — the close-out the
+    // operator asked for is moot once the recipient reports the import
+    // finished, and no kick-off can be sent for it any more.
+    if pending_status_due(&s) {
+        retry_pending_status(&state, &mut s, &headers, &id, &rt.id).await;
+        changed = true;
+    } else if !s.pending_status.is_empty() && !can_change_status(&s.status) {
+        let (pending, status) = (s.pending_status.clone(), s.status.clone());
+        push_log(
+            &mut s,
+            format!(
+                "Queued status change ({pending}) dropped: the submission is already {status}."
+            ),
+        );
+        s.status_error = String::new();
+        clear_pending_status(&mut s);
+        changed = true;
+    }
+    if changed {
         save_or_warn(&state, &rt, &id, &s, Some(sv)).await;
     }
     let label = status_label(&i18n, &s.status);
+    let status_error = status_error_message(&i18n, &s);
     render(StatusCard {
         id,
-        polling: !s.poll_url.is_empty(),
+        polling: !s.poll_url.is_empty() && !is_terminal(&s.status),
         can_abort: matches!(s.status.as_str(), "in-progress" | "failed"),
         percent: progress_percent(&s.progress),
         progress: s.progress.clone(),
@@ -1267,6 +1933,7 @@ pub async fn status_fragment(
         errors: s.result["errors"].as_u64().unwrap_or(0),
         completed_at: s.result["completedAt"].as_str().unwrap_or("").to_string(),
         status_label: label,
+        status_error,
         log: log_lines(&s),
         log_oob: true,
         i18n,
@@ -1278,8 +1945,8 @@ pub async fn status_fragment(
 /// bar about to fill, not a percentage that never moves — the indeterminate
 /// sweep is reserved for recipients that report no percentage at all.
 ///
-/// Pre-ingest phase reports (#953) — `waiting for a worker`, `reading
-/// manifest`, `sizing {done} of {total} files`, `downloading file {done} of
+/// Pre-ingest phase reports (#953) — `Queued - starting shortly`, `Reading
+/// manifest`, `Sizing {done} of {total} files`, `Downloading file {done} of
 /// {total}` — deliberately fall through to `None`: there is no meaningful
 /// share-of-the-whole to draw yet, so the card pairs the phase text with the
 /// indeterminate sweep. #827 is the rule being honoured here — a determinate
@@ -1291,7 +1958,7 @@ pub async fn status_fragment(
 /// 412 files`) would be mis-parsed as a percentage. The recipient owns the
 /// vocabulary; this parser only claims the one prefix.
 fn progress_percent(progress: &str) -> Option<u8> {
-    // Case-insensitive: HFS capitalizes the line ("Processing 3% of bytes -
+    // Case-insensitive: HFS capitalizes the line ("Processing 3% -
     // …", #954), older HFS versions and foreign recipients may send lowercase
     // "processing 3% complete …". Either way the digits follow the prefix.
     let rest = progress
@@ -1352,19 +2019,80 @@ pub async fn test_auth(
 mod tests {
     use super::*;
 
+    /// #1436: a submission without a client of its own authenticates its
+    /// self-calls with the process's outbound credential — but only when the
+    /// recipient is this server, so the token never travels to a third party.
+    #[test]
+    fn self_call_credential_follows_the_recipient_and_the_submission_auth() {
+        let public = "http://localhost:8080";
+        let lo = "http://127.0.0.1:8080";
+        // backend-services always mints its own token, whoever the recipient is
+        assert_eq!(
+            self_call_credential(
+                "backend-services",
+                "https://recipient.example/fhir",
+                public,
+                lo
+            ),
+            SelfCallCredential::BackendServices
+        );
+        assert_eq!(
+            self_call_credential("backend-services", public, public, lo),
+            SelfCallCredential::BackendServices
+        );
+        // none + this server (public base, with or without a tenant path, or loopback)
+        for recipient in [
+            "http://localhost:8080",
+            "http://localhost:8080/",
+            "http://localhost:8080/clinic-a",
+            "http://LOCALHOST:8080/fhir",
+            "http://127.0.0.1:8080",
+        ] {
+            assert_eq!(
+                self_call_credential("none", recipient, public, lo),
+                SelfCallCredential::Outbound,
+                "{recipient}"
+            );
+        }
+        // none + a remote recipient, or a merely similar origin: nothing
+        for recipient in [
+            "https://recipient.example/fhir",
+            "http://localhost:8081",
+            "https://localhost:8080",
+            "http://localhost",
+            "not a url",
+        ] {
+            assert_eq!(
+                self_call_credential("none", recipient, public, lo),
+                SelfCallCredential::None,
+                "{recipient}"
+            );
+        }
+        // a public base URL on the default port matches a recipient that omits it
+        assert_eq!(
+            self_call_credential(
+                "none",
+                "https://fhir.example.org",
+                "https://fhir.example.org:443/base",
+                lo
+            ),
+            SelfCallCredential::Outbound
+        );
+    }
+
     #[test]
     fn progress_percent_reads_both_hfs_wordings_and_foreign_case() {
         // Current HFS wording (#954, ASCII-only since the sentence travels in
         // a header).
         assert_eq!(
-            progress_percent("Processing 3% of bytes - 609,191 resources written"),
+            progress_percent("Processing 3% - 609,191 Resources written"),
             Some(3)
         );
-        assert_eq!(progress_percent("Processing 0% of bytes"), Some(0));
+        assert_eq!(progress_percent("Processing 0%"), Some(0));
         // A recipient that does use non-ASCII still gets its percentage read:
         // the header is decoded from bytes, so the sentence arrives intact.
         assert_eq!(
-            progress_percent("Processing 3% of bytes — 609,191 resources written"),
+            progress_percent("Processing 3% — 609,191 Resources written"),
             Some(3)
         );
         // Pre-#954 HFS and lowercase foreign recipients.
@@ -1375,6 +2103,35 @@ mod tests {
         // Non-matching recipients keep the indeterminate sweep.
         assert_eq!(progress_percent("halfway there"), None);
         assert_eq!(progress_percent("processing lots"), None);
+    }
+
+    /// #1437: the client assertion must carry `iat` (Keycloak rejects it
+    /// otherwise), with `exp` exactly 300s later and the SMART Backend Services
+    /// `iss`/`sub`/`aud` set.
+    #[test]
+    fn client_assertion_claims_carry_iat_and_matching_exp() {
+        let now = 1_700_000_000i64;
+        let claims = client_assertion_claims("hfs-import", "https://idp/token", now);
+        assert_eq!(claims["iat"], now);
+        assert_eq!(claims["exp"], now + 300);
+        assert_eq!(claims["iss"], "hfs-import");
+        assert_eq!(claims["sub"], "hfs-import");
+        assert_eq!(claims["aud"], "https://idp/token");
+        assert!(
+            claims["jti"].as_str().is_some_and(|j| !j.is_empty()),
+            "jti is a non-empty unique id"
+        );
+    }
+
+    /// #1069: only a provider close-out is terminal; `failed` can still be
+    /// resubmitted, aborted, or completed.
+    #[test]
+    fn only_stopped_and_completed_are_terminal() {
+        assert!(is_terminal("stopped"));
+        assert!(is_terminal("completed"));
+        for status in ["not-started", "in-progress", "failed", ""] {
+            assert!(!is_terminal(status), "status: {status}");
+        }
     }
 
     #[test]
@@ -1410,10 +2167,12 @@ mod tests {
     #[test]
     fn pre_ingest_phases_report_no_percentage() {
         for phase in [
-            "waiting for a worker",
-            "reading manifest",
-            "sizing 37 of 412 files",
-            "downloading file 1 of 412",
+            "Queued - starting shortly",
+            "Queued - waiting for an external worker",
+            "Reading manifest",
+            "Sizing 37 of 412 files",
+            "Downloading file 1 of 412",
+            "Downloaded 24 of 24 files",
         ] {
             assert_eq!(progress_percent(phase), None, "phase: {phase}");
             assert!(
@@ -1444,7 +2203,7 @@ mod tests {
     #[test]
     fn a_stalled_report_stays_indeterminate() {
         assert_eq!(
-            progress_percent("stalled at 40% - a worker stopped without handoff; see server logs"),
+            progress_percent("Stalled at 40% - a worker stopped without handoff; see server logs"),
             None
         );
     }
@@ -1456,6 +2215,174 @@ mod tests {
         assert_eq!(progress_percent("processing 101% complete"), None);
         assert_eq!(progress_percent("processing complete"), None);
         assert_eq!(progress_percent(""), None);
-        assert_eq!(progress_percent("in progress"), None);
+        assert_eq!(progress_percent("In progress"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // #998 — recording a status-change outcome
+    // -----------------------------------------------------------------------
+
+    fn running() -> Submission {
+        Submission {
+            status: "in-progress".to_string(),
+            poll_url: "http://recipient.example/poll".to_string(),
+            progress: "Processing 65%".to_string(),
+            result: json!({ "outputs": 2, "errors": 0 }),
+            ..Default::default()
+        }
+    }
+
+    fn last_log_line(submission: &Submission) -> String {
+        submission
+            .log
+            .last()
+            .and_then(|entry| entry["message"].as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn an_acknowledged_change_lands_and_settles_the_queue() {
+        let mut s = running();
+        s.pending_status = "completed".to_string();
+        s.pending_status_attempts = 3;
+        s.status_error = "timed out".to_string();
+
+        apply_status_change(&mut s, "completed", &KickoffOutcome::Acknowledged(200));
+
+        assert_eq!(s.status, "completed");
+        assert!(s.pending_status.is_empty());
+        assert!(s.pending_status_retry_at.is_empty());
+        assert_eq!(s.pending_status_attempts, 0);
+        assert!(s.status_error.is_empty());
+        // Closed out: no more polling, and the result card is stamped while
+        // the counts an earlier manifest recorded survive (#1069).
+        assert!(s.poll_url.is_empty());
+        assert!(s.progress.is_empty());
+        assert_eq!(s.result["outputs"], 2);
+        assert!(
+            s.result["completedAt"]
+                .as_str()
+                .is_some_and(|at| !at.is_empty()),
+            "{}",
+            s.result
+        );
+        assert_eq!(last_log_line(&s), "Recipient acknowledged (200).");
+    }
+
+    #[test]
+    fn a_refusal_keeps_the_status_and_queues_nothing() {
+        let mut s = running();
+        s.pending_status = "stopped".to_string();
+        s.pending_status_attempts = 2;
+
+        apply_status_change(
+            &mut s,
+            "stopped",
+            &KickoffOutcome::Refused("409: already closed".to_string()),
+        );
+
+        assert_eq!(s.status, "in-progress", "a refusal changes nothing");
+        assert_eq!(s.status_error, "409: already closed");
+        assert!(s.pending_status.is_empty(), "an answer settles the queue");
+        assert_eq!(s.pending_status_attempts, 0);
+        assert!(!pending_status_due(&s));
+        assert_eq!(s.poll_url, "http://recipient.example/poll");
+    }
+
+    #[test]
+    fn an_unanswered_change_is_queued_with_a_hold_and_an_attempt_count() {
+        let mut s = running();
+
+        apply_status_change(
+            &mut s,
+            "completed",
+            &KickoffOutcome::Unreachable("timed out".to_string()),
+        );
+
+        assert_eq!(s.status, "in-progress", "nothing landed yet");
+        assert_eq!(s.pending_status, "completed");
+        assert_eq!(s.pending_status_attempts, 1);
+        assert_eq!(s.status_error, "timed out");
+        assert!(last_log_line(&s).starts_with("Status change failed: timed out"));
+        assert!(
+            last_log_line(&s).contains("attempt 1 of 10"),
+            "{}",
+            last_log_line(&s)
+        );
+        assert!(
+            !pending_status_due(&s),
+            "held for {STATUS_CHANGE_RETRY_SECS}s before the re-send"
+        );
+        s.pending_status_retry_at = "2000-01-01T00:00:00.000Z".to_string();
+        assert!(pending_status_due(&s));
+        s.pending_status_retry_at = String::new();
+        assert!(pending_status_due(&s), "no hold at all is due");
+        s.status = "completed".to_string();
+        assert!(
+            !pending_status_due(&s),
+            "a closed-out submission takes no status change"
+        );
+    }
+
+    #[test]
+    fn the_queue_gives_up_after_the_attempt_budget() {
+        let mut s = running();
+        for attempt in 1..STATUS_CHANGE_MAX_ATTEMPTS {
+            apply_status_change(
+                &mut s,
+                "stopped",
+                &KickoffOutcome::Unreachable("connection reset".to_string()),
+            );
+            assert_eq!(
+                s.pending_status, "stopped",
+                "attempt {attempt} still queued"
+            );
+            assert_eq!(s.pending_status_attempts, attempt);
+        }
+        apply_status_change(
+            &mut s,
+            "stopped",
+            &KickoffOutcome::Unreachable("connection reset".to_string()),
+        );
+        assert!(s.pending_status.is_empty(), "the budget is spent");
+        assert_eq!(s.pending_status_attempts, 0);
+        assert_eq!(s.status, "in-progress");
+        assert_eq!(
+            s.status_error, "connection reset",
+            "the banner falls back to 'try again' with the last diagnosis"
+        );
+        assert!(
+            last_log_line(&s).contains("giving up after 10 unanswered attempts"),
+            "{}",
+            last_log_line(&s)
+        );
+    }
+
+    #[test]
+    fn a_version_conflict_is_the_one_save_error_that_is_retried() {
+        assert!(is_version_conflict(&StorageError::Concurrency(
+            ConcurrencyError::OptimisticLockFailure {
+                resource_type: "BulkProviderSubmission".to_string(),
+                id: "s".to_string(),
+                expected_etag: "W/\"1\"".to_string(),
+                actual_etag: Some("W/\"2\"".to_string()),
+            }
+        )));
+        assert!(is_version_conflict(&StorageError::Concurrency(
+            ConcurrencyError::VersionConflict {
+                resource_type: "BulkProviderSubmission".to_string(),
+                id: "s".to_string(),
+                expected_version: "1".to_string(),
+                actual_version: "2".to_string(),
+            }
+        )));
+        assert!(!is_version_conflict(
+            &BackendError::Unavailable {
+                backend_name: "bulk-provider".to_string(),
+                message: "down".to_string(),
+            }
+            .into()
+        ));
     }
 }

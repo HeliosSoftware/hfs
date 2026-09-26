@@ -12,9 +12,8 @@
 //! references from any position.
 //!
 //! Criteria arrive typed on `BundleEntry::criteria`, as the REST layer sends
-//! them; the scenarios build a plain `identifier` token, the one shape every
-//! backend's in-transaction matcher evaluates (MongoDB's refuses the rest, see
-//! `mongodb_tests.rs`).
+//! them; the scenarios build a plain `identifier` token (`mongodb_tests.rs`
+//! adds a modifier case).
 //!
 //! Like `if_match_suite.rs`, this file is `#[path]`-included by each backend's
 //! test binary rather than living in `tests/common/` (issue #306). The

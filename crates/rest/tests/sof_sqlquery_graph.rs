@@ -273,6 +273,66 @@ mod sof_sqlquery_graph_tests {
         assert_eq!(rows[0]["cb"], json!(2));
     }
 
+    /// Two labels declared by the same consumer both target the same
+    /// ViewDefinition, so the subject's `JOIN` reads the shared node twice
+    /// under two different names. Each label is a view over the same
+    /// underlying table, not a copy, so both sides see identical rows —
+    /// checked with a self-join on `patient_id` and by asserting every
+    /// value, not just row counts.
+    #[tokio::test]
+    async fn two_labels_on_one_dependency_return_identical_rows_and_types() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Smith").await;
+        seed_patient(&backend, "p2", "Jones").await;
+        seed_patient(&backend, "p3", "Brown").await;
+
+        let shared_url =
+            seed_view_definition(&backend, "shared", "http://example.org/two-labels-shared").await;
+
+        let subject = sql_lib(
+            "two-labels-subject",
+            None,
+            "sql-query",
+            "SELECT f.patient_id AS pid, s.family AS fam FROM first f \
+             JOIN second s ON s.patient_id = f.patient_id ORDER BY pid",
+            &[("first", &shared_url), ("second", &shared_url)],
+            vec![],
+        );
+
+        let json_response = post_sql_run(&server, &run_body_inline(subject.clone(), "json")).await;
+        json_response.assert_status(StatusCode::OK);
+        let rows: Value = json_response.json();
+        let rows = rows.as_array().expect("json array");
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert_eq!(rows[0]["pid"], json!("p1"));
+        assert_eq!(rows[0]["fam"], json!("Smith"));
+        assert_eq!(rows[1]["pid"], json!("p2"));
+        assert_eq!(rows[1]["fam"], json!("Jones"));
+        assert_eq!(rows[2]["pid"], json!("p3"));
+        assert_eq!(rows[2]["fam"], json!("Brown"));
+
+        let fhir_response = post_sql_run(&server, &run_body_inline(subject, "fhir")).await;
+        fhir_response.assert_status(StatusCode::OK);
+        let v: Value = fhir_response.json();
+        assert_eq!(v["resourceType"], json!("Parameters"));
+        let parameters = v["parameter"].as_array().expect("parameter array");
+        assert_eq!(parameters.len(), 3, "{parameters:?}");
+        let expected = [("p1", "Smith"), ("p2", "Jones"), ("p3", "Brown")];
+        for (param, (pid, fam)) in parameters.iter().zip(expected) {
+            let parts = param["part"].as_array().expect("part array");
+            let pid_part = parts
+                .iter()
+                .find(|p| p["name"] == "pid")
+                .expect("pid part present");
+            assert_eq!(pid_part["valueString"], json!(pid), "{pid_part}");
+            let fam_part = parts
+                .iter()
+                .find(|p| p["name"] == "fam")
+                .expect("fam part present");
+            assert_eq!(fam_part["valueString"], json!(fam), "{fam_part}");
+        }
+    }
+
     // =========================================================================
     // Cycle detection
     // =========================================================================

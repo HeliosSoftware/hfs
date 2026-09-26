@@ -561,16 +561,35 @@ where
     let ctx = tenant.context();
 
     // Reject further submissions for a terminal submitter+submissionId.
-    if let Some(existing) = jobs
-        .get_submission(ctx, &sub_id)
+    if let Some(existing_status) = jobs
+        .get_submission_status(ctx, &sub_id)
         .await
         .map_err(RestError::from)?
     {
-        if existing.status.is_terminal() {
+        if existing_status.is_terminal() {
+            // A status-only kick-off that restates the terminal status the
+            // submission already has is not a further submission — it is the
+            // same close-out arriving twice, and it must answer the same way
+            // both times. The Data Provider that sent it may never have seen
+            // the first answer (a timed-out request whose server side still
+            // committed), and its only safe move is to send it again; a 409
+            // there would read as a refusal of a transition that landed
+            // (#998). Nothing else is admitted: a manifest, a replacement, or
+            // the *other* terminal status stays a conflict.
+            let restates = req.manifest_url.is_none()
+                && req.replaces_manifest_url.is_none()
+                && matches!(
+                    (req.submission_status.as_str(), existing_status),
+                    ("completed", SubmissionStatus::Complete)
+                        | ("stopped", SubmissionStatus::Aborted)
+                );
+            if restates {
+                return kickoff_accepted(&sub_id);
+            }
             return Err(RestError::Conflict {
                 message: format!(
                     "submission {} is already {} — no further submissions allowed",
-                    sub_id, existing.status
+                    sub_id, existing_status
                 ),
             });
         }
@@ -673,7 +692,9 @@ where
         );
     }
 
-    // submissionStatus=stopped → abort (rolls back recorded changes).
+    // submissionStatus=stopped → abort. This stops the submission: it is marked
+    // `aborted` and its pending/processing manifests `failed`. Entries already
+    // ingested are kept, not rolled back (#968, #1161).
     if req.submission_status == "stopped" {
         jobs.abort_submission(ctx, &sub_id, "submissionStatus=stopped")
             .await
@@ -692,6 +713,11 @@ where
             .map_err(RestError::from)?;
     }
 
+    kickoff_accepted(&sub_id)
+}
+
+/// The `200` a `$bulk-submit` kick-off answers once it has been applied.
+fn kickoff_accepted(sub_id: &SubmissionId) -> RestResult<Response> {
     let oo = json!({
         "resourceType": "OperationOutcome",
         "issue": [{
@@ -738,15 +764,13 @@ where
     let sub_id = SubmissionId::new(req.0, req.1);
     let ctx = tenant.context();
 
-    let summary = jobs
-        .get_submission(ctx, &sub_id)
+    jobs.get_submission_status(ctx, &sub_id)
         .await
         .map_err(RestError::from)?
         .ok_or_else(|| RestError::NotFound {
             resource_type: "Submission".to_string(),
             id: sub_id.to_string(),
         })?;
-    let _ = summary;
 
     let token = jobs
         .ensure_poll_token(ctx, &sub_id)
@@ -877,8 +901,8 @@ where
     let sub_id = &target.submission_id;
     let page = parse_page_param(request.uri().query())?;
 
-    let summary = jobs
-        .get_submission(ctx, sub_id)
+    let status = jobs
+        .get_submission_status(ctx, sub_id)
         .await
         .map_err(RestError::from)?
         .ok_or_else(|| RestError::NotFound {
@@ -891,7 +915,7 @@ where
         .await
         .map_err(RestError::from)?;
     let all_terminal = manifests.iter().all(|m| m.status.is_terminal());
-    let stopped = summary.status == SubmissionStatus::Aborted;
+    let stopped = status == SubmissionStatus::Aborted;
 
     if !all_terminal && !stopped {
         // Byte-level progress when the workers know every file's size: the
@@ -954,13 +978,37 @@ where
         // the bar out of its indeterminate state. Mixing the two was the
         // regression of #827, so indeterminate phases must stay lexically
         // distinct from that prefix.
+        // The manifest whose phase speaks for the submission: a status header
+        // is a single line, and the manifest a worker is actually inside is
+        // the interesting one. Hence the first non-terminal manifest carrying
+        // a phase.
+        let phase_manifest = manifests
+            .iter()
+            .filter(|m| !m.status.is_terminal())
+            .find(|m| m.phase.is_some());
+        // "All files in" (#1218) is the one phase that stays interesting after
+        // the counters move — it is what separates a long tail of downloads
+        // from the manifest's own wind-down (receipts, artifacts, reindex). It
+        // therefore rides along as a suffix on the counter line instead of
+        // being outranked into silence like the other phases.
+        let downloaded = phase_manifest.and_then(|m| match m.phase {
+            Some(ManifestPhase::Downloaded) if m.files_total > 0 => Some(format!(
+                "Downloaded {} of {} files",
+                m.files_done, m.files_total
+            )),
+            _ => None,
+        });
+        let downloaded_suffix = downloaded
+            .as_deref()
+            .map(|d| format!(" - {d}"))
+            .unwrap_or_default();
         let progress = if stalled {
             tracing::warn!(
                 submission = %sub_id,
                 "bulk-submit ingestion appears stalled: a processing manifest's \
                  worker lease expired without renewal or reclaim"
             );
-            format!("stalled at {pct}% - a worker stopped without handoff; see server logs")
+            format!("Stalled at {pct}% - a worker stopped without handoff; see server logs")
         } else if entries > 0 {
             // Operator-facing wording (#954): the percentage is byte progress,
             // the count is FHIR resources written to the store ("written", not
@@ -977,11 +1025,11 @@ where
             // the number #969 exists to show was invisible exactly when it had
             // something to say.
             format!(
-                "Processing {pct}% of bytes - {} resources written",
+                "Processing {pct}% - {} Resources written{downloaded_suffix}",
                 group_thousands(entries)
             )
         } else if pct > 0 {
-            format!("Processing {pct}% of bytes")
+            format!("Processing {pct}%{downloaded_suffix}")
         } else if !manifests.is_empty()
             && manifests
                 .iter()
@@ -990,37 +1038,57 @@ where
             // Nothing claimed yet: the submission is queued, not slow. (The
             // emptiness guard is belt-and-braces — an empty manifest list is
             // vacuously `all_terminal` and never reaches this branch.)
-            "waiting for a worker".to_string()
+            //
+            // With the in-process pool running, an idle worker claims within
+            // its two-second idle sleep, so this reads as a moment in a queue
+            // rather than a wait on something scarce. With the pool disabled
+            // nothing in this process will ever claim it, and the operator
+            // needs to hear that an external worker is the missing piece.
+            if cfg.disable_local_worker {
+                "Queued - waiting for an external worker".to_string()
+            } else {
+                "Queued - starting shortly".to_string()
+            }
         } else {
             // A worker holds a manifest but has not produced a countable byte.
-            // The first non-terminal manifest carrying a phase speaks for the
-            // submission: a status header is a single line, and the manifest a
-            // worker is actually inside is the interesting one.
-            manifests
-                .iter()
-                .filter(|m| !m.status.is_terminal())
-                .find(|m| m.phase.is_some())
+            phase_manifest
                 .and_then(|m| match m.phase {
-                    Some(ManifestPhase::ReadingManifest) => Some("reading manifest".to_string()),
+                    Some(ManifestPhase::ReadingManifest) => Some("Reading manifest".to_string()),
                     // `files_total == 0` means the denominator is not known yet
                     // (the manifest has not been parsed, or advertised no
                     // output). Fall through rather than emit "of 0 files".
                     Some(ManifestPhase::Sizing) if m.files_total > 0 => Some(format!(
-                        "sizing {} of {} files",
+                        "Sizing {} of {} files",
                         m.files_done, m.files_total
                     )),
                     Some(ManifestPhase::Downloading) if m.files_total > 0 => Some(format!(
-                        "downloading file {} of {}",
+                        "Downloading file {} of {}",
                         m.files_done, m.files_total
                     )),
+                    // Every file was empty (or the counters never flushed):
+                    // still worth saying that the downloads are behind us.
+                    Some(ManifestPhase::Downloaded) => downloaded.clone(),
                     _ => None,
                 })
-                .unwrap_or_else(|| format!("Processing {pct}% of bytes"))
+                .unwrap_or_else(|| format!("Processing {pct}%"))
+        };
+        // Poll cadence follows the phase. The pre-ingest phases each last
+        // seconds, so a client honouring the ingest cadence (two minutes by
+        // default) would sleep through every one of them and the #953 reports
+        // would never reach a screen — the Import page showed the queued text
+        // for the whole first window. Advertise the short cadence until the
+        // first byte or entry is counted, then fall back to the long one.
+        // A stall keeps the long cadence: nothing is about to change.
+        let pre_ingest = !stalled && entries == 0 && pct == 0;
+        let retry_after = if pre_ingest {
+            cfg.effective_pre_ingest_retry_after_secs()
+        } else {
+            cfg.retry_after_secs
         };
         return Response::builder()
             .status(StatusCode::ACCEPTED)
             .header("X-Progress", progress)
-            .header("Retry-After", cfg.retry_after_secs.to_string())
+            .header("Retry-After", retry_after.to_string())
             .body(Body::empty())
             .map_err(|e| RestError::InternalError {
                 message: e.to_string(),
@@ -1233,7 +1301,8 @@ where
     let ctx = &target.tenant;
     let sub_id = &target.submission_id;
 
-    // Cooperative cancel (rolls back recorded changes).
+    // Cooperative cancel: marks the submission `aborted` and its pending/processing
+    // manifests `failed`. Already-ingested entries are kept, not rolled back.
     let _ = jobs
         .abort_submission(ctx, sub_id, "cancelled via DELETE")
         .await;

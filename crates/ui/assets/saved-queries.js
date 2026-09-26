@@ -57,9 +57,36 @@
   var urlInput = form && form.elements.url;
   if (!form || !messageHost || !window.fetch) return;
 
+  /* #1240: the Queries page's save-name field opts into the shared
+   * unsaved-changes tracker — a name typed for a not-yet-saved query is the
+   * only thing worth asking about here; the exploratory search URL itself
+   * never counts. Absent on the Resources page (search-builder.html renders
+   * `show_save=false` there, so `elements.name` does not exist). */
+  var unsavedName =
+    form.elements.name && window.HfsUnsaved
+      ? window.HfsUnsaved.track({
+          root: form,
+          read: function () {
+            return form.elements.name.value;
+          },
+          cue: form.querySelector(".query-builder__save"),
+        })
+      : null;
+
   var messages = messageHost.dataset;
   var etag = null;
   var lang = document.documentElement.lang || undefined;
+
+  /* Result-header counts follow the page's own locale (#1426), the same way
+   * `whenText` localizes dates: `lang` is the negotiated `<html lang>`, and
+   * an absent attribute leaves the choice to the platform. Only the rendered
+   * text is grouped — the wire query, `Bundle.total`, paging, and the numbers
+   * the script keeps for itself are untouched. */
+  function formatCount(value) {
+    var count = Number(value);
+    if (!Number.isFinite(count)) return String(value);
+    return count.toLocaleString(lang);
+  }
 
   function fetchDocument() {
     return fetch(SETTINGS, {
@@ -185,6 +212,20 @@
 
   var CONTROL_KEYS = ["_count", "_sort", "_total", "_summary", "_elements"];
   var INCLUDE_KEYS = ["_include", "_revinclude"];
+  /* Resource infrastructure fields, excluded from the derived result columns
+   * (#1105). Mirrors the server's `default_result_columns` (lib.rs), which
+   * uses the same list to build the catalog's empty-page fallback. */
+  var INFRASTRUCTURE = [
+    "resourceType",
+    "id",
+    "meta",
+    "implicitRules",
+    "language",
+    "text",
+    "contained",
+    "extension",
+    "modifierExtension",
+  ];
   var COLON_MODIFIERS = [
     "exact", "contains", "missing", "not", "text",
     "above", "below", "in", "not-in", "identifier", "of-type",
@@ -1710,7 +1751,8 @@
           var wire = serializedConditionAlternative(input);
           if (wire === null) return;
           var comparator = alternative.querySelector(".builder-row__comparator");
-          values.push((comparator ? comparator.value : "") + wire);
+          // URL-encode each comparator+value alternative; commas joining them are FHIR/structural OR.
+          values.push(encodeURIComponent((comparator ? comparator.value : "") + wire));
         });
       } else {
         row.querySelectorAll(".builder-row__value").forEach(function (vi) {
@@ -2386,16 +2428,93 @@
     return json.length > 60 ? json.slice(0, 60) + "…" : json;
   }
 
-  /* Typed default columns (#416): common fields per resource type when the
-   * query names no _elements; unknown types keep the compact id/updated view. */
-  var DEFAULT_COLUMNS = {
-    Patient: ["name", "gender", "birthDate", "managingOrganization"],
-    Practitioner: ["name", "gender"],
-    Organization: ["name", "type"],
-    Observation: ["code", "status", "subject"],
-    Encounter: ["status", "class", "subject"],
-    Condition: ["code", "clinicalStatus", "subject"],
-  };
+  /* Keep long ids on one line as an 8-character chip; short ids stay whole
+   * (#1106). The full id is always the link's accessible name. */
+  function abbreviateId(id) {
+    return id.length <= 12 ? id : id.slice(0, 8);
+  }
+
+  /* Copy-id button beside the id chip (#1106); gated on the Clipboard API so
+   * a browser without it never renders a control that cannot work. */
+  function supportsClipboard() {
+    return Boolean(
+      window.navigator && navigator.clipboard && navigator.clipboard.writeText,
+    );
+  }
+
+  var SVG_NS = "http://www.w3.org/2000/svg";
+
+  function svgIcon(attrs, pathD) {
+    var svg = document.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("viewBox", "0 0 16 16");
+    svg.setAttribute("width", attrs.size);
+    svg.setAttribute("height", attrs.size);
+    svg.setAttribute("fill", "none");
+    svg.setAttribute("stroke", "currentColor");
+    svg.setAttribute("stroke-width", "1.5");
+    svg.setAttribute("aria-hidden", "true");
+    if (attrs.rect) {
+      var rect = document.createElementNS(SVG_NS, "rect");
+      rect.setAttribute("width", "8");
+      rect.setAttribute("height", "8");
+      rect.setAttribute("x", "5.5");
+      rect.setAttribute("y", "5.5");
+      rect.setAttribute("rx", "1.5");
+      svg.appendChild(rect);
+    }
+    var path = document.createElementNS(SVG_NS, "path");
+    path.setAttribute("d", pathD);
+    svg.appendChild(path);
+    return svg;
+  }
+
+  function copyIcon() {
+    return svgIcon(
+      { size: "16", rect: true },
+      "M10.5 3.5v-.5a1.5 1.5 0 0 0-1.5-1.5H4A1.5 1.5 0 0 0 2.5 3v5A1.5 1.5 0 0 0 4 9.5h.5",
+    );
+  }
+
+  function checkIcon() {
+    return svgIcon({ size: "12", rect: false }, "M3 8.5l3.2 3L13 4.5");
+  }
+
+  function copyIdButton(id) {
+    var button = document.createElement("button");
+    button.type = "button";
+    button.className = "result-id__copy";
+    button.dataset.copyId = id;
+    button.setAttribute("aria-label", results.card.dataset.msgCopyId);
+    button.appendChild(copyIcon());
+    return button;
+  }
+
+  /* Swaps the copy button for a "Copied" pill for 2s, then restores it,
+   * returning focus only if it was on the pill or (the realistic case, since
+   * a focused element that becomes hidden loses focus to the document) on
+   * the body. Re-clicking within the window resets the timer (sql-export.js
+   * pattern). */
+  function showCopiedPill(button) {
+    if (button.copyResetTimer) window.clearTimeout(button.copyResetTimer);
+    var stalePill = button.nextElementSibling;
+    if (stalePill && stalePill.classList.contains("result-id__copied"))
+      stalePill.remove();
+    button.hidden = true;
+    var pill = document.createElement("span");
+    pill.className = "result-id__copied";
+    pill.setAttribute("role", "status");
+    pill.appendChild(checkIcon());
+    pill.appendChild(document.createTextNode(results.card.dataset.msgCopied));
+    button.insertAdjacentElement("afterend", pill);
+    button.copyResetTimer = window.setTimeout(function () {
+      var active = document.activeElement;
+      var refocus = active === pill || active === document.body;
+      pill.remove();
+      button.hidden = false;
+      button.copyResetTimer = null;
+      if (refocus) button.focus();
+    }, 2000);
+  }
 
   function elementColumns(query) {
     var columns = [];
@@ -2409,17 +2528,34 @@
     return columns;
   }
 
+  /* One column per top-level attribute actually present in the returned
+   * resources, in order of first appearance across `primary` (#1105). Used
+   * when the query names no _elements, so _summary=true and full payloads
+   * each show what the server sent instead of a fixed hint. */
+  function resultColumns(primary) {
+    var columns = [];
+    primary.forEach(function (entry) {
+      var resource = entry.resource;
+      if (!resource) return;
+      Object.keys(resource).forEach(function (key) {
+        if (INFRASTRUCTURE.indexOf(key) >= 0) return;
+        if (columns.indexOf(key) < 0) columns.push(key);
+      });
+    });
+    return columns;
+  }
+
+  /* Every result cell stays on one line, clipped with an ellipsis, and the
+   * clipped-or-not full value lives on the `td` for the shared tooltip
+   * (resource-filter.js) to read (#1106). */
   function cell(row, text, mono) {
     var td = document.createElement("td");
-    if (mono) {
-      var span = document.createElement("span");
-      span.className = "url";
-      span.textContent = text;
-      td.appendChild(span);
-    } else {
-      td.textContent = text;
-    }
+    var span = document.createElement("span");
+    span.className = mono ? "result-cell url" : "result-cell";
+    span.textContent = text;
+    td.appendChild(span);
     row.appendChild(td);
+    if (text) td.dataset.fullName = text;
     return td;
   }
 
@@ -2471,21 +2607,33 @@
     });
     var included = entries.length - primary.length;
 
-    var total = typeof body.total === "number" ? body.total : primary.length;
-    var meta = results.card.dataset.msgTotal.replace("{count}", total);
+    /* No `Bundle.total` (the user opted out with `_total=none`, or the
+     * backend could not count): the page count is exact only when there is
+     * no next page; otherwise say so instead of reading as a total (#1003). */
+    var hasTotal = typeof body.total === "number";
+    var hasNext = !!pagerLink(body, "next");
+    var total = hasTotal ? body.total : primary.length;
+    var meta = (
+      !hasTotal && hasNext
+        ? results.card.dataset.msgTotalPartial
+        : results.card.dataset.msgTotal
+    ).replace("{count}", formatCount(total));
     if (included > 0)
       meta +=
         " · " +
-        results.card.dataset.msgIncluded.replace("{count}", included);
+        results.card.dataset.msgIncluded.replace("{count}", formatCount(included));
 
     var columns = elementColumns(context.query);
-    if (!columns.length) columns = DEFAULT_COLUMNS[context.type] || [];
-    /* Every other type: summary elements from the catalog hint (#958). */
+    /* No _elements: one column per attribute the server actually returned, so
+     * _summary=true lists the summary elements and a full payload lists
+     * everything (#1105). The catalog hint only covers an empty page. */
+    if (!columns.length) columns = resultColumns(primary);
     if (!columns.length) columns = TYPE_COLUMNS[context.type] || [];
 
     var head = document.createDocumentFragment();
     var headRow = document.createElement("tr");
     var th = document.createElement("th");
+    th.className = "col-id";
     th.textContent = "id";
     headRow.appendChild(th);
     columns.forEach(function (col) {
@@ -2503,15 +2651,41 @@
       var resource = entry.resource;
       var row = document.createElement("tr");
       var idCell = document.createElement("td");
+      idCell.className = "col-id";
       var link = document.createElement("a");
-      link.className = "url";
+      link.className = "result-id row-link";
       link.href = safeResourceHref(entry, context, resource);
       link.dataset.resourceType = context.type;
       link.dataset.resourceId = resource.id || "";
       link.target = "_blank";
       link.rel = "noopener";
-      link.textContent = resource.id || "";
-      idCell.appendChild(link);
+      var id = resource.id || "";
+      /* `.result-id` is `display: inline-flex` (#1106): Chromium's accessible
+       * name computation inserts a space between the text of two flex-item
+       * children, splitting "98f3fa36" and "-95ec-…" apart even though they
+       * are adjacent in the DOM with no whitespace between them. `aria-label`
+       * bypasses that name-from-content join and pins the accessible name to
+       * the exact full id; the hidden span stays for in-page find (Ctrl+F). */
+      link.setAttribute("aria-label", id);
+      var idText = document.createElement("span");
+      idText.className = "result-id__text";
+      idText.textContent = abbreviateId(id);
+      link.appendChild(idText);
+      if (id.length > 12) {
+        var idRest = document.createElement("span");
+        idRest.className = "visually-hidden";
+        idRest.textContent = id.slice(8);
+        link.appendChild(idRest);
+      }
+      var idGroup = document.createElement("span");
+      idGroup.className = "result-id-group";
+      idGroup.appendChild(link);
+      if (id && supportsClipboard()) idGroup.appendChild(copyIdButton(id));
+      idCell.appendChild(idGroup);
+      /* The shared tooltip (resource-filter.js) reads these from the `td`,
+       * not the link, so the copy button never interferes with it (#1106). */
+      idCell.dataset.fullName = id;
+      if (abbreviateId(id) !== id) idCell.dataset.tooltipAbbreviated = "";
       row.appendChild(idCell);
       columns.forEach(function (col) {
         cell(row, fmt(resource[col]));
@@ -2602,13 +2776,47 @@
     }
   }
 
-  function showResultsError(path) {
+  function isSameOrigin(path) {
+    try {
+      return (
+        new URL(path, window.location.href).origin === window.location.origin
+      );
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /* Pulls a human message out of a FHIR OperationOutcome, so an error
+   * *response* (e.g. a 501 "search is not implemented" from a search-less
+   * backend, #1227) shows the server's own diagnostic instead of the generic
+   * "check HFS_BASE_URL" hint, which is only right for a failed connection. */
+  function outcomeMessage(body) {
+    try {
+      if (body && body.resourceType === "OperationOutcome" && body.issue) {
+        var issue = body.issue[0];
+        if (issue) {
+          return (
+            issue.diagnostics ||
+            (issue.details && issue.details.text) ||
+            null
+          );
+        }
+      }
+    } catch (e) {
+      /* fall through to the generic message */
+    }
+    return null;
+  }
+
+  function showResultsError(path, message) {
     if (results.card) results.card.hidden = false;
     if (results.error) {
-      results.error.textContent = results.card.dataset.msgFetchError.replace(
-        "{origin}",
-        failedOrigin(path),
-      );
+      results.error.textContent =
+        message ||
+        results.card.dataset.msgFetchError.replace(
+          "{origin}",
+          failedOrigin(path),
+        );
       results.error.hidden = false;
     }
     document.dispatchEvent(
@@ -2636,6 +2844,21 @@
     if (results.sort) results.sort.disabled = busy;
   }
 
+  /* The results header needs `Bundle.total`, which the server only computes
+   * when the request asks for it (#1003). Ask on the wire only: the typed
+   * query, the URL box, and Recent keep the user's exact text. An explicit
+   * `_total=` (including `none`) or `_summary=count` is left alone. */
+  function withTotal(path) {
+    var q = path.indexOf("?");
+    var query = q === -1 ? "" : path.slice(q + 1);
+    var parts = query ? query.split("&") : [];
+    for (var i = 0; i < parts.length; i++) {
+      if (parts[i].indexOf("_total=") === 0) return path;
+      if (parts[i] === "_summary=count") return path;
+    }
+    return path + (query ? "&" : q === -1 ? "?" : "") + "_total=accurate";
+  }
+
   function runSearch(path, record, context) {
     var requestedContext = context || resultContext(path);
     if (!results.card) {
@@ -2643,12 +2866,27 @@
     } else {
       var ticket = ++searchTicket;
       setResultsBusy(true);
-      fetch(path, {
+      fetch(withTotal(path), {
         headers: fhirHeaders(),
         credentials: "same-origin",
       })
         .then(function (response) {
-          if (!response.ok) return null;
+          if (!response.ok) {
+            // Same-origin error responses carry our own OperationOutcome,
+            // whose diagnostic beats the generic connection hint (#1227). A
+            // cross-origin pagination target is never read back — its body
+            // could leak an upstream response — so it keeps the generic
+            // message.
+            if (!isSameOrigin(path)) return { __resultsError: null };
+            return response.json().then(
+              function (body) {
+                return { __resultsError: outcomeMessage(body) };
+              },
+              function () {
+                return { __resultsError: null };
+              },
+            );
+          }
           return response.json().catch(function () {
             return null;
           });
@@ -2656,6 +2894,10 @@
         .then(function (body) {
           if (ticket !== searchTicket) return;
           setResultsBusy(false);
+          if (body && body.__resultsError !== undefined) {
+            showResultsError(path, body.__resultsError);
+            return;
+          }
           if (!renderResults(path, body, requestedContext))
             showResultsError(path);
         })
@@ -2689,6 +2931,38 @@
         urlInput.dispatchEvent(new Event("input", { bubbles: true }));
       }
       runSearch(path, false);
+    });
+
+  /* Delegated on `results.body` (not replaced between renders, unlike the
+   * rows it holds) so every re-rendered page's copy buttons work without
+   * re-attaching a listener per row (#1106). */
+  results.body &&
+    results.body.addEventListener("click", function (event) {
+      /* The "Copied" pill sits exactly where the button just was, so a
+       * second, fast click in that spot lands on the pill rather than a
+       * (hidden) button. Left unhandled, that click would fall through to
+       * row-navigation.js's document-level listener and open the modal
+       * (#1106). `results.body` (the `tbody`) sits between the click target
+       * and `document` in the bubble path, so this listener always runs
+       * first; row-navigation.js already backs off once `defaultPrevented`
+       * is set. */
+      if (event.target.closest(".result-id__copied")) {
+        event.preventDefault();
+        return;
+      }
+      var button = event.target.closest(".result-id__copy");
+      if (!button) return;
+      event.preventDefault();
+      if (!supportsClipboard()) return;
+      navigator.clipboard
+        .writeText(button.dataset.copyId || "")
+        .then(function () {
+          showCopiedPill(button);
+        })
+        .catch(function () {
+          // Clipboard permission denied or unavailable: stay silent, as
+          // sql-export.js's Copy job id button does.
+        });
     });
 
   /* ---- Recent searches & the saved list -------------------------------- */
@@ -3112,6 +3386,7 @@
       }).then(function (saved) {
         if (!saved) return;
         form.elements.name.value = "";
+        if (unsavedName) unsavedName.check();
       });
     });
   }

@@ -12,6 +12,7 @@ use crate::core::history::{
 };
 use crate::core::transaction::{
     BundleEntry, BundleEntryResult, BundleMethod, BundleProvider, BundleResult, BundleType,
+    PatchCandidateValidator, patch_update_result, prepare_bundle_patch,
 };
 use crate::core::{
     ConditionalCreateResult, ConditionalDeleteResult, ConditionalStorage, ConditionalUpdateResult,
@@ -22,12 +23,11 @@ use crate::error::TransactionError;
 use crate::error::{
     BackendError, ConcurrencyError, QueryErrorExt, ResourceError, StorageError, StorageResult,
 };
-use crate::search::extractor::ExtractedValue;
-use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
+use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage, SkippedResource};
 use crate::tenant::{Operation, TenantContext};
 use crate::types::Pagination;
+use crate::types::SearchQuery;
 use crate::types::{CursorValue, Page, PageCursor, PageInfo, StoredResource};
-use crate::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
 
 use super::SqliteBackend;
 use super::search::writer::{SqlValue, SqliteSearchIndexWriter};
@@ -42,6 +42,50 @@ fn internal_error(message: String) -> StorageError {
 
 fn serialization_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::SerializationError { message })
+}
+
+/// The database-free product of indexing one resource: every `search_index`
+/// row's bound parameters (or the extraction error that sends the write to
+/// the minimal fallback), the contained resources' rows, and the full-text
+/// content. Built by [`SqliteBackend::prepare_index`], written by
+/// [`SqliteBackend::write_prepared_index`].
+pub(crate) struct PreparedIndex {
+    rows: Result<Vec<Vec<SqlValue>>, String>,
+    contained_rows: Vec<Vec<SqlValue>>,
+    fts: Option<super::search::fts::SearchableContent>,
+}
+
+/// Batches below this size are prepared on the calling thread.
+const PARALLEL_PREPARE_MIN_BATCH: usize = 16;
+
+/// Runs currently inside a bulk index rebuild, process-wide: the indexes are
+/// per database, not per run, so the first run in drops them and the last
+/// one out rebuilds them. Held across the DROP / CREATE so two runs cannot
+/// race each other's transition.
+static BULK_INDEX_REBUILDS: parking_lot::Mutex<usize> = parking_lot::Mutex::new(0);
+
+/// The pool [`SqliteBackend::prepare_index_batch`] runs on. Its own pool
+/// rather than rayon's global one so its width can be set independently of
+/// anything else in the process that uses rayon: `HFS_INDEX_THREADS`,
+/// defaulting to the machine's parallelism.
+fn index_prepare_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::env::var("HFS_INDEX_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+            });
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("hfs-index-{i}"))
+            .build()
+            .expect("build index thread pool")
+    })
 }
 
 /// Whether the optional `resource_fts` FTS5 virtual table exists on this
@@ -69,6 +113,76 @@ pub(crate) fn fts_table_exists(conn: &rusqlite::Connection) -> StorageResult<boo
         .map_err(|e| internal_error(format!("Failed to probe for resource_fts: {e}")))
 }
 
+/// Cap on [`WriteMarker::recent_writes`](crate::core::WriteMarker): the count is
+/// a change detector, not a figure, so it stops at this many rows (#1078).
+const WRITE_MARKER_RECENT_CAP: i64 = 10_000;
+
+/// The tenant's newest history timestamp: one descending probe of the
+/// `(tenant_id, last_updated)` index (`idx_history_updated`), no sort.
+const LATEST_WRITE_SQL: &str = "SELECT last_updated FROM resource_history \
+     WHERE tenant_id = ?1 ORDER BY last_updated DESC LIMIT 1";
+
+/// History rows at or after `?2`, counted over the same index range and
+/// stopped after `?3` rows by the inner `LIMIT`.
+const RECENT_WRITES_SQL: &str = "SELECT COUNT(*) FROM (SELECT 1 FROM resource_history \
+     WHERE tenant_id = ?1 AND last_updated >= ?2 LIMIT ?3)";
+
+impl SqliteBackend {
+    /// [`ResourceStorage::latest_write_marker`] with the `recent_writes` cap as
+    /// a parameter, so tests can exercise the cap without 10,000 writes.
+    async fn latest_write_marker_capped(
+        &self,
+        tenant: &TenantContext,
+        recent_since: Option<chrono::DateTime<Utc>>,
+        cap: i64,
+    ) -> StorageResult<Option<crate::core::WriteMarker>> {
+        use rusqlite::OptionalExtension;
+
+        // Owned copies: the probes run in a blocking task (#959).
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        // Formatted the same RFC3339 way rows are written, so the raw-column
+        // `last_updated >= ?2` range compares like-for-like and stays sargable
+        // (see `count_deltas_by_bucket`).
+        let since_bound = recent_since.map(|since| since.to_rfc3339());
+
+        self.run_blocking(move |conn| {
+            let latest: Option<String> = conn
+                .prepare_cached(LATEST_WRITE_SQL)
+                .and_then(|mut stmt| {
+                    stmt.query_row(params![tenant_id], |row| row.get(0))
+                        .optional()
+                })
+                .or_query_error("Failed to query latest write marker")?;
+            let latest = latest
+                .map(|s| {
+                    chrono::DateTime::parse_from_rfc3339(&s)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .map_err(|e| internal_error(format!("Failed to parse last_updated: {}", e)))
+                })
+                .transpose()?;
+
+            let recent_writes = match since_bound {
+                Some(bound) => {
+                    let n: i64 = conn
+                        .prepare_cached(RECENT_WRITES_SQL)
+                        .and_then(|mut stmt| {
+                            stmt.query_row(params![tenant_id, bound, cap], |row| row.get(0))
+                        })
+                        .or_query_error("Failed to count recent writes")?;
+                    Some(n.max(0) as u64)
+                }
+                None => None,
+            };
+
+            Ok(Some(crate::core::WriteMarker {
+                latest,
+                recent_writes,
+            }))
+        })
+        .await
+    }
+}
+
 /// Runs a `DELETE FROM resource_fts …` on a purge path, skipping it when FTS5
 /// is unavailable and propagating any other failure.
 ///
@@ -90,22 +204,6 @@ fn purge_fts_rows(
     conn.execute(sql, params)
         .map_err(|e| internal_error(format!("purge fts delete: {e}")))?;
     Ok(())
-}
-
-/// Extracts the `value[x]` payload from a FHIRPath Patch `Parameters.part`
-/// entry whose `name` is `"value"`. Returns the value of the first key
-/// matching `value[A-Z]…` (e.g. `valueString`, `valueQuantity`,
-/// `valueReference`), so every FHIR polymorphic variant is accepted rather
-/// than only the handful the patch handler used to special-case.
-fn extract_part_value(part: &Value) -> Option<Value> {
-    part.as_object()?.iter().find_map(|(k, v)| {
-        let suffix = k.strip_prefix("value")?;
-        suffix
-            .chars()
-            .next()?
-            .is_ascii_uppercase()
-            .then(|| v.clone())
-    })
 }
 
 #[async_trait]
@@ -348,48 +446,15 @@ impl ResourceStorage for SqliteBackend {
         let resource_type = current.resource_type();
         tenant.check_permission(Operation::Update, resource_type)?;
 
-        let conn = self.get_connection()?;
+        let mut conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
         let id = current.id();
 
-        // Check that the resource still exists with the expected version
-        let actual_version: Result<String, _> = conn.query_row(
-            "SELECT version_id FROM resources
-             WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3 AND is_deleted = 0",
-            params![tenant_id, resource_type, id],
-            |row| row.get(0),
-        );
-
-        let actual_version = match actual_version {
-            Ok(v) => v,
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                return Err(StorageError::Resource(ResourceError::NotFound {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                }));
-            }
-            Err(e) => {
-                return Err(internal_error(format!(
-                    "Failed to get current version: {}",
-                    e
-                )));
-            }
-        };
-
-        // Check version match
-        if actual_version != current.version_id() {
-            return Err(StorageError::Concurrency(
-                ConcurrencyError::VersionConflict {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                    expected_version: current.version_id().to_string(),
-                    actual_version,
-                },
-            ));
-        }
-
-        // Calculate new version
-        let new_version: u64 = actual_version.parse().unwrap_or(0) + 1;
+        // The expected version is `current`'s, and the UPDATE below only matches
+        // a row that still carries it — so the new version follows from what the
+        // caller already read.
+        let expected_version = current.version_id();
+        let new_version: u64 = expected_version.parse().unwrap_or(0) + 1;
         let new_version_str = new_version.to_string();
 
         // Ensure the resource has correct type and id
@@ -406,27 +471,85 @@ impl ResourceStorage for SqliteBackend {
         let data = serde_json::to_vec(&resource)
             .map_err(|e| serialization_error(format!("Failed to serialize resource: {}", e)))?;
 
+        // Extract the search values before taking the write lock: it is pure
+        // CPU, and SQLite has one writer.
+        let prepared = (!self.is_search_offloaded())
+            .then(|| self.prepare_index(tenant_id, resource_type, id, &resource));
+
         let now = Utc::now();
         let last_updated = now.to_rfc3339();
+        let fhir_version_str = current.fhir_version().as_mime_param();
 
-        // Update the resource
-        conn.execute(
-            "UPDATE resources SET version_id = ?1, data = ?2, last_updated = ?3
-             WHERE tenant_id = ?4 AND resource_type = ?5 AND id = ?6",
-            params![
-                new_version_str,
-                data,
-                last_updated,
-                tenant_id,
-                resource_type,
-                id
-            ],
-        )
-        .map_err(|e| internal_error(format!("Failed to update resource: {}", e)))?;
+        // Compare-and-swap, history row and search index in ONE transaction.
+        //
+        // This used to be a `SELECT version_id`, a comparison in Rust, and then
+        // an `UPDATE` with no version in its `WHERE`, each statement
+        // auto-committed on a pooled connection. Two writers holding the same
+        // version on two connections both passed the comparison; the second
+        // `UPDATE` then overwrote the first and committed, and only its history
+        // `INSERT` failed — on `PRIMARY KEY (…, version_id)` — so that writer got
+        // a 500 while its content was already the current row, under a version
+        // whose history entry holds the *winner's* content (#1404).
+        //
+        // The version now rides in the `UPDATE`'s predicate, so the comparison
+        // and the write are one statement; and everything that follows shares
+        // its transaction, so a writer that loses leaves nothing behind.
+        // IMMEDIATE takes the write lock up front, where the busy handler
+        // applies (see `purge_tenant_data`).
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| internal_error(format!("Failed to begin update: {}", e)))?;
+
+        let updated = tx
+            .execute(
+                "UPDATE resources SET version_id = ?1, data = ?2, last_updated = ?3
+                 WHERE tenant_id = ?4 AND resource_type = ?5 AND id = ?6
+                   AND version_id = ?7 AND is_deleted = 0",
+                params![
+                    new_version_str,
+                    data,
+                    last_updated,
+                    tenant_id,
+                    resource_type,
+                    id,
+                    expected_version
+                ],
+            )
+            .map_err(|e| internal_error(format!("Failed to update resource: {}", e)))?;
+
+        if updated == 0 {
+            // Matched nothing; which of the two reasons it was costs a query,
+            // but only on the path that is already failing.
+            let actual: Result<String, _> = tx.query_row(
+                "SELECT version_id FROM resources
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3 AND is_deleted = 0",
+                params![tenant_id, resource_type, id],
+                |row| row.get(0),
+            );
+            return match actual {
+                Ok(actual_version) => Err(StorageError::Concurrency(
+                    ConcurrencyError::VersionConflict {
+                        resource_type: resource_type.to_string(),
+                        id: id.to_string(),
+                        expected_version: expected_version.to_string(),
+                        actual_version,
+                    },
+                )),
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    Err(StorageError::Resource(ResourceError::NotFound {
+                        resource_type: resource_type.to_string(),
+                        id: id.to_string(),
+                    }))
+                }
+                Err(e) => Err(internal_error(format!(
+                    "Failed to get current version: {}",
+                    e
+                ))),
+            };
+        }
 
         // Insert into history (preserve the original FHIR version)
-        let fhir_version_str = current.fhir_version().as_mime_param();
-        conn.execute(
+        tx.execute(
             "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
             params![tenant_id, resource_type, id, new_version_str, data, last_updated, fhir_version_str],
@@ -434,8 +557,13 @@ impl ResourceStorage for SqliteBackend {
         .map_err(|e| internal_error(format!("Failed to insert history: {}", e)))?;
 
         // Re-index the resource (delete old entries, add new)
-        self.delete_search_index(&conn, tenant_id, resource_type, id)?;
-        self.index_resource(&conn, tenant_id, resource_type, id, &resource)?;
+        if let Some(prepared) = prepared {
+            self.delete_search_index(&tx, tenant_id, resource_type, id)?;
+            self.write_prepared_index(&tx, tenant_id, resource_type, id, &resource, prepared)?;
+        }
+
+        tx.commit()
+            .map_err(|e| internal_error(format!("Failed to commit update: {}", e)))?;
 
         // A SearchParameter write invalidates this tenant's cached registry.
         if resource_type == "SearchParameter" {
@@ -461,103 +589,17 @@ impl ResourceStorage for SqliteBackend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<()> {
-        tenant.check_permission(Operation::Delete, resource_type)?;
+        self.soft_delete(tenant, resource_type, id, None)
+    }
 
-        let conn = self.get_connection()?;
-        let tenant_id = tenant.tenant_id().as_str();
-
-        // Check if resource exists and get its fhir_version
-        let result: Result<(String, Vec<u8>, String), _> = conn.query_row(
-            "SELECT version_id, data, fhir_version FROM resources
-             WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3 AND is_deleted = 0",
-            params![tenant_id, resource_type, id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        );
-
-        let (current_version, data, fhir_version_str) = match result {
-            Ok(v) => v,
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                return Err(StorageError::Resource(ResourceError::NotFound {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                }));
-            }
-            Err(e) => {
-                return Err(internal_error(format!("Failed to check resource: {}", e)));
-            }
-        };
-
-        let now = Utc::now();
-        let deleted_at = now.to_rfc3339();
-
-        // Calculate new version for the deletion record
-        let new_version: u64 = current_version.parse().unwrap_or(0) + 1;
-        let new_version_str = new_version.to_string();
-
-        // Soft delete the resource, guarded by the version we just read.
-        //
-        // The `version_id`/`is_deleted` predicates make this a compare-and-swap
-        // rather than a blind overwrite. Without them a concurrent writer that
-        // lands between the SELECT above and this UPDATE is silently clobbered,
-        // and worse: `new_version` was computed from the stale read, so the
-        // history INSERT below then collides with the row that writer already
-        // wrote and trips `PRIMARY KEY (tenant_id, resource_type, id,
-        // version_id)`. Because neither statement runs in a transaction, the
-        // UPDATE is already committed at that point — the caller gets a 500 and
-        // the current row now points at a version whose history entry holds
-        // someone else's content.
-        //
-        // MongoDB and S3 already guarded their equivalent writes (a
-        // `version_id` term in the update filter, and a conditional PUT
-        // respectively); this brings SQLite to parity. Losing the race is
-        // reported as `NotFound`, which is what a caller racing a concurrent
-        // delete would have seen anyway.
-        let updated = conn
-            .execute(
-                "UPDATE resources SET is_deleted = 1, deleted_at = ?1, version_id = ?2, last_updated = ?1
-                 WHERE tenant_id = ?3 AND resource_type = ?4 AND id = ?5
-                   AND version_id = ?6 AND is_deleted = 0",
-                params![
-                    deleted_at,
-                    new_version_str,
-                    tenant_id,
-                    resource_type,
-                    id,
-                    current_version
-                ],
-            )
-            .map_err(|e| internal_error(format!("Failed to delete resource: {}", e)))?;
-
-        if updated == 0 {
-            return Err(StorageError::Resource(ResourceError::NotFound {
-                resource_type: resource_type.to_string(),
-                id: id.to_string(),
-            }));
-        }
-
-        // Insert deletion record into history (preserve fhir_version)
-        conn.execute(
-            "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)",
-            params![tenant_id, resource_type, id, new_version_str, data, deleted_at, fhir_version_str],
-        )
-        .map_err(|e| internal_error(format!("Failed to insert deletion history: {}", e)))?;
-
-        // Delete search index entries (skip when search is offloaded)
-        if !self.is_search_offloaded() {
-            conn.execute(
-                "DELETE FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id = ?3",
-                params![tenant_id, resource_type, id],
-            )
-            .map_err(|e| internal_error(format!("Failed to delete search index: {}", e)))?;
-        }
-
-        // A SearchParameter delete invalidates this tenant's cached registry.
-        if resource_type == "SearchParameter" {
-            self.tenant_registries().invalidate(tenant_id);
-        }
-
-        Ok(())
+    async fn delete_versioned(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: &str,
+    ) -> StorageResult<()> {
+        self.soft_delete(tenant, resource_type, id, Some(expected_version))
     }
 
     async fn count(
@@ -717,6 +759,88 @@ impl ResourceStorage for SqliteBackend {
                         bucket_start,
                         delta,
                     });
+                }
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn count_deltas_by_type_and_bucket(
+        &self,
+        tenant: &TenantContext,
+        resource_types: &[&str],
+        since: chrono::DateTime<chrono::Utc>,
+        bucket_seconds: i64,
+    ) -> StorageResult<Vec<(String, crate::core::ResourceCountDelta)>> {
+        if resource_types.is_empty() {
+            return Ok(Vec::new());
+        }
+        if bucket_seconds <= 0 {
+            return Err(internal_error(
+                "count_deltas_by_type_and_bucket: bucket_seconds must be positive".to_string(),
+            ));
+        }
+        // Owned copies of the borrowed inputs: the aggregate below runs in a
+        // blocking task (#959), whose closure must be `'static`.
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        let mut resource_types: Vec<String> =
+            resource_types.iter().map(|rt| (*rt).to_string()).collect();
+        resource_types.sort();
+        resource_types.dedup();
+
+        // One scan for every requested type (#1078), bounded exactly like
+        // `count_deltas_by_bucket`: the raw `last_updated` column against a
+        // bucket-floored RFC3339 bound, so the `(tenant_id, last_updated)`
+        // history index prunes the range, and the same strftime bucketing and
+        // delta rule. The type list only filters that range and splits the
+        // grouping, so each type's rows equal its per-type call's.
+        let since_bound = crate::core::bucket_floor(since, bucket_seconds).to_rfc3339();
+
+        self.run_blocking(move |conn| {
+            let placeholders = (0..resource_types.len())
+                .map(|i| format!("?{}", i + 4))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT resource_type, \
+                        (CAST(strftime('%s', last_updated) AS INTEGER) / ?3) * ?3 AS bucket, \
+                        SUM(CASE WHEN is_deleted = 1 THEN -1 \
+                                 WHEN version_id = '1' THEN 1 \
+                                 ELSE 0 END) AS delta \
+                 FROM resource_history \
+                 WHERE tenant_id = ?1 AND last_updated >= ?2 \
+                   AND resource_type IN ({placeholders}) \
+                 GROUP BY resource_type, bucket HAVING delta != 0 \
+                 ORDER BY resource_type, bucket"
+            );
+            let mut stmt = conn
+                .prepare(&sql)
+                .or_query_error("Failed to prepare count_deltas_by_type_and_bucket")?;
+
+            let mut bound: Vec<&dyn ToSql> = vec![&tenant_id, &since_bound, &bucket_seconds];
+            bound.extend(resource_types.iter().map(|rt| rt as &dyn ToSql));
+            let rows = stmt
+                .query_map(bound.as_slice(), |row| {
+                    let resource_type: String = row.get(0)?;
+                    let bucket: i64 = row.get(1)?;
+                    let delta: i64 = row.get(2)?;
+                    Ok((resource_type, bucket, delta))
+                })
+                .or_query_error("Failed to query count_deltas_by_type_and_bucket")?;
+
+            let mut out = Vec::new();
+            for row in rows {
+                let (resource_type, bucket, delta) =
+                    row.or_query_error("Failed to read count_deltas_by_type_and_bucket row")?;
+                if let Some(bucket_start) = chrono::DateTime::from_timestamp(bucket, 0) {
+                    out.push((
+                        resource_type,
+                        crate::core::ResourceCountDelta {
+                            bucket_start,
+                            delta,
+                        },
+                    ));
                 }
             }
             Ok(out)
@@ -884,6 +1008,19 @@ impl ResourceStorage for SqliteBackend {
             out.push(row.or_query_error("count_by_tenant row")?);
         }
         Ok(out)
+    }
+
+    fn supports_type_counts(&self) -> bool {
+        true
+    }
+
+    async fn latest_write_marker(
+        &self,
+        tenant: &TenantContext,
+        recent_since: Option<chrono::DateTime<Utc>>,
+    ) -> StorageResult<Option<crate::core::WriteMarker>> {
+        self.latest_write_marker_capped(tenant, recent_since, WRITE_MARKER_RECENT_CAP)
+            .await
     }
 
     fn supports_tenant_registry(&self) -> bool {
@@ -1062,6 +1199,138 @@ impl ResourceStorage for SqliteBackend {
 
 // Search Index Helpers
 impl SqliteBackend {
+    /// Soft-deletes a resource, optionally only at `expected_version`
+    /// ([`ResourceStorage::delete`] / [`ResourceStorage::delete_versioned`]).
+    ///
+    /// The read of the current row, the tombstone `UPDATE`, the deletion history
+    /// row and the search-index cleanup share one `IMMEDIATE` transaction. They
+    /// used to be auto-committed statements: a failure after the `UPDATE` left a
+    /// tombstone with no history entry, and a writer landing between the read
+    /// and the `UPDATE` turned a plain delete into a spurious `NotFound`. Inside
+    /// the write lock neither can happen, and `expected_version` is compared
+    /// against the very row the `UPDATE` then tombstones — the comparison and
+    /// the delete cannot be separated (#1404).
+    fn soft_delete(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: Option<&str>,
+    ) -> StorageResult<()> {
+        tenant.check_permission(Operation::Delete, resource_type)?;
+
+        let mut conn = self.get_connection()?;
+        let tenant_id = tenant.tenant_id().as_str();
+
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| internal_error(format!("Failed to begin delete: {}", e)))?;
+
+        // Check if resource exists and get its fhir_version
+        let result: Result<(String, Vec<u8>, String), _> = tx.query_row(
+            "SELECT version_id, data, fhir_version FROM resources
+             WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3 AND is_deleted = 0",
+            params![tenant_id, resource_type, id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        );
+
+        let (current_version, data, fhir_version_str) = match result {
+            Ok(v) => v,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                return Err(StorageError::Resource(ResourceError::NotFound {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                }));
+            }
+            Err(e) => {
+                return Err(internal_error(format!("Failed to check resource: {}", e)));
+            }
+        };
+
+        if let Some(expected) = expected_version
+            && expected != current_version
+        {
+            return Err(StorageError::Concurrency(
+                ConcurrencyError::VersionConflict {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                    expected_version: expected.to_string(),
+                    actual_version: current_version,
+                },
+            ));
+        }
+
+        let now = Utc::now();
+        let deleted_at = now.to_rfc3339();
+
+        // Calculate new version for the deletion record
+        let new_version: u64 = current_version.parse().unwrap_or(0) + 1;
+        let new_version_str = new_version.to_string();
+
+        // Soft delete the resource. The `version_id`/`is_deleted` predicates
+        // keep the statement a compare-and-swap in its own right: the write
+        // lock already guarantees the row is the one read above, and the
+        // predicate is what would say so if that ever stopped being true.
+        let updated = tx
+            .execute(
+                "UPDATE resources SET is_deleted = 1, deleted_at = ?1, version_id = ?2, last_updated = ?1
+                 WHERE tenant_id = ?3 AND resource_type = ?4 AND id = ?5
+                   AND version_id = ?6 AND is_deleted = 0",
+                params![
+                    deleted_at,
+                    new_version_str,
+                    tenant_id,
+                    resource_type,
+                    id,
+                    current_version
+                ],
+            )
+            .map_err(|e| internal_error(format!("Failed to delete resource: {}", e)))?;
+
+        if updated == 0 {
+            return Err(StorageError::Resource(ResourceError::NotFound {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+            }));
+        }
+
+        // Insert deletion record into history (preserve fhir_version)
+        tx.execute(
+            "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)",
+            params![tenant_id, resource_type, id, new_version_str, data, deleted_at, fhir_version_str],
+        )
+        .map_err(|e| internal_error(format!("Failed to insert deletion history: {}", e)))?;
+
+        // Delete search index entries (skip when search is offloaded). Keyed on
+        // resource_key. The tenant_id/resource_type prefix is required for the
+        // delete to seek idx_search_composite instead of full-scanning
+        // search_index (see delete_search_index, #1197); the soft-delete keeps
+        // the resources row, so the subquery resolves.
+        if !self.is_search_offloaded() {
+            tx.execute(
+                "DELETE FROM search_index
+                  WHERE tenant_id = ?1 AND resource_type = ?2
+                    AND resource_key = (
+                     SELECT rowid FROM resources
+                      WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3
+                 )",
+                params![tenant_id, resource_type, id],
+            )
+            .map_err(|e| internal_error(format!("Failed to delete search index: {}", e)))?;
+        }
+
+        tx.commit()
+            .map_err(|e| internal_error(format!("Failed to commit delete: {}", e)))?;
+
+        // A SearchParameter delete invalidates this tenant's cached registry.
+        if resource_type == "SearchParameter" {
+            self.tenant_registries().invalidate(tenant_id);
+        }
+
+        Ok(())
+    }
+
     /// Brings a soft-deleted resource back to life with new content.
     ///
     /// FHIR permits a deleted resource to be restored by a subsequent update
@@ -1180,10 +1449,12 @@ impl SqliteBackend {
 
     /// Index a resource for search.
     ///
-    /// This method uses the SearchParameterExtractor to dynamically extract
-    /// searchable values based on the configured SearchParameterRegistry.
-    /// Falls back to hardcoded common parameter extraction if the registry
-    /// extraction fails.
+    /// Extracts the resource's search values with the tenant's registry-driven
+    /// extractor and writes them, falling back to the hardcoded `_id` /
+    /// `_lastUpdated` pair if extraction fails. The two halves are
+    /// [`Self::prepare_index`] (pure CPU, no connection) and
+    /// [`Self::write_prepared_index`] (the statements); bulk paths prepare a
+    /// whole batch in parallel and call the second half alone.
     pub(crate) fn index_resource(
         &self,
         conn: &rusqlite::Connection,
@@ -1196,10 +1467,243 @@ impl SqliteBackend {
         if self.is_search_offloaded() {
             return Ok(());
         }
+        let prepared = self.prepare_index(tenant_id, resource_type, resource_id, resource);
+        self.write_prepared_index(
+            conn,
+            tenant_id,
+            resource_type,
+            resource_id,
+            resource,
+            prepared,
+        )
+        .map(|_| ())
+    }
 
-        // Try dynamic extraction using the registry-driven extractor
-        match self.index_resource_dynamic(conn, tenant_id, resource_type, resource_id, resource) {
-            Ok(count) => {
+    /// The database-free half of indexing one resource: FHIRPath extraction,
+    /// value normalisation, the bound parameters of every `search_index` row,
+    /// and the full-text content. Holds no connection and takes no lock other
+    /// than the registry's read lock, so a batch of these can be built on a
+    /// thread pool while the single writer connection is busy with the
+    /// previous batch (see [`Self::prepare_index_batch`]).
+    pub(crate) fn prepare_index(
+        &self,
+        tenant_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+        resource: &Value,
+    ) -> PreparedIndex {
+        use super::search::fts::extract_searchable_content;
+        use crate::search::converters::IndexValue;
+
+        let _span = crate::perf::span(crate::perf::Phase::Extract);
+        let extractor = self.tenant_extractor(tenant_id);
+        let rows = match extractor.extract(resource, resource_type) {
+            Ok(values) => {
+                let marshal_span = crate::perf::span(crate::perf::Phase::IndexMarshal);
+                // Composite groups missing a component can never match a
+                // composite search (`GROUP BY … HAVING` needs every axis) and
+                // were 6% of all rows on a Synthea load; PostgreSQL already
+                // skips them.
+                let values = crate::search::extractor::drop_incomplete_composites(values);
+                let rows = values
+                    .into_iter()
+                    .map(|v| {
+                        let normalized = match &v.value {
+                            IndexValue::Date {
+                                value: d,
+                                precision,
+                                end,
+                            } => {
+                                let mut n = v.clone();
+                                n.value = IndexValue::Date {
+                                    value: Self::normalize_date_for_sqlite(d),
+                                    precision: *precision,
+                                    end: end.clone(),
+                                };
+                                n
+                            }
+                            _ => v,
+                        };
+                        // `resource_key` is patched in by `write_prepared_index`
+                        // (this half is connection-free); pass a placeholder.
+                        SqliteSearchIndexWriter::to_sql_params(
+                            tenant_id,
+                            resource_type,
+                            resource_id,
+                            0,
+                            &normalized,
+                        )
+                    })
+                    .collect();
+                drop(marshal_span);
+                Ok(rows)
+            }
+            Err(e) => Err(e.to_string()),
+        };
+
+        // Contained resources, for `_contained` search: each value row is
+        // flagged `is_contained = 1` and carries the contained resource's
+        // type and local id, with `resource_type` / `resource_id` naming the
+        // container.
+        let mut contained_rows = Vec::new();
+        for contained in extractor.extract_contained(resource) {
+            for value in &contained.values {
+                let normalized = match &value.value {
+                    IndexValue::Date {
+                        value: d,
+                        precision,
+                        end,
+                    } => {
+                        let mut n = value.clone();
+                        n.value = IndexValue::Date {
+                            value: Self::normalize_date_for_sqlite(d),
+                            precision: *precision,
+                            end: end.clone(),
+                        };
+                        Some(n)
+                    }
+                    _ => None,
+                };
+                let mut params = SqliteSearchIndexWriter::to_sql_params(
+                    tenant_id,
+                    resource_type,
+                    resource_id,
+                    0, // resource_key patched in by write_prepared_index
+                    normalized.as_ref().unwrap_or(value),
+                );
+                params.push(SqlValue::Int(1));
+                params.push(SqlValue::String(contained.contained_type.clone()));
+                params.push(SqlValue::String(contained.local_id.clone()));
+                contained_rows.push(params);
+            }
+        }
+
+        let fts = {
+            let content = extract_searchable_content(resource);
+            (!content.is_empty()).then_some(content)
+        };
+
+        PreparedIndex {
+            rows,
+            contained_rows,
+            fts,
+        }
+    }
+
+    /// [`Self::prepare_index`] for a whole batch, spread across a thread
+    /// pool. Extraction is the largest CPU cost of indexing and is
+    /// independent per resource; SQLite's single writer cannot be
+    /// parallelised, but this can, and it moves the extraction off the
+    /// writer's critical path entirely.
+    ///
+    /// Items are `(resource_type, resource_id, resource)`; the result is in
+    /// input order. Small batches are prepared inline — the pool's
+    /// scheduling overhead is not worth paying for a handful of resources.
+    pub(crate) fn prepare_index_batch(
+        &self,
+        tenant_id: &str,
+        items: &[(&str, &str, &Value)],
+    ) -> Vec<PreparedIndex> {
+        use rayon::prelude::*;
+
+        let _span = crate::perf::span(crate::perf::Phase::PrepareBatch);
+        if items.len() < PARALLEL_PREPARE_MIN_BATCH {
+            return items
+                .iter()
+                .map(|(rt, id, res)| self.prepare_index(tenant_id, rt, id, res))
+                .collect();
+        }
+        index_prepare_pool().install(|| {
+            items
+                .par_iter()
+                .map(|(rt, id, res)| self.prepare_index(tenant_id, rt, id, res))
+                .collect()
+        })
+    }
+
+    /// The statement half of indexing one resource: `search_index` rows
+    /// eight per INSERT, the contained rows, then the full-text row. Returns
+    /// the number of `search_index` rows written. Runs the minimal `_id` /
+    /// `_lastUpdated` fallback when extraction failed, as
+    /// [`Self::index_resource`] always has.
+    pub(crate) fn write_prepared_index(
+        &self,
+        conn: &rusqlite::Connection,
+        tenant_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+        resource: &Value,
+        prepared: PreparedIndex,
+    ) -> StorageResult<usize> {
+        let mut count = 0;
+        // The connection-free prepare step left `resource_key` as a placeholder
+        // (see RESOURCE_KEY_PARAM_IX); resolve the owning resource's rowid here,
+        // where we hold the connection, and patch every row before binding. The
+        // resource has already been written by the time indexing runs.
+        let resource_key: i64 = conn
+            .query_row(
+                "SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3",
+                rusqlite::params![tenant_id, resource_type, resource_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| {
+                internal_error(format!(
+                    "resolve resource_key for {resource_type}/{resource_id}: {e}"
+                ))
+            })?;
+        let mut prepared = prepared;
+        if let Ok(rows) = prepared.rows.as_mut() {
+            for row in rows.iter_mut() {
+                row[SqliteSearchIndexWriter::RESOURCE_KEY_PARAM_IX] = SqlValue::Int(resource_key);
+            }
+        }
+        for row in prepared.contained_rows.iter_mut() {
+            row[SqliteSearchIndexWriter::RESOURCE_KEY_PARAM_IX] = SqlValue::Int(resource_key);
+        }
+        match prepared.rows {
+            Ok(rows) => {
+                // Rows are written eight at a time: a single-row INSERT stepped
+                // once per row spends a measurable share of its time entering
+                // and leaving the statement, and every resource writes ~10-30
+                // rows. The B-tree work is unchanged; only the per-statement
+                // overhead is amortized (measured +9% bulk-ingest throughput
+                // on the real 31 GB manifest).
+                let _span = crate::perf::span(crate::perf::Phase::IndexInsert);
+                let mut i = 0;
+                while i + 8 <= rows.len() {
+                    let refs: Vec<&dyn ToSql> = rows[i..i + 8]
+                        .iter()
+                        .flatten()
+                        .map(|p| self.sql_value_to_ref(p))
+                        .collect();
+                    conn.prepare_cached(SqliteSearchIndexWriter::insert_sql_rows8())
+                        .and_then(|mut s| s.execute(refs.as_slice()))
+                        .map_err(|e| internal_error(format!("multi-row index insert: {e}")))?;
+                    i += 8;
+                    count += 8;
+                }
+                for row in &rows[i..] {
+                    let refs: Vec<&dyn ToSql> =
+                        row.iter().map(|p| self.sql_value_to_ref(p)).collect();
+                    conn.prepare_cached(SqliteSearchIndexWriter::insert_sql())
+                        .and_then(|mut s| s.execute(refs.as_slice()))
+                        .map_err(|e| internal_error(format!("index insert: {e}")))?;
+                    count += 1;
+                }
+                for row in &prepared.contained_rows {
+                    let refs: Vec<&dyn ToSql> =
+                        row.iter().map(|p| self.sql_value_to_ref(p)).collect();
+                    conn.prepare_cached(SqliteSearchIndexWriter::insert_contained_sql())
+                        .and_then(|mut s| s.execute(refs.as_slice()))
+                        .map_err(|e| {
+                            internal_error(format!(
+                                "Failed to insert contained search index entry: {}",
+                                e
+                            ))
+                        })?;
+                    count += 1;
+                }
+                crate::perf::add_rows(crate::perf::Phase::IndexInsert, count as u64);
                 tracing::debug!(
                     "Dynamically indexed {} values for {}/{}",
                     count,
@@ -1220,36 +1724,26 @@ impl SqliteBackend {
         }
 
         // Index FTS content for _text and _content searches
-        {
+        if let Some(content) = prepared.fts {
             let _span = crate::perf::span(crate::perf::Phase::Fts);
-            self.index_fts_content(conn, tenant_id, resource_type, resource_id, resource)?;
+            self.index_fts_content(conn, tenant_id, resource_type, resource_id, content)?;
         }
 
-        Ok(())
+        Ok(count)
     }
 
-    /// Index full-text search content for _text and _content searches.
-    ///
-    /// This populates the resource_fts table if FTS5 is available.
+    /// Writes the full-text row for `_text` / `_content` searches, if FTS5 is
+    /// available, and records the rowid FTS5 assigned.
     fn index_fts_content(
         &self,
         conn: &rusqlite::Connection,
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
-        resource: &Value,
+        content: super::search::fts::SearchableContent,
     ) -> StorageResult<()> {
-        use super::search::fts::extract_searchable_content;
-
         if !fts_table_exists(conn)? {
             // FTS5 not available - skip silently
-            return Ok(());
-        }
-
-        // Extract searchable content
-        let content = extract_searchable_content(resource);
-
-        if content.is_empty() {
             return Ok(());
         }
 
@@ -1284,246 +1778,6 @@ impl SqliteBackend {
             conn.last_insert_rowid()
         ])
         .map_err(|e| internal_error(format!("Failed to record FTS rowid: {}", e)))?;
-
-        Ok(())
-    }
-
-    /// Index a resource using dynamic extraction from the SearchParameterRegistry.
-    ///
-    /// Returns the number of index entries created.
-    fn index_resource_dynamic(
-        &self,
-        conn: &rusqlite::Connection,
-        tenant_id: &str,
-        resource_type: &str,
-        resource_id: &str,
-        resource: &Value,
-    ) -> StorageResult<usize> {
-        // Extract values using the tenant's registry-driven extractor
-        let values = {
-            let _span = crate::perf::span(crate::perf::Phase::Extract);
-            self.tenant_extractor(tenant_id)
-                .extract(resource, resource_type)
-                .map_err(|e| internal_error(format!("Search parameter extraction failed: {}", e)))?
-        };
-
-        // Rows are written eight at a time: a single-row INSERT stepped once
-        // per row spends a measurable share of its time entering and leaving
-        // the statement, and every resource writes ~10-30 rows. The B-tree
-        // work is unchanged; only the per-statement overhead is amortized
-        // (measured +9% bulk-ingest throughput on the real 31 GB manifest).
-        let mut count = 0;
-        {
-            // The whole insert, plus its Rust-side half (normalising values and
-            // building the bound parameters) as a nested phase, so a profile can
-            // tell our marshalling apart from SQLite's b-tree work (#947).
-            let _span = crate::perf::span(crate::perf::Phase::IndexInsert);
-            use crate::search::converters::IndexValue;
-            let marshal_span = crate::perf::span(crate::perf::Phase::IndexMarshal);
-            let owned: Vec<_> = values
-                .into_iter()
-                .map(|v| match &v.value {
-                    IndexValue::Date {
-                        value: d,
-                        precision,
-                    } => {
-                        let mut n = v.clone();
-                        n.value = IndexValue::Date {
-                            value: Self::normalize_date_for_sqlite(d),
-                            precision: *precision,
-                        };
-                        n
-                    }
-                    _ => v,
-                })
-                .collect();
-            let rows: Vec<Vec<_>> = owned
-                .iter()
-                .map(|v| {
-                    SqliteSearchIndexWriter::to_sql_params(tenant_id, resource_type, resource_id, v)
-                })
-                .collect();
-            drop(marshal_span);
-            let mut i = 0;
-            while i + 8 <= rows.len() {
-                let refs: Vec<&dyn ToSql> = rows[i..i + 8]
-                    .iter()
-                    .flatten()
-                    .map(|p| self.sql_value_to_ref(p))
-                    .collect();
-                conn.prepare_cached(SqliteSearchIndexWriter::insert_sql_rows8())
-                    .and_then(|mut s| s.execute(refs.as_slice()))
-                    .map_err(|e| internal_error(format!("multi-row index insert: {e}")))?;
-                i += 8;
-                count += 8;
-            }
-            for row in &rows[i..] {
-                let refs: Vec<&dyn ToSql> = row.iter().map(|p| self.sql_value_to_ref(p)).collect();
-                conn.prepare_cached(SqliteSearchIndexWriter::insert_sql())
-                    .and_then(|mut s| s.execute(refs.as_slice()))
-                    .map_err(|e| internal_error(format!("index insert: {e}")))?;
-                count += 1;
-            }
-        }
-        crate::perf::add_rows(crate::perf::Phase::IndexInsert, count as u64);
-
-        // Also index any contained resources for `_contained` search.
-        count +=
-            self.index_contained_resources(conn, tenant_id, resource_type, resource_id, resource)?;
-
-        Ok(count)
-    }
-
-    /// Writes a single ExtractedValue to the search_index table.
-    fn write_index_entry(
-        &self,
-        conn: &rusqlite::Connection,
-        tenant_id: &str,
-        resource_type: &str,
-        resource_id: &str,
-        value: &ExtractedValue,
-    ) -> StorageResult<()> {
-        use crate::search::converters::IndexValue;
-
-        let marshal_span = crate::perf::span(crate::perf::Phase::IndexMarshal);
-        // For date values, normalize the date format for consistent SQLite comparisons
-        let normalized_value = match &value.value {
-            IndexValue::Date {
-                value: date_str,
-                precision,
-            } => {
-                let normalized_date = Self::normalize_date_for_sqlite(date_str);
-                let mut normalized = value.clone();
-                normalized.value = IndexValue::Date {
-                    value: normalized_date,
-                    precision: *precision,
-                };
-                Some(normalized)
-            }
-            _ => None,
-        };
-
-        let value_to_use = normalized_value.as_ref().unwrap_or(value);
-        let sql_params = SqliteSearchIndexWriter::to_sql_params(
-            tenant_id,
-            resource_type,
-            resource_id,
-            value_to_use,
-        );
-
-        // Build parameter refs for rusqlite
-        let param_refs: Vec<&dyn ToSql> = sql_params
-            .iter()
-            .map(|p| self.sql_value_to_ref(p))
-            .collect();
-
-        drop(marshal_span);
-        // `prepare_cached`, not `execute`: `Connection::execute` compiles the
-        // statement on every call, and a bulk import runs this one ~14 times
-        // per resource. The 24-column INSERT costs more to compile than to
-        // run, and the cache is keyed on the `&'static str` above, so every
-        // row after the first on a given connection reuses the same program.
-        conn.prepare_cached(SqliteSearchIndexWriter::insert_sql())
-            .map_err(|e| internal_error(format!("Failed to prepare search index insert: {}", e)))?
-            .execute(param_refs.as_slice())
-            .map_err(|e| internal_error(format!("Failed to insert search index entry: {}", e)))?;
-
-        Ok(())
-    }
-
-    /// Extracts and indexes a container's `contained[]` resources for
-    /// `_contained` search. Each contained resource's search values are written
-    /// as `is_contained = 1` rows whose `resource_type` / `resource_id` identify
-    /// the container. Returns the number of entries written.
-    fn index_contained_resources(
-        &self,
-        conn: &rusqlite::Connection,
-        tenant_id: &str,
-        container_type: &str,
-        container_id: &str,
-        resource: &Value,
-    ) -> StorageResult<usize> {
-        let mut count = 0;
-        let container = (container_type, container_id);
-        for contained in self.tenant_extractor(tenant_id).extract_contained(resource) {
-            for value in &contained.values {
-                self.write_contained_index_entry(
-                    conn,
-                    tenant_id,
-                    container,
-                    (&contained.contained_type, &contained.local_id),
-                    value,
-                )?;
-                count += 1;
-            }
-        }
-        Ok(count)
-    }
-
-    /// Writes a single contained `ExtractedValue` to the search_index table,
-    /// flagged `is_contained = 1` and carrying the contained resource's type and
-    /// local id (mirrors [`Self::write_index_entry`]). `container` is the
-    /// `(type, id)` of the holding resource; `contained` is the
-    /// `(type, local id)` of the nested resource.
-    fn write_contained_index_entry(
-        &self,
-        conn: &rusqlite::Connection,
-        tenant_id: &str,
-        container: (&str, &str),
-        contained: (&str, &str),
-        value: &ExtractedValue,
-    ) -> StorageResult<()> {
-        use crate::search::converters::IndexValue;
-
-        let (container_type, container_id) = container;
-        let (contained_type, contained_local_id) = contained;
-
-        let normalized_value = match &value.value {
-            IndexValue::Date {
-                value: date_str,
-                precision,
-            } => {
-                let mut normalized = value.clone();
-                normalized.value = IndexValue::Date {
-                    value: Self::normalize_date_for_sqlite(date_str),
-                    precision: *precision,
-                };
-                Some(normalized)
-            }
-            _ => None,
-        };
-        let value_to_use = normalized_value.as_ref().unwrap_or(value);
-
-        let mut sql_params = SqliteSearchIndexWriter::to_sql_params(
-            tenant_id,
-            container_type,
-            container_id,
-            value_to_use,
-        );
-        // Trailing contained columns (?25..?27).
-        sql_params.push(SqlValue::Int(1));
-        sql_params.push(SqlValue::String(contained_type.to_string()));
-        sql_params.push(SqlValue::String(contained_local_id.to_string()));
-
-        let param_refs: Vec<&dyn ToSql> = sql_params
-            .iter()
-            .map(|p| self.sql_value_to_ref(p))
-            .collect();
-
-        conn.prepare_cached(SqliteSearchIndexWriter::insert_contained_sql())
-            .map_err(|e| {
-                internal_error(format!(
-                    "Failed to prepare contained search index insert: {}",
-                    e
-                ))
-            })?
-            .execute(param_refs.as_slice())
-            .map_err(|e| {
-                internal_error(format!(
-                    "Failed to insert contained search index entry: {}",
-                    e
-                ))
-            })?;
 
         Ok(())
     }
@@ -1640,10 +1894,25 @@ impl SqliteBackend {
             return Ok(0);
         }
 
-        // Delete from main search index
+        // Delete from main search index by resource_key. The `tenant_id` and
+        // `resource_type` equality prefix is load-bearing, not redundant with
+        // the subquery: `idx_search_composite` leads with
+        // `(tenant_id, resource_type, resource_key, …)`, so a predicate on
+        // `resource_key` alone cannot use it and SQLite falls back to a full
+        // scan of `search_index` — O(rows) per delete, which is O(rows) per
+        // resource UPDATE and per re-indexed resource (#1197). With the prefix
+        // the delete is a covering seek. Every caller runs while the `resources`
+        // row still exists (update, re-index, soft-delete), so the subquery
+        // resolves; the purge path removes `resources` first and deletes by
+        // `resource_id` inline instead.
         let deleted = conn
             .prepare_cached(
-                "DELETE FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id = ?3",
+                "DELETE FROM search_index
+                  WHERE tenant_id = ?1 AND resource_type = ?2
+                    AND resource_key = (
+                     SELECT rowid FROM resources
+                      WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3
+                 )",
             )
             .map_err(|e| internal_error(format!("Failed to prepare search index delete: {}", e)))?
             .execute(params![tenant_id, resource_type, resource_id])
@@ -1714,8 +1983,8 @@ impl SqliteBackend {
         code: &str,
     ) -> StorageResult<()> {
         conn.execute(
-            "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_token_system, value_token_code)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO search_index (tenant_id, resource_type, resource_id, resource_key, param_name, value_token_system, value_token_code)
+             VALUES (?1, ?2, ?3, (SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3), ?4, ?5, ?6)",
             params![tenant_id, resource_type, resource_id, param_name, system, code],
         )
         .map_err(|e| internal_error(format!("Failed to insert token index: {}", e)))?;
@@ -1749,10 +2018,15 @@ impl SqliteBackend {
             value.to_string()
         };
 
+        // The end of the value's range (#1391), read from the text as written.
+        let end = super::search::writer::stored_date_end(
+            &crate::search::converters::IndexValue::date(value),
+        );
+
         conn.execute(
-            "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_date)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![tenant_id, resource_type, resource_id, param_name, normalized],
+            "INSERT INTO search_index (tenant_id, resource_type, resource_id, resource_key, param_name, value_date, value_date_end)
+             VALUES (?1, ?2, ?3, (SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3), ?4, ?5, ?6)",
+            params![tenant_id, resource_type, resource_id, param_name, normalized, end],
         )
         .map_err(|e| internal_error(format!("Failed to insert date index: {}", e)))?;
         Ok(())
@@ -1905,9 +2179,14 @@ impl VersionedStorage for SqliteBackend {
                 },
             ));
         }
+        drop(conn);
 
-        // Perform delete
-        self.delete(tenant, resource_type, id).await
+        // Delete exactly the version the precondition was evaluated against.
+        // A plain `delete` here was check-then-act: a writer landing after the
+        // read above was deleted along with the version the client named
+        // (#1404).
+        self.delete_versioned(tenant, resource_type, id, &current_version)
+            .await
     }
 
     async fn list_versions(
@@ -2909,30 +3188,19 @@ impl DifferentialHistoryProvider for SqliteBackend {
     }
 }
 
-// Helper function to parse simple search parameters
-// Supports basic formats like: identifier=X, _id=Y, name=Z
 /// Why conditional criteria cannot be resolved inside a transaction when
 /// search is offloaded to a secondary backend (#511, #859).
 const OFFLOADED_CONDITIONAL_REFUSAL: &str = "conditional criteria cannot be resolved inside a \
      transaction when search is offloaded to a secondary backend; submit the entry in a batch \
      Bundle instead";
 
-fn parse_simple_search_params(params: &str) -> Vec<(String, String)> {
-    params
-        .split('&')
-        .filter_map(|pair| {
-            let parts: Vec<&str> = pair.splitn(2, '=').collect();
-            if parts.len() == 2 {
-                Some((parts[0].to_string(), parts[1].to_string()))
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
 #[async_trait]
 impl ConditionalStorage for SqliteBackend {
+    fn supports_conditional(&self, interaction: crate::core::ConditionalInteraction) -> bool {
+        // One declaration: the capability list the contract test pins (#1384).
+        crate::core::Backend::supports(self, interaction.capability())
+    }
+
     async fn conditional_create(
         &self,
         tenant: &TenantContext,
@@ -2967,6 +3235,7 @@ impl ConditionalStorage for SqliteBackend {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn conditional_update(
         &self,
         tenant: &TenantContext,
@@ -2975,6 +3244,7 @@ impl ConditionalStorage for SqliteBackend {
         search_params: &str,
         upsert: bool,
         fhir_version: FhirVersion,
+        if_match: &crate::core::EntityTagPrecondition,
     ) -> StorageResult<ConditionalUpdateResult> {
         // Find matching resources based on search parameters
         let matches = self
@@ -2983,6 +3253,9 @@ impl ConditionalStorage for SqliteBackend {
 
         match matches.len() {
             0 => {
+                // `If-Match` names a version; nothing matched, so nothing
+                // can carry it and the create below must not run (#1381).
+                crate::core::conditional_if_match_gate(if_match, resource_type, None)?;
                 if upsert {
                     // No match, but upsert is true - create new resource
                     let created = self
@@ -2995,8 +3268,11 @@ impl ConditionalStorage for SqliteBackend {
                 }
             }
             1 => {
-                // Exactly one match - update it (preserves existing FHIR version)
+                // Exactly one match - update it (preserves existing FHIR version).
+                // `update` compares-and-swaps on `existing`'s version, the one
+                // `If-Match` is evaluated against here.
                 let existing = matches.into_iter().next().unwrap();
+                crate::core::conditional_if_match_gate(if_match, resource_type, Some(&existing))?;
                 let updated = self.update(tenant, &existing, resource).await?;
                 Ok(ConditionalUpdateResult::Updated(updated))
             }
@@ -3012,6 +3288,7 @@ impl ConditionalStorage for SqliteBackend {
         tenant: &TenantContext,
         resource_type: &str,
         search_params: &str,
+        if_match: &crate::core::EntityTagPrecondition,
     ) -> StorageResult<ConditionalDeleteResult> {
         // Find matching resources based on search parameters
         let matches = self
@@ -3020,13 +3297,16 @@ impl ConditionalStorage for SqliteBackend {
 
         match matches.len() {
             0 => {
-                // No match
+                // No match. A supplied `If-Match` fails against it, as it
+                // does on `DELETE [type]/[id]` for a missing resource.
+                crate::core::conditional_if_match_gate(if_match, resource_type, None)?;
                 Ok(ConditionalDeleteResult::NoMatch)
             }
             1 => {
                 // Exactly one match - delete it
                 let existing = matches.into_iter().next().unwrap();
-                self.delete(tenant, resource_type, existing.id()).await?;
+                crate::core::conditional_if_match_gate(if_match, resource_type, Some(&existing))?;
+                crate::core::delete_under_precondition(self, tenant, if_match, &existing).await?;
                 Ok(ConditionalDeleteResult::Deleted(existing))
             }
             n => {
@@ -3036,55 +3316,17 @@ impl ConditionalStorage for SqliteBackend {
         }
     }
 
-    /// Patches a resource based on search criteria.
-    ///
-    /// This implements conditional patch as defined in FHIR:
-    /// `PATCH [base]/[type]?[search-params]`
-    ///
-    /// Supports three patch formats:
-    /// - JSON Patch (RFC 6902)
-    /// - FHIRPath Patch (FHIR-specific)
-    /// - JSON Merge Patch (RFC 7386)
-    async fn conditional_patch(
+    /// The criteria resolver the provided
+    /// [`ConditionalStorage::conditional_patch`] is written in terms of: this
+    /// backend has no patch code of its own (#1406).
+    async fn resolve_conditional_matches(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         search_params: &str,
-        patch: &crate::core::PatchFormat,
-    ) -> StorageResult<crate::core::ConditionalPatchResult> {
-        use crate::core::{ConditionalPatchResult, PatchFormat};
-
-        // Find matching resources based on search parameters
-        let matches = self
-            .find_matching_resources(tenant, resource_type, search_params)
-            .await?;
-
-        match matches.len() {
-            0 => Ok(ConditionalPatchResult::NoMatch),
-            1 => {
-                // Exactly one match - apply the patch
-                let existing = matches.into_iter().next().unwrap();
-                let current_content = existing.content().clone();
-
-                // Apply the patch based on format
-                let patched_content = match patch {
-                    PatchFormat::JsonPatch(patch_doc) => {
-                        self.apply_json_patch(&current_content, patch_doc)?
-                    }
-                    PatchFormat::FhirPathPatch(patch_params) => {
-                        self.apply_fhirpath_patch(&current_content, patch_params)?
-                    }
-                    PatchFormat::MergePatch(merge_doc) => {
-                        self.apply_merge_patch(&current_content, merge_doc)
-                    }
-                };
-
-                // Update the resource with the patched content
-                let updated = self.update(tenant, &existing, patched_content).await?;
-                Ok(ConditionalPatchResult::Patched(updated))
-            }
-            n => Ok(ConditionalPatchResult::MultipleMatches(n)),
-        }
+    ) -> StorageResult<Vec<StoredResource>> {
+        self.find_matching_resources(tenant, resource_type, search_params)
+            .await
     }
 }
 
@@ -3135,278 +3377,24 @@ impl SqliteBackend {
     /// Builds the search a conditional interaction's criteria describe, or
     /// `None` when the criteria are empty — matching everything would be the
     /// literal reading, but no conditional interaction means that.
+    ///
+    /// The parsing is [`crate::search::build_conditional_query`], shared by
+    /// every backend so criteria mean what they mean as a direct search
+    /// (#1312).
     fn conditional_query(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         search_params_str: &str,
     ) -> StorageResult<Option<SearchQuery>> {
-        // Parse search parameters into (name, value) pairs
-        let parsed_params = parse_simple_search_params(search_params_str);
-
-        if parsed_params.is_empty() {
-            return Ok(None);
-        }
-
-        // Build SearchParameter objects by looking up types from the registry
-        let search_params = self.build_search_parameters(tenant, resource_type, &parsed_params)?;
-
-        Ok(Some(SearchQuery {
-            resource_type: resource_type.to_string(),
-            parameters: search_params,
-            // No pagination limit for conditional operations - we need all matches
-            count: Some(1000), // Reasonable upper limit for conditional matching
-            ..Default::default()
-        }))
-    }
-
-    /// Builds SearchParameter objects from parsed (name, value) pairs.
-    ///
-    /// Looks up the parameter type from the registry, falling back to sensible defaults
-    /// for common parameters when not found.
-    fn build_search_parameters(
-        &self,
-        tenant: &TenantContext,
-        resource_type: &str,
-        params: &[(String, String)],
-    ) -> StorageResult<Vec<SearchParameter>> {
         let registry_arc = self.tenant_registry(tenant.tenant_id().as_str());
         let registry = registry_arc.read();
-        let mut search_params = Vec::with_capacity(params.len());
-
-        for (name, value) in params {
-            // Look up the parameter definition to get its type, falling back to
-            // the shared registry-miss guess when it is not registered.
-            let param_type = self
-                .lookup_param_type(&registry, resource_type, name)
-                .unwrap_or_else(|| crate::search::fallback_param_type(name));
-
-            search_params.push(SearchParameter {
-                name: name.clone(),
-                param_type,
-                modifier: None,
-                values: vec![SearchValue::parse(value)],
-                chain: vec![],
-                components: vec![],
-            });
-        }
-
-        Ok(search_params)
-    }
-
-    /// Looks up a search parameter type from the registry.
-    ///
-    /// Checks both the specific resource type and "Resource" base type for common params.
-    fn lookup_param_type(
-        &self,
-        registry: &crate::search::SearchParameterRegistry,
-        resource_type: &str,
-        param_name: &str,
-    ) -> Option<SearchParamType> {
-        // First try the specific resource type
-        if let Some(def) = registry.get_param(resource_type, param_name) {
-            return Some(def.param_type);
-        }
-
-        // Then try "Resource" for common parameters like _id, _lastUpdated
-        if let Some(def) = registry.get_param("Resource", param_name) {
-            return Some(def.param_type);
-        }
-
-        None
-    }
-
-    // ========================================================================
-    // Patch Helper Methods
-    // ========================================================================
-
-    /// Applies a JSON Patch (RFC 6902) to a resource.
-    ///
-    /// JSON Patch operations:
-    /// - `add`: Add a value at the specified path
-    /// - `remove`: Remove the value at the specified path
-    /// - `replace`: Replace the value at the specified path
-    /// - `move`: Move a value from one path to another
-    /// - `copy`: Copy a value from one path to another
-    /// - `test`: Test that a value equals the expected value
-    fn apply_json_patch(&self, resource: &Value, patch_doc: &Value) -> StorageResult<Value> {
-        use crate::error::ValidationError;
-
-        // Parse the patch document as an array of operations
-        let patch: json_patch::Patch = serde_json::from_value(patch_doc.clone()).map_err(|e| {
-            StorageError::Validation(ValidationError::InvalidResource {
-                message: format!("Invalid JSON Patch document: {}", e),
-                details: vec![],
-            })
-        })?;
-
-        // Apply the patch to a mutable copy
-        let mut patched = resource.clone();
-        json_patch::patch(&mut patched, &patch).map_err(|e| {
-            StorageError::Validation(ValidationError::InvalidResource {
-                message: format!("Failed to apply JSON Patch: {}", e),
-                details: vec![],
-            })
-        })?;
-
-        Ok(patched)
-    }
-
-    /// Applies a FHIRPath Patch to a resource.
-    ///
-    /// FHIRPath Patch uses a Parameters resource with operation parts:
-    /// - `type`: add, insert, delete, replace, move
-    /// - `path`: FHIRPath expression
-    /// - `name`: element name (for add)
-    /// - `value`: new value
-    ///
-    /// Note: Full FHIRPath Patch support requires the helios-fhirpath evaluator.
-    /// This implementation handles common cases.
-    fn apply_fhirpath_patch(&self, resource: &Value, patch_params: &Value) -> StorageResult<Value> {
-        use crate::error::ValidationError;
-
-        // The patch_params should be a Parameters resource with operation parts
-        let parameter = patch_params.get("parameter").and_then(|p| p.as_array());
-        if parameter.is_none() {
-            return Err(StorageError::Validation(ValidationError::InvalidResource {
-                message: "FHIRPath Patch must have a 'parameter' array".to_string(),
-                details: vec![],
-            }));
-        }
-
-        let mut patched = resource.clone();
-
-        for operation in parameter.unwrap() {
-            // Each operation has parts with name "type", "path", "name", "value"
-            let parts = operation.get("part").and_then(|p| p.as_array());
-            if parts.is_none() {
-                continue;
-            }
-
-            let mut op_type = None;
-            let mut op_path = None;
-            let mut op_name = None;
-            let mut op_value = None;
-
-            for part in parts.unwrap() {
-                match part.get("name").and_then(|n| n.as_str()) {
-                    Some("type") => {
-                        op_type = part
-                            .get("valueCode")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                    }
-                    Some("path") => {
-                        op_path = part
-                            .get("valueString")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                    }
-                    Some("name") => {
-                        op_name = part
-                            .get("valueString")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                    }
-                    Some("value") => {
-                        op_value = extract_part_value(part);
-                    }
-                    _ => {}
-                }
-            }
-
-            // Apply the operation based on type
-            match op_type.as_deref() {
-                Some("replace") => {
-                    if let (Some(path), Some(value)) = (&op_path, &op_value) {
-                        self.fhirpath_replace(&mut patched, path, value)?;
-                    }
-                }
-                Some("add") => {
-                    if let (Some(path), Some(name), Some(value)) = (&op_path, &op_name, &op_value) {
-                        self.fhirpath_add(&mut patched, path, name, value)?;
-                    }
-                }
-                Some("delete") => {
-                    if let Some(path) = &op_path {
-                        self.fhirpath_delete(&mut patched, path)?;
-                    }
-                }
-                _ => {
-                    // Unsupported operation type - skip
-                }
-            }
-        }
-
-        Ok(patched)
-    }
-
-    /// Helper for FHIRPath replace operation.
-    fn fhirpath_replace(
-        &self,
-        resource: &mut Value,
-        path: &str,
-        value: &Value,
-    ) -> StorageResult<()> {
-        // Simple implementation for common paths like "Resource.field"
-        // Full implementation would use helios-fhirpath for path evaluation
-        let parts: Vec<&str> = path.split('.').collect();
-        if parts.len() == 2 {
-            // Simple path like "Patient.active"
-            if let Some(obj) = resource.as_object_mut() {
-                obj.insert(parts[1].to_string(), value.clone());
-            }
-        }
-        Ok(())
-    }
-
-    /// Helper for FHIRPath add operation.
-    fn fhirpath_add(
-        &self,
-        resource: &mut Value,
-        path: &str,
-        name: &str,
-        value: &Value,
-    ) -> StorageResult<()> {
-        // Simple implementation for adding to root or nested object
-        let parts: Vec<&str> = path.split('.').collect();
-        if parts.len() == 1
-            && parts[0]
-                == resource
-                    .get("resourceType")
-                    .and_then(|r| r.as_str())
-                    .unwrap_or("")
-        {
-            // Adding to root level
-            if let Some(obj) = resource.as_object_mut() {
-                obj.insert(name.to_string(), value.clone());
-            }
-        }
-        Ok(())
-    }
-
-    /// Helper for FHIRPath delete operation.
-    fn fhirpath_delete(&self, resource: &mut Value, path: &str) -> StorageResult<()> {
-        // Simple implementation for deleting fields
-        let parts: Vec<&str> = path.split('.').collect();
-        if parts.len() == 2 {
-            if let Some(obj) = resource.as_object_mut() {
-                obj.remove(parts[1]);
-            }
-        }
-        Ok(())
-    }
-
-    /// Applies a JSON Merge Patch (RFC 7386) to a resource.
-    ///
-    /// Merge Patch is simpler than JSON Patch:
-    /// - Fields in the patch replace those in the target
-    /// - null values remove fields from the target
-    /// - Nested objects are merged recursively
-    fn apply_merge_patch(&self, resource: &Value, merge_doc: &Value) -> Value {
-        let mut patched = resource.clone();
-        json_patch::merge(&mut patched, merge_doc);
-        patched
+        crate::search::build_conditional_query(
+            &registry,
+            resource_type,
+            search_params_str,
+            crate::search::ResourceTypeScope::version(self.config().fhir_version),
+        )
     }
 }
 
@@ -3427,11 +3415,12 @@ impl BundleProvider for SqliteBackend {
         !self.is_search_offloaded()
     }
 
-    async fn process_transaction(
+    async fn process_transaction_with_patch_validator(
         &self,
         tenant: &TenantContext,
         entries: Vec<BundleEntry>,
         fhir_version: helios_fhir::FhirVersion,
+        validator: Option<&dyn PatchCandidateValidator>,
     ) -> Result<BundleResult, TransactionError> {
         use crate::core::transaction::{Transaction, TransactionOptions, TransactionProvider};
         use std::collections::HashMap;
@@ -3446,6 +3435,7 @@ impl BundleProvider for SqliteBackend {
 
         let mut results = Vec::with_capacity(entries.len());
         let mut error_info: Option<(usize, String)> = None;
+        let mut patch_error: Option<TransactionError> = None;
 
         // Build a map of fullUrl -> assigned reference for reference resolution
         // This maps urn:uuid:xxx to ResourceType/assigned-id after creates
@@ -3499,13 +3489,27 @@ impl BundleProvider for SqliteBackend {
             }
 
             let result = self
-                .process_bundle_entry_tx(tenant, &mut tx, entry, targets.get(&idx))
+                .process_bundle_entry_tx(
+                    tenant,
+                    &mut tx,
+                    entry,
+                    fhir_version,
+                    validator,
+                    targets.get(&idx),
+                )
                 .await;
 
             match result {
                 Ok(entry_result) => {
                     // Check for error status codes
                     if entry_result.status >= 400 {
+                        if entry.method == BundleMethod::Patch {
+                            patch_error = Some(TransactionError::PatchEntry {
+                                index: idx,
+                                status: entry_result.status,
+                                outcome: entry_result.outcome.clone().unwrap_or_default(),
+                            });
+                        }
                         error_info = Some((
                             idx,
                             format!("Entry failed with status {}", entry_result.status),
@@ -3578,7 +3582,7 @@ impl BundleProvider for SqliteBackend {
         // Handle error or commit
         if let Some((index, message)) = error_info {
             let _ = Box::new(tx).rollback().await;
-            return Err(TransactionError::BundleError { index, message });
+            return Err(patch_error.unwrap_or(TransactionError::BundleError { index, message }));
         }
 
         // Commit the transaction
@@ -3615,6 +3619,8 @@ impl SqliteBackend {
         tenant: &TenantContext,
         tx: &mut crate::backends::sqlite::transaction::SqliteTransaction,
         entry: &BundleEntry,
+        bundle_version: helios_fhir::FhirVersion,
+        validator: Option<&dyn PatchCandidateValidator>,
         target: Option<&crate::core::ConditionalTarget>,
     ) -> StorageResult<BundleEntryResult> {
         use crate::core::transaction::Transaction;
@@ -3716,7 +3722,7 @@ impl SqliteBackend {
                 match existing {
                     Some(existing) => {
                         let updated = tx.update(&existing, resource).await?;
-                        Ok(BundleEntryResult::ok(updated))
+                        Ok(BundleEntryResult::updated(updated))
                     }
                     None => {
                         // Create new resource with specified ID
@@ -3758,14 +3764,46 @@ impl SqliteBackend {
                 Ok(BundleEntryResult::deleted())
             }
             BundleMethod::Patch => {
-                // PATCH is not fully implemented yet
-                Ok(BundleEntryResult::error(
-                    501,
-                    serde_json::json!({
-                        "resourceType": "OperationOutcome",
-                        "issue": [{"severity": "error", "code": "not-supported", "diagnostics": "PATCH not implemented"}]
-                    }),
-                ))
+                let (resource_type, id) = self.parse_url(&entry.url)?;
+                if resource_type == "AuditEvent" {
+                    return Ok(BundleEntryResult::error(
+                        405,
+                        serde_json::json!({
+                            "resourceType": "OperationOutcome",
+                            "issue": [{"severity": "error", "code": "not-supported", "details": {"text": "AuditEvent resources are immutable"}}]
+                        }),
+                    ));
+                }
+                let existing = tx.read(&resource_type, &id).await?;
+                if let Some(failure) = bundle_if_match_gate(
+                    entry.if_match.as_deref(),
+                    existing.as_ref().map(|r| r.version_id()),
+                ) {
+                    return Ok(failure);
+                }
+                let Some(existing) = existing else {
+                    return Ok(BundleEntryResult::error(
+                        404,
+                        serde_json::json!({
+                            "resourceType": "OperationOutcome",
+                            "issue": [{"severity": "error", "code": "not-found", "details": {"text": format!("{resource_type}/{id} not found")}}]
+                        }),
+                    ));
+                };
+                let candidate = match prepare_bundle_patch(
+                    tenant,
+                    &resource_type,
+                    &existing,
+                    entry.resource.as_ref(),
+                    bundle_version,
+                    validator,
+                )
+                .await
+                {
+                    Ok(candidate) => candidate,
+                    Err(failure) => return Ok(*failure),
+                };
+                patch_update_result(tx.update(&existing, candidate).await)
             }
         }
     }
@@ -3874,19 +3912,33 @@ impl ReindexSource for SqliteBackend {
         cursor: Option<&str>,
         limit: u32,
     ) -> StorageResult<ResourcePage> {
+        self.fetch_resources_page_capped(tenant, resource_type, cursor, limit, 0)
+            .await
+    }
+
+    /// Pages by resource count and, when `max_bytes` is set, by the bytes of
+    /// stored JSON the page carries: a page of ~108 KB `Provenance` resources
+    /// ends at the first one that crosses the cap instead of holding ~108 MB
+    /// before a single document is written (#1125). At least one resource is
+    /// always returned, so the page loop advances even on a resource larger
+    /// than the cap.
+    async fn fetch_resources_page_capped(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<ResourcePage> {
         let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str().to_string();
 
         // Parse cursor if provided (format: "last_updated|id")
-        let (cursor_ts, cursor_id) = if let Some(c) = cursor {
-            let parts: Vec<&str> = c.split('|').collect();
-            if parts.len() == 2 {
-                (Some(parts[0].to_string()), Some(parts[1].to_string()))
-            } else {
-                (None, None)
-            }
-        } else {
-            (None, None)
+        // Split on the last `|`: an id cannot contain one, but the stored
+        // `last_updated` text of a corrupted row can.
+        let (cursor_ts, cursor_id) = match cursor.and_then(|c| c.rsplit_once('|')) {
+            Some((ts, id)) => (Some(ts.to_string()), Some(id.to_string())),
+            None => (None, None),
         };
 
         // Build query based on whether we have a cursor
@@ -3926,44 +3978,61 @@ impl ReindexSource for SqliteBackend {
 
         let param_refs: Vec<&dyn ToSql> = params.iter().map(|p| p.as_ref()).collect();
 
-        let resources: Vec<StoredResource> = stmt
-            .query_map(param_refs.as_slice(), |row| {
-                let id: String = row.get(0)?;
-                let version_id: String = row.get(1)?;
-                let data: Vec<u8> = row.get(2)?;
-                let last_updated: String = row.get(3)?;
-                let fhir_version: String = row.get(4)?;
+        let rows = stmt
+            .query_map(param_refs.as_slice(), RawReindexRow::read)
+            .map_err(|e| internal_error(format!("Failed to query resources: {}", e)))?;
 
-                Ok((id, version_id, data, last_updated, fhir_version))
-            })
-            .map_err(|e| internal_error(format!("Failed to query resources: {}", e)))?
-            .filter_map(|r| r.ok())
-            .filter_map(|(id, version_id, data, last_updated, fhir_version_str)| {
-                let content: Value = serde_json::from_slice(&data).ok()?;
-                let last_modified = chrono::DateTime::parse_from_rfc3339(&last_updated)
-                    .ok()?
-                    .with_timezone(&Utc);
-                let fhir_version = FhirVersion::from_storage(&fhir_version_str)
-                    .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
-                Some(StoredResource::from_storage(
-                    resource_type.to_string(),
-                    id,
-                    version_id,
-                    tenant.tenant_id().clone(),
-                    content,
-                    last_modified, // created_at (use last_modified as approximation)
-                    last_modified,
-                    None, // not deleted
-                    fhir_version,
+        let mut resources = Vec::with_capacity(limit as usize);
+        let mut skipped = Vec::new();
+        let mut scanned = 0usize;
+        let mut last_scanned: Option<String> = None;
+        let mut bytes = 0u64;
+        let mut capped = false;
+        for row in rows {
+            // A step error is the database failing, not one row being bad:
+            // surface it rather than guess where the next page starts.
+            let row =
+                row.map_err(|e| internal_error(format!("Failed to read resource row: {}", e)))?;
+            scanned += 1;
+            // The cursor follows every row the query returned, decodable or
+            // not, and uses the stored text so the keyset comparison in the
+            // SQL above sees exactly what it compares against (#1125).
+            if let (Some(last_updated), Some(id)) = (&row.last_updated, &row.id) {
+                last_scanned = Some(format!("{last_updated}|{id}"));
+            }
+            let row_bytes = row.data.as_ref().map_or(0, |data| data.len() as u64);
+            match row.decode(tenant, resource_type) {
+                Ok(resource) => resources.push(resource),
+                Err(skip) => {
+                    tracing::warn!(
+                        tenant = %tenant.tenant_id(),
+                        resource_type,
+                        resource_id = %skip.resource_id,
+                        reason = %skip.reason,
+                        "reindex source: stored resource row cannot be decoded; skipping it"
+                    );
+                    skipped.push(skip);
+                }
+            }
+            // Counted after the row is taken, so a page always carries at
+            // least one resource however large it is.
+            bytes = bytes.saturating_add(row_bytes);
+            if max_bytes > 0 && bytes >= max_bytes && scanned < limit as usize {
+                capped = true;
+                break;
+            }
+        }
+
+        // A full page, or one the byte cap ended early, means there may be
+        // more rows, however many of them decoded: deciding on
+        // `resources.len()` let one unreadable row end the pagination of its
+        // whole type silently.
+        let next_cursor = if limit > 0 && (capped || scanned == limit as usize) {
+            Some(last_scanned.ok_or_else(|| {
+                internal_error(format!(
+                    "Cannot page {resource_type}: no row in a full page has a readable id and lastUpdated"
                 ))
-            })
-            .collect();
-
-        // Determine next cursor
-        let next_cursor = if resources.len() == limit as usize {
-            resources
-                .last()
-                .map(|r| format!("{}|{}", r.last_modified().to_rfc3339(), r.id()))
+            })?)
         } else {
             None
         };
@@ -3971,7 +4040,164 @@ impl ReindexSource for SqliteBackend {
         Ok(ResourcePage {
             resources,
             next_cursor,
+            skipped,
         })
+    }
+
+    async fn fetch_resources_by_ids(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[String],
+    ) -> StorageResult<Vec<StoredResource>> {
+        let mut unique: Vec<&str> = ids.iter().map(String::as_str).collect();
+        unique.sort_unstable();
+        unique.dedup();
+        if unique.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.get_connection()?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let mut found = Vec::with_capacity(unique.len());
+        for batch in unique.chunks(FETCH_BY_IDS_BATCH) {
+            let placeholders = (0..batch.len())
+                .map(|k| format!("?{}", k + 3))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT id, version_id, data, last_updated, fhir_version FROM resources \
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
+                 AND id IN ({placeholders})"
+            );
+            let mut params: Vec<&dyn ToSql> = Vec::with_capacity(batch.len() + 2);
+            params.push(&tenant_id);
+            params.push(&resource_type);
+            for id in batch {
+                params.push(id);
+            }
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| internal_error(format!("Failed to prepare statement: {}", e)))?;
+            let rows = stmt
+                .query_map(params.as_slice(), RawReindexRow::read)
+                .map_err(|e| internal_error(format!("Failed to query resources: {}", e)))?;
+            for row in rows {
+                let row =
+                    row.map_err(|e| internal_error(format!("Failed to read resource row: {}", e)))?;
+                match row.decode(tenant, resource_type) {
+                    Ok(resource) => found.push(resource),
+                    // The contract has no channel for these: the scan that
+                    // first met the row already reported it as skipped.
+                    Err(skip) => tracing::warn!(
+                        tenant = %tenant.tenant_id(),
+                        resource_type,
+                        resource_id = %skip.resource_id,
+                        reason = %skip.reason,
+                        "reindex source: stored resource row cannot be decoded; skipping it"
+                    ),
+                }
+            }
+        }
+        Ok(found)
+    }
+}
+
+/// Ids bound per `IN (...)` query in [`SqliteBackend::fetch_resources_by_ids`],
+/// far below SQLite's bound-parameter limit.
+const FETCH_BY_IDS_BATCH: usize = 500;
+
+/// One `resources` row as the reindex source reads it, before decoding.
+///
+/// Every column is read leniently so a bad value becomes a
+/// [`SkippedResource`] for that row instead of an error that ends the query
+/// (or, as before #1125, a row that silently vanished).
+struct RawReindexRow {
+    id: Option<String>,
+    version_id: Option<String>,
+    data: Option<Vec<u8>>,
+    last_updated: Option<String>,
+    fhir_version: Option<String>,
+}
+
+impl RawReindexRow {
+    /// Column order: `id, version_id, data, last_updated, fhir_version`.
+    fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: column_text(row, 0),
+            version_id: column_text(row, 1),
+            data: match row.get_ref(2)? {
+                rusqlite::types::ValueRef::Blob(bytes) | rusqlite::types::ValueRef::Text(bytes) => {
+                    Some(bytes.to_vec())
+                }
+                _ => None,
+            },
+            last_updated: column_text(row, 3),
+            fhir_version: column_text(row, 4),
+        })
+    }
+
+    fn decode(
+        self,
+        tenant: &TenantContext,
+        resource_type: &str,
+    ) -> Result<StoredResource, SkippedResource> {
+        let resource_id = self.id.unwrap_or_default();
+        let skip = |reason: String| SkippedResource {
+            resource_id: resource_id.clone(),
+            reason,
+        };
+        if resource_id.is_empty() {
+            return Err(skip("row has no readable id".to_string()));
+        }
+        let version_id = self
+            .version_id
+            .ok_or_else(|| skip("row has no readable versionId".to_string()))?;
+        let data = self
+            .data
+            .ok_or_else(|| skip("row has no resource content".to_string()))?;
+        let content: Value = serde_json::from_slice(&data)
+            .map_err(|e| skip(format!("resource content is not valid JSON: {e}")))?;
+        let last_updated = self
+            .last_updated
+            .ok_or_else(|| skip("row has no readable lastUpdated".to_string()))?;
+        let last_modified = chrono::DateTime::parse_from_rfc3339(&last_updated)
+            .map_err(|e| {
+                skip(format!(
+                    "lastUpdated {last_updated:?} is not a timestamp: {e}"
+                ))
+            })?
+            .with_timezone(&Utc);
+        let fhir_version = self
+            .fhir_version
+            .as_deref()
+            .and_then(FhirVersion::from_storage)
+            .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
+        Ok(StoredResource::from_storage(
+            resource_type.to_string(),
+            resource_id.clone(),
+            version_id,
+            tenant.tenant_id().clone(),
+            content,
+            last_modified, // created_at (use last_modified as approximation)
+            last_modified,
+            None, // not deleted
+            fhir_version,
+        ))
+    }
+}
+
+/// A column as text whatever its storage class, or `None` for NULL or an
+/// out-of-range index.
+fn column_text(row: &rusqlite::Row<'_>, index: usize) -> Option<String> {
+    use rusqlite::types::ValueRef;
+    match row.get_ref(index).ok()? {
+        ValueRef::Null => None,
+        ValueRef::Integer(v) => Some(v.to_string()),
+        ValueRef::Real(v) => Some(v.to_string()),
+        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => {
+            Some(String::from_utf8_lossy(bytes).into_owned())
+        }
     }
 }
 
@@ -3987,62 +4213,53 @@ impl SqliteBackend {
         tenant: &TenantContext,
         resource: &StoredResource,
     ) -> StorageResult<usize> {
+        // Nothing reads this index when search is offloaded, and the matching
+        // delete (`delete_search_index`) is already a no-op there, so writing
+        // would only accumulate dead rows on every rebuild (#1125).
+        if self.is_search_offloaded() {
+            return Ok(0);
+        }
         let resource_type = resource.resource_type();
         let resource_id = resource.id();
         let content = resource.content();
 
-        // Use the dynamic extraction over the tenant's registry
-        let values = self
-            .tenant_extractor(tenant.tenant_id().as_str())
-            .extract(content, resource_type)
-            .map_err(|e| internal_error(format!("Search parameter extraction failed: {}", e)))?;
-
-        let mut count = 0;
-        for value in values {
-            self.write_index_entry(
-                conn,
-                tenant.tenant_id().as_str(),
-                resource_type,
-                resource_id,
-                &value,
-            )?;
-            count += 1;
-        }
-
-        // Re-index contained resources too, so `$reindex` rebuilds `_contained`
-        // search entries.
-        count += self.index_contained_resources(
+        // The same two halves the CRUD path uses. Every caller deletes the
+        // resource's search entries (FTS row included) immediately before
+        // this — without that, `$reindex` was a *destructive* operation for
+        // `_text`/`_content`: the delete dropped the FTS row and nothing put
+        // it back. `index_fts_content` is a bare INSERT with no
+        // delete-first, so if that ordering ever changes this must become
+        // delete-then-insert.
+        let tenant_id = tenant.tenant_id().as_str();
+        let prepared = self.prepare_index(tenant_id, resource_type, resource_id, content);
+        self.write_prepared_index(
             conn,
-            tenant.tenant_id().as_str(),
+            tenant_id,
             resource_type,
             resource_id,
             content,
-        )?;
+            prepared,
+        )
+    }
 
-        // Rebuild the full-text row as well. Without this, `$reindex` was a
-        // *destructive* operation for `_text`/`_content`: `run_reindex` deletes
-        // each resource's search entries via `delete_search_entries` ->
-        // `delete_search_index`, which does drop the FTS row, and nothing here
-        // put it back. That happened on every reindex, with or without
-        // `clear_existing`, so the documented recovery operation silently
-        // disabled full-text search until each resource was next written.
-        //
-        // Not counted in `count`: that value is the number of `search_index`
-        // entries, which `$reindex-status` reports, and an FTS row is not one.
-        //
-        // Safe against duplicates because every caller deletes the resource's
-        // search entries (FTS row included) immediately before this, and
-        // SQLite's `index_fts_content` is a bare INSERT with no delete-first.
-        // If that ordering ever changes, this must become delete-then-insert.
-        self.index_fts_content(
+    /// [`Self::write_search_entries_on`] with the extraction already done —
+    /// the reindex page loop prepares a page in parallel and then writes it
+    /// through here on the one connection.
+    fn write_prepared_search_entries_on(
+        &self,
+        conn: &rusqlite::Connection,
+        tenant: &TenantContext,
+        resource: &StoredResource,
+        prepared: PreparedIndex,
+    ) -> StorageResult<usize> {
+        self.write_prepared_index(
             conn,
             tenant.tenant_id().as_str(),
-            resource_type,
-            resource_id,
-            content,
-        )?;
-
-        Ok(count)
+            resource.resource_type(),
+            resource.id(),
+            resource.content(),
+            prepared,
+        )
     }
 }
 
@@ -4083,6 +4300,13 @@ impl ReindexTarget for SqliteBackend {
         tenant: &TenantContext,
         resources: &[StoredResource],
     ) -> Vec<StorageResult<usize>> {
+        // Same guard as `write_search_entries_on` and
+        // `begin_bulk_index_rebuild`: when a secondary owns search, a
+        // composite still wires this backend as a reindex writer, and the
+        // page must neither extract, take the write lock, nor insert (#1125).
+        if self.is_search_offloaded() {
+            return resources.iter().map(|_| Ok(0)).collect();
+        }
         let conn = match self.get_connection() {
             Ok(conn) => conn,
             Err(e) => {
@@ -4100,15 +4324,30 @@ impl ReindexTarget for SqliteBackend {
                 .map(|_| Err(internal_error(msg.clone())))
                 .collect();
         }
+        let page_span = crate::perf::span(crate::perf::Phase::ReindexPage);
         let tenant_id = tenant.tenant_id().as_str();
+        // Extraction for the whole page first, across the thread pool, while
+        // this connection holds the write lock for nothing else; the loop
+        // below is then statements only.
+        let items: Vec<(&str, &str, &Value)> = resources
+            .iter()
+            .map(|r| (r.resource_type(), r.id(), r.content()))
+            .collect();
+        let prepared = self.prepare_index_batch(tenant_id, &items);
         let mut results: Vec<StorageResult<usize>> = Vec::with_capacity(resources.len());
-        for resource in resources {
-            let outcome = self
-                .delete_search_index(&conn, tenant_id, resource.resource_type(), resource.id())
-                .and_then(|_| self.write_search_entries_on(&conn, tenant, resource));
+        for (resource, prepared) in resources.iter().zip(prepared) {
+            let outcome = {
+                let _span = crate::perf::span(crate::perf::Phase::IndexDelete);
+                self.delete_search_index(&conn, tenant_id, resource.resource_type(), resource.id())
+            }
+            .and_then(|_| self.write_prepared_search_entries_on(&conn, tenant, resource, prepared));
             results.push(outcome);
         }
-        if let Err(e) = conn.execute("COMMIT", []) {
+        let commit_span = crate::perf::span(crate::perf::Phase::Commit);
+        let committed = conn.execute("COMMIT", []);
+        drop(commit_span);
+        drop(page_span);
+        if let Err(e) = committed {
             let _ = conn.execute("ROLLBACK", []);
             let msg = format!("Failed to commit reindex batch: {e}");
             return resources
@@ -4119,7 +4358,59 @@ impl ReindexTarget for SqliteBackend {
         results
     }
 
+    /// Drops the `search_index` value indexes for the duration of the run.
+    /// Measured on a 72k-resource rebuild that already prepared its pages in
+    /// parallel: 18.5s with the indexes maintained row by row, 10.7s without
+    /// them plus 2.75s to build all thirteen sorted at the end — and the
+    /// sorted build is sequential I/O, so the gap widens once the b-trees
+    /// no longer fit the page cache. Reference-counted across concurrent
+    /// runs: the first one in drops, the last one out rebuilds. A process
+    /// that dies inside the window is healed at the next startup by
+    /// `schema::ensure_search_value_indexes`.
+    async fn begin_bulk_index_rebuild(&self) -> StorageResult<()> {
+        if self.is_search_offloaded() {
+            return Ok(());
+        }
+        let mut active = BULK_INDEX_REBUILDS.lock();
+        if *active == 0 {
+            let conn = self.get_connection()?;
+            let started = std::time::Instant::now();
+            super::schema::drop_search_value_indexes(&conn)?;
+            tracing::info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "bulk index rebuild: search_index value indexes dropped for the run"
+            );
+        }
+        *active += 1;
+        Ok(())
+    }
+
+    async fn end_bulk_index_rebuild(&self) -> StorageResult<()> {
+        if self.is_search_offloaded() {
+            return Ok(());
+        }
+        let mut active = BULK_INDEX_REBUILDS.lock();
+        *active = active.saturating_sub(1);
+        if *active == 0 {
+            let conn = self.get_connection()?;
+            let started = std::time::Instant::now();
+            let created = super::schema::ensure_search_value_indexes(&conn)?;
+            tracing::info!(
+                created,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "bulk index rebuild: search_index value indexes rebuilt"
+            );
+        }
+        Ok(())
+    }
+
     async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64> {
+        // Offloaded: the writes above are no-ops, so clearing must be one too
+        // or `$reindex` with `clearExisting` would be the only operation that
+        // still touches this index.
+        if self.is_search_offloaded() {
+            return Ok(0);
+        }
         let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
 
@@ -4159,6 +4450,7 @@ mod tests {
     use super::*;
     use crate::core::history::HistoryParams;
     use crate::tenant::{TenantId, TenantPermissions};
+    use crate::types::{SearchParamType, SearchParameter, SearchValue};
     use serde_json::json;
     use std::path::PathBuf;
 
@@ -4187,6 +4479,571 @@ mod tests {
             TenantId::new("test-tenant"),
             TenantPermissions::full_access(),
         )
+    }
+
+    /// #1078: SQLite's `count_all_types` / `count_deltas_by_bucket` are real
+    /// aggregates, so it opts in to `supports_type_counts`.
+    #[test]
+    fn test_supports_type_counts() {
+        let backend = SqliteBackend::in_memory().unwrap();
+        assert!(backend.supports_type_counts());
+    }
+
+    fn other_tenant() -> TenantContext {
+        TenantContext::new(
+            TenantId::new("other-tenant"),
+            TenantPermissions::full_access(),
+        )
+    }
+
+    /// #1078: an empty tenant has no newest write, and zero recent writes only
+    /// when a bound was asked for.
+    #[tokio::test]
+    async fn test_latest_write_marker_empty_tenant() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+
+        let marker = backend
+            .latest_write_marker(&tenant, None)
+            .await
+            .unwrap()
+            .expect("SQLite provides a marker");
+        assert_eq!(
+            marker,
+            crate::core::WriteMarker {
+                latest: None,
+                recent_writes: None
+            }
+        );
+
+        let since = Utc::now() - chrono::Duration::hours(1);
+        let marker = backend
+            .latest_write_marker(&tenant, Some(since))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(marker.latest, None);
+        assert_eq!(marker.recent_writes, Some(0));
+    }
+
+    /// #1078: every committed write of the tenant — create, update, delete —
+    /// changes its marker; another tenant's writes do not.
+    #[tokio::test]
+    async fn test_latest_write_marker_changes_on_each_write_and_is_tenant_scoped() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let since = Some(Utc::now() - chrono::Duration::hours(1));
+        let marker = || async { backend.latest_write_marker(&tenant, since).await.unwrap() };
+
+        let empty = marker().await;
+
+        let created = backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        let after_create = marker().await;
+        assert_ne!(after_create, empty, "a create changes the marker");
+        let after_create_marker = after_create.unwrap();
+        assert_eq!(after_create_marker.latest, Some(created.last_modified()));
+        assert_eq!(after_create_marker.recent_writes, Some(1));
+
+        let updated = backend
+            .update(&tenant, &created, json!({"active": true}))
+            .await
+            .unwrap();
+        let after_update = marker().await;
+        assert_ne!(after_update, after_create, "an update changes the marker");
+        assert_eq!(after_update.unwrap().latest, Some(updated.last_modified()));
+
+        backend
+            .delete(&tenant, "Patient", created.id())
+            .await
+            .unwrap();
+        let after_delete = marker().await;
+        assert_ne!(after_delete, after_update, "a delete changes the marker");
+        assert_eq!(after_delete.unwrap().recent_writes, Some(3));
+
+        // Another tenant's writes leave this tenant's marker alone.
+        let other = other_tenant();
+        backend
+            .create(&other, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        assert_eq!(marker().await, after_delete);
+        let other_marker = backend
+            .latest_write_marker(&other, since)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(other_marker.recent_writes, Some(1));
+    }
+
+    /// #1078: `recent_writes` counts only the tenant's history rows at or after
+    /// the bound, and stops at the cap.
+    #[tokio::test]
+    async fn test_latest_write_marker_recent_writes_bound_and_cap() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let start = Utc::now() - chrono::Duration::seconds(1);
+
+        for _ in 0..3 {
+            backend
+                .create(&tenant, "Patient", json!({}), FhirVersion::default())
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let bound = Utc::now();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        for _ in 0..2 {
+            backend
+                .create(&tenant, "Observation", json!({}), FhirVersion::default())
+                .await
+                .unwrap();
+        }
+
+        let recent = |since, cap| {
+            let backend = &backend;
+            let tenant = &tenant;
+            async move {
+                backend
+                    .latest_write_marker_capped(tenant, Some(since), cap)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .recent_writes
+            }
+        };
+        assert_eq!(recent(bound, WRITE_MARKER_RECENT_CAP).await, Some(2));
+        assert_eq!(recent(start, WRITE_MARKER_RECENT_CAP).await, Some(5));
+        assert_eq!(recent(start, 3).await, Some(3), "capped");
+        assert_eq!(
+            recent(Utc::now() + chrono::Duration::hours(1), 3).await,
+            Some(0)
+        );
+
+        // The trait method uses the production cap.
+        let marker = backend
+            .latest_write_marker(&tenant, Some(start))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(marker.recent_writes, Some(5));
+    }
+
+    /// #1078: both marker probes are index searches on `idx_history_updated` —
+    /// never a table or full-index scan, and the newest-row probe never sorts.
+    #[test]
+    fn test_latest_write_marker_query_plans_use_the_history_index() {
+        let backend = create_test_backend();
+        let conn = backend.get_connection().unwrap();
+        let plan = |sql: &str, binds: &[&dyn ToSql]| -> Vec<String> {
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            stmt.query_map(binds, |row| row.get::<_, String>(3))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        let bound = Utc::now().to_rfc3339();
+
+        for (name, details) in [
+            ("latest", plan(LATEST_WRITE_SQL, &[&"t"])),
+            (
+                "recent",
+                plan(RECENT_WRITES_SQL, &[&"t", &bound, &WRITE_MARKER_RECENT_CAP]),
+            ),
+        ] {
+            assert!(
+                details
+                    .iter()
+                    .any(|d| d.starts_with("SEARCH resource_history")
+                        && d.contains("idx_history_updated")),
+                "{name}: expected an idx_history_updated search, got {details:?}"
+            );
+            assert!(
+                !details
+                    .iter()
+                    .any(|d| d.starts_with("SCAN resource_history")),
+                "{name}: must not scan resource_history, got {details:?}"
+            );
+            assert!(
+                !details.iter().any(|d| d.contains("TEMP B-TREE")),
+                "{name}: must not sort, got {details:?}"
+            );
+        }
+    }
+
+    fn count_rows(backend: &SqliteBackend, table: &str, tenant: &TenantContext) -> i64 {
+        let conn = backend.get_connection().unwrap();
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE tenant_id = ?1"),
+            params![tenant.tenant_id().as_str()],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// #1125: on `sqlite-es` the offloaded primary is still handed to the
+    /// reindex as a writer. Its delete was already a no-op there, so an
+    /// unguarded write added a full set of dead `search_index` and FTS rows on
+    /// every rebuild. Every write-side entry point must now leave the index
+    /// exactly as it found it — rows from before the offload included.
+    #[tokio::test]
+    async fn reindex_writes_are_no_ops_when_search_is_offloaded() {
+        let mut backend = create_test_backend();
+        let tenant = create_test_tenant();
+        for i in 1..=3 {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": format!("p{i}"),
+                        "name": [{"family": "Offload", "given": ["Ann"]}]
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let index_rows = count_rows(&backend, "search_index", &tenant);
+        let fts_rows = count_rows(&backend, "resource_fts", &tenant);
+        assert!(index_rows > 0, "precondition: the resources were indexed");
+        assert!(fts_rows > 0, "precondition: the FTS rows exist");
+
+        backend.set_search_offloaded(true);
+        let page = backend
+            .fetch_resources_page(&tenant, "Patient", None, 100)
+            .await
+            .unwrap();
+        assert_eq!(page.resources.len(), 3);
+
+        for _ in 0..2 {
+            let results = backend
+                .write_search_entries_page(&tenant, &page.resources)
+                .await;
+            assert_eq!(results.len(), 3, "one result per resource");
+            assert!(results.iter().all(|r| matches!(r, Ok(0))), "{results:?}");
+        }
+        for resource in &page.resources {
+            assert_eq!(
+                backend
+                    .write_search_entries(&tenant, resource)
+                    .await
+                    .unwrap(),
+                0
+            );
+        }
+        assert_eq!(backend.clear_search_index(&tenant).await.unwrap(), 0);
+
+        assert_eq!(
+            count_rows(&backend, "search_index", &tenant),
+            index_rows,
+            "offloaded reindex writes must neither add nor clear search_index rows"
+        );
+        assert_eq!(
+            count_rows(&backend, "resource_fts", &tenant),
+            fts_rows,
+            "offloaded reindex writes must neither add nor clear FTS rows"
+        );
+    }
+
+    /// #1125: a row whose content or timestamp does not parse used to vanish
+    /// from its page, and because the cursor was only emitted for a page that
+    /// *decoded* to `limit` resources, it also ended the pagination of its
+    /// type. It is now reported and the scan carries on past it.
+    #[tokio::test]
+    async fn fetch_resources_page_reports_unparseable_rows_and_keeps_paginating() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        for i in 1..=5 {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": format!("p{i}")}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        {
+            let conn = backend.get_connection().unwrap();
+            conn.execute(
+                "UPDATE resources SET data = CAST('{not json' AS BLOB) \
+                 WHERE tenant_id = ?1 AND resource_type = 'Patient' AND id = 'p1'",
+                params![tenant.tenant_id().as_str()],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE resources SET last_updated = 'not-a-date' \
+                 WHERE tenant_id = ?1 AND resource_type = 'Patient' AND id = 'p2'",
+                params![tenant.tenant_id().as_str()],
+            )
+            .unwrap();
+        }
+
+        let mut decoded = Vec::new();
+        let mut skipped = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let page = backend
+                .fetch_resources_page(&tenant, "Patient", cursor.as_deref(), 2)
+                .await
+                .unwrap();
+            pages += 1;
+            assert!(pages <= 5, "pagination must terminate");
+            decoded.extend(page.resources.iter().map(|r| r.id().to_string()));
+            skipped.extend(page.skipped);
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+
+        decoded.sort();
+        assert_eq!(
+            decoded,
+            ["p3", "p4", "p5"],
+            "every decodable resource after the bad rows must still be read"
+        );
+        skipped.sort_by(|a, b| a.resource_id.cmp(&b.resource_id));
+        let skipped_ids: Vec<&str> = skipped.iter().map(|s| s.resource_id.as_str()).collect();
+        assert_eq!(skipped_ids, ["p1", "p2"]);
+        assert!(skipped[0].reason.contains("JSON"), "{}", skipped[0].reason);
+        assert!(
+            skipped[1].reason.contains("lastUpdated"),
+            "{}",
+            skipped[1].reason
+        );
+    }
+
+    /// #1125: `HFS_REINDEX_BATCH_BYTES` bounds a reindex page by the bytes of
+    /// stored JSON it carries as well as by its resource count, so a page of
+    /// large resources is not one oversized read. Under a cap only one
+    /// resource fits beneath, the scan must still walk the whole type — every
+    /// resource once, no resource twice — and then stop.
+    #[tokio::test]
+    async fn fetch_resources_page_capped_pages_one_resource_at_a_time_under_a_byte_cap() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        for i in 1..=5 {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": format!("p{i}"),
+                        "name": [{"family": "Capped"}]
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        // A cap the smallest stored row already reaches on its own: whichever
+        // resource a page starts with ends it.
+        let cap: u64 = {
+            let conn = backend.get_connection().unwrap();
+            conn.query_row(
+                "SELECT MIN(LENGTH(data)) FROM resources \
+                 WHERE tenant_id = ?1 AND resource_type = 'Patient' AND is_deleted = 0",
+                params![tenant.tenant_id().as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap() as u64
+        };
+        assert!(cap > 0, "precondition: the rows have stored bytes");
+
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let page = backend
+                .fetch_resources_page_capped(&tenant, "Patient", cursor.as_deref(), 100, cap)
+                .await
+                .unwrap();
+            pages += 1;
+            assert!(pages <= 10, "pagination must terminate");
+            assert!(
+                page.resources.len() <= 1,
+                "the cap admits one resource per page, got {}",
+                page.resources.len()
+            );
+            seen.extend(page.resources.iter().map(|r| r.id().to_string()));
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+
+        seen.sort();
+        assert_eq!(
+            seen,
+            ["p1", "p2", "p3", "p4", "p5"],
+            "every resource is returned exactly once across the capped pages"
+        );
+
+        // `0` is the cap switched off: the same rows come back as one page.
+        let whole = backend
+            .fetch_resources_page_capped(&tenant, "Patient", None, 100, 0)
+            .await
+            .unwrap();
+        assert_eq!(whole.resources.len(), 5);
+        assert!(whole.next_cursor.is_none());
+    }
+
+    /// #1125: the bytes are counted *after* the row is taken, so a resource
+    /// larger than the cap is still returned. A page that refused it would be
+    /// empty, and the reindex loop would either stop early or ask for the same
+    /// page forever.
+    #[tokio::test]
+    async fn fetch_resources_page_capped_returns_a_resource_larger_than_the_cap() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "big",
+                    "name": [{"family": "X".repeat(20_000)}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "small"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        // Two bytes: below every row, the oversized one included.
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let page = backend
+                .fetch_resources_page_capped(&tenant, "Patient", cursor.as_deref(), 100, 2)
+                .await
+                .unwrap();
+            pages += 1;
+            assert!(pages <= 4, "pagination must terminate");
+            if seen.len() < 2 {
+                assert_eq!(
+                    page.resources.len(),
+                    1,
+                    "page {pages} is empty: a resource over the cap was refused"
+                );
+            }
+            seen.extend(page.resources.iter().map(|r| r.id().to_string()));
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+
+        seen.sort();
+        assert_eq!(seen, ["big", "small"]);
+    }
+
+    /// The SQLite writer drops its value indexes on `begin` and has every one
+    /// of them back on `end`, with the rows written meanwhile indexed — the
+    /// rebuild wrote them into the table only, and the sorted build picked
+    /// them up.
+    #[tokio::test]
+    async fn bulk_index_rebuild_restores_every_value_index_and_search_works() {
+        use crate::search::{ReindexOperation, ReindexRequest};
+
+        let backend = std::sync::Arc::new(create_test_backend());
+        let tenant = create_test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p1", "name": [{"family": "Rebuild"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let index_names = |backend: &SqliteBackend| -> Vec<String> {
+            let conn = backend.get_connection().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'search_index' ORDER BY name",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        let before = index_names(&backend);
+        assert!(before.len() > 2);
+
+        backend.begin_bulk_index_rebuild().await.unwrap();
+        assert_eq!(
+            index_names(&backend),
+            vec!["idx_search_composite".to_string()]
+        );
+        // Nested run: still dropped, and the outer end is the one that rebuilds.
+        backend.begin_bulk_index_rebuild().await.unwrap();
+        backend.end_bulk_index_rebuild().await.unwrap();
+        assert_eq!(
+            index_names(&backend),
+            vec!["idx_search_composite".to_string()]
+        );
+        backend.end_bulk_index_rebuild().await.unwrap();
+        assert_eq!(index_names(&backend), before);
+
+        // The whole run, through the driver, on a database whose rows were
+        // written without the indexes.
+        let op = ReindexOperation::new(backend.clone(), backend.tenant_registries().clone());
+        let id = op
+            .start(
+                tenant.clone(),
+                ReindexRequest::for_types(["Patient"]).with_bulk_index_rebuild(true),
+                None,
+            )
+            .await
+            .unwrap();
+        // The run does its SQLite work on blocking threads, so yielding the
+        // async runtime is not enough to let it finish: wait on the clock.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            if op.get_progress(&id).await.unwrap().status.is_finished() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reindex did not finish within 60s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let progress = op.get_progress(&id).await.unwrap();
+        assert!(progress.errors.is_empty(), "{:?}", progress.errors);
+        assert_eq!(index_names(&backend), before);
+
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "family".to_string(),
+            param_type: SearchParamType::String,
+            modifier: None,
+            values: vec![SearchValue::eq("Rebuild")],
+            chain: vec![],
+            components: vec![],
+        });
+        let results = backend.search(&tenant, &query).await.unwrap();
+        assert_eq!(results.resources.items.len(), 1);
     }
 
     #[tokio::test]
@@ -4577,6 +5434,193 @@ mod tests {
         assert!(
             backend
                 .count_deltas_by_bucket(&tenant, "Patient", since, 0)
+                .await
+                .is_err()
+        );
+    }
+
+    /// #1078: the grouped `count_deltas_by_type_and_bucket` returns exactly the
+    /// `(type, bucket, delta)` rows the per-type `count_deltas_by_bucket` calls
+    /// return — over creates, updates and deletes in two buckets, per tenant,
+    /// with a type netting to zero in a bucket and a requested type with no
+    /// rows at all.
+    #[tokio::test]
+    async fn test_count_deltas_by_type_and_bucket_matches_per_type_calls() {
+        use std::collections::BTreeSet;
+
+        let backend = create_test_backend();
+        let tenant_a = create_test_tenant();
+        let tenant_b = TenantContext::new(
+            TenantId::new("other-tenant"),
+            TenantPermissions::full_access(),
+        );
+        let v = FhirVersion::default();
+
+        // Earlier bucket, backdated below: tenant A creates two Patients
+        // (updating one) and an Observation, and creates then deletes an
+        // Encounter (a net zero); tenant B creates three Patients.
+        let p1 = backend
+            .create(&tenant_a, "Patient", json!({}), v)
+            .await
+            .unwrap();
+        let p2 = backend
+            .create(&tenant_a, "Patient", json!({}), v)
+            .await
+            .unwrap();
+        let p1 = backend
+            .update(&tenant_a, &p1, json!({"active": true}))
+            .await
+            .unwrap();
+        let o1 = backend
+            .create(&tenant_a, "Observation", json!({}), v)
+            .await
+            .unwrap();
+        let e1 = backend
+            .create(&tenant_a, "Encounter", json!({}), v)
+            .await
+            .unwrap();
+        backend
+            .delete(&tenant_a, "Encounter", e1.id())
+            .await
+            .unwrap();
+        let mut b_patients = Vec::new();
+        for _ in 0..3 {
+            b_patients.push(
+                backend
+                    .create(&tenant_b, "Patient", json!({}), v)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let earlier = Utc::now() - chrono::Duration::hours(2);
+        backend
+            .get_connection()
+            .unwrap()
+            .execute(
+                "UPDATE resource_history SET last_updated = ?1",
+                params![earlier.to_rfc3339()],
+            )
+            .unwrap();
+
+        // Current bucket: tenant A deletes a Patient, updates p1 and the
+        // Observation, and creates an Observation and an Encounter; tenant B
+        // deletes a Patient and creates an Observation.
+        backend.delete(&tenant_a, "Patient", p2.id()).await.unwrap();
+        backend
+            .update(&tenant_a, &p1, json!({"active": false}))
+            .await
+            .unwrap();
+        backend
+            .update(&tenant_a, &o1, json!({"status": "final"}))
+            .await
+            .unwrap();
+        backend
+            .create(&tenant_a, "Observation", json!({}), v)
+            .await
+            .unwrap();
+        backend
+            .create(&tenant_a, "Encounter", json!({}), v)
+            .await
+            .unwrap();
+        backend
+            .delete(&tenant_b, "Patient", b_patients[0].id())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant_b, "Observation", json!({}), v)
+            .await
+            .unwrap();
+
+        let since = Utc::now() - chrono::Duration::hours(3);
+        let bucket = 3600;
+        let earlier_bucket = crate::core::bucket_floor(earlier, bucket).timestamp();
+        let types = ["Patient", "Observation", "Encounter", "Condition"];
+
+        type Row = (String, i64, i64);
+        let mut grouped_by_tenant = Vec::new();
+        for tenant in [&tenant_a, &tenant_b] {
+            let grouped: Vec<Row> = backend
+                .count_deltas_by_type_and_bucket(tenant, &types, since, bucket)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(rt, d)| (rt, d.bucket_start.timestamp(), d.delta))
+                .collect();
+            let mut per_type: BTreeSet<Row> = BTreeSet::new();
+            for rt in types {
+                for d in backend
+                    .count_deltas_by_bucket(tenant, rt, since, bucket)
+                    .await
+                    .unwrap()
+                {
+                    per_type.insert((rt.to_string(), d.bucket_start.timestamp(), d.delta));
+                }
+            }
+            let grouped_set: BTreeSet<Row> = grouped.iter().cloned().collect();
+            assert_eq!(grouped.len(), grouped_set.len(), "no duplicate rows");
+            assert_eq!(grouped_set, per_type, "{}", tenant.tenant_id().as_str());
+            assert!(grouped.iter().all(|(_, b, d)| b % bucket == 0 && *d != 0));
+            assert!(
+                grouped
+                    .windows(2)
+                    .all(|w| w[0].0 != w[1].0 || w[0].1 < w[1].1),
+                "buckets ascend within a type"
+            );
+            assert!(
+                !grouped.iter().any(|(rt, _, _)| rt == "Condition"),
+                "a type with no rows contributes none"
+            );
+            grouped_by_tenant.push(grouped_set);
+        }
+
+        let net = |rows: &BTreeSet<Row>, rt: &str| -> i64 {
+            rows.iter()
+                .filter(|(t, _, _)| t == rt)
+                .map(|(_, _, d)| d)
+                .sum()
+        };
+        let at = |rows: &BTreeSet<Row>, rt: &str, b: i64| -> Option<i64> {
+            rows.iter()
+                .find(|(t, rb, _)| t == rt && *rb == b)
+                .map(|(_, _, d)| *d)
+        };
+        let a = &grouped_by_tenant[0];
+        let buckets: BTreeSet<i64> = a.iter().map(|(_, b, _)| *b).collect();
+        assert!(buckets.len() >= 2, "the fixture spans two buckets: {a:?}");
+        assert_eq!(at(a, "Patient", earlier_bucket), Some(2));
+        assert_eq!(at(a, "Observation", earlier_bucket), Some(1));
+        assert_eq!(
+            at(a, "Encounter", earlier_bucket),
+            None,
+            "a create and delete in one bucket net to zero and are dropped"
+        );
+        assert_eq!(net(a, "Patient"), 1);
+        assert_eq!(net(a, "Observation"), 2);
+        assert_eq!(net(a, "Encounter"), 1);
+
+        let b = &grouped_by_tenant[1];
+        assert_eq!(at(b, "Patient", earlier_bucket), Some(3), "tenant-isolated");
+        assert_eq!(net(b, "Patient"), 2);
+        assert_eq!(net(b, "Observation"), 1);
+        assert_eq!(net(b, "Encounter"), 0);
+
+        // A duplicated type is counted once; no types means no rows; a bogus
+        // width is rejected like the per-type method's.
+        let twice = backend
+            .count_deltas_by_type_and_bucket(&tenant_a, &["Patient", "Patient"], since, bucket)
+            .await
+            .unwrap();
+        assert_eq!(twice.len(), a.iter().filter(|r| r.0 == "Patient").count());
+        assert!(
+            backend
+                .count_deltas_by_type_and_bucket(&tenant_a, &[], since, bucket)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            backend
+                .count_deltas_by_type_and_bucket(&tenant_a, &["Patient"], since, 0)
                 .await
                 .is_err()
         );
@@ -6361,6 +7405,7 @@ mod tests {
                 "identifier=12345",
                 false,
                 FhirVersion::default(),
+                &crate::core::EntityTagPrecondition::Absent,
             )
             .await
             .unwrap();
@@ -6387,6 +7432,7 @@ mod tests {
                 "identifier=99999",
                 false,
                 FhirVersion::default(),
+                &crate::core::EntityTagPrecondition::Absent,
             )
             .await
             .unwrap();
@@ -6411,6 +7457,7 @@ mod tests {
                 "identifier=new-id",
                 true,
                 FhirVersion::default(),
+                &crate::core::EntityTagPrecondition::Absent,
             )
             .await
             .unwrap();
@@ -6441,7 +7488,12 @@ mod tests {
 
         // Conditional delete
         let result = backend
-            .conditional_delete(&tenant, "Patient", "_id=p1")
+            .conditional_delete(
+                &tenant,
+                "Patient",
+                "_id=p1",
+                &crate::core::EntityTagPrecondition::Absent,
+            )
             .await
             .unwrap();
 
@@ -6466,7 +7518,12 @@ mod tests {
 
         // Conditional delete with no match
         let result = backend
-            .conditional_delete(&tenant, "Patient", "_id=nonexistent")
+            .conditional_delete(
+                &tenant,
+                "Patient",
+                "_id=nonexistent",
+                &crate::core::EntityTagPrecondition::Absent,
+            )
             .await
             .unwrap();
 
@@ -6541,7 +7598,13 @@ mod tests {
         ]));
 
         let result = backend
-            .conditional_patch(&tenant, "Patient", "_id=p1", &patch)
+            .conditional_patch(
+                &tenant,
+                "Patient",
+                "_id=p1",
+                &patch,
+                &crate::core::EntityTagPrecondition::Absent,
+            )
             .await
             .unwrap();
 
@@ -6578,7 +7641,13 @@ mod tests {
         }));
 
         let result = backend
-            .conditional_patch(&tenant, "Patient", "_id=p1", &patch)
+            .conditional_patch(
+                &tenant,
+                "Patient",
+                "_id=p1",
+                &patch,
+                &crate::core::EntityTagPrecondition::Absent,
+            )
             .await
             .unwrap();
 
@@ -6603,7 +7672,13 @@ mod tests {
         ]));
 
         let result = backend
-            .conditional_patch(&tenant, "Patient", "_id=nonexistent", &patch)
+            .conditional_patch(
+                &tenant,
+                "Patient",
+                "_id=nonexistent",
+                &patch,
+                &crate::core::EntityTagPrecondition::Absent,
+            )
             .await
             .unwrap();
 
@@ -6874,6 +7949,83 @@ mod tests {
             Some("Heart rate"),
             "Display text should be 'Heart rate'"
         );
+    }
+
+    /// #1379: a `code` element's row carries the implicit-system marker, and
+    /// `system|code` accepts it. A row written before the marker existed has
+    /// no system at all, exactly like a system-less Coding, so it cannot be
+    /// told apart and must keep its old behaviour — never over-match — until
+    /// the resource is reindexed.
+    #[tokio::test]
+    async fn test_unmarked_code_rows_keep_their_old_behaviour() {
+        use crate::search::IMPLICIT_TOKEN_SYSTEM;
+
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "pt-f", "gender": "female"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let ids = |modifier: Option<crate::types::SearchModifier>, value: &str| {
+            let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+                name: "gender".to_string(),
+                param_type: SearchParamType::Token,
+                modifier,
+                values: vec![SearchValue::eq(value)],
+                chain: vec![],
+                components: vec![],
+            });
+            let backend = &backend;
+            let tenant = &tenant;
+            async move {
+                let found = backend.search(tenant, &query).await.unwrap();
+                found
+                    .resources
+                    .items
+                    .iter()
+                    .map(|r| r.id().to_string())
+                    .collect::<Vec<_>>()
+            }
+        };
+        let qualified = "http://hl7.org/fhir/administrative-gender|female";
+        let not = Some(crate::types::SearchModifier::Not);
+
+        // As indexed today.
+        let stored: Option<String> = backend
+            .get_connection()
+            .unwrap()
+            .query_row(
+                "SELECT value_token_system FROM search_index
+                 WHERE resource_id = 'pt-f' AND param_name = 'gender'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some(IMPLICIT_TOKEN_SYSTEM));
+        assert_eq!(ids(None, qualified).await, vec!["pt-f"]);
+        assert!(ids(not.clone(), qualified).await.is_empty());
+
+        // As indexed before #1379.
+        let updated = backend
+            .get_connection()
+            .unwrap()
+            .execute(
+                "UPDATE search_index SET value_token_system = NULL
+                 WHERE resource_id = 'pt-f' AND param_name = 'gender'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(updated, 1);
+        assert_eq!(ids(None, "female").await, vec!["pt-f"], "positive control");
+        assert_eq!(ids(None, "|female").await, vec!["pt-f"]);
+        assert!(ids(None, qualified).await.is_empty());
+        assert_eq!(ids(not, qualified).await, vec!["pt-f"]);
     }
 
     #[tokio::test]

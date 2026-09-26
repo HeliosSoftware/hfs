@@ -18,7 +18,24 @@
     "display": "Inpatient"
   },
   "dateTime": "2014-09-17",
+  "requester": {
+    "reference": "Practitioner/example",
+    "display": "Dr Adam Careful"
+  },
   "enteralFormula": {
+    "type": [
+      {
+        "concept": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "40043006",
+              "display": "Bottle feeding of patient (regime/therapy)"
+            }
+          ]
+        }
+      }
+    ],
     "caloricDensity": {
       "value": 20,
       "unit": "calories per ounce",
@@ -61,6 +78,12 @@
         }
       }
     ],
+    "maxVolumeToAdminister": {
+      "value": 32,
+      "unit": "ounces",
+      "system": "http://unitsofmeasure.org",
+      "code": "[foz_us]"
+    },
     "administrationInstruction": "Add high calorie high carbohydrate additive to increase cal/oz from 24 cal/oz to 27 cal/oz."
   },
   "additive": [

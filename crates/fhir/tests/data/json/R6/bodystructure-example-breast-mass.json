@@ -6,8 +6,8 @@
       "structure": {
         "coding": [
           {
-            "code": "76752008",
             "system": "http://snomed.info/sct",
+            "code": "76752008",
             "display": "Breast"
           }
         ]
@@ -15,8 +15,8 @@
       "laterality": {
         "coding": [
           {
-            "code": "7771000",
             "system": "http://snomed.info/sct",
+            "code": "7771000",
             "display": "Left"
           }
         ]
@@ -27,8 +27,8 @@
             {
               "coding": [
                 {
-                  "code": "260328008",
                   "system": "http://snomed.info/sct",
+                  "code": "260328008",
                   "display": "2 o\u0027clock position"
                 }
               ]
@@ -40,8 +40,8 @@
             {
               "coding": [
                 {
-                  "code": "24142002",
                   "system": "http://snomed.info/sct",
+                  "code": "24142002",
                   "display": "Nipple"
                 }
               ]
@@ -52,9 +52,9 @@
               "value": [
                 {
                   "value": 3,
-                  "code": "cm",
                   "unit": "cm",
-                  "system": "http://unitsofmeasure.org"
+                  "system": "http://unitsofmeasure.org",
+                  "code": "cm"
                 }
               ]
             }
@@ -65,8 +65,8 @@
         {
           "coding": [
             {
-              "code": "89164003",
               "system": "http://snomed.info/sct",
+              "code": "89164003",
               "display": "Breast mass"
             }
           ]

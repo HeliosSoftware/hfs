@@ -191,6 +191,25 @@ pub enum BackendCapability {
     InDbSofRunner,
     /// Backend supports raw SQL queries via `$sql-query-run` (Postgres, SQLite only).
     RawSqlQuery,
+    /// Conditional create (`POST [type]` with `If-None-Exist`):
+    /// [`ConditionalStorage::conditional_create`](crate::core::ConditionalStorage::conditional_create)
+    /// resolves the criteria and writes, rather than answering
+    /// `UnsupportedCapability`.
+    ///
+    /// The four `Conditional*` variants are the one source the
+    /// CapabilityStatement's `rest.resource.conditional*` elements and the REST
+    /// layer's `501` both read, through
+    /// [`ConditionalStorage::supports_conditional`](crate::core::ConditionalStorage::supports_conditional)
+    /// (#1384). A backend declares one only when the matching trait method is
+    /// really implemented; S3 declares none.
+    ConditionalCreate,
+    /// Conditional update (`PUT [type]?criteria`).
+    ConditionalUpdate,
+    /// Conditional delete (`DELETE [type]?criteria`). Single-match only: more
+    /// than one match is reported, never deleted.
+    ConditionalDelete,
+    /// Conditional patch (`PATCH [type]?criteria`). S3 does not serve it.
+    ConditionalPatch,
 }
 
 impl std::fmt::Display for BackendCapability {
@@ -225,6 +244,10 @@ impl std::fmt::Display for BackendCapability {
             BackendCapability::DatabasePerTenant => "database-per-tenant",
             BackendCapability::InDbSofRunner => "indb-sof-runner",
             BackendCapability::RawSqlQuery => "raw-sql-query",
+            BackendCapability::ConditionalCreate => "conditional-create",
+            BackendCapability::ConditionalUpdate => "conditional-update",
+            BackendCapability::ConditionalDelete => "conditional-delete",
+            BackendCapability::ConditionalPatch => "conditional-patch",
         };
         write!(f, "{}", name)
     }

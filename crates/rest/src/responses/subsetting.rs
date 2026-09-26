@@ -78,36 +78,12 @@ pub fn add_subsetted_tag(resource: &mut Value) {
     }
 }
 
-/// Converts a Rust snake_case field name to JSON camelCase.
-///
-/// The generated FHIR types use snake_case for Rust field names, but the
-/// JSON serialization uses camelCase. This function converts between the two.
-fn snake_to_camel(s: &str) -> String {
-    // Handle raw identifier prefix
-    let s = s.strip_prefix("r#").unwrap_or(s);
-
-    let mut result = String::with_capacity(s.len());
-    let mut capitalize_next = false;
-
-    for c in s.chars() {
-        if c == '_' {
-            capitalize_next = true;
-        } else if capitalize_next {
-            result.push(c.to_ascii_uppercase());
-            capitalize_next = false;
-        } else {
-            result.push(c);
-        }
-    }
-
-    result
-}
-
 /// Returns summary elements for a resource type using the FHIR specification metadata.
 ///
-/// This function retrieves the summary fields from the generated FHIR types, which are
-/// derived from the `isSummary` flag in the official FHIR StructureDefinitions.
-/// The field names are converted from Rust snake_case to JSON camelCase.
+/// The element names come from [`helios_fhir::summary_elements`], which derives
+/// them from the `isSummary` flag in the official FHIR StructureDefinitions and
+/// owns the Rust-field-name → JSON-element-name conversion (this module used to
+/// carry its own copy; #1107).
 ///
 /// # Arguments
 ///
@@ -116,34 +92,17 @@ fn snake_to_camel(s: &str) -> String {
 ///
 /// # Returns
 ///
-/// A vector of field names in camelCase that should be included in summaries.
+/// A vector of JSON element names that should be included in summaries.
+/// `resourceType` is always first (it is not a struct field but always needed);
+/// `id` and `meta` follow from the spec's own summary flags, and
+/// [`ALWAYS_INCLUDED`] backstops them in `filter_resource` regardless.
 fn get_summary_elements(resource_type: &str, fhir_version: FhirVersion) -> Vec<String> {
-    // Get the summary fields from the generated FHIR types
-    let summary_fields: &[&str] = match fhir_version {
-        #[cfg(feature = "R4")]
-        FhirVersion::R4 => helios_fhir::r4::get_summary_fields(resource_type),
-        #[cfg(feature = "R4B")]
-        FhirVersion::R4B => helios_fhir::r4b::get_summary_fields(resource_type),
-        #[cfg(feature = "R5")]
-        FhirVersion::R5 => helios_fhir::r5::get_summary_fields(resource_type),
-        #[cfg(feature = "R6")]
-        FhirVersion::R6 => helios_fhir::r6::get_summary_fields(resource_type),
-        // Fallback for versions not enabled - use minimal fields
-        #[allow(unreachable_patterns)]
-        _ => &["resourceType", "id", "meta"],
-    };
-
-    // Convert snake_case Rust field names to camelCase JSON keys
-    // Also ensure resourceType is always included (it's not a struct field but always needed)
     let mut elements: Vec<String> = vec!["resourceType".to_string()];
-
-    for field in summary_fields {
-        let camel = snake_to_camel(field);
-        if !elements.contains(&camel) {
-            elements.push(camel);
+    for element in helios_fhir::summary_elements(fhir_version, resource_type) {
+        if !elements.contains(&element) {
+            elements.push(element);
         }
     }
-
     elements
 }
 
@@ -210,41 +169,40 @@ pub fn apply_elements(resource: &Value, elements: &[&str]) -> Value {
 
 /// Filters a resource to include only specified top-level elements.
 fn filter_resource(resource: &Value, elements: &[&str]) -> Value {
-    if let Value::Object(obj) = resource {
-        let mut result = Map::new();
-
-        for (key, value) in obj {
-            // Check if this key is in the elements list
-            // Also handle nested paths (e.g., "name" should include "name" object)
-            if elements
-                .iter()
-                .any(|e| *e == key || e.starts_with(&format!("{}.", key)) || key == "resourceType")
-            {
-                // If there's a nested path, filter the nested object
-                let nested_paths: Vec<&str> = elements
-                    .iter()
-                    .filter_map(|e| {
-                        if e.starts_with(&format!("{}.", key)) {
-                            Some(&e[key.len() + 1..])
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-
-                if !nested_paths.is_empty() && value.is_object() {
-                    // Filter nested object
-                    result.insert(key.clone(), filter_nested(value, &nested_paths));
-                } else {
-                    result.insert(key.clone(), value.clone());
-                }
-            }
-        }
-
-        Value::Object(result)
-    } else {
-        resource.clone()
+    let Value::Object(obj) = resource else {
+        return resource.clone();
+    };
+    // Kept elements come out in the order `elements` names them (the
+    // specification order for _summary, the requested order for _elements),
+    // not in the order the store happened to return the keys: a jsonb column
+    // hands them back sorted by length, which is no order a reader expects.
+    let mut order: Vec<&str> = Vec::new();
+    if obj.contains_key("resourceType") {
+        order.push("resourceType");
     }
+    for element in elements {
+        let top = element.split('.').next().unwrap_or(element);
+        if !order.contains(&top) {
+            order.push(top);
+        }
+    }
+
+    let mut result = Map::new();
+    for key in order {
+        let Some(value) = obj.get(key) else {
+            continue;
+        };
+        let nested_paths: Vec<&str> = elements
+            .iter()
+            .filter_map(|e| e.strip_prefix(key).and_then(|rest| rest.strip_prefix('.')))
+            .collect();
+        if !nested_paths.is_empty() && value.is_object() {
+            result.insert(key.to_string(), filter_nested(value, &nested_paths));
+        } else {
+            result.insert(key.to_string(), value.clone());
+        }
+    }
+    Value::Object(result)
 }
 
 /// Filters nested objects based on path components.
@@ -318,18 +276,6 @@ mod tests {
         assert_eq!(SummaryMode::parse("data"), Some(SummaryMode::Data));
         assert_eq!(SummaryMode::parse("count"), Some(SummaryMode::Count));
         assert_eq!(SummaryMode::parse("invalid"), None);
-    }
-
-    #[test]
-    fn test_snake_to_camel() {
-        assert_eq!(snake_to_camel("birth_date"), "birthDate");
-        assert_eq!(
-            snake_to_camel("managing_organization"),
-            "managingOrganization"
-        );
-        assert_eq!(snake_to_camel("id"), "id");
-        assert_eq!(snake_to_camel("r#type"), "type");
-        assert_eq!(snake_to_camel("implicit_rules"), "implicitRules");
     }
 
     #[test]
@@ -433,6 +379,33 @@ mod tests {
         assert!(patient_summary.contains(&"active".to_string()));
     }
 
+    /// `_summary=true` on a Claim keeps `type` and `use` — the elements whose
+    /// generated Rust fields are raw identifiers (`r#type`, `r#use`) (#1107).
+    #[test]
+    fn test_apply_summary_true_keeps_keyword_named_elements() {
+        let resource = json!({
+            "resourceType": "Claim",
+            "id": "c1",
+            "status": "active",
+            "type": {"coding": [{"code": "institutional"}]},
+            "use": "claim",
+            "patient": {"reference": "Patient/p1"},
+            "billablePeriod": {"start": "2024-01-01"},
+            "item": [{"sequence": 1}]
+        });
+
+        let result = apply_summary(&resource, SummaryMode::True, FhirVersion::R4);
+
+        assert!(result.get("type").is_some());
+        assert!(result.get("use").is_some());
+        assert!(result.get("billablePeriod").is_some());
+        assert!(result.get("r#type").is_none());
+        assert!(
+            result.get("item").is_none(),
+            "item is not a summary element"
+        );
+    }
+
     #[test]
     fn test_apply_elements_basic() {
         let resource = json!({
@@ -519,5 +492,66 @@ mod tests {
         assert!(result.get("id").is_some());
         assert!(result.get("name").is_some());
         assert!(result.get("text").is_none());
+    }
+
+    /// A jsonb column returns keys sorted by length, so a PostgreSQL-backed
+    /// server used to emit a `_summary=true` Patient as name, active, gender,
+    /// address, ... The subset follows the specification order instead, with
+    /// `resourceType` first, whatever order the store returned.
+    #[test]
+    fn summary_keeps_the_specification_element_order_not_the_stores() {
+        let stored = serde_json::json!({
+            "id": "p1",
+            "meta": {"versionId": "1"},
+            "name": [{"family": "Columns"}],
+            "active": true,
+            "gender": "female",
+            "address": [{"city": "Quito"}],
+            "telecom": [{"system": "phone", "value": "555"}],
+            "birthDate": "1990-05-11",
+            "identifier": [{"system": "urn:test", "value": "1"}],
+            "resourceType": "Patient"
+        });
+        let summary = apply_summary(&stored, SummaryMode::True, FhirVersion::R4);
+        let keys: Vec<&str> = summary
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys[0], "resourceType");
+        let order = [
+            "identifier",
+            "active",
+            "name",
+            "telecom",
+            "gender",
+            "birthDate",
+            "address",
+        ];
+        let positions: Vec<usize> = order
+            .iter()
+            .map(|k| keys.iter().position(|key| key == k).unwrap())
+            .collect();
+        assert!(positions.windows(2).all(|w| w[0] < w[1]), "{keys:?}");
+    }
+
+    #[test]
+    fn elements_come_out_in_the_requested_order() {
+        let stored = serde_json::json!({
+            "birthDate": "1990-05-11",
+            "gender": "female",
+            "id": "p1",
+            "name": [{"family": "Columns", "given": ["A"]}],
+            "resourceType": "Patient"
+        });
+        let subset = apply_elements(&stored, &["gender", "name.family", "birthDate"]);
+        let keys: Vec<&str> = subset
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["resourceType", "id", "gender", "name", "birthDate"]);
     }
 }

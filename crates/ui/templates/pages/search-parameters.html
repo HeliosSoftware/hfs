@@ -23,7 +23,7 @@
 </section>
 
 {% if !view.spec_loaded %}
-<p class="notice notice--warn">{{ i18n.t("sp-spec-missing") }}</p>
+<p class="notice notice--warn">{{ i18n.t("sp-degraded") }}</p>
 {% endif %}
 
 <div class="filter-layout" hx-boost="true">
@@ -59,7 +59,7 @@
              hx-trigger="input changed delay:300ms, search"
              hx-target="#sp-rail-list" hx-select="#sp-rail-list" hx-swap="outerHTML">
     </form>
-    {% call recent::group("sp-rail-recent", "sp-rail-list", view.rail_page, view.max_recent, i18n.t("sp-rail-recent"), view.recent) %}{% endcall %}
+    {% call recent::group("sp-rail-recent", "sp-rail-list", view.rail_page, view.max_recent, i18n.t("sp-rail-recent"), view.recent, false) %}{% endcall %}
     <div class="filter-rail__divider" aria-hidden="true"></div>
     <div class="filter-rail__heading filter-rail__heading--group">{{ i18n.t("rail-all-types-heading") }}</div>
     <div class="filter-rail__list" id="sp-rail-list">
@@ -161,7 +161,7 @@
     {% if let Some(rid) = d.resource_id %}
     <div class="detail__actions">
       <a class="btn" href="/ui/editor?type=SearchParameter&id={{ rid }}">{{ i18n.t("sp-edit") }}</a>
-      <button type="button" class="btn btn--danger" data-crud-delete
+      <button type="button" class="btn btn--danger btn--busy-slot" data-crud-delete
               data-type="SearchParameter" data-id="{{ rid }}"
               data-confirm="{{ i18n.t("sp-delete-confirm") }}"
               data-failed="{{ i18n.t("crud-delete-failed") }}"
@@ -222,6 +222,6 @@
 </div>
 
 <script src="/ui/assets/resource-filter.js" defer></script>
-<script src="/ui/assets/search-parameters.js" defer></script>
+<script src="/ui/assets/row-navigation.js" defer></script>
 <script src="/ui/assets/conformance-crud.js" defer></script>
 {% endblock %}

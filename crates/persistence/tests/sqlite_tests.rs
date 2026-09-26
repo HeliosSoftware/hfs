@@ -18,6 +18,197 @@ use helios_persistence::core::{
 use helios_persistence::error::{ResourceError, StorageError};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 
+#[path = "search/large_id_set_suite.rs"]
+mod large_id_set_suite;
+
+#[tokio::test]
+async fn sqlite_large_id_set_search_count_cursor_not_and_tenant() {
+    let backend = create_backend();
+    large_id_set_suite::large_id_set_search_count_cursor_not_and_tenant(
+        &backend,
+        "large-id-set-sqlite",
+    )
+    .await;
+    large_id_set_suite::wide_chain_and_nested_has(&backend, "wide-chain-sqlite").await;
+}
+
+/// The backend-agnostic conditional-criteria suite (#1312). `#[path]` resolves
+/// relative to this file, the same arrangement the other backends' binaries
+/// use for their shared suites.
+#[path = "search/conditional_criteria_suite.rs"]
+mod conditional_criteria_suite;
+
+/// #1312: criteria whose values begin with comparator letters (`family=Neal`,
+/// `identifier=ne123`) name the right resource, and never an unrelated one.
+#[tokio::test]
+async fn sqlite_conditional_criteria_with_prefix_like_values() {
+    let backend = create_backend();
+    conditional_criteria_suite::prefix_like_criteria_name_the_right_resource(
+        &backend,
+        "cond-criteria-1312",
+        true,
+    )
+    .await;
+}
+
+/// The backend-agnostic `_contained` suite (#1336, #1362, #1363). Same
+/// `#[path]` arrangement.
+#[path = "search/contained_suite.rs"]
+mod contained_suite;
+
+/// #1362: a repeated parameter under `_contained` is a conjunction on one
+/// contained resource.
+#[tokio::test]
+async fn sqlite_contained_repeated_parameters_are_anded() {
+    let backend = create_backend();
+    contained_suite::repeated_parameters_are_anded(&backend, "contained-repeated-1362").await;
+}
+
+/// #1363: `_`-parameters, composites and modifiers are applied under
+/// `_contained`, or refused by name — never dropped.
+#[tokio::test]
+async fn sqlite_contained_criteria_are_applied_or_rejected() {
+    let backend = create_backend();
+    contained_suite::criteria_are_applied_or_rejected(&backend, "contained-criteria-1363").await;
+}
+
+/// #1383: `_contained` alone is every contained resource of the type;
+/// `_total`, `search_count` and paging agree; compartment membership is
+/// applied; `_has`, `_list` and chains are refused by name.
+#[tokio::test]
+async fn sqlite_contained_unconstrained_and_out_of_band_constraints() {
+    let backend = create_backend();
+    contained_suite::unconstrained_and_out_of_band_constraints(&backend, "contained-gaps-1383")
+        .await;
+}
+
+/// #1407: `_sort` under `_contained` is applied or refused by name, and a
+/// contained resource with nothing indexed but its id is still found.
+#[tokio::test]
+async fn sqlite_contained_sort_and_id_only_contained() {
+    let backend = create_backend();
+    contained_suite::sort_and_id_only_contained(&backend, "contained-sort-1407").await;
+}
+
+/// #1407: `reference:identifier` under `_contained` resolves the reference's
+/// top-level target.
+#[tokio::test]
+async fn sqlite_contained_reference_identifier_resolves_the_target() {
+    let backend = create_backend();
+    contained_suite::reference_identifier_resolves_the_target(&backend, "contained-ident-1407")
+        .await;
+}
+
+/// The backend-agnostic conditional `If-Match` suite (#1381). Same `#[path]`
+/// arrangement.
+#[path = "search/conditional_if_match_suite.rs"]
+mod conditional_if_match_suite;
+
+/// #1381: `If-Match` is evaluated against the resource the criteria resolve
+/// to, on conditional update, delete and patch.
+#[tokio::test]
+async fn sqlite_conditional_writes_honour_if_match() {
+    let backend = create_backend();
+    conditional_if_match_suite::if_match_is_evaluated_against_the_resolved_match(
+        &backend,
+        "cond-if-match-1381",
+        true,
+    )
+    .await;
+}
+
+/// #1381: of several writers holding the same `If-Match`, one writes.
+#[tokio::test]
+async fn sqlite_conditional_writers_with_the_same_if_match_admit_one() {
+    let backend = create_backend();
+    conditional_if_match_suite::concurrent_writers_with_the_same_if_match_admit_one(
+        &backend,
+        "cond-if-match-race-1381",
+    )
+    .await;
+}
+
+/// The backend-agnostic race suite for version-aware writes (#1404, #1405).
+/// Same `#[path]` arrangement.
+#[path = "search/versioned_write_race_suite.rs"]
+mod versioned_write_race_suite;
+
+/// A file-backed (WAL) backend with the default pool — what `hfs` runs in
+/// production. Several pooled connections on several runtime threads is the
+/// configuration in which SQLite writers really interleave; the shared-cache
+/// `:memory:` database serialises them at the table lock instead.
+fn create_file_backend(dir: &tempfile::TempDir) -> SqliteBackend {
+    let backend =
+        SqliteBackend::with_config(dir.path().join("race.db"), SqliteBackendConfig::default())
+            .expect("Failed to create SQLite backend");
+    backend.init_schema().expect("Failed to initialize schema");
+    backend
+}
+
+/// #1404: of several writers holding the same version, one `update` writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn sqlite_concurrent_updates_from_the_same_version_admit_one() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = std::sync::Arc::new(create_file_backend(&dir));
+    versioned_write_race_suite::concurrent_updates_from_the_same_version_admit_one(
+        backend,
+        "update-race-1404",
+        40,
+    )
+    .await;
+}
+
+/// #1404: an update and a versioned delete of the same version: one wins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn sqlite_concurrent_update_and_versioned_delete_admit_one() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = std::sync::Arc::new(create_file_backend(&dir));
+    versioned_write_race_suite::concurrent_update_and_versioned_delete_admit_one(
+        backend,
+        "delete-race-1404",
+        40,
+    )
+    .await;
+}
+
+/// #1404: an update racing an unconditional delete leaves a contiguous history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn sqlite_concurrent_update_and_plain_delete_stay_consistent() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = std::sync::Arc::new(create_file_backend(&dir));
+    versioned_write_race_suite::concurrent_update_and_plain_delete_stay_consistent(
+        backend,
+        "plain-delete-race-1404",
+        40,
+    )
+    .await;
+}
+
+/// #1404: `delete_versioned` compares and deletes in one step.
+#[tokio::test]
+async fn sqlite_versioned_delete_is_a_compare_and_swap() {
+    let backend = create_backend();
+    versioned_write_race_suite::versioned_delete_is_a_compare_and_swap(&backend, "delete-cas-1404")
+        .await;
+}
+
+/// The backend-agnostic conditional patch suite (#1406). Same `#[path]`
+/// arrangement.
+#[path = "search/conditional_patch_suite.rs"]
+mod conditional_patch_suite;
+
+/// #1406: conditional patch is the trait's provided implementation over the
+/// backend's criteria resolver and the shared patch applier.
+#[tokio::test]
+async fn sqlite_conditional_patch() {
+    let backend = create_backend();
+    conditional_patch_suite::conditional_patch_resolves_gates_applies_and_swaps(
+        &backend,
+        "cond-patch-1406",
+    )
+    .await;
+}
+
 fn create_backend() -> SqliteBackend {
     // Configure with data directory to load spec SearchParameters
     // CARGO_MANIFEST_DIR for tests is crates/persistence
@@ -1980,6 +2171,87 @@ async fn test_search_reference_subject() {
     assert!(ids.contains(&"obs-2"));
 }
 
+/// A `Type/id` reference search must not match a *different* resource whose
+/// id merely extends the searched id. FHIR ids may contain `-` and `.`, which
+/// sort below `'/'` and `'0'` in SQLite's BINARY collation, so a naive
+/// `[base, base || '0')` index range (PR #1030) wrongly captured `Patient/123-4`
+/// and `Patient/123.5` for `subject=Patient/123`. The predicate must still be
+/// version-agnostic (match `Patient/123/_history/<v>`).
+#[tokio::test]
+async fn test_search_by_reference_does_not_match_extended_sibling_ids() {
+    let backend = create_backend();
+    let tenant = create_tenant("test-tenant");
+
+    // Every stored reference shares the "Patient/123" prefix; only the first
+    // two are the same resource.
+    let refs = [
+        ("obs-base", "Patient/123"),
+        ("obs-versioned", "Patient/123/_history/2"),
+        ("obs-dash", "Patient/123-4"),
+        ("obs-dot", "Patient/123.5"),
+        ("obs-digit", "Patient/1234"),
+        ("obs-zero", "Patient/1230"),
+        ("obs-dash-versioned", "Patient/123-4/_history/1"),
+        ("obs-short", "Patient/12"),
+    ];
+    for (id, reference) in refs {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": id,
+                    "status": "final",
+                    "subject": {"reference": reference},
+                    "code": {"coding": [{"code": "8867-4"}]}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let search = |value: &str| {
+        SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: vec![SearchValue::eq(value)],
+            chain: vec![],
+            components: vec![],
+        })
+    };
+
+    let result = backend
+        .search(&tenant, &search("Patient/123"))
+        .await
+        .unwrap();
+    let mut ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec!["obs-base", "obs-versioned"],
+        "subject=Patient/123 must match only Patient/123 and its _history versions"
+    );
+
+    // The siblings are themselves searchable, exactly.
+    let result = backend
+        .search(&tenant, &search("Patient/123-4"))
+        .await
+        .unwrap();
+    let mut ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec!["obs-dash", "obs-dash-versioned"]);
+
+    let result = backend
+        .search(&tenant, &search("Patient/123.5"))
+        .await
+        .unwrap();
+    let ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
+    assert_eq!(ids, vec!["obs-dot"]);
+}
+
 #[tokio::test]
 async fn test_patient_compartment_export_observation_without_since() {
     let backend = create_backend();
@@ -2606,6 +2878,212 @@ async fn test_reindex_fans_out_to_every_target() {
     );
 }
 
+/// Runs `request` on `op` and waits for it to complete cleanly.
+async fn run_reindex_to_completion(
+    op: &ReindexOperation,
+    tenant: &TenantContext,
+    request: ReindexRequest,
+) {
+    let job_id = op.start(tenant.clone(), request, None).await.unwrap();
+    for _ in 0..200 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+        let progress = op.get_progress(&job_id).await.unwrap();
+        match progress.status {
+            ReindexStatus::Completed => {
+                assert!(progress.errors.is_empty(), "{:?}", progress.errors);
+                return;
+            }
+            ReindexStatus::Failed | ReindexStatus::Cancelled => {
+                panic!(
+                    "reindex ended {:?}: {:?}",
+                    progress.status, progress.error_message
+                )
+            }
+            _ => {}
+        }
+    }
+    panic!("reindex timed out");
+}
+
+fn count_index_rows(path: &std::path::Path, table: &str) -> i64 {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+        row.get(0)
+    })
+    .unwrap()
+}
+
+/// #1125: `sqlite-es` wires the offloaded SQLite primary as a reindex writer
+/// next to Elasticsearch. The rebuild must reach the secondary for every
+/// resource while leaving SQLite's `search_index` and FTS tables exactly as
+/// they were — no dead rows written, none accumulated across reruns, and
+/// `clearExisting` not reaching into an index nothing reads.
+#[tokio::test]
+async fn test_reindex_leaves_offloaded_sqlite_index_untouched_when_wired_as_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fhir.db");
+    let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("data"))
+        .unwrap_or_else(|| PathBuf::from("data"));
+    let tenant = create_tenant("test-tenant");
+
+    // Index some resources locally first, so "untouched" is observable.
+    {
+        let local = SqliteBackend::with_config(
+            &path,
+            SqliteBackendConfig {
+                data_dir: Some(data_dir.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        local.init_schema().unwrap();
+        for i in 1..=3 {
+            local
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": format!("p{i}"),
+                        "name": [{"family": "Offload"}]
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+    }
+    let index_rows = count_index_rows(&path, "search_index");
+    let fts_rows = count_index_rows(&path, "resource_fts");
+    assert!(
+        index_rows > 0 && fts_rows > 0,
+        "precondition: indexed locally"
+    );
+
+    let offloaded = SqliteBackend::with_config(
+        &path,
+        SqliteBackendConfig {
+            data_dir: Some(data_dir),
+            search_offloaded: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    offloaded.init_schema().unwrap();
+    let offloaded = Arc::new(offloaded);
+    let secondary = Arc::new(SpyReindexTarget::default());
+    let op = ReindexOperation::with_parts(
+        offloaded.clone(),
+        vec![offloaded.clone(), secondary.clone()],
+        offloaded.tenant_registries().clone(),
+    );
+
+    for run in 1..=2 {
+        run_reindex_to_completion(
+            &op,
+            &tenant,
+            ReindexRequest::for_types(vec!["Patient"]).clear_existing(),
+        )
+        .await;
+        assert_eq!(
+            secondary.written.lock().unwrap().len(),
+            3 * run,
+            "run {run}: every resource must still reach the secondary"
+        );
+        assert_eq!(
+            count_index_rows(&path, "search_index"),
+            index_rows,
+            "run {run}: an offloaded primary must not gain or lose search_index rows"
+        );
+        assert_eq!(
+            count_index_rows(&path, "resource_fts"),
+            fts_rows,
+            "run {run}: an offloaded primary must not gain or lose FTS rows"
+        );
+    }
+}
+
+/// The id-scoped lookup a retry of failed resources uses (#1125): only live
+/// resources of the requested type come back, duplicates and unknown ids are
+/// harmless, and a list longer than one `IN (...)` batch is fully covered.
+#[tokio::test]
+async fn test_reindex_fetch_resources_by_ids() {
+    let backend = create_backend();
+    let tenant = create_tenant("test-tenant");
+    for i in 1..=5 {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": format!("p{i}")}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({"resourceType": "Observation", "id": "p4", "status": "final"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend.delete(&tenant, "Patient", "p5").await.unwrap();
+    // Same ids in another tenant must not leak in.
+    let other = create_tenant("other-tenant");
+    backend
+        .create(
+            &other,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "p3"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    // 1,200 ids spanning several batches, the real ones at the edges and in
+    // the middle, plus a duplicate and a deleted resource.
+    let mut ids: Vec<String> = (0..1200).map(|k| format!("missing-{k}")).collect();
+    ids[0] = "p1".to_string();
+    ids[640] = "p3".to_string();
+    ids[1199] = "p4".to_string();
+    ids.push("p1".to_string());
+    ids.push("p5".to_string());
+
+    let mut found: Vec<(String, String)> = backend
+        .fetch_resources_by_ids(&tenant, "Patient", &ids)
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| {
+            assert_eq!(r.tenant_id().as_str(), "test-tenant");
+            (r.resource_type().to_string(), r.id().to_string())
+        })
+        .collect();
+    found.sort();
+    assert_eq!(
+        found,
+        [
+            ("Patient".to_string(), "p1".to_string()),
+            ("Patient".to_string(), "p3".to_string()),
+            ("Patient".to_string(), "p4".to_string()),
+        ]
+    );
+
+    assert!(
+        backend
+            .fetch_resources_by_ids(&tenant, "Patient", &[])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
 // ============================================================================
 // Conditional Operations Tests (using search index)
 // ============================================================================
@@ -2753,6 +3231,7 @@ async fn test_conditional_update_with_identifier() {
             "identifier=http://hospital.org/mrn|MRN-UPDATE-1",
             false,
             FhirVersion::default(),
+            &helios_persistence::core::EntityTagPrecondition::Absent,
         )
         .await
         .unwrap();
@@ -2790,6 +3269,7 @@ async fn test_conditional_update_with_upsert() {
             "identifier=http://hospital.org/mrn|MRN-UPSERT-1",
             true, // upsert=true
             FhirVersion::default(),
+            &helios_persistence::core::EntityTagPrecondition::Absent,
         )
         .await
         .unwrap();
@@ -2822,6 +3302,7 @@ async fn test_conditional_delete_with_identifier() {
             &tenant,
             "Patient",
             "identifier=http://hospital.org/mrn|MRN-DELETE-1",
+            &helios_persistence::core::EntityTagPrecondition::Absent,
         )
         .await
         .unwrap();

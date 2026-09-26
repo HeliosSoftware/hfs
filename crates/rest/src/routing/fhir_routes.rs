@@ -18,6 +18,7 @@ use tower::ServiceExt;
 
 use crate::config::TenantRoutingMode;
 use crate::handlers;
+use crate::middleware::resource_type::reject_unknown_resource_type;
 use crate::middleware::tenant_prefix::{
     ExtractedTenantFromUrl, OriginalPath, extract_tenant_from_path,
 };
@@ -39,10 +40,15 @@ use crate::state::AppState;
 /// - `GET /health` - Health check
 /// - `GET /_history` - System history
 /// - `POST /` - Batch/Transaction
+/// - `GET /?params`, `GET|POST /_search` - System-level search: refused with
+///   `501` + OperationOutcome; not implemented (#1338)
 ///
 /// ## Type-level
 /// - `GET /{type}` - Search
 /// - `POST /{type}` - Create
+/// - `PUT /{type}?criteria` - Conditional update
+/// - `PATCH /{type}?criteria` - Conditional patch
+/// - `DELETE /{type}?criteria` - Conditional delete
 /// - `POST /{type}/_search` - Search (POST)
 /// - `GET /{type}/_history` - Type history
 ///
@@ -53,6 +59,11 @@ use crate::state::AppState;
 /// - `DELETE /{type}/{id}` - Delete
 /// - `GET /{type}/{id}/_history` - Instance history
 /// - `GET /{type}/{id}/_history/{vid}` - Version read
+///
+/// Every `{type}` route is gated by
+/// [`reject_unknown_resource_type`](crate::middleware::resource_type::reject_unknown_resource_type):
+/// a type segment that is not a resource type for the request's effective FHIR
+/// version answers `404` + OperationOutcome before any handler runs (#989).
 pub fn create_routes<S>(state: AppState<S>) -> Router
 where
     S: ResourceStorage
@@ -97,7 +108,7 @@ where
         + Sync
         + 'static,
 {
-    create_fhir_router().with_state(state)
+    build_fhir_router(state)
 }
 
 /// Creates routes with URL-based tenant identification.
@@ -122,7 +133,7 @@ where
         + Sync
         + 'static,
 {
-    let router = create_fhir_router().with_state(state);
+    let router = build_fhir_router(state);
 
     // Use tower's map_request to modify the request BEFORE routing
     let service = router.map_request(strip_tenant_prefix);
@@ -152,7 +163,7 @@ where
         + Sync
         + 'static,
 {
-    let router = create_fhir_router().with_state(state);
+    let router = build_fhir_router(state);
 
     // Use tower's map_request to modify the request BEFORE routing
     let service = router.map_request(strip_tenant_prefix);
@@ -202,6 +213,40 @@ fn build_uri_with_new_path(original: &axum::http::Uri, new_path: &str) -> axum::
     axum::http::Uri::from_parts(parts).unwrap_or_else(|_| original.clone())
 }
 
+/// Builds the core FHIR router, installs the resource-type gate, and binds
+/// the state.
+///
+/// The gate is a router layer rather than a check in each handler so that
+/// every current and future `{resource_type}` route — read, search, history,
+/// write, `$operation`, compartment — refuses an unknown type identically. It
+/// is installed here, on the FHIR router alone, so routes merged later (the
+/// web UI, console, admin API) are never judged as resource types.
+fn build_fhir_router<S>(state: AppState<S>) -> Router
+where
+    S: ResourceStorage
+        + ConditionalStorage
+        + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
+        + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
+        + BundleProvider
+        + helios_persistence::core::ExportDataProvider
+        + helios_persistence::core::PatientExportProvider
+        + helios_persistence::core::GroupExportProvider
+        + Send
+        + Sync
+        + 'static,
+{
+    create_fhir_router()
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            reject_unknown_resource_type::<S>,
+        ))
+        .with_state(state)
+}
+
 /// Creates the core FHIR router with all endpoints.
 fn create_fhir_router<S>() -> Router<AppState<S>>
 where
@@ -248,7 +293,21 @@ where
         // Natural-language search translation (#255): returns a generated
         // query for the client to review and run via the normal search path.
         .route("/$nl-search", post(handlers::nl_search_handler::<S>))
-        .route("/", post(handlers::batch_handler::<S>))
+        // `GET [base]?params` and `[base]/_search` are system-level search,
+        // which is not implemented. They are routed — rather than left to fall
+        // through as a bare `405` and as "`_search` is not a resource type" —
+        // so the client gets a `501` OperationOutcome saying so (#1338).
+        // `POST /` stays the batch/transaction endpoint whatever its
+        // Content-Type: the spec's POST form of this search is `/_search`.
+        .route(
+            "/",
+            post(handlers::batch_handler::<S>).get(handlers::search_system_not_supported_handler),
+        )
+        .route(
+            "/_search",
+            get(handlers::search_system_not_supported_handler)
+                .post(handlers::search_system_not_supported_handler),
+        )
         // Bulk Data Export ($export) — operation routes precede the catch-all.
         .route(
             "/$export",
@@ -259,6 +318,16 @@ where
             "/Patient/$export",
             get(handlers::patient_export_kickoff_handler::<S>)
                 .post(handlers::patient_export_kickoff_handler::<S>),
+        )
+        .route(
+            "/Patient/$everything",
+            get(handlers::patient_everything_type_handler::<S>)
+                .post(handlers::patient_everything_type_handler::<S>),
+        )
+        .route(
+            "/Patient/{id}/$everything",
+            get(handlers::patient_everything_instance_handler::<S>)
+                .post(handlers::patient_everything_instance_handler::<S>),
         )
         .route(
             "/Group/{id}/$export",
@@ -322,6 +391,11 @@ where
         .route(
             "/{resource_type}",
             delete(handlers::conditional_delete_handler::<S>),
+        )
+        // Conditional patch: PATCH [base]/[type]?[search-params]
+        .route(
+            "/{resource_type}",
+            patch(handlers::conditional_patch_handler::<S>),
         )
         .route(
             "/{resource_type}/_search",
@@ -481,7 +555,15 @@ where
 /// of functionality.
 pub fn create_minimal_routes<S>(state: AppState<S>) -> Router
 where
-    S: ResourceStorage + SearchProvider + BundleProvider + Send + Sync + 'static,
+    // `ConditionalStorage`: `/metadata` reads which conditional interactions
+    // the storage serves (#1384).
+    S: ResourceStorage
+        + ConditionalStorage
+        + SearchProvider
+        + BundleProvider
+        + Send
+        + Sync
+        + 'static,
 {
     Router::new()
         .route("/health", get(handlers::health_handler::<S>))

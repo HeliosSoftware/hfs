@@ -271,7 +271,8 @@ impl RailState {
     /// The type rails never call this: a stale type is simply hidden by
     /// [`Self::resolve_recents`]'s `is_valid` filter, never written away,
     /// since a stale `last` already falls back to the page default in
-    /// silence. The SQL rails prune on a stale explicit selection's click.
+    /// silence. The SQL rails prune on a stale explicit selection's click,
+    /// and on the existence sweep [`Self::prune_gone`] runs at render (#1014).
     pub(crate) fn prune(&self, id: &str) -> Option<Self> {
         let in_recent = self.recent.iter().any(|e| e.id == id);
         let is_last = self.last.as_deref() == Some(id);
@@ -286,6 +287,25 @@ impl RailState {
                 self.recent.clone()
             },
         })
+    }
+
+    /// Applies the outcome of an existence sweep over `recent`: every id whose
+    /// verdict is `Ok(false)` (the server answered 404/410) is pruned;
+    /// `Ok(true)` and `Err(_)` (unverifiable: outage, auth, other version)
+    /// keep the entry. `None` when nothing changed, so the caller persists
+    /// only on a real prune (#1014).
+    pub(crate) fn prune_gone(&self, verdicts: &[(String, Result<bool, String>)]) -> Option<Self> {
+        let mut current: Option<Self> = None;
+        for (id, verdict) in verdicts {
+            if !matches!(verdict, Ok(false)) {
+                continue;
+            }
+            let base = current.as_ref().unwrap_or(self);
+            if let Some(next) = base.prune(id) {
+                current = Some(next);
+            }
+        }
+        current
     }
 
     /// Resolves `recent`, in order, against a rail's currently-live items
@@ -403,6 +423,78 @@ impl RequestSettings {
             .and_then(|rails| rails.get(page.key()));
         RailState::from_raw(raw)
     }
+
+    /// The sanitized [`DashboardSelection`] the Home chart last stored, scoped
+    /// to `tenant` — the fallback the dashboard reads when the request carries
+    /// no explicit `?types=` selection. Like [`rail`](Self::rail), pure
+    /// in-memory navigation over the already-fetched document.
+    pub(crate) fn dashboard(&self, tenant: &str) -> DashboardSelection {
+        let Some(document) = &self.document else {
+            return DashboardSelection::default();
+        };
+        let projected = project_for_tenant(document, tenant);
+        DashboardSelection::from_raw(projected.get("dashboard"))
+    }
+}
+
+/// The maximum number of charted types kept in the stored selection. Mirrors
+/// `CHART_MAX_SERIES` in `lib.rs` (the chart's palette/legend cap): storing more
+/// than the chart can ever draw is pointless, and it bounds the settings value.
+const DASHBOARD_MAX_TYPES: usize = 6;
+
+/// The Home "FHIR resources over time" chart selection persisted per user and
+/// per tenant under the settings document's `dashboard` key (#1358): the charted
+/// resource types and the time window slug (`1h`/`24h`/`30d`). Both fields are
+/// optional on read — an absent or malformed value reads as the empty default,
+/// which the dashboard treats as "no stored selection" and falls through to the
+/// provider default.
+///
+/// The "View all resources" toggle is deliberately **not** persisted: it is a
+/// transient exploration mode (it offers every spec type, not the tenant's
+/// stored set), and silently restoring it on every visit to Home would surprise
+/// the user and change the established default-off behavior. Only the two things
+/// a user actually curates — which types, over what window — are remembered.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct DashboardSelection {
+    /// Charted resource type names, already sanitized (ASCII-alphanumeric,
+    /// capped at [`DASHBOARD_MAX_TYPES`]). Empty means "nothing stored".
+    pub(crate) types: Vec<String>,
+    /// The time-window slug, if one was stored. `None` means "use the default".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) window: Option<String>,
+}
+
+impl DashboardSelection {
+    /// Reads and sanitizes a stored `dashboard` value, tolerating anything a
+    /// hand-edit or an older schema might hold: unknown fields are ignored,
+    /// non-string / non-alphanumeric type names are dropped, and the type list
+    /// is de-duplicated and capped. Never errors — a malformed value is the
+    /// empty default.
+    fn from_raw(raw: Option<&Value>) -> Self {
+        let Some(obj) = raw.and_then(Value::as_object) else {
+            return Self::default();
+        };
+        let mut seen = HashSet::new();
+        let types: Vec<String> = obj
+            .get("types")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric()))
+                    .filter(|t| seen.insert(t.to_string()))
+                    .take(DASHBOARD_MAX_TYPES)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let window = obj
+            .get("window")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        Self { types, window }
+    }
 }
 
 impl<S> axum::extract::FromRequestParts<S> for RequestSettings
@@ -480,6 +572,37 @@ pub(crate) async fn persist(
     }
 }
 
+/// Writes the Home chart's `selection` to the settings document's `dashboard`
+/// key, scoped to `tenant` (#1358). Same best-effort, last-write-wins,
+/// no-precondition contract as [`persist`]: a `None` store is a silent no-op, a
+/// store error is logged and swallowed, and the tenant scoping is applied by
+/// [`scope_merge_patch`] so the value lands under `byTenant.<tenant>.dashboard`.
+pub(crate) async fn persist_dashboard(
+    settings: &Option<Arc<dyn SettingsStore>>,
+    user_key: &str,
+    tenant: &str,
+    selection: &DashboardSelection,
+) {
+    let Some(store) = settings else {
+        return;
+    };
+
+    let value = match serde_json::to_value(selection) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to serialize dashboard selection");
+            return;
+        }
+    };
+    let mut patch = Map::new();
+    patch.insert("dashboard".to_string(), value);
+    let patch = scope_merge_patch(Value::Object(patch), tenant);
+
+    if let Err(error) = store.patch_settings(user_key, patch, None).await {
+        tracing::warn!(tenant, error = %error, "failed to persist dashboard selection");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,6 +657,100 @@ mod tests {
 
         let other = settings.rail(RailPage::Resources, "gamma");
         assert_eq!(other, RailState::default());
+    }
+
+    #[test]
+    fn dashboard_selection_reads_the_tenant_subtree_and_sanitizes() {
+        let document = json!({
+            "byTenant": {
+                "acme": {"dashboard": {
+                    "types": ["Patient", "bad name", "Observation", "Patient", "Enc$", "A", "B", "C", "D", "E"],
+                    "window": "24h"
+                }},
+                "beta": {"dashboard": {"types": ["Condition"], "window": "1h"}}
+            }
+        });
+        let settings = RequestSettings {
+            user_key: "l2:".to_string(),
+            document: Some(document),
+            version: 1,
+        };
+        let acme = settings.dashboard("acme");
+        // Non-alphanumeric names dropped, duplicate Patient collapsed, capped at 6.
+        assert_eq!(
+            acme.types,
+            vec!["Patient", "Observation", "A", "B", "C", "D"]
+        );
+        assert_eq!(acme.window.as_deref(), Some("24h"));
+
+        // Another tenant's selection is not visible here.
+        let gamma = settings.dashboard("gamma");
+        assert_eq!(gamma, DashboardSelection::default());
+    }
+
+    #[test]
+    fn dashboard_selection_from_a_malformed_value_is_empty() {
+        // Absent document, wrong-typed value, and a non-object all read empty.
+        let none = RequestSettings {
+            user_key: "l2:".to_string(),
+            document: None,
+            version: 0,
+        };
+        assert_eq!(none.dashboard("acme"), DashboardSelection::default());
+
+        let settings = RequestSettings {
+            user_key: "l2:".to_string(),
+            document: Some(json!({"byTenant": {"acme": {"dashboard": "nonsense"}}})),
+            version: 0,
+        };
+        assert_eq!(settings.dashboard("acme"), DashboardSelection::default());
+    }
+
+    #[tokio::test]
+    async fn persist_dashboard_writes_a_tenant_scoped_patch_and_nothing_else() {
+        let store = Arc::new(mock_store::MockSettingsStore::default());
+        // Pre-existing content on another tenant, and this tenant's rails, must
+        // survive untouched.
+        store
+            .patch_settings(
+                "l2:",
+                json!({"theme": "dark", "byTenant": {
+                    "acme": {"rails": {"resources": {"last": "Patient", "recent": []}}},
+                    "beta": {"dashboard": {"types": ["X"]}}
+                }}),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let settings: Option<Arc<dyn SettingsStore>> = Some(store.clone());
+        let selection = DashboardSelection {
+            types: vec!["Patient".to_string(), "Observation".to_string()],
+            window: Some("30d".to_string()),
+        };
+        persist_dashboard(&settings, "l2:", "acme", &selection).await;
+
+        let document = store.get_settings("l2:").await.unwrap().unwrap().document;
+        assert_eq!(
+            document["byTenant"]["acme"]["dashboard"],
+            json!({"types": ["Patient", "Observation"], "window": "30d"})
+        );
+        assert_eq!(
+            document["byTenant"]["acme"]["rails"]["resources"]["last"], "Patient",
+            "the same tenant's rails must be untouched"
+        );
+        assert_eq!(
+            document["byTenant"]["beta"]["dashboard"]["types"][0], "X",
+            "another tenant's dashboard must be untouched"
+        );
+        assert_eq!(document["theme"], "dark");
+    }
+
+    #[tokio::test]
+    async fn persist_dashboard_is_a_silent_no_op_with_no_settings_store() {
+        let settings: Option<Arc<dyn SettingsStore>> = None;
+        // Must not panic.
+        persist_dashboard(&settings, "l2:", "acme", &DashboardSelection::default()).await;
     }
 
     /// A pre-#313 legacy document with `rails` at the top level is read
@@ -778,6 +995,42 @@ mod tests {
         assert_eq!(state.prune("Patient"), None);
     }
 
+    #[test]
+    fn prune_gone_drops_only_the_ids_the_server_declared_gone() {
+        let state = RailState {
+            last: Some("b".to_string()),
+            recent: vec![
+                RailEntry::id_only("a"),
+                RailEntry::id_only("b"),
+                RailEntry::id_only("c"),
+            ],
+        };
+        let verdicts = vec![
+            ("a".to_string(), Ok(true)),
+            ("b".to_string(), Ok(false)),
+            ("c".to_string(), Err("boom".to_string())),
+        ];
+        let next = state.prune_gone(&verdicts).expect("b was pruned");
+        assert_eq!(next.last, None);
+        assert_eq!(
+            next.recent,
+            vec![RailEntry::id_only("a"), RailEntry::id_only("c")]
+        );
+    }
+
+    #[test]
+    fn prune_gone_is_a_no_op_without_a_gone_verdict() {
+        let state = RailState {
+            last: Some("a".to_string()),
+            recent: vec![RailEntry::id_only("a"), RailEntry::id_only("c")],
+        };
+        let verdicts = vec![
+            ("a".to_string(), Ok(true)),
+            ("c".to_string(), Err("boom".to_string())),
+        ];
+        assert_eq!(state.prune_gone(&verdicts), None);
+    }
+
     // ── Resolving recents against the live rail ──────────────────────────
 
     #[test]
@@ -973,13 +1226,16 @@ mod tests {
             data_dir: None,
             public_base_url: "http://localhost:8080".to_string(),
             self_base_url: "http://localhost:8080".to_string(),
+            outbound_auth: Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
             tenant_path_routing: false,
             fhir_version: helios_fhir::FhirVersion::R4,
             default_tenant: "default".to_string(),
             terminology: None,
             settings,
             bulk_provider: None,
+            write_observer: None,
             patient_name_search: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            login: None,
         }
     }
 

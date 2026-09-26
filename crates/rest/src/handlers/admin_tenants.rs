@@ -27,7 +27,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use helios_audit::{AuditAction, AuditEventBuilder};
-use helios_persistence::core::ResourceStorage;
+use helios_persistence::core::{ErasedScope, ResourceStorage, WriteEvent, WriteObserver};
 use helios_persistence::tenant::{SYSTEM_TENANT, TenantId};
 use serde::Deserialize;
 use serde_json::json;
@@ -73,6 +73,7 @@ async fn seed_new_tenant<S: ResourceStorage>(
     storage: &S,
     config: &crate::config::ServerConfig,
     tenant_id: &str,
+    observer: &dyn WriteObserver,
 ) {
     let data_dir = config
         .data_dir
@@ -83,6 +84,7 @@ async fn seed_new_tenant<S: ResourceStorage>(
         config.default_fhir_version,
         &data_dir,
         tenant_id,
+        Some(observer),
     )
     .await;
 }
@@ -234,7 +236,13 @@ where
     // server seeds every provisioned tenant with at startup. Best-effort: a
     // failed seed logs and still returns the created tenant.
     if state.config().seed_conformance {
-        seed_new_tenant(state.storage(), state.config(), &id).await;
+        seed_new_tenant(
+            state.storage(),
+            state.config(),
+            &id,
+            state.write_observer().as_ref(),
+        )
+        .await;
     }
 
     audit(
@@ -304,10 +312,23 @@ where
 
     let deregistered = state.storage().deregister_tenant(&id).await?;
     let resources_removed = if query.purge {
-        Some(state.storage().purge_tenant_data(&id).await?)
+        let removed = state.storage().purge_tenant_data(&id).await?;
+        // The tenant's data is gone; consumers holding figures for it (the
+        // dashboard counters) treat them as stale (#1078).
+        state.write_observer().on_write(&WriteEvent::Erased {
+            tenant: TenantId::new(id.clone()),
+            scope: ErasedScope::Tenant,
+        });
+        Some(removed)
     } else {
         None
     };
+    // Reported after the purge's `Erased`: consumers holding state for the
+    // tenant (the dashboard counters) drop it, and a later use of the tenant
+    // rebuilds it from storage (#1078).
+    state.write_observer().on_write(&WriteEvent::TenantRemoved {
+        tenant: TenantId::new(id.clone()),
+    });
 
     debug!(tenant = %id, purge = query.purge, "Deleted tenant");
     audit(

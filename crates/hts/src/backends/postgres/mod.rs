@@ -104,7 +104,7 @@ async fn search_resources(
         .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
         .start()
         .await
-        .map_err(|error| HtsError::StorageError(error.to_string()))?;
+        .map_err(|error| HtsError::StorageError(error_chain(&error)))?;
     let result =
         search_resources_in_transaction(&transaction, table, resource_type, query, search).await;
     match result {
@@ -112,7 +112,7 @@ async fn search_resources(
             transaction
                 .commit()
                 .await
-                .map_err(|error| HtsError::StorageError(error.to_string()))?;
+                .map_err(|error| HtsError::StorageError(error_chain(&error)))?;
             Ok(resources)
         }
         Err(search_error) => match transaction.rollback().await {
@@ -145,7 +145,7 @@ where
     let rows = client
         .query(&metadata_sql, &[&query.url, &query.version, &query.status])
         .await
-        .map_err(|error| HtsError::StorageError(error.to_string()))?
+        .map_err(|error| HtsError::StorageError(error_chain(&error)))?
         .into_iter()
         .map(|row| ResourceSearchRow {
             id: row.get(0),
@@ -169,7 +169,7 @@ where
         client
             .query(&resource_sql, &[&ids])
             .await
-            .map_err(|error| HtsError::StorageError(error.to_string()))?
+            .map_err(|error| HtsError::StorageError(error_chain(&error)))?
             .into_iter()
             .map(|row| {
                 (
@@ -375,7 +375,7 @@ impl TerminologyCaches for PostgresTerminologyBackend {
 /// error with `{e}` discards the one piece of information needed to diagnose
 /// it. Walking the chain preserves messages like
 /// `db error: ERROR: could not resize shared memory segment …`.
-fn error_chain(e: &dyn std::error::Error) -> String {
+pub(super) fn error_chain(e: &dyn std::error::Error) -> String {
     let mut out = e.to_string();
     let mut src = e.source();
     while let Some(s) = src {
@@ -396,8 +396,9 @@ fn build_pool(database_url: &str) -> Result<Pool, HtsError> {
     // cold-warming throughput while staying well under PG's
     // `max_connections=100`.
     cfg.pool = Some(deadpool_postgres::PoolConfig::new(32));
-    cfg.create_pool(Some(Runtime::Tokio1), NoTls)
-        .map_err(|e| HtsError::StorageError(format!("Failed to create PG pool: {e}")))
+    cfg.create_pool(Some(Runtime::Tokio1), NoTls).map_err(|e| {
+        HtsError::StorageError(format!("Failed to create PG pool: {}", error_chain(&e)))
+    })
 }
 
 // ── TerminologyMetadata ────────────────────────────────────────────────────────
@@ -508,7 +509,7 @@ impl BundleImportBackend for PostgresTerminologyBackend {
             .pool
             .get()
             .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
 
         // Before the transaction: record which CodeSystems currently have zero
         // concepts in the DB so the post-commit closure build only touches
@@ -533,17 +534,16 @@ impl BundleImportBackend for PostgresTerminologyBackend {
                     &[&cs.url],
                 )
                 .await
-                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
             let has_concepts: bool = row.map(|r| r.get(0)).unwrap_or(false);
             if !has_concepts {
                 systems_needing_closure.push(cs.url.clone());
             }
         }
 
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| HtsError::StorageError(format!("Begin transaction: {e}")))?;
+        let tx = client.transaction().await.map_err(|e| {
+            HtsError::StorageError(format!("Begin transaction: {}", error_chain(&e)))
+        })?;
 
         let mut stats = ImportStats::default();
         stats.errors.extend(parsed.parse_errors.iter().cloned());
@@ -570,9 +570,9 @@ impl BundleImportBackend for PostgresTerminologyBackend {
             }
         }
 
-        tx.commit()
-            .await
-            .map_err(|e| HtsError::StorageError(format!("Commit transaction: {e}")))?;
+        tx.commit().await.map_err(|e| {
+            HtsError::StorageError(format!("Commit transaction: {}", error_chain(&e)))
+        })?;
 
         // Rebuild concept_closure for newly-imported (previously empty) code
         // systems. Skipped for batch imports of existing systems so SNOMED
@@ -590,7 +590,7 @@ impl BundleImportBackend for PostgresTerminologyBackend {
             let rows = client
                 .query("SELECT id FROM code_systems WHERE url = $1", &[url])
                 .await
-                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
             for row in rows {
                 let sid: String = row.get(0);
                 let has_hier: bool = client
@@ -629,7 +629,7 @@ impl BundleImportBackend for PostgresTerminologyBackend {
             .pool
             .get()
             .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
         let row = client
             .query_one(
                 "SELECT EXISTS(
@@ -640,7 +640,7 @@ impl BundleImportBackend for PostgresTerminologyBackend {
                 &[&url],
             )
             .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
         Ok(row.get(0))
     }
 
@@ -662,7 +662,7 @@ impl BundleImportBackend for PostgresTerminologyBackend {
             .pool
             .get()
             .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
 
         match resource_type {
             "CodeSystem" => {
@@ -674,27 +674,27 @@ impl BundleImportBackend for PostgresTerminologyBackend {
                         &[&resource_url],
                     )
                     .await
-                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                    .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
                 // Delete the system row; ON DELETE CASCADE removes concepts,
                 // concept_hierarchy, concept_properties, concept_designations.
                 client
                     .execute("DELETE FROM code_systems WHERE url = $1", &[&resource_url])
                     .await
-                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                    .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
             }
             "ValueSet" => {
                 // ON DELETE CASCADE removes value_set_expansions.
                 client
                     .execute("DELETE FROM value_sets WHERE url = $1", &[&resource_url])
                     .await
-                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                    .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
             }
             "ConceptMap" => {
                 // ON DELETE CASCADE removes concept_map_elements.
                 client
                     .execute("DELETE FROM concept_maps WHERE url = $1", &[&resource_url])
                     .await
-                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                    .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
             }
             _ => {} // Unknown resource type — nothing to clean up.
         }
@@ -743,7 +743,7 @@ async fn write_code_system(
             &[&cs.url, &cs.version],
         )
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?
         .and_then(|r| r.get::<_, Option<String>>(0));
     let storage_id = if let Some(id) = existing_for_url_version {
         id
@@ -789,7 +789,7 @@ async fn write_code_system(
             ],
         )
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     // authority_rank keeps the strongest claim ever asserted for this row; the
     // COALESCE sentinel (9 — above any real rank) means a row that predates the
@@ -824,7 +824,7 @@ async fn write_code_system(
             ],
         )
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     let system_id: String = cs_rows
         .into_iter()
@@ -851,7 +851,7 @@ async fn write_code_system(
                 ],
             )
             .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
         let concept_id: i64 = rows
             .into_iter()
@@ -883,14 +883,14 @@ async fn write_code_system(
                     &[&concept_id],
                 )
                 .await
-                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
             client
                 .execute(
                     "DELETE FROM concept_designations WHERE concept_id = $1",
                     &[&concept_id],
                 )
                 .await
-                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
         }
 
         for prop in &concept.properties {
@@ -905,7 +905,7 @@ async fn write_code_system(
                     &[&concept_id, &prop.code, &prop.value_type, &prop.value],
                 )
                 .await
-                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
             // Extra hierarchy edge from a "parent" property.
             if prop.is_parent_edge {
@@ -930,7 +930,7 @@ async fn write_code_system(
                     ],
                 )
                 .await
-                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
         }
     }
 
@@ -944,7 +944,7 @@ async fn write_code_system(
             &[&system_id],
         )
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     stats.code_systems += 1;
     Ok(())
@@ -964,7 +964,7 @@ async fn insert_hierarchy(
             &[&system_id, &parent_code, &child_code],
         )
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
     Ok(())
 }
 
@@ -980,7 +980,7 @@ async fn write_value_set(
     let existing = client
         .query("SELECT id FROM value_sets WHERE url = $1", &[&vs.url])
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     if let Some(row) = existing.into_iter().next() {
         let existing_id: String = row.get(0);
@@ -990,7 +990,7 @@ async fn write_value_set(
                 &[&existing_id],
             )
             .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
     }
 
     // Synthetic storage id: `<fhir-id>|<version>` (or `<fhir-id>` when
@@ -1011,7 +1011,7 @@ async fn write_value_set(
             &[&vs.url, &vs.version],
         )
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?
         .and_then(|r| r.get::<_, Option<String>>(0));
     let storage_id = if let Some(id) = existing_for_url_version {
         id
@@ -1052,7 +1052,7 @@ async fn write_value_set(
             ],
         )
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     // See `write_code_system` for the LEAST/COALESCE-sentinel rationale.
     let vs_update = format!(
@@ -1083,7 +1083,7 @@ async fn write_value_set(
             ],
         )
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     stats.value_sets += 1;
     Ok(())
@@ -1119,7 +1119,7 @@ async fn write_concept_map(
             ],
         )
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     let rows = client
         .query(
@@ -1145,7 +1145,7 @@ async fn write_concept_map(
             ],
         )
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     let map_id: String = rows
         .into_iter()
@@ -1162,7 +1162,7 @@ async fn write_concept_map(
             &[&map_id],
         )
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     for el in &cm.elements {
         client
@@ -1181,7 +1181,7 @@ async fn write_concept_map(
                 ],
             )
             .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
     }
 
     stats.concept_maps += 1;

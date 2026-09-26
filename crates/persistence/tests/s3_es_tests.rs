@@ -29,7 +29,9 @@ use helios_persistence::core::{Backend, BackendKind, ResourceStorage};
 use helios_persistence::error::{ResourceError, StorageError};
 use helios_persistence::search::{SearchParameterLoader, TenantSearchRegistries};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
-use helios_persistence::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
+use helios_persistence::types::{
+    SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue, SortDirective,
+};
 
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_s3::Client;
@@ -43,12 +45,18 @@ use testcontainers_modules::elastic_search::ElasticSearch;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
+// `SHARED_MINIO` / `SHARED_ES` are statics and never dropped; containers
+// labeled via `with_cleanup_label` are removed by an exit hook instead.
+#[path = "common/container_cleanup.rs"]
+mod container_cleanup;
+use container_cleanup::with_cleanup_label;
+
 // ============================================================================
 // Container setup
 // ============================================================================
 
-const DEFAULT_MINIO_IMAGE: &str = "minio/minio";
-const DEFAULT_MINIO_TAG: &str = "RELEASE.2025-02-28T09-55-16Z";
+const DEFAULT_MINIO_IMAGE: &str = "ghcr.io/coollabsio/minio";
+const DEFAULT_MINIO_TAG: &str = "RELEASE.2025-10-15T17-29-55Z";
 const DEFAULT_MINIO_ROOT_USER: &str = "minioadmin";
 const DEFAULT_MINIO_ROOT_PASSWORD: &str = "minioadmin";
 
@@ -92,15 +100,17 @@ async fn shared_minio() -> &'static SharedMinio {
             let root_password = std::env::var("MINIO_ROOT_PASSWORD")
                 .unwrap_or_else(|_| DEFAULT_MINIO_ROOT_PASSWORD.to_string());
 
-            let container = GenericImage::new(image, tag)
-                .with_wait_for(WaitFor::message_on_stderr("API:"))
-                .with_exposed_port(9000.tcp())
-                .with_env_var("MINIO_ROOT_USER", root_user.clone())
-                .with_env_var("MINIO_ROOT_PASSWORD", root_password.clone())
-                .with_cmd(["server", "/data", "--console-address", ":9001"])
-                .start()
-                .await
-                .expect("failed to start MinIO container");
+            let container = with_cleanup_label(
+                GenericImage::new(image, tag)
+                    .with_wait_for(WaitFor::message_on_stderr("API:"))
+                    .with_exposed_port(9000.tcp())
+                    .with_env_var("MINIO_ROOT_USER", root_user.clone())
+                    .with_env_var("MINIO_ROOT_PASSWORD", root_password.clone())
+                    .with_cmd(["server", "/data", "--console-address", ":9001"]),
+            )
+            .start()
+            .await
+            .expect("failed to start MinIO container");
 
             let host = container
                 .get_host()
@@ -157,13 +167,15 @@ async fn start_es_container() -> testcontainers::ContainerAsync<ElasticSearch> {
     let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
     let mut last_err = None;
     for attempt in 1..=ES_START_ATTEMPTS {
-        match ElasticSearch::default()
-            .with_tag(ES_IMAGE_TAG)
-            .with_env_var("ES_JAVA_OPTS", "-Xms256m -Xmx256m")
-            .with_label("github.run_id", &run_id)
-            .with_startup_timeout(ES_STARTUP_TIMEOUT)
-            .start()
-            .await
+        match with_cleanup_label(
+            ElasticSearch::default()
+                .with_tag(ES_IMAGE_TAG)
+                .with_env_var("ES_JAVA_OPTS", "-Xms256m -Xmx256m")
+                .with_label("github.run_id", &run_id)
+                .with_startup_timeout(ES_STARTUP_TIMEOUT),
+        )
+        .start()
+        .await
         {
             Ok(container) => return container,
             Err(err) => {
@@ -265,6 +277,14 @@ fn build_search_registry() -> Arc<TenantSearchRegistries> {
             }
         }
         if let Ok(params) = loader.load_from_spec_file(&data_dir) {
+            for p in params {
+                let _ = registry.register(p);
+            }
+        }
+        // Custom files (e.g. the SQL-on-FHIR `ViewDefinition` params), the
+        // third tier `start_s3_elasticsearch` loads too — without it ES never
+        // indexes `ViewDefinition.name` (#1070).
+        if let Ok((params, _files)) = loader.load_custom_from_directory_with_files(&data_dir) {
             for p in params {
                 let _ = registry.register(p);
             }
@@ -393,6 +413,75 @@ where
 // ============================================================================
 // Tests
 // ============================================================================
+
+/// `ViewDefinition?_sort=name&name:contains=view` — the web UI's SQL-views rail
+/// and Add-table combobox query — returns only the case-insensitive substring
+/// matches, in name order (#1070). The `name` param comes from the custom
+/// `sql-on-fhir-search-parameters.json` file, so this fails if the search
+/// registry skips the custom tier: ES never indexes `ViewDefinition.name`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s3_es_test_view_definition_name_contains_sorted() {
+    if skip_if_disabled("s3_es_test_view_definition_name_contains_sorted") {
+        return;
+    }
+
+    let harness = make_harness("vd-name-contains").await;
+    let tenant = tenant("s3-es-tenant");
+
+    // Created out of name order so the sort is observable. Names start
+    // lowercase so the expected order is the same whether the backend's
+    // string sort is case-sensitive or not.
+    let mut ids_by_name = HashMap::new();
+    for name in ["beta_VIEW_x", "gamma", "alpha_view"] {
+        let created = harness
+            .composite
+            .create(
+                &tenant,
+                "ViewDefinition",
+                json!({
+                    "resourceType": "ViewDefinition",
+                    "url": format!("http://example.org/ViewDefinition/{name}"),
+                    "name": name,
+                    "status": "active",
+                    "resource": "Patient",
+                    "select": [{"column": [{"path": "id", "name": "id"}]}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("create ViewDefinition should succeed");
+        ids_by_name.insert(name, created.id().to_string());
+    }
+
+    let query = SearchQuery::new("ViewDefinition")
+        .with_parameter(SearchParameter {
+            name: "name".to_string(),
+            param_type: SearchParamType::String,
+            modifier: Some(SearchModifier::Contains),
+            values: vec![SearchValue::eq("view")],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_sort(SortDirective::parse("name").with_param_type(Some(SearchParamType::String)));
+
+    let expected = vec![
+        ids_by_name["alpha_view"].clone(),
+        ids_by_name["beta_VIEW_x"].clone(),
+    ];
+    let ids = |r: &SearchResult| -> Vec<String> {
+        r.resources
+            .items
+            .iter()
+            .map(|res| res.id().to_string())
+            .collect()
+    };
+    let results = search_until(&harness, &tenant, &query, |r| ids(r) == expected).await;
+    assert_eq!(
+        ids(&results),
+        expected,
+        "name:contains=view must return only alpha_view and beta_VIEW_x, sorted by name"
+    );
+}
 
 /// Write a Patient to S3, then verify it appears in ES search by name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

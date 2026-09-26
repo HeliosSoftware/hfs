@@ -37,6 +37,9 @@ HFS_SERVER_PORT=3000 HFS_LOG_LEVEL=debug cargo run --bin hfs
 | `HFS_DATA_DIR` | `./data` | FHIR data directory, including search parameters |
 | `HFS_SEARCH_PARAM_CACHE_TTL` | `3600` | Seconds between refreshes of the in-memory SearchParameter registry from storage; a param POSTed to one cluster node becomes visible to others within this interval. `0` disables the refresh. |
 | `HFS_UI_ENABLED` | `true` | Serve the web UI at `/ui`. `false` = headless (`/ui` returns 404 + OperationOutcome). Replaces the removed `headless` build feature (#975) |
+| `HFS_DASHBOARD_RECONCILE_SECS` | `30` | Seconds between Home dashboard reconcile passes (`--dashboard-reconcile-interval-secs`). Whole seconds, `> 0`; `0` or non-numeric fails startup. Also spaces per-tenant full recounts (max(interval, 10 × last recount duration)) and failed-seed retries |
+| `HFS_DASHBOARD_REFRESH_SECS` | `5` | Seconds between refreshes of a Home dashboard whose figures are moving (`--dashboard-refresh-secs`). Whole seconds, `> 0`, `<=` `HFS_DASHBOARD_IDLE_REFRESH_SECS`; otherwise fails startup. In-memory counters only |
+| `HFS_DASHBOARD_IDLE_REFRESH_SECS` | `10` | Seconds between watch ticks of a settled Home dashboard (`--dashboard-idle-refresh-secs`). Whole seconds, `> 0`, `>=` `HFS_DASHBOARD_REFRESH_SECS`; otherwise fails startup |
 
 ## Limits
 
@@ -46,6 +49,7 @@ HFS_SERVER_PORT=3000 HFS_LOG_LEVEL=debug cargo run --bin hfs
 | `HFS_REQUEST_TIMEOUT` | `30` | Request timeout in seconds |
 | `HFS_DEFAULT_PAGE_SIZE` | `20` | Default search result page size |
 | `HFS_MAX_PAGE_SIZE` | `1000` | Maximum search result page size |
+| `HFS_EVERYTHING_MAX_UNPAGED` | `10000` | Ceiling on `match` entries for an unpaged `Patient/$everything`; when reached the response is paged and carries a `next` link. |
 
 ## Compression
 
@@ -72,9 +76,26 @@ HFS_SERVER_PORT=3000 HFS_LOG_LEVEL=debug cargo run --bin hfs
 | `HFS_ELASTICSEARCH_PASSWORD` | none | Elasticsearch basic auth password |
 | `HFS_ELASTICSEARCH_REFRESH_INTERVAL` | `1s` | Index `refresh_interval` applied when an index is created (`-1` disables periodic refresh) |
 | `HFS_ELASTICSEARCH_WRITE_REFRESH` | `false` | `refresh` parameter on index/delete writes: `false`, `wait_for`, or `true` |
+| `HFS_ELASTICSEARCH_NESTED_OBJECTS_LIMIT` | `50000` | Index `mapping.nested_objects.limit`: max nested objects per document across all nested search-parameter fields. Set on new indices; raised at startup on existing indices below it |
 | `HFS_COMPOSITE_SYNC_MODE` | `asynchronous` | ES-backed composite write sync mode: asynchronous, synchronous, or hybrid |
 
-Use `HFS_COMPOSITE_SYNC_MODE=synchronous` **and** `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for` when callers need read-your-write search semantics, such as integration tests or bulk loads that immediately search. Either alone still leaves a window: synchronous mode only guarantees the document reached Elasticsearch, and it is not searchable until the next index refresh. See `crates/persistence/README.md` (Search visibility on Elasticsearch-backed composites).
+Use `HFS_COMPOSITE_SYNC_MODE=synchronous` **and** `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for` when callers need read-your-write search semantics, such as integration tests or bulk loads that immediately search. Either alone still leaves a window: synchronous mode only guarantees the document reached Elasticsearch, and it is not searchable until the next index refresh. See `crates/persistence/README.md` (Search visibility on Elasticsearch-backed composites). Transaction conditional references (`Organization?identifier=…` in a resource body) and `If-None-Exist` creates are exempt: they make acknowledged writes visible before resolving, on any setting (#1047).
+
+### When the search index misses a write (#1334)
+
+On an ES-backed composite the primary is the system of record: a write succeeds once the primary has committed it, in **every** `HFS_COMPOSITE_SYNC_MODE` (synchronous included), even if Elasticsearch then refuses the document after the sync retries. The client sees the same `201`/`200`/`204` either way; the resource is readable by id but missing from (or stale in) search until it is re-synced. That failure is never silent:
+
+- **Metric** (`/metrics`): `composite_secondary_sync_failures_total{backend,operation}` counts final failures (once per failed write, not per retry; `backend` is the secondary's id, `es`; `operation` is `create`/`update`/`delete`). `composite_secondary_sync_needs_reindex` is the number of resources currently recorded as owed. Alert on the gauge staying above zero. No tenant, type or id labels — `/metrics` is public.
+- **Log event**: one `ERROR` "Secondary sync failed; …" per final failure with fields `tenant`, `resource_type`, `id`, `version`, `backend_id`, `operation`, `attempts`, `recorded`, `error`. No resource content.
+- **Durable record**: one row per (tenant, type, id, backend) in the primary's `secondary_sync_failures` table (SQLite, PostgreSQL) or collection (MongoDB): `operation`, `first_failed_at`, `last_failed_at`, `last_error`, `attempts`. It survives restarts. A later successful write of the same resource clears it. **S3 primaries keep no ledger**: metric and log only (`recorded=false`), repair with `$reindex`.
+- **Repair**: a background task re-syncs recorded resources from the primary's *current* state (a delete if the primary no longer has it) and clears the record; a secondary that is still down leaves the record for the next pass. It is idempotent and safe alongside writes. `$reindex` also rebuilds the index; the next pass then finds the records in sync and clears them.
+
+| Variable | Default | Description |
+|---|---|---|
+| `HFS_COMPOSITE_SYNC_REPAIR_INTERVAL` | `60` | Seconds between repair passes; `0` disables the task (the records are still written) |
+| `HFS_COMPOSITE_SYNC_REPAIR_BATCH` | `100` | Records examined per pass, least recently failed first |
+
+To list what is owed: `SELECT * FROM secondary_sync_failures ORDER BY last_failed_at;` on the primary.
 
 ## Storage Backends
 
@@ -118,6 +139,19 @@ loudly; one that silently *ignores* them would turn every concurrent write into 
 lost update with no error anywhere, so verify support before pointing HFS at an
 unfamiliar S3-compatible provider.
 
+### Conditional interactions on S3
+
+S3 has no search index, so of the four conditional interactions it serves only
+**conditional create** (`POST [type]` with `If-None-Exist`, and `batch` entries
+with `ifNoneExist`), identifier-scoped (#1435): `_id` criteria read the objects
+they name, `identifier` criteria walk the type's prefix (one `LIST` plus `GET`s
+until the second match) and are read as token search reads them (`code`,
+`system|code`, `|code`, `system|`; repeated criteria AND, comma lists OR). Any
+other parameter is refused with `400` before anything is read. Conditional
+update, delete and patch answer `501`, and the CapabilityStatement says so.
+The scan costs what an export or SQL-on-FHIR scan of the type costs; see #1502
+for the `LIST` curve on large prefixes.
+
 ### S3 key prefixes (IAM)
 
 The backend writes under these prefixes inside `HFS_S3_BUCKET` (each below the
@@ -129,16 +163,18 @@ optional `HFS_S3_PREFIX`):
 | `{tenant}/bulk/submit/` | Bulk-submit staging |
 | `tenants/` | Tenant registry |
 | `_system.user-settings/` | Per-user UI settings (`/_user/settings`) |
+| `_system.login-sessions/` | Web UI login sessions and pending logins (#1481) |
 
-The last two are **cross-tenant** and sit outside any tenant prefix. A
+The last three are **cross-tenant** and sit outside any tenant prefix. A
 least-privilege bucket policy scoped only to the FHIR prefixes will pass startup
 validation (which only issues `HeadBucket`) and then return `AccessDenied` — a
 500 on every affected request. Grant the policy these prefixes too.
 
 Note also that a **bucket-wide** lifecycle rule (expiration or Glacier
-transition) will apply to `_system.user-settings/` as well: expiry silently resets
-users' preferences, and a Glacier transition makes them unreadable. Scope lifecycle
-rules to the FHIR prefixes.
+transition) will apply to `_system.user-settings/` and `_system.login-sessions/`
+as well: expiry silently resets users' preferences or signs everyone out, and a
+Glacier transition makes them unreadable. Scope lifecycle rules to the FHIR
+prefixes.
 
 ## Per-user UI settings
 
@@ -248,6 +284,7 @@ StructureDefinition writes since process start (no startup warm-load yet).
 | delete | DELETE | `/[type]/[id]` |
 | create | POST | `/[type]` |
 | search | GET/POST | `/[type]?params` or `/[type]/_search` |
+| search, system | GET/POST | `/?params` or `/_search` — **not supported**: `501` + OperationOutcome (`not-supported`), and not listed in `/metadata` (#1338). With the UI mounted, bare `GET /` (no query) redirects to `/ui` |
 | history, instance | GET | `/[type]/[id]/_history` |
 | history, type | GET | `/[type]/_history` |
 | history, system | GET | `/_history` |
@@ -257,6 +294,8 @@ StructureDefinition writes since process start (no startup warm-load yet).
 | purge, type | POST | `/[type]/$purge` |
 | reindex | POST | `/$reindex`, `/[type]/$reindex` |
 | reindex status / cancel | GET/DELETE | `/$reindex-status/[job_id]` |
+| everything, instance | GET/POST | `/Patient/[id]/$everything` |
+| everything, type | GET/POST | `/Patient/$everything` |
 
 `$purge` (permanent, irreversible deletion including history) and `$reindex`
 (rebuild the search index) are administrative, non-FHIR operations. They require

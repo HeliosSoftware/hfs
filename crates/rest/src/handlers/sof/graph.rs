@@ -694,13 +694,7 @@ pub(crate) async fn execute_plan(
                     "materialized SQL query dependency"
                 );
                 leaf_schemas.push(schema);
-                engine = materialize_labels(
-                    engine,
-                    internal_name,
-                    &labels_by_target,
-                    limits.max_source_rows_per_vd,
-                )
-                .await?;
+                engine = materialize_labels(engine, internal_name, &labels_by_target).await?;
             }
             PlanNode::SqlView {
                 internal_name, sql, ..
@@ -729,13 +723,7 @@ pub(crate) async fn execute_plan(
                     elapsed_ms,
                     "materialized SQL view node"
                 );
-                engine = materialize_labels(
-                    engine,
-                    internal_name,
-                    &labels_by_target,
-                    limits.max_source_rows_per_vd,
-                )
-                .await?;
+                engine = materialize_labels(engine, internal_name, &labels_by_target).await?;
             }
         }
     }
@@ -794,26 +782,32 @@ fn labels_by_target(plan: &GraphPlan) -> HashMap<String, Vec<String>> {
         .collect()
 }
 
-/// Copies `internal_name`'s rows into a table named by every label that
-/// aliases it, so a consumer's SQL — which addresses its dependencies by
-/// label, not by internal name — finds them. A node with no referencing
-/// label is a no-op (never happens in practice: every plan node exists only
-/// because some edge pointed at it).
+/// Exposes `internal_name` under every label that aliases it, so a
+/// consumer's SQL — which addresses its dependencies by label, not by
+/// internal name — finds it. Each label is a view over the internal table
+/// (`CREATE VIEW "<label>" AS SELECT * FROM "<internal>"`): no rows are
+/// copied, and the DDL runs on a blocking thread like every other SQLite
+/// statement in the plan. A node with no referencing label is a no-op
+/// (never happens in practice: every plan node exists only because some
+/// edge pointed at it).
 async fn materialize_labels(
-    mut engine: InMemorySqlEngine,
+    engine: InMemorySqlEngine,
     internal_name: &str,
     labels_by_target: &HashMap<String, Vec<String>>,
-    max_rows: usize,
 ) -> Result<InMemorySqlEngine, SqlQueryError> {
     let Some(labels) = labels_by_target.get(internal_name) else {
         return Ok(engine);
     };
-    for label in labels {
-        let copy_sql = format!("SELECT * FROM \"{internal_name}\"");
-        let result = engine.execute_select(&copy_sql, &[], max_rows.saturating_add(1))?;
-        engine = materialize_query_result(engine, label, &result).await?;
-    }
-    Ok(engine)
+    let internal_name = internal_name.to_string();
+    let labels = labels.clone();
+    tokio::task::spawn_blocking(move || {
+        for label in &labels {
+            engine.create_view(label, &internal_name)?;
+        }
+        Ok(engine)
+    })
+    .await
+    .map_err(|e| SqlQueryError::Internal(format!("sqlquery worker panicked: {e}")))?
 }
 
 /// Builds a [`TableSchema`] from a [`QueryResult`]'s columns and inferred

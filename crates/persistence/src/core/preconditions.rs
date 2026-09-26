@@ -447,6 +447,94 @@ pub fn if_match_field_satisfied(raw: &str, current_version_id: &str) -> bool {
     super::versioned::normalize_etag(raw) == super::versioned::normalize_etag(current_version_id)
 }
 
+/// Evaluates `If-Match` for a conditional interaction (`PUT`/`PATCH`/`DELETE
+/// [type]?[criteria]`) against the one resource its criteria resolved to.
+///
+/// `matched` is `None` when the criteria matched nothing. A supplied
+/// precondition then fails, `*` included: it names a version of a resource
+/// that does not exist, so a conditional update must not fall through to its
+/// create (#1381) — the same rule [`bundle_if_match_gate`] applies to an
+/// instance `PUT` that would otherwise create.
+///
+/// Every [`ConditionalStorage`](super::ConditionalStorage) implementation calls
+/// this between resolving the match and writing, and then hands *that* row to
+/// `update`, whose compare-and-swap is keyed on the version evaluated here. A
+/// writer landing in between therefore ends in `VersionConflict`, never in a
+/// write over a version the client did not name. A delete gets the same
+/// guarantee from [`delete_under_precondition`].
+///
+/// The failure is [`ConcurrencyError::OptimisticLockFailure`], which the REST
+/// layer already renders as `412`. `id` is empty when nothing matched.
+///
+/// [`ConcurrencyError::OptimisticLockFailure`]: crate::error::ConcurrencyError::OptimisticLockFailure
+pub fn conditional_if_match_gate(
+    if_match: &EntityTagPrecondition,
+    resource_type: &str,
+    matched: Option<&StoredResource>,
+) -> crate::error::StorageResult<()> {
+    let current_version = matched.map(StoredResource::version_id);
+    if if_match.if_match_satisfied(current_version) {
+        return Ok(());
+    }
+
+    let expected_etag = match if_match {
+        EntityTagPrecondition::Tags(tags) => tags
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+        // `Absent` is always satisfied and never reaches this point.
+        EntityTagPrecondition::Any | EntityTagPrecondition::Absent => "*".to_string(),
+    };
+
+    Err(crate::error::StorageError::Concurrency(
+        crate::error::ConcurrencyError::OptimisticLockFailure {
+            resource_type: resource_type.to_string(),
+            id: matched.map(|m| m.id().to_string()).unwrap_or_default(),
+            expected_etag,
+            actual_etag: current_version.map(|v| format!("W/\"{v}\"")),
+        },
+    ))
+}
+
+/// Deletes `current` — the resource an `If-Match` precondition has just been
+/// evaluated against — so that the evaluation and the delete are one step.
+///
+/// With a precondition the delete goes through
+/// [`ResourceStorage::delete_versioned`](super::ResourceStorage::delete_versioned),
+/// pinned to `current`'s version: a writer landing after the evaluation ends
+/// in `VersionConflict` instead of being deleted along with the version the
+/// client named (#1404). Without one it is the plain, unconditional
+/// [`delete`](super::ResourceStorage::delete) it always was — FHIR's delete
+/// carries no precondition of its own.
+///
+/// Shared by `DELETE [type]/[id]` and every
+/// [`ConditionalStorage::conditional_delete`](super::ConditionalStorage::conditional_delete).
+pub async fn delete_under_precondition<S>(
+    storage: &S,
+    tenant: &crate::tenant::TenantContext,
+    if_match: &EntityTagPrecondition,
+    current: &StoredResource,
+) -> crate::error::StorageResult<()>
+where
+    S: super::ResourceStorage + ?Sized,
+{
+    if if_match.is_present() {
+        storage
+            .delete_versioned(
+                tenant,
+                current.resource_type(),
+                current.id(),
+                current.version_id(),
+            )
+            .await
+    } else {
+        storage
+            .delete(tenant, current.resource_type(), current.id())
+            .await
+    }
+}
+
 /// Builds the `412` bundle entry result used by every backend.
 pub fn precondition_failed_entry(diagnostics: &str) -> BundleEntryResult {
     BundleEntryResult::error(
@@ -481,10 +569,7 @@ pub fn bundle_if_none_exist_gate(matches: Vec<StoredResource>) -> Option<BundleE
         0 => None,
         1 => {
             let existing = matches.into_iter().next().expect("length checked");
-            let location = existing.versioned_url();
-            let mut result = BundleEntryResult::ok(existing);
-            result.location = Some(location);
-            Some(result)
+            Some(BundleEntryResult::matched_existing(existing))
         }
         n => Some(multiple_matches_entry("create", n)),
     }
@@ -857,6 +942,11 @@ mod tests {
     fn if_none_exist_gate_answers_200_with_a_location_for_the_single_match() {
         let result = bundle_if_none_exist_gate(vec![stored("p1")]).expect("gated");
         assert_eq!(result.status, 200);
+        assert_eq!(
+            result.effect,
+            crate::core::transaction::BundleEntryEffect::NoOp,
+            "a matched conditional create writes nothing"
+        );
         assert_eq!(result.location.as_deref(), Some("Patient/p1/_history/1"));
         assert_eq!(
             result
@@ -873,6 +963,10 @@ mod tests {
     fn if_none_exist_gate_answers_412_for_several_matches() {
         let result = bundle_if_none_exist_gate(vec![stored("p1"), stored("p2")]).expect("gated");
         assert_eq!(result.status, 412);
+        assert_eq!(
+            result.effect,
+            crate::core::transaction::BundleEntryEffect::Failed
+        );
         assert!(result.resource.is_none());
         let outcome = result.outcome.expect("outcome");
         assert_eq!(outcome["issue"][0]["code"], "multiple-matches");
@@ -886,8 +980,72 @@ mod tests {
     fn not_supported_entry_is_a_501_with_the_diagnostics() {
         let result = not_supported_entry("why");
         assert_eq!(result.status, 501);
+        assert_eq!(
+            result.effect,
+            crate::core::transaction::BundleEntryEffect::Failed
+        );
         let outcome = result.outcome.expect("outcome");
         assert_eq!(outcome["issue"][0]["code"], "not-supported");
         assert_eq!(outcome["issue"][0]["diagnostics"], "why");
+    }
+
+    // ── Conditional-write gate (#1381) ───────────────────────────────────────
+
+    #[test]
+    fn conditional_gate_passes_an_absent_precondition_match_or_not() {
+        let absent = EntityTagPrecondition::Absent;
+        assert!(conditional_if_match_gate(&absent, "Patient", None).is_ok());
+        assert!(conditional_if_match_gate(&absent, "Patient", Some(&stored("p"))).is_ok());
+    }
+
+    #[test]
+    fn conditional_gate_compares_against_the_matched_version() {
+        // `StoredResource::new` starts at version 1.
+        let matched = stored("p");
+        for ok in [r#"W/"1""#, r#""1""#, "*", r#"W/"7", W/"1""#] {
+            let precondition = EntityTagPrecondition::parse([ok]).unwrap();
+            assert!(
+                conditional_if_match_gate(&precondition, "Patient", Some(&matched)).is_ok(),
+                "{ok}"
+            );
+        }
+
+        let stale = EntityTagPrecondition::parse([r#"W/"7", W/"8""#]).unwrap();
+        match conditional_if_match_gate(&stale, "Patient", Some(&matched)) {
+            Err(crate::error::StorageError::Concurrency(
+                crate::error::ConcurrencyError::OptimisticLockFailure {
+                    resource_type,
+                    id,
+                    expected_etag,
+                    actual_etag,
+                },
+            )) => {
+                assert_eq!(resource_type, "Patient");
+                assert_eq!(id, "p");
+                assert_eq!(expected_etag, r#"W/"7", W/"8""#);
+                assert_eq!(actual_etag.as_deref(), Some(r#"W/"1""#));
+            }
+            other => panic!("expected OptimisticLockFailure, got {other:?}"),
+        }
+    }
+
+    /// Nothing matched: every supplied precondition fails, `*` included, and
+    /// the failure names no id — so a no-match update cannot go on to create.
+    #[test]
+    fn conditional_gate_fails_every_precondition_when_nothing_matched() {
+        for raw in [r#"W/"1""#, "*"] {
+            let precondition = EntityTagPrecondition::parse([raw]).unwrap();
+            match conditional_if_match_gate(&precondition, "Patient", None) {
+                Err(crate::error::StorageError::Concurrency(
+                    crate::error::ConcurrencyError::OptimisticLockFailure {
+                        id, actual_etag, ..
+                    },
+                )) => {
+                    assert!(id.is_empty(), "{raw}");
+                    assert_eq!(actual_etag, None, "{raw}");
+                }
+                other => panic!("{raw}: expected OptimisticLockFailure, got {other:?}"),
+            }
+        }
     }
 }

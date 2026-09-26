@@ -13,6 +13,9 @@ on:
   workflow_dispatch:
 
 env:
+  # Rustup ranks this above a directory override left on a self-hosted runner
+  # (see ci.yml).
+  RUSTUP_TOOLCHAIN: stable
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: 1
   CARGO_PROFILE_DEV_DEBUG: 0
@@ -48,7 +51,7 @@ jobs:
             {"build_key":"R4B-R5-R6",   "features":"R4B,R5,R6",    "enabled":["R4B","R5","R6"]},
             {"build_key":"all",         "features":"R4,R4B,R5,R6", "enabled":["R4","R4B","R5","R6"]}
           ]'
-          BACKENDS='["sqlite","sqlite-elasticsearch","postgres","mongodb","s3-elasticsearch"]'
+          BACKENDS='["sqlite","sqlite-elasticsearch","postgres","postgres-elasticsearch","mongodb","mongodb-elasticsearch","s3-elasticsearch"]'
 
           BUILD=$(jq -c '[.[] | {build_key, features}]' <<<"$SUBSETS")
           # Runtime smoke excludes R6 (ballot spec).
@@ -155,7 +158,7 @@ jobs:
           fi
 
       - name: Start Elasticsearch
-        if: matrix.backend == 'sqlite-elasticsearch' || matrix.backend == 's3-elasticsearch'
+        if: endsWith(matrix.backend, '-elasticsearch')
         run: |
           ES_CONTAINER="es-subscriptions-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.build_key }}-${{ matrix.fhir_version }}"
           docker rm -fv "$ES_CONTAINER" 2>/dev/null || true
@@ -186,9 +189,9 @@ jobs:
           exit 1
 
       - name: Start PostgreSQL
-        if: matrix.backend == 'postgres'
+        if: matrix.backend == 'postgres' || matrix.backend == 'postgres-elasticsearch'
         run: |
-          PG_CONTAINER="pg-subscriptions-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.build_key }}-${{ matrix.fhir_version }}"
+          PG_CONTAINER="pg-subscriptions-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.build_key }}-${{ matrix.fhir_version }}"
           docker rm -fv "$PG_CONTAINER" 2>/dev/null || true
           docker run -d --name "$PG_CONTAINER" -p 0:5432 \
             -e POSTGRES_USER=helios \
@@ -217,9 +220,9 @@ jobs:
           exit 1
 
       - name: Start MongoDB replica set
-        if: matrix.backend == 'mongodb'
+        if: matrix.backend == 'mongodb' || matrix.backend == 'mongodb-elasticsearch'
         run: |
-          MONGO_CONTAINER="mongo-subscriptions-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.build_key }}-${{ matrix.fhir_version }}"
+          MONGO_CONTAINER="mongo-subscriptions-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.build_key }}-${{ matrix.fhir_version }}"
           docker rm -fv "$MONGO_CONTAINER" 2>/dev/null || true
           docker run -d --name "$MONGO_CONTAINER" -p 0:27017 mongo:7.0 --replSet rs0 --bind_ip_all
 
@@ -349,6 +352,8 @@ jobs:
             postgres) HFS_PORT=18090 ;;
             mongodb) HFS_PORT=18091 ;;
             s3-elasticsearch) HFS_PORT=18092 ;;
+            postgres-elasticsearch) HFS_PORT=18093 ;;
+            mongodb-elasticsearch) HFS_PORT=18094 ;;
             *) HFS_PORT=18088 ;;
           esac
           mkdir -p "$RESULTS_DIR"
@@ -376,6 +381,18 @@ jobs:
             HFS_PG_USER=helios \
             HFS_PG_PASSWORD=helios \
             ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          elif [ "${{ matrix.backend }}" = "postgres-elasticsearch" ]; then
+            HFS_SUBSCRIPTIONS_ENABLED=true \
+            HFS_BASE_URL="http://localhost:$HFS_PORT" \
+            HFS_DEFAULT_FHIR_VERSION="${{ matrix.fhir_version }}" \
+            HFS_STORAGE_BACKEND=postgres-elasticsearch \
+            HFS_PG_HOST="$DOCKER_HOST_IP" \
+            HFS_PG_PORT="$PG_PORT" \
+            HFS_PG_DBNAME=helios \
+            HFS_PG_USER=helios \
+            HFS_PG_PASSWORD=helios \
+            HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
+            ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "mongodb" ]; then
             HFS_SUBSCRIPTIONS_ENABLED=true \
             HFS_BASE_URL="http://localhost:$HFS_PORT" \
@@ -383,6 +400,15 @@ jobs:
             HFS_STORAGE_BACKEND=mongodb \
             HFS_DATABASE_URL="mongodb://$DOCKER_HOST_IP:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
             HFS_MONGODB_DATABASE="helios_subscriptions_smoke_${{ github.run_id }}_${{ github.run_attempt }}_${{ matrix.build_key }}_${{ matrix.fhir_version }}" \
+            ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          elif [ "${{ matrix.backend }}" = "mongodb-elasticsearch" ]; then
+            HFS_SUBSCRIPTIONS_ENABLED=true \
+            HFS_BASE_URL="http://localhost:$HFS_PORT" \
+            HFS_DEFAULT_FHIR_VERSION="${{ matrix.fhir_version }}" \
+            HFS_STORAGE_BACKEND=mongodb-elasticsearch \
+            HFS_DATABASE_URL="mongodb://$DOCKER_HOST_IP:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
+            HFS_MONGODB_DATABASE="helios_subscriptions_smoke_${{ github.run_id }}_${{ github.run_attempt }}_${{ matrix.build_key }}_${{ matrix.fhir_version }}" \
+            HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
             ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "s3-elasticsearch" ]; then
             HFS_SUBSCRIPTIONS_ENABLED=true \

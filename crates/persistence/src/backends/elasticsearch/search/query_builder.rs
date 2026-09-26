@@ -5,8 +5,9 @@
 use serde_json::{Value, json};
 
 use crate::types::{
-    CompartmentMembership, PageCursor, SearchModifier, SearchParamType, SearchParameter,
-    SearchPrefix, SearchQuery, SortDirection, SortDirective, strip_reference_version,
+    CompartmentMembership, CursorDirection, PageCursor, SearchModifier, SearchParamType,
+    SearchParameter, SearchPrefix, SearchQuery, SortDirection, SortDirective,
+    strip_reference_version,
 };
 
 use super::fts;
@@ -20,6 +21,10 @@ pub struct EsQuery {
     pub body: Value,
     /// The index to search.
     pub index: String,
+    /// Whether `size` includes one extra hit beyond `count`. False only when
+    /// `from + count + 1` would exceed `max_result_window`, in which case the
+    /// results layer cannot prove a further page from an extra hit (#1079).
+    pub over_fetched: bool,
 }
 
 /// Returns true if the query contains a relevance-scoring (full-text) clause:
@@ -35,12 +40,33 @@ fn query_has_relevance(query: &SearchQuery) -> bool {
     })
 }
 
+/// Returns the effective Elasticsearch sort order (`"asc"`/`"desc"`) for a
+/// sort directive's `direction`, swapped when `paging` is
+/// `CursorDirection::Previous`. Paging backward means walking the result set
+/// in the opposite order, so every criterion — including `mode` and
+/// `missing`, which are derived from this order — must flip too (#1015).
+fn es_order(direction: SortDirection, paging: CursorDirection) -> &'static str {
+    let ascending = match direction {
+        SortDirection::Ascending => true,
+        SortDirection::Descending => false,
+    };
+    let ascending = if paging == CursorDirection::Previous {
+        !ascending
+    } else {
+        ascending
+    };
+    if ascending { "asc" } else { "desc" }
+}
+
 /// Builds Elasticsearch queries from FHIR search queries.
 pub struct EsQueryBuilder<'a> {
     tenant_id: &'a str,
     #[allow(dead_code)]
     resource_type: &'a str,
     index: String,
+    /// The index's `index.max_result_window` setting, used to clamp the
+    /// over-fetched `size` so `from + size` never exceeds it (#1079).
+    max_result_window: u32,
 }
 
 impl<'a> EsQueryBuilder<'a> {
@@ -50,7 +76,18 @@ impl<'a> EsQueryBuilder<'a> {
             tenant_id,
             resource_type,
             index,
+            // Same default as `ElasticsearchConfig::max_result_window`
+            // (`backend.rs`); overridden via `with_max_result_window` when
+            // the caller knows the actual configured window.
+            max_result_window: 10_000,
         }
+    }
+
+    /// Overrides the index's `max_result_window`, used to clamp the
+    /// over-fetched `size` so `from + size` stays within the window (#1079).
+    pub fn with_max_result_window(mut self, window: u32) -> Self {
+        self.max_result_window = window;
+        self
     }
 
     /// Builds a complete ES query from a FHIR SearchQuery.
@@ -110,18 +147,43 @@ impl<'a> EsQueryBuilder<'a> {
             "query": { "bool": bool_query },
         });
 
+        // Decode the cursor once and reuse it for sort direction, size, and
+        // `search_after` — an undecodable cursor is treated as absent
+        // everywhere, matching the pre-existing `search_after` behavior.
+        let cursor = query
+            .cursor
+            .as_deref()
+            .and_then(|c| PageCursor::decode(c).ok());
+        let paging = cursor
+            .as_ref()
+            .map(PageCursor::direction)
+            .unwrap_or_default();
+
         // Add sorting
-        let sort = self.build_sort(&query.sort);
+        let sort = self.build_sort(&query.sort, paging);
         body["sort"] = sort;
 
         // Add pagination
         let count = query.count.unwrap_or(20);
-        body["size"] = json!(count);
+        // Both directions over-fetch by one hit so the results layer can tell
+        // whether another page exists: forward it proves a next page, backward
+        // (#1015) it proves a previous page. The extra hit is dropped there.
+        // Elasticsearch rejects `from + size > index.max_result_window`, and
+        // internal include queries already ask for exactly that window, so the
+        // extra hit is only requested when it fits (#1079).
+        let from = if query.cursor.is_some() {
+            0
+        } else {
+            query.offset.unwrap_or(0)
+        };
+        let room = self.max_result_window.saturating_sub(from);
+        let size = (count + 1).min(room.max(1));
+        let over_fetched = size > count;
+        body["size"] = json!(size);
 
-        if let Some(ref cursor_str) = query.cursor {
-            if let Ok(cursor) = PageCursor::decode(cursor_str) {
-                let search_after = self.build_search_after(&cursor);
-                body["search_after"] = search_after;
+        if query.cursor.is_some() {
+            if let Some(cursor) = cursor.as_ref() {
+                body["search_after"] = self.build_search_after(cursor);
             }
         } else if let Some(offset) = query.offset {
             body["from"] = json!(offset);
@@ -141,6 +203,7 @@ impl<'a> EsQueryBuilder<'a> {
         EsQuery {
             body,
             index: self.index.clone(),
+            over_fetched,
         }
     }
 
@@ -190,6 +253,15 @@ impl<'a> EsQueryBuilder<'a> {
         // interpret the boolean literal as an ID or date value.
         if param.modifier == Some(SearchModifier::Missing) {
             return modifier_handlers::build_missing_clause(param);
+        }
+
+        // Defence in depth behind `validate_value_presence` (#1380): an empty
+        // value is a prefix of every string, so it matches nothing here rather
+        // than whatever the handler below would make of it — the whole
+        // parameter, since under `:not` "nothing" negates into "everything".
+        // `match_none`, never `None`: a `None` drops the constraint.
+        if crate::search::has_empty_value(param) {
+            return Some(date::match_none());
         }
 
         // Handle special parameters
@@ -259,12 +331,30 @@ impl<'a> EsQueryBuilder<'a> {
     }
 
     /// Builds a clause for the _id special parameter.
+    ///
+    /// `_id` is dispatched here by name (`build_parameter_clause`, above),
+    /// bypassing the generic `:not` handling that wraps every other
+    /// parameter's clauses in `must_not` — so `_id:not=a` used to build the
+    /// exact same `term`/`terms` clause as a bare `_id=a` and match precisely
+    /// the resource the caller asked to exclude (#1092). `:missing` is
+    /// resolved earlier, in `build_parameter_clause`, and any other modifier
+    /// is rejected before this point by the backend's search entry point, so
+    /// only `None` and `Some(SearchModifier::Not)` are handled here.
     fn build_id_clause(&self, param: &SearchParameter) -> Option<Value> {
+        if param.values.is_empty() {
+            return None;
+        }
         let ids: Vec<&str> = param.values.iter().map(|v| v.value.as_str()).collect();
-        if ids.len() == 1 {
-            Some(json!({ "term": { "resource_id": ids[0] } }))
+        let clause = if ids.len() == 1 {
+            json!({ "term": { "resource_id": ids[0] } })
         } else {
-            Some(json!({ "terms": { "resource_id": ids } }))
+            json!({ "terms": { "resource_id": ids } })
+        };
+
+        if matches!(param.modifier, Some(SearchModifier::Not)) {
+            Some(json!({ "bool": { "must_not": [clause] } }))
+        } else {
+            Some(clause)
         }
     }
 
@@ -283,10 +373,13 @@ impl<'a> EsQueryBuilder<'a> {
             .iter()
             .map(
                 |value| match date::field_range("last_updated", &value.value, value.prefix) {
-                    date::DateRange::Within(range) => range,
-                    date::DateRange::Outside(range) => {
+                    Some(date::DateRange::Within(range)) => range,
+                    Some(date::DateRange::Outside(range)) => {
                         json!({ "bool": { "must_not": [range] } })
                     }
+                    // Not a date: a clause that matches nothing. Dropping the
+                    // value instead would return every resource (#1293).
+                    None => date::match_none(),
                 },
             )
             .collect();
@@ -304,22 +397,34 @@ impl<'a> EsQueryBuilder<'a> {
     }
 
     /// Builds the sort clause.
-    fn build_sort(&self, directives: &[SortDirective]) -> Value {
+    ///
+    /// A `Previous` cursor walks the result set backward, so `paging`
+    /// reverses every criterion — including the final `resource_id`
+    /// tie-breaker — relative to the `Next` order. `search_after` then seeks
+    /// from the cursor position in that reversed order, and the results
+    /// layer restores the caller-facing order before returning the page
+    /// (#1015).
+    fn build_sort(&self, directives: &[SortDirective], paging: CursorDirection) -> Value {
         if directives.is_empty() {
-            // Default sort: _lastUpdated descending, then _id for tie-breaking
-            return json!([
-                { "last_updated": { "order": "desc" } },
-                { "resource_id": { "order": "asc" } }
-            ]);
+            // Default sort: _lastUpdated descending, then _id for
+            // tie-breaking; reversed when paging backward.
+            return if paging == CursorDirection::Previous {
+                json!([
+                    { "last_updated": { "order": "asc" } },
+                    { "resource_id": { "order": "desc" } }
+                ])
+            } else {
+                json!([
+                    { "last_updated": { "order": "desc" } },
+                    { "resource_id": { "order": "asc" } }
+                ])
+            };
         }
 
         let mut sort_clauses: Vec<Value> = Vec::new();
 
         for directive in directives {
-            let order = match directive.direction {
-                SortDirection::Ascending => "asc",
-                SortDirection::Descending => "desc",
-            };
+            let order = es_order(directive.direction, paging);
 
             match directive.parameter.as_str() {
                 "_id" => {
@@ -341,6 +446,17 @@ impl<'a> EsQueryBuilder<'a> {
                 // with a 200 (#883).
                 name => {
                     let (group, field) = match directive.param_type {
+                        // A date is a range `[value, end)` (#1391): an
+                        // ascending sort orders by where it starts, a
+                        // descending one by where it ends, so a `Period` sorts
+                        // by its end as it did when each end was its own
+                        // entry. Chosen by the requested direction, not the
+                        // paging one, so a `Previous` cursor keeps the key.
+                        Some(SearchParamType::Date)
+                            if matches!(directive.direction, SortDirection::Descending) =>
+                        {
+                            ("date", "search_params.date.end")
+                        }
                         Some(SearchParamType::Date) => ("date", "search_params.date.value"),
                         Some(SearchParamType::Number) => ("number", "search_params.number.value"),
                         Some(SearchParamType::Quantity) => {
@@ -359,25 +475,37 @@ impl<'a> EsQueryBuilder<'a> {
                     // orders an ascending sort, the largest a descending one
                     // (the SQL backends' MIN/MAX).
                     let mode = if order == "asc" { "min" } else { "max" };
-                    sort_clauses.push(json!({
-                        field: {
-                            "order": order,
-                            "mode": mode,
-                            "nested": {
-                                "path": format!("search_params.{group}"),
-                                "filter": {
-                                    "term": { format!("search_params.{group}.name"): name }
-                                }
-                            },
-                            "missing": if order == "asc" { "_last" } else { "_first" }
-                        }
-                    }));
+                    let mut clause = json!({
+                        "order": order,
+                        "mode": mode,
+                        "nested": {
+                            "path": format!("search_params.{group}"),
+                            "filter": {
+                                "term": { format!("search_params.{group}.name"): name }
+                            }
+                        },
+                        "missing": if order == "asc" { "_last" } else { "_first" }
+                    });
+                    // `search_params.date.end` exists only in indices at schema
+                    // version 2 (#1391). An index that has not been reconciled
+                    // yet (the mapping is brought up to date on the first write
+                    // to it) lacks the field, and Elasticsearch refuses to sort
+                    // on an unmapped one with a 400 unless told its type.
+                    if field == "search_params.date.end" {
+                        clause["unmapped_type"] = json!("date");
+                    }
+                    sort_clauses.push(json!({ field: clause }));
                 }
             }
         }
 
-        // Always add tie-breaker
-        sort_clauses.push(json!({ "resource_id": { "order": "asc" } }));
+        // Always add tie-breaker, reversed when paging backward.
+        let tie_breaker_order = if paging == CursorDirection::Previous {
+            "desc"
+        } else {
+            "asc"
+        };
+        sort_clauses.push(json!({ "resource_id": { "order": tie_breaker_order } }));
 
         Value::Array(sort_clauses)
     }
@@ -420,7 +548,19 @@ pub fn build_count_query(tenant_id: &str, resource_type: &str, query: &SearchQue
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{SearchValue, SortDirection};
+    use crate::types::{CursorValue, SearchValue, SortDirection};
+
+    /// Encodes a `Previous` cursor at the given resource ID, used to
+    /// exercise the backward-paging path of `build`.
+    fn previous_cursor(id: &str) -> String {
+        PageCursor::previous(vec![CursorValue::Number(1_700_000_000_000)], id).encode()
+    }
+
+    /// Encodes a `Next` cursor at the given resource ID, used as the
+    /// forward-paging regression baseline.
+    fn next_cursor(id: &str) -> String {
+        PageCursor::new(vec![CursorValue::Number(1_700_000_000_000)], id).encode()
+    }
 
     #[test]
     fn test_basic_query_build() {
@@ -448,6 +588,90 @@ mod tests {
         let es_query = builder.build(&query);
         let body_str = serde_json::to_string(&es_query.body).unwrap();
         assert!(body_str.contains("resource_id"));
+    }
+
+    /// #1092: `_id` is dispatched through `build_id_clause`, bypassing the
+    /// generic `:not` handling that wraps every other parameter's clauses in
+    /// `must_not` — so `_id:not=a` used to build the exact same `term`
+    /// clause as a bare `_id=a` and match precisely the resource the caller
+    /// asked to exclude.
+    #[test]
+    fn id_no_modifier_control_is_a_term_clause() {
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("a")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let es_query = builder.build(&query);
+        let clause = &es_query.body["query"]["bool"]["must"][0];
+
+        assert_eq!(clause, &json!({ "term": { "resource_id": "a" } }));
+    }
+
+    /// Matches the SQL backends' `_id` builders, which both guard on
+    /// `values.is_empty()` and contribute no condition rather than an
+    /// empty `terms: []` clause (which would match nothing rather than
+    /// leaving the parameter's absence unconstrained).
+    #[test]
+    fn id_with_no_values_produces_no_clause() {
+        let param = SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![],
+            chain: vec![],
+            components: vec![],
+        };
+
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        assert!(builder.build_id_clause(&param).is_none());
+    }
+
+    #[test]
+    fn id_not_single_value_is_negated_with_must_not() {
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::Not),
+            values: vec![SearchValue::eq("a")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let es_query = builder.build(&query);
+        let clause = &es_query.body["query"]["bool"]["must"][0];
+
+        assert_eq!(
+            clause,
+            &json!({ "bool": { "must_not": [ { "term": { "resource_id": "a" } } ] } })
+        );
+    }
+
+    #[test]
+    fn id_not_two_values_is_negated_with_must_not() {
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::Not),
+            values: vec![SearchValue::eq("a"), SearchValue::eq("b")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let es_query = builder.build(&query);
+        let clause = &es_query.body["query"]["bool"]["must"][0];
+
+        assert_eq!(
+            clause,
+            &json!({ "bool": { "must_not": [ { "terms": { "resource_id": ["a", "b"] } } ] } })
+        );
     }
 
     #[test]
@@ -528,6 +752,49 @@ mod tests {
         assert_eq!(clause["bool"]["minimum_should_match"], 1);
         assert_eq!(should[0]["range"]["last_updated"]["gte"], "2026-09-01");
         assert_eq!(should[1]["range"]["last_updated"]["gte"], "2026-09-03");
+    }
+
+    /// #1293: a value that is not a date used to be read as the year 2000, so
+    /// `_lastUpdated=gtnot-a-date` returned every resource. The search gate
+    /// rejects it before a query is built; if one is built anyway, the clause
+    /// matches nothing and is never dropped from the query.
+    #[test]
+    fn a_date_value_that_is_not_a_date_matches_nothing() {
+        let clause = last_updated_query(vec![SearchValue::new(SearchPrefix::Gt, "not-a-date")]);
+        assert_eq!(clause, json!({ "match_none": {} }));
+
+        // In an OR list the bad value contributes nothing; the good one stays.
+        let clause = last_updated_query(vec![
+            SearchValue::new(SearchPrefix::Ne, "2024-13-45"),
+            SearchValue::eq("2026-09-03"),
+        ]);
+        let should = clause["bool"]["should"].as_array().expect("bool.should");
+        assert_eq!(should[0], json!({ "match_none": {} }));
+        assert_eq!(should[1]["range"]["last_updated"]["gte"], "2026-09-03");
+
+        // An indexed date parameter: `filter_map` must not get a `None` to drop.
+        let query = SearchQuery::new("Procedure").with_parameter(SearchParameter {
+            name: "date".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: vec![SearchValue::new(SearchPrefix::Gt, "abcd")],
+            chain: vec![],
+            components: vec![],
+        });
+        let builder = EsQueryBuilder::new("acme", "Procedure", "hfs_acme_procedure".to_string());
+        assert_eq!(
+            builder.build(&query).body["query"]["bool"]["must"][0],
+            json!({ "match_none": {} })
+        );
+    }
+
+    #[test]
+    fn last_updated_second_precision_is_the_whole_second() {
+        let clause = last_updated_query(vec![SearchValue::eq("2026-09-06T04:44:27-04:00")]);
+        assert_eq!(
+            clause["range"]["last_updated"],
+            json!({ "gte": "2026-09-06T08:44:27.000Z", "lt": "2026-09-06T08:44:28.000Z" })
+        );
     }
 
     fn not_param(values: Vec<SearchValue>) -> SearchQuery {
@@ -634,6 +901,36 @@ mod tests {
         );
     }
 
+    /// #1391: a descending date sort orders by where each range ends — the
+    /// end of a `Period` — and keeps that key under a `Previous` cursor.
+    #[test]
+    fn test_descending_date_sort_uses_the_range_end() {
+        let directive = SortDirective {
+            parameter: "date".to_string(),
+            direction: SortDirection::Descending,
+            param_type: Some(SearchParamType::Date),
+        };
+        let builder = EsQueryBuilder::new("acme", "Encounter", "hfs_acme_encounter".to_string());
+
+        let query = SearchQuery::new("Encounter").with_sort(directive.clone());
+        let sort = &builder.build(&query).body["sort"][0];
+        let clause = &sort["search_params.date.end"];
+        assert!(!clause.is_null(), "descending sorts on the end, got {sort}");
+        assert_eq!(clause["order"], "desc");
+        assert_eq!(clause["mode"], "max");
+        // An index not yet reconciled to schema version 2 has no `end`.
+        assert_eq!(clause["unmapped_type"], "date");
+
+        let query = SearchQuery::new("Encounter")
+            .with_sort(directive)
+            .with_cursor(previous_cursor("e-5"));
+        let sort = &builder.build(&query).body["sort"][0];
+        assert!(
+            !sort["search_params.date.end"].is_null(),
+            "a Previous cursor keeps the sort key, got {sort}"
+        );
+    }
+
     #[test]
     fn test_token_sort_descending_uses_max_mode() {
         let query = SearchQuery::new("Patient").with_sort(SortDirective {
@@ -664,5 +961,217 @@ mod tests {
             !sort["search_params.string.value.keyword"].is_null(),
             "untyped parameters keep the string-group sort, got {sort}"
         );
+    }
+
+    /// #1015: a `Previous` cursor must reverse the default sort (including
+    /// the tie-breaker) and over-fetch by one hit so the results layer can
+    /// tell whether an earlier page exists.
+    #[test]
+    fn test_previous_cursor_reverses_default_sort_and_overfetches() {
+        let query = SearchQuery::new("Patient")
+            .with_count(5)
+            .with_cursor(previous_cursor("p-5"));
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let body = builder.build(&query).body;
+
+        assert_eq!(
+            body["sort"],
+            json!([
+                { "last_updated": { "order": "asc" } },
+                { "resource_id": { "order": "desc" } }
+            ])
+        );
+        assert_eq!(body["search_after"], json!([1_700_000_000_000i64, "p-5"]));
+        assert_eq!(body["size"], json!(6));
+        assert!(body.get("from").is_none());
+    }
+
+    /// #1015: a custom sort's `mode`/`missing` are derived from the
+    /// *effective* order, so a `Previous` cursor over an ascending directive
+    /// yields `desc`/`max`/`_first` — the same derivation used for a plain
+    /// descending sort, without a second table for the reversed case.
+    #[test]
+    fn test_previous_cursor_reverses_custom_sort_mode_and_missing() {
+        let query = SearchQuery::new("Patient")
+            .with_sort(SortDirective {
+                parameter: "birthdate".to_string(),
+                direction: SortDirection::Ascending,
+                param_type: Some(SearchParamType::Date),
+            })
+            .with_cursor(previous_cursor("p-5"));
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let sort = builder.build(&query).body["sort"].clone();
+        let sort = sort.as_array().expect("sort is an array");
+
+        let clause = &sort[0]["search_params.date.value"];
+        assert_eq!(clause["order"], "desc");
+        assert_eq!(clause["mode"], "max");
+        assert_eq!(clause["missing"], "_first");
+
+        let tie_breaker = sort.last().expect("tie-breaker present");
+        assert_eq!(tie_breaker, &json!({ "resource_id": { "order": "desc" } }));
+    }
+
+    /// #1015: `_sort=_score` also flips under a `Previous` cursor.
+    #[test]
+    fn test_previous_cursor_reverses_score_sort() {
+        let query = SearchQuery::new("Patient")
+            .with_sort(SortDirective {
+                parameter: "_score".to_string(),
+                direction: SortDirection::Descending,
+                param_type: None,
+            })
+            .with_cursor(previous_cursor("p-5"));
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let sort = builder.build(&query).body["sort"].clone();
+
+        assert_eq!(sort[0], json!({ "_score": { "order": "asc" } }));
+    }
+
+    /// #1015 regression + #1079: a Next cursor leaves the sort untouched and
+    /// over-fetches by one hit like Previous does.
+    #[test]
+    fn test_next_cursor_keeps_sort_and_overfetches() {
+        let query = SearchQuery::new("Patient")
+            .with_count(5)
+            .with_cursor(next_cursor("p-5"));
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let body = builder.build(&query).body;
+
+        assert_eq!(
+            body["sort"],
+            json!([
+                { "last_updated": { "order": "desc" } },
+                { "resource_id": { "order": "asc" } }
+            ])
+        );
+        assert_eq!(body["size"], json!(6));
+        assert_eq!(body["search_after"], json!([1_700_000_000_000i64, "p-5"]));
+    }
+
+    /// #1079: a first page with neither a cursor nor an offset over-fetches
+    /// by one hit and adds neither `from` nor `search_after`.
+    #[test]
+    fn test_first_page_overfetches_by_one() {
+        let query = SearchQuery::new("Patient").with_count(5);
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let body = builder.build(&query).body;
+
+        assert_eq!(body["size"], json!(6));
+        assert!(body.get("from").is_none());
+        assert!(body.get("search_after").is_none());
+    }
+
+    /// #1079: an offset page over-fetches by one hit, keeps `from` set to the
+    /// requested offset, and adds no `search_after`.
+    #[test]
+    fn test_offset_page_overfetches_by_one_and_keeps_from() {
+        let mut query = SearchQuery::new("Patient").with_count(5);
+        query.offset = Some(10);
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let body = builder.build(&query).body;
+
+        assert_eq!(body["size"], json!(6));
+        assert_eq!(body["from"], json!(10));
+        assert!(body.get("search_after").is_none());
+    }
+
+    /// #1079: requesting a full window (`count == max_result_window`) leaves
+    /// no room for the extra hit, so `size` is clamped to `count` and
+    /// `over_fetched` is false.
+    #[test]
+    fn test_size_is_clamped_to_max_result_window() {
+        let query = SearchQuery::new("Patient").with_count(10_000);
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let es_query = builder.build(&query);
+
+        assert_eq!(es_query.body["size"], json!(10_000));
+        assert!(!es_query.over_fetched);
+    }
+
+    /// #1079: when the extra hit still fits under `max_result_window`, it is
+    /// requested as usual.
+    #[test]
+    fn test_size_keeps_extra_hit_when_it_fits_the_window() {
+        let query = SearchQuery::new("Patient").with_count(9_999);
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let es_query = builder.build(&query);
+
+        assert_eq!(es_query.body["size"], json!(10_000));
+        assert!(es_query.over_fetched);
+    }
+
+    /// #1079: an offset page near the end of the window clamps `size` to the
+    /// remaining room instead of over-fetching past `max_result_window`.
+    #[test]
+    fn test_offset_page_clamps_size_to_remaining_window() {
+        let mut query = SearchQuery::new("Patient").with_count(20);
+        query.offset = Some(9_990);
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let es_query = builder.build(&query);
+
+        assert_eq!(es_query.body["from"], json!(9_990));
+        assert_eq!(es_query.body["size"], json!(10));
+        assert!(!es_query.over_fetched);
+    }
+
+    /// #1079: `with_max_result_window` overrides the default window for both
+    /// the exact-fit and the room-to-spare cases.
+    #[test]
+    fn test_with_max_result_window_overrides_default() {
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string())
+            .with_max_result_window(50);
+
+        let full = builder.build(&SearchQuery::new("Patient").with_count(50));
+        assert_eq!(full.body["size"], json!(50));
+        assert!(!full.over_fetched);
+
+        let room = builder.build(&SearchQuery::new("Patient").with_count(10));
+        assert_eq!(room.body["size"], json!(11));
+        assert!(room.over_fetched);
+    }
+
+    /// #1380: `family=Zzz,` reached the builder as the values `Zzz` and `""`,
+    /// and a prefix match on `""` is every row. The search gate
+    /// (`validate_value_presence`) rejects it before a query is built; if one
+    /// is built anyway, the parameter matches nothing — the whole parameter, or
+    /// `:not` would negate it into everything — and as `match_none`, since a
+    /// `None` clause is dropped.
+    #[test]
+    fn a_parameter_with_an_empty_value_matches_nothing() {
+        use SearchModifier as M;
+        use SearchParamType as T;
+        let cases: Vec<(&str, SearchParamType, Option<SearchModifier>, Vec<&str>)> = vec![
+            ("family", T::String, None, vec!["Zzz", ""]),
+            ("family", T::String, None, vec![""]),
+            ("family", T::String, Some(M::Contains), vec!["", "Zzz"]),
+            ("family", T::String, Some(M::Text), vec![" "]),
+            ("gender", T::Token, None, vec![""]),
+            ("gender", T::Token, Some(M::Not), vec!["female", ""]),
+            ("gender", T::Token, Some(M::Text), vec![""]),
+            ("identifier", T::Token, Some(M::OfType), vec![""]),
+            ("_id", T::Token, None, vec!["a", ""]),
+            ("_tag", T::Token, None, vec![""]),
+            ("general-practitioner", T::Reference, None, vec![""]),
+            ("url", T::Uri, Some(M::Below), vec![""]),
+            ("url", T::Uri, Some(M::Contains), vec!["", "x"]),
+        ];
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        for (name, param_type, modifier, values) in cases {
+            let context = format!("{name} {modifier:?} {values:?}");
+            let param = SearchParameter {
+                name: name.to_string(),
+                param_type,
+                modifier,
+                values: values.into_iter().map(SearchValue::eq).collect(),
+                chain: vec![],
+                components: vec![],
+            };
+            assert_eq!(
+                builder.build_parameter_clause(&param),
+                Some(json!({ "match_none": {} })),
+                "{context}"
+            );
+        }
     }
 }

@@ -23,6 +23,7 @@ use crate::types::{SearchParameter, StoredResource};
 
 use super::SqliteBackend;
 use super::backend::load_tenant_stored_params_with_conn;
+use super::storage::PreparedIndex;
 
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -119,6 +120,7 @@ impl SqliteTransaction {
     /// extraction with minimal fallback, FTS content, contained resources),
     /// so transactional writes are searchable exactly like direct ones
     /// (#815 review).
+    #[allow(clippy::too_many_arguments)]
     fn index_resource(
         &self,
         conn: &rusqlite::Connection,
@@ -127,6 +129,7 @@ impl SqliteTransaction {
         resource_id: &str,
         resource: &Value,
         clear_stale_rows: bool,
+        prepared: Option<PreparedIndex>,
     ) -> StorageResult<()> {
         let _index_span = perf::span(Phase::Index);
         // `clear_stale_rows` is false only on the create path, where the
@@ -150,17 +153,50 @@ impl SqliteTransaction {
         if self.defer_search_indexing {
             return Ok(());
         }
-        self.backend
-            .index_resource(conn, tenant_id, resource_type, resource_id, resource)
+        // A batch caller may have run the extraction already, off this
+        // thread (`SqliteBackend::prepare_index_batch`); then only the
+        // statements are left.
+        match prepared {
+            Some(prepared) if !self.backend.is_search_offloaded() => self
+                .backend
+                .write_prepared_index(
+                    conn,
+                    tenant_id,
+                    resource_type,
+                    resource_id,
+                    resource,
+                    prepared,
+                )
+                .map(|_| ()),
+            _ => self
+                .backend
+                .index_resource(conn, tenant_id, resource_type, resource_id, resource),
+        }
     }
-}
 
-#[async_trait]
-impl Transaction for SqliteTransaction {
-    async fn create(
+    /// [`Transaction::create`] with the search-index extraction already done
+    /// by the caller. Bulk ingest prepares a whole batch in parallel before
+    /// opening the entry loop and hands each entry's result in here; the
+    /// caller must have extracted from a resource carrying the same `id` and
+    /// `resourceType` this create will store, or the index rows would
+    /// describe a different resource. Unlike the trait method this is not
+    /// reached through `dyn Transaction`, so it is inherent.
+    pub(crate) async fn create_prepared(
         &mut self,
         resource_type: &str,
         resource: Value,
+        prepared: Option<PreparedIndex>,
+    ) -> StorageResult<StoredResource> {
+        self.create_inner(resource_type, resource, prepared)
+    }
+}
+
+impl SqliteTransaction {
+    fn create_inner(
+        &mut self,
+        resource_type: &str,
+        resource: Value,
+        prepared: Option<PreparedIndex>,
     ) -> StorageResult<StoredResource> {
         let _create_span = perf::span(Phase::Create);
         self.tenant
@@ -202,7 +238,10 @@ impl Transaction for SqliteTransaction {
         }
 
         // Build the resource with id and resourceType
-        let mut data = resource.clone();
+        let mut data = {
+            let _span = perf::span(Phase::EntryClone);
+            resource.clone()
+        };
         if let Some(obj) = data.as_object_mut() {
             obj.insert("id".to_string(), Value::String(id.clone()));
             obj.insert(
@@ -250,7 +289,7 @@ impl Transaction for SqliteTransaction {
 
         // Index the resource for search. Nothing to clear: the existence
         // probe above established there is no row for this id.
-        self.index_resource(&conn, tenant_id, resource_type, &id, &data, false)?;
+        self.index_resource(&conn, tenant_id, resource_type, &id, &data, false, prepared)?;
         drop(conn);
 
         // Mirrors the storage path: an overlay-affecting SearchParameter
@@ -276,6 +315,17 @@ impl Transaction for SqliteTransaction {
             None,
             self.fhir_version,
         ))
+    }
+}
+
+#[async_trait]
+impl Transaction for SqliteTransaction {
+    async fn create(
+        &mut self,
+        resource_type: &str,
+        resource: Value,
+    ) -> StorageResult<StoredResource> {
+        self.create_inner(resource_type, resource, None)
     }
 
     async fn read(
@@ -453,7 +503,7 @@ impl Transaction for SqliteTransaction {
         }
 
         // Re-index the resource for search, clearing the previous version's rows.
-        self.index_resource(&conn, tenant_id, resource_type, id, &data, true)?;
+        self.index_resource(&conn, tenant_id, resource_type, id, &data, true, None)?;
         drop(conn);
 
         // A SearchParameter write invalidates this tenant's cached registry

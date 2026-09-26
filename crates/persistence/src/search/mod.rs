@@ -6,6 +6,7 @@
 //! - [`loader`] - Loads parameters from embedded, stored, and config sources
 //! - [`extractor`] - FHIRPath-based value extraction from resources
 //! - [`converters`] - Conversion between FHIRPath results and index values
+//! - [`date_value`] - The shared grammar, precision range and prefix mapping for date search values
 //! - [`writer`] - Trait for writing extracted values to search indexes
 //! - [`reindex`] - $reindex operation for rebuilding search indexes
 //! - [`errors`] - Search-specific error types
@@ -62,34 +63,63 @@
 //! ```
 
 pub mod chain_resolver;
+pub mod conditional;
 pub mod converters;
+pub mod date_value;
 pub mod errors;
 pub mod extractor;
 pub mod list_resolver;
 pub mod loader;
+pub mod metadata_modifier;
+pub mod numeric_value;
 pub mod range;
 pub mod registry;
 pub mod reindex;
+mod reindex_stats;
 pub mod seeder;
 pub mod tenant_registries;
 pub mod text_fold;
+pub mod type_qualifier;
+pub mod uri;
+pub mod value_parser;
 pub mod writer;
 
 // Re-export main types
-pub use chain_resolver::{query_has_chains, resolve_chains};
-pub use converters::{IndexValue, ValueConverter};
+pub use chain_resolver::{
+    ChainResolveOptions, TerminologyExpander, TerminologyExpansion, query_has_chains,
+    resolve_chains, resolve_chains_with,
+};
+pub use conditional::{
+    build_conditional_parameters, build_conditional_query, build_conditional_query_from_pairs,
+    parse_conditional_criteria,
+};
+pub use converters::{
+    DateEnd, IMPLICIT_TOKEN_SYSTEM, IndexValue, ValueConverter, implicit_system_candidates,
+};
+pub use date_value::{
+    ApproxMargin, DatePredicate, DateValueError, DateValueErrorReason, DateValuePrecision,
+    FhirDateValue, OPEN_START, RangeCondition, RangePredicate, StorageResolution, indexed_end,
+    indexed_range, open_end, open_start, parse_stored_date, validate_date_parameter,
+    validate_date_values,
+};
 pub use errors::{ExtractionError, LoaderError, RegistryError, ReindexError};
 pub use extractor::{ContainedExtraction, ExtractedValue, SearchParameterExtractor};
 pub use list_resolver::{query_has_list, resolve_list};
 pub use loader::SearchParameterLoader;
-pub use range::{implicit_precision, implicit_range};
+pub use metadata_modifier::reject_unsupported_metadata_modifier;
+pub use numeric_value::{
+    FhirNumberValue, FhirQuantityValue, NumberValueError, NumberValueErrorReason,
+    validate_numeric_parameter, validate_numeric_values,
+};
+pub use range::{approx_range, implicit_precision, implicit_range};
 pub use registry::{
     RegistryUpdate, SearchParameterDefinition, SearchParameterRegistry, SearchParameterSource,
     SearchParameterStatus, fallback_param_type, resolve_param_targets, resolve_param_type,
 };
 pub use reindex::{
-    ReindexOnFinish, ReindexOperation, ReindexProgress, ReindexRequest, ReindexSource,
-    ReindexStatus, ReindexTarget, ReindexableStorage, ResourcePage,
+    DEFERRED_REINDEX_BATCH_SIZE, DeferredReindexLedger, ReindexOnFinish, ReindexOperation,
+    ReindexPageStats, ReindexProgress, ReindexProgressError, ReindexRequest, ReindexSource,
+    ReindexStatus, ReindexTarget, ReindexableStorage, ResourcePage, ResourceRef, SkippedResource,
 };
 pub use seeder::{
     SeedOutcome, seed_spec_compartment_definitions, seed_spec_search_parameters,
@@ -97,4 +127,10 @@ pub use seeder::{
 };
 pub use tenant_registries::{StoredParamLoader, TenantSearchRegistries};
 pub use text_fold::fold_text;
+pub use type_qualifier::ResourceTypeScope;
+pub use uri::compute_parent_uris;
+pub use value_parser::{
+    EMPTY_VALUE_REASON, has_empty_value, modifier_requires_terminology, param_requires_terminology,
+    parse_typed_values, split_unescaped_commas, validate_modifier, validate_value_presence,
+};
 pub use writer::SearchIndexWriter;

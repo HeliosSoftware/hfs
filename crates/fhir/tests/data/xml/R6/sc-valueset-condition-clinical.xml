@@ -16,7 +16,7 @@
       </p>
       <br/>
       <p>Mapping from 
-        <a href="http://terminology.hl7.org/7.2.0/CodeSystem-condition-clinical.html">Condition Clinical Status Codes</a> to 
+        <a href="http://terminology.hl7.org/7.3.0/CodeSystem-condition-clinical.html">Condition Clinical Status Codes</a> to 
         <a href="codesystem-resource-status.html">Canonical Status Codes for FHIR Resources</a>
       </p>
       <table class="grid">
@@ -34,42 +34,42 @@
         <tr>
           <td>active</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>active</td>
         </tr>
         <tr>
           <td>recurrence</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>active</td>
         </tr>
         <tr>
           <td>relapse</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>active</td>
         </tr>
         <tr>
           <td>inactive</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>suspended</td>
         </tr>
         <tr>
           <td>remission</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>suspended</td>
         </tr>
         <tr>
           <td>resolved</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>failed</td>
         </tr>
@@ -77,7 +77,7 @@
     </div>
   </text>
   <url value="http://hl7.org/fhir/ConceptMap/sc-condition-clinical"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-snapshot1"/>
   <name value="ConditionClinicalStatusCodesCanonicalMap"/>
   <title value="Canonical Mapping for &quot;Condition Clinical Status Codes&quot;"/>
   <status value="draft"/>

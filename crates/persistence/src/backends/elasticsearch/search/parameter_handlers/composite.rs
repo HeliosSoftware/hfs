@@ -2,6 +2,7 @@
 
 use serde_json::{Value, json};
 
+use crate::search::FhirNumberValue;
 use crate::types::{SearchParamType, SearchParameter};
 
 /// Builds an ES query clause for a composite search parameter.
@@ -60,7 +61,15 @@ fn component_conditions(param_type: SearchParamType, part: &str) -> Option<Vec<V
         SearchParamType::Token => {
             let conds = if let Some((system, code)) = part.split_once('|') {
                 let mut v = Vec::new();
-                if !system.is_empty() {
+                if !system.is_empty() && !code.is_empty() {
+                    // Or a `code` component, whose system is implicit (#1379).
+                    v.push(json!({
+                        "terms": {
+                            field("token_system"):
+                                crate::search::implicit_system_candidates(system)
+                        }
+                    }));
+                } else if !system.is_empty() {
                     v.push(json!({ "term": { field("token_system"): system } }));
                 }
                 if !code.is_empty() {
@@ -76,24 +85,38 @@ fn component_conditions(param_type: SearchParamType, part: &str) -> Option<Vec<V
             "term": { field("string.lowercase"): part.to_lowercase() }
         })]),
         SearchParamType::Number => {
-            let (op, num) = parse_prefixed_number(part)?;
-            Some(vec![numeric_condition(&field("number"), op, num)])
+            let (op, number) = parse_prefixed_number(part)?;
+            Some(vec![numeric_condition(&field("number"), op, &number)])
         }
         SearchParamType::Quantity => {
-            let mut comps = part.splitn(3, '|');
-            let (op, num) = parse_prefixed_number(comps.next()?)?;
-            let mut v = vec![numeric_condition(&field("quantity_value"), op, num)];
-            let _system = comps.next();
-            if let Some(code) = comps.next() {
-                if !code.is_empty() {
-                    v.push(json!({ "term": { field("quantity_unit"): code } }));
-                }
+            let (op, rest) = split_prefix(part);
+            let quantity = crate::search::FhirQuantityValue::parse(rest).ok()?;
+            let mut v = vec![numeric_condition(
+                &field("quantity_value"),
+                op,
+                &quantity.number,
+            )];
+            if let Some(code) = quantity.code {
+                v.push(json!({ "term": { field("quantity_unit"): code } }));
             }
             Some(v)
         }
         SearchParamType::Date => {
+            // The same precision range a standalone date parameter gets. This
+            // used to send the value as written under a scalar comparison, so
+            // `2024-01-15` was midnight rather than the day, and `ne` was
+            // treated as `eq`. `None` — not a date — makes the caller emit a
+            // clause that never matches.
             let (op, val) = split_prefix(part);
-            Some(vec![range_condition(&field("date"), op, json!(val))])
+            let prefix = op.parse().unwrap_or_default();
+            Some(vec![
+                match super::date::field_range(&field("date"), val, prefix)? {
+                    super::date::DateRange::Within(range) => range,
+                    super::date::DateRange::Outside(range) => {
+                        json!({ "bool": { "must_not": [range] } })
+                    }
+                },
+            ])
         }
         SearchParamType::Reference => Some(vec![json!({ "term": { field("reference"): part } })]),
         SearchParamType::Uri => Some(vec![json!({ "term": { field("uri"): part } })]),
@@ -111,30 +134,38 @@ fn split_prefix(part: &str) -> (&str, &str) {
     ("eq", part)
 }
 
-fn parse_prefixed_number(part: &str) -> Option<(&str, f64)> {
+/// `None` — not a number by the grammar every backend shares, which excludes
+/// the `inf` and `nan` that `f64::from_str` takes — makes the caller emit a
+/// clause that never matches.
+fn parse_prefixed_number(part: &str) -> Option<(&str, FhirNumberValue)> {
     let (op, rest) = split_prefix(part);
-    rest.parse::<f64>().ok().map(|n| (op, n))
+    FhirNumberValue::parse(rest).ok().map(|n| (op, n))
 }
 
-/// Builds a numeric term/range condition honoring the comparison prefix.
-fn numeric_condition(field: &str, op: &str, num: f64) -> Value {
+/// Builds a numeric range condition honoring the comparison prefix, with the
+/// ranges a standalone number parameter gets: `eq`/`ne` the implicit-precision
+/// range, `ap` the shared approximate window (#1390), and the other
+/// comparators the exact value. `eq`, `ne` and `ap` used to be an exact
+/// `term`.
+fn numeric_condition(field: &str, op: &str, number: &FhirNumberValue) -> Value {
+    let num = number.value;
     match op {
         "gt" | "sa" => json!({ "range": { field: { "gt": num } } }),
         "lt" | "eb" => json!({ "range": { field: { "lt": num } } }),
         "ge" => json!({ "range": { field: { "gte": num } } }),
         "le" => json!({ "range": { field: { "lte": num } } }),
-        _ => json!({ "term": { field: num } }),
-    }
-}
-
-/// Builds a date range condition honoring the comparison prefix.
-fn range_condition(field: &str, op: &str, val: Value) -> Value {
-    match op {
-        "gt" | "sa" => json!({ "range": { field: { "gt": val } } }),
-        "lt" | "eb" => json!({ "range": { field: { "lt": val } } }),
-        "ge" => json!({ "range": { field: { "gte": val } } }),
-        "le" => json!({ "range": { field: { "lte": val } } }),
-        _ => json!({ "range": { field: { "gte": val, "lte": val } } }),
+        "ap" => {
+            let (lo, hi) = number.approx_range();
+            json!({ "range": { field: { "gte": lo, "lte": hi } } })
+        }
+        "ne" => {
+            let (lo, hi) = number.implicit_range();
+            json!({ "bool": { "must_not": [{ "range": { field: { "gte": lo, "lt": hi } } }] } })
+        }
+        _ => {
+            let (lo, hi) = number.implicit_range();
+            json!({ "range": { field: { "gte": lo, "lt": hi } } })
+        }
     }
 }
 
@@ -142,7 +173,6 @@ fn range_condition(field: &str, op: &str, val: Value) -> Value {
 mod tests {
     use super::*;
     use crate::types::{CompositeSearchComponent, SearchValue};
-
     fn composite_param(components: Vec<CompositeSearchComponent>) -> SearchParameter {
         SearchParameter {
             name: "code-value-quantity".to_string(),
@@ -180,6 +210,124 @@ mod tests {
         assert!(s.contains("token_code"));
         assert!(s.contains("quantity_value"));
         assert!(s.contains("gte"));
+        // The named system, or the marker of a `code` component (#1379).
+        assert!(s.contains(crate::search::IMPLICIT_TOKEN_SYSTEM));
+        // `system|` names the codes OF a system: no marker.
+        let clause = build_clause(&param, "http://loinc.org|$ge100").unwrap();
+        assert!(
+            !clause
+                .to_string()
+                .contains(crate::search::IMPLICIT_TOKEN_SYSTEM)
+        );
+    }
+
+    fn code_date_param() -> SearchParameter {
+        composite_param(vec![
+            CompositeSearchComponent {
+                param_type: SearchParamType::Token,
+                param_name: "code".to_string(),
+            },
+            CompositeSearchComponent {
+                param_type: SearchParamType::Date,
+                param_name: "date".to_string(),
+            },
+        ])
+    }
+
+    #[test]
+    fn date_component_is_a_precision_range() {
+        let clause = build_clause(&code_date_param(), "8867-4$ge2013-04-05T09:20").unwrap();
+        let must = &clause["nested"]["query"]["bool"]["must"];
+        assert_eq!(
+            must[2]["range"]["search_params.composite.date"],
+            json!({ "gte": "2013-04-05T09:20:00.000Z" })
+        );
+
+        let clause = build_clause(&code_date_param(), "8867-4$2024-01-15").unwrap();
+        let must = &clause["nested"]["query"]["bool"]["must"];
+        assert_eq!(
+            must[2]["range"]["search_params.composite.date"],
+            json!({ "gte": "2024-01-15", "lt": "2024-01-16" })
+        );
+    }
+
+    fn code_quantity_param() -> SearchParameter {
+        composite_param(vec![
+            CompositeSearchComponent {
+                param_type: SearchParamType::Token,
+                param_name: "code".to_string(),
+            },
+            CompositeSearchComponent {
+                param_type: SearchParamType::Quantity,
+                param_name: "value-quantity".to_string(),
+            },
+        ])
+    }
+
+    /// A numeric component gets the ranges a standalone number does, not an
+    /// exact `term` (#1390).
+    #[test]
+    fn number_component_uses_the_shared_ranges() {
+        // `MolecularSequence`'s `chromosome-variant-coordinate` shape, reduced
+        // to one number: a number component compares as a standalone number
+        // parameter does (#1390).
+        let param = composite_param(vec![
+            CompositeSearchComponent {
+                param_type: SearchParamType::Token,
+                param_name: "chromosome".to_string(),
+            },
+            CompositeSearchComponent {
+                param_type: SearchParamType::Number,
+                param_name: "variant-start".to_string(),
+            },
+        ]);
+        let value_range = |value: &str| {
+            let clause = build_clause(&param, value).unwrap();
+            clause["nested"]["query"]["bool"]["must"][2].clone()
+        };
+        assert_eq!(
+            value_range("1$ap100"),
+            json!({ "range": { "search_params.composite.number": { "gte": 90.0, "lte": 110.0 } } })
+        );
+        assert_eq!(
+            value_range("1$ap0"),
+            json!({ "range": { "search_params.composite.number": { "gte": -0.5, "lte": 0.5 } } })
+        );
+        assert_eq!(
+            value_range("1$1e2"),
+            json!({ "range": { "search_params.composite.number": { "gte": 50.0, "lt": 150.0 } } })
+        );
+    }
+
+    #[test]
+    fn quantity_component_uses_the_shared_ranges() {
+        let value_range = |value: &str| {
+            let clause = build_clause(&code_quantity_param(), value).unwrap();
+            clause["nested"]["query"]["bool"]["must"][2].clone()
+        };
+        assert_eq!(
+            value_range("8867-4$ap100"),
+            json!({ "range": { "search_params.composite.quantity_value": { "gte": 90.0, "lte": 110.0 } } })
+        );
+        assert_eq!(
+            value_range("8867-4$100"),
+            json!({ "range": { "search_params.composite.quantity_value": { "gte": 99.5, "lt": 100.5 } } })
+        );
+        assert_eq!(
+            value_range("8867-4$ne100"),
+            json!({ "bool": { "must_not": [
+                { "range": { "search_params.composite.quantity_value": { "gte": 99.5, "lt": 100.5 } } }
+            ] } })
+        );
+    }
+
+    /// An `ap` date component is the shared window, as for a standalone date.
+    #[test]
+    fn date_component_that_is_not_a_date_never_matches() {
+        for value in ["8867-4$2024-02-30", "8867-4$gtnot-a-date", "8867-4$"] {
+            let clause = build_clause(&code_date_param(), value).unwrap();
+            assert!(clause.to_string().contains("group_id"), "{value}");
+        }
     }
 
     #[test]

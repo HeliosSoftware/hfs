@@ -990,6 +990,54 @@ mod sof_run_tests {
         }
     }
 
+    /// A `resource` that names no compiled-in FHIR resource type
+    /// (`DiagnosticCode::UnknownResourceType`, #1014) is rejected by the
+    /// same pre-execution lint gate as any other structural problem: 422,
+    /// `OperationOutcome`, `code-invalid`. Previously this reached the
+    /// storage-backed compiler and produced zero rows instead of an error.
+    #[tokio::test]
+    async fn sql_run_rejects_an_inline_view_with_an_unknown_resource_type() {
+        let (server, _backend) = create_test_server().await;
+
+        let bad_view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Nope",
+            "status": "draft",
+            "select": [
+                { "column": [{ "name": "id", "path": "id" }] }
+            ]
+        });
+
+        let parameters_body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "subjectResource", "resource": bad_view},
+            ]
+        });
+
+        let response = server
+            .post("/$sql-run?_format=ndjson")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&parameters_body)
+            .await;
+
+        response.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+        let body: Value =
+            serde_json::from_str(&response.text()).expect("422 body must be valid JSON");
+        assert_eq!(body["resourceType"], "OperationOutcome");
+
+        let issues = body["issue"].as_array().expect("issue must be an array");
+        assert!(
+            issues.iter().any(|issue| issue["code"] == "code-invalid"
+                && issue["details"]["coding"][0]["code"] == "unknown-resource-type"),
+            "{issues:?}"
+        );
+    }
+
     /// A lint-clean inline ViewDefinition is unaffected by the new
     /// pre-execution lint gate (#821) and still runs to completion.
     #[tokio::test]

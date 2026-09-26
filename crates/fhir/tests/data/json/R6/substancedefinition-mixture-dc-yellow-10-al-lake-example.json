@@ -58,13 +58,13 @@
           ]
         }
       ],
+      "description": "The aluminum substrate onto which the dye is precipitated to form the lake. Unspecified in GSRS.",
       "name": [
         {
           "name": "Unspecified aluminum substrate",
           "preferred": true
         }
-      ],
-      "description": "The aluminum substrate onto which the dye is precipitated to form the lake. Unspecified in GSRS."
+      ]
     }
   ],
   "identifier": [

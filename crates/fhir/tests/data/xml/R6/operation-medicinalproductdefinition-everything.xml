@@ -111,23 +111,23 @@
       </div>
     </div>
   </text>
-  <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm">
-    <valueInteger value="1"/>
-  </extension>
   <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status">
     <valueCode value="normative"/>
+  </extension>
+  <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-normative-version">
+    <valueCode value="6.0.0-snapshot1"/>
   </extension>
   <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-wg">
     <valueCode value="brr"/>
   </extension>
   <url value="http://hl7.org/fhir/OperationDefinition/MedicinalProductDefinition-everything"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-snapshot1"/>
   <name value="Everything"/>
   <title value="Fetch Product Record"/>
   <status value="active"/>
   <kind value="operation"/>
   <experimental value="false"/>
-  <date value="2026-07-17T03:44:13+00:00"/>
+  <date value="2026-09-14T16:43:45+00:00"/>
   <publisher value="HL7 International / Biomedical Research and Regulation"/>
   <contact>
     <telecom>

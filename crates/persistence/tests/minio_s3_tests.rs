@@ -35,8 +35,11 @@ use testcontainers::{GenericImage, ImageExt};
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
-const DEFAULT_MINIO_IMAGE: &str = "minio/minio";
-const DEFAULT_MINIO_TAG: &str = "RELEASE.2025-02-28T09-55-16Z";
+#[path = "common/container_cleanup.rs"]
+mod container_cleanup;
+
+const DEFAULT_MINIO_IMAGE: &str = "ghcr.io/coollabsio/minio";
+const DEFAULT_MINIO_TAG: &str = "RELEASE.2025-10-15T17-29-55Z";
 const DEFAULT_MINIO_ROOT_USER: &str = "minioadmin";
 const DEFAULT_MINIO_ROOT_PASSWORD: &str = "minioadmin";
 
@@ -44,6 +47,8 @@ struct SharedMinio {
     endpoint_url: String,
     root_user: String,
     root_password: String,
+    /// Kept alive for the duration of the test binary; the
+    /// `container_cleanup` exit hook removes it at process exit.
     _container: testcontainers::ContainerAsync<GenericImage>,
 }
 
@@ -105,18 +110,22 @@ async fn shared_minio() -> &'static SharedMinio {
                 .unwrap_or_else(|_| DEFAULT_MINIO_ROOT_PASSWORD.to_string());
 
             let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
-            let container = GenericImage::new(image, tag)
-                .with_wait_for(WaitFor::message_on_stderr("API:"))
-                .with_exposed_port(9000.tcp())
-                .with_exposed_port(9001.tcp())
-                .with_env_var("MINIO_ROOT_USER", root_user.clone())
-                .with_env_var("MINIO_ROOT_PASSWORD", root_password.clone())
-                .with_env_var("MINIO_CONSOLE_ADDRESS", ":9001")
-                .with_cmd(["server", "/data", "--console-address", ":9001"])
-                .with_label("github.run_id", &run_id)
-                .start()
-                .await
-                .expect("failed to start MinIO container");
+            // `SHARED_MINIO` is a static and never dropped; the cleanup label
+            // lets the exit hook remove the container.
+            let container = container_cleanup::with_cleanup_label(
+                GenericImage::new(image, tag)
+                    .with_wait_for(WaitFor::message_on_stderr("API:"))
+                    .with_exposed_port(9000.tcp())
+                    .with_exposed_port(9001.tcp())
+                    .with_env_var("MINIO_ROOT_USER", root_user.clone())
+                    .with_env_var("MINIO_ROOT_PASSWORD", root_password.clone())
+                    .with_env_var("MINIO_CONSOLE_ADDRESS", ":9001")
+                    .with_cmd(["server", "/data", "--console-address", ":9001"])
+                    .with_label("github.run_id", &run_id),
+            )
+            .start()
+            .await
+            .expect("failed to start MinIO container");
 
             let host = container
                 .get_host()
@@ -937,6 +946,195 @@ fn unique_user_key(scope: &str) -> String {
     )
 }
 
+// ── Web UI login sessions (#1481) ──────────────────────────────────────
+
+fn login_session(id: &str) -> helios_auth::PersistedSession {
+    let now = chrono::Utc::now();
+    helios_auth::PersistedSession {
+        id: id.to_string(),
+        principal: helios_auth::SessionPrincipal {
+            subject: "demo-sub".to_string(),
+            issuer: "https://idp".to_string(),
+            name: Some("Demo User".to_string()),
+            preferred_username: None,
+            email: None,
+            picture: None,
+        },
+        access_token: "at-1".to_string(),
+        access_expires_at: now + chrono::TimeDelta::minutes(5),
+        refresh_token: Some("rt-1".to_string()),
+        id_token: None,
+        last_seen: now,
+        created_at: now,
+        version: 0,
+    }
+}
+
+fn pending_login(id: &str) -> helios_auth::PersistedPending {
+    helios_auth::PersistedPending {
+        id: id.to_string(),
+        state: "state-1".to_string(),
+        code_verifier: "verifier-1".to_string(),
+        next: "/ui/resources".to_string(),
+        started_at: chrono::Utc::now(),
+    }
+}
+
+#[tokio::test]
+async fn test_minio_login_session_round_trip_and_conflict() {
+    use helios_auth::{SaveOutcome, SessionPersistence};
+    if skip_if_disabled("test_minio_login_session_round_trip_and_conflict") {
+        return;
+    }
+    let harness = make_prefix_backend("login-session").await;
+    let backend = &harness.backend;
+    let id = format!("s-{}", Uuid::new_v4().simple());
+    assert!(backend.load_session(&id).await.unwrap().is_none());
+
+    assert_eq!(
+        backend
+            .save_session(&login_session(&id), Some(0))
+            .await
+            .unwrap(),
+        SaveOutcome::Saved(1)
+    );
+    let loaded = backend.load_session(&id).await.unwrap().unwrap();
+    assert_eq!(loaded.version, 1);
+    assert_eq!(loaded.access_token, "at-1");
+    assert_eq!(loaded.principal.display(), "Demo User");
+
+    let mut stale = login_session(&id);
+    stale.access_token = "at-stale".to_string();
+    assert_eq!(
+        backend.save_session(&stale, Some(0)).await.unwrap(),
+        SaveOutcome::Conflict { current: 1 }
+    );
+    assert_eq!(
+        backend.save_session(&stale, Some(7)).await.unwrap(),
+        SaveOutcome::Conflict { current: 1 }
+    );
+    let missing = format!("s-{}", Uuid::new_v4().simple());
+    assert_eq!(
+        backend
+            .save_session(&login_session(&missing), Some(1))
+            .await
+            .unwrap(),
+        SaveOutcome::Conflict { current: 0 }
+    );
+
+    let mut newer = loaded.clone();
+    newer.access_token = "at-2".to_string();
+    assert_eq!(
+        backend.save_session(&newer, Some(1)).await.unwrap(),
+        SaveOutcome::Saved(2)
+    );
+    assert_eq!(
+        backend.save_session(&newer, None).await.unwrap(),
+        SaveOutcome::Saved(3)
+    );
+    assert_eq!(
+        backend
+            .load_session(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .access_token,
+        "at-2"
+    );
+
+    // A fresh object survives the sweep.
+    backend.sweep(chrono::Utc::now()).await.unwrap();
+    assert!(backend.load_session(&id).await.unwrap().is_some());
+
+    backend.delete_session(&id).await.unwrap();
+    assert!(backend.load_session(&id).await.unwrap().is_none());
+    backend.delete_session(&id).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_minio_pending_login_is_consumed_exactly_once() {
+    use helios_auth::SessionPersistence;
+    if skip_if_disabled("test_minio_pending_login_is_consumed_exactly_once") {
+        return;
+    }
+    let harness = make_prefix_backend("login-pending").await;
+    let backend = &harness.backend;
+    let id = format!("p-{}", Uuid::new_v4().simple());
+    assert!(!backend.delete_pending(&id).await.unwrap());
+
+    backend.save_pending(&pending_login(&id)).await.unwrap();
+    let loaded = backend.load_pending(&id).await.unwrap().unwrap();
+    assert_eq!(loaded.state, "state-1");
+    assert_eq!(loaded.next, "/ui/resources");
+    assert!(
+        backend.load_session(&id).await.unwrap().is_none(),
+        "a pending id is never a session"
+    );
+
+    assert!(backend.delete_pending(&id).await.unwrap());
+    assert!(!backend.delete_pending(&id).await.unwrap());
+    assert!(backend.load_pending(&id).await.unwrap().is_none());
+}
+
+// ── Identifier-scoped conditional create (#1435) ─────────────────────────
+
+/// Against a real store: the first `If-None-Exist` on an identifier creates,
+/// the next answers the resource it created, two live matches are a
+/// `MultipleMatches`, and a criterion the scan cannot evaluate is refused.
+#[tokio::test]
+async fn test_minio_conditional_create_by_identifier() {
+    use helios_persistence::core::{ConditionalCreateResult, ConditionalStorage};
+
+    if skip_if_disabled("test_minio_conditional_create_by_identifier") {
+        return;
+    }
+    let harness = make_prefix_backend("conditional-create").await;
+    let backend = &harness.backend;
+    let t = tenant("tenant-cc");
+    let mrn = format!("mrn-{}", Uuid::new_v4().simple());
+    let patient = json!({
+        "resourceType": "Patient",
+        "identifier": [{"system": "http://example.org/mrn", "value": mrn}],
+        "active": true
+    });
+    let criteria = format!("identifier=http%3A%2F%2Fexample.org%2Fmrn%7C{mrn}");
+
+    let created = match backend
+        .conditional_create(&t, "Patient", patient.clone(), &criteria, FhirVersion::R4)
+        .await
+        .unwrap()
+    {
+        ConditionalCreateResult::Created(stored) => stored,
+        other => panic!("expected Created, got {other:?}"),
+    };
+    match backend
+        .conditional_create(&t, "Patient", patient.clone(), &criteria, FhirVersion::R4)
+        .await
+        .unwrap()
+    {
+        ConditionalCreateResult::Exists(stored) => assert_eq!(stored.id(), created.id()),
+        other => panic!("expected Exists, got {other:?}"),
+    }
+
+    backend
+        .create(&t, "Patient", patient.clone(), FhirVersion::R4)
+        .await
+        .unwrap();
+    assert!(matches!(
+        backend
+            .conditional_create(&t, "Patient", patient.clone(), &criteria, FhirVersion::R4)
+            .await
+            .unwrap(),
+        ConditionalCreateResult::MultipleMatches(2)
+    ));
+
+    let err = backend
+        .conditional_create(&t, "Patient", patient, "active=true", FhirVersion::R4)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StorageError::Search(_)), "{err:?}");
+}
+
 #[tokio::test]
 async fn test_minio_settings_round_trip() {
     if skip_if_disabled("test_minio_settings_round_trip") {
@@ -1386,5 +1584,324 @@ async fn test_minio_count_by_tenant_survives_deregistration() {
     assert_eq!(
         counts,
         vec![("count-a".to_string(), 1), ("count-b".to_string(), 2)]
+    );
+}
+
+// ============================================================================
+// SQL-on-FHIR streaming tests
+// ============================================================================
+
+/// Verifies that `scan_resources` on the S3 backend yields resources with
+/// server-populated `meta.versionId` and `meta.lastUpdated` merged in.
+///
+/// The S3 backend stores these fields separately from the resource body. The
+/// `since` filter and any ViewDefinition that reads `meta.*` both rely on
+/// `into_content_with_meta` being called during the scan; a regression to
+/// `content().clone()` would silently return null for both fields.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_sof_scan_resources_include_server_meta() {
+    use helios_persistence::core::sof_runner::ViewFilters;
+    use tokio_stream::StreamExt;
+
+    if skip_if_disabled("test_minio_sof_scan_resources_include_server_meta") {
+        return;
+    }
+
+    let harness = make_prefix_backend("sof-meta").await;
+    let backend = &harness.backend;
+    let t = tenant("sof-meta-tenant");
+
+    backend
+        .create(
+            &t,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "meta-obs-1",
+                "status": "final",
+                "code": { "text": "x" }
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    // ViewDefinition that extracts the server-managed meta fields.
+    let view = json!({
+        "resourceType": "ViewDefinition",
+        "resource": "Observation",
+        "status": "active",
+        "select": [{ "column": [
+            { "path": "id",                "name": "obs_id" },
+            { "path": "meta.versionId",    "name": "version_id" },
+            { "path": "meta.lastUpdated",  "name": "last_updated" }
+        ]}]
+    });
+
+    let runner = backend
+        .sof_runner()
+        .expect("S3 backend must provide a SOF runner");
+    let mut stream = runner
+        .run_view(&t, view, ViewFilters::default())
+        .await
+        .expect("run_view");
+
+    let row = stream
+        .next()
+        .await
+        .expect("at least one row")
+        .expect("row must not be an error");
+
+    assert_eq!(row["obs_id"], "meta-obs-1");
+    assert!(
+        row["version_id"].is_string() && !row["version_id"].as_str().unwrap().is_empty(),
+        "meta.versionId must be a non-empty string from the server; got: {:?}",
+        row["version_id"]
+    );
+    assert!(
+        row["last_updated"].is_string() && !row["last_updated"].as_str().unwrap().is_empty(),
+        "meta.lastUpdated must be a non-empty string from the server; got: {:?}",
+        row["last_updated"]
+    );
+}
+
+/// Verifies that the `since` filter works end-to-end on the S3 backend.
+///
+/// Correctness depends on `into_content_with_meta` being used in `scan_resources`
+/// so that `meta.lastUpdated` is present when the in-process runner evaluates the
+/// `since` cutoff. This test would silently pass without the fix only if
+/// `meta.lastUpdated` happened to be embedded in the stored body, which it is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_sof_since_filter() {
+    use helios_persistence::core::sof_runner::ViewFilters;
+    use tokio_stream::StreamExt;
+
+    if skip_if_disabled("test_minio_sof_since_filter") {
+        return;
+    }
+
+    let harness = make_prefix_backend("sof-since").await;
+    let backend = &harness.backend;
+    let t = tenant("sof-since-tenant");
+
+    backend
+        .create(
+            &t,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "s3-since-before",
+                "status": "final",
+                "code": { "text": "x" }
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let stored_before = backend
+        .read(&t, "Observation", "s3-since-before")
+        .await
+        .unwrap()
+        .unwrap();
+    let cutoff = stored_before.last_modified();
+
+    // Guarantee a strictly later timestamp for the second resource.
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+    backend
+        .create(
+            &t,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "s3-since-after",
+                "status": "final",
+                "code": { "text": "x" }
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let view = json!({
+        "resourceType": "ViewDefinition",
+        "resource": "Observation",
+        "status": "active",
+        "select": [{ "column": [{ "path": "id", "name": "obs_id" }] }]
+    });
+
+    let runner = backend
+        .sof_runner()
+        .expect("S3 backend must provide a SOF runner");
+
+    let collect = |filters: ViewFilters| {
+        let runner = runner.clone();
+        let t = t.clone();
+        let view = view.clone();
+        async move {
+            let mut stream = runner.run_view(&t, view, filters).await.expect("run_view");
+            let mut ids = Vec::new();
+            while let Some(row) = stream.next().await {
+                ids.push(row.expect("row")["obs_id"].as_str().unwrap().to_string());
+            }
+            ids.sort();
+            ids
+        }
+    };
+
+    // Unfiltered: both observations present.
+    let all = collect(ViewFilters::default()).await;
+    assert!(
+        all.contains(&"s3-since-before".to_string()),
+        "unfiltered must include before: {all:?}"
+    );
+    assert!(
+        all.contains(&"s3-since-after".to_string()),
+        "unfiltered must include after: {all:?}"
+    );
+
+    // since=cutoff: only the after-cutoff observation.
+    let filtered = collect(ViewFilters {
+        since: Some(cutoff),
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(
+        filtered,
+        vec!["s3-since-after"],
+        "since filter must exclude before-cutoff; cutoff={cutoff:?}: {filtered:?}"
+    );
+
+    // since=future: nothing.
+    let future_cutoff = cutoff + chrono::Duration::hours(1);
+    let empty = collect(ViewFilters {
+        since: Some(future_cutoff),
+        ..Default::default()
+    })
+    .await;
+    assert!(
+        empty.is_empty(),
+        "future cutoff must return nothing: {empty:?}"
+    );
+}
+
+/// Verifies that the patient compartment filter on S3 returns the correct
+/// observations for each patient, and that the two sets are disjoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_sof_patient_filter() {
+    use helios_persistence::core::sof_runner::ViewFilters;
+    use tokio_stream::StreamExt;
+
+    if skip_if_disabled("test_minio_sof_patient_filter") {
+        return;
+    }
+
+    let harness = make_prefix_backend("sof-patient").await;
+    let backend = &harness.backend;
+    let t = tenant("sof-patient-tenant");
+
+    for resource in [
+        json!({ "resourceType": "Patient", "id": "s3-pt-1" }),
+        json!({ "resourceType": "Patient", "id": "s3-pt-2" }),
+    ] {
+        backend
+            .create(&t, "Patient", resource, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+
+    for id in ["s3-obs-p1-a", "s3-obs-p1-b"] {
+        backend
+            .create(
+                &t,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": id,
+                    "status": "final",
+                    "code": { "text": "x" },
+                    "subject": { "reference": "Patient/s3-pt-1" }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    for id in ["s3-obs-p2-a"] {
+        backend
+            .create(
+                &t,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": id,
+                    "status": "final",
+                    "code": { "text": "x" },
+                    "subject": { "reference": "Patient/s3-pt-2" }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let view = json!({
+        "resourceType": "ViewDefinition",
+        "resource": "Observation",
+        "status": "active",
+        "select": [{ "column": [{ "path": "id", "name": "obs_id" }] }]
+    });
+
+    let runner = backend
+        .sof_runner()
+        .expect("S3 backend must provide a SOF runner");
+
+    let collect = |filters: ViewFilters| {
+        let runner = runner.clone();
+        let t = t.clone();
+        let view = view.clone();
+        async move {
+            let mut stream = runner.run_view(&t, view, filters).await.expect("run_view");
+            let mut ids = Vec::new();
+            while let Some(row) = stream.next().await {
+                ids.push(row.expect("row")["obs_id"].as_str().unwrap().to_string());
+            }
+            ids.sort();
+            ids
+        }
+    };
+
+    let all = collect(ViewFilters::default()).await;
+    assert_eq!(
+        all,
+        vec!["s3-obs-p1-a", "s3-obs-p1-b", "s3-obs-p2-a"],
+        "unfiltered: {all:?}"
+    );
+
+    let p1 = collect(ViewFilters {
+        patient: vec!["Patient/s3-pt-1".to_string()],
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(
+        p1,
+        vec!["s3-obs-p1-a", "s3-obs-p1-b"],
+        "patient/s3-pt-1 filter: {p1:?}"
+    );
+
+    let p2 = collect(ViewFilters {
+        patient: vec!["Patient/s3-pt-2".to_string()],
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(p2, vec!["s3-obs-p2-a"], "patient/s3-pt-2 filter: {p2:?}");
+
+    let p1_set: std::collections::HashSet<_> = p1.iter().collect();
+    let p2_set: std::collections::HashSet<_> = p2.iter().collect();
+    assert!(
+        p1_set.is_disjoint(&p2_set),
+        "patient filters must return non-overlapping observations"
     );
 }

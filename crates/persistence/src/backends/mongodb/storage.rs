@@ -1,36 +1,41 @@
 //! ResourceStorage implementation for MongoDB.
 
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use helios_fhir::FhirVersion;
 use mongodb::{
     ClientSession, Collection, Cursor, SessionCursor,
     bson::{self, Bson, DateTime as BsonDateTime, Document, doc},
-    error::Error as MongoError,
-    options::FindOptions,
+    error::{Error as MongoError, ErrorKind as MongoErrorKind},
+    options::{FindOptions, Hint},
 };
 use serde_json::Value;
 
 use crate::core::{
     BundleEntry, BundleEntryResult, BundleMethod, BundleProvider, BundleResult, BundleType,
     HistoryEntry, HistoryMethod, HistoryPage, HistoryParams, InstanceHistoryProvider,
-    PurgableStorage, ResourceStorage, SettingsStore, SystemHistoryProvider, TypeHistoryProvider,
-    VersionedStorage, bundle_if_match_gate, bundle_if_none_exist_gate, if_match_field_satisfied,
-    normalize_etag,
+    PatchCandidateValidator, PurgableStorage, ResourceStorage, SettingsStore,
+    SystemHistoryProvider, TypeHistoryProvider, VersionedStorage, bundle_if_match_gate,
+    bundle_if_none_exist_gate, if_match_field_satisfied, normalize_etag,
 };
 use crate::error::{
-    BackendError, ConcurrencyError, QueryErrorExt, ResourceError, StorageError, StorageResult,
-    TransactionError,
+    BackendError, ConcurrencyError, QueryErrorExt, ResourceError, SearchError, StorageError,
+    StorageResult, TransactionError,
 };
 use crate::search::converters::IndexValue;
 use crate::search::extractor::ExtractedValue;
-use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
+use crate::search::reindex::{ReindexPageStats, ReindexSource, ReindexTarget, ResourcePage};
 use crate::tenant::{Operation, TenantContext};
-use crate::types::{CursorValue, Page, PageCursor, PageInfo, SearchQuery, StoredResource};
+use crate::types::{
+    CursorValue, Page, PageCursor, PageInfo, SearchParamType, SearchParameter, SearchPrefix,
+    SearchQuery, StoredResource,
+};
 
 use super::MongoBackend;
+use super::schema::{RESOURCES_IDENTITY_INDEX, RESOURCES_TYPE_SCAN_INDEX};
 
 pub(super) fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -51,12 +56,80 @@ enum PendingSearchParameterChange {
     Delete,
 }
 
+/// Request context shared by every entry in one MongoDB Bundle transaction.
+struct BundleEntryContext<'a> {
+    tenant: &'a TenantContext,
+    fhir_version: helios_fhir::FhirVersion,
+    patch_validator: Option<&'a dyn PatchCandidateValidator>,
+}
+
 fn serialization_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::SerializationError { message })
 }
 
 pub(super) fn is_duplicate_key_error(err: &MongoError) -> bool {
     err.to_string().contains("E11000")
+}
+
+/// The server's `WriteConflict` code.
+const WRITE_CONFLICT_CODE: i32 = 112;
+
+/// Pause before the single retry of an unconditional delete that hit a write
+/// conflict: long enough for the winner's transaction to commit, so the retry
+/// does not just collide with it again.
+const WRITE_CONFLICT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Why one attempt at a versioned write failed.
+enum WriteAttemptError {
+    /// The server refused the write because a concurrent writer got there
+    /// first ([`is_write_conflict`]); nothing was written.
+    Conflict(MongoError),
+    /// Anything else, already in its final form.
+    Storage(StorageError),
+}
+
+impl WriteAttemptError {
+    /// Classifies a driver error raised inside the attempt's session.
+    fn driver(context: &str, err: MongoError) -> Self {
+        if is_write_conflict(&err) {
+            Self::Conflict(err)
+        } else {
+            Self::Storage(internal_error(format!("{}: {}", context, err)))
+        }
+    }
+}
+
+impl<E: Into<StorageError>> From<E> for WriteAttemptError {
+    fn from(err: E) -> Self {
+        Self::Storage(err.into())
+    }
+}
+
+/// True when the server refused (and rolled back) a write because another
+/// operation got to the document first.
+///
+/// Inside a multi-document transaction MongoDB does not queue behind a
+/// conflicting writer the way PostgreSQL queues behind a row lock: the loser's
+/// write fails at once with `WriteConflict` (112), labelled
+/// `TransientTransactionError`, and its transaction is aborted. The label on
+/// its own means the same thing for our purposes — the transaction did not and
+/// will not commit, and running it again is safe — so both are classified.
+/// `UnknownTransactionCommitResult` is deliberately not: there the write may
+/// have landed.
+///
+/// This used to reach the client as `BackendError::Internal` -> 500 (#1405):
+/// "the server failed", for what is "you lost a race, read and retry".
+pub(super) fn is_write_conflict(err: &MongoError) -> bool {
+    if err.contains_label(mongodb::error::TRANSIENT_TRANSACTION_ERROR) {
+        return true;
+    }
+    match err.kind.as_ref() {
+        MongoErrorKind::Command(command) => command.code == WRITE_CONFLICT_CODE,
+        MongoErrorKind::Write(mongodb::error::WriteFailure::WriteError(write)) => {
+            write.code == WRITE_CONFLICT_CODE
+        }
+        _ => false,
+    }
 }
 
 pub(super) fn ensure_resource_identity(resource_type: &str, id: &str, resource: &mut Value) {
@@ -93,7 +166,35 @@ pub(super) fn chrono_to_bson(dt: DateTime<Utc>) -> BsonDateTime {
     BsonDateTime::from_millis(dt.timestamp_millis())
 }
 
+/// The instant a stored date is indexed at, or `None` when it cannot be read
+/// and the caller should skip the index entry.
+///
+/// The value is read with the search side's own `FhirDateValue` first, so
+/// whatever that grammar accepts is indexed at exactly the first instant of the
+/// range a search for the same text covers. That is what indexes a stored
+/// `…T09:20` — minutes without seconds, which RFC 3339 does not allow and which
+/// used to be skipped here although `date=…T09:20` is a valid search (#1315) —
+/// and what puts a `:60` leap second on the next second, where the search side
+/// looks for it.
+///
+/// Only the text as stored counts: the search-side repairs (trimming, and a
+/// space read as a form-decoded `+`) do not apply to a resource, where a space
+/// is simply not part of a date. Anything the strict grammar does not take
+/// verbatim falls through to the lenient reading below, which is unchanged.
 fn normalize_date_for_mongo(value: &str) -> Option<DateTime<Utc>> {
+    if let Ok(parsed) = crate::search::FhirDateValue::parse(value) {
+        if parsed.canonical() == value {
+            return Some(parsed.start);
+        }
+    }
+    normalize_date_for_mongo_lenient(value)
+}
+
+/// The reading [`normalize_date_for_mongo`] falls back to: complete the value
+/// and take whatever chrono's RFC 3339 parser makes of it. Wider than the FHIR
+/// grammar on purpose — it is what keeps an out-of-grammar value (`+14:30`, an
+/// instant past the year 9999) indexed rather than dropped.
+fn normalize_date_for_mongo_lenient(value: &str) -> Option<DateTime<Utc>> {
     let normalized = if value.contains('T') {
         if value.contains('Z') || value.contains('+') || value.matches('-').count() > 2 {
             value.to_string()
@@ -195,7 +296,7 @@ async fn collect_documents(mut cursor: Cursor<Document>) -> StorageResult<Vec<Do
     Ok(docs)
 }
 
-async fn collect_session_documents(
+pub(super) async fn collect_session_documents(
     mut cursor: SessionCursor<Document>,
     session: &mut ClientSession,
 ) -> StorageResult<Vec<Document>> {
@@ -275,6 +376,57 @@ fn parse_system_history_cursor(params: &HistoryParams) -> Option<(DateTime<Utc>,
     };
 
     Some((timestamp, resource_type, id))
+}
+
+/// Server-side keyset predicate for a `history_type` cursor page: matches the
+/// same `last_updated < ts OR (last_updated == ts AND id < cursor_id)` shape
+/// already used by the Rust-side comparison here and by the SQLite/Postgres
+/// backends, but as a MongoDB `$or` so the index — not a full scan — can
+/// serve it. `None` when there is no cursor (first page), an absent/malformed
+/// cursor, or offset-mode pagination — in every such case the caller adds no
+/// `$or` and the query is simply the first page.
+fn type_history_cursor_or(params: &HistoryParams) -> Option<Vec<Document>> {
+    let (ts, id) = parse_type_history_cursor(params)?;
+    let bson_ts = chrono_to_bson(ts);
+    Some(vec![
+        doc! { "last_updated": { "$lt": bson_ts } },
+        doc! { "last_updated": bson_ts, "id": { "$lt": id } },
+    ])
+}
+
+/// Same as [`type_history_cursor_or`] but for `history_system`'s 3-key sort
+/// (`last_updated`, `resource_type`, `id`).
+fn system_history_cursor_or(params: &HistoryParams) -> Option<Vec<Document>> {
+    let (ts, resource_type, id) = parse_system_history_cursor(params)?;
+    let bson_ts = chrono_to_bson(ts);
+    Some(vec![
+        doc! { "last_updated": { "$lt": bson_ts } },
+        doc! { "last_updated": bson_ts, "resource_type": { "$lt": &resource_type } },
+        doc! {
+            "last_updated": bson_ts,
+            "resource_type": &resource_type,
+            "id": { "$lt": id },
+        },
+    ])
+}
+
+/// Sort matching `idx_history_type_updated`'s key order after its two
+/// equality-filtered prefix fields (`tenant_id`, `resource_type`).
+fn type_history_sort() -> Document {
+    doc! { "last_updated": -1_i32, "id": -1_i32 }
+}
+
+/// Sort matching `idx_history_system_updated`'s key order after its
+/// equality-filtered prefix field (`tenant_id`).
+fn system_history_sort() -> Document {
+    doc! { "last_updated": -1_i32, "resource_type": -1_i32, "id": -1_i32 }
+}
+
+/// Documents to fetch for a history page: `count + 1` so the caller can
+/// detect `has_next` by truncating back to `count`. Never 0 — MongoDB reads
+/// `limit(0)` as "unlimited", which would silently undo the bound.
+fn history_fetch_limit(count: u32) -> i64 {
+    i64::from(count.saturating_add(1))
 }
 
 #[derive(Debug, Clone)]
@@ -364,68 +516,7 @@ fn parse_history_row(
     })
 }
 
-/// Flattens typed conditional criteria into the `(name, value)` pairs the
-/// session-scoped matcher evaluates, or names the first criterion whose shape
-/// that matcher cannot evaluate: a modifier, a chain, composite components,
-/// an OR-list, or a comparison prefix.
-///
-/// Refusing is the honest answer — the SQL backends evaluate all of these
-/// through their query builders, and a silent "no match" here would create a
-/// duplicate or delete nothing (#865, #709).
-fn bundle_criteria_pairs(
-    criteria: &[crate::types::SearchParameter],
-) -> Result<Vec<(String, String)>, String> {
-    use crate::types::SearchPrefix;
-
-    criteria
-        .iter()
-        .map(|param| {
-            let plain = param.modifier.is_none()
-                && param.chain.is_empty()
-                && param.components.is_empty()
-                && param.values.len() == 1
-                && param.values[0].prefix == SearchPrefix::Eq;
-            if !plain {
-                // `eq` is the implicit prefix: spelling it out would echo the
-                // criterion back in a form the client never sent.
-                let values = param
-                    .values
-                    .iter()
-                    .map(|v| match v.prefix {
-                        SearchPrefix::Eq => v.value.clone(),
-                        prefix => format!("{prefix}{}", v.value),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",");
-                let name = match &param.modifier {
-                    Some(modifier) => format!("{}:{modifier}", param.name),
-                    None => param.name.clone(),
-                };
-                return Err(format!("{name}={values}"));
-            }
-            Ok((param.name.clone(), param.values[0].value.clone()))
-        })
-        .collect()
-}
-
-fn parse_simple_bundle_search_params(params: &str) -> Vec<(String, String)> {
-    params
-        .split('&')
-        .filter_map(|pair| {
-            let mut iter = pair.splitn(2, '=');
-            let key = iter.next()?.trim();
-            let value = iter.next()?.trim();
-
-            if key.is_empty() || value.is_empty() {
-                return None;
-            }
-
-            Some((key.to_string(), value.to_string()))
-        })
-        .collect()
-}
-
-fn document_to_stored_resource(
+pub(super) fn document_to_stored_resource(
     doc: &Document,
     tenant: &TenantContext,
     fallback_resource_type: &str,
@@ -489,36 +580,103 @@ impl crate::sof::in_process::ResourceScan for MongoResourceScan {
         &self,
         tenant: &TenantContext,
         resource_type: &str,
-    ) -> Result<Vec<Value>, crate::core::sof_runner::SofError> {
+    ) -> Result<crate::sof::in_process::ResourceStream, crate::core::sof_runner::SofError> {
         use crate::core::sof_runner::SofError;
+        use futures::stream;
 
         let client = self
             .client
             .get_or_try_init(|| super::backend::connect_client(&self.config))
             .await
             .map_err(|e| SofError::Storage(e.to_string()))?;
-        let resources = client
-            .database(&self.config.database_name)
-            .collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+
         let filter = doc! {
             "tenant_id": tenant.tenant_id().as_str(),
             "resource_type": resource_type,
             "is_deleted": false,
         };
-        let cursor = resources
+        let cursor = client
+            .database(&self.config.database_name)
+            .collection::<Document>(MongoBackend::RESOURCES_COLLECTION)
             .find(filter)
             .await
             .map_err(|e| SofError::Storage(e.to_string()))?;
-        let docs = collect_documents(cursor)
+
+        let tenant_owned = tenant.clone();
+        let resource_type = resource_type.to_string();
+
+        let scan_stream = stream::try_unfold(cursor, move |mut cursor| {
+            let tenant_owned = tenant_owned.clone();
+            let resource_type = resource_type.clone();
+            async move {
+                match cursor.advance().await {
+                    Err(e) => Err(SofError::Storage(e.to_string())),
+                    Ok(false) => Ok(None),
+                    Ok(true) => {
+                        let doc = cursor
+                            .deserialize_current()
+                            .map_err(|e| SofError::Storage(e.to_string()))?;
+                        let value =
+                            document_to_stored_resource(&doc, &tenant_owned, &resource_type)
+                                .map(StoredResource::into_content_with_meta)
+                                .map_err(|e| SofError::Storage(e.to_string()))?;
+                        Ok(Some((value, cursor)))
+                    }
+                }
+            }
+        });
+
+        Ok(Box::pin(scan_stream))
+    }
+
+    async fn read_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[String],
+    ) -> Result<Vec<Value>, crate::core::sof_runner::SofError> {
+        use crate::core::sof_runner::SofError;
+
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let client = self
+            .client
+            .get_or_try_init(|| super::backend::connect_client(&self.config))
             .await
             .map_err(|e| SofError::Storage(e.to_string()))?;
-        docs.iter()
-            .map(|doc| {
-                document_to_stored_resource(doc, tenant, resource_type)
-                    .map(StoredResource::into_content_with_meta)
-                    .map_err(|e| SofError::Storage(e.to_string()))
-            })
-            .collect()
+
+        // One `find` over the same `(tenant_id, resource_type, id)` index the
+        // single-resource read uses; soft-deleted ids drop out with the filter.
+        let filter = doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": resource_type,
+            "is_deleted": false,
+            "id": { "$in": ids },
+        };
+        let mut cursor = client
+            .database(&self.config.database_name)
+            .collection::<Document>(MongoBackend::RESOURCES_COLLECTION)
+            .find(filter)
+            .await
+            .map_err(|e| SofError::Storage(e.to_string()))?;
+
+        let mut out = Vec::with_capacity(ids.len());
+        while cursor
+            .advance()
+            .await
+            .map_err(|e| SofError::Storage(e.to_string()))?
+        {
+            let doc = cursor
+                .deserialize_current()
+                .map_err(|e| SofError::Storage(e.to_string()))?;
+            let value = document_to_stored_resource(&doc, tenant, resource_type)
+                .map(StoredResource::into_content_with_meta)
+                .map_err(|e| SofError::Storage(e.to_string()))?;
+            out.push(value);
+        }
+        Ok(out)
     }
 }
 
@@ -596,17 +754,28 @@ async fn commit_best_effort_multi_write_session(
     transaction_active: bool,
     operation: &str,
 ) -> StorageResult<()> {
+    try_commit_best_effort_multi_write_session(session, transaction_active)
+        .await
+        .map_err(|e| {
+            internal_error(format!(
+                "Failed to commit MongoDB transaction after {}: {}",
+                operation, e
+            ))
+        })
+}
+
+/// [`commit_best_effort_multi_write_session`] with the driver's error intact,
+/// for the writes that classify a commit-time `WriteConflict`.
+async fn try_commit_best_effort_multi_write_session(
+    session: &mut Option<ClientSession>,
+    transaction_active: bool,
+) -> Result<(), MongoError> {
     if !transaction_active {
         return Ok(());
     }
 
     if let Some(active_session) = session.as_mut() {
-        active_session.commit_transaction().await.map_err(|e| {
-            internal_error(format!(
-                "Failed to commit MongoDB transaction after {}: {}",
-                operation, e
-            ))
-        })?;
+        active_session.commit_transaction().await?;
     }
 
     Ok(())
@@ -790,11 +959,15 @@ impl ResourceStorage for MongoBackend {
         self.index_resource(&db, tenant_id, resource_type, &id, &resource, &mut session)
             .await?;
 
+        commit_best_effort_multi_write_session(&mut session, transaction_active, "create").await?;
+
         // An overlay-affecting SearchParameter write: refresh the stored-param
         // cache (which the per-tenant loader reads) and drop the cached
-        // registries. Seeded spec copies never affect the overlay (see
-        // `create_affects_overlay`), which keeps bulk seeding from triggering
-        // an O(n²) reload storm.
+        // registries. This must run after the commit above: `reload_stored_cache`
+        // reads the `resources` collection without the session, so while the
+        // transaction is still open the write above is invisible to it. Seeded
+        // spec copies never affect the overlay (see `create_affects_overlay`),
+        // which keeps bulk seeding from triggering an O(n²) reload storm.
         if resource_type == "SearchParameter"
             && self.tenant_registries().create_affects_overlay(&resource)
         {
@@ -802,8 +975,6 @@ impl ResourceStorage for MongoBackend {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
             }
         }
-
-        commit_best_effort_multi_write_session(&mut session, transaction_active, "create").await?;
 
         Ok(StoredResource::from_storage(
             resource_type,
@@ -923,189 +1094,23 @@ impl ResourceStorage for MongoBackend {
         current: &StoredResource,
         resource: Value,
     ) -> StorageResult<StoredResource> {
-        let resource_type = current.resource_type();
-        tenant.check_permission(Operation::Update, resource_type)?;
-
-        let db = self.get_database().await?;
-        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
-        let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
-        let (mut session, transaction_active) = begin_best_effort_multi_write_session(&db).await;
-        let tenant_id = tenant.tenant_id().as_str();
-        let id = current.id();
-
-        let current_filter = doc! {
-            "tenant_id": tenant_id,
-            "resource_type": resource_type,
-            "id": id,
-            "is_deleted": false,
-        };
-
-        let maybe_existing = if let Some(active_session) = session.as_mut() {
-            resources
-                .find_one(current_filter.clone())
-                .session(active_session)
-                .await
-                .map_err(|e| {
-                    internal_error(format!("Failed to load current resource (session): {}", e))
-                })?
-        } else {
-            resources
-                .find_one(current_filter)
-                .await
-                .map_err(|e| internal_error(format!("Failed to load current resource: {}", e)))?
-        };
-
-        let Some(existing_doc) = maybe_existing else {
-            return Err(StorageError::Resource(ResourceError::NotFound {
-                resource_type: resource_type.to_string(),
-                id: id.to_string(),
-            }));
-        };
-
-        let actual_version = existing_doc
-            .get_str("version_id")
-            .map_err(|e| internal_error(format!("Missing current version: {}", e)))?
-            .to_string();
-
-        if actual_version != current.version_id() {
-            return Err(StorageError::Concurrency(
-                ConcurrencyError::VersionConflict {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                    expected_version: current.version_id().to_string(),
-                    actual_version,
-                },
-            ));
+        // No retry: `update` always carries a precondition (`current`'s
+        // version), and a writer that beat us to the document has, or is about
+        // to have, moved it on. The honest answer is the one PostgreSQL gives
+        // for the same race — `VersionConflict` -> 409 — not a second attempt.
+        match self.update_attempt(tenant, current, resource).await {
+            Ok(stored) => Ok(stored),
+            Err(WriteAttemptError::Storage(e)) => Err(e),
+            Err(WriteAttemptError::Conflict(e)) => Err(self
+                .lost_race(
+                    tenant,
+                    current.resource_type(),
+                    current.id(),
+                    current.version_id(),
+                    &e,
+                )
+                .await),
         }
-
-        let new_version = next_version(current.version_id())?;
-
-        let mut resource = resource;
-        ensure_resource_identity(resource_type, id, &mut resource);
-        let payload = value_to_document(&resource)?;
-
-        let now = Utc::now();
-        let now_bson = chrono_to_bson(now);
-        let fhir_version = current.fhir_version();
-        let fhir_version_str = fhir_version.as_mime_param().to_string();
-
-        let update_filter = doc! {
-            "tenant_id": tenant_id,
-            "resource_type": resource_type,
-            "id": id,
-            "version_id": current.version_id(),
-            "is_deleted": false,
-        };
-        let update_doc = doc! {
-            "$set": {
-                "version_id": &new_version,
-                "data": Bson::Document(payload.clone()),
-                "last_updated": now_bson,
-                "is_deleted": false,
-                "deleted_at": Bson::Null,
-                "fhir_version": &fhir_version_str,
-            }
-        };
-
-        let update_result = if let Some(active_session) = session.as_mut() {
-            resources
-                .update_one(update_filter.clone(), update_doc.clone())
-                .session(active_session)
-                .await
-                .map_err(|e| {
-                    internal_error(format!("Failed to update resource (session): {}", e))
-                })?
-        } else {
-            resources
-                .update_one(update_filter, update_doc)
-                .await
-                .map_err(|e| internal_error(format!("Failed to update resource: {}", e)))?
-        };
-
-        if update_result.matched_count == 0 {
-            let latest = resources
-                .find_one(doc! {
-                    "tenant_id": tenant_id,
-                    "resource_type": resource_type,
-                    "id": id,
-                })
-                .await
-                .map_err(|e| {
-                    internal_error(format!("Failed to reload version conflict state: {}", e))
-                })?;
-
-            let actual = latest
-                .as_ref()
-                .and_then(|d| d.get_str("version_id").ok())
-                .unwrap_or("unknown")
-                .to_string();
-
-            return Err(StorageError::Concurrency(
-                ConcurrencyError::VersionConflict {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                    expected_version: current.version_id().to_string(),
-                    actual_version: actual,
-                },
-            ));
-        }
-
-        let created_at = extract_created_at(&existing_doc, now);
-
-        let history_doc = doc! {
-            "tenant_id": tenant_id,
-            "resource_type": resource_type,
-            "id": id,
-            "version_id": &new_version,
-            "data": Bson::Document(payload),
-            "created_at": chrono_to_bson(created_at),
-            "last_updated": now_bson,
-            "is_deleted": false,
-            "deleted_at": Bson::Null,
-            "fhir_version": fhir_version_str,
-        };
-
-        if let Some(active_session) = session.as_mut() {
-            history
-                .insert_one(history_doc)
-                .session(active_session)
-                .await
-                .map_err(|e| {
-                    internal_error(format!(
-                        "Failed to insert updated history row (session): {}",
-                        e
-                    ))
-                })?;
-        } else {
-            history.insert_one(history_doc).await.map_err(|e| {
-                internal_error(format!("Failed to insert updated history row: {}", e))
-            })?;
-        }
-
-        self.index_resource(&db, tenant_id, resource_type, id, &resource, &mut session)
-            .await?;
-
-        // A SearchParameter update may change a tenant's overlay (status flips,
-        // expression edits): refresh the stored-param cache and drop registries.
-        if resource_type == "SearchParameter" {
-            if let Err(e) = self.reload_stored_cache().await {
-                tracing::warn!("SearchParameter cache reload failed: {e}");
-            }
-        }
-
-        commit_best_effort_multi_write_session(&mut session, transaction_active, "update").await?;
-
-        Ok(StoredResource::from_storage(
-            resource_type,
-            id,
-            new_version,
-            tenant.tenant_id().clone(),
-            resource,
-            created_at,
-            now,
-            None,
-            fhir_version,
-        ))
     }
 
     async fn delete(
@@ -1114,149 +1119,18 @@ impl ResourceStorage for MongoBackend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<()> {
-        tenant.check_permission(Operation::Delete, resource_type)?;
+        self.soft_delete(tenant, resource_type, id, None).await
+    }
 
-        let db = self.get_database().await?;
-        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
-        let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
-        let (mut session, transaction_active) = begin_best_effort_multi_write_session(&db).await;
-        let tenant_id = tenant.tenant_id().as_str();
-
-        let delete_lookup_filter = doc! {
-            "tenant_id": tenant_id,
-            "resource_type": resource_type,
-            "id": id,
-            "is_deleted": false,
-        };
-
-        let maybe_existing = if let Some(active_session) = session.as_mut() {
-            resources
-                .find_one(delete_lookup_filter.clone())
-                .session(active_session)
-                .await
-                .map_err(|e| {
-                    internal_error(format!(
-                        "Failed to check resource before delete (session): {}",
-                        e
-                    ))
-                })?
-        } else {
-            resources
-                .find_one(delete_lookup_filter)
-                .await
-                .map_err(|e| {
-                    internal_error(format!("Failed to check resource before delete: {}", e))
-                })?
-        };
-
-        let Some(existing_doc) = maybe_existing else {
-            return Err(StorageError::Resource(ResourceError::NotFound {
-                resource_type: resource_type.to_string(),
-                id: id.to_string(),
-            }));
-        };
-
-        let current_version = existing_doc
-            .get_str("version_id")
-            .map_err(|e| internal_error(format!("Missing current version: {}", e)))?
-            .to_string();
-        let new_version = next_version(&current_version)?;
-
-        let payload = existing_doc
-            .get_document("data")
-            .map_err(|e| internal_error(format!("Missing resource payload: {}", e)))?
-            .clone();
-        let fhir_version = existing_doc
-            .get_str("fhir_version")
-            .unwrap_or("4.0")
-            .to_string();
-        let created_at = extract_created_at(&existing_doc, Utc::now());
-
-        let now = Utc::now();
-        let now_bson = chrono_to_bson(now);
-
-        let delete_update_filter = doc! {
-            "tenant_id": tenant_id,
-            "resource_type": resource_type,
-            "id": id,
-            "version_id": &current_version,
-            "is_deleted": false,
-        };
-        let delete_update_doc = doc! {
-            "$set": {
-                "version_id": &new_version,
-                "is_deleted": true,
-                "deleted_at": now_bson,
-                "last_updated": now_bson,
-            }
-        };
-
-        let update_result = if let Some(active_session) = session.as_mut() {
-            resources
-                .update_one(delete_update_filter.clone(), delete_update_doc.clone())
-                .session(active_session)
-                .await
-                .map_err(|e| {
-                    internal_error(format!("Failed to soft-delete resource (session): {}", e))
-                })?
-        } else {
-            resources
-                .update_one(delete_update_filter, delete_update_doc)
-                .await
-                .map_err(|e| internal_error(format!("Failed to soft-delete resource: {}", e)))?
-        };
-
-        if update_result.matched_count == 0 {
-            return Err(StorageError::Resource(ResourceError::NotFound {
-                resource_type: resource_type.to_string(),
-                id: id.to_string(),
-            }));
-        }
-
-        let history_doc = doc! {
-            "tenant_id": tenant_id,
-            "resource_type": resource_type,
-            "id": id,
-            "version_id": &new_version,
-            "data": Bson::Document(payload),
-            "created_at": chrono_to_bson(created_at),
-            "last_updated": now_bson,
-            "is_deleted": true,
-            "deleted_at": now_bson,
-            "fhir_version": fhir_version,
-        };
-
-        if let Some(active_session) = session.as_mut() {
-            history
-                .insert_one(history_doc)
-                .session(active_session)
-                .await
-                .map_err(|e| {
-                    internal_error(format!(
-                        "Failed to insert deletion history row (session): {}",
-                        e
-                    ))
-                })?;
-        } else {
-            history.insert_one(history_doc).await.map_err(|e| {
-                internal_error(format!("Failed to insert deletion history row: {}", e))
-            })?;
-        }
-
-        self.delete_search_index(&db, tenant_id, resource_type, id, &mut session)
-            .await?;
-
-        // A SearchParameter delete may remove a tenant's overlay entry: refresh
-        // the stored-param cache and drop registries.
-        if resource_type == "SearchParameter" {
-            if let Err(e) = self.reload_stored_cache().await {
-                tracing::warn!("SearchParameter cache reload failed: {e}");
-            }
-        }
-
-        commit_best_effort_multi_write_session(&mut session, transaction_active, "delete").await?;
-
-        Ok(())
+    async fn delete_versioned(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: &str,
+    ) -> StorageResult<()> {
+        self.soft_delete(tenant, resource_type, id, Some(expected_version))
+            .await
     }
 
     async fn exists(
@@ -1291,8 +1165,14 @@ impl ResourceStorage for MongoBackend {
         let mut resources = Vec::with_capacity(ids.len());
 
         for id in ids {
-            if let Some(resource) = self.read(tenant, resource_type, id).await? {
-                resources.push(resource);
+            // A missing or soft-deleted (Gone) id is omitted, not fatal — one
+            // deleted target must not fail the whole batch (matches the default
+            // impl / #1119).
+            match self.read(tenant, resource_type, id).await {
+                Ok(Some(resource)) => resources.push(resource),
+                Ok(None) => {}
+                Err(StorageError::Resource(ResourceError::Gone { .. })) => {}
+                Err(e) => return Err(e),
             }
         }
 
@@ -1469,6 +1349,105 @@ impl ResourceStorage for MongoBackend {
         Ok(out)
     }
 
+    async fn count_deltas_by_type_and_bucket(
+        &self,
+        tenant: &TenantContext,
+        resource_types: &[&str],
+        since: DateTime<Utc>,
+        bucket_seconds: i64,
+    ) -> StorageResult<Vec<(String, crate::core::ResourceCountDelta)>> {
+        if resource_types.is_empty() {
+            return Ok(Vec::new());
+        }
+        if bucket_seconds <= 0 {
+            return Err(internal_error(
+                "count_deltas_by_type_and_bucket: bucket_seconds must be positive".to_string(),
+            ));
+        }
+        let db = self.get_database().await?;
+        let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
+        let tenant_id = tenant.tenant_id().as_str();
+        let bucket_ms = bucket_seconds * 1000;
+        let since_bson = BsonDateTime::from_millis(
+            crate::core::bucket_floor(since, bucket_seconds).timestamp_millis(),
+        );
+        let mut types: Vec<&str> = resource_types.to_vec();
+        types.sort_unstable();
+        types.dedup();
+
+        // One aggregation for every requested type (#1078): the same `$match`
+        // window, epoch-millis bucket arithmetic and delta rule as
+        // `count_deltas_by_bucket`, with `resource_type` narrowed by `$in` and
+        // added to the group key, so each type's rows equal its per-type call's.
+        // `idx_history_system_updated` (tenant_id, last_updated, resource_type)
+        // serves the tenant + time-range scan.
+        let epoch_ms = doc! { "$toLong": "$last_updated" };
+        let pipeline = vec![
+            doc! { "$match": {
+                "tenant_id": tenant_id,
+                "resource_type": { "$in": types },
+                "last_updated": { "$gte": since_bson },
+            }},
+            doc! { "$group": {
+                "_id": {
+                    "resource_type": "$resource_type",
+                    "bucket": { "$subtract": [
+                        epoch_ms.clone(),
+                        { "$mod": [epoch_ms, bucket_ms] },
+                    ]},
+                },
+                "delta": { "$sum": { "$switch": {
+                    "branches": [
+                        { "case": { "$eq": ["$is_deleted", true] }, "then": -1 },
+                        { "case": { "$eq": ["$version_id", "1"] }, "then": 1 },
+                    ],
+                    "default": 0,
+                }}},
+            }},
+            doc! { "$match": { "delta": { "$ne": 0 } } },
+            doc! { "$sort": { "_id.resource_type": 1, "_id.bucket": 1 } },
+        ];
+
+        let mut cursor = history
+            .aggregate(pipeline)
+            .await
+            .or_query_error("Failed to aggregate count_deltas_by_type_and_bucket")?;
+
+        let mut out = Vec::new();
+        while cursor
+            .advance()
+            .await
+            .or_query_error("count_deltas_by_type cursor advance")?
+        {
+            let doc = cursor
+                .deserialize_current()
+                .or_query_error("count_deltas_by_type cursor deserialize")?;
+            let Ok(key) = doc.get_document("_id") else {
+                continue;
+            };
+            let Ok(resource_type) = key.get_str("resource_type") else {
+                continue;
+            };
+            let bucket_ms_start = key.get_i64("bucket").unwrap_or_default();
+            // `$sum` yields an int32 for small totals and an int64 once it overflows,
+            // so accept either width rather than assuming one.
+            let delta = doc
+                .get_i64("delta")
+                .or_else(|_| doc.get_i32("delta").map(i64::from))
+                .unwrap_or_default();
+            if let Some(bucket_start) = DateTime::from_timestamp_millis(bucket_ms_start) {
+                out.push((
+                    resource_type.to_string(),
+                    crate::core::ResourceCountDelta {
+                        bucket_start,
+                        delta,
+                    },
+                ));
+            }
+        }
+        Ok(out)
+    }
+
     async fn activity_histogram(
         &self,
         tenant: &TenantContext,
@@ -1576,6 +1555,58 @@ impl ResourceStorage for MongoBackend {
         grouped_string_counts(resources, pipeline).await
     }
 
+    fn supports_type_counts(&self) -> bool {
+        true
+    }
+
+    async fn latest_write_marker(
+        &self,
+        tenant: &TenantContext,
+        recent_since: Option<DateTime<Utc>>,
+    ) -> StorageResult<Option<crate::core::WriteMarker>> {
+        /// Cap on `recent_writes`: a change detector, not a figure (#1078).
+        const RECENT_CAP: u64 = 10_000;
+
+        let db = self.get_database().await?;
+        let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
+        let tenant_id = tenant.tenant_id().as_str();
+
+        // Newest timestamp: the first key of `idx_history_system_updated`
+        // (`tenant_id: 1, last_updated: -1, ...`) for this tenant. Projecting
+        // only `last_updated` (and dropping `_id`) keeps it a covered query —
+        // one index key, no document fetch, no in-memory sort.
+        let newest = history
+            .find_one(doc! { "tenant_id": tenant_id })
+            .sort(doc! { "last_updated": -1_i32 })
+            .projection(doc! { "_id": 0_i32, "last_updated": 1_i32 })
+            .await
+            .or_query_error("Failed to query latest write marker")?;
+        let latest = newest
+            .as_ref()
+            .and_then(|doc| doc.get_datetime("last_updated").ok())
+            .map(bson_to_chrono);
+
+        // Recent writes: a range over the same index, stopped at the cap.
+        let recent_writes = match recent_since {
+            Some(since) => Some(
+                history
+                    .count_documents(doc! {
+                        "tenant_id": tenant_id,
+                        "last_updated": { "$gte": chrono_to_bson(since) },
+                    })
+                    .limit(RECENT_CAP)
+                    .await
+                    .or_query_error("Failed to count recent writes")?,
+            ),
+            None => None,
+        };
+
+        Ok(Some(crate::core::WriteMarker {
+            latest,
+            recent_writes,
+        }))
+    }
+
     fn supports_tenant_registry(&self) -> bool {
         true
     }
@@ -1668,6 +1699,7 @@ impl ResourceStorage for MongoBackend {
             .or_query_error("purge count")?;
         for collection in [
             MongoBackend::SEARCH_INDEX_COLLECTION,
+            MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION,
             MongoBackend::RESOURCE_HISTORY_COLLECTION,
             MongoBackend::RESOURCES_COLLECTION,
         ] {
@@ -1749,7 +1781,544 @@ async fn grouped_string_counts(
     Ok(out)
 }
 
+/// One resource's `search_index` contribution, split by destination
+/// collection: its own rows go to `search_index`, and rows extracted from its
+/// `contained` entries go to `search_index_contained`.
+#[derive(Debug, Default)]
+pub(super) struct SearchIndexDocuments {
+    /// The resource's own rows, for `search_index`.
+    pub own: Vec<Document>,
+    /// Rows extracted from `contained` entries, for `search_index_contained`.
+    pub contained: Vec<Document>,
+}
+
+impl SearchIndexDocuments {
+    pub fn is_empty(&self) -> bool {
+        self.own.is_empty() && self.contained.is_empty()
+    }
+}
+
 impl MongoBackend {
+    /// One attempt at [`ResourceStorage::update`]: the compare-and-swap on
+    /// `current`'s version, the history row and the search index, in one
+    /// transaction where the deployment has them. A write the server refused
+    /// because another writer holds the document comes back as
+    /// [`WriteAttemptError::Conflict`] rather than as an `Internal` error.
+    async fn update_attempt(
+        &self,
+        tenant: &TenantContext,
+        current: &StoredResource,
+        resource: Value,
+    ) -> Result<StoredResource, WriteAttemptError> {
+        let resource_type = current.resource_type();
+        tenant.check_permission(Operation::Update, resource_type)?;
+
+        let db = self.get_database().await?;
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
+        let (mut session, transaction_active) = begin_best_effort_multi_write_session(&db).await;
+        let tenant_id = tenant.tenant_id().as_str();
+        let id = current.id();
+
+        let current_filter = doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "id": id,
+            "is_deleted": false,
+        };
+
+        let maybe_existing = if let Some(active_session) = session.as_mut() {
+            resources
+                .find_one(current_filter.clone())
+                .session(active_session)
+                .await
+                .map_err(|e| {
+                    WriteAttemptError::driver("Failed to load current resource (session)", e)
+                })?
+        } else {
+            resources
+                .find_one(current_filter)
+                .await
+                .map_err(|e| internal_error(format!("Failed to load current resource: {}", e)))?
+        };
+
+        let Some(existing_doc) = maybe_existing else {
+            return Err(StorageError::Resource(ResourceError::NotFound {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+            })
+            .into());
+        };
+
+        let actual_version = existing_doc
+            .get_str("version_id")
+            .map_err(|e| internal_error(format!("Missing current version: {}", e)))?
+            .to_string();
+
+        if actual_version != current.version_id() {
+            return Err(
+                StorageError::Concurrency(ConcurrencyError::VersionConflict {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                    expected_version: current.version_id().to_string(),
+                    actual_version,
+                })
+                .into(),
+            );
+        }
+
+        let new_version = next_version(current.version_id())?;
+
+        let mut resource = resource;
+        ensure_resource_identity(resource_type, id, &mut resource);
+        let payload = value_to_document(&resource)?;
+
+        let now = Utc::now();
+        let now_bson = chrono_to_bson(now);
+        let fhir_version = current.fhir_version();
+        let fhir_version_str = fhir_version.as_mime_param().to_string();
+
+        let update_filter = doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "id": id,
+            "version_id": current.version_id(),
+            "is_deleted": false,
+        };
+        let update_doc = doc! {
+            "$set": {
+                "version_id": &new_version,
+                "data": Bson::Document(payload.clone()),
+                "last_updated": now_bson,
+                "is_deleted": false,
+                "deleted_at": Bson::Null,
+                "fhir_version": &fhir_version_str,
+            }
+        };
+
+        let update_result = if let Some(active_session) = session.as_mut() {
+            resources
+                .update_one(update_filter.clone(), update_doc.clone())
+                .session(active_session)
+                .await
+                .map_err(|e| WriteAttemptError::driver("Failed to update resource (session)", e))?
+        } else {
+            resources
+                .update_one(update_filter, update_doc)
+                .await
+                .map_err(|e| internal_error(format!("Failed to update resource: {}", e)))?
+        };
+
+        if update_result.matched_count == 0 {
+            let latest = resources
+                .find_one(doc! {
+                    "tenant_id": tenant_id,
+                    "resource_type": resource_type,
+                    "id": id,
+                })
+                .await
+                .map_err(|e| {
+                    internal_error(format!("Failed to reload version conflict state: {}", e))
+                })?;
+
+            let actual = latest
+                .as_ref()
+                .and_then(|d| d.get_str("version_id").ok())
+                .unwrap_or("unknown")
+                .to_string();
+
+            return Err(
+                StorageError::Concurrency(ConcurrencyError::VersionConflict {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                    expected_version: current.version_id().to_string(),
+                    actual_version: actual,
+                })
+                .into(),
+            );
+        }
+
+        let created_at = extract_created_at(&existing_doc, now);
+
+        let history_doc = doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "id": id,
+            "version_id": &new_version,
+            "data": Bson::Document(payload),
+            "created_at": chrono_to_bson(created_at),
+            "last_updated": now_bson,
+            "is_deleted": false,
+            "deleted_at": Bson::Null,
+            "fhir_version": fhir_version_str,
+        };
+
+        if let Some(active_session) = session.as_mut() {
+            history
+                .insert_one(history_doc)
+                .session(active_session)
+                .await
+                .map_err(|e| {
+                    WriteAttemptError::driver("Failed to insert updated history row (session)", e)
+                })?;
+        } else {
+            history.insert_one(history_doc).await.map_err(|e| {
+                internal_error(format!("Failed to insert updated history row: {}", e))
+            })?;
+        }
+
+        self.index_resource(&db, tenant_id, resource_type, id, &resource, &mut session)
+            .await?;
+
+        try_commit_best_effort_multi_write_session(&mut session, transaction_active)
+            .await
+            .map_err(|e| {
+                WriteAttemptError::driver("Failed to commit MongoDB transaction after update", e)
+            })?;
+
+        // A SearchParameter update may change a tenant's overlay (status flips,
+        // expression edits): refresh the stored-param cache and drop registries.
+        // This must run after the commit above: `reload_stored_cache` reads the
+        // `resources` collection without the session, so it cannot observe the
+        // update while the transaction is still open.
+        if resource_type == "SearchParameter" {
+            if let Err(e) = self.reload_stored_cache().await {
+                tracing::warn!("SearchParameter cache reload failed: {e}");
+            }
+        }
+
+        Ok(StoredResource::from_storage(
+            resource_type,
+            id,
+            new_version,
+            tenant.tenant_id().clone(),
+            resource,
+            created_at,
+            now,
+            None,
+            fhir_version,
+        ))
+    }
+
+    /// The version of the live (not deleted) resource, read outside any
+    /// session — what a write that just lost a race reports as the version it
+    /// lost to.
+    async fn live_version(
+        &self,
+        resources: &Collection<Document>,
+        tenant_id: &str,
+        resource_type: &str,
+        id: &str,
+    ) -> StorageResult<Option<String>> {
+        let live = resources
+            .find_one(doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "id": id,
+                "is_deleted": false,
+            })
+            .await
+            .map_err(|e| internal_error(format!("Failed to reload current version: {}", e)))?;
+        Ok(live.and_then(|d| d.get_str("version_id").ok().map(str::to_string)))
+    }
+
+    /// Soft-deletes a resource, optionally only at `expected_version`
+    /// ([`ResourceStorage::delete`] / [`ResourceStorage::delete_versioned`]).
+    ///
+    /// The tombstone `update_one` carries the version in its filter, so the
+    /// comparison and the delete are one conditional write whether or not the
+    /// deployment supports transactions. `expected_version` is checked against
+    /// the document that filter is then built from: a `DELETE` with `If-Match`
+    /// used to be evaluated above this layer against an earlier read and then
+    /// deleted whatever version was current by the time it got here (#1404).
+    async fn soft_delete(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: Option<&str>,
+    ) -> StorageResult<()> {
+        let mut retried = false;
+        loop {
+            let conflict = match self
+                .soft_delete_attempt(tenant, resource_type, id, expected_version)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(WriteAttemptError::Storage(e)) => return Err(e),
+                Err(WriteAttemptError::Conflict(e)) => e,
+            };
+
+            // ONE more attempt, and only for a delete with no precondition:
+            // "delete whatever is current" means the same thing after the
+            // other writer commits, which is the driver's recommended handling
+            // of a transient transaction error. A delete that names a version
+            // is never run again — the writer it lost to has moved the resource
+            // on, and the client must see that (`VersionConflict` -> 409).
+            if expected_version.is_none() && !retried {
+                retried = true;
+                tracing::debug!(
+                    resource_type,
+                    id,
+                    error = %conflict,
+                    "MongoDB write conflict on an unconditional delete; retrying once"
+                );
+                tokio::time::sleep(WRITE_CONFLICT_RETRY_DELAY).await;
+                continue;
+            }
+
+            return Err(self
+                .lost_race(
+                    tenant,
+                    resource_type,
+                    id,
+                    expected_version.unwrap_or("unknown"),
+                    &conflict,
+                )
+                .await);
+        }
+    }
+
+    /// Reports a write the server refused with `WriteConflict` as the
+    /// concurrency error it is: `VersionConflict` against whatever is live now,
+    /// or `NotFound` when the winner was a delete. The winner may not have
+    /// committed yet, in which case the live version still reads as the
+    /// expected one and is reported as `unknown` rather than as a conflict of a
+    /// version with itself. A failure of this read must not turn a 409 back
+    /// into a 500, so it degrades to `unknown` too.
+    async fn lost_race(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: &str,
+        conflict: &MongoError,
+    ) -> StorageError {
+        tracing::debug!(
+            resource_type,
+            id,
+            expected_version,
+            error = %conflict,
+            "MongoDB write conflict: a concurrent writer won"
+        );
+
+        let live = match self.get_database().await {
+            Ok(db) => {
+                let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+                self.live_version(&resources, tenant.tenant_id().as_str(), resource_type, id)
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+
+        match live {
+            Ok(None) => StorageError::Resource(ResourceError::NotFound {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+            }),
+            Ok(Some(actual)) if actual != expected_version => {
+                StorageError::Concurrency(ConcurrencyError::VersionConflict {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                    expected_version: expected_version.to_string(),
+                    actual_version: actual,
+                })
+            }
+            Ok(Some(_)) | Err(_) => StorageError::Concurrency(ConcurrencyError::VersionConflict {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+                expected_version: expected_version.to_string(),
+                actual_version: "unknown".to_string(),
+            }),
+        }
+    }
+
+    /// One attempt at [`Self::soft_delete`]; see [`Self::update_attempt`].
+    async fn soft_delete_attempt(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: Option<&str>,
+    ) -> Result<(), WriteAttemptError> {
+        tenant.check_permission(Operation::Delete, resource_type)?;
+
+        let db = self.get_database().await?;
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
+        let (mut session, transaction_active) = begin_best_effort_multi_write_session(&db).await;
+        let tenant_id = tenant.tenant_id().as_str();
+
+        let delete_lookup_filter = doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "id": id,
+            "is_deleted": false,
+        };
+
+        let maybe_existing = if let Some(active_session) = session.as_mut() {
+            resources
+                .find_one(delete_lookup_filter.clone())
+                .session(active_session)
+                .await
+                .map_err(|e| {
+                    WriteAttemptError::driver("Failed to check resource before delete (session)", e)
+                })?
+        } else {
+            resources
+                .find_one(delete_lookup_filter)
+                .await
+                .map_err(|e| {
+                    internal_error(format!("Failed to check resource before delete: {}", e))
+                })?
+        };
+
+        let Some(existing_doc) = maybe_existing else {
+            return Err(StorageError::Resource(ResourceError::NotFound {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+            })
+            .into());
+        };
+
+        let current_version = existing_doc
+            .get_str("version_id")
+            .map_err(|e| internal_error(format!("Missing current version: {}", e)))?
+            .to_string();
+        if let Some(expected) = expected_version
+            && expected != current_version
+        {
+            return Err(
+                StorageError::Concurrency(ConcurrencyError::VersionConflict {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                    expected_version: expected.to_string(),
+                    actual_version: current_version,
+                })
+                .into(),
+            );
+        }
+        let new_version = next_version(&current_version)?;
+
+        let payload = existing_doc
+            .get_document("data")
+            .map_err(|e| internal_error(format!("Missing resource payload: {}", e)))?
+            .clone();
+        let fhir_version = existing_doc
+            .get_str("fhir_version")
+            .unwrap_or("4.0")
+            .to_string();
+        let created_at = extract_created_at(&existing_doc, Utc::now());
+
+        let now = Utc::now();
+        let now_bson = chrono_to_bson(now);
+
+        let delete_update_filter = doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "id": id,
+            "version_id": &current_version,
+            "is_deleted": false,
+        };
+        let delete_update_doc = doc! {
+            "$set": {
+                "version_id": &new_version,
+                "is_deleted": true,
+                "deleted_at": now_bson,
+                "last_updated": now_bson,
+            }
+        };
+
+        let update_result = if let Some(active_session) = session.as_mut() {
+            resources
+                .update_one(delete_update_filter.clone(), delete_update_doc.clone())
+                .session(active_session)
+                .await
+                .map_err(|e| {
+                    WriteAttemptError::driver("Failed to soft-delete resource (session)", e)
+                })?
+        } else {
+            resources
+                .update_one(delete_update_filter, delete_update_doc)
+                .await
+                .map_err(|e| internal_error(format!("Failed to soft-delete resource: {}", e)))?
+        };
+
+        if update_result.matched_count == 0 {
+            // A writer got in after the read above (only possible without a
+            // transaction). A versioned delete says which way it lost.
+            if let Some(expected) = expected_version
+                && let Some(actual) = self
+                    .live_version(&resources, tenant_id, resource_type, id)
+                    .await?
+            {
+                return Err(
+                    StorageError::Concurrency(ConcurrencyError::VersionConflict {
+                        resource_type: resource_type.to_string(),
+                        id: id.to_string(),
+                        expected_version: expected.to_string(),
+                        actual_version: actual,
+                    })
+                    .into(),
+                );
+            }
+            return Err(StorageError::Resource(ResourceError::NotFound {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+            })
+            .into());
+        }
+
+        let history_doc = doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "id": id,
+            "version_id": &new_version,
+            "data": Bson::Document(payload),
+            "created_at": chrono_to_bson(created_at),
+            "last_updated": now_bson,
+            "is_deleted": true,
+            "deleted_at": now_bson,
+            "fhir_version": fhir_version,
+        };
+
+        if let Some(active_session) = session.as_mut() {
+            history
+                .insert_one(history_doc)
+                .session(active_session)
+                .await
+                .map_err(|e| {
+                    WriteAttemptError::driver("Failed to insert deletion history row (session)", e)
+                })?;
+        } else {
+            history.insert_one(history_doc).await.map_err(|e| {
+                internal_error(format!("Failed to insert deletion history row: {}", e))
+            })?;
+        }
+
+        self.delete_search_index(&db, tenant_id, resource_type, id, &mut session)
+            .await?;
+
+        try_commit_best_effort_multi_write_session(&mut session, transaction_active)
+            .await
+            .map_err(|e| {
+                WriteAttemptError::driver("Failed to commit MongoDB transaction after delete", e)
+            })?;
+
+        // A SearchParameter delete may remove a tenant's overlay entry: refresh
+        // the stored-param cache and drop registries. This must run after the
+        // commit above: `reload_stored_cache` reads the `resources` collection
+        // without the session, so it cannot observe the delete while the
+        // transaction is still open.
+        if resource_type == "SearchParameter" {
+            if let Err(e) = self.reload_stored_cache().await {
+                tracing::warn!("SearchParameter cache reload failed: {e}");
+            }
+        }
+
+        Ok(())
+    }
+
     /// Brings a soft-deleted resource back to life with new content.
     ///
     /// FHIR permits a deleted resource to be restored by a subsequent update
@@ -1902,15 +2471,18 @@ impl MongoBackend {
         self.index_resource(&db, tenant_id, resource_type, id, &resource, &mut session)
             .await?;
 
+        commit_best_effort_multi_write_session(&mut session, transaction_active, "restore").await?;
+
         // A restored SearchParameter re-enters a tenant's overlay: refresh the
-        // stored-param cache and drop registries.
+        // stored-param cache and drop registries. This must run after the
+        // commit above: `reload_stored_cache` reads the `resources` collection
+        // without the session, so it cannot observe the restore while the
+        // transaction is still open.
         if resource_type == "SearchParameter" {
             if let Err(e) = self.reload_stored_cache().await {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
             }
         }
-
-        commit_best_effort_multi_write_session(&mut session, transaction_active, "restore").await?;
 
         Ok(StoredResource::from_storage(
             resource_type,
@@ -1925,8 +2497,9 @@ impl MongoBackend {
         ))
     }
 
-    /// The `search_index` documents one resource contributes — every value the
-    /// extractor yields, plus the `_contained` rows, with no I/O of its own.
+    /// The `search_index`/`search_index_contained` documents one resource
+    /// contributes — every value the extractor yields, split by destination
+    /// collection, with no I/O of its own.
     ///
     /// Split out of [`Self::index_resource`] so the batched bulk-submit ingest
     /// (#1000) can build a whole batch's index documents and write them in one
@@ -1938,17 +2511,45 @@ impl MongoBackend {
         resource_type: &str,
         resource_id: &str,
         resource: &Value,
-    ) -> Vec<Document> {
-        let mut index_docs = match self
+    ) -> SearchIndexDocuments {
+        self.search_index_documents_checked(tenant_id, resource_type, resource_id, resource)
+            .0
+    }
+
+    /// [`Self::search_index_documents`], plus the extraction failure message
+    /// (if any) that made this resource fall back to minimal index rows.
+    ///
+    /// Used by [`ReindexTarget::write_search_entries_page`] so a page can
+    /// still write every resource's fallback rows (matching what
+    /// [`Self::index_resource`] already does for a single resource) while
+    /// still reporting that resource as failed — the way the old, per-resource
+    /// `write_search_entries` always did — instead of a batched rewrite
+    /// silently turning a corrupt resource into a quiet `Ok`.
+    pub(super) fn search_index_documents_checked(
+        &self,
+        tenant_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+        resource: &Value,
+    ) -> (SearchIndexDocuments, Option<String>) {
+        let (own, failure) = match self
             .tenant_extractor(tenant_id)
             .extract(resource, resource_type)
         {
-            Ok(values) => values
-                .iter()
-                .filter_map(|value| {
-                    self.build_search_index_document(tenant_id, resource_type, resource_id, value)
-                })
-                .collect::<Vec<_>>(),
+            Ok(values) => (
+                values
+                    .iter()
+                    .filter_map(|value| {
+                        self.build_search_index_document(
+                            tenant_id,
+                            resource_type,
+                            resource_id,
+                            value,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                None,
+            ),
             Err(e) => {
                 tracing::warn!(
                     "Search extraction failed for {}/{}: {}. Using minimal fallback index values.",
@@ -1956,36 +2557,41 @@ impl MongoBackend {
                     resource_id,
                     e
                 );
-                self.index_minimal_fallback_documents(
-                    tenant_id,
-                    resource_type,
-                    resource_id,
-                    resource,
+                (
+                    self.index_minimal_fallback_documents(
+                        tenant_id,
+                        resource_type,
+                        resource_id,
+                        resource,
+                    ),
+                    Some(format!("Search parameter extraction failed: {e}")),
                 )
             }
         };
 
-        // Also index any contained resources for `_contained` search. These rows
-        // share the container's (resource_type, resource_id) — so the
-        // delete-by-(type,id) that precedes a re-index cleans them too — but are
-        // flagged `is_contained` and carry the contained resource's type and
-        // local id.
-        for contained in self.tenant_extractor(tenant_id).extract_contained(resource) {
-            for value in &contained.values {
+        // Also index any contained resources for `_contained` search, into
+        // their own collection (`search_index_contained`) rather than mixed
+        // into `own`. These rows share the container's
+        // (resource_type, resource_id) — so the delete-by-(type,id) that
+        // precedes a re-index cleans them too — and carry the contained
+        // resource's type and local id.
+        let mut contained = Vec::new();
+        for c in self.tenant_extractor(tenant_id).extract_contained(resource) {
+            for value in &c.values {
                 if let Some(d) = self.build_contained_index_document(
                     tenant_id,
                     resource_type,
                     resource_id,
-                    &contained.contained_type,
-                    &contained.local_id,
+                    &c.contained_type,
+                    &c.local_id,
                     value,
                 ) {
-                    index_docs.push(d);
+                    contained.push(d);
                 }
             }
         }
 
-        index_docs
+        (SearchIndexDocuments { own, contained }, failure)
     }
 
     pub(crate) async fn index_resource(
@@ -2004,28 +2610,146 @@ impl MongoBackend {
         self.delete_search_index(db, tenant_id, resource_type, resource_id, session)
             .await?;
 
-        let index_docs =
-            self.search_index_documents(tenant_id, resource_type, resource_id, resource);
+        let docs = self.search_index_documents(tenant_id, resource_type, resource_id, resource);
 
-        if index_docs.is_empty() {
+        if docs.is_empty() {
             return Ok(());
         }
 
-        let collection = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+        self.insert_search_index_documents(db, docs, session.as_mut())
+            .await
+    }
+
+    /// Runs `insert_many(docs)` on `collection` through `session` when given,
+    /// skipping the call entirely when `docs` is empty. Shared by
+    /// [`Self::insert_search_index_documents`]'s two collection inserts so
+    /// they read alike.
+    async fn insert_indexed_docs(
+        collection: &Collection<Document>,
+        docs: Vec<Document>,
+        session: &mut Option<&mut ClientSession>,
+        error_prefix: &str,
+    ) -> StorageResult<()> {
+        if docs.is_empty() {
+            return Ok(());
+        }
 
         if let Some(active_session) = session.as_mut() {
             collection
-                .insert_many(index_docs)
-                .session(active_session)
+                .insert_many(docs)
+                .session(&mut **active_session)
                 .await
-                .map_err(|e| {
-                    internal_error(format!("Failed to insert search index entries: {}", e))
-                })?;
+                .map_err(|e| internal_error(format!("{error_prefix}: {}", e)))?;
         } else {
-            collection.insert_many(index_docs).await.map_err(|e| {
-                internal_error(format!("Failed to insert search index entries: {}", e))
-            })?;
+            collection
+                .insert_many(docs)
+                .await
+                .map_err(|e| internal_error(format!("{error_prefix}: {}", e)))?;
         }
+
+        Ok(())
+    }
+
+    /// Inserts one resource's [`SearchIndexDocuments`]: `own` rows into
+    /// `search_index`, `contained` rows into `search_index_contained`, each
+    /// only when non-empty, through `session` when given. Used by every
+    /// insert path so a resource's own rows and its contained rows land in
+    /// the right collection by construction.
+    async fn insert_search_index_documents(
+        &self,
+        db: &mongodb::Database,
+        docs: SearchIndexDocuments,
+        session: Option<&mut ClientSession>,
+    ) -> StorageResult<()> {
+        let mut session = session;
+
+        let own_collection = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+        Self::insert_indexed_docs(
+            &own_collection,
+            docs.own,
+            &mut session,
+            "Failed to insert search index entries",
+        )
+        .await?;
+
+        let contained_collection =
+            db.collection::<Document>(MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION);
+        Self::insert_indexed_docs(
+            &contained_collection,
+            docs.contained,
+            &mut session,
+            "Failed to insert search_index_contained entries",
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Runs `delete_many(filter)` on `collection` through `session` when
+    /// given. Shared by [`Self::delete_search_index_rows_for`]'s two
+    /// collection deletes so they read alike (and alongside
+    /// [`Self::insert_indexed_docs`]).
+    async fn delete_indexed_docs(
+        collection: &Collection<Document>,
+        filter: Document,
+        session: &mut Option<&mut ClientSession>,
+        error_prefix: &str,
+    ) -> StorageResult<()> {
+        if let Some(active_session) = session.as_mut() {
+            collection
+                .delete_many(filter)
+                .session(&mut **active_session)
+                .await
+                .map_err(|e| internal_error(format!("{error_prefix}: {}", e)))?;
+        } else {
+            collection
+                .delete_many(filter)
+                .await
+                .map_err(|e| internal_error(format!("{error_prefix}: {}", e)))?;
+        }
+
+        Ok(())
+    }
+
+    /// Deletes rows matching `{tenant_id, resource_type, resource_id:
+    /// id_filter}` from `search_index` and then `search_index_contained`,
+    /// through `session` when given. `id_filter` is either a single id
+    /// (`Bson::String`) or an `$in` filter over multiple ids. Used by every
+    /// delete path so a resource's own rows and its contained rows are
+    /// removed together by construction.
+    async fn delete_search_index_rows_for(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        resource_type: &str,
+        id_filter: Bson,
+        session: Option<&mut ClientSession>,
+    ) -> StorageResult<()> {
+        let mut session = session;
+        let filter = doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "resource_id": id_filter,
+        };
+
+        let own_collection = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+        Self::delete_indexed_docs(
+            &own_collection,
+            filter.clone(),
+            &mut session,
+            "Failed to delete search index entries",
+        )
+        .await?;
+
+        let contained_collection =
+            db.collection::<Document>(MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION);
+        Self::delete_indexed_docs(
+            &contained_collection,
+            filter,
+            &mut session,
+            "Failed to delete search_index_contained entries",
+        )
+        .await?;
 
         Ok(())
     }
@@ -2042,28 +2766,14 @@ impl MongoBackend {
             return Ok(());
         }
 
-        let collection = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
-        let filter = doc! {
-            "tenant_id": tenant_id,
-            "resource_type": resource_type,
-            "resource_id": resource_id,
-        };
-
-        if let Some(active_session) = session.as_mut() {
-            collection
-                .delete_many(filter)
-                .session(active_session)
-                .await
-                .map_err(|e| {
-                    internal_error(format!("Failed to delete search index entries: {}", e))
-                })?;
-        } else {
-            collection.delete_many(filter).await.map_err(|e| {
-                internal_error(format!("Failed to delete search index entries: {}", e))
-            })?;
-        }
-
-        Ok(())
+        self.delete_search_index_rows_for(
+            db,
+            tenant_id,
+            resource_type,
+            Bson::String(resource_id.to_string()),
+            session.as_mut(),
+        )
+        .await
     }
 
     fn build_search_index_document(
@@ -2112,6 +2822,7 @@ impl MongoBackend {
             IndexValue::Date {
                 value: date,
                 precision,
+                end,
             } => {
                 let normalized = match normalize_date_for_mongo(date) {
                     Some(v) => v,
@@ -2124,7 +2835,26 @@ impl MongoBackend {
                         return None;
                     }
                 };
+                // #1391: the row stores the range `[value_date, value_date_end)`
+                // a range-aware search compares against. The shared reading
+                // when the start is in the FHIR grammar; otherwise the end is
+                // derived from the lenient start read above.
+                let resolution = crate::search::StorageResolution::Millis;
+                let range_end = crate::search::indexed_range(&value.value, resolution)
+                    .map(|(_, end)| end)
+                    .or_else(|| {
+                        crate::search::indexed_end(normalized, *precision, end, resolution)
+                    });
+                let Some(range_end) = range_end else {
+                    tracing::warn!(
+                        "Skipping date index value '{}' for parameter '{}': its Period end is not a date",
+                        date,
+                        value.param_name
+                    );
+                    return None;
+                };
                 doc.insert("value_date", chrono_to_bson(normalized));
+                doc.insert("value_date_end", chrono_to_bson(range_end));
                 doc.insert("value_date_precision", precision.to_string());
             }
             IndexValue::Number(v) => {
@@ -2160,14 +2890,17 @@ impl MongoBackend {
         if let Some(group) = value.composite_group {
             doc.insert("composite_group", group as i32);
         }
+        if let Some(slot) = value.composite_slot {
+            doc.insert("composite_slot", i32::from(slot));
+        }
 
         Some(doc)
     }
 
     /// Builds a contained-resource search-index document (`_contained` search):
     /// the same value columns as [`Self::build_search_index_document`], with the
-    /// container's `(resource_type, resource_id)`, flagged `is_contained` and
-    /// carrying the contained resource's type and local id.
+    /// container's `(resource_type, resource_id)`, carrying the contained
+    /// resource's type and local id; written to `search_index_contained`.
     fn build_contained_index_document(
         &self,
         tenant_id: &str,
@@ -2179,7 +2912,6 @@ impl MongoBackend {
     ) -> Option<Document> {
         let mut doc =
             self.build_search_index_document(tenant_id, container_type, container_id, value)?;
-        doc.insert("is_contained", true);
         doc.insert("contained_type", contained_type);
         doc.insert("contained_local_id", contained_local_id);
         Some(doc)
@@ -2344,7 +3076,13 @@ impl VersionedStorage for MongoBackend {
             ));
         }
 
-        self.delete(tenant, resource_type, id).await
+        // Delete exactly the version the precondition was evaluated against.
+        // A plain `delete` here was check-then-act: a writer landing after the
+        // read above was deleted along with the version the client named
+        // (#1404).
+        let actual = actual.to_string();
+        self.delete_versioned(tenant, resource_type, id, &actual)
+            .await
     }
 
     async fn list_versions(
@@ -2488,9 +3226,25 @@ impl TypeHistoryProvider for MongoBackend {
             "resource_type": resource_type,
         };
         apply_history_params_filter(&mut filter, params);
+        if let Some(or_branches) = type_history_cursor_or(params) {
+            // A distinct top-level key from the `last_updated` range that
+            // `apply_history_params_filter` may have just inserted, so the
+            // two AND together implicitly rather than colliding.
+            filter.insert("$or", or_branches);
+        }
+
+        let opts = FindOptions::builder()
+            .sort(type_history_sort())
+            .limit(history_fetch_limit(params.pagination.count))
+            // Exclusion-style on the only two fields parse_history_row never
+            // reads: an inclusion projection risks silently substituting a
+            // default for a field it does read (e.g. fhir_version).
+            .projection(doc! { "_id": 0, "created_at": 0 })
+            .build();
 
         let cursor = history
             .find(filter)
+            .with_options(opts)
             .await
             .or_query_error("Failed to query type history")?;
 
@@ -2500,19 +3254,25 @@ impl TypeHistoryProvider for MongoBackend {
             .map(|doc| parse_history_row(doc, Some(resource_type), None))
             .collect::<StorageResult<Vec<_>>>()?;
 
+        // The server-side sort (matching idx_history_type_updated) already
+        // orders the <= count+1 fetched rows by (last_updated desc, id desc);
+        // only the version_id tie-break stays in Rust, because version_id is
+        // in neither idx_history_type_updated nor idx_history_system_updated
+        // (pushing it server-side would reintroduce a blocking SORT, and it
+        // is stored as a string, so a server-side $lt/sort on it would
+        // misorder "10" ahead of "9" anyway). When a (last_updated, id) tie
+        // group straddles the fetch-limit boundary, the server's limit() may
+        // now pick an arbitrary subset of that group before this sort runs,
+        // so which member lands on the page is no longer guaranteed to be
+        // the highest version_id — but any group member beyond the boundary
+        // was already dropped by the (ts, id)-only cursor predicate above
+        // (shared with SQLite/Postgres), so total loss is unchanged.
         rows.sort_by(|a, b| {
             b.last_updated
                 .cmp(&a.last_updated)
                 .then_with(|| b.id.cmp(&a.id))
                 .then_with(|| parse_version_id(&b.version_id).cmp(&parse_version_id(&a.version_id)))
         });
-
-        if let Some((cursor_timestamp, cursor_id)) = parse_type_history_cursor(params) {
-            rows.retain(|row| {
-                row.last_updated < cursor_timestamp
-                    || (row.last_updated == cursor_timestamp && row.id < cursor_id)
-            });
-        }
 
         let page_len = params.pagination.count as usize;
         let has_more = rows.len() > page_len;
@@ -2578,9 +3338,19 @@ impl SystemHistoryProvider for MongoBackend {
             "tenant_id": tenant_id,
         };
         apply_history_params_filter(&mut filter, params);
+        if let Some(or_branches) = system_history_cursor_or(params) {
+            filter.insert("$or", or_branches);
+        }
+
+        let opts = FindOptions::builder()
+            .sort(system_history_sort())
+            .limit(history_fetch_limit(params.pagination.count))
+            .projection(doc! { "_id": 0, "created_at": 0 })
+            .build();
 
         let cursor = history
             .find(filter)
+            .with_options(opts)
             .await
             .or_query_error("Failed to query system history")?;
 
@@ -2590,6 +3360,12 @@ impl SystemHistoryProvider for MongoBackend {
             .map(|doc| parse_history_row(doc, None, None))
             .collect::<StorageResult<Vec<_>>>()?;
 
+        // See the matching comment in history_type: the server-side sort
+        // (matching idx_history_system_updated) already orders the fetched
+        // page; only the version_id tie-break stays in Rust, and a
+        // (last_updated, resource_type, id) tie group straddling the
+        // fetch-limit boundary can show an arbitrary member without
+        // widening total loss versus today.
         rows.sort_by(|a, b| {
             b.last_updated
                 .cmp(&a.last_updated)
@@ -2597,17 +3373,6 @@ impl SystemHistoryProvider for MongoBackend {
                 .then_with(|| b.id.cmp(&a.id))
                 .then_with(|| parse_version_id(&b.version_id).cmp(&parse_version_id(&a.version_id)))
         });
-
-        if let Some((cursor_timestamp, cursor_type, cursor_id)) =
-            parse_system_history_cursor(params)
-        {
-            rows.retain(|row| {
-                row.last_updated < cursor_timestamp
-                    || (row.last_updated == cursor_timestamp
-                        && (row.resource_type < cursor_type
-                            || (row.resource_type == cursor_type && row.id < cursor_id)))
-            });
-        }
 
         let page_len = params.pagination.count as usize;
         let has_more = rows.len() > page_len;
@@ -2670,18 +3435,18 @@ impl BundleProvider for MongoBackend {
 
     /// The in-transaction matcher is the session-scoped one `ifNoneExist`
     /// already uses: index-backed when search is local, and the
-    /// `_id`/`identifier` collection scan when it is offloaded. Criteria
-    /// shapes it cannot evaluate refuse the entry instead (see
-    /// `bundle_criteria_pairs`, and the offloaded scan's own refusal).
+    /// `_id`/`identifier` collection scan when it is offloaded, which refuses
+    /// the criteria shapes it cannot evaluate itself.
     fn supports_conditional_in_transaction(&self) -> bool {
         true
     }
 
-    async fn process_transaction(
+    async fn process_transaction_with_patch_validator(
         &self,
         tenant: &TenantContext,
         entries: Vec<BundleEntry>,
         fhir_version: helios_fhir::FhirVersion,
+        validator: Option<&dyn PatchCandidateValidator>,
     ) -> Result<BundleResult, TransactionError> {
         let db = self
             .get_database()
@@ -2709,6 +3474,7 @@ impl BundleProvider for MongoBackend {
 
         let mut results = Vec::with_capacity(entries.len());
         let mut error_info: Option<(usize, String)> = None;
+        let mut patch_error: Option<TransactionError> = None;
         // A conditional entry that matched is known now, so `urn:uuid`
         // references to it resolve regardless of entry order.
         let mut reference_map: HashMap<String, String> = HashMap::new();
@@ -2732,9 +3498,12 @@ impl BundleProvider for MongoBackend {
                 .process_bundle_entry_transaction(
                     &db,
                     &mut session,
-                    tenant,
+                    BundleEntryContext {
+                        tenant,
+                        fhir_version,
+                        patch_validator: validator,
+                    },
                     entry,
-                    fhir_version,
                     &mut pending_search_parameter_changes,
                     targets.get(&idx),
                 )
@@ -2743,6 +3512,13 @@ impl BundleProvider for MongoBackend {
             match result {
                 Ok(entry_result) => {
                     if entry_result.status >= 400 {
+                        if entry.method == BundleMethod::Patch {
+                            patch_error = Some(TransactionError::PatchEntry {
+                                index: idx,
+                                status: entry_result.status,
+                                outcome: entry_result.outcome.clone().unwrap_or_default(),
+                            });
+                        }
                         error_info = Some((
                             idx,
                             format!("Entry failed with status {}", entry_result.status),
@@ -2776,7 +3552,7 @@ impl BundleProvider for MongoBackend {
 
         if let Some((index, message)) = error_info {
             let _ = session.abort_transaction().await;
-            return Err(TransactionError::BundleError { index, message });
+            return Err(patch_error.unwrap_or(TransactionError::BundleError { index, message }));
         }
 
         session
@@ -2830,22 +3606,13 @@ impl MongoBackend {
                     message: format!("Entry request.url '{}' names no resource type", entry.url),
                 })?
                 .to_string();
-            let pairs = bundle_criteria_pairs(criteria).map_err(|shape| {
-                crate::core::unsupported_conditional_entry(
-                    index,
-                    &format!(
-                        "criteria '{shape}' cannot be evaluated inside a MongoDB transaction; \
-                         submit the entry in a batch Bundle instead"
-                    ),
-                )
-            })?;
             let matches = self
-                .find_matching_pairs_in_bundle_transaction(
+                .find_matching_typed_in_bundle_transaction(
                     db,
                     session,
                     tenant,
                     &resource_type,
-                    &pairs,
+                    criteria.to_vec(),
                 )
                 .await
                 .map_err(|e| TransactionError::BundleError {
@@ -2876,12 +3643,16 @@ impl MongoBackend {
         &self,
         db: &mongodb::Database,
         session: &mut ClientSession,
-        tenant: &TenantContext,
+        context: BundleEntryContext<'_>,
         entry: &BundleEntry,
-        fhir_version: helios_fhir::FhirVersion,
         pending_search_parameter_changes: &mut Vec<PendingSearchParameterChange>,
         target: Option<&crate::core::ConditionalTarget>,
     ) -> StorageResult<BundleEntryResult> {
+        let BundleEntryContext {
+            tenant,
+            fhir_version,
+            patch_validator: validator,
+        } = context;
         match entry.method {
             BundleMethod::Get => {
                 let (resource_type, id) = self.parse_url(&entry.url)?;
@@ -3013,7 +3784,7 @@ impl MongoBackend {
                                 pending_search_parameter_changes,
                             )
                             .await?;
-                        Ok(BundleEntryResult::ok(updated))
+                        Ok(BundleEntryResult::updated(updated))
                     }
                     None => {
                         // A supplied `ifMatch` — including `*` — cannot be
@@ -3101,20 +3872,69 @@ impl MongoBackend {
                         .await
                     {
                         Ok(()) => Ok(BundleEntryResult::deleted()),
+                        // Still 204 on the wire (delete is idempotent), but
+                        // nothing live went away (#1078).
                         Err(StorageError::Resource(ResourceError::NotFound { .. })) => {
-                            Ok(BundleEntryResult::deleted())
+                            Ok(BundleEntryResult::delete_not_found())
                         }
                         Err(e) => Err(e),
                     }
                 }
             }
-            BundleMethod::Patch => Ok(BundleEntryResult::error(
-                501,
-                serde_json::json!({
-                    "resourceType": "OperationOutcome",
-                    "issue": [{"severity": "error", "code": "not-supported", "diagnostics": "PATCH not implemented in transaction bundles"}]
-                }),
-            )),
+            BundleMethod::Patch => {
+                let (resource_type, id) = self.parse_url(&entry.url)?;
+                if resource_type == "AuditEvent" {
+                    return Ok(BundleEntryResult::error(
+                        405,
+                        serde_json::json!({
+                            "resourceType": "OperationOutcome",
+                            "issue": [{"severity": "error", "code": "not-supported", "details": {"text": "AuditEvent resources are immutable"}}]
+                        }),
+                    ));
+                }
+                let existing = self
+                    .read_resource_in_bundle_transaction(db, session, tenant, &resource_type, &id)
+                    .await?;
+                if let Some(failure) = bundle_if_match_gate(
+                    entry.if_match.as_deref(),
+                    existing.as_ref().map(|r| r.version_id()),
+                ) {
+                    return Ok(failure);
+                }
+                let Some(existing) = existing else {
+                    return Ok(BundleEntryResult::error(
+                        404,
+                        serde_json::json!({
+                            "resourceType": "OperationOutcome",
+                            "issue": [{"severity": "error", "code": "not-found", "details": {"text": format!("{resource_type}/{id} not found")}}]
+                        }),
+                    ));
+                };
+                let candidate = match crate::core::transaction::prepare_bundle_patch(
+                    tenant,
+                    &resource_type,
+                    &existing,
+                    entry.resource.as_ref(),
+                    fhir_version,
+                    validator,
+                )
+                .await
+                {
+                    Ok(candidate) => candidate,
+                    Err(failure) => return Ok(*failure),
+                };
+                let update_result = self
+                    .update_resource_in_bundle_transaction(
+                        db,
+                        session,
+                        tenant,
+                        &existing,
+                        candidate,
+                        pending_search_parameter_changes,
+                    )
+                    .await;
+                crate::core::transaction::patch_update_result(update_result)
+            }
         }
     }
 
@@ -3602,39 +4422,57 @@ impl MongoBackend {
         resource_type: &str,
         search_params: &str,
     ) -> StorageResult<Vec<StoredResource>> {
-        let parsed_params = parse_simple_bundle_search_params(search_params);
-        self.find_matching_pairs_in_bundle_transaction(
+        let parsed_params = crate::search::parse_conditional_criteria(search_params);
+        if parsed_params.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Typed through the shared builder, which applies registry validation,
+        // type-aware parsing, OR splitting and modifier rules (#1312, #1321,
+        // #1323, #1360, #1366), so this path accepts and rejects the same
+        // criteria as `If-None-Exist` on the resource endpoint.
+        let typed_params = self.build_search_parameters(tenant, resource_type, &parsed_params)?;
+        self.find_matching_typed_in_bundle_transaction(
             db,
             session,
             tenant,
             resource_type,
-            &parsed_params,
+            typed_params,
         )
         .await
     }
 
     /// The session-scoped matcher both criteria forms end in: `ifNoneExist`'s
-    /// string, parsed above, and a URL-borne conditional entry's typed
-    /// criteria, flattened by `bundle_criteria_pairs` (#859).
-    async fn find_matching_pairs_in_bundle_transaction(
+    /// string, typed above, and a URL-borne conditional entry's criteria,
+    /// which the REST layer already typed (#859).
+    async fn find_matching_typed_in_bundle_transaction(
         &self,
         db: &mongodb::Database,
         session: &mut ClientSession,
         tenant: &TenantContext,
         resource_type: &str,
-        parsed_params: &[(String, String)],
+        typed_params: Vec<SearchParameter>,
     ) -> StorageResult<Vec<StoredResource>> {
-        if parsed_params.is_empty() {
+        // Result-shaping names (`_format`, …) are not criteria; with nothing
+        // left, an empty filter would match the whole type.
+        if typed_params.is_empty() {
             return Ok(Vec::new());
         }
 
         if self.is_search_offloaded() {
             return self
-                .if_none_exist_offloaded_scan(db, session, tenant, resource_type, parsed_params)
+                .if_none_exist_offloaded_scan(db, session, tenant, resource_type, &typed_params)
                 .await;
         }
 
-        let typed_params = self.build_search_parameters(tenant, resource_type, parsed_params);
+        self.preflight_legacy_composites(
+            db,
+            tenant.tenant_id().as_str(),
+            resource_type,
+            &typed_params,
+            false,
+            Some(&mut *session),
+        )
+        .await?;
         let index_params: Vec<_> = typed_params
             .iter()
             .filter(|p| !matches!(p.name.as_str(), "_id" | "_lastUpdated"))
@@ -3672,32 +4510,60 @@ impl MongoBackend {
         const PROBE_LIMIT: i64 = 2;
         const BATCH_SIZE: i64 = 128;
 
+        // #1206: cache each composite's driver-arm probe (component filters +
+        // counts already resolved) so the winning index, if composite,
+        // doesn't re-probe below — mirrors `matching_resource_ids` in
+        // `search_impl.rs`.
+        let mut composite_probes: HashMap<usize, (Document, i64)> = HashMap::new();
+
         let driver_idx = {
             let mut best: Option<(usize, i64)> = None;
             for (i, param) in index_params.iter().enumerate() {
-                let filter = self.build_search_index_filter(tenant_id, resource_type, param)?;
-                let pipeline = vec![
-                    doc! { "$match": filter },
-                    doc! { "$group": { "_id": "$resource_id" } },
-                    doc! { "$limit": PROBE_LIMIT },
-                    doc! { "$count": "n" },
-                ];
-                let cursor = search_index
-                    .aggregate(pipeline)
-                    .session(&mut *session)
-                    .await
-                    .map_err(|e| {
-                        internal_error(format!("Failed probe for ifNoneExist driver: {}", e))
-                    })?;
-                let probe_docs = collect_session_documents(cursor, session).await?;
-                let count = probe_docs
-                    .first()
-                    .and_then(|d| d.get_i32("n").ok())
-                    .map(|n| n as i64)
-                    .unwrap_or(0);
-                if count == 0 {
-                    return Ok(Vec::new());
-                }
+                let count = if param.param_type == SearchParamType::Composite {
+                    match self
+                        .composite_driver_probe(
+                            &search_index,
+                            tenant_id,
+                            resource_type,
+                            param,
+                            PROBE_LIMIT as u64,
+                            Some(&mut *session),
+                        )
+                        .await?
+                    {
+                        None => return Ok(Vec::new()),
+                        Some((filter, count)) => {
+                            let count = count as i64;
+                            composite_probes.insert(i, (filter, count));
+                            count
+                        }
+                    }
+                } else {
+                    let filter = self.build_search_index_filter(tenant_id, resource_type, param)?;
+                    let pipeline = vec![
+                        doc! { "$match": filter },
+                        doc! { "$limit": PROBE_LIMIT },
+                        doc! { "$group": { "_id": "$resource_id" } },
+                        doc! { "$count": "n" },
+                    ];
+                    let cursor = search_index
+                        .aggregate(pipeline)
+                        .session(&mut *session)
+                        .await
+                        .map_err(|e| {
+                            internal_error(format!("Failed probe for ifNoneExist driver: {}", e))
+                        })?;
+                    let probe_docs = collect_session_documents(cursor, session).await?;
+                    let count = probe_docs
+                        .first()
+                        .and_then(|d| d.get_i32("n").ok())
+                        .map(|n| n as i64)
+                        .unwrap_or(0);
+                    if count == 0 {
+                        return Ok(Vec::new());
+                    }
+                    count
+                };
                 if best.is_none_or(|(_, prev)| count < prev) {
                     best = Some((i, count));
                 }
@@ -3705,8 +4571,14 @@ impl MongoBackend {
             best.map(|(i, _)| i).unwrap_or(0)
         };
 
-        let driver_filter =
-            self.build_search_index_filter(tenant_id, resource_type, index_params[driver_idx])?;
+        // Every composite index visited above has its probe result cached,
+        // so `driver_idx` pointing at a composite always finds an entry
+        // here; a plain param never has one and falls through as before.
+        let driver_filter = if let Some((filter, _)) = composite_probes.remove(&driver_idx) {
+            filter
+        } else {
+            self.build_search_index_filter(tenant_id, resource_type, index_params[driver_idx])?
+        };
 
         let mut last_index_id: Option<Bson> = None;
         let mut matches: Vec<StoredResource> = Vec::with_capacity(2);
@@ -3756,7 +4628,28 @@ impl MongoBackend {
             }
 
             for (i, param) in index_params.iter().enumerate() {
-                if i == driver_idx || candidate_ids.is_empty() {
+                if candidate_ids.is_empty() {
+                    continue;
+                }
+                // Same reasoning as `matching_resource_ids`: a composite's
+                // driver arm only proves its most selective component
+                // matched, so every composite here — including the driver —
+                // still needs the grouped pair check (#1206).
+                if param.param_type == SearchParamType::Composite {
+                    let passing = self
+                        .composite_pair_check(
+                            &search_index,
+                            tenant_id,
+                            resource_type,
+                            param,
+                            &candidate_ids,
+                            Some(&mut *session),
+                        )
+                        .await?;
+                    candidate_ids.retain(|id| passing.contains(id));
+                    continue;
+                }
+                if i == driver_idx {
                     continue;
                 }
                 let param_filter =
@@ -3820,18 +4713,37 @@ impl MongoBackend {
         Ok(matches)
     }
 
+    /// Matches `ifNoneExist` criteria against the raw `resources` documents.
+    ///
+    /// Search is offloaded, so there are no `search_index` rows to consult;
+    /// the match runs inside the transaction session (read-your-writes).
+    /// Criteria arrive typed by the shared conditional builder
+    /// ([`MongoBackend::build_search_parameters`]), which already applied
+    /// registry, empty-value, modifier and `:[type]` validation. This scan
+    /// evaluates only the shapes provable against raw documents and fails
+    /// closed on everything else — never silently ignoring a criterion
+    /// (which widens the match) nor silently failing to match (which creates
+    /// duplicates).
+    ///
+    /// Supported: `_id` / `_lastUpdated` (via [`MongoBackend::build_resource_filter`],
+    /// the same predicates direct search uses) and plain `identifier` values
+    /// in `code`, `|code`, or `system|code` form with a nonempty code (`|code`
+    /// matches any system, same as Mongo direct search). Comma-separated
+    /// values OR within one parameter; repeated parameters AND.
     async fn if_none_exist_offloaded_scan(
         &self,
         db: &mongodb::Database,
         session: &mut ClientSession,
         tenant: &TenantContext,
         resource_type: &str,
-        parsed_params: &[(String, String)],
+        params: &[SearchParameter],
     ) -> StorageResult<Vec<StoredResource>> {
         let tenant_id = tenant.tenant_id().as_str();
 
-        for (name, _) in parsed_params {
-            match name.as_str() {
+        // Anything outside the evaluatable set is rejected, not ignored:
+        // silently dropping a criterion widens the match.
+        for param in params {
+            match param.name.as_str() {
                 "_id" | "_lastUpdated" | "identifier" => {}
                 other => {
                     return Err(StorageError::Search(
@@ -3839,8 +4751,8 @@ impl MongoBackend {
                             message: format!(
                                 "ifNoneExist parameter '{other}' cannot be evaluated \
                                  against the resource collection when search is offloaded; \
-                                 use a supported parameter (_id, identifier) or disable \
-                                 search offloading"
+                                 use a supported parameter (_id, _lastUpdated, identifier) \
+                                 or disable search offloading"
                             ),
                         },
                     ));
@@ -3848,35 +4760,96 @@ impl MongoBackend {
             }
         }
 
-        let mut conditions = vec![doc! {
-            "tenant_id": tenant_id,
-            "resource_type": resource_type,
-            "is_deleted": false,
-        }];
+        let mut conditions: Vec<Document> = Vec::new();
 
-        for (name, value) in parsed_params {
-            match name.as_str() {
-                "_id" => {
-                    conditions.push(doc! { "id": value.as_str() });
+        // `_id` / `_lastUpdated` reuse the resource-level predicates direct
+        // search builds (prefix-aware, dates validated); they carry the
+        // tenant / type / live-only base with them.
+        let resource_params: Vec<SearchParameter> = params
+            .iter()
+            .filter(|p| matches!(p.name.as_str(), "_id" | "_lastUpdated"))
+            .cloned()
+            .collect();
+        if resource_params.is_empty() {
+            conditions.push(doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "is_deleted": false,
+            });
+        } else {
+            let query = SearchQuery {
+                resource_type: resource_type.to_string(),
+                parameters: resource_params,
+                count: Some(2),
+                ..Default::default()
+            };
+            conditions.push(self.build_resource_filter(
+                tenant_id,
+                resource_type,
+                &query,
+                None,
+                None,
+            )?);
+        }
+
+        // Plain `identifier` values against the raw `data.identifier` array.
+        // One parameter's comma-separated values OR; repeated parameters AND
+        // through the top-level `$and`.
+        for param in params.iter().filter(|p| p.name.as_str() == "identifier") {
+            Self::validate_offloaded_identifier_param(param)?;
+            let mut branches: Vec<Bson> = Vec::with_capacity(param.values.len());
+            for value in &param.values {
+                if value.value.chars().filter(|c| *c == '|').count() > 1 {
+                    return Err(StorageError::Search(
+                        crate::error::SearchError::QueryParseError {
+                            message: format!(
+                                "Unsupported value '{}' for ifNoneExist parameter \
+                                 'identifier' when search is offloaded: supported forms \
+                                 are 'code', '|code' and 'system|code' with a single '|'",
+                                value.value
+                            ),
+                        },
+                    ));
                 }
-                "_lastUpdated" => {}
-                "identifier" => {
-                    let mut elem_match = Document::new();
-                    if let Some((system, val)) = value.split_once('|') {
-                        if !system.is_empty() {
-                            elem_match.insert("system", system);
-                        }
-                        if !val.is_empty() {
-                            elem_match.insert("value", val);
-                        }
-                    } else if !value.is_empty() {
-                        elem_match.insert("value", value.as_str());
-                    }
-                    if !elem_match.is_empty() {
-                        conditions.push(doc! { "data.identifier": { "$elemMatch": elem_match } });
-                    }
+                let (system, code) = match value.value.split_once('|') {
+                    Some((system, code)) => (system, code),
+                    None => ("", value.value.as_str()),
+                };
+                if code.is_empty() {
+                    return Err(StorageError::Search(
+                        crate::error::SearchError::QueryParseError {
+                            message: "Unsupported empty code for ifNoneExist parameter \
+                                      'identifier' when search is offloaded: supported \
+                                      forms are 'code', '|code' and 'system|code' with a \
+                                      nonempty code"
+                                .to_string(),
+                        },
+                    ));
                 }
-                _ => unreachable!("unsupported params are rejected above"),
+                let mut elem_match = Document::new();
+                if !system.is_empty() {
+                    elem_match.insert("system", system);
+                }
+                elem_match.insert("value", code);
+                branches.push(Bson::Document(
+                    doc! { "data.identifier": { "$elemMatch": elem_match } },
+                ));
+            }
+            if branches.is_empty() {
+                return Err(StorageError::Search(
+                    crate::error::SearchError::QueryParseError {
+                        message: "ifNoneExist parameter 'identifier' carries no value; \
+                                  nothing was written"
+                            .to_string(),
+                    },
+                ));
+            } else if branches.len() == 1 {
+                match branches.remove(0) {
+                    Bson::Document(condition) => conditions.push(condition),
+                    _ => unreachable!("identifier branches are documents"),
+                }
+            } else {
+                conditions.push(doc! { "$or": Bson::Array(branches) });
             }
         }
 
@@ -3918,6 +4891,45 @@ impl MongoBackend {
         Ok(matches)
     }
 
+    /// Keep the raw-document scan fail-closed if the conditional builder's
+    /// typed-parameter contract changes. This check needs no database session.
+    fn validate_offloaded_identifier_param(param: &SearchParameter) -> StorageResult<()> {
+        if param.param_type != SearchParamType::Token {
+            return Err(StorageError::Search(
+                crate::error::SearchError::QueryParseError {
+                    message: format!(
+                        "ifNoneExist parameter 'identifier' cannot be evaluated \
+                         against the resource collection when search is offloaded: \
+                         unsupported parameter type '{}'",
+                        param.param_type
+                    ),
+                },
+            ));
+        }
+        if let Some(modifier) = param.modifier.as_ref() {
+            return Err(StorageError::Search(
+                crate::error::SearchError::UnsupportedModifier {
+                    modifier: modifier.to_string(),
+                    param_type: param.param_type.to_string(),
+                },
+            ));
+        }
+        for value in &param.values {
+            if value.prefix != SearchPrefix::Eq {
+                return Err(StorageError::Search(
+                    crate::error::SearchError::QueryParseError {
+                        message: format!(
+                            "Unsupported prefix '{}' for ifNoneExist parameter \
+                             'identifier' when search is offloaded",
+                            value.prefix
+                        ),
+                    },
+                ));
+            }
+        }
+        Ok(())
+    }
+
     async fn index_resource_in_bundle_transaction(
         &self,
         db: &mongodb::Database,
@@ -3940,48 +4952,11 @@ impl MongoBackend {
         )
         .await?;
 
-        let index_docs = match self
-            .tenant_extractor(tenant_id)
-            .extract(resource, resource_type)
-        {
-            Ok(values) => values
-                .iter()
-                .filter_map(|value| {
-                    self.build_search_index_document(tenant_id, resource_type, resource_id, value)
-                })
-                .collect::<Vec<_>>(),
-            Err(e) => {
-                tracing::warn!(
-                    "Search extraction failed for {}/{} in transaction: {}. Using minimal fallback index values.",
-                    resource_type,
-                    resource_id,
-                    e
-                );
-                self.index_minimal_fallback_documents(
-                    tenant_id,
-                    resource_type,
-                    resource_id,
-                    resource,
-                )
-            }
-        };
+        let (docs, _failure) =
+            self.search_index_documents_checked(tenant_id, resource_type, resource_id, resource);
 
-        if index_docs.is_empty() {
-            return Ok(());
-        }
-
-        db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION)
-            .insert_many(index_docs)
-            .session(&mut *session)
+        self.insert_search_index_documents(db, docs, Some(session))
             .await
-            .map_err(|e| {
-                internal_error(format!(
-                    "Failed to insert search_index entries in transaction: {}",
-                    e
-                ))
-            })?;
-
-        Ok(())
     }
 
     async fn delete_search_index_in_bundle_transaction(
@@ -3996,22 +4971,14 @@ impl MongoBackend {
             return Ok(());
         }
 
-        db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION)
-            .delete_many(doc! {
-                "tenant_id": tenant_id,
-                "resource_type": resource_type,
-                "resource_id": resource_id,
-            })
-            .session(&mut *session)
-            .await
-            .map_err(|e| {
-                internal_error(format!(
-                    "Failed to delete search_index entries in transaction: {}",
-                    e
-                ))
-            })?;
-
-        Ok(())
+        self.delete_search_index_rows_for(
+            db,
+            tenant_id,
+            resource_type,
+            Bson::String(resource_id.to_string()),
+            Some(session),
+        )
+        .await
     }
 
     fn parse_url(&self, url: &str) -> StorageResult<(String, String)> {
@@ -4044,10 +5011,11 @@ impl MongoBackend {
 // ============================================================================
 // PurgableStorage
 //
-// MongoDB stores resources across three collections — `resources`,
-// `resource_history`, and `search_index` — the same shape SQLite uses, so purge
-// is the same three deletes keyed by (tenant_id, resource_type, id). Note that
-// the ordinary `delete` is a *soft* delete: it flips `is_deleted` and writes a
+// MongoDB stores resources across four collections — `resources`,
+// `resource_history`, `search_index`, and `search_index_contained` — the same
+// shape SQLite uses (plus the #1160 contained-rows split), so purge is the
+// same four deletes keyed by (tenant_id, resource_type, id). Note that the
+// ordinary `delete` is a *soft* delete: it flips `is_deleted` and writes a
 // tombstone. Purge is the only path that removes the bytes.
 // ============================================================================
 
@@ -4105,6 +5073,19 @@ impl PurgableStorage for MongoBackend {
             .await
             .or_query_error("Failed to purge search index")?;
 
+        // Contained rows share the container's (tenant_id, resource_type,
+        // resource_id), so they key the same way.
+        let search_index_contained =
+            db.collection::<Document>(MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION);
+        search_index_contained
+            .delete_many(doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "resource_id": id,
+            })
+            .await
+            .or_query_error("Failed to purge contained search index")?;
+
         Ok(())
     }
 
@@ -4115,6 +5096,8 @@ impl PurgableStorage for MongoBackend {
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
         let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+        let search_index_contained =
+            db.collection::<Document>(MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION);
 
         let key = doc! { "tenant_id": tenant_id, "resource_type": resource_type };
 
@@ -4138,6 +5121,12 @@ impl PurgableStorage for MongoBackend {
             .delete_many(doc! { "tenant_id": tenant_id, "resource_type": resource_type })
             .await
             .or_query_error("Failed to purge search index")?;
+        // Contained rows share the container's (tenant_id, resource_type),
+        // so a type-level purge keys the same way (#1160 Task 4).
+        search_index_contained
+            .delete_many(doc! { "tenant_id": tenant_id, "resource_type": resource_type })
+            .await
+            .or_query_error("Failed to purge contained search index")?;
 
         Ok(count)
     }
@@ -4149,6 +5138,420 @@ impl PurgableStorage for MongoBackend {
 // MongoDB is a full primary with its own `search_index` collection, so it is
 // both — it can reindex itself standalone.
 // ============================================================================
+
+/// Whether a reindex page that already holds `taken` rows totalling `bytes_taken`
+/// admits a next row of `row_bytes` under `max_bytes` (`0` = no cap, #1499). The
+/// first row is always admitted, so a page always advances; after it the page
+/// never grows past the cap (PostgreSQL's rule, `PostgresBackend::fetch_resources_page_capped`).
+fn reindex_page_admits(taken: usize, bytes_taken: u64, row_bytes: u64, max_bytes: u64) -> bool {
+    max_bytes == 0 || taken == 0 || bytes_taken.saturating_add(row_bytes) <= max_bytes
+}
+
+/// What [`MongoBackend::reindex_find_page`] read (#1499): the rows it took, in scan
+/// order, their raw BSON bytes, and whether the byte cap stopped it before `limit`.
+struct ReindexFoundPage {
+    docs: Vec<Document>,
+    bytes: u64,
+    capped: bool,
+}
+
+/// Logs a byte-capped reindex page read (#1499), in [`MongoBackend::fetch_reindex_page`]'s
+/// id-phase and catch-up-round arms alike, so the two call sites share one log
+/// line, one target and one field order instead of pasting the block twice.
+fn log_capped_page_read(tenant_id: &str, resource_type: &str, found: &ReindexFoundPage) {
+    tracing::debug!(
+        tenant = %tenant_id,
+        resource_type = %resource_type,
+        rows = found.docs.len(),
+        bytes = found.bytes,
+        capped = found.capped,
+        "mongodb reindex capped page read"
+    );
+}
+
+impl MongoBackend {
+    /// The newest-live probe (#1403): a covered reverse scan of
+    /// `idx_resources_type_scan` for the `last_updated` of the newest live
+    /// resource of `resource_type`, or `None` if it has no live resource.
+    async fn reindex_newest_live_last_updated(
+        &self,
+        resources: &Collection<Document>,
+        tenant_id: &str,
+        resource_type: &str,
+    ) -> StorageResult<Option<DateTime<Utc>>> {
+        let found = resources
+            .find_one(doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "is_deleted": false,
+            })
+            .sort(doc! { "last_updated": -1, "id": -1 })
+            .projection(doc! { "_id": 0, "last_updated": 1 })
+            .hint(Hint::Name(RESOURCES_TYPE_SCAN_INDEX.to_string()))
+            .await
+            .map_err(|e| internal_error(format!("Failed to probe newest resource: {e}")))?;
+        match found {
+            Some(doc) => {
+                let ts = doc
+                    .get_datetime("last_updated")
+                    .map_err(|e| internal_error(format!("Missing last_updated: {e}")))?;
+                Ok(Some(bson_to_chrono(ts)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// One hinted, sorted, limited find (#1403). The page is drained up to
+    /// `limit` rows, or until `max_bytes` (`0` = no cap, #1499) rejects the
+    /// next row — the first row is always admitted.
+    async fn reindex_find_page(
+        &self,
+        resources: &Collection<Document>,
+        filter: Document,
+        sort: Document,
+        hint: &str,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<ReindexFoundPage> {
+        let mut stream = resources
+            .find(filter)
+            .sort(sort)
+            .limit(limit as i64)
+            .hint(Hint::Name(hint.to_string()))
+            .await
+            .map_err(|e| internal_error(format!("Failed to fetch resources: {e}")))?;
+        let mut docs: Vec<Document> = Vec::new();
+        let mut bytes: u64 = 0;
+        let mut capped = false;
+        while stream
+            .advance()
+            .await
+            .map_err(|e| internal_error(format!("Failed to advance cursor: {e}")))?
+        {
+            let row_bytes = stream.current().as_bytes().len() as u64;
+            if !reindex_page_admits(docs.len(), bytes, row_bytes, max_bytes) {
+                capped = true;
+                break;
+            }
+            bytes = bytes.saturating_add(row_bytes);
+            docs.push(
+                stream
+                    .deserialize_current()
+                    .map_err(|e| internal_error(format!("Failed to read resource: {e}")))?,
+            );
+        }
+        drop(stream); // a capped read leaves server-side results; dropping kills the cursor
+        Ok(ReindexFoundPage {
+            docs,
+            bytes,
+            capped,
+        })
+    }
+
+    /// Pages `resource_type` in id order with catch-up rounds (#1403), bounded
+    /// by `max_bytes` as well as by `limit` (`max_bytes == 0` is the id-order
+    /// walk's uncapped page, #1499). A page the byte cap stops before `limit` is still non-empty
+    /// (the first row is always admitted), so it continues its current walk phase
+    /// exactly as a full page would — it never ends a phase and never returns
+    /// `None` on its own account. `fetch_resources_page` and
+    /// `fetch_resources_page_capped` are both thin calls to this method.
+    async fn fetch_reindex_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<ResourcePage> {
+        let db = self.get_database().await?;
+        let resources: Collection<Document> = db.collection(MongoBackend::RESOURCES_COLLECTION);
+        let tenant_id = tenant.tenant_id().as_str();
+        let limit = limit.max(1); // MongoDB treats limit(0) as "no limit"
+        let margin = reindex_catch_up_margin(self.config().reindex_catch_up_margin_ms);
+
+        let mut step = match cursor {
+            None => WalkStep::Start,
+            Some(c) => WalkStep::from(ReindexWalkCursor::parse(c)?),
+        };
+
+        loop {
+            step = match step {
+                WalkStep::Start => {
+                    let t0 = Utc::now();
+                    let newest_live = self
+                        .reindex_newest_live_last_updated(&resources, tenant_id, resource_type)
+                        .await?;
+                    let floor = reindex_catch_up_floor(t0, newest_live, margin);
+                    tracing::info!(
+                        tenant = %tenant_id,
+                        resource_type = %resource_type,
+                        t0 = %format_walk_instant(t0),
+                        newest_live = %newest_live.map(format_walk_instant).unwrap_or_else(|| "none".to_string()),
+                        floor = %format_walk_instant(floor),
+                        "mongodb reindex walk started"
+                    );
+                    WalkStep::IdPhase {
+                        floor,
+                        after_id: None,
+                    }
+                }
+                WalkStep::IdPhase { floor, after_id } => {
+                    let filter = reindex_id_page_filter(
+                        tenant_id,
+                        resource_type,
+                        floor,
+                        after_id.as_deref(),
+                    );
+                    let found = self
+                        .reindex_find_page(
+                            &resources,
+                            filter,
+                            doc! { "id": 1 },
+                            RESOURCES_IDENTITY_INDEX,
+                            limit,
+                            max_bytes,
+                        )
+                        .await?;
+                    if max_bytes > 0 {
+                        log_capped_page_read(tenant_id, resource_type, &found);
+                    }
+                    let docs = found.docs;
+                    if !docs.is_empty() {
+                        let last_id = docs
+                            .last()
+                            .expect("non-empty")
+                            .get_str("id")
+                            .map_err(|e| internal_error(format!("Missing id: {e}")))?
+                            .to_string();
+                        return reindex_page_from_docs(
+                            &docs,
+                            resource_type,
+                            tenant,
+                            ReindexWalkCursor::Id {
+                                floor,
+                                after_id: last_id,
+                            },
+                        );
+                    }
+                    tracing::info!(
+                        tenant = %tenant_id,
+                        resource_type = %resource_type,
+                        floor = %format_walk_instant(floor),
+                        "mongodb reindex id phase finished"
+                    );
+                    WalkStep::RoundStart { round: 1, floor }
+                }
+                WalkStep::RoundStart { round, floor } => {
+                    let now = Utc::now();
+                    match reindex_round_start_decision(round, floor, now, margin) {
+                        RoundStartDecision::Complete => {
+                            tracing::debug!(
+                                tenant = %tenant_id,
+                                resource_type = %resource_type,
+                                rounds = round - 1,
+                                "mongodb reindex catch-up complete"
+                            );
+                            return Ok(ResourcePage {
+                                resources: Vec::new(),
+                                next_cursor: None,
+                                skipped: Vec::new(),
+                            });
+                        }
+                        RoundStartDecision::CapReached => {
+                            tracing::warn!(
+                                tenant = %tenant_id,
+                                resource_type = %resource_type,
+                                rounds = round - 1,
+                                last_ceiling = %format_walk_instant(floor),
+                                "mongodb reindex catch-up stopped at its round limit"
+                            );
+                            return Ok(ResourcePage {
+                                resources: Vec::new(),
+                                next_cursor: None,
+                                skipped: Vec::new(),
+                            });
+                        }
+                        RoundStartDecision::Run => {
+                            let newest_live = self
+                                .reindex_newest_live_last_updated(
+                                    &resources,
+                                    tenant_id,
+                                    resource_type,
+                                )
+                                .await?;
+                            let ceiling = reindex_catch_up_ceiling(now, newest_live, margin);
+                            if let Some(newest_live) = newest_live {
+                                let by_margin_only = truncate_to_millis(now + margin);
+                                if ceiling > by_margin_only {
+                                    tracing::warn!(
+                                        tenant = %tenant_id,
+                                        resource_type = %resource_type,
+                                        round,
+                                        newest_live = %format_walk_instant(newest_live),
+                                        ceiling = %format_walk_instant(ceiling),
+                                        "mongodb reindex found live resources stamped in the future"
+                                    );
+                                }
+                            }
+                            tracing::info!(
+                                tenant = %tenant_id,
+                                resource_type = %resource_type,
+                                round,
+                                floor = %format_walk_instant(floor),
+                                ceiling = %format_walk_instant(ceiling),
+                                "mongodb reindex catch-up round started"
+                            );
+                            WalkStep::Round {
+                                round,
+                                floor,
+                                ceiling,
+                                walked: 0,
+                                after: None,
+                            }
+                        }
+                    }
+                }
+                WalkStep::Round {
+                    round,
+                    floor,
+                    ceiling,
+                    walked,
+                    after,
+                } => {
+                    let filter = reindex_catch_up_page_filter(
+                        tenant_id,
+                        resource_type,
+                        floor,
+                        ceiling,
+                        after.as_ref().map(|(lu, id)| (*lu, id.as_str())),
+                    );
+                    let found = self
+                        .reindex_find_page(
+                            &resources,
+                            filter,
+                            doc! { "last_updated": 1, "id": 1 },
+                            RESOURCES_TYPE_SCAN_INDEX,
+                            limit,
+                            max_bytes,
+                        )
+                        .await?;
+                    if max_bytes > 0 {
+                        log_capped_page_read(tenant_id, resource_type, &found);
+                    }
+                    let scanned = found.docs;
+                    if scanned.is_empty() {
+                        tracing::info!(
+                            tenant = %tenant_id,
+                            resource_type = %resource_type,
+                            round,
+                            floor = %format_walk_instant(floor),
+                            ceiling = %format_walk_instant(ceiling),
+                            walked,
+                            "mongodb reindex catch-up round finished"
+                        );
+                        WalkStep::RoundStart {
+                            round: round + 1,
+                            floor: ceiling,
+                        }
+                    } else {
+                        let last = scanned.last().expect("non-empty");
+                        let scanned_lu = last
+                            .get_datetime("last_updated")
+                            .map_err(|e| internal_error(format!("Missing last_updated: {e}")))?;
+                        let scanned_id = last
+                            .get_str("id")
+                            .map_err(|e| internal_error(format!("Missing id: {e}")))?
+                            .to_string();
+                        let scanned_last_updated = bson_to_chrono(scanned_lu);
+                        let docs = dedupe_reindex_page_keep_last(scanned);
+                        let walked = walked + docs.len() as u64;
+                        return reindex_page_from_docs(
+                            &docs,
+                            resource_type,
+                            tenant,
+                            ReindexWalkCursor::Round {
+                                round,
+                                floor,
+                                ceiling,
+                                walked,
+                                after_last_updated: scanned_last_updated,
+                                after_id: scanned_id,
+                            },
+                        );
+                    }
+                }
+            };
+        }
+    }
+}
+
+/// One step of the walk inside a single call (#1403); never leaves the
+/// call — only `ReindexWalkCursor::Id`/`Round` do, as an encoded cursor.
+enum WalkStep {
+    Start,
+    IdPhase {
+        floor: DateTime<Utc>,
+        after_id: Option<String>,
+    },
+    RoundStart {
+        round: u8,
+        floor: DateTime<Utc>,
+    },
+    Round {
+        round: u8,
+        floor: DateTime<Utc>,
+        ceiling: DateTime<Utc>,
+        walked: u64,
+        after: Option<(DateTime<Utc>, String)>,
+    },
+}
+
+impl From<ReindexWalkCursor> for WalkStep {
+    fn from(cursor: ReindexWalkCursor) -> Self {
+        match cursor {
+            ReindexWalkCursor::Id { floor, after_id } => WalkStep::IdPhase {
+                floor,
+                after_id: Some(after_id),
+            },
+            ReindexWalkCursor::Round {
+                round,
+                floor,
+                ceiling,
+                walked,
+                after_last_updated,
+                after_id,
+            } => WalkStep::Round {
+                round,
+                floor,
+                ceiling,
+                walked,
+                after: Some((after_last_updated, after_id)),
+            },
+        }
+    }
+}
+
+/// Converts a returned page plus its next cursor into a [`ResourcePage`],
+/// exactly as HEAD's `fetch_resources_page` did (`:4851-4863` at c86d0f08b).
+fn reindex_page_from_docs(
+    docs: &[Document],
+    resource_type: &str,
+    tenant: &TenantContext,
+    next_cursor: ReindexWalkCursor,
+) -> StorageResult<ResourcePage> {
+    let resources = docs
+        .iter()
+        .map(|doc| {
+            parse_history_row(doc, Some(resource_type), None)
+                .map(|row| row.into_stored_resource(tenant))
+        })
+        .collect::<StorageResult<Vec<_>>>()?;
+    Ok(ResourcePage {
+        resources,
+        next_cursor: Some(next_cursor.encode()),
+        skipped: Vec::new(),
+    })
+}
 
 #[async_trait]
 impl ReindexSource for MongoBackend {
@@ -4178,6 +5581,14 @@ impl ReindexSource for MongoBackend {
         self.count(tenant, Some(resource_type)).await
     }
 
+    /// Two phases per type (#1403): an id phase over live resources stamped
+    /// before the floor, keyset on id and hinted to idx_resources_identity,
+    /// then up to REINDEX_CATCH_UP_MAX_ROUNDS catch-up rounds over
+    /// [floor, ceiling) in (last_updated, id) order on idx_resources_type_scan.
+    /// A phase ends only on an empty query and the next phase starts in the
+    /// same call, so the driver sees non-empty pages with Some(cursor) and one
+    /// trailing empty page with None. The cursor is the versioned v2 grammar
+    /// of ReindexWalkCursor.
     async fn fetch_resources_page(
         &self,
         tenant: &TenantContext,
@@ -4185,81 +5596,26 @@ impl ReindexSource for MongoBackend {
         cursor: Option<&str>,
         limit: u32,
     ) -> StorageResult<ResourcePage> {
-        let db = self.get_database().await?;
-        let resources: Collection<Document> = db.collection(MongoBackend::RESOURCES_COLLECTION);
-
-        let mut filter = doc! {
-            "tenant_id": tenant.tenant_id().as_str(),
-            "resource_type": resource_type,
-            "is_deleted": false,
-        };
-
-        // Keyset pagination on (last_updated, id) — the same cursor shape the
-        // bulk-export batcher and the SQLite reindex source use, so a cursor is
-        // stable across pages even as resources are written.
-        if let Some((cur_dt, cur_id)) = cursor.and_then(parse_reindex_cursor) {
-            filter.insert(
-                "$or",
-                vec![
-                    doc! { "last_updated": { "$gt": chrono_to_bson(cur_dt) } },
-                    doc! {
-                        "last_updated": chrono_to_bson(cur_dt),
-                        "id": { "$gt": cur_id },
-                    },
-                ],
-            );
-        }
-
-        let opts = FindOptions::builder()
-            .sort(doc! { "last_updated": 1, "id": 1 })
-            .limit(limit as i64)
-            .build();
-
-        let mut stream = resources
-            .find(filter)
-            .with_options(opts)
+        self.fetch_reindex_page(tenant, resource_type, cursor, limit, 0)
             .await
-            .map_err(|e| internal_error(format!("Failed to fetch resources: {e}")))?;
+    }
 
-        let mut docs = Vec::new();
-        while stream
-            .advance()
+    /// Pages by resource count and, when `max_bytes` is set, by the raw BSON
+    /// bytes of the `resources` rows the page reads: a page never exceeds
+    /// `max_bytes` unless it holds exactly one resource (PostgreSQL's strict
+    /// rule, not SQLite's overshoot-by-one, #1499). A byte-capped page continues
+    /// the walk's current phase — it is never empty, so it never ends a phase —
+    /// and its cursor names the last row it *took*, never a row the cap rejected.
+    async fn fetch_resources_page_capped(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<ResourcePage> {
+        self.fetch_reindex_page(tenant, resource_type, cursor, limit, max_bytes)
             .await
-            .map_err(|e| internal_error(format!("Failed to advance cursor: {e}")))?
-        {
-            docs.push(
-                stream
-                    .deserialize_current()
-                    .map_err(|e| internal_error(format!("Failed to read resource: {e}")))?,
-            );
-        }
-
-        let full_page = docs.len() as u32 == limit;
-        let next_cursor = match (full_page, docs.last()) {
-            (true, Some(last)) => {
-                let ts = last
-                    .get_datetime("last_updated")
-                    .map_err(|e| internal_error(format!("Missing last_updated: {e}")))?;
-                let id = last
-                    .get_str("id")
-                    .map_err(|e| internal_error(format!("Missing id: {e}")))?;
-                Some(format!("{}|{}", bson_to_chrono(ts).to_rfc3339(), id))
-            }
-            _ => None,
-        };
-
-        let resources = docs
-            .iter()
-            .map(|doc| {
-                parse_history_row(doc, Some(resource_type), None)
-                    .map(|row| row.into_stored_resource(tenant))
-            })
-            .collect::<StorageResult<Vec<_>>>()?;
-
-        Ok(ResourcePage {
-            resources,
-            next_cursor,
-        })
     }
 }
 
@@ -4278,17 +5634,34 @@ impl ReindexTarget for MongoBackend {
         }
 
         let db = self.get_database().await?;
+        let filter = doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": resource_type,
+            "resource_id": resource_id,
+        };
+
         let result = db
             .collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION)
-            .delete_many(doc! {
-                "tenant_id": tenant.tenant_id().as_str(),
-                "resource_type": resource_type,
-                "resource_id": resource_id,
-            })
+            .delete_many(filter.clone())
             .await
             .map_err(|e| internal_error(format!("Failed to delete search entries: {e}")))?;
 
-        Ok(result.deleted_count)
+        // Contained rows key the same way (#1160 Task 4), so this default
+        // `ReindexTarget` per-resource delete clears both collections too —
+        // keeping the invariant intact even though `write_search_entries_page`
+        // below overrides the page-level caller, making this single-resource
+        // path unreachable on MongoDB today.
+        let contained_result = db
+            .collection::<Document>(MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION)
+            .delete_many(filter)
+            .await
+            .map_err(|e| {
+                internal_error(format!(
+                    "Failed to delete search_index_contained entries: {e}"
+                ))
+            })?;
+
+        Ok(result.deleted_count + contained_result.deleted_count)
     }
 
     async fn write_search_entries(
@@ -4296,31 +5669,15 @@ impl ReindexTarget for MongoBackend {
         tenant: &TenantContext,
         resource: &StoredResource,
     ) -> StorageResult<usize> {
-        if self.is_search_offloaded() {
-            return Ok(0);
-        }
-
-        let db = self.get_database().await?;
-        let mut no_session: Option<ClientSession> = None;
-
-        // Reuses the CRUD indexing path, so contained resources are indexed the
-        // same way here as they are on create/update.
-        self.index_resource(
-            &db,
-            tenant.tenant_id().as_str(),
-            resource.resource_type(),
-            resource.id(),
-            resource.content(),
-            &mut no_session,
-        )
-        .await?;
-
-        let values = self
-            .tenant_extractor(tenant.tenant_id().as_str())
-            .extract(resource.content(), resource.resource_type())
-            .map_err(|e| internal_error(format!("Search parameter extraction failed: {e}")))?;
-
-        Ok(values.len())
+        // Delegates to the page method (a slice of one) so the single-resource
+        // and batched-reindex paths write and count identically by
+        // construction, and so this no longer pays a redundant second
+        // `extract()` purely to compute a count (#1064) — a count that also
+        // omitted any `_contained` rows the write itself inserted.
+        self.write_search_entries_page(tenant, std::slice::from_ref(resource))
+            .await
+            .pop()
+            .unwrap_or(Ok(0))
     }
 
     async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64> {
@@ -4329,21 +5686,605 @@ impl ReindexTarget for MongoBackend {
         }
 
         let db = self.get_database().await?;
+        let tenant_id = tenant.tenant_id().as_str();
         let result = db
             .collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION)
-            .delete_many(doc! { "tenant_id": tenant.tenant_id().as_str() })
+            .delete_many(doc! { "tenant_id": tenant_id })
             .await
             .or_query_error("Failed to clear search index")?;
 
-        Ok(result.deleted_count)
+        // A reindex scoped by `resource_types`/`resource_ids` never rewrites
+        // out-of-scope containers, so a `clear_existing` run that skipped
+        // this would leave their contained rows behind as orphans (#1160
+        // Task 4) — same tenant-wide scope as the `search_index` clear above.
+        let contained_result = db
+            .collection::<Document>(MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION)
+            .delete_many(doc! { "tenant_id": tenant_id })
+            .await
+            .or_query_error("Failed to clear contained search index")?;
+
+        Ok(result.deleted_count + contained_result.deleted_count)
+    }
+
+    /// Rebuilds a whole page in one `delete_many` plus one (possibly chunked)
+    /// `insert_many`, instead of the default's two `delete_many` plus one
+    /// `insert_many` PER RESOURCE — `delete_search_entries` above, then
+    /// `write_search_entries` -> `index_resource`'s own delete-then-insert
+    /// (#1064). For a 100-resource page that was 300 sequential round trips;
+    /// this is two (three only if a page mixes resource types, which no
+    /// production caller does — see the precondition below).
+    ///
+    /// Building every resource's documents through
+    /// [`Self::search_index_documents_checked`] keeps a rebuild and the CRUD
+    /// path (`index_resource`) indexing identically by construction, and
+    /// lets one resource's bad content fall back to minimal rows (as
+    /// `index_resource` already does) while still reporting that resource as
+    /// failed — mirroring what the old, per-resource `write_search_entries`
+    /// did, and what SQLite's `write_search_entries_on` and Elasticsearch's
+    /// override still do for the same case.
+    ///
+    /// The count each `Ok` reports is the number of documents actually
+    /// written for that resource, which — unlike the old
+    /// `write_search_entries`'s `extract(..).len()` — includes any
+    /// `_contained` rows. `$reindex-status.entries_created` will read higher
+    /// for corpora with `contained` resources as a result; this is a more
+    /// truthful count of what was written, and matches SQLite's
+    /// `write_search_entries_on` (which also adds `index_contained_resources`'
+    /// count).
+    ///
+    /// Precondition: `resources` must hold each `(resource_type, id)` at most
+    /// once; unlike Elasticsearch's `_id`-keyed upsert, a repeated id here
+    /// would double-insert, because the delete for the whole page runs once,
+    /// up front. The production caller, `fetch_resources_page`, guarantees
+    /// it: an id-phase page walks the unique `idx_resources_identity` in key
+    /// order, and a catch-up page is de-duplicated by id (keeping the newest
+    /// version) before it is returned (#1403). The same resource in two
+    /// different calls is expected — a catch-up round rewrites what the id
+    /// phase wrote.
+    ///
+    /// A page-level failure — getting the database handle, the grouped
+    /// delete, or an insert error the driver does not attribute to a specific
+    /// document — fans out to every resource as the same `Err`, because in
+    /// that case nothing was written for anybody (mirroring SQLite's
+    /// BEGIN/COMMIT fan-out and Elasticsearch's `ensure_index` fan-out for the
+    /// same reason). An unordered `insert_many` write error IS attributed to
+    /// just the document(s) it names, via the same per-op index mapping the
+    /// batched bulk-submit ingest uses (`bulk_ingest.rs`'s create-batch path)
+    /// and that Elasticsearch's `send_bulk_index` uses for the same purpose.
+    async fn write_search_entries_page_timed(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+        stats: &mut ReindexPageStats,
+    ) -> Vec<StorageResult<usize>> {
+        if resources.is_empty() {
+            return Vec::new();
+        }
+
+        let _page_span = crate::perf::span(crate::perf::Phase::ReindexPage);
+
+        // Honors `is_search_offloaded()`, matching the guards in
+        // `delete_search_entries` and `write_search_entries`/`clear_search_index`
+        // above: a search-offloaded backend keeps no index of its own and must
+        // issue no commands here.
+        if self.is_search_offloaded() {
+            return resources.iter().map(|_| Ok(0)).collect();
+        }
+
+        let db = match self.get_database().await {
+            Ok(db) => db,
+            Err(e) => {
+                let msg = e.to_string();
+                return resources
+                    .iter()
+                    .map(|_| Err(internal_error(msg.clone())))
+                    .collect();
+            }
+        };
+
+        let tenant_id = tenant.tenant_id().as_str();
+
+        struct Prepared {
+            docs: SearchIndexDocuments,
+            failure: Option<String>,
+        }
+        let extract_started = Instant::now();
+        let prepared: Vec<Prepared> = resources
+            .iter()
+            .map(|resource| {
+                let (docs, failure) = self.search_index_documents_checked(
+                    tenant_id,
+                    resource.resource_type(),
+                    resource.id(),
+                    resource.content(),
+                );
+                Prepared { docs, failure }
+            })
+            .collect();
+        let extract_time = extract_started.elapsed();
+        stats.extract += extract_time;
+        crate::perf::record_duration(crate::perf::Phase::ReindexExtract, extract_time);
+
+        let collection = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+        let contained_collection =
+            db.collection::<Document>(MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION);
+
+        // ONE delete per distinct resource_type in the page (a production
+        // page is single-type — `fetch_resources_page` filters on one type —
+        // so this is one command; grouping keeps a hypothetical
+        // heterogeneous slice correct too), run against both collections so
+        // stale contained rows don't outlive the page they belonged to
+        // (#1160 Task 4). A failure on either delete means stale rows may
+        // remain for the whole page, so it fans out to every resource.
+        let mut ids_by_type: HashMap<&str, Vec<Bson>> = HashMap::new();
+        for resource in resources {
+            ids_by_type
+                .entry(resource.resource_type())
+                .or_default()
+                .push(Bson::from(resource.id()));
+        }
+        let delete_started = Instant::now();
+        for (resource_type, ids) in ids_by_type {
+            let filter = doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "resource_id": { "$in": ids },
+            };
+            match collection.delete_many(filter.clone()).await {
+                Ok(result) => stats.deleted_entries += result.deleted_count,
+                Err(e) => {
+                    stats.delete += delete_started.elapsed();
+                    let msg = format!("Failed to delete search entries: {e}");
+                    return resources
+                        .iter()
+                        .map(|_| Err(internal_error(msg.clone())))
+                        .collect();
+                }
+            }
+            match contained_collection.delete_many(filter).await {
+                Ok(result) => stats.deleted_entries += result.deleted_count,
+                Err(e) => {
+                    stats.delete += delete_started.elapsed();
+                    let msg = format!("Failed to delete search_index_contained entries: {e}");
+                    return resources
+                        .iter()
+                        .map(|_| Err(internal_error(msg.clone())))
+                        .collect();
+                }
+            }
+        }
+        let delete_time = delete_started.elapsed();
+        stats.delete += delete_time;
+        crate::perf::record_duration(crate::perf::Phase::ReindexSearchDelete, delete_time);
+
+        // Flatten every resource's own documents into one insert, chunked at
+        // SEARCH_INDEX_INSERT_CHUNK, tracking which resource each document
+        // belongs to so an unordered write error attributes back to just
+        // that resource instead of failing the whole page.
+        let mut own_owners: Vec<usize> =
+            Vec::with_capacity(prepared.iter().map(|p| p.docs.own.len()).sum());
+        let mut own_docs: Vec<Document> = Vec::with_capacity(own_owners.capacity());
+        for (i, p) in prepared.iter().enumerate() {
+            for d in &p.docs.own {
+                own_owners.push(i);
+                own_docs.push(d.clone());
+            }
+        }
+
+        let insert_started = Instant::now();
+        let own_result = insert_search_entries_chunk(
+            &collection,
+            &own_owners,
+            &own_docs,
+            "Failed to insert search index entries",
+            stats,
+        )
+        .await;
+        let mut insert_time = insert_started.elapsed();
+        stats.insert += insert_time;
+        let mut insert_failures = match own_result {
+            Ok(failures) => failures,
+            Err(msg) => {
+                return resources
+                    .iter()
+                    .map(|_| Err(internal_error(msg.clone())))
+                    .collect();
+            }
+        };
+
+        // Same flatten-and-chunked-insert for contained rows, into their own
+        // collection. A failed contained insert attributes back to its
+        // resource exactly like a failed own insert; if a resource already
+        // has an own-row failure recorded, that one wins (matching the
+        // "first write error found" semantics `insert_search_entries_chunk`
+        // already uses within one collection).
+        let mut contained_owners: Vec<usize> =
+            Vec::with_capacity(prepared.iter().map(|p| p.docs.contained.len()).sum());
+        let mut contained_docs: Vec<Document> = Vec::with_capacity(contained_owners.capacity());
+        for (i, p) in prepared.iter().enumerate() {
+            for d in &p.docs.contained {
+                contained_owners.push(i);
+                contained_docs.push(d.clone());
+            }
+        }
+
+        if !contained_docs.is_empty() {
+            let contained_started = Instant::now();
+            let contained_result = insert_search_entries_chunk(
+                &contained_collection,
+                &contained_owners,
+                &contained_docs,
+                "Failed to insert search_index_contained entries",
+                stats,
+            )
+            .await;
+            let contained_time = contained_started.elapsed();
+            stats.insert += contained_time;
+            insert_time += contained_time;
+            match contained_result {
+                Ok(failures) => {
+                    for (owner, msg) in failures {
+                        insert_failures.entry(owner).or_insert(msg);
+                    }
+                }
+                Err(msg) => {
+                    return resources
+                        .iter()
+                        .map(|_| Err(internal_error(msg.clone())))
+                        .collect();
+                }
+            }
+        }
+
+        crate::perf::record_duration(crate::perf::Phase::ReindexSearchInsert, insert_time);
+        crate::perf::add_rows(
+            crate::perf::Phase::ReindexSearchInsert,
+            (own_docs.len() + contained_docs.len()) as u64,
+        );
+
+        prepared
+            .into_iter()
+            .enumerate()
+            .map(|(i, p)| match p.failure {
+                Some(msg) => Err(internal_error(msg)),
+                None => match insert_failures.remove(&i) {
+                    Some(msg) => Err(internal_error(msg)),
+                    None => Ok(p.docs.own.len() + p.docs.contained.len()),
+                },
+            })
+            .collect()
+    }
+
+    /// Delegates to [`Self::write_search_entries_page_timed`] with a
+    /// throwaway `ReindexPageStats`, so the two cannot diverge (#1403).
+    async fn write_search_entries_page(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+    ) -> Vec<StorageResult<usize>> {
+        let mut stats = ReindexPageStats::default();
+        self.write_search_entries_page_timed(tenant, resources, &mut stats)
+            .await
     }
 }
 
-/// Parses a `{rfc3339}|{id}` keyset-pagination cursor for the reindex source.
-fn parse_reindex_cursor(cursor: &str) -> Option<(DateTime<Utc>, String)> {
-    let (ts, id) = cursor.split_once('|')?;
-    let dt = DateTime::parse_from_rfc3339(ts).ok()?.with_timezone(&Utc);
-    Some((dt, id.to_string()))
+/// Documents per `insert_many` when [`MongoBackend`]'s
+/// [`ReindexTarget::write_search_entries_page`] flattens a page's index
+/// documents into one insert. Mirrors `bulk_ingest.rs`'s
+/// `INSERT_DOCS_PER_COMMAND` (same value, same rationale: bound how much the
+/// driver serializes per command) without depending on that module, since a
+/// page's `search_index` documents are built the same way a batch's are.
+const SEARCH_INDEX_INSERT_CHUNK: usize = 5_000;
+
+/// Chunked, unordered `insert_many` of `docs` into `collection`, attributing
+/// each document to the resource index at the same position in `owners`.
+///
+/// Used by [`MongoBackend::write_search_entries_page`] once per destination
+/// collection (`search_index` for a page's own rows, `search_index_contained`
+/// for its contained rows) so a failed contained insert attributes back to
+/// its resource exactly like a failed own insert.
+///
+/// Returns the per-resource write failures found, each message already
+/// carrying `error_context` (so a `search_index_contained` failure reads as
+/// that, not as "Failed to insert search index entries" regardless of which
+/// collection actually failed). A page-level error — one the driver did not
+/// attribute to specific documents — is returned as `Err`, for the caller to
+/// fan out to every resource in the page. Also counts each command it issues,
+/// and the documents in it, into `stats` (#1403).
+async fn insert_search_entries_chunk(
+    collection: &mongodb::Collection<Document>,
+    owners: &[usize],
+    docs: &[Document],
+    error_context: &str,
+    stats: &mut ReindexPageStats,
+) -> Result<HashMap<usize, String>, String> {
+    let mut insert_failures: HashMap<usize, String> = HashMap::new();
+    let mut offset = 0usize;
+    for chunk in docs.chunks(SEARCH_INDEX_INSERT_CHUNK) {
+        stats.insert_commands += 1;
+        stats.inserted_entries += chunk.len() as u64;
+        match collection.insert_many(chunk).ordered(false).await {
+            Ok(_) => {}
+            Err(e) => match e.kind.as_ref() {
+                MongoErrorKind::InsertMany(insert_many) => {
+                    let Some(write_errors) = insert_many.write_errors.as_ref() else {
+                        return Err(format!("{error_context}: {e}"));
+                    };
+                    for write_error in write_errors {
+                        let owner = owners[offset + write_error.index];
+                        insert_failures
+                            .entry(owner)
+                            .or_insert_with(|| format!("{error_context}: {}", write_error.message));
+                    }
+                }
+                _ => return Err(format!("{error_context}: {e}")),
+            },
+        }
+        offset += chunk.len();
+    }
+    Ok(insert_failures)
+}
+
+/// Most catch-up rounds one type's `$reindex` walk runs (#1403).
+const REINDEX_CATCH_UP_MAX_ROUNDS: u8 = 3;
+/// Smallest catch-up margin honoured: below it every round would count as
+/// "needed" and a quiescent type would run all rounds.
+const REINDEX_CATCH_UP_MARGIN_MIN_MS: u64 = 1_000;
+/// Largest catch-up margin honoured, so `t0 - margin` stays in range.
+const REINDEX_CATCH_UP_MARGIN_MAX_MS: u64 = 86_400_000;
+
+/// The walk position handed to the driver between calls (#1403). `v2|` and a
+/// tag version the grammar; anything else is a foreign or corrupt cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReindexWalkCursor {
+    Id {
+        floor: DateTime<Utc>,
+        after_id: String,
+    },
+    Round {
+        round: u8,
+        floor: DateTime<Utc>,
+        ceiling: DateTime<Utc>,
+        walked: u64,
+        after_last_updated: DateTime<Utc>,
+        after_id: String,
+    },
+}
+
+impl ReindexWalkCursor {
+    fn encode(&self) -> String {
+        match self {
+            ReindexWalkCursor::Id { floor, after_id } => {
+                format!("v2|i|{}|{}", format_walk_instant(*floor), after_id)
+            }
+            ReindexWalkCursor::Round {
+                round,
+                floor,
+                ceiling,
+                walked,
+                after_last_updated,
+                after_id,
+            } => format!(
+                "v2|c|{}|{}|{}|{}|{}|{}",
+                round,
+                format_walk_instant(*floor),
+                format_walk_instant(*ceiling),
+                walked,
+                format_walk_instant(*after_last_updated),
+                after_id
+            ),
+        }
+    }
+
+    /// Anything that does not exactly match the grammar (including HEAD's
+    /// `<rfc3339>|<id>` and an empty string) is `SearchError::InvalidCursor`.
+    /// A cursor this process did not produce means there is a bug; restarting
+    /// the type could loop forever, so the run fails instead (#1403).
+    fn parse(cursor: &str) -> StorageResult<Self> {
+        let invalid = || {
+            StorageError::Search(SearchError::InvalidCursor {
+                cursor: cursor.to_string(),
+            })
+        };
+        let rest = cursor.strip_prefix("v2|").ok_or_else(invalid)?;
+        let (tag, rest) = rest.split_once('|').ok_or_else(invalid)?;
+        match tag {
+            "i" => {
+                let (floor, after_id) = rest.split_once('|').ok_or_else(invalid)?;
+                if after_id.is_empty() {
+                    return Err(invalid());
+                }
+                let floor = DateTime::parse_from_rfc3339(floor)
+                    .map_err(|_| invalid())?
+                    .with_timezone(&Utc);
+                Ok(ReindexWalkCursor::Id {
+                    floor,
+                    after_id: after_id.to_string(),
+                })
+            }
+            "c" => {
+                let fields: Vec<&str> = rest.splitn(6, '|').collect();
+                let [round, floor, ceiling, walked, after_lu, after_id] = fields[..] else {
+                    return Err(invalid());
+                };
+                if after_id.is_empty() {
+                    return Err(invalid());
+                }
+                let round: u8 = round.parse().map_err(|_| invalid())?;
+                if !(1..=REINDEX_CATCH_UP_MAX_ROUNDS).contains(&round) {
+                    return Err(invalid());
+                }
+                let walked: u64 = walked.parse().map_err(|_| invalid())?;
+                let floor = DateTime::parse_from_rfc3339(floor)
+                    .map_err(|_| invalid())?
+                    .with_timezone(&Utc);
+                let ceiling = DateTime::parse_from_rfc3339(ceiling)
+                    .map_err(|_| invalid())?
+                    .with_timezone(&Utc);
+                let after_last_updated = DateTime::parse_from_rfc3339(after_lu)
+                    .map_err(|_| invalid())?
+                    .with_timezone(&Utc);
+                if !(floor < ceiling && floor <= after_last_updated && after_last_updated < ceiling)
+                {
+                    return Err(invalid());
+                }
+                Ok(ReindexWalkCursor::Round {
+                    round,
+                    floor,
+                    ceiling,
+                    walked,
+                    after_last_updated,
+                    after_id: after_id.to_string(),
+                })
+            }
+            _ => Err(invalid()),
+        }
+    }
+}
+
+/// Whether round-start should run the round, declare the walk complete, or
+/// stop at the round cap (#1403).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoundStartDecision {
+    Run,
+    Complete,
+    CapReached,
+}
+
+fn truncate_to_millis(dt: DateTime<Utc>) -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp_millis(dt.timestamp_millis()).unwrap_or(dt)
+}
+
+fn format_walk_instant(dt: DateTime<Utc>) -> String {
+    dt.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+/// Clamps a configured margin to `[REINDEX_CATCH_UP_MARGIN_MIN_MS,
+/// REINDEX_CATCH_UP_MARGIN_MAX_MS]` (#1403).
+fn reindex_catch_up_margin(configured_ms: u64) -> chrono::Duration {
+    chrono::Duration::milliseconds(configured_ms.clamp(
+        REINDEX_CATCH_UP_MARGIN_MIN_MS,
+        REINDEX_CATCH_UP_MARGIN_MAX_MS,
+    ) as i64)
+}
+
+/// `min(newest_live + 1 ms, t0 - margin)` (#1403).
+fn reindex_catch_up_floor(
+    t0: DateTime<Utc>,
+    newest_live: Option<DateTime<Utc>>,
+    margin: chrono::Duration,
+) -> DateTime<Utc> {
+    let fresh = truncate_to_millis(t0 - margin);
+    match newest_live {
+        Some(newest) => (newest + chrono::Duration::milliseconds(1)).min(fresh),
+        None => fresh,
+    }
+}
+
+/// `max(now + margin, newest_live + 1 ms)` (#1403).
+fn reindex_catch_up_ceiling(
+    now: DateTime<Utc>,
+    newest_live: Option<DateTime<Utc>>,
+    margin: chrono::Duration,
+) -> DateTime<Utc> {
+    let by_margin = truncate_to_millis(now + margin);
+    match newest_live {
+        Some(newest) => by_margin.max(newest + chrono::Duration::milliseconds(1)),
+        None => by_margin,
+    }
+}
+
+/// Whether the next round should run, or the walk is done (#1403).
+fn reindex_round_start_decision(
+    round: u8,
+    floor: DateTime<Utc>,
+    now: DateTime<Utc>,
+    margin: chrono::Duration,
+) -> RoundStartDecision {
+    if round == 1 {
+        return RoundStartDecision::Run;
+    }
+    if now < floor - margin / 2 {
+        return RoundStartDecision::Complete;
+    }
+    if round > REINDEX_CATCH_UP_MAX_ROUNDS {
+        return RoundStartDecision::CapReached;
+    }
+    RoundStartDecision::Run
+}
+
+/// The id phase's filter: live resources older than `floor`, keyset on `id`
+/// (#1403).
+fn reindex_id_page_filter(
+    tenant_id: &str,
+    resource_type: &str,
+    floor: DateTime<Utc>,
+    after_id: Option<&str>,
+) -> Document {
+    let mut filter = doc! {
+        "tenant_id": tenant_id,
+        "resource_type": resource_type,
+        "is_deleted": false,
+        "last_updated": { "$lt": chrono_to_bson(floor) },
+    };
+    if let Some(after_id) = after_id {
+        filter.insert("id", doc! { "$gt": after_id });
+    }
+    filter
+}
+
+/// A catch-up round's filter over `[floor, ceiling)`, keyset on
+/// `(last_updated, id)` once a page has been returned (#1403).
+fn reindex_catch_up_page_filter(
+    tenant_id: &str,
+    resource_type: &str,
+    floor: DateTime<Utc>,
+    ceiling: DateTime<Utc>,
+    after: Option<(DateTime<Utc>, &str)>,
+) -> Document {
+    let mut filter = doc! {
+        "tenant_id": tenant_id,
+        "resource_type": resource_type,
+        "is_deleted": false,
+    };
+    match after {
+        None => {
+            filter.insert(
+                "last_updated",
+                doc! { "$gte": chrono_to_bson(floor), "$lt": chrono_to_bson(ceiling) },
+            );
+        }
+        Some((after_lu, after_id)) => {
+            filter.insert(
+                "$or",
+                vec![
+                    doc! { "last_updated": { "$gt": chrono_to_bson(after_lu), "$lt": chrono_to_bson(ceiling) } },
+                    doc! { "last_updated": chrono_to_bson(after_lu), "id": { "$gt": after_id } },
+                ],
+            );
+        }
+    }
+    filter
+}
+
+/// Keeps only the last (newest) occurrence of each `id` in `docs`, preserving
+/// scan order otherwise; a document with no string `id` is kept in place and
+/// left to fail parsing with HEAD's error (#1403).
+fn dedupe_reindex_page_keep_last(docs: Vec<Document>) -> Vec<Document> {
+    let mut last_index_for_id: HashMap<String, usize> = HashMap::new();
+    for (i, doc) in docs.iter().enumerate() {
+        if let Ok(id) = doc.get_str("id") {
+            last_index_for_id.insert(id.to_string(), i);
+        }
+    }
+    docs.into_iter()
+        .enumerate()
+        .filter(|(i, doc)| match doc.get_str("id").ok() {
+            Some(id) => last_index_for_id.get(id) == Some(i),
+            None => true,
+        })
+        .map(|(_, doc)| doc)
+        .collect()
 }
 
 fn resolve_bundle_references(value: &mut Value, reference_map: &HashMap<String, String>) {
@@ -4371,143 +6312,840 @@ fn resolve_bundle_references(value: &mut Value, reference_map: &HashMap<String, 
 }
 
 #[cfg(test)]
-mod tests {
+mod offloaded_identifier_guard_tests {
     use super::*;
-    use crate::types::{
-        ChainedParameter, CompositeSearchComponent, SearchModifier, SearchParamType,
-        SearchParameter, SearchPrefix, SearchValue,
-    };
+    use crate::types::{SearchModifier, SearchValue};
 
-    fn plain(name: &str, value: &str) -> SearchParameter {
+    fn identifier_param() -> SearchParameter {
         SearchParameter {
-            name: name.to_string(),
+            name: "identifier".to_string(),
             param_type: SearchParamType::Token,
-            values: vec![SearchValue::eq(value)],
+            values: vec![SearchValue::eq("MRN-1")],
             ..Default::default()
         }
     }
 
-    /// The shapes the session-scoped matcher does understand: one `eq` value
-    /// per criterion, flattened in order.
     #[test]
-    fn plain_criteria_flatten_to_name_value_pairs() {
-        let pairs = bundle_criteria_pairs(&[
-            plain("identifier", "http://example.org|12345"),
-            plain("family", "Nguyen"),
-        ])
-        .expect("plain criteria are evaluable");
+    fn rejects_non_token_type() {
+        let param = SearchParameter {
+            param_type: SearchParamType::String,
+            ..identifier_param()
+        };
+        let err = MongoBackend::validate_offloaded_identifier_param(&param).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unsupported parameter type 'string'")
+        );
+    }
 
+    #[test]
+    fn rejects_modifier() {
+        let param = SearchParameter {
+            modifier: Some(SearchModifier::Missing),
+            ..identifier_param()
+        };
+        let err = MongoBackend::validate_offloaded_identifier_param(&param).unwrap_err();
+        assert!(err.to_string().contains("missing"));
+    }
+
+    #[test]
+    fn rejects_non_eq_prefix() {
+        let param = SearchParameter {
+            values: vec![SearchValue::new(SearchPrefix::Ne, "MRN-1")],
+            ..identifier_param()
+        };
+        let err = MongoBackend::validate_offloaded_identifier_param(&param).unwrap_err();
+        assert!(err.to_string().contains("Unsupported prefix 'ne'"));
+    }
+
+    #[test]
+    fn accepts_plain_token() {
+        MongoBackend::validate_offloaded_identifier_param(&identifier_param()).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod index_date_tests {
+    use super::*;
+
+    /// A search value and the stored value it should match must never be zoned
+    /// differently. Both are read by the shared `FhirDateValue` (the writer
+    /// since #1315): for every value the search grammar accepts, the instant
+    /// indexed must be the start of the range searched (both are then cut to
+    /// the millisecond a BSON date holds).
+    ///
+    /// That includes what a resource cannot validly carry but real data does —
+    /// `hh:mm` without seconds — and a `:60` leap second, which the search
+    /// side reads as the next second.
+    #[test]
+    fn search_and_index_agree_on_every_valid_value() {
+        for value in [
+            "2013",
+            "2013-04",
+            "2013-12",
+            "2013-04-05",
+            "2024-02-29",
+            "2013-04-05T09:20:00",
+            "2013-04-05T09:20:00Z",
+            "2013-04-05T09:20:00-04:00",
+            "2013-04-05T18:50:00+05:30",
+            "2013-04-05T09:20:00-00:00",
+            "2013-04-05T23:20:00+14:00",
+            "2013-04-05T09:20:00.5Z",
+            "2013-04-05T23:30:00.123-04:00",
+            "2021-11-10T16:48:57.246958-08:00",
+            // Minutes without seconds (#1315).
+            "2013-04-05T09:20",
+            "2013-04-05T09:20Z",
+            "2013-04-05T09:20-04:00",
+            "2013-04-05T18:50+05:30",
+            "2013-04-05T09:20-00:00",
+            "2013-04-05T23:59-14:00",
+            // A leap second is the first instant of the next second.
+            "2016-12-31T23:59:60Z",
+            "2013-04-05T09:20:60",
+            "2016-12-31T18:59:60-05:00",
+            "2016-12-31T23:59:60.5Z",
+            // Nine fraction digits, and digits past the ninth.
+            "2013-04-05T09:20:00.123456789Z",
+            "2013-04-05T09:20:00.1234567891Z",
+            "2013-04-05T09:20:00.12345678912345-04:00",
+            // The edges of the supported years.
+            "0001",
+            "0001-01-01T00:00:00Z",
+            "0001-01-01T14:00:00+14:00",
+            "9999",
+            "9999-12-31",
+            "9999-12-31T23:59",
+            "9999-12-31T23:59:59Z",
+            "9999-12-31T09:59:59-14:00",
+        ] {
+            let searched = crate::search::FhirDateValue::parse(value)
+                .unwrap_or_else(|e| panic!("{value} is a valid search value: {e}"));
+            assert_eq!(
+                normalize_date_for_mongo(value),
+                Some(searched.start),
+                "{value}"
+            );
+            let (start, _) = searched.range_at(crate::search::StorageResolution::Millis);
+            assert_eq!(
+                normalize_date_for_mongo(value).map(chrono_to_bson),
+                Some(chrono_to_bson(start)),
+                "{value} at BSON resolution"
+            );
+        }
+    }
+
+    /// #1315 itself: minutes without seconds are not RFC 3339, so the lenient
+    /// reading — all there was — dropped the value and the index document was
+    /// skipped.
+    #[test]
+    fn minute_precision_values_are_indexed() {
+        for (value, expected) in [
+            ("2013-04-05T09:20", "2013-04-05T09:20:00+00:00"),
+            ("2013-04-05T09:20Z", "2013-04-05T09:20:00+00:00"),
+            ("2013-04-05T09:20-04:00", "2013-04-05T13:20:00+00:00"),
+            ("2013-04-05T18:50+05:30", "2013-04-05T13:20:00+00:00"),
+        ] {
+            assert_eq!(
+                normalize_date_for_mongo_lenient(value),
+                None,
+                "{value} before"
+            );
+            assert_eq!(
+                normalize_date_for_mongo(value).map(|t| t.to_rfc3339()),
+                Some(expected.to_string()),
+                "{value}"
+            );
+        }
+    }
+
+    /// The only value both readings accept and disagree on. Chrono keeps a
+    /// leap second as `:59` plus a second of nanoseconds, which a BSON date
+    /// holds as `:59.999`-and-a-bit at best; the search side looks for it *at*
+    /// the next second.
+    #[test]
+    fn leap_second_is_indexed_where_the_search_side_looks_for_it() {
+        let lenient =
+            normalize_date_for_mongo_lenient("2016-12-31T23:59:60Z").expect("chrono reads it");
+        assert_eq!(lenient.timestamp(), 1_483_228_799, "lenient: still :59");
+        let indexed = normalize_date_for_mongo("2016-12-31T23:59:60Z").expect("indexed");
+        assert_eq!(indexed.to_rfc3339(), "2017-01-01T00:00:00+00:00");
+    }
+
+    /// The search side trims a value and reads a space in the zone-sign
+    /// position as a form-decoded `+` (#1296). Neither applies to a stored
+    /// value: there a space is not part of a date, and the value is skipped as
+    /// it always was rather than indexed at a zone nobody wrote.
+    #[test]
+    fn search_side_repairs_do_not_apply_to_stored_values() {
+        for value in [
+            "2013-04-05T18:50:00 05:30",
+            "2013-04-05T18:50 05:30",
+            " 2013-04-05T09:20",
+            "2013-04-05T09:20 ",
+            " 2013-04-05 ",
+        ] {
+            assert!(
+                crate::search::FhirDateValue::parse(value).is_ok(),
+                "{value:?} is accepted as a search value"
+            );
+            assert_eq!(normalize_date_for_mongo(value), None, "{value:?}");
+        }
+    }
+
+    fn date_document(value: IndexValue) -> Option<Document> {
+        let backend = MongoBackend::new(super::super::backend::MongoBackendConfig::default())
+            .expect("backend without a connection");
+        let extracted = ExtractedValue::new(
+            "date",
+            "http://hl7.org/fhir/SearchParameter/clinical-date",
+            crate::types::SearchParamType::Date,
+            value,
+        );
+        backend.build_search_index_document("t1", "Encounter", "e1", &extracted)
+    }
+
+    fn stored(doc: &Document, field: &str) -> String {
+        bson_to_chrono(doc.get_datetime(field).expect(field)).to_rfc3339()
+    }
+
+    /// #1391: every date row stores the range it covers — a point to the end
+    /// of its precision, a `Period` to the end of its own `end`, and an open
+    /// side at the edge of the supported years.
+    #[test]
+    fn date_rows_store_the_range_they_cover() {
+        let point = date_document(IndexValue::date("2020-06")).expect("point");
+        assert_eq!(stored(&point, "value_date"), "2020-06-01T00:00:00+00:00");
         assert_eq!(
-            pairs,
+            stored(&point, "value_date_end"),
+            "2020-07-01T00:00:00+00:00"
+        );
+
+        let period = date_document(
+            IndexValue::date_range(Some("2019-06-15"), Some("2020-03")).expect("period"),
+        )
+        .expect("period row");
+        assert_eq!(stored(&period, "value_date"), "2019-06-15T00:00:00+00:00");
+        assert_eq!(
+            stored(&period, "value_date_end"),
+            "2020-04-01T00:00:00+00:00"
+        );
+
+        let open_end = date_document(IndexValue::date_range(Some("2019"), None).expect("open"))
+            .expect("open-ended row");
+        assert_eq!(stored(&open_end, "value_date"), "2019-01-01T00:00:00+00:00");
+        assert_eq!(
+            *open_end.get_datetime("value_date_end").unwrap(),
+            chrono_to_bson(crate::search::open_end(
+                crate::search::StorageResolution::Millis
+            ))
+        );
+
+        let open_start = date_document(IndexValue::date_range(None, Some("2020")).expect("open"))
+            .expect("open-started row");
+        assert_eq!(
+            *open_start.get_datetime("value_date").unwrap(),
+            chrono_to_bson(crate::search::open_start())
+        );
+        assert_eq!(
+            stored(&open_start, "value_date_end"),
+            "2021-01-01T00:00:00+00:00"
+        );
+    }
+
+    /// A `Period` whose `end` is not a date is skipped whole, like any other
+    /// unparseable date: indexing it as open would over-match.
+    #[test]
+    fn a_period_with_a_bad_end_is_skipped() {
+        let bad = IndexValue::date_range(Some("2020-01-01"), Some("not-a-date")).expect("period");
+        assert!(date_document(bad).is_none());
+    }
+
+    /// What the strict grammar rejects still goes through the lenient reading,
+    /// exactly as before: the strict pass only ever adds index documents.
+    #[test]
+    fn values_outside_the_grammar_keep_the_lenient_reading() {
+        for value in [
+            // Offset beyond ±14:00.
+            "2013-04-05T09:20:00+14:30",
+            // Valid text whose UTC instant is past the year 9999.
+            "9999-12-31T23:59:59-01:00",
+            // Its range would have no width left inside the supported years.
+            "9999-12-31T23:59:59.999999999Z",
+        ] {
+            assert!(
+                crate::search::FhirDateValue::parse(value).is_err(),
+                "{value} is outside the search grammar"
+            );
+            assert!(normalize_date_for_mongo_lenient(value).is_some(), "{value}");
+            assert_eq!(
+                normalize_date_for_mongo(value),
+                normalize_date_for_mongo_lenient(value),
+                "{value}"
+            );
+        }
+    }
+
+    /// Never a timestamp for something that is not a date.
+    #[test]
+    fn unparseable_values_are_dropped_not_substituted() {
+        for value in ["", "not-a-date", "2024-13-45T99:99:99", "T00:00:00"] {
+            assert_eq!(normalize_date_for_mongo(value), None, "{value:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod history_query_tests {
+    //! Docker-free unit tests for the pure query builders behind #1053's
+    //! fix: the server-side cursor predicate, sort, and fetch-limit that
+    //! `history_type`/`history_system` now push to MongoDB instead of
+    //! draining the whole history corpus into Rust before paging.
+
+    use super::*;
+    use crate::types::Pagination;
+
+    fn cursor_params(sort_values: Vec<CursorValue>, resource_id: &str) -> HistoryParams {
+        let cursor = PageCursor::new(sort_values, resource_id);
+        HistoryParams {
+            pagination: Pagination::with_cursor(10, cursor.encode()),
+            ..HistoryParams::default()
+        }
+    }
+
+    #[test]
+    fn type_history_cursor_or_matches_expected_shape() {
+        let ts = DateTime::parse_from_rfc3339("2024-01-01T00:00:10Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let params = cursor_params(
             vec![
-                (
-                    "identifier".to_string(),
-                    "http://example.org|12345".to_string()
-                ),
-                ("family".to_string(), "Nguyen".to_string()),
+                CursorValue::String(ts.to_rfc3339()),
+                CursorValue::String("obs-5".to_string()),
+            ],
+            "Observation",
+        );
+
+        let or_branches = type_history_cursor_or(&params).expect("expected a cursor predicate");
+        let expected_ts = chrono_to_bson(ts);
+        assert_eq!(
+            or_branches,
+            vec![
+                doc! { "last_updated": { "$lt": expected_ts } },
+                doc! { "last_updated": expected_ts, "id": { "$lt": "obs-5" } },
             ]
         );
-        assert_eq!(bundle_criteria_pairs(&[]).expect("no criteria"), vec![]);
     }
 
-    /// A modifier the matcher cannot evaluate names itself in the refusal, so
-    /// the 501 says which criterion the entry has to lose (#709, #865).
     #[test]
-    fn a_modifier_is_refused_and_named_with_its_modifier() {
-        let mut param = plain("family", "Nguyen");
-        param.modifier = Some(SearchModifier::Exact);
+    fn system_history_cursor_or_matches_expected_3_branch_shape() {
+        let ts = DateTime::parse_from_rfc3339("2024-01-01T00:00:10Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let params = cursor_params(
+            vec![
+                CursorValue::String(ts.to_rfc3339()),
+                CursorValue::String("Observation".to_string()),
+                CursorValue::String("obs-5".to_string()),
+            ],
+            "system",
+        );
 
+        let or_branches = system_history_cursor_or(&params).expect("expected a cursor predicate");
+        let expected_ts = chrono_to_bson(ts);
         assert_eq!(
-            bundle_criteria_pairs(&[param]).expect_err("a modifier is not evaluable"),
-            "family:exact=Nguyen"
+            or_branches,
+            vec![
+                doc! { "last_updated": { "$lt": expected_ts } },
+                doc! {
+                    "last_updated": expected_ts,
+                    "resource_type": { "$lt": "Observation" },
+                },
+                doc! {
+                    "last_updated": expected_ts,
+                    "resource_type": "Observation",
+                    "id": { "$lt": "obs-5" },
+                },
+            ]
         );
     }
 
-    /// A chain resolves through another resource, which the in-memory matcher
-    /// never loads: refusing beats silently matching nothing.
     #[test]
-    fn a_chain_is_refused() {
-        let mut param = plain("subject", "Nguyen");
-        param.chain = vec![ChainedParameter {
-            reference_param: "subject".to_string(),
-            target_type: Some("Patient".to_string()),
-            target_param: "family".to_string(),
-        }];
-
-        assert_eq!(
-            bundle_criteria_pairs(&[param]).expect_err("a chain is not evaluable"),
-            "subject=Nguyen"
-        );
+    fn cursor_or_is_none_for_absent_cursor() {
+        let params = HistoryParams::default();
+        assert!(type_history_cursor_or(&params).is_none());
+        assert!(system_history_cursor_or(&params).is_none());
     }
 
-    /// A comparison prefix is kept in the refusal's value, so `gt2020` reads
-    /// back as it was sent rather than as a bare `2020`.
     #[test]
-    fn a_comparison_prefix_is_refused_and_shown() {
-        let param = SearchParameter {
-            name: "birthdate".to_string(),
-            param_type: SearchParamType::Date,
-            values: vec![SearchValue::new(SearchPrefix::Gt, "2020-01-01")],
-            ..Default::default()
+    fn cursor_or_is_none_for_malformed_cursor() {
+        // Only one sort value: type history needs 2, system needs 3.
+        let ts = Utc::now();
+        let params = cursor_params(vec![CursorValue::String(ts.to_rfc3339())], "Observation");
+        assert!(type_history_cursor_or(&params).is_none());
+        assert!(system_history_cursor_or(&params).is_none());
+
+        // Two sort values: enough for type history, not for system history.
+        let params2 = cursor_params(
+            vec![
+                CursorValue::String(ts.to_rfc3339()),
+                CursorValue::String("obs-5".to_string()),
+            ],
+            "Observation",
+        );
+        assert!(type_history_cursor_or(&params2).is_some());
+        assert!(system_history_cursor_or(&params2).is_none());
+    }
+
+    #[test]
+    fn cursor_or_is_none_for_offset_mode_pagination() {
+        let params = HistoryParams {
+            pagination: Pagination::offset(5),
+            ..HistoryParams::default()
         };
+        assert!(type_history_cursor_or(&params).is_none());
+        assert!(system_history_cursor_or(&params).is_none());
+    }
 
+    #[test]
+    fn since_before_range_coexists_with_cursor_or_without_key_collision() {
+        let since = DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let before = DateTime::parse_from_rfc3339("2024-06-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let cursor_ts = DateTime::parse_from_rfc3339("2024-03-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let mut params = cursor_params(
+            vec![
+                CursorValue::String(cursor_ts.to_rfc3339()),
+                CursorValue::String("obs-5".to_string()),
+            ],
+            "Observation",
+        );
+        params.since = Some(since);
+        params.before = Some(before);
+
+        let mut filter = doc! { "tenant_id": "tenant-1", "resource_type": "Observation" };
+        apply_history_params_filter(&mut filter, &params);
+        let or_branches = type_history_cursor_or(&params).expect("expected a cursor predicate");
+        filter.insert("$or", or_branches);
+
+        // Both the range (under "last_updated") and the cursor predicate
+        // (under the distinct top-level "$or" key) are present — they AND
+        // together implicitly rather than colliding on the same key.
+        let range = filter
+            .get_document("last_updated")
+            .expect("expected the since/before range to remain under last_updated");
+        assert_eq!(range.get("$gte"), Some(&Bson::from(chrono_to_bson(since))));
+        assert_eq!(range.get("$lt"), Some(&Bson::from(chrono_to_bson(before))));
+        assert!(filter.contains_key("$or"));
+        // include_deleted defaults to false, so the filter also carries it.
+        assert_eq!(filter.get_bool("is_deleted").ok(), Some(false));
+    }
+
+    #[test]
+    fn history_fetch_limit_is_count_plus_one_and_never_zero() {
+        assert_eq!(history_fetch_limit(10), 11);
+        assert_eq!(history_fetch_limit(0), 1);
+        assert_eq!(history_fetch_limit(99), 100);
+    }
+
+    #[test]
+    fn sorts_match_the_serving_index_key_order() {
+        // idx_history_type_updated = {tenant_id, resource_type, last_updated: -1, id: -1}
         assert_eq!(
-            bundle_criteria_pairs(&[param]).expect_err("a prefix is not evaluable"),
-            "birthdate=gt2020-01-01"
+            type_history_sort(),
+            doc! { "last_updated": -1_i32, "id": -1_i32 }
+        );
+        // idx_history_system_updated = {tenant_id, last_updated: -1, resource_type: -1, id: -1}
+        assert_eq!(
+            system_history_sort(),
+            doc! { "last_updated": -1_i32, "resource_type": -1_i32, "id": -1_i32 }
         );
     }
+}
 
-    /// An OR-list is one criterion with several values; the matcher tests a
-    /// single value, so the whole list is refused, comma-joined as sent.
-    #[test]
-    fn an_or_list_is_refused_whole() {
-        let mut param = plain("identifier", "12345");
-        param.values.push(SearchValue::eq("67890"));
+#[cfg(test)]
+mod reindex_walk_tests {
+    //! Docker-free unit tests for #1403's id-order `$reindex` walk: the
+    //! cursor grammar, the pure floor/ceiling/round-decision rules, the
+    //! filter builders, and the round-page dedupe. The walk itself
+    //! (`fetch_resources_page`) is covered by the MongoDB integration suite
+    //! in `tests/mongodb/reindex_id_walk.rs`, since it needs a live server.
 
-        assert_eq!(
-            bundle_criteria_pairs(&[param]).expect_err("an OR-list is not evaluable"),
-            "identifier=12345,67890"
-        );
+    use super::*;
+
+    fn ts(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
     }
 
-    /// A composite parameter carries components rather than a plain value.
+    // --- Cursor grammar ---
+
     #[test]
-    fn a_composite_is_refused() {
-        let mut param = plain("component-code-value-quantity", "loinc|8480-6$lt60");
-        param.components = vec![CompositeSearchComponent {
-            param_type: SearchParamType::Token,
-            param_name: "component-code".to_string(),
-        }];
-
-        assert!(bundle_criteria_pairs(&[param]).is_err());
-    }
-
-    /// The first criterion the matcher cannot evaluate decides the refusal,
-    /// even when a later one could have been flattened.
-    #[test]
-    fn the_first_unevaluable_criterion_refuses_the_entry() {
-        let mut param = plain("family", "Nguyen");
-        param.modifier = Some(SearchModifier::Contains);
-
-        assert_eq!(
-            bundle_criteria_pairs(&[param, plain("identifier", "12345")])
-                .expect_err("one unevaluable criterion refuses the entry"),
-            "family:contains=Nguyen"
-        );
-    }
-
-    /// A criterion with no value at all is not a plain `name=value` either.
-    #[test]
-    fn a_valueless_criterion_is_refused() {
-        let param = SearchParameter {
-            name: "identifier".to_string(),
-            param_type: SearchParamType::Token,
-            ..Default::default()
+    fn cursor_round_trips_every_state() {
+        let id_cursor = ReindexWalkCursor::Id {
+            floor: ts("2026-01-01T00:00:00.123Z"),
+            after_id: "A-1.b".to_string(),
         };
-
         assert_eq!(
-            bundle_criteria_pairs(&[param]).expect_err("no value is not evaluable"),
-            "identifier="
+            ReindexWalkCursor::parse(&id_cursor.encode()).unwrap(),
+            id_cursor
         );
+
+        for round in [1u8, REINDEX_CATCH_UP_MAX_ROUNDS] {
+            for walked in [0u64, u64::MAX] {
+                let round_cursor = ReindexWalkCursor::Round {
+                    round,
+                    floor: ts("2026-01-01T00:00:00.000Z"),
+                    ceiling: ts("2026-01-01T00:02:00.000Z"),
+                    walked,
+                    after_last_updated: ts("2026-01-01T00:01:00.500Z"),
+                    after_id: "obs-017".to_string(),
+                };
+                assert_eq!(
+                    ReindexWalkCursor::parse(&round_cursor.encode()).unwrap(),
+                    round_cursor
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cursor_id_is_the_verbatim_remainder() {
+        let id_cursor = ReindexWalkCursor::Id {
+            floor: ts("2026-01-01T00:00:00.000Z"),
+            after_id: "a|b".to_string(),
+        };
+        assert_eq!(
+            ReindexWalkCursor::parse(&id_cursor.encode()).unwrap(),
+            id_cursor
+        );
+
+        let round_cursor = ReindexWalkCursor::Round {
+            round: 1,
+            floor: ts("2026-01-01T00:00:00.000Z"),
+            ceiling: ts("2026-01-01T00:02:00.000Z"),
+            walked: 3,
+            after_last_updated: ts("2026-01-01T00:01:00.000Z"),
+            after_id: "a|b".to_string(),
+        };
+        assert_eq!(
+            ReindexWalkCursor::parse(&round_cursor.encode()).unwrap(),
+            round_cursor
+        );
+    }
+
+    #[test]
+    fn cursor_rejects_foreign_and_malformed_tokens() {
+        let instant = "2026-01-01T00:00:00.000Z";
+        let ceiling = "2026-01-01T00:02:00.000Z";
+        let bad: Vec<String> = vec![
+            "".to_string(),
+            "2026-09-19T04:43:29.668+00:00|e357ce58-f379-216d-a369-99da40ff76ae".to_string(),
+            format!("v1|i|{instant}|a"),
+            format!("v3|i|{instant}|a"),
+            format!("v2|x|{instant}|a"),
+            format!("v2|s|1|{instant}"),
+            format!("v2|i|{instant}|"),
+            "v2|i|not-a-time|a".to_string(),
+            // round 0 (below the 1..=MAX range)
+            format!("v2|c|0|{instant}|{ceiling}|0|{instant}|a"),
+            // round MAX + 1 (above the range)
+            format!(
+                "v2|c|{}|{instant}|{ceiling}|0|{instant}|a",
+                REINDEX_CATCH_UP_MAX_ROUNDS + 1
+            ),
+            // five fields instead of six (missing after_lu)
+            format!("v2|c|1|{instant}|{ceiling}|0|a"),
+            // walked = -1
+            format!("v2|c|1|{instant}|{ceiling}|-1|{instant}|a"),
+            // floor == ceiling
+            format!("v2|c|1|{instant}|{instant}|0|{instant}|a"),
+            // after_lu < floor
+            format!("v2|c|1|{instant}|{ceiling}|0|2025-12-31T23:59:59.000Z|a"),
+            // after_lu == ceiling
+            format!("v2|c|1|{instant}|{ceiling}|0|{ceiling}|a"),
+        ];
+        for cursor in bad {
+            match ReindexWalkCursor::parse(&cursor) {
+                Err(StorageError::Search(SearchError::InvalidCursor { .. })) => {}
+                other => panic!("expected InvalidCursor for {cursor:?}, got {other:?}"),
+            }
+        }
+    }
+
+    // --- Floor / ceiling / margin / round decision ---
+
+    #[test]
+    fn floor_is_newest_plus_one_ms_for_old_data() {
+        let t0 = ts("2026-01-01T01:00:00.000Z");
+        let newest = ts("2026-01-01T00:00:00.000Z"); // far older than t0 - margin
+        let margin = chrono::Duration::seconds(120);
+        assert_eq!(
+            reindex_catch_up_floor(t0, Some(newest), margin),
+            newest + chrono::Duration::milliseconds(1)
+        );
+    }
+
+    #[test]
+    fn floor_is_t0_minus_margin_for_fresh_data() {
+        let t0 = ts("2026-01-01T01:00:00.000Z");
+        let newest = t0 - chrono::Duration::seconds(1); // inside the margin
+        let margin = chrono::Duration::seconds(120);
+        assert_eq!(
+            reindex_catch_up_floor(t0, Some(newest), margin),
+            t0 - margin
+        );
+    }
+
+    #[test]
+    fn floor_without_live_resources_is_t0_minus_margin() {
+        let t0 = ts("2026-01-01T01:00:00.000Z");
+        let margin = chrono::Duration::seconds(120);
+        assert_eq!(reindex_catch_up_floor(t0, None, margin), t0 - margin);
+    }
+
+    #[test]
+    fn floor_truncates_to_milliseconds() {
+        let t0 = Utc::now(); // sub-millisecond precision on most platforms
+        let margin = chrono::Duration::seconds(120);
+        let floor = reindex_catch_up_floor(t0, None, margin);
+        assert_eq!(floor.timestamp_subsec_nanos() % 1_000_000, 0);
+    }
+
+    #[test]
+    fn ceiling_is_now_plus_margin_for_past_stamps() {
+        let now = ts("2026-01-01T01:00:00.000Z");
+        let margin = chrono::Duration::seconds(120);
+        assert_eq!(
+            reindex_catch_up_ceiling(now, Some(now - chrono::Duration::seconds(1)), margin),
+            now + margin
+        );
+        assert_eq!(reindex_catch_up_ceiling(now, None, margin), now + margin);
+    }
+
+    #[test]
+    fn ceiling_passes_a_future_stamp() {
+        let now = ts("2026-01-01T01:00:00.000Z");
+        let margin = chrono::Duration::seconds(120);
+        let newest = now + margin + chrono::Duration::seconds(5);
+        assert_eq!(
+            reindex_catch_up_ceiling(now, Some(newest), margin),
+            newest + chrono::Duration::milliseconds(1)
+        );
+    }
+
+    #[test]
+    fn round_start_decision_round_one_always_runs() {
+        let floor = ts("2026-01-01T00:00:00.000Z");
+        let margin = chrono::Duration::seconds(120);
+        assert_eq!(
+            reindex_round_start_decision(1, floor, floor - chrono::Duration::hours(1), margin),
+            RoundStartDecision::Run
+        );
+        assert_eq!(
+            reindex_round_start_decision(1, floor, floor + chrono::Duration::hours(1), margin),
+            RoundStartDecision::Run
+        );
+    }
+
+    #[test]
+    fn round_start_decision_round_two_completes_or_runs_at_the_half_margin_boundary() {
+        let floor = ts("2026-01-01T00:02:00.000Z");
+        let margin = chrono::Duration::seconds(120);
+        let boundary = floor - margin / 2;
+        assert_eq!(
+            reindex_round_start_decision(2, floor, boundary, margin),
+            RoundStartDecision::Run
+        );
+        assert_eq!(
+            reindex_round_start_decision(
+                2,
+                floor,
+                boundary - chrono::Duration::milliseconds(1),
+                margin
+            ),
+            RoundStartDecision::Complete
+        );
+    }
+
+    #[test]
+    fn round_start_decision_caps_or_completes_past_the_round_limit() {
+        let floor = ts("2026-01-01T00:02:00.000Z");
+        let margin = chrono::Duration::seconds(120);
+        let boundary = floor - margin / 2;
+        let round = REINDEX_CATCH_UP_MAX_ROUNDS + 1;
+        assert_eq!(
+            reindex_round_start_decision(round, floor, boundary, margin),
+            RoundStartDecision::CapReached
+        );
+        assert_eq!(
+            reindex_round_start_decision(
+                round,
+                floor,
+                boundary - chrono::Duration::milliseconds(1),
+                margin
+            ),
+            RoundStartDecision::Complete
+        );
+    }
+
+    #[test]
+    fn margin_is_clamped() {
+        assert_eq!(reindex_catch_up_margin(0), chrono::Duration::seconds(1));
+        assert_eq!(
+            reindex_catch_up_margin(120_000),
+            chrono::Duration::seconds(120)
+        );
+        assert_eq!(
+            reindex_catch_up_margin(u64::MAX),
+            chrono::Duration::hours(24)
+        );
+    }
+
+    // --- Filter shapes ---
+
+    #[test]
+    fn id_page_filter_shape() {
+        let floor = ts("2026-01-01T00:00:00.000Z");
+        let first = reindex_id_page_filter("t1", "Observation", floor, None);
+        assert!(!first.contains_key("id"));
+        // Tenant/type scope: a regression here (e.g. PR2a/PR2b's
+        // `reindex_find_page` refactor dropping a clause) would let the walk
+        // read another tenant's or resource type's rows undetected by any
+        // Docker-gated test (#1403 review finding).
+        assert_eq!(first.get_str("tenant_id"), Ok("t1"));
+        assert_eq!(first.get_str("resource_type"), Ok("Observation"));
+        assert_eq!(first.get_bool("is_deleted"), Ok(false));
+        assert_eq!(
+            first.get_document("last_updated").unwrap().get("$lt"),
+            Some(&Bson::from(chrono_to_bson(floor)))
+        );
+
+        let later = reindex_id_page_filter("t1", "Observation", floor, Some("obs-010"));
+        assert_eq!(later.get_str("tenant_id"), Ok("t1"));
+        assert_eq!(later.get_str("resource_type"), Ok("Observation"));
+        assert_eq!(later.get_bool("is_deleted"), Ok(false));
+        assert_eq!(
+            later.get_document("last_updated").unwrap().get("$lt"),
+            Some(&Bson::from(chrono_to_bson(floor)))
+        );
+        assert_eq!(
+            later.get_document("id").unwrap().get_str("$gt"),
+            Ok("obs-010")
+        );
+    }
+
+    #[test]
+    fn catch_up_filter_shape() {
+        let floor = ts("2026-01-01T00:00:00.000Z");
+        let ceiling = ts("2026-01-01T00:02:00.000Z");
+        let first = reindex_catch_up_page_filter("t1", "Observation", floor, ceiling, None);
+        assert!(!first.contains_key("$or"));
+        // Tenant/type scope and the deleted-row exclusion: nothing else would
+        // catch either clause silently dropping from the catch-up filter
+        // (#1403 review finding) — the integration tests can't distinguish a
+        // scoped catch-up round from an unscoped one that happens to see the
+        // same rows.
+        assert_eq!(first.get_str("tenant_id"), Ok("t1"));
+        assert_eq!(first.get_str("resource_type"), Ok("Observation"));
+        assert_eq!(first.get_bool("is_deleted"), Ok(false));
+        let range = first.get_document("last_updated").unwrap();
+        assert_eq!(range.get("$gte"), Some(&Bson::from(chrono_to_bson(floor))));
+        assert_eq!(range.get("$lt"), Some(&Bson::from(chrono_to_bson(ceiling))));
+
+        let after_lu = ts("2026-01-01T00:01:00.000Z");
+        let continuation = reindex_catch_up_page_filter(
+            "t1",
+            "Observation",
+            floor,
+            ceiling,
+            Some((after_lu, "obs-020")),
+        );
+        assert_eq!(continuation.get_str("tenant_id"), Ok("t1"));
+        assert_eq!(continuation.get_str("resource_type"), Ok("Observation"));
+        assert_eq!(continuation.get_bool("is_deleted"), Ok(false));
+        assert!(!continuation.contains_key("last_updated"));
+        let or = continuation.get_array("$or").unwrap();
+        assert_eq!(or.len(), 2);
+        let first_arm_doc = or[0].as_document().unwrap();
+        assert_eq!(
+            first_arm_doc.len(),
+            1,
+            "arm 0 must hold only `last_updated`: {first_arm_doc:?}"
+        );
+        let first_arm = first_arm_doc.get_document("last_updated").unwrap();
+        assert_eq!(
+            first_arm.get("$gt"),
+            Some(&Bson::from(chrono_to_bson(after_lu)))
+        );
+        assert_eq!(
+            first_arm.get("$lt"),
+            Some(&Bson::from(chrono_to_bson(ceiling)))
+        );
+        let second_arm = or[1].as_document().unwrap();
+        assert_eq!(
+            second_arm.len(),
+            2,
+            "arm 1 must hold exactly `last_updated` and `id`: {second_arm:?}"
+        );
+        assert_eq!(
+            second_arm.get("last_updated"),
+            Some(&Bson::from(chrono_to_bson(after_lu)))
+        );
+        assert_eq!(
+            second_arm.get_document("id").unwrap().get_str("$gt"),
+            Ok("obs-020")
+        );
+    }
+
+    // --- Dedupe ---
+
+    #[test]
+    fn dedupe_keeps_the_last_occurrence_in_scan_order() {
+        let docs = vec![
+            doc! { "id": "a", "v": 1 },
+            doc! { "note": "no id" },
+            doc! { "id": "b", "v": 1 },
+            doc! { "id": "a", "v": 2 },
+        ];
+        let deduped = dedupe_reindex_page_keep_last(docs);
+        assert_eq!(deduped.len(), 3);
+        assert!(!deduped[0].contains_key("id")); // "no id" doc kept in place
+        assert_eq!(deduped[0].get_str("note"), Ok("no id"));
+        assert_eq!(deduped[1].get_str("id"), Ok("b"));
+        assert_eq!(deduped[2].get_str("id"), Ok("a"));
+        assert_eq!(deduped[2].get_i32("v"), Ok(2));
+    }
+}
+
+#[cfg(test)]
+mod reindex_page_cap_tests {
+    use super::*;
+
+    #[test]
+    fn admits_the_first_row_whatever_its_size() {
+        assert!(reindex_page_admits(0, 0, 10_000, 1));
+    }
+
+    #[test]
+    fn admits_up_to_and_including_the_cap() {
+        assert!(reindex_page_admits(1, 100, 50, 150));
+        assert!(!reindex_page_admits(1, 100, 50, 149));
+    }
+
+    #[test]
+    fn zero_cap_admits_everything() {
+        assert!(reindex_page_admits(7, u64::MAX, u64::MAX, 0));
+    }
+
+    #[test]
+    fn saturating_sum_does_not_overflow() {
+        assert!(reindex_page_admits(1, u64::MAX - 1, 10, u64::MAX));
     }
 }

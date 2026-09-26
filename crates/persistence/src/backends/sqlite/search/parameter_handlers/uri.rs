@@ -24,10 +24,16 @@ impl UriHandler {
         let uri_value = &value.value;
 
         match modifier {
+            // The `IS NOT NULL` leads are for the planner: SQLite cannot infer
+            // non-null from `LIKE`, and they are what let the partial
+            // `idx_search_uri` serve these instead of a type-wide scan.
             Some(SearchModifier::Contains) => {
                 // :contains - case-insensitive substring match on the URI.
                 SqlFragment::with_params(
-                    format!("value_uri LIKE '%' || ?{} || '%'", param_num),
+                    format!(
+                        "value_uri IS NOT NULL AND value_uri LIKE '%' || ?{} || '%'",
+                        param_num
+                    ),
                     vec![SqlParam::string(uri_value)],
                 )
             }
@@ -36,7 +42,7 @@ impl UriHandler {
                 // For "http://example.org", matches "http://example.org" and "http://example.org/foo"
                 SqlFragment::with_params(
                     format!(
-                        "(value_uri = ?{} OR value_uri LIKE ?{} || '/%')",
+                        "value_uri IS NOT NULL AND (value_uri = ?{} OR value_uri LIKE ?{} || '/%')",
                         param_num,
                         param_num + 1
                     ),
@@ -48,7 +54,7 @@ impl UriHandler {
                 // For "http://example.org/foo/bar", matches "http://example.org", "http://example.org/foo", etc.
                 SqlFragment::with_params(
                     format!(
-                        "(?{} = value_uri OR ?{} LIKE value_uri || '/%')",
+                        "value_uri IS NOT NULL AND (?{} = value_uri OR ?{} LIKE value_uri || '/%')",
                         param_num,
                         param_num + 1
                     ),

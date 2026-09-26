@@ -48,6 +48,13 @@ pub struct AuthMiddlewareState {
     /// operation. In `header_only` mode this is `false` and the path is used
     /// verbatim.
     pub tenant_url_routing: bool,
+    /// Browser login sessions for the web UI (issue #1449). When set, a
+    /// request that carries the UI session cookie and **no** `Authorization`
+    /// header has the session's access token injected as its bearer before
+    /// validation, so the pages' own browser-originated FHIR calls are
+    /// authenticated with no change to the validation, scope or audit path.
+    /// `None` when the interactive login is not configured.
+    pub sessions: Option<Arc<helios_auth::SessionStore>>,
 }
 
 /// Paths that are exempt from authentication.
@@ -68,6 +75,25 @@ const EXEMPT_PATHS: &[&str] = &[
 fn is_exempt_path(path: &str) -> bool {
     let path = path.trim_end_matches('/');
     EXEMPT_PATHS.contains(&path)
+}
+
+/// The bearer a web-UI session stands for, when this request carries a valid
+/// session cookie, sessions are configured, and the request is not cross-site
+/// (issue #1449). `None` otherwise — including when the session's access
+/// token has expired and could not be refreshed, which drops the session.
+async fn session_bearer(
+    auth_state: &AuthMiddlewareState,
+    headers: &axum::http::HeaderMap,
+) -> Option<String> {
+    let sessions = auth_state.sessions.as_ref()?;
+    if helios_auth::is_cross_site(headers) {
+        return None;
+    }
+    let session_id = helios_auth::cookie_value(headers, helios_auth::SESSION_COOKIE)?;
+    match sessions.access_token(&session_id).await {
+        helios_auth::AccessOutcome::Token(token) => Some(format!("Bearer {token}")),
+        helios_auth::AccessOutcome::NoSession => None,
+    }
 }
 
 /// Authentication middleware.
@@ -95,10 +121,29 @@ pub async fn auth_middleware(
     let auth_header = request
         .headers()
         .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    // A browser signed in through the web UI carries a session cookie, not a
+    // bearer (#1449). Turn a valid session into the bearer it stands for and
+    // let the normal validation below run on it. Only when the request sent no
+    // `Authorization` of its own — an explicit bearer always wins — and never
+    // for a cross-site request, so another origin cannot ride the cookie.
+    let auth_header = match auth_header {
+        Some(h) => Some(h),
+        None => match session_bearer(&auth_state, request.headers()).await {
+            Some(bearer) => {
+                if let Ok(value) = bearer.parse() {
+                    request.headers_mut().insert(header::AUTHORIZATION, value);
+                }
+                Some(bearer)
+            }
+            None => None,
+        },
+    };
 
     let auth_header = match auth_header {
-        Some(h) => h.to_string(),
+        Some(h) => h,
         None => {
             if !auth_state
                 .audit_exclusion_filter
@@ -338,6 +383,24 @@ fn extract_operation_for_routing(
 /// `handlers::reindex`.
 const HANDLER_AUTHORIZED_OPS: [&str; 3] = ["$purge", "$reindex", "$reindex-status"];
 
+/// Operations that are read-shaped regardless of HTTP method: both
+/// `GET /{type}/$op` and `POST /{type}/{id}/$op` (and their instance-level
+/// equivalents) return data and must be authorized as `FhirOperation::Read`,
+/// never as the method-based fallthrough (`POST` → `Create`) would produce.
+///
+/// This MUST stay a narrow, explicit allowlist — add an operation only after
+/// confirming it is read-only and needs no scope of its own. A destructive or
+/// write-shaped `$`-operation (e.g. `$bulk-submit`, a genuine write) belongs in
+/// `HANDLER_AUTHORIZED_OPS` instead, with its own handler-level check.
+///
+/// `$export` (Bulk Data) is read-shaped: type-level `/{type}/$export` and
+/// Group-instance `/Group/{id}/$export` return the exported data and are
+/// authorized as a Read of the first-segment type, exactly as their `GET`
+/// forms already are, so kicking one off with `POST` needs the same read scope,
+/// not a write one (#1123). System-level `/$export` is `$`-first and so is
+/// already method-agnostic (handled by the system-path guard below).
+const READ_SHAPED_OPERATIONS: &[&str] = &["$everything", "$export"];
+
 /// Extract the FHIR resource type and operation from a request path and method.
 ///
 /// Returns `None` for system-level operations (batch, history) where
@@ -394,6 +457,18 @@ fn extract_operation(path: &str, method: &str) -> Option<(String, FhirOperation)
         .any(|s| HANDLER_AUTHORIZED_OPS.contains(s))
     {
         return None;
+    }
+
+    // Read-shaped operations (e.g. `$everything`) are authorized as Read
+    // against the resource type in the first path segment, for any HTTP
+    // method — checked before the method-based fallthrough below so a POST
+    // is not misclassified as Create. Covers both `/{type}/$op` and
+    // `/{type}/{id}/$op`.
+    if segments
+        .last()
+        .is_some_and(|s| READ_SHAPED_OPERATIONS.contains(s))
+    {
+        return Some((resource_type, FhirOperation::Read));
     }
 
     // Detect compartment search: GET /{compartment_type}/{id}/{target_type}
@@ -567,6 +642,51 @@ mod tests {
     #[test]
     fn test_extract_operation_metadata() {
         assert!(extract_operation("/metadata", "GET").is_none());
+    }
+
+    #[test]
+    fn test_extract_operation_everything_type_level() {
+        for method in ["GET", "POST"] {
+            let (rt, op) = extract_operation("/Patient/$everything", method).unwrap();
+            assert_eq!(rt, "Patient", "method={method}");
+            assert_eq!(op, FhirOperation::Read, "method={method}");
+        }
+    }
+
+    #[test]
+    fn test_extract_operation_everything_instance_level() {
+        for method in ["GET", "POST"] {
+            let (rt, op) = extract_operation("/Patient/123/$everything", method).unwrap();
+            assert_eq!(rt, "Patient", "method={method}");
+            assert_eq!(op, FhirOperation::Read, "method={method}");
+        }
+    }
+
+    #[test]
+    fn test_extract_operation_export_is_read_for_get_and_post() {
+        // $export is read-shaped: GET and POST must both authorize as a Read of
+        // the first-segment type, at type and Group-instance level (#1123).
+        for method in ["GET", "POST"] {
+            let (rt, op) = extract_operation("/Patient/$export", method).unwrap();
+            assert_eq!(rt, "Patient", "type-level method={method}");
+            assert_eq!(op, FhirOperation::Read, "type-level method={method}");
+
+            let (rt, op) = extract_operation("/Group/g1/$export", method).unwrap();
+            assert_eq!(rt, "Group", "group-instance method={method}");
+            assert_eq!(op, FhirOperation::Read, "group-instance method={method}");
+        }
+    }
+
+    #[test]
+    fn test_extract_operation_system_export_is_deferred_for_both_methods() {
+        // System-level `/$export` is `$`-first, so it returns None (no per-type
+        // check) for GET and POST alike — already method-agnostic.
+        for method in ["GET", "POST"] {
+            assert!(
+                extract_operation("/$export", method).is_none(),
+                "method={method}"
+            );
+        }
     }
 
     #[test]

@@ -541,3 +541,120 @@ async fn underscore_prefixed_tenants_remain_usable() {
         .await
         .assert_status(StatusCode::OK);
 }
+
+// ── #1078: deleting a tenant reaches the write observers ─────────────────────
+
+/// Records the tenant-level write events a delete reports, as
+/// `"erased:<tenant>"` / `"removed:<tenant>"`.
+#[derive(Default)]
+struct TenantEventRecorder {
+    events: std::sync::Mutex<Vec<String>>,
+}
+
+impl helios_persistence::core::WriteObserver for TenantEventRecorder {
+    fn on_write(&self, event: &helios_persistence::core::WriteEvent) {
+        use helios_persistence::core::{ErasedScope, WriteEvent};
+        let label = match event {
+            WriteEvent::Erased {
+                tenant,
+                scope: ErasedScope::Tenant,
+            } => format!("erased:{}", tenant.as_str()),
+            WriteEvent::TenantRemoved { tenant } => format!("removed:{}", tenant.as_str()),
+            _ => return,
+        };
+        self.events.lock().unwrap().push(label);
+    }
+}
+
+/// [`create_test_server`] with the write observers exposed: the recorder and
+/// the dashboard counters they feed.
+async fn create_observed_test_server() -> (
+    TestServer,
+    Arc<TenantEventRecorder>,
+    Arc<helios_observability::dashboard_counters::DashboardCounters>,
+) {
+    let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("data"))
+        .unwrap_or_else(|| PathBuf::from("data"));
+    let backend_config = SqliteBackendConfig {
+        data_dir: Some(data_dir),
+        ..Default::default()
+    };
+    let backend = SqliteBackend::with_config(":memory:", backend_config)
+        .expect("Failed to create SQLite backend");
+    backend.init_schema().expect("Failed to init schema");
+    let backend = Arc::new(backend);
+
+    let config = ServerConfig {
+        multitenancy: MultitenancyConfig {
+            routing_mode: TenantRoutingMode::HeaderOnly,
+            ..Default::default()
+        },
+        base_url: "http://localhost:8080".to_string(),
+        default_tenant: "default-tenant".to_string(),
+        seed_conformance: false,
+        ..ServerConfig::for_testing()
+    };
+
+    let observability = helios_rest::WriteObservability::new();
+    let recorder = Arc::new(TenantEventRecorder::default());
+    observability
+        .observers
+        .subscribe(Arc::clone(&recorder) as Arc<dyn helios_persistence::core::WriteObserver>);
+    let counters = Arc::clone(&observability.counters);
+    let state = helios_rest::AppState::new(Arc::clone(&backend), config)
+        .with_write_observability(observability);
+    let router = helios_rest::routing::fhir_routes::create_routes(state.clone())
+        .merge(helios_rest::routing::admin_tenants::routes(state));
+    (
+        TestServer::new(router).expect("Failed to create test server"),
+        recorder,
+        counters,
+    )
+}
+
+/// Deregistering a tenant reports `TenantRemoved`, which drops the tenant's
+/// dashboard counters (#1078); the data itself survives without `purge`.
+#[tokio::test]
+async fn delete_reports_tenant_removed_and_drops_its_dashboard_counters() {
+    let (server, recorder, counters) = create_observed_test_server().await;
+    server
+        .post("/admin/tenants")
+        .json(&json!({ "id": "acme" }))
+        .await
+        .assert_status(StatusCode::CREATED);
+    seed_for(&server, "acme", "Patient").await;
+    assert!(counters.tenants().contains(&"acme".to_string()));
+
+    server
+        .delete("/admin/tenants/acme")
+        .await
+        .assert_status(StatusCode::OK);
+    assert_eq!(*recorder.events.lock().unwrap(), vec!["removed:acme"]);
+    assert!(!counters.tenants().contains(&"acme".to_string()));
+}
+
+/// With `purge`, the tenant's data erasure is reported first, then its
+/// removal (#1078).
+#[tokio::test]
+async fn delete_with_purge_reports_erased_then_tenant_removed() {
+    let (server, recorder, counters) = create_observed_test_server().await;
+    server
+        .post("/admin/tenants")
+        .json(&json!({ "id": "beta" }))
+        .await
+        .assert_status(StatusCode::CREATED);
+    seed_for(&server, "beta", "Patient").await;
+
+    server
+        .delete("/admin/tenants/beta?purge=true")
+        .await
+        .assert_status(StatusCode::OK);
+    assert_eq!(
+        *recorder.events.lock().unwrap(),
+        vec!["erased:beta", "removed:beta"]
+    );
+    assert!(!counters.tenants().contains(&"beta".to_string()));
+}

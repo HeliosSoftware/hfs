@@ -4,6 +4,9 @@ on:
   workflow_dispatch:
 
 env:
+  # Rustup ranks this above a directory override left on a self-hosted runner
+  # (see ci.yml).
+  RUSTUP_TOOLCHAIN: stable
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: 1
   CARGO_PROFILE_DEV_DEBUG: 0
@@ -180,7 +183,17 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
-        backend: [sqlite, sqlite-elasticsearch, postgres, mongodb, s3-elasticsearch, cloudwatch]
+        backend:
+          [
+            sqlite,
+            sqlite-elasticsearch,
+            postgres,
+            postgres-elasticsearch,
+            mongodb,
+            mongodb-elasticsearch,
+            s3-elasticsearch,
+            cloudwatch,
+          ]
 
     steps:
       - name: Checkout code
@@ -226,7 +239,7 @@ jobs:
           fi
 
       - name: Start Elasticsearch
-        if: matrix.backend == 'sqlite-elasticsearch' || matrix.backend == 's3-elasticsearch'
+        if: endsWith(matrix.backend, '-elasticsearch')
         run: |
           ES_CONTAINER="es-audit-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}"
           docker rm -fv "$ES_CONTAINER" 2>/dev/null || true
@@ -257,9 +270,9 @@ jobs:
           exit 1
 
       - name: Start PostgreSQL
-        if: matrix.backend == 'postgres'
+        if: matrix.backend == 'postgres' || matrix.backend == 'postgres-elasticsearch'
         run: |
-          PG_CONTAINER="pg-audit-${{ github.run_id }}-${{ github.run_attempt }}"
+          PG_CONTAINER="pg-audit-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}"
           docker rm -fv "$PG_CONTAINER" 2>/dev/null || true
           docker run -d --name "$PG_CONTAINER" -p 0:5432 \
             -e POSTGRES_USER=helios \
@@ -288,9 +301,9 @@ jobs:
           exit 1
 
       - name: Start MongoDB replica set
-        if: matrix.backend == 'mongodb'
+        if: matrix.backend == 'mongodb' || matrix.backend == 'mongodb-elasticsearch'
         run: |
-          MONGO_CONTAINER="mongo-audit-${{ github.run_id }}-${{ github.run_attempt }}"
+          MONGO_CONTAINER="mongo-audit-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}"
           docker rm -fv "$MONGO_CONTAINER" 2>/dev/null || true
           docker run -d --name "$MONGO_CONTAINER" -p 0:27017 mongo:7.0 --replSet rs0 --bind_ip_all
 
@@ -475,6 +488,24 @@ jobs:
             HFS_SMART_AUTHORIZE_ENDPOINT="$AUTH_AUTHORIZE_ENDPOINT" \
             HFS_SMART_JWKS_URL="$AUTH_JWKS_URL" \
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          elif [ "${{ matrix.backend }}" = "postgres-elasticsearch" ]; then
+            HFS_STORAGE_BACKEND=postgres-elasticsearch \
+            HFS_PG_HOST="$DOCKER_HOST_IP" \
+            HFS_PG_PORT="$PG_PORT" \
+            HFS_PG_DBNAME=helios \
+            HFS_PG_USER=helios \
+            HFS_PG_PASSWORD=helios \
+            HFS_AUDIT_BACKEND=file \
+            HFS_AUDIT_FILE_PATH="$AUDIT_FILE" \
+            HFS_ENABLE_CORS=false \
+            HFS_AUTH_ENABLED=true \
+            HFS_AUTH_JWKS_URL="$AUTH_JWKS_URL" \
+            HFS_AUTH_ISSUER="$AUTH_ISSUER" \
+            HFS_SMART_TOKEN_ENDPOINT="$AUTH_TOKEN_ENDPOINT" \
+            HFS_SMART_AUTHORIZE_ENDPOINT="$AUTH_AUTHORIZE_ENDPOINT" \
+            HFS_SMART_JWKS_URL="$AUTH_JWKS_URL" \
+            HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
+            ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "mongodb" ]; then
             MONGO_HOST="${DOCKER_HOST_IP:-127.0.0.1}"
             HFS_STORAGE_BACKEND=mongodb \
@@ -489,6 +520,22 @@ jobs:
             HFS_SMART_TOKEN_ENDPOINT="$AUTH_TOKEN_ENDPOINT" \
             HFS_SMART_AUTHORIZE_ENDPOINT="$AUTH_AUTHORIZE_ENDPOINT" \
             HFS_SMART_JWKS_URL="$AUTH_JWKS_URL" \
+            ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          elif [ "${{ matrix.backend }}" = "mongodb-elasticsearch" ]; then
+            MONGO_HOST="${DOCKER_HOST_IP:-127.0.0.1}"
+            HFS_STORAGE_BACKEND=mongodb-elasticsearch \
+            HFS_DATABASE_URL="mongodb://$MONGO_HOST:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
+            HFS_MONGODB_DATABASE="helios_audit_${{ github.run_id }}_${{ github.run_attempt }}" \
+            HFS_AUDIT_BACKEND=file \
+            HFS_AUDIT_FILE_PATH="$AUDIT_FILE" \
+            HFS_ENABLE_CORS=false \
+            HFS_AUTH_ENABLED=true \
+            HFS_AUTH_JWKS_URL="$AUTH_JWKS_URL" \
+            HFS_AUTH_ISSUER="$AUTH_ISSUER" \
+            HFS_SMART_TOKEN_ENDPOINT="$AUTH_TOKEN_ENDPOINT" \
+            HFS_SMART_AUTHORIZE_ENDPOINT="$AUTH_AUTHORIZE_ENDPOINT" \
+            HFS_SMART_JWKS_URL="$AUTH_JWKS_URL" \
+            HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "s3-elasticsearch" ]; then
             HFS_STORAGE_BACKEND=s3-elasticsearch \

@@ -30,18 +30,57 @@ export async function createResource(
 export type BatchEntry = { type: string; body: Record<string, unknown> };
 
 /**
- * Create several resources in a single batch Bundle round trip, returning
- * their server-assigned ids in submission order. For tests that need many
- * resources (e.g. enough `$sql-export` subjects to keep a job genuinely
- * `in-progress` for a moment — a single tiny job finishes before the page
- * even finishes rendering), calling `createResource` in a loop is one HTTP
- * round trip per resource; this is one round trip total.
+ * Create several resources in batch Bundle round trips of `CREATE_BATCH`
+ * entries apiece, returning their server-assigned ids in submission order.
+ * For tests that need many resources (e.g. enough `$sql-export` subjects to
+ * keep a job genuinely `in-progress` for a moment — a single tiny job
+ * finishes before the page even finishes rendering), calling
+ * `createResource` in a loop is one HTTP round trip per resource; this is
+ * one round trip per chunk.
+ *
+ * `onChunk` receives the ids each chunk created as soon as that chunk lands
+ * — including the entries that did succeed in a chunk that then throws — so
+ * a spec can register them for cleanup incrementally: a failure in chunk N
+ * still leaves chunks 0..N-1 known and deletable. A chunk whose whole
+ * request fails (e.g. a `408`) reports nothing, and the server may still be
+ * committing it; pair this with [`deleteByNamePrefix`] for those.
  */
 export async function createResources(
   request: APIRequestContext,
   entries: BatchEntry[],
   tenant?: string,
+  onChunk?: (ids: string[]) => void,
 ): Promise<string[]> {
+  // One request per CREATE_BATCH entries, for the same reason as
+  // `deleteResources`: a batch runs its entries at the backend's write
+  // concurrency inside the server's 30s request timeout, and on the ES
+  // composites (synchronous sync, `wait_for` refreshed writes) a 200-entry
+  // padding batch ran past it — a 408 while the server kept committing,
+  // leaking every entry the caller never learned the id of (#1070).
+  const ids: string[] = [];
+  for (let start = 0; start < entries.length; start += CREATE_BATCH) {
+    const chunkIds = await createBatch(
+      request,
+      entries.slice(start, start + CREATE_BATCH),
+      start,
+      tenant,
+      onChunk,
+    );
+    ids.push(...chunkIds);
+  }
+  return ids;
+}
+
+const CREATE_BATCH = 25;
+
+async function createBatch(
+  request: APIRequestContext,
+  entries: BatchEntry[],
+  offset: number,
+  tenant?: string,
+  onChunk?: (ids: string[]) => void,
+): Promise<string[]> {
+  if (entries.length === 0) return [];
   const bundle = {
     resourceType: "Bundle",
     type: "batch",
@@ -61,19 +100,27 @@ export async function createResources(
   if (!res.ok()) throw new Error(`batch create -> ${res.status()}: ${await res.text()}`);
   type BatchResponseEntry = { response?: { status?: string; location?: string } };
   const responseEntries = ((await res.json()).entry ?? []) as BatchResponseEntry[];
-  return responseEntries.map((entry, index) => {
+  const ids: string[] = [];
+  const failures: string[] = [];
+  for (const [i, entry] of responseEntries.entries()) {
+    const index = offset + i;
     const status = entry.response?.status ?? "";
     if (!status.startsWith("201")) {
-      throw new Error(`batch entry ${index} (${entries[index]?.type}) failed: ${status}`);
+      failures.push(`batch entry ${index} (${entries[i]?.type}) failed: ${status}`);
+      continue;
     }
     // `Location: {Type}/{id}/_history/{version}`.
     const location = entry.response?.location ?? "";
     const id = location.split("/")[1];
     if (!id) {
-      throw new Error(`batch entry ${index} had no usable Location: ${location}`);
+      failures.push(`batch entry ${index} had no usable Location: ${location}`);
+      continue;
     }
-    return id;
-  });
+    ids.push(id);
+  }
+  onChunk?.(ids);
+  if (failures.length > 0) throw new Error(failures[0]);
+  return ids;
 }
 
 /**
@@ -137,6 +184,60 @@ async function deleteBatch(
       throw new Error(`batch delete entry ${index} (${type}/${ids[index]}) failed: ${status}`);
     }
   });
+}
+
+/**
+ * Delete every `type` resource whose `name` starts with `prefix`. The
+ * backstop for [`createResources`] padding: a batch whose request failed
+ * outright (e.g. a `408` past the server's request timeout) never told the
+ * spec its ids, yet the server may have committed its entries anyway, so a
+ * spec that names its padding under a per-run prefix sweeps that prefix
+ * here too.
+ *
+ * Searches `name=<prefix>` (FHIR's default string search: a case- and
+ * accent-insensitive starts-with) and re-checks `name.startsWith(prefix)`
+ * on each hit, since that match is looser than an exact prefix. Every page
+ * is collected (following `link[relation=next]`, path and query only, so a
+ * server-advertised base URL never matters) before anything is deleted: an
+ * offset-paged search would skip rows if the set shrank under it.
+ */
+export async function deleteByNamePrefix(
+  request: APIRequestContext,
+  type: string,
+  prefix: string,
+  tenant?: string,
+): Promise<void> {
+  const headers = { Accept: FHIR_JSON, ...(tenant ? { "X-Tenant-ID": tenant } : {}) };
+  const ids = new Set<string>();
+  const seen = new Set<string>();
+  let url: string | undefined =
+    `/${type}?name=${encodeURIComponent(prefix)}&_count=${SWEEP_PAGE}`;
+  while (url && !seen.has(url)) {
+    seen.add(url);
+    const res = await request.get(url, { headers });
+    if (!res.ok()) throw new Error(`search ${url} -> ${res.status()}: ${await res.text()}`);
+    type SearchBundle = {
+      entry?: { resource?: { id?: string; name?: string } }[];
+      link?: { relation?: string; url?: string }[];
+    };
+    const bundle = (await res.json()) as SearchBundle;
+    for (const { resource } of bundle.entry ?? []) {
+      if (resource?.id && resource.name?.startsWith(prefix)) ids.add(resource.id);
+    }
+    const next = bundle.link?.find((link) => link.relation === "next")?.url;
+    url = next ? pathAndQuery(next) : undefined;
+  }
+  await deleteResources(request, type, [...ids], tenant);
+}
+
+const SWEEP_PAGE = 100;
+
+/** `https://host/a/b?c` -> `/a/b?c`; an already-relative link passes through. */
+function pathAndQuery(link: string): string {
+  const scheme = link.indexOf("://");
+  if (scheme < 0) return link.startsWith("/") ? link : `/${link}`;
+  const slash = link.indexOf("/", scheme + 3);
+  return slash < 0 ? "/" : link.slice(slash);
 }
 
 /** PUT a resource, minting a new version. */

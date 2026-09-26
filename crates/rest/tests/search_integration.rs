@@ -312,6 +312,32 @@ fn get_bundle_total(body: &Value) -> Option<i64> {
     body["total"].as_i64()
 }
 
+/// Returns the bundle's `self` link URL.
+fn self_link(body: &Value) -> String {
+    body["link"]
+        .as_array()
+        .and_then(|links| links.iter().find(|l| l["relation"] == "self"))
+        .and_then(|l| l["url"].as_str())
+        .expect("searchset must carry a self link")
+        .to_string()
+}
+
+/// Returns the `search.mode = outcome` entries of a searchset bundle.
+fn outcome_entries(body: &Value) -> Vec<&Value> {
+    get_bundle_entries(body)
+        .into_iter()
+        .filter(|e| e["search"]["mode"] == "outcome")
+        .collect()
+}
+
+/// Returns the `search.mode = match` entries of a searchset bundle.
+fn match_entries(body: &Value) -> Vec<&Value> {
+    get_bundle_entries(body)
+        .into_iter()
+        .filter(|e| e["search"]["mode"] == "match")
+        .collect()
+}
+
 // =============================================================================
 // Basic Search Tests
 // =============================================================================
@@ -353,8 +379,8 @@ mod basic_search {
         let patient_count = get_bundle_entries(&baseline).len() as i64;
         assert!(patient_count > 0, "fixture should seed patients");
         assert!(
-            baseline["total"].is_null(),
-            "Bundle.total should be absent without _total"
+            baseline.get("total").is_none(),
+            "Bundle.total should be absent (not null) without _total: {baseline}"
         );
 
         // _total=accurate -> Bundle.total present and equal to the match count.
@@ -404,24 +430,6 @@ mod basic_search {
             )
             .await;
         ok.assert_status_ok();
-    }
-
-    /// Returns the bundle's `self` link URL.
-    fn self_link(body: &Value) -> String {
-        body["link"]
-            .as_array()
-            .and_then(|links| links.iter().find(|l| l["relation"] == "self"))
-            .and_then(|l| l["url"].as_str())
-            .expect("searchset must carry a self link")
-            .to_string()
-    }
-
-    /// Returns the `search.mode = outcome` entries of a searchset bundle.
-    fn outcome_entries(body: &Value) -> Vec<&Value> {
-        get_bundle_entries(body)
-            .into_iter()
-            .filter(|e| e["search"]["mode"] == "outcome")
-            .collect()
     }
 
     #[tokio::test]
@@ -898,6 +906,110 @@ mod string_search {
                 .contains("above")
         );
     }
+
+    /// #1318: an unknown modifier on a direct parameter used to be dropped, so
+    /// `name:exat=Smith` ran as `name=Smith`. It is a 400 over GET and POST,
+    /// under either `Prefer: handling` mode — the parameter is one the server
+    /// understands, so there is nothing to leniently ignore.
+    #[tokio::test]
+    async fn test_unknown_modifier_on_direct_param_returns_400() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        // Positive control: the unmodified search finds seeded patients, so a
+        // dropped modifier would have returned 200 with these.
+        let control = server
+            .get("/Patient?name=Smith")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        control.assert_status_ok();
+        assert!(!get_bundle_entries(&control.json::<Value>()).is_empty());
+
+        let assert_rejected = |body: Value, param: &str, suffix: &str| {
+            assert_eq!(body["resourceType"], "OperationOutcome");
+            assert_eq!(body["issue"][0]["severity"], "error");
+            assert_eq!(body["issue"][0]["code"], "invalid");
+            let text = body["issue"][0]["details"]["text"].as_str().unwrap();
+            assert!(text.contains(param), "{text}");
+            assert!(text.contains(suffix), "{text}");
+        };
+
+        for handling in ["handling=lenient", "handling=strict"] {
+            for (path, key, param, suffix) in [
+                ("/Patient", "name:bogus", "name", ":bogus"),
+                ("/Patient", "name:exat", "name", ":exat"),
+                // Capitalised, but not a resource type.
+                ("/Observation", "subject:Bogus", "subject", ":Bogus"),
+            ] {
+                let response = server
+                    .get(&format!("{path}?{key}=Smith"))
+                    .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                    .add_header(
+                        HeaderName::from_static("prefer"),
+                        HeaderValue::from_static(handling),
+                    )
+                    .await;
+                response.assert_status(StatusCode::BAD_REQUEST);
+                assert_rejected(response.json(), param, suffix);
+
+                let response = server
+                    .post(&format!("{path}/_search"))
+                    .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                    .add_header(
+                        HeaderName::from_static("prefer"),
+                        HeaderValue::from_static(handling),
+                    )
+                    .form(&[(key, "Smith")])
+                    .await;
+                response.assert_status(StatusCode::BAD_REQUEST);
+                assert_rejected(response.json(), param, suffix);
+            }
+        }
+    }
+
+    /// #1318: an unknown modifier on an unknown *parameter* follows the
+    /// unknown-parameter rule — ignored and reported under lenient handling,
+    /// rejected as an unknown parameter under strict.
+    #[tokio::test]
+    async fn test_unknown_modifier_on_unknown_param_follows_unknown_param_rule() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let control = server
+            .get("/Patient")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        control.assert_status_ok();
+        let all = get_bundle_entries(&control.json::<Value>()).len();
+        assert!(all > 0);
+
+        let lenient = server
+            .get("/Patient?nosuchparam:bogus=x")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        lenient.assert_status_ok();
+        let body: Value = lenient.json();
+        let matches = get_bundle_entries(&body)
+            .into_iter()
+            .filter(|e| e["resource"]["resourceType"] == "Patient")
+            .count();
+        assert_eq!(matches, all, "the unknown parameter is ignored");
+
+        let strict = server
+            .get("/Patient?nosuchparam:bogus=x")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                HeaderName::from_static("prefer"),
+                HeaderValue::from_static("handling=strict"),
+            )
+            .await;
+        strict.assert_status(StatusCode::BAD_REQUEST);
+        let text = strict.json::<Value>()["issue"][0]["details"]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(text.contains("unknown search parameter"), "{text}");
+    }
 }
 
 // =============================================================================
@@ -1265,6 +1377,452 @@ mod date_search {
         let entries = get_bundle_entries(&body);
         // Patients born before 1985: patient-1 (1980), patient-3 (1975)
         assert!(entries.len() >= 2);
+    }
+
+    /// The date values no backend may accept, with the comparator prefixes the
+    /// issues reported them under.
+    const INVALID_DATE_VALUES: &[&str] = &[
+        "not-a-date",
+        "ltnot-a-date",
+        "gtnot-a-date",
+        "gtabcd",
+        "lt2024-1x",
+        "gt2024-13-45",
+        "ne2024-13-45",
+        // SQLite's `datetime()` used to roll this over to March 1st (#1295).
+        "lt2024-02-30",
+        "ltT25:00:00Z",
+        // An hour needs minutes; minutes without seconds are fine.
+        "2013-04-05T10",
+    ];
+
+    fn assert_invalid_date_outcome(response: &axum_test::TestResponse, context: &str) {
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let body: Value = response.json();
+        assert_eq!(body["resourceType"], "OperationOutcome", "{context}");
+        assert_eq!(body["issue"][0]["code"], "invalid", "{context}");
+        let text = body["issue"][0]["diagnostics"]
+            .as_str()
+            .or_else(|| body["issue"][0]["details"]["text"].as_str())
+            .unwrap_or_default();
+        assert!(
+            text.contains("not a valid FHIR date"),
+            "{context}: the outcome should say what is wrong, got {body}"
+        );
+    }
+
+    /// #1289, #1293, #1295: a value that is not a date never reaches a storage
+    /// backend. PostgreSQL used to replace it with the current time and
+    /// Elasticsearch with the year 2000, so the client got a plausible 200.
+    #[tokio::test]
+    async fn test_invalid_date_value_is_a_400_not_a_search() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        for value in INVALID_DATE_VALUES {
+            for param in ["birthdate", "_lastUpdated"] {
+                let query = format!("/Patient?{param}={value}");
+                let response = server
+                    .get(&query)
+                    .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                    .await;
+                assert_invalid_date_outcome(&response, &query);
+            }
+        }
+    }
+
+    /// The same values through POST `_search`, which has its own form decoding.
+    #[tokio::test]
+    async fn test_invalid_date_value_is_a_400_on_post_search() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        for value in INVALID_DATE_VALUES {
+            for param in ["birthdate", "_lastUpdated"] {
+                let response = server
+                    .post("/Patient/_search")
+                    .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                    .form(&[(param, value)])
+                    .await;
+                assert_invalid_date_outcome(&response, &format!("POST {param}={value}"));
+            }
+        }
+    }
+
+    /// An invalid value is a 400 whatever the client's `Prefer: handling`:
+    /// lenient handling is for parameters the server does not know, not for
+    /// values it cannot read.
+    #[tokio::test]
+    async fn test_invalid_date_value_is_a_400_under_lenient_handling() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        for handling in ["handling=lenient", "handling=strict"] {
+            let response = server
+                .get("/Patient?birthdate=lt2024-02-30")
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .add_header(
+                    axum::http::header::HeaderName::from_static("prefer"),
+                    HeaderValue::from_static(handling),
+                )
+                .await;
+            assert_invalid_date_outcome(&response, handling);
+        }
+    }
+
+    /// A chained terminal is typed only when the chain is resolved, so it is
+    /// the storage gate that rejects it. (Valid prefixed terminals are #1292.)
+    #[tokio::test]
+    async fn test_invalid_chained_date_value_is_a_400() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let query = "/Observation?subject:Patient.birthdate=not-a-date";
+        let response = server
+            .get(query)
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        assert_invalid_date_outcome(&response, query);
+    }
+
+    /// Seeds one Procedure performed at `2013-04-05T13:20:00Z`, written with a
+    /// positive offset.
+    async fn seed_procedure_with_positive_offset(backend: &SqliteBackend) {
+        backend
+            .create(
+                &test_tenant(),
+                "Procedure",
+                json!({
+                    "resourceType": "Procedure",
+                    "id": "proc-plus",
+                    "status": "completed",
+                    "subject": {"reference": "Patient/patient-1"},
+                    "performedDateTime": "2013-04-05T18:50:00+05:30"
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed procedure");
+    }
+
+    fn assert_finds_the_procedure(response: &axum_test::TestResponse, context: &str) {
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+        assert_eq!(entries.len(), 1, "{context}: {body}");
+        assert_eq!(entries[0]["resource"]["id"], "proc-plus", "{context}");
+    }
+
+    /// #1296: a `+` offset sent without percent-encoding is form-decoded into
+    /// a space. It used to be an empty 200 on SQLite and PostgreSQL, a 400 on
+    /// MongoDB and a 500 on Elasticsearch; it is now read as the `+` it was.
+    #[tokio::test]
+    async fn test_literal_plus_offset_finds_the_resource() {
+        let (server, backend) = create_test_server().await;
+        seed_procedure_with_positive_offset(&backend).await;
+
+        for query in [
+            // Positive control: properly encoded.
+            "/Procedure?date=2013-04-05T18:50:00%2B05:30",
+            // The literal `+`, under no prefix and under one.
+            "/Procedure?date=2013-04-05T18:50:00+05:30",
+            "/Procedure?date=ge2013-04-05T18:50:00+05:30",
+            "/Procedure?date=eq2013-04-05T18:50+05:30",
+            // The same instant in another zone.
+            "/Procedure?date=2013-04-05T09:20:00-04:00",
+        ] {
+            let response = server
+                .get(query)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            assert_finds_the_procedure(&response, query);
+        }
+
+        // The repair restores an offset; it does not make a wrong one match.
+        let response = server
+            .get("/Procedure?date=2013-04-05T18:50:00+05:00")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        assert_eq!(get_bundle_entries(&response.json::<Value>()).len(), 0);
+    }
+
+    /// The same through a POST `_search` body, which is form-decoded too.
+    #[tokio::test]
+    async fn test_literal_plus_offset_finds_the_resource_on_post_search() {
+        let (server, backend) = create_test_server().await;
+        seed_procedure_with_positive_offset(&backend).await;
+
+        for body in [
+            "date=2013-04-05T18:50:00%2B05:30",
+            "date=2013-04-05T18:50:00+05:30",
+        ] {
+            let response = server
+                .post("/Procedure/_search")
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                // `text` sets `text/plain`; the form content type goes after.
+                .text(body)
+                .content_type("application/x-www-form-urlencoded")
+                .await;
+            assert_finds_the_procedure(&response, body);
+        }
+    }
+
+    /// The self link must describe the search that ran, and must round-trip:
+    /// the repaired value is re-encoded, not echoed with a bare space or `+`.
+    #[tokio::test]
+    async fn test_literal_plus_offset_self_link_round_trips() {
+        let (server, backend) = create_test_server().await;
+        seed_procedure_with_positive_offset(&backend).await;
+
+        let response = server
+            .get("/Procedure?date=2013-04-05T18:50:00+05:30")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let self_link = body["link"]
+            .as_array()
+            .and_then(|links| links.iter().find(|l| l["relation"] == "self"))
+            .and_then(|l| l["url"].as_str())
+            .expect("self link")
+            .to_string();
+
+        let path = self_link
+            .strip_prefix("http://localhost:8080")
+            .unwrap_or(&self_link);
+        let again = server
+            .get(path)
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        assert_finds_the_procedure(&again, &self_link);
+    }
+
+    /// Minute precision is valid in FHIR search, unlike the dateTime datatype.
+    #[tokio::test]
+    async fn test_minute_precision_date_value_is_accepted() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let response = server
+            .get("/Patient?birthdate=lt2013-04-05T09:20")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+    }
+
+    /// #1319: a number or quantity value whose number part is not a number
+    /// never reaches a storage backend. PostgreSQL and Elasticsearch used to
+    /// skip it, turning `value-quantity=abc` into an unconstrained search.
+    #[tokio::test]
+    async fn test_invalid_number_or_quantity_value_is_a_400_not_a_search() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        // Positive control: the valid forms still search.
+        for query in [
+            "/Observation?value-quantity=gt70",
+            "/Observation?value-quantity=72%7C%7Cbpm",
+            "/Observation?value-quantity=le1e3",
+            "/RiskAssessment?probability=gt0.5",
+        ] {
+            let response = server
+                .get(query)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            response.assert_status_ok();
+        }
+        let response = server
+            .get("/Observation?value-quantity=gt70")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        let body: Value = response.json();
+        assert!(!get_bundle_entries(&body).is_empty());
+
+        let assert_invalid = |response: axum_test::TestResponse, context: String| {
+            response.assert_status(StatusCode::BAD_REQUEST);
+            let body: Value = response.json();
+            assert_eq!(body["resourceType"], "OperationOutcome", "{context}");
+            assert_eq!(body["issue"][0]["code"], "invalid", "{context}");
+        };
+
+        for query in [
+            "/RiskAssessment?probability=abc",
+            "/RiskAssessment?probability=gtabc",
+            "/RiskAssessment?probability=1e",
+            "/RiskAssessment?probability=ltinf",
+            "/Observation?value-quantity=abc",
+            "/Observation?value-quantity=neabc",
+            "/Observation?value-quantity=abc%7Chttp://unitsofmeasure.org%7Cmg",
+            "/Observation?value-quantity=gt%7Chttp://unitsofmeasure.org%7Cmg",
+            "/Observation?value-quantity=nenan%7C%7Cmg",
+        ] {
+            let response = server
+                .get(query)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            assert_invalid(response, format!("GET {query}"));
+        }
+
+        for (path, name, value) in [
+            ("/RiskAssessment/_search", "probability", "abc"),
+            ("/RiskAssessment/_search", "probability", "neabc"),
+            ("/Observation/_search", "value-quantity", "abc"),
+            (
+                "/Observation/_search",
+                "value-quantity",
+                "gt|http://unitsofmeasure.org|mg",
+            ),
+        ] {
+            let response = server
+                .post(path)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .form(&[(name, value)])
+                .await;
+            assert_invalid(response, format!("POST {path} {name}={value}"));
+        }
+    }
+
+    fn assert_invalid_number_outcome(response: &axum_test::TestResponse, context: &str) {
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let body: Value = response.json();
+        assert_eq!(body["resourceType"], "OperationOutcome", "{context}");
+        assert_eq!(body["issue"][0]["code"], "invalid", "{context}");
+        let text = body["issue"][0]["diagnostics"]
+            .as_str()
+            .or_else(|| body["issue"][0]["details"]["text"].as_str())
+            .unwrap_or_default();
+        assert!(
+            text.contains("not a valid number"),
+            "{context}: the outcome should say what is wrong, got {body}"
+        );
+    }
+
+    /// #1340: the values `f64::from_str` takes for numbers — as a bound they
+    /// match every row — an empty value, and a composite's numeric component,
+    /// over GET and POST `_search`, whatever the client's `Prefer: handling`:
+    /// lenient handling is for parameters the server does not know, not for
+    /// values it cannot read.
+    #[tokio::test]
+    async fn test_invalid_number_is_a_400_from_the_shared_gate() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        for (path, name, value) in [
+            ("/RiskAssessment", "probability", "inf"),
+            ("/RiskAssessment", "probability", "lt-inf"),
+            ("/RiskAssessment", "probability", "neNaN"),
+            ("/RiskAssessment", "probability", "lt1e999"),
+            ("/RiskAssessment", "probability", "0x10"),
+            // (`probability=`, no value at all, is an empty parameter and
+            // ignored — #1380, `empty_search_values.rs`. A prefix with no
+            // number is not.)
+            ("/RiskAssessment", "probability", "gt"),
+            ("/Observation", "value-quantity", "ltinf||mg"),
+            ("/Observation", "value-quantity", "||mg"),
+            ("/Observation", "value-quantity", "5.4\\|mg"),
+            ("/Observation", "code-value-quantity", "8480-6$abc"),
+            ("/Observation", "code-value-quantity", "8480-6$ltinf||mg"),
+        ] {
+            for handling in ["handling=lenient", "handling=strict"] {
+                let response = server
+                    .get(path)
+                    .add_query_param(name, value)
+                    .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                    .add_header(
+                        axum::http::header::HeaderName::from_static("prefer"),
+                        HeaderValue::from_static(handling),
+                    )
+                    .await;
+                assert_invalid_number_outcome(&response, &format!("GET {name}={value} {handling}"));
+
+                let response = server
+                    .post(&format!("{path}/_search"))
+                    .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                    .add_header(
+                        axum::http::header::HeaderName::from_static("prefer"),
+                        HeaderValue::from_static(handling),
+                    )
+                    .form(&[(name, value)])
+                    .await;
+                assert_invalid_number_outcome(
+                    &response,
+                    &format!("POST {name}={value} {handling}"),
+                );
+            }
+        }
+    }
+
+    /// A chained or `_has` terminal is typed only when the chain is resolved,
+    /// so it is the storage gate that rejects it.
+    #[tokio::test]
+    async fn test_invalid_chained_number_value_is_a_400() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        for (path, name, value) in [
+            ("/DiagnosticReport", "result.value-quantity", "abc"),
+            (
+                "/DiagnosticReport",
+                "result:Observation.value-quantity",
+                "ltinf",
+            ),
+            ("/Patient", "_has:Observation:subject:value-quantity", "abc"),
+            (
+                "/Patient",
+                "_has:Observation:subject:value-quantity",
+                "ltinf||mg",
+            ),
+            (
+                "/Patient",
+                "_has:RiskAssessment:subject:probability",
+                "nenan",
+            ),
+        ] {
+            let response = server
+                .get(path)
+                .add_query_param(name, value)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            assert_invalid_number_outcome(&response, &format!("GET {path}?{name}={value}"));
+        }
+
+        // Positive control: the valid forms of the same searches run.
+        for (path, name, value) in [
+            ("/DiagnosticReport", "result.value-quantity", "gt1"),
+            ("/Patient", "_has:Observation:subject:value-quantity", "gt1"),
+        ] {
+            let response = server
+                .get(path)
+                .add_query_param(name, value)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            response.assert_status_ok();
+        }
+    }
+
+    /// A `+` that form-decoding turned into a space is still the number the
+    /// client wrote.
+    #[tokio::test]
+    async fn test_literal_plus_in_a_number_is_accepted() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        for query in [
+            "/Observation?value-quantity=lt1e+3",
+            "/Observation?value-quantity=gt+70",
+            "/Observation?value-quantity=+72",
+        ] {
+            let response = server
+                .get(query)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            response.assert_status_ok();
+            assert!(
+                !get_bundle_entries(&response.json::<Value>()).is_empty(),
+                "{query} should find the seeded heart rate"
+            );
+        }
     }
 }
 
@@ -1692,6 +2250,182 @@ mod compartment_search {
             );
         }
     }
+
+    #[tokio::test]
+    async fn test_compartment_unknown_param_lenient_ignored_strict_rejected() {
+        // Compartment search used to hand an unrecognized parameter straight to
+        // the backend: no 400 under strict handling, and under lenient handling
+        // a silent empty result set whose self link still claimed the filter.
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let lenient = server
+            .get("/Patient/patient-1/Observation?nonsense-param=foo")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        lenient.assert_status_ok();
+
+        let strict = server
+            .get("/Patient/patient-1/Observation?nonsense-param=foo")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                HeaderName::from_static("prefer"),
+                HeaderValue::from_static("handling=strict"),
+            )
+            .await;
+        assert_eq!(
+            strict.status_code(),
+            StatusCode::BAD_REQUEST,
+            "unknown compartment parameter must be rejected under Prefer: handling=strict"
+        );
+
+        // A parameter the target type does know is accepted even under strict.
+        let ok = server
+            .get("/Patient/patient-1/Observation?code=8867-4")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                HeaderName::from_static("prefer"),
+                HeaderValue::from_static("handling=strict"),
+            )
+            .await;
+        ok.assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn test_compartment_unknown_underscore_param_rejected_under_strict() {
+        // `_`-prefixed names are not a bypass here either (#524 for the
+        // type-level path).
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        for param in ["_typo=foo", "_whatever=foo"] {
+            let strict = server
+                .get(&format!("/Patient/patient-1/Observation?{param}"))
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .add_header(
+                    HeaderName::from_static("prefer"),
+                    HeaderValue::from_static("handling=strict"),
+                )
+                .await;
+            assert_eq!(
+                strict.status_code(),
+                StatusCode::BAD_REQUEST,
+                "{param} must be rejected under Prefer: handling=strict"
+            );
+        }
+
+        // Global parameters the server does honour still pass.
+        for param in ["_id=obs-1", "_lastUpdated=gt2000-01-01"] {
+            let ok = server
+                .get(&format!("/Patient/patient-1/Observation?{param}"))
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .add_header(
+                    HeaderName::from_static("prefer"),
+                    HeaderValue::from_static("handling=strict"),
+                )
+                .await;
+            ok.assert_status_ok();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_compartment_ignored_param_dropped_from_self_link_and_reported() {
+        // Under lenient handling an unsupported parameter may be ignored only if
+        // the server says so: it must not appear in the self link, it must be
+        // reported as an OperationOutcome entry, and "ignored" must be literal —
+        // the compartment result set is the same as without it.
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let unfiltered: Value = server
+            .get("/Patient/patient-1/Observation")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await
+            .json();
+        let total = match_entries(&unfiltered).len();
+        assert!(total > 0, "fixture should seed patient-1 observations");
+
+        for query in ["_typo=foo", "nonsense-param=foo"] {
+            let response = server
+                .get(&format!("/Patient/patient-1/Observation?{query}"))
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            response.assert_status_ok();
+            let body: Value = response.json();
+
+            let link = self_link(&body);
+            assert!(
+                !link.contains("typo") && !link.contains("nonsense-param"),
+                "self link must not echo the ignored parameter ({query}): {link}"
+            );
+
+            let outcomes = outcome_entries(&body);
+            assert_eq!(
+                outcomes.len(),
+                1,
+                "ignored parameter must be reported ({query})"
+            );
+            let issue = &outcomes[0]["resource"]["issue"][0];
+            assert_eq!(issue["severity"], "warning");
+            assert_eq!(issue["code"], "not-supported");
+            let text = issue["details"]["text"].as_str().unwrap_or_default();
+            assert!(
+                text.contains(query.split('=').next().unwrap()),
+                "outcome must name the ignored parameter: {text}"
+            );
+
+            assert_eq!(
+                match_entries(&body).len(),
+                total,
+                "ignored parameter must not filter the compartment ({query})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_compartment_all_types_unknown_param() {
+        // `GET [compartment]/[id]/*` applies the same rule, but a parameter only
+        // counts as unknown when NO member type knows it.
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let strict = server
+            .get("/Patient/patient-1/*?nonsense-param=foo")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                HeaderName::from_static("prefer"),
+                HeaderValue::from_static("handling=strict"),
+            )
+            .await;
+        assert_eq!(strict.status_code(), StatusCode::BAD_REQUEST);
+
+        // `code` is not a Patient parameter, but it is an Observation one, and
+        // the member types that cannot satisfy it are simply skipped. Rejecting
+        // it here would break `*` for a parameter the single-type search accepts.
+        let known_to_one_member = server
+            .get("/Patient/patient-1/*?code=8867-4")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                HeaderName::from_static("prefer"),
+                HeaderValue::from_static("handling=strict"),
+            )
+            .await;
+        known_to_one_member.assert_status_ok();
+
+        // Lenient: ignored, reported, and absent from the self link.
+        let response = server
+            .get("/Patient/patient-1/*?nonsense-param=foo")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        assert!(
+            !self_link(&body).contains("nonsense-param"),
+            "self link must not echo the ignored parameter: {}",
+            self_link(&body)
+        );
+        assert_eq!(outcome_entries(&body).len(), 1);
+    }
 }
 
 // =============================================================================
@@ -2068,6 +2802,899 @@ mod chaining {
         }
     }
 
+    /// Two patients with two Procedures each, plus an Encounter and an
+    /// Observation per patient for the multi-hop case (#1292).
+    async fn seed_dated_chain_data(backend: &SqliteBackend) {
+        let tenant = test_tenant();
+        let resources = [
+            json!({"resourceType": "Patient", "id": "p80", "birthDate": "1980-05-06",
+                   "name": [{"family": "Lee"}]}),
+            json!({"resourceType": "Patient", "id": "p90", "birthDate": "1990-01-01",
+                   "name": [{"family": "Gert"}]}),
+            json!({"resourceType": "Procedure", "id": "pr1", "status": "completed",
+                   "subject": {"reference": "Patient/p80"},
+                   "performedDateTime": "2013-04-05T09:20:00-04:00"}),
+            json!({"resourceType": "Procedure", "id": "pr2", "status": "completed",
+                   "subject": {"reference": "Patient/p80"},
+                   "performedDateTime": "2013-04-05"}),
+            json!({"resourceType": "Procedure", "id": "pr3", "status": "completed",
+                   "subject": {"reference": "Patient/p90"},
+                   "performedDateTime": "2020-06-01T10:00:00+05:30"}),
+            json!({"resourceType": "Procedure", "id": "pr4", "status": "completed",
+                   "subject": {"reference": "Patient/p90"},
+                   "performedDateTime": "2021-02-03"}),
+            json!({"resourceType": "Encounter", "id": "e80", "status": "finished",
+                   "class": {"code": "AMB"},
+                   "subject": {"reference": "Patient/p80"}}),
+            json!({"resourceType": "Encounter", "id": "e90", "status": "finished",
+                   "class": {"code": "AMB"},
+                   "subject": {"reference": "Patient/p90"}}),
+            json!({"resourceType": "Observation", "id": "ob80", "status": "final",
+                   "code": {"text": "hr"},
+                   "subject": {"reference": "Patient/p80"},
+                   "encounter": {"reference": "Encounter/e80"},
+                   "valueQuantity": {"value": 60, "unit": "bpm"}}),
+            json!({"resourceType": "Observation", "id": "ob90", "status": "final",
+                   "code": {"text": "hr"},
+                   "subject": {"reference": "Patient/p90"},
+                   "encounter": {"reference": "Encounter/e90"},
+                   "valueQuantity": {"value": 90, "unit": "bpm"}}),
+        ];
+        for resource in resources {
+            let resource_type = resource["resourceType"].as_str().unwrap().to_string();
+            backend
+                .create(&tenant, &resource_type, resource, FhirVersion::R4)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Sorted ids of a search that must succeed.
+    async fn ids(server: &TestServer, url: &str) -> Vec<String> {
+        let response = server
+            .get(url)
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let mut ids: Vec<String> = get_bundle_entries(&body)
+            .iter()
+            .map(|e| e["resource"]["id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// #1292: the terminal parameter of a forward chain is parsed like the
+    /// same parameter in a direct search — comparator prefix and OR list.
+    #[tokio::test]
+    async fn test_chained_terminal_value_prefix_and_or_list() {
+        let (server, backend) = create_test_server().await;
+        seed_dated_chain_data(&backend).await;
+        let all = ["pr1", "pr2", "pr3", "pr4"];
+
+        assert_eq!(
+            ids(&server, "/Procedure?subject:Patient.birthdate=1980-05-06").await,
+            ["pr1", "pr2"]
+        );
+        assert_eq!(
+            ids(&server, "/Procedure?subject:Patient.birthdate=ge1980-01-01").await,
+            all
+        );
+        assert_eq!(
+            ids(&server, "/Procedure?subject:Patient.birthdate=eq1980-05-06").await,
+            ["pr1", "pr2"]
+        );
+        assert_eq!(
+            ids(&server, "/Procedure?subject:Patient.birthdate=lt1985-01-01").await,
+            ["pr1", "pr2"]
+        );
+        // Untyped chain, same answer.
+        assert_eq!(
+            ids(&server, "/Procedure?subject.birthdate=ge1985-01-01").await,
+            ["pr3", "pr4"]
+        );
+        // Every value of the OR list counts, not just the first.
+        assert_eq!(
+            ids(
+                &server,
+                "/Procedure?subject:Patient.birthdate=1980-05-06,1990-01-01"
+            )
+            .await,
+            all
+        );
+        // It agrees with the equivalent direct search.
+        assert_eq!(
+            ids(&server, "/Patient?birthdate=ge1985-01-01").await,
+            ["p90"]
+        );
+        // Multi-hop.
+        assert_eq!(
+            ids(
+                &server,
+                "/Observation?encounter.subject.birthdate=ge1985-01-01"
+            )
+            .await,
+            ["ob90"]
+        );
+        // Quantity terminal.
+        assert_eq!(
+            ids(
+                &server,
+                "/Encounter?_has:Observation:encounter:value-quantity=gt70"
+            )
+            .await,
+            ["e90"]
+        );
+        // Chained _lastUpdated.
+        assert_eq!(
+            ids(
+                &server,
+                "/Procedure?subject:Patient._lastUpdated=ge2000-01-01"
+            )
+            .await,
+            all
+        );
+        assert!(
+            ids(
+                &server,
+                "/Procedure?subject:Patient._lastUpdated=lt2000-01-01"
+            )
+            .await
+            .is_empty()
+        );
+        // A string terminal that starts with comparator letters is untouched.
+        assert_eq!(
+            ids(&server, "/Procedure?subject:Patient.family=Lee").await,
+            ["pr1", "pr2"]
+        );
+        assert_eq!(
+            ids(&server, "/Procedure?subject:Patient.family=gert").await,
+            ["pr3", "pr4"]
+        );
+    }
+
+    /// #1292: same for the terminal parameter of `_has`.
+    #[tokio::test]
+    async fn test_has_terminal_value_prefix_and_or_list() {
+        let (server, backend) = create_test_server().await;
+        seed_dated_chain_data(&backend).await;
+
+        assert_eq!(
+            ids(&server, "/Patient?_has:Procedure:subject:date=ge2013-01-01").await,
+            ["p80", "p90"]
+        );
+        assert_eq!(
+            ids(&server, "/Patient?_has:Procedure:subject:date=ge2020-01-01").await,
+            ["p90"]
+        );
+        assert_eq!(
+            ids(&server, "/Patient?_has:Procedure:subject:date=lt2014").await,
+            ["p80"]
+        );
+        assert_eq!(
+            ids(
+                &server,
+                "/Patient?_has:Procedure:subject:date=2013-04-05T09:20:00-04:00,2020"
+            )
+            .await,
+            ["p80", "p90"]
+        );
+    }
+
+    /// Data for the chain-name parsing cases (#1302, #1303).
+    ///
+    /// `Patient.general-practitioner` is polymorphic and both of the targets
+    /// used here define `name`: patient `ps` points at a *Practitioner* named
+    /// Smith, patient `pl` at an *Organization* named Smith Clinic — so only a
+    /// middle-hop `:Type` qualifier can tell their Observations apart.
+    ///
+    /// The two patients are "Smith" and "Smithson" (default string matching is
+    /// a prefix match, so `:exact` narrows it), differ in gender, and only `ps`
+    /// has a birth date.
+    async fn seed_chain_name_data(backend: &SqliteBackend) {
+        let tenant = test_tenant();
+        let resources = [
+            json!({"resourceType": "Practitioner", "id": "gp-prac",
+                   "name": [{"family": "Smith"}]}),
+            json!({"resourceType": "Organization", "id": "gp-org",
+                   "name": "Smith Clinic"}),
+            json!({"resourceType": "Patient", "id": "ps", "gender": "male",
+                   "birthDate": "1980-01-01",
+                   "name": [{"family": "Smith"}],
+                   "generalPractitioner": [{"reference": "Practitioner/gp-prac"}]}),
+            json!({"resourceType": "Patient", "id": "pl", "gender": "female",
+                   "name": [{"family": "Smithson"}],
+                   "generalPractitioner": [{"reference": "Organization/gp-org"}]}),
+            json!({"resourceType": "Encounter", "id": "es", "status": "finished",
+                   "class": {"code": "AMB"},
+                   "subject": {"reference": "Patient/ps"}}),
+            json!({"resourceType": "Encounter", "id": "el", "status": "finished",
+                   "class": {"code": "AMB"},
+                   "subject": {"reference": "Patient/pl"}}),
+            json!({"resourceType": "Observation", "id": "os", "status": "final",
+                   "code": {"coding": [{"system": "http://loinc.org", "code": "1234-5"}]},
+                   "subject": {"reference": "Patient/ps"},
+                   "encounter": {"reference": "Encounter/es"}}),
+            json!({"resourceType": "Observation", "id": "ol", "status": "final",
+                   "code": {"coding": [{"system": "http://loinc.org", "code": "9999-9"}]},
+                   "subject": {"reference": "Patient/pl"},
+                   "encounter": {"reference": "Encounter/el"}}),
+        ];
+        for resource in resources {
+            let resource_type = resource["resourceType"].as_str().unwrap().to_string();
+            backend
+                .create(&tenant, &resource_type, resource, FhirVersion::R4)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Status of a search, whatever it is.
+    async fn status(server: &TestServer, url: &str) -> StatusCode {
+        server
+            .get(url)
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await
+            .status_code()
+    }
+
+    /// #1303: a `:Type` qualifier on a middle hop constrains that hop's
+    /// reference, so a polymorphic reference resolves only to the named type.
+    #[tokio::test]
+    async fn test_chained_middle_hop_type_qualifier() {
+        let (server, backend) = create_test_server().await;
+        seed_chain_name_data(&backend).await;
+
+        // Unqualified: every target type of general-practitioner is searched.
+        assert_eq!(
+            ids(
+                &server,
+                "/Observation?subject:Patient.general-practitioner.name=Smith"
+            )
+            .await,
+            ["ol", "os"]
+        );
+        assert_eq!(
+            ids(
+                &server,
+                "/Observation?subject:Patient.general-practitioner:Practitioner.name=Smith"
+            )
+            .await,
+            ["os"]
+        );
+        assert_eq!(
+            ids(
+                &server,
+                "/Observation?subject:Patient.general-practitioner:Organization.name=Smith"
+            )
+            .await,
+            ["ol"]
+        );
+        // The qualifier works without one on the first hop …
+        assert_eq!(
+            ids(
+                &server,
+                "/Observation?subject.general-practitioner:Organization.name=Smith"
+            )
+            .await,
+            ["ol"]
+        );
+        // … and on the last reference of a three-hop chain.
+        assert_eq!(
+            ids(
+                &server,
+                "/Observation?encounter.subject.general-practitioner:Practitioner.name=Smith"
+            )
+            .await,
+            ["os"]
+        );
+        assert_eq!(
+            ids(
+                &server,
+                "/Observation?encounter:Encounter.subject:Patient.general-practitioner:Organization.name=Smith"
+            )
+            .await,
+            ["ol"]
+        );
+    }
+
+    /// #1302: a modifier on the terminal parameter of a forward chain applies
+    /// exactly as it does on the same parameter in a direct search.
+    #[tokio::test]
+    async fn test_chained_terminal_modifier() {
+        let (server, backend) = create_test_server().await;
+        seed_chain_name_data(&backend).await;
+
+        // Baseline: default string matching is a prefix match.
+        assert_eq!(
+            ids(&server, "/Observation?subject:Patient.family=Smith").await,
+            ["ol", "os"]
+        );
+        assert_eq!(ids(&server, "/Patient?family:exact=Smith").await, ["ps"]);
+
+        assert_eq!(
+            ids(&server, "/Observation?subject:Patient.family:exact=Smith").await,
+            ["os"]
+        );
+        assert_eq!(
+            ids(&server, "/Observation?subject.family:exact=Smith").await,
+            ["os"]
+        );
+        // `mith` is no prefix of either name; only :contains finds it.
+        assert!(
+            ids(&server, "/Observation?subject:Patient.family=mith")
+                .await
+                .is_empty()
+        );
+        assert_eq!(
+            ids(&server, "/Observation?subject:Patient.family:contains=mith").await,
+            ["ol", "os"]
+        );
+        assert_eq!(
+            ids(&server, "/Observation?subject:Patient.family:contains=thso").await,
+            ["ol"]
+        );
+        // :missing on a date terminal — the value is a boolean, not a date.
+        assert_eq!(
+            ids(
+                &server,
+                "/Observation?subject:Patient.birthdate:missing=true"
+            )
+            .await,
+            ["ol"]
+        );
+        assert_eq!(
+            ids(
+                &server,
+                "/Observation?subject:Patient.birthdate:missing=false"
+            )
+            .await,
+            ["os"]
+        );
+        // :not on a token terminal.
+        assert_eq!(
+            ids(&server, "/Observation?subject:Patient.gender:not=male").await,
+            ["ol"]
+        );
+        // Multi-hop, with a middle-hop qualifier next to the modifier.
+        assert_eq!(
+            ids(
+                &server,
+                "/Observation?encounter:Encounter.subject:Patient.family:exact=Smith"
+            )
+            .await,
+            ["os"]
+        );
+        assert_eq!(
+            ids(
+                &server,
+                "/Observation?subject:Patient.general-practitioner:Organization.name:exact=Smith"
+            )
+            .await,
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            ids(
+                &server,
+                "/Observation?subject:Patient.general-practitioner:Organization.name:contains=clin"
+            )
+            .await,
+            ["ol"]
+        );
+    }
+
+    /// #1302: what a direct search rejects, a chained terminal rejects too.
+    #[tokio::test]
+    async fn test_chained_terminal_modifier_rejections() {
+        let (server, backend) = create_test_server().await;
+        seed_chain_name_data(&backend).await;
+
+        for url in [
+            // Modifier not defined for the terminal's type.
+            "/Observation?subject:Patient.birthdate:exact=1980-01-01",
+            "/Observation?subject:Patient.gender:contains=mal",
+            "/Observation?encounter.subject:Patient.birthdate:exact=1980-01-01",
+            "/Patient?_has:Observation:subject:code:exact=1234-5",
+            // Not a modifier at all.
+            "/Observation?subject:Patient.family:bogus=Smith",
+            "/Patient?_has:Observation:subject:code:bogus=1234-5",
+            // A resource type is not a modifier of a string parameter.
+            "/Observation?subject:Patient.family:Patient=Smith",
+            // :missing takes exactly true|false.
+            "/Observation?subject:Patient.birthdate:missing=yes",
+            "/Patient?_has:Observation:subject:code:missing=yes",
+        ] {
+            assert_eq!(status(&server, url).await, StatusCode::BAD_REQUEST, "{url}");
+        }
+    }
+
+    /// #1302: same for the terminal parameter of `_has`.
+    #[tokio::test]
+    async fn test_has_terminal_modifier() {
+        let (server, backend) = create_test_server().await;
+        seed_chain_name_data(&backend).await;
+
+        assert_eq!(
+            ids(&server, "/Patient?_has:Observation:subject:code=1234-5").await,
+            ["ps"]
+        );
+        assert_eq!(
+            ids(&server, "/Patient?_has:Observation:subject:code:not=1234-5").await,
+            ["pl"]
+        );
+        assert_eq!(
+            ids(
+                &server,
+                "/Patient?_has:Observation:subject:encounter:missing=false"
+            )
+            .await,
+            ["pl", "ps"]
+        );
+        assert!(
+            ids(
+                &server,
+                "/Patient?_has:Observation:subject:encounter:missing=true"
+            )
+            .await
+            .is_empty()
+        );
+        // Nested: the modifier sits on the innermost terminal.
+        assert_eq!(
+            ids(
+                &server,
+                "/Patient?_has:Encounter:subject:_has:Observation:encounter:code:not=1234-5"
+            )
+            .await,
+            ["pl"]
+        );
+    }
+
+    /// The `501` a search gets, as (status, OperationOutcome text).
+    async fn outcome(server: &TestServer, url: &str) -> (StatusCode, String) {
+        let response = server
+            .get(url)
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        let body: Value = response.json();
+        (response.status_code(), body["issue"][0].to_string())
+    }
+
+    /// #1317: with no terminology server configured, a terminology-backed
+    /// modifier is a `501` on a direct parameter. On the terminal parameter of
+    /// a typed chain or a `_has` it used to slip past that guard — which reads
+    /// the modifier off the query key's first `:` segment — and the terminal
+    /// search then ran without terminology: `:in` matched the ValueSet URL as a
+    /// literal code (an empty `200`), `:above` / `:below` matched the code
+    /// alone.
+    #[tokio::test]
+    async fn test_chained_terminology_modifier_without_terminology_server() {
+        let (server, backend) = create_test_server().await;
+        seed_chain_name_data(&backend).await;
+
+        // Positive controls: the chains themselves resolve.
+        assert_eq!(ids(&server, "/Encounter?subject.gender=male").await, ["es"]);
+        assert_eq!(
+            ids(&server, "/Patient?_has:Observation:subject:code=1234-5").await,
+            ["ps"]
+        );
+
+        // The direct form, for reference.
+        let (direct_status, direct_text) =
+            outcome(&server, "/Observation?code:in=http://example.org/vs").await;
+        assert_eq!(direct_status, StatusCode::NOT_IMPLEMENTED);
+        assert!(
+            direct_text.contains("requires a configured terminology server"),
+            "{direct_text}"
+        );
+
+        let gender = "http://hl7.org/fhir/administrative-gender|male";
+        for url in [
+            // Forward chains: untyped, typed, multi-hop, typed multi-hop.
+            "/Encounter?subject.gender:in=http://example.org/vs".to_string(),
+            "/Encounter?subject:Patient.gender:in=http://example.org/vs".to_string(),
+            "/Observation?encounter.subject.gender:in=http://example.org/vs".to_string(),
+            "/Observation?encounter:Encounter.subject:Patient.gender:in=http://example.org/vs"
+                .to_string(),
+            format!("/Encounter?subject.gender:below={gender}"),
+            format!("/Encounter?subject.gender:above={gender}"),
+            format!("/Encounter?subject:Patient.gender:below={gender}"),
+            format!("/Observation?encounter.subject:Patient.gender:above={gender}"),
+            // `_has`, plain and nested.
+            "/Patient?_has:Observation:subject:code:in=http://example.org/vs".to_string(),
+            "/Patient?_has:Observation:subject:code:below=http://loinc.org|1234-5".to_string(),
+            "/Patient?_has:Observation:subject:code:above=http://loinc.org|1234-5".to_string(),
+            "/Patient?_has:Encounter:subject:_has:Observation:encounter:code:in=http://example.org/vs"
+                .to_string(),
+            "/Patient?_has:Encounter:subject:_has:Observation:encounter:code:below=http://loinc.org|1234-5"
+                .to_string(),
+        ] {
+            let (status, text) = outcome(&server, &url).await;
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{url}: {text}");
+            assert!(
+                text.contains("requires a configured terminology server"),
+                "{url}: {text}"
+            );
+        }
+
+        // The wording is the direct form's, naming the parameter as written.
+        let (_, text) = outcome(
+            &server,
+            "/Encounter?subject:Patient.gender:below=http://hl7.org/fhir/administrative-gender|male",
+        )
+        .await;
+        assert!(
+            text.contains(
+                "search modifier ':below' on token parameter 'subject:Patient.gender' requires \
+                 a configured terminology server (set HFS_TERMINOLOGY_SERVER)"
+            ),
+            "{text}"
+        );
+        let (_, text) = outcome(
+            &server,
+            "/Patient?_has:Observation:subject:code:in=http://example.org/vs",
+        )
+        .await;
+        assert!(
+            text.contains("':in' on token parameter '_has:Observation:subject:code'"),
+            "{text}"
+        );
+
+        // `:not-in` stays the `501` it already was.
+        for url in [
+            "/Encounter?subject.gender:not-in=http://example.org/vs",
+            "/Patient?_has:Observation:subject:code:not-in=http://example.org/vs",
+        ] {
+            assert_eq!(
+                status(&server, url).await,
+                StatusCode::NOT_IMPLEMENTED,
+                "{url}"
+            );
+        }
+    }
+
+    /// #1317: the same over `POST [type]/_search`.
+    #[tokio::test]
+    async fn test_chained_terminology_modifier_without_terminology_server_post() {
+        let (server, backend) = create_test_server().await;
+        seed_chain_name_data(&backend).await;
+
+        for (resource_type, key, value) in [
+            (
+                "Encounter",
+                "subject:Patient.gender:in",
+                "http://example.org/vs",
+            ),
+            (
+                "Patient",
+                "_has:Observation:subject:code:below",
+                "http://loinc.org|1234-5",
+            ),
+        ] {
+            let response = server
+                .post(&format!("/{resource_type}/_search"))
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .form(&[(key, value)])
+                .await;
+            response.assert_status(StatusCode::NOT_IMPLEMENTED);
+            let body: Value = response.json();
+            assert!(
+                body["issue"][0]
+                    .to_string()
+                    .contains("requires a configured terminology server"),
+                "{key}: {body}"
+            );
+        }
+
+        // Positive control: a chained POST search works.
+        let response = server
+            .post("/Encounter/_search")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .form(&[("subject:Patient.gender", "male")])
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        assert_eq!(get_bundle_entries(&body).len(), 1);
+    }
+
+    /// #1317: `:above` / `:below` are terminology-backed on a token only. On a
+    /// uri or reference terminal they are structural, need no terminology
+    /// server, and must keep resolving.
+    #[tokio::test]
+    async fn test_chained_structural_hierarchy_modifier_needs_no_terminology_server() {
+        let (server, backend) = create_test_server().await;
+        seed_chain_name_data(&backend).await;
+        let tenant = test_tenant();
+        for resource in [
+            json!({"resourceType": "Patient", "id": "pp",
+                   "meta": {"profile": ["http://example.org/profiles/special-patient"]},
+                   "name": [{"family": "Profiled"}]}),
+            json!({"resourceType": "Observation", "id": "op", "status": "final",
+                   "code": {"coding": [{"system": "http://loinc.org", "code": "1234-5"}]},
+                   "subject": {"reference": "Patient/pp"}}),
+        ] {
+            let resource_type = resource["resourceType"].as_str().unwrap().to_string();
+            backend
+                .create(&tenant, &resource_type, resource, FhirVersion::R4)
+                .await
+                .unwrap();
+        }
+
+        // Positive control: the direct uri `:below`.
+        assert_eq!(
+            ids(
+                &server,
+                "/Patient?_profile:below=http://example.org/profiles"
+            )
+            .await,
+            ["pp"]
+        );
+        // Uri terminal, forward (untyped and typed) and `_has`.
+        for url in [
+            "/Observation?subject._profile:below=http://example.org/profiles",
+            "/Observation?subject:Patient._profile:below=http://example.org/profiles",
+        ] {
+            assert_eq!(ids(&server, url).await, ["op"], "{url}");
+        }
+        assert_eq!(
+            ids(
+                &server,
+                "/Patient?_has:Observation:subject:_profile:below=http://loinc.org"
+            )
+            .await,
+            Vec::<String>::new()
+        );
+        // Reference terminal.
+        assert_eq!(
+            ids(&server, "/Observation?encounter.subject:below=Patient/ps").await,
+            ["os"]
+        );
+        assert_eq!(
+            ids(
+                &server,
+                "/Patient?_has:Observation:subject:encounter:below=Encounter/es"
+            )
+            .await,
+            ["ps"]
+        );
+    }
+
+    /// #1339: a terminology-backed modifier the parameter's type does not
+    /// define is a client error, whether or not a terminology server is
+    /// configured: the `400` a direct or chained `birthdate:exact` gets, not the
+    /// `501` reserved for a *valid* modifier this server cannot answer.
+    #[tokio::test]
+    async fn test_terminology_modifier_on_wrong_parameter_type_is_400_not_501() {
+        let (server, backend) = create_test_server().await;
+        seed_chain_name_data(&backend).await;
+
+        // Positive controls: the parameters and chains themselves resolve.
+        assert_eq!(ids(&server, "/Patient?name=Smith").await, ["pl", "ps"]);
+        assert_eq!(ids(&server, "/Patient?birthdate=1980-01-01").await, ["ps"]);
+        assert_eq!(ids(&server, "/Encounter?subject.name=Smith").await.len(), 2);
+
+        for url in [
+            // Direct.
+            "/Patient?name:in=http://example.org/vs",
+            "/Patient?name:not-in=http://example.org/vs",
+            "/Patient?name:below=Smith",
+            "/Patient?birthdate:below=1980-01-01",
+            "/Patient?birthdate:above=1980-01-01",
+            "/Patient?birthdate:in=http://example.org/vs",
+            // `:in` is token-only: not defined for a reference or a uri either.
+            "/Observation?subject:in=http://example.org/vs",
+            "/Patient?_profile:in=http://example.org/vs",
+            // Forward chains, untyped, typed and multi-hop.
+            "/Encounter?subject.name:in=http://example.org/vs",
+            "/Encounter?subject:Patient.name:in=http://example.org/vs",
+            "/Encounter?subject:Patient.birthdate:below=1980-01-01",
+            "/Observation?encounter.subject:Patient.name:above=Smith",
+            // `_has`, plain and nested.
+            "/Patient?_has:Observation:subject:date:in=http://example.org/vs",
+            "/Patient?_has:Observation:subject:date:below=2020-01-01",
+            "/Patient?_has:Encounter:subject:_has:Observation:encounter:date:in=http://example.org/vs",
+        ] {
+            let (status, text) = outcome(&server, url).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{url}: {text}");
+            assert!(text.contains("is not supported for"), "{url}: {text}");
+        }
+
+        // A valid terminology modifier is still the `501`.
+        for url in [
+            "/Patient?gender:in=http://example.org/vs",
+            "/Patient?gender:below=http://hl7.org/fhir/administrative-gender|male",
+            "/Encounter?subject.gender:in=http://example.org/vs",
+            "/Patient?_has:Observation:subject:code:below=http://loinc.org|1234-5",
+        ] {
+            let (status, text) = outcome(&server, url).await;
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{url}: {text}");
+        }
+    }
+
+    /// #1365: `:not-in` on the terminal parameter of a chained / `_has` search
+    /// follows the direct form's order — the `400` for a type that does not
+    /// define it comes before the `501` for one that does. It used to be a
+    /// blanket `501` on any key ending in `:not-in`.
+    #[tokio::test]
+    async fn test_chained_not_in_is_400_on_a_non_token_terminal_and_501_on_a_token() {
+        let (server, backend) = create_test_server().await;
+        seed_chain_name_data(&backend).await;
+
+        // Positive controls: the chains themselves resolve.
+        assert_eq!(ids(&server, "/Encounter?subject.name=Smith").await.len(), 2);
+        assert_eq!(ids(&server, "/Encounter?subject.gender=male").await, ["es"]);
+        assert_eq!(
+            ids(&server, "/Patient?_has:Observation:subject:code=1234-5").await,
+            ["ps"]
+        );
+
+        // The direct forms, for reference.
+        let (direct_status, _) = outcome(&server, "/Patient?name:not-in=http://vs").await;
+        assert_eq!(direct_status, StatusCode::BAD_REQUEST);
+        let (direct_status, direct_text) =
+            outcome(&server, "/Patient?gender:not-in=http://vs").await;
+        assert_eq!(direct_status, StatusCode::NOT_IMPLEMENTED);
+        assert!(
+            direct_text.contains("search modifier ':not-in' is not supported"),
+            "{direct_text}"
+        );
+
+        for url in [
+            "/Encounter?subject.name:not-in=http://example.org/vs",
+            "/Encounter?subject:Patient.name:not-in=http://example.org/vs",
+            "/Encounter?subject:Patient.birthdate:not-in=http://example.org/vs",
+            "/Observation?encounter.subject:Patient.name:not-in=http://example.org/vs",
+            "/Patient?_has:Observation:subject:date:not-in=http://example.org/vs",
+            "/Patient?_has:Encounter:subject:_has:Observation:encounter:date:not-in=http://example.org/vs",
+        ] {
+            let (status, text) = outcome(&server, url).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{url}: {text}");
+            assert!(text.contains("is not supported for"), "{url}: {text}");
+        }
+
+        for url in [
+            "/Encounter?subject.gender:not-in=http://example.org/vs",
+            "/Encounter?subject:Patient.gender:not-in=http://example.org/vs",
+            "/Observation?encounter.subject:Patient.gender:not-in=http://example.org/vs",
+            "/Patient?_has:Observation:subject:code:not-in=http://example.org/vs",
+            "/Patient?_has:Encounter:subject:_has:Observation:encounter:code:not-in=http://example.org/vs",
+        ] {
+            let (status, text) = outcome(&server, url).await;
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{url}: {text}");
+            // The direct form's wording, not "requires a terminology server":
+            // one would not help.
+            assert!(
+                text.contains("search modifier ':not-in' is not supported"),
+                "{url}: {text}"
+            );
+        }
+    }
+
+    /// #1339: modifiers and `:[type]` qualifiers are case-sensitive. A
+    /// differently-cased one used to be honoured (`name:EXACT`); it is now the
+    /// `400` of any unknown modifier, never a search without it.
+    #[tokio::test]
+    async fn test_modifiers_are_case_sensitive() {
+        let (server, backend) = create_test_server().await;
+        seed_chain_name_data(&backend).await;
+
+        // Positive controls: the properly-cased forms.
+        assert_eq!(ids(&server, "/Patient?family:exact=Smith").await, ["ps"]);
+        assert_eq!(
+            ids(&server, "/Observation?subject:Patient=ps").await,
+            ["os"]
+        );
+        assert_eq!(
+            ids(&server, "/Encounter?subject:Patient.family:exact=Smith").await,
+            ["es"]
+        );
+
+        for (url, hint) in [
+            ("/Patient?family:EXACT=Smith", "':exact'?"),
+            ("/Patient?family:Exact=Smith", "':exact'?"),
+            ("/Patient?gender:Missing=true", "':missing'?"),
+            ("/Observation?code:NOT=1234-5", "':not'?"),
+            ("/Observation?subject:patient=ps", "':Patient'?"),
+            ("/Observation?subject:PATIENT=ps", "':Patient'?"),
+            ("/Encounter?subject:Patient.family:EXACT=Smith", "':exact'?"),
+            (
+                "/Patient?_has:Observation:subject:code:NOT=1234-5",
+                "':not'?",
+            ),
+        ] {
+            let (status, text) = outcome(&server, url).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{url}: {text}");
+            assert!(text.contains("case-sensitive"), "{url}: {text}");
+            assert!(text.contains(hint), "{url}: {text}");
+        }
+    }
+
+    /// #1339: a `:[type]` qualifier is judged against the FHIR version of the
+    /// search (R4 here), wherever it is written. On a chain hop and as a `_has`
+    /// source type it used not to be judged at all: an empty `200`, or a `400`
+    /// about something else.
+    #[tokio::test]
+    async fn test_type_qualifier_must_be_a_resource_type_of_the_request_version() {
+        let (server, backend) = create_test_server().await;
+        seed_chain_name_data(&backend).await;
+
+        // Positive controls.
+        assert_eq!(
+            ids(&server, "/Encounter?subject:Patient.family=Smith").await,
+            ["el", "es"]
+        );
+        assert_eq!(
+            ids(&server, "/Patient?_has:Observation:subject:code=1234-5").await,
+            ["ps"]
+        );
+
+        for (url, named) in [
+            // `ActorDefinition` is an R5 resource type.
+            ("/Observation?subject:ActorDefinition=x", "ActorDefinition"),
+            (
+                "/Encounter?subject:ActorDefinition.name=x",
+                "ActorDefinition",
+            ),
+            (
+                "/Patient?_has:ActorDefinition:subject:code=x",
+                "ActorDefinition",
+            ),
+            ("/Encounter?subject:Bogus.family=Smith", "Bogus"),
+            ("/Encounter?subject:patient.family=Smith", "':Patient'?"),
+            (
+                "/Observation?subject:Patient.general-practitioner:practitioner.name=Smith",
+                "':Practitioner'?",
+            ),
+            (
+                "/Patient?_has:observation:subject:code=1234-5",
+                "':Observation'?",
+            ),
+            (
+                "/Patient?_has:Encounter:subject:_has:Bogus:encounter:code=1234-5",
+                "Bogus",
+            ),
+        ] {
+            let (status, text) = outcome(&server, url).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{url}: {text}");
+            assert!(text.contains(named), "{url}: {text}");
+            assert!(text.contains("of FHIR R4"), "{url}: {text}");
+        }
+    }
+
+    /// #1339: the `400` / `501` for the terminal parameter of a nested `_has`
+    /// names the whole key as written, not just its innermost level.
+    #[tokio::test]
+    async fn test_nested_has_errors_name_the_full_key() {
+        let (server, backend) = create_test_server().await;
+        seed_chain_name_data(&backend).await;
+
+        let key = "_has:Encounter:subject:_has:Observation:encounter:code";
+        // Positive control: the nested `_has` resolves.
+        assert_eq!(
+            ids(&server, &format!("/Patient?{key}=1234-5")).await,
+            ["ps"]
+        );
+
+        for (suffix, value, expected) in [
+            // Needs a terminology server (#1317).
+            (":in", "http://example.org/vs", StatusCode::NOT_IMPLEMENTED),
+            (
+                ":below",
+                "http://loinc.org|1234-5",
+                StatusCode::NOT_IMPLEMENTED,
+            ),
+            // Not defined for a token; not a modifier; not a boolean (#1302).
+            (":exact", "1234-5", StatusCode::BAD_REQUEST),
+            (":bogus", "1234-5", StatusCode::BAD_REQUEST),
+            (":missing", "yes", StatusCode::BAD_REQUEST),
+        ] {
+            let url = format!("/Patient?{key}{suffix}={value}");
+            let (status, text) = outcome(&server, &url).await;
+            assert_eq!(status, expected, "{url}: {text}");
+            assert!(text.contains(key), "{url}: {text}");
+        }
+    }
+
     #[tokio::test]
     async fn test_multiple_chain_levels() {
         let (server, backend) = create_test_server().await;
@@ -2096,6 +3723,27 @@ mod chaining {
 
 mod includes {
     use super::*;
+
+    /// Sorted `(resourceType, id)` pairs for bundle entries tagged
+    /// `search.mode == "include"`, for exact-set assertions independent of
+    /// fetch order.
+    fn include_entries(body: &Value) -> Vec<(String, String)> {
+        let mut pairs: Vec<(String, String)> = get_bundle_entries(body)
+            .iter()
+            .filter(|e| e["search"]["mode"] == "include")
+            .map(|e| {
+                (
+                    e["resource"]["resourceType"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    e["resource"]["id"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        pairs.sort();
+        pairs
+    }
 
     #[tokio::test]
     async fn test_include_subject() {
@@ -2337,6 +3985,121 @@ mod includes {
             }
         }
     }
+
+    #[tokio::test]
+    async fn test_include_service_provider_conditional_reference_yields_no_includes() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let tenant = test_tenant();
+        let encounter = json!({
+            "resourceType": "Encounter",
+            "id": "enc-cond",
+            "status": "finished",
+            "class": {"system": "http://terminology.hl7.org/CodeSystem/v3-ActCode", "code": "AMB"},
+            "subject": {"reference": "Patient/patient-1"},
+            "serviceProvider": {
+                "reference": "Organization?identifier=http://example.org/org|dept-9"
+            }
+        });
+        backend
+            .create(&tenant, "Encounter", encounter, FhirVersion::R4)
+            .await
+            .unwrap();
+
+        let response = server
+            .get("/Encounter?_id=enc-cond&_include=Encounter:service-provider")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+
+        let match_entries: Vec<&&Value> = entries
+            .iter()
+            .filter(|e| e["search"]["mode"] == "match")
+            .collect();
+        assert_eq!(match_entries.len(), 1);
+        assert_eq!(match_entries[0]["resource"]["resourceType"], "Encounter");
+
+        assert!(
+            include_entries(&body).is_empty(),
+            "a conditional serviceProvider reference must not produce an include"
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e["resource"]["resourceType"] == "Patient"),
+            "the conditional serviceProvider reference must not pull in the subject Patient either"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_include_service_provider_returns_only_the_organization() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let tenant = test_tenant();
+        let encounter = json!({
+            "resourceType": "Encounter",
+            "id": "enc-sp",
+            "status": "finished",
+            "class": {"system": "http://terminology.hl7.org/CodeSystem/v3-ActCode", "code": "AMB"},
+            "subject": {"reference": "Patient/patient-1"},
+            "serviceProvider": {"reference": "Organization/org-2"}
+        });
+        backend
+            .create(&tenant, "Encounter", encounter, FhirVersion::R4)
+            .await
+            .unwrap();
+
+        let expected = vec![("Organization".to_string(), "org-2".to_string())];
+
+        for query in [
+            "/Encounter?_id=enc-sp&_include=Encounter:service-provider",
+            "/Encounter?_id=enc-sp&_include=Encounter:service-provider:Organization",
+        ] {
+            let response = server
+                .get(query)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+
+            response.assert_status_ok();
+            let body: Value = response.json();
+            assert_eq!(include_entries(&body), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_include_subject_returns_only_the_patient() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let tenant = test_tenant();
+        let encounter = json!({
+            "resourceType": "Encounter",
+            "id": "enc-sp",
+            "status": "finished",
+            "class": {"system": "http://terminology.hl7.org/CodeSystem/v3-ActCode", "code": "AMB"},
+            "subject": {"reference": "Patient/patient-1"},
+            "serviceProvider": {"reference": "Organization/org-2"}
+        });
+        backend
+            .create(&tenant, "Encounter", encounter, FhirVersion::R4)
+            .await
+            .unwrap();
+
+        let response = server
+            .get("/Encounter?_id=enc-sp&_include=Encounter:subject")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let expected = vec![("Patient".to_string(), "patient-1".to_string())];
+        assert_eq!(include_entries(&body), expected);
+    }
 }
 
 // =============================================================================
@@ -2345,6 +4108,19 @@ mod includes {
 
 mod fulltext_search {
     use super::*;
+
+    /// Extracts the `id` of every `entry[].resource` in a search Bundle.
+    ///
+    /// Used instead of raw `get_bundle_entries` closures so every full-text
+    /// test can assert both presence and absence of specific ids without
+    /// repeating the extraction logic.
+    fn entry_ids(body: &Value) -> Vec<String> {
+        get_bundle_entries(body)
+            .iter()
+            .filter_map(|e| e["resource"]["id"].as_str())
+            .map(|s| s.to_string())
+            .collect()
+    }
 
     #[tokio::test]
     async fn test_text_search() {
@@ -2357,28 +4133,22 @@ mod fulltext_search {
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .await;
 
-        // Full-text search may or may not be implemented
-        let status = response.status_code();
-        if status == StatusCode::OK {
-            let body: Value = response.json();
-            let entries = get_bundle_entries(&body);
+        assert_eq!(response.status_code(), StatusCode::OK);
+        let body: Value = response.json();
+        let ids = entry_ids(&body);
 
-            // If implemented, should find patient-1 (has "diabetes" in text)
-            if !entries.is_empty() {
-                // At least one result should mention diabetes in narrative
-                let has_diabetes_patient =
-                    entries.iter().any(|e| e["resource"]["id"] == "patient-1");
-                assert!(
-                    has_diabetes_patient,
-                    "Should find patient with diabetes in text"
-                );
-            }
-        } else {
-            // Not implemented - that's okay
-            assert_eq!(
-                status,
-                StatusCode::BAD_REQUEST,
-                "Should return 400 if not supported"
+        // patient-1's narrative mentions diabetes; the others don't.
+        assert!(
+            ids.contains(&"patient-1".to_string()),
+            "expected patient-1 in results, got {:?}",
+            ids
+        );
+        for excluded in ["patient-2", "patient-3", "patient-4"] {
+            assert!(
+                !ids.contains(&excluded.to_string()),
+                "did not expect {} in results, got {:?}",
+                excluded,
+                ids
             );
         }
     }
@@ -2394,29 +4164,21 @@ mod fulltext_search {
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .await;
 
-        let status = response.status_code();
-        if status == StatusCode::OK {
-            let body: Value = response.json();
-            let entries = get_bundle_entries(&body);
+        assert_eq!(response.status_code(), StatusCode::OK);
+        let body: Value = response.json();
+        let ids = entry_ids(&body);
 
-            // If implemented, should find condition-2 (hypertension)
-            if !entries.is_empty() {
-                let has_hypertension = entries.iter().any(|e| {
-                    e["resource"]["id"] == "condition-2"
-                        || e["resource"]["code"]["coding"]
-                            .as_array()
-                            .map(|arr| arr.iter().any(|c| c["display"] == "Hypertension"))
-                            .unwrap_or(false)
-                });
-                if has_hypertension {
-                    // Good, found the expected result
-                }
-            }
-        }
-        // Either OK or BAD_REQUEST is acceptable
+        // condition-2's display ("Hypertension") and narrative both mention
+        // it; condition-1 is about diabetes and mentions neither.
         assert!(
-            status == StatusCode::OK || status == StatusCode::BAD_REQUEST,
-            "Should return OK or 400"
+            ids.contains(&"condition-2".to_string()),
+            "expected condition-2 in results, got {:?}",
+            ids
+        );
+        assert!(
+            !ids.contains(&"condition-1".to_string()),
+            "did not expect condition-1 in results, got {:?}",
+            ids
         );
     }
 
@@ -2425,22 +4187,32 @@ mod fulltext_search {
         let (server, backend) = create_test_server().await;
         seed_search_test_data(&backend).await;
 
-        // Search for multiple words
+        // Search for multiple words; FTS5's default bareword syntax is an
+        // implicit AND across terms, so this must behave like Elasticsearch's
+        // `operator: "and"` rather than matching on either word alone.
         let response = server
             .get("/Observation?_text=heart%20rate")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .await;
 
-        let status = response.status_code();
-        if status == StatusCode::OK {
-            let body: Value = response.json();
-            // Should find observations with "heart rate" in text
-            assert_eq!(body["resourceType"], "Bundle");
+        assert_eq!(response.status_code(), StatusCode::OK);
+        let body: Value = response.json();
+        let ids = entry_ids(&body);
+
+        // obs-1, obs-3, obs-4 mention both "heart" and "rate"; obs-2 mentions
+        // neither (its narrative is about temperature).
+        for expected in ["obs-1", "obs-3", "obs-4"] {
+            assert!(
+                ids.contains(&expected.to_string()),
+                "expected {} in results, got {:?}",
+                expected,
+                ids
+            );
         }
-        // Either OK or BAD_REQUEST is acceptable
         assert!(
-            status == StatusCode::OK || status == StatusCode::BAD_REQUEST,
-            "Should return OK or 400"
+            !ids.contains(&"obs-2".to_string()),
+            "did not expect obs-2 in results, got {:?}",
+            ids
         );
     }
 
@@ -2454,17 +4226,72 @@ mod fulltext_search {
             .get("/Patient?_text=smith")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .await;
-
         let response_upper = server
             .get("/Patient?_text=SMITH")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .await;
 
-        // Both should succeed or both should fail (unsupported)
+        assert_eq!(response_lower.status_code(), StatusCode::OK);
+        assert_eq!(response_upper.status_code(), StatusCode::OK);
+
+        let mut ids_lower = entry_ids(&response_lower.json::<Value>());
+        let mut ids_upper = entry_ids(&response_upper.json::<Value>());
+        ids_lower.sort();
+        ids_upper.sort();
+
+        // patient-1 and patient-2 are both named Smith; case must not change
+        // which resources are found.
+        assert!(!ids_lower.is_empty(), "expected some matches for 'smith'");
         assert_eq!(
-            response_lower.status_code(),
-            response_upper.status_code(),
-            "Case should not affect search availability"
+            ids_lower, ids_upper,
+            "case should not affect which resources are found"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_text_search_count_summary_carries_total() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let response = server
+            .get("/Patient?_text=smith&_summary=count")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+        let body: Value = response.json();
+
+        // patient-1 and patient-2 both match "smith"; _summary=count must
+        // carry the numeric total instead of an empty/absent Bundle field.
+        assert_eq!(body["total"].as_i64(), Some(2));
+        assert!(
+            body.get("entry").is_none(),
+            "_summary=count must not return entries, got {:?}",
+            body.get("entry")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_text_search_without_match_is_empty_200() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let response = server
+            .get("/Patient?_text=zzzznomatchzzzz")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        // No matches is a well-formed empty result, not "unsupported".
+        assert_eq!(response.status_code(), StatusCode::OK);
+        let body: Value = response.json();
+        assert!(get_bundle_entries(&body).is_empty());
+        // `total` may be omitted or reported as zero, but never a non-zero
+        // number: that would mean the filter was silently dropped.
+        let total = body.get("total").and_then(|t| t.as_i64());
+        assert!(
+            total.is_none() || total == Some(0),
+            "expected no total or a total of 0, got {:?}",
+            total
         );
     }
 
@@ -2480,7 +4307,7 @@ mod fulltext_search {
             .await;
 
         let status = response.status_code();
-        // This is an advanced feature, may not be supported
+        // :text-advanced is out of scope for #1012; still accepts OK or 400.
         assert!(
             status == StatusCode::OK || status == StatusCode::BAD_REQUEST,
             "Should return OK or 400"
@@ -2498,20 +4325,28 @@ mod fulltext_search {
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .await;
 
-        let status = response.status_code();
-        if status == StatusCode::OK {
-            let body: Value = response.json();
-            let entries = get_bundle_entries(&body);
+        assert_eq!(response.status_code(), StatusCode::OK);
+        let body: Value = response.json();
+        let ids = entry_ids(&body);
 
-            // obs-1 has "normal sinus rhythm", obs-2 has "normal range"
-            if !entries.is_empty() {
-                // Results should include observations with "normal" in content
-            }
+        // obs-1 has "normal sinus rhythm", obs-2 has "normal range"; obs-3
+        // and obs-4 don't mention "normal" anywhere.
+        for expected in ["obs-1", "obs-2"] {
+            assert!(
+                ids.contains(&expected.to_string()),
+                "expected {} in results, got {:?}",
+                expected,
+                ids
+            );
         }
-        assert!(
-            status == StatusCode::OK || status == StatusCode::BAD_REQUEST,
-            "Should return OK or 400"
-        );
+        for excluded in ["obs-3", "obs-4"] {
+            assert!(
+                !ids.contains(&excluded.to_string()),
+                "did not expect {} in results, got {:?}",
+                excluded,
+                ids
+            );
+        }
     }
 }
 
@@ -2757,6 +4592,176 @@ mod contained_search {
         assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
     }
 
+    /// Seeds, for #1383: a Patient `p1` (Smith), a top-level Observation `c1`
+    /// about it, a Provenance targeting that Observation, a List holding it —
+    /// and a DiagnosticReport `dr` whose contained Observation has the local
+    /// id `c1` too, plus a second report `dr-other` (contained `c2`).
+    async fn seed_out_of_band(backend: &SqliteBackend) {
+        let observation = |id: &str, patient: &str| {
+            json!({
+                "resourceType": "Observation",
+                "id": id,
+                "status": "final",
+                "code": { "coding": [{ "system": "http://loinc.org", "code": "1234-5" }] },
+                "subject": { "reference": format!("Patient/{patient}") }
+            })
+        };
+        for (resource_type, resource) in [
+            (
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p1", "name": [{"family": "Smith"}]}),
+            ),
+            ("Observation", observation("c1", "p1")),
+            (
+                "Provenance",
+                json!({
+                    "resourceType": "Provenance",
+                    "id": "prov1",
+                    "target": [{ "reference": "Observation/c1" }],
+                    "recorded": "2020-01-01T00:00:00Z",
+                    "agent": [{ "who": { "reference": "Practitioner/x" } }]
+                }),
+            ),
+            (
+                "List",
+                json!({
+                    "resourceType": "List",
+                    "id": "l1",
+                    "status": "current",
+                    "mode": "working",
+                    "entry": [{ "item": { "reference": "Observation/c1" } }]
+                }),
+            ),
+            (
+                "DiagnosticReport",
+                json!({
+                    "resourceType": "DiagnosticReport",
+                    "id": "dr",
+                    "status": "final",
+                    "code": { "text": "panel" },
+                    "contained": [observation("c1", "p2")]
+                }),
+            ),
+            (
+                "DiagnosticReport",
+                json!({
+                    "resourceType": "DiagnosticReport",
+                    "id": "dr-other",
+                    "status": "final",
+                    "code": { "text": "panel" },
+                    "contained": [observation("c2", "p1")]
+                }),
+            ),
+        ] {
+            backend
+                .create(&test_tenant(), resource_type, resource, FhirVersion::R4)
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn get(server: &TestServer, url: &str) -> (StatusCode, Value) {
+        let response = server
+            .get(url)
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        (response.status_code(), response.json())
+    }
+
+    fn entry_ids(body: &Value) -> Vec<String> {
+        let mut ids: Vec<String> = get_bundle_entries(body)
+            .iter()
+            .map(|e| {
+                format!(
+                    "{}/{}",
+                    e["resource"]["resourceType"].as_str().unwrap_or("?"),
+                    e["resource"]["id"].as_str().unwrap_or("?")
+                )
+            })
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// #1383: `_list`, `_has` and chained parameters select top-level
+    /// resources and are resolved into an `_id` filter before the backend
+    /// runs — where, under `_contained`, `_id` is a contained resource's
+    /// *local* id. The resolved top-level id `c1` therefore used to select the
+    /// unrelated contained Observation `dr#c1`. They are refused instead.
+    #[tokio::test]
+    async fn test_contained_refuses_list_has_and_chains() {
+        let (server, backend) = create_test_server().await;
+        seed_out_of_band(&backend).await;
+
+        // Positive controls: each constraint works without `_contained`, and
+        // `_contained` works without them.
+        for url in [
+            "/Observation?_list=l1",
+            "/Observation?_has:Provenance:target:_id=prov1",
+            "/Observation?subject.family=Smith",
+        ] {
+            let (status, body) = get(&server, url).await;
+            assert_eq!(status, StatusCode::OK, "{url}: {body}");
+            assert_eq!(entry_ids(&body), ["Observation/c1"], "{url}");
+        }
+        let (status, body) = get(&server, "/Observation?_contained=true").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            entry_ids(&body),
+            ["DiagnosticReport/dr", "DiagnosticReport/dr-other"]
+        );
+
+        for (constraint, named) in [
+            ("_list=l1", "_list"),
+            ("_has:Provenance:target:_id=prov1", "_has"),
+            ("subject.family=Smith", "subject.family"),
+        ] {
+            for mode in ["true", "both"] {
+                let url = format!("/Observation?_contained={mode}&{constraint}");
+                let (status, body) = get(&server, &url).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{url}: {body}");
+                assert_eq!(body["resourceType"], "OperationOutcome", "{url}");
+                let text = body["issue"][0]["details"]["text"]
+                    .as_str()
+                    .unwrap_or_default();
+                assert!(
+                    text.contains(named) && text.contains("_contained"),
+                    "{url}: {body}"
+                );
+            }
+        }
+    }
+
+    /// #1383: a compartment search under `_contained` applies membership to
+    /// the contained resource (its own `subject`), and `_total` counts what is
+    /// returned.
+    #[tokio::test]
+    async fn test_contained_compartment_search_applies_membership() {
+        let (server, backend) = create_test_server().await;
+        seed_out_of_band(&backend).await;
+
+        let (status, body) = get(&server, "/Patient/p1/Observation").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(entry_ids(&body), ["Observation/c1"]);
+
+        let (status, body) = get(
+            &server,
+            "/Patient/p1/Observation?_contained=true&_total=accurate",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(entry_ids(&body), ["DiagnosticReport/dr-other"]);
+        assert_eq!(body["total"], json!(1), "{body}");
+
+        let (status, body) = get(
+            &server,
+            "/Patient/p1/Observation?_contained=both&_summary=count",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["total"], json!(2), "{body}");
+    }
+
     #[tokio::test]
     async fn test_metadata_advertises_new_search_controls() {
         // SQLite supports contained search, so `_contained`/`_containedType` are
@@ -2819,6 +4824,31 @@ mod summary_count {
         );
     }
 
+    /// `_total=none` means no total on a plain search either, whatever the
+    /// backend can produce for free (Elasticsearch always has one, and the
+    /// MongoDB backend used to count for it), so the header a client derives
+    /// from the Bundle reads the same on every backend.
+    #[tokio::test]
+    async fn test_plain_search_respects_explicit_total_none() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let response = server
+            .get("/Patient?_count=1&_total=none")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        assert!(
+            body.get("total").is_none(),
+            "no total with _total=none: {body}"
+        );
+        assert!(
+            body.get("entry").is_some(),
+            "entries are still returned: {body}"
+        );
+    }
+
     /// An explicit `_total` still wins over the implication.
     #[tokio::test]
     async fn test_summary_count_respects_explicit_total_none() {
@@ -2831,7 +4861,10 @@ mod summary_count {
             .await;
         response.assert_status_ok();
         let body: Value = response.json();
-        assert!(body["total"].is_null(), "explicit _total=none wins: {body}");
+        assert!(
+            body.get("total").is_none(),
+            "explicit _total=none wins and total is absent, not null: {body}"
+        );
     }
 }
 
@@ -3104,5 +5137,151 @@ mod server_meta {
         let entry = &get_bundle_entries(&search)[0]["resource"];
         assert_eq!(entry["meta"]["versionId"], "2");
         assert!(entry["meta"]["lastUpdated"].is_string());
+    }
+}
+
+// ============================================================================
+// Bundle.total on a resource type with no stored rows (#990)
+// ============================================================================
+
+mod empty_type_total {
+    use super::*;
+
+    /// `Bundle.total` is either a number or absent. A resource type with no
+    /// stored rows is a known-empty set: `_summary=count` and `_total=accurate`
+    /// report `0`, and a plain search that computes no total omits the key.
+    /// The literal `null` is never valid FHIR JSON for a primitive.
+    async fn get_json(server: &TestServer, path: &str) -> Value {
+        let response = server
+            .get(path)
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        response.json()
+    }
+
+    fn assert_total_is_number_or_absent(body: &Value) {
+        match body.get("total") {
+            None => {}
+            Some(total) => assert!(
+                total.is_u64(),
+                "Bundle.total must be a number or absent, never {total}: {body}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_empty_type_summary_count_reports_zero() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let body = get_json(&server, "/Group?_summary=count").await;
+        assert_eq!(body["total"], serde_json::json!(0), "{body}");
+        assert!(body.get("entry").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn test_empty_type_total_accurate_reports_zero() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let body = get_json(&server, "/Group?_total=accurate").await;
+        assert_eq!(body["total"], serde_json::json!(0), "{body}");
+        assert_eq!(body["entry"], serde_json::json!([]), "{body}");
+    }
+
+    #[tokio::test]
+    async fn test_empty_type_plain_search_never_serializes_null_total() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let body = get_json(&server, "/Group").await;
+        assert_eq!(body["resourceType"], "Bundle");
+        assert_eq!(body["type"], "searchset");
+        assert_total_is_number_or_absent(&body);
+        assert_eq!(body["entry"], serde_json::json!([]), "{body}");
+
+        // Explicitly opting out of a total omits the key rather than nulling it.
+        let body = get_json(&server, "/Group?_summary=count&_total=none").await;
+        assert_total_is_number_or_absent(&body);
+    }
+}
+
+/// Compartment searches (`Patient/p1/Observation?...`) take the same
+/// out-of-band criteria a type search does (#1407): `_list`, `_has` and chained
+/// parameters select top-level resources and are resolved before the backend
+/// runs. The compartment handler used to pass them through unresolved, and the
+/// backends ignore them.
+mod compartment_out_of_band {
+    use super::*;
+
+    async fn seed(backend: &SqliteBackend) {
+        let resources = [
+            json!({"resourceType": "Patient", "id": "p1"}),
+            json!({"resourceType": "Encounter", "id": "e-done", "status": "finished",
+                   "class": {"code": "AMB"}, "subject": {"reference": "Patient/p1"}}),
+            json!({"resourceType": "Encounter", "id": "e-plan", "status": "planned",
+                   "class": {"code": "AMB"}, "subject": {"reference": "Patient/p1"}}),
+            json!({"resourceType": "Observation", "id": "o-done", "status": "final",
+                   "code": {"coding": [{"system": "http://loinc.org", "code": "X"}]},
+                   "subject": {"reference": "Patient/p1"},
+                   "encounter": {"reference": "Encounter/e-done"}}),
+            json!({"resourceType": "Observation", "id": "o-plan", "status": "final",
+                   "code": {"coding": [{"system": "http://loinc.org", "code": "Y"}]},
+                   "subject": {"reference": "Patient/p1"},
+                   "encounter": {"reference": "Encounter/e-plan"}}),
+            json!({"resourceType": "List", "id": "l1", "status": "current", "mode": "working",
+                   "entry": [{"item": {"reference": "Observation/o-done"}}]}),
+        ];
+        for resource in resources {
+            let resource_type = resource["resourceType"].as_str().unwrap().to_string();
+            backend
+                .create(&test_tenant(), &resource_type, resource, FhirVersion::R4)
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn ids(server: &TestServer, url: &str) -> Vec<String> {
+        let response = server
+            .get(url)
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let mut ids: Vec<String> = get_bundle_entries(&body)
+            .iter()
+            .map(|e| e["resource"]["id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[tokio::test]
+    async fn test_compartment_search_resolves_list_has_and_chains() {
+        let (server, backend) = create_test_server().await;
+        seed(&backend).await;
+
+        // Positive control: both Observations are in the compartment.
+        assert_eq!(
+            ids(&server, "/Patient/p1/Observation").await,
+            ["o-done", "o-plan"]
+        );
+        assert_eq!(
+            ids(&server, "/Patient/p1/Observation?_list=l1").await,
+            ["o-done"]
+        );
+        assert_eq!(
+            ids(&server, "/Patient/p1/Observation?encounter.status=planned").await,
+            ["o-plan"]
+        );
+        assert_eq!(
+            ids(
+                &server,
+                "/Patient/p1/Encounter?_has:Observation:encounter:code=X"
+            )
+            .await,
+            ["e-done"]
+        );
     }
 }

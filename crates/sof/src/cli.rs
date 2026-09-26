@@ -142,7 +142,7 @@ use std::io::{self, BufReader, BufWriter, Read};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "sof-cli")]
+#[command(name = "sof-cli", version)]
 #[command(about = "SQL-on-FHIR CLI tool for running ViewDefinition transformations")]
 struct Args {
     /// Path to ViewDefinition JSON file (or use stdin if not provided)

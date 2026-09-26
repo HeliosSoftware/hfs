@@ -2,21 +2,37 @@
 
 use serde_json::{Value, json};
 
+use crate::search::{FhirNumberValue, FhirQuantityValue};
 use crate::types::SearchPrefix;
 
 /// Builds an ES query clause for a quantity search parameter.
 ///
-/// Format: `[prefix]number|system|code` or `[prefix]number|code` or `[prefix]number`
+/// Format: `[prefix]number|system|code` or `[prefix]number|code` or
+/// `[prefix]number`, read by the grammar every backend shares
+/// ([`FhirQuantityValue`]): only an unescaped `|` separates.
+///
+/// Never returns `None` for a value it cannot read — see
+/// [`number::build_clause`](super::number::build_clause): the query builder's
+/// `filter_map` would drop the constraint and the search would return
+/// everything (#1319). It is [`match_none`](super::date::match_none) instead.
 pub fn build_clause(name: &str, value: &str, prefix: SearchPrefix) -> Option<Value> {
-    let (num_str, system, code) = parse_quantity_value(value);
-    let num: f64 = num_str.parse().ok()?;
+    let quantity = match FhirQuantityValue::parse(value) {
+        Ok(quantity) => quantity,
+        Err(error) => {
+            tracing::warn!(
+                "unvalidated quantity search value reached the Elasticsearch handler: {error}"
+            );
+            return Some(super::date::match_none());
+        }
+    };
+    let number = &quantity.number;
+    let num = number.value;
+    let (system, code) = (quantity.system.as_deref(), quantity.code.as_deref());
 
     // Raw match against the stored value/unit/system.
     let mut raw_must = vec![
         json!({ "term": { "search_params.quantity.name": name } }),
-        range_condition("search_params.quantity.value", prefix, num, num_str, |x| {
-            Some(x)
-        })?,
+        range_condition("search_params.quantity.value", prefix, number, Some)?,
     ];
     if let Some(sys) = system {
         raw_must.push(json!({ "term": { "search_params.quantity.system": sys } }));
@@ -34,8 +50,7 @@ pub fn build_clause(name: &str, value: &str, prefix: SearchPrefix) -> Option<Val
         let range = range_condition(
             "search_params.quantity.canonical_value",
             prefix,
-            num,
-            num_str,
+            number,
             canon,
         )?;
         Some(json!({
@@ -73,27 +88,46 @@ pub fn build_clause(name: &str, value: &str, prefix: SearchPrefix) -> Option<Val
 fn range_condition(
     field: &str,
     prefix: SearchPrefix,
-    num: f64,
-    num_str: &str,
+    number: &FhirNumberValue,
     map: impl Fn(f64) -> Option<f64>,
 ) -> Option<Value> {
-    // Half-precision of the search value (e.g. "100" → 0.5); comparators match
-    // the implicit range boundaries: gt/sa → ≥ hi, lt/eb → < lo, ge → ≥ lo,
-    // le → < hi (per the FHIR spec).
-    let p = super::number::implicit_range(num_str);
+    // gt/lt/ge/le/sa/eb ignore the implicit precision and compare against the
+    // exact search value (FHIR spec). Only eq/ne use the implicit-precision
+    // range of the search value (e.g. "100" → [99.5, 100.5)), and ap the
+    // shared approximate window around it.
+    let num = number.value;
+    let (eq_lo, eq_hi) = number.implicit_range();
+    if matches!(prefix, SearchPrefix::Ne) {
+        // ne matches values outside the implicit-precision window: negate the
+        // same [lo, hi) range eq builds for this field. Since this clause
+        // stays inside the same raw/canonical `must` list eq uses (unit,
+        // system, and code terms untouched), a resource only matches ne when
+        // it has a quantity entry meeting eq's unit/system criteria whose
+        // value falls outside the range; resources without a matching entry
+        // never satisfy the surrounding `must`, so they are correctly
+        // excluded.
+        let (lo, hi) = ordered(map(eq_lo)?, map(eq_hi)?);
+        return Some(json!({
+            "bool": {
+                "must_not": [
+                    { "range": { field: { "gte": lo, "lt": hi } } }
+                ]
+            }
+        }));
+    }
     let range = match prefix {
-        SearchPrefix::Gt | SearchPrefix::Sa => json!({ "gte": map(num + p)? }),
-        SearchPrefix::Lt | SearchPrefix::Eb => json!({ "lt": map(num - p)? }),
-        SearchPrefix::Ge => json!({ "gte": map(num - p)? }),
-        SearchPrefix::Le => json!({ "lt": map(num + p)? }),
+        SearchPrefix::Gt | SearchPrefix::Sa => json!({ "gt": map(num)? }),
+        SearchPrefix::Lt | SearchPrefix::Eb => json!({ "lt": map(num)? }),
+        SearchPrefix::Ge => json!({ "gte": map(num)? }),
+        SearchPrefix::Le => json!({ "lte": map(num)? }),
         SearchPrefix::Ap => {
-            let margin = (num * 0.1).abs().max(0.5);
-            let (lo, hi) = ordered(map(num - margin)?, map(num + margin)?);
+            let (ap_lo, ap_hi) = number.approx_range();
+            let (lo, hi) = ordered(map(ap_lo)?, map(ap_hi)?);
             json!({ "gte": lo, "lte": hi })
         }
-        // Eq, Ne (treated as Eq range here), and any default
+        // Eq and any default.
         _ => {
-            let (lo, hi) = ordered(map(num - p)?, map(num + p)?);
+            let (lo, hi) = ordered(map(eq_lo)?, map(eq_hi)?);
             json!({ "gte": lo, "lt": hi })
         }
     };
@@ -106,50 +140,9 @@ fn ordered(a: f64, b: f64) -> (f64, f64) {
     if a <= b { (a, b) } else { (b, a) }
 }
 
-/// Parses a quantity value string into (number, system, code).
-///
-/// Formats:
-/// - `5.4` -> ("5.4", None, None)
-/// - `5.4|mg` -> ("5.4", None, Some("mg"))
-/// - `5.4|http://unitsofmeasure.org|mg` -> ("5.4", Some("http://..."), Some("mg"))
-fn parse_quantity_value(value: &str) -> (&str, Option<&str>, Option<&str>) {
-    let parts: Vec<&str> = value.splitn(3, '|').collect();
-    match parts.len() {
-        1 => (parts[0], None, None),
-        2 => (parts[0], None, Some(parts[1])),
-        3 => {
-            let system = if parts[1].is_empty() {
-                None
-            } else {
-                Some(parts[1])
-            };
-            let code = if parts[2].is_empty() {
-                None
-            } else {
-                Some(parts[2])
-            };
-            (parts[0], system, code)
-        }
-        _ => (value, None, None),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_parse_quantity_value() {
-        let (n, s, c) = parse_quantity_value("5.4");
-        assert_eq!(n, "5.4");
-        assert!(s.is_none());
-        assert!(c.is_none());
-
-        let (n, s, c) = parse_quantity_value("5.4|http://unitsofmeasure.org|mg");
-        assert_eq!(n, "5.4");
-        assert_eq!(s, Some("http://unitsofmeasure.org"));
-        assert_eq!(c, Some("mg"));
-    }
 
     #[test]
     fn test_quantity_clause() {
@@ -162,5 +155,184 @@ mod tests {
         let s = serde_json::to_string(&clause).unwrap();
         assert!(s.contains("search_params.quantity"));
         assert!(s.contains("mm[Hg]"));
+    }
+
+    /// Recursively finds the `range` clause for `field` anywhere in `value`,
+    /// regardless of how deeply it is nested inside the raw/canonical
+    /// `bool.should` wrapping.
+    fn find_range<'a>(value: &'a Value, field: &str) -> Option<&'a Value> {
+        if let Some(range) = value.get("range").and_then(|r| r.get(field)) {
+            return Some(range);
+        }
+        match value {
+            Value::Object(map) => map.values().find_map(|v| find_range(v, field)),
+            Value::Array(arr) => arr.iter().find_map(|v| find_range(v, field)),
+            _ => None,
+        }
+    }
+
+    /// Recursively finds a `{"bool": {"must_not": [{"range": {field: ...}}]}}`
+    /// clause for `field` anywhere in `value`, returning the negated range's
+    /// inner bounds object (e.g. `{"gte": ..., "lt": ...}`).
+    fn find_negated_range<'a>(value: &'a Value, field: &str) -> Option<&'a Value> {
+        if let Some(must_not) = value.get("bool").and_then(|b| b.get("must_not")) {
+            if let Some(range) = must_not
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find_map(|item| item.get("range").and_then(|r| r.get(field)))
+            {
+                return Some(range);
+            }
+        }
+        match value {
+            Value::Object(map) => map.values().find_map(|v| find_negated_range(v, field)),
+            Value::Array(arr) => arr.iter().find_map(|v| find_negated_range(v, field)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn raw_comparators_use_exact_value() {
+        // gt/lt/ge/le/sa/eb ignore implicit precision and compare against the
+        // exact search value on the raw (stored-unit) field.
+        let clause = build_clause("value-quantity", "60|kg", SearchPrefix::Gt).unwrap();
+        let range = find_range(&clause, "search_params.quantity.value")
+            .expect("raw range clause must be present");
+        assert_eq!(range, &json!({ "gt": 60.0 }));
+    }
+
+    #[test]
+    fn canonical_comparator_uses_exact_canonical_value() {
+        // Same rule on the canonical (UCUM-converted) field.
+        let clause = build_clause(
+            "value-quantity",
+            "60|http://unitsofmeasure.org|kg",
+            SearchPrefix::Gt,
+        )
+        .unwrap();
+        let expected = helios_fhirpath::ucum::canonicalize_quantity(60.0, "kg")
+            .expect("kg must canonicalize")
+            .0;
+        let range = find_range(&clause, "search_params.quantity.canonical_value")
+            .expect("canonical range clause must be present");
+        assert_eq!(range, &json!({ "gt": expected }));
+    }
+
+    #[test]
+    fn eq_keeps_text_precision_range() {
+        // eq is unaffected by this change: it still ranges over the
+        // implicit-precision window derived from the value as written.
+        let clause = build_clause("value-quantity", "60.0", SearchPrefix::Eq).unwrap();
+        let range = find_range(&clause, "search_params.quantity.value")
+            .expect("raw range clause must be present");
+        let gte = range["gte"].as_f64().expect("gte must be a number");
+        let lt = range["lt"].as_f64().expect("lt must be a number");
+        assert!((gte - 59.95).abs() < 1e-9);
+        assert!((lt - 60.05).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ne_excludes_text_precision_range() {
+        // ne "60" negates the same [59.5, 60.5) range eq would match, on the
+        // raw field.
+        let clause = build_clause("value-quantity", "60", SearchPrefix::Ne).unwrap();
+        let raw_range = find_negated_range(&clause, "search_params.quantity.value")
+            .expect("raw must_not range clause must be present");
+        assert_eq!(raw_range, &json!({ "gte": 59.5, "lt": 60.5 }));
+
+        // With a UCUM unit, the canonical branch's range is negated too.
+        let clause = build_clause(
+            "value-quantity",
+            "60|http://unitsofmeasure.org|kg",
+            SearchPrefix::Ne,
+        )
+        .unwrap();
+        let expected_lo = helios_fhirpath::ucum::canonicalize_quantity(59.5, "kg")
+            .expect("kg must canonicalize")
+            .0;
+        let expected_hi = helios_fhirpath::ucum::canonicalize_quantity(60.5, "kg")
+            .expect("kg must canonicalize")
+            .0;
+        let raw_range = find_negated_range(&clause, "search_params.quantity.value")
+            .expect("raw must_not range clause must be present");
+        assert_eq!(raw_range, &json!({ "gte": 59.5, "lt": 60.5 }));
+
+        let canonical_range = find_negated_range(&clause, "search_params.quantity.canonical_value")
+            .expect("canonical must_not range clause must be present");
+        let gte = canonical_range["gte"]
+            .as_f64()
+            .expect("gte must be a number");
+        let lt = canonical_range["lt"].as_f64().expect("lt must be a number");
+        assert!((gte - expected_lo).abs() < 1e-9);
+        assert!((lt - expected_hi).abs() < 1e-9);
+    }
+
+    /// `ap` is the shared window (#1390) on both the raw and the canonical
+    /// field: ±10% of the value, closed, with both ends converted.
+    #[test]
+    fn ap_uses_the_shared_approximate_window() {
+        let clause = build_clause("value-quantity", "5.4", SearchPrefix::Ap).unwrap();
+        let range = find_range(&clause, "search_params.quantity.value")
+            .expect("raw range clause must be present");
+        assert!((range["gte"].as_f64().unwrap() - 4.86).abs() < 1e-9);
+        assert!((range["lte"].as_f64().unwrap() - 5.94).abs() < 1e-9);
+
+        let clause = build_clause(
+            "value-quantity",
+            "5.4|http://unitsofmeasure.org|mg",
+            SearchPrefix::Ap,
+        )
+        .unwrap();
+        let canon = |x: f64| {
+            helios_fhirpath::ucum::canonicalize_quantity(x, "mg")
+                .expect("mg must canonicalize")
+                .0
+        };
+        let range = find_range(&clause, "search_params.quantity.canonical_value")
+            .expect("canonical range clause must be present");
+        let gte = range["gte"].as_f64().expect("gte must be a number");
+        let lte = range["lte"].as_f64().expect("lte must be a number");
+        assert!((gte - canon(4.86)).abs() < 1e-12, "gte {gte}");
+        assert!((lte - canon(5.94)).abs() < 1e-12, "lte {lte}");
+    }
+
+    /// The `filter_map` trap (#1319), as for numbers: never `None`.
+    #[test]
+    fn an_invalid_number_part_is_match_none_never_none() {
+        for prefix in [SearchPrefix::Eq, SearchPrefix::Ne, SearchPrefix::Lt] {
+            for raw in [
+                "abc",
+                "",
+                "||mg",
+                "|http://unitsofmeasure.org|mg",
+                "abc|http://unitsofmeasure.org|mg",
+                "inf||mg",
+                "nan",
+                "1e999|mg",
+            ] {
+                assert_eq!(
+                    build_clause("value-quantity", raw, prefix),
+                    Some(json!({ "match_none": {} })),
+                    "{prefix:?} {raw:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_escaped_pipe_is_part_of_the_code() {
+        let clause = build_clause(
+            "value-quantity",
+            "5.4|http://example.org|a\\|b",
+            SearchPrefix::Eq,
+        )
+        .unwrap();
+        let s = serde_json::to_string(&clause).unwrap();
+        assert!(s.contains(r#""search_params.quantity.code":"a|b""#), "{s}");
+        assert!(
+            s.contains(r#""search_params.quantity.system":"http://example.org""#),
+            "{s}"
+        );
     }
 }
