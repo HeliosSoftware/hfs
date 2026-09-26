@@ -182,6 +182,15 @@ pub struct MongoBackendConfig {
     /// operator can build them out of band (`HFS_MONGODB_INDEX_BUILD`).
     #[serde(default)]
     pub index_build: IndexBuildMode,
+
+    /// Clock-skew and commit-lag allowance of the `$reindex` walk's catch-up
+    /// rounds, in milliseconds (#1403). A resource stamped within this much of
+    /// a walk's start, or written while it runs, is re-read in `last_updated`
+    /// order after the id-order pass. Default 120 000 (two minutes); values
+    /// are clamped to 1 000 ..= 86 400 000. No `HFS_*` variable sets it;
+    /// tests construct a shorter one directly.
+    #[serde(default = "default_reindex_catch_up_margin_ms")]
+    pub reindex_catch_up_margin_ms: u64,
 }
 
 fn default_connection_string() -> String {
@@ -212,6 +221,10 @@ fn default_app_name() -> String {
     "helios-persistence".to_string()
 }
 
+fn default_reindex_catch_up_margin_ms() -> u64 {
+    120_000
+}
+
 impl Default for MongoBackendConfig {
     fn default() -> Self {
         Self {
@@ -226,6 +239,7 @@ impl Default for MongoBackendConfig {
             max_included_resources: default_max_included_resources(),
             app_name: default_app_name(),
             index_build: IndexBuildMode::default(),
+            reindex_catch_up_margin_ms: default_reindex_catch_up_margin_ms(),
         }
     }
 }
@@ -506,7 +520,7 @@ impl MongoBackend {
     /// Initializes the MongoDB schema/index bootstrap for this backend.
     ///
     /// Inline-class indexes are created before this returns. The
-    /// generation-3 `search_index` indexes are built by `SearchIndexBuilder`,
+    /// generation-4 `search_index` indexes are built by `SearchIndexBuilder`,
     /// which moves any contained rows out of `search_index` first, in every
     /// mode (#1160): spawned and left running in `background` mode, awaited
     /// in `inline` mode, and only inspected in `off` mode (see

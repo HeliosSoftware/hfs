@@ -86,7 +86,7 @@ const RETRY_BACKOFF_BASE: Duration = Duration::from_millis(5);
 /// identical delays and they would simply collide again. A v4 UUID gives an
 /// independent draw without taking on a random-number dependency (`uuid` is
 /// already a dependency of this crate).
-fn retry_backoff(attempt: usize) -> Duration {
+pub(super) fn retry_backoff(attempt: usize) -> Duration {
     let exponential = RETRY_BACKOFF_BASE * (1 << attempt.min(5)) as u32;
     // Full jitter: sleep for a uniformly random point in [0, exponential).
     let span = u64::try_from(exponential.as_nanos()).unwrap_or(u64::MAX);

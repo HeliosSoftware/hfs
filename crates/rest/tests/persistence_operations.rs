@@ -424,20 +424,32 @@ async fn test_reindex_rebuilds_the_search_index() {
 
     // The rebuild runs in the background, so poll rather than assuming.
     let mut final_status = String::new();
+    let mut final_body = Value::Null;
     for _ in 0..100 {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let status = server.get(&format!("/$reindex-status/{job_id}")).await;
         if status.status_code() != StatusCode::OK {
             continue;
         }
-        let state =
-            param_string(&status.json::<Value>(), "status", "valueCode").unwrap_or_default();
+        let body = status.json::<Value>();
+        let state = param_string(&body, "status", "valueCode").unwrap_or_default();
         if state == "completed" || state == "failed" || state == "cancelled" {
             final_status = state;
+            final_body = body;
             break;
         }
     }
     assert_eq!(final_status, "completed", "reindex job did not complete");
+
+    // A finished job reports when it started and completed, so its duration
+    // can be read from the status alone.
+    let instant = |name: &str| {
+        let value = param_string(&final_body, name, "valueDateTime")
+            .unwrap_or_else(|| panic!("{name} missing from a completed job's status"));
+        chrono::DateTime::parse_from_rfc3339(&value)
+            .unwrap_or_else(|e| panic!("{name} is not an RFC 3339 instant ({value}): {e}"))
+    };
+    assert!(instant("completedAt") >= instant("startedAt"));
 
     assert_eq!(
         search_matches(&server).await,

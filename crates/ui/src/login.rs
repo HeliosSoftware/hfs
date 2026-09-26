@@ -176,7 +176,7 @@ pub(crate) async fn login(
         return not_configured();
     };
     let next = query.next.as_deref().unwrap_or("/ui");
-    let (pending_id, authorize_url) = login.sessions.begin(next);
+    let (pending_id, authorize_url) = login.sessions.begin(next).await;
     tracing::info!(next = %next, "web login started; redirecting to the identity provider");
     let secure = login.sessions.config().cookie_secure;
     let mut response = Redirect::to(&authorize_url).into_response();
@@ -264,9 +264,10 @@ pub(crate) async fn logout(State(state): State<WebState>, request: Request) -> R
     };
     let secure = login.sessions.config().cookie_secure;
     let session_id = helios_auth::cookie_value(request.headers(), SESSION_COOKIE);
-    let end_session = session_id
-        .as_deref()
-        .and_then(|id| login.sessions.logout(id));
+    let end_session = match session_id.as_deref() {
+        Some(id) => login.sessions.logout(id).await,
+        None => None,
+    };
 
     let post_logout = format!("{}/ui", state.public_base_url.trim_end_matches('/'));
     let end_session_requested = end_session.is_some();
@@ -357,5 +358,266 @@ mod tests {
         assert!(!dev.contains("Secure"));
         let cleared = cookie(SESSION_COOKIE, "", Some(0), true);
         assert!(cleared.ends_with("Max-Age=0"));
+    }
+}
+
+/// The `Authorization` value a self-call made on this request's behalf should
+/// carry when the browser sent none of its own: the signed-in user's session
+/// bearer (issue #1480). Resolved through the same `access_token` path the
+/// REST middleware uses — a token about to lapse is refreshed, a session whose
+/// refresh is dead is dropped — so a page's server-side call runs with exactly
+/// the credential its browser-side calls run with. `None` when no login is
+/// installed or the request carries no valid session; the caller then falls
+/// back to the process's outbound service credential as before.
+pub(crate) async fn session_authorization(
+    state: &WebState,
+    headers: &axum::http::HeaderMap,
+) -> Option<String> {
+    let login = state.login.as_ref()?;
+    let id = helios_auth::cookie_value(headers, SESSION_COOKIE)?;
+    match login.sessions.access_token(&id).await {
+        AccessOutcome::Token(token) => Some(format!("Bearer {token}")),
+        AccessOutcome::NoSession => None,
+    }
+}
+
+/// A [`crate::Caller`] for this request: the browser's own `Authorization`
+/// when it sent one, else the signed-in session's bearer (#1480), else none —
+/// in which case the conformance source applies the outbound service
+/// credential. The `$sql-export` self-calls run as the user who clicked.
+pub(crate) async fn caller_for(
+    state: &WebState,
+    headers: &axum::http::HeaderMap,
+    tenant: &str,
+) -> crate::Caller {
+    let mut caller = crate::Caller::from_request(headers, tenant);
+    if caller.authorization.is_none() {
+        caller.authorization = session_authorization(state, headers).await;
+    }
+    caller
+}
+
+/// The credential a page's own server-side self-call carries under the
+/// interactive login (#1480): the browser's `Authorization` when it sent one,
+/// else the signed-in session's bearer, else nothing (the outbound service
+/// credential applies downstream).
+#[cfg(test)]
+mod selfcall_tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use axum::http::{HeaderMap, HeaderValue, header};
+    use helios_auth::{LoginConfig, Session, SessionPrincipal, SessionStore};
+
+    use super::*;
+
+    const TOKEN: &str = "access-token-1";
+
+    fn store() -> Arc<SessionStore> {
+        let store = Arc::new(SessionStore::new(LoginConfig {
+            client_id: "hfs-web".to_string(),
+            client_secret: None,
+            redirect_uri: "http://localhost:8080/ui/callback".to_string(),
+            scopes: "openid".to_string(),
+            authorization_endpoint: "https://idp.example.com/auth".to_string(),
+            token_endpoint: "https://idp.example.com/token".to_string(),
+            end_session_endpoint: None,
+            cookie_secure: true,
+        }));
+        store.insert(Session {
+            id: "sess-1".to_string(),
+            principal: SessionPrincipal {
+                subject: "demo-sub".to_string(),
+                issuer: "https://idp.example.com".to_string(),
+                name: Some("Demo User".to_string()),
+                preferred_username: None,
+                email: None,
+                picture: None,
+            },
+            access_token: TOKEN.to_string(),
+            access_expires_at: Instant::now() + Duration::from_secs(300),
+            refresh_token: None,
+            id_token: None,
+            last_seen: Instant::now(),
+            created_at: Utc::now(),
+        });
+        store
+    }
+
+    /// A real `WebState`, with or without a login installed.
+    fn web_state(sessions: Option<Arc<SessionStore>>) -> WebState {
+        let source: Arc<dyn crate::ConformanceSource> = Arc::new(
+            crate::StaticConformanceSource::from_data_dir(std::path::Path::new("../../data")),
+        );
+        WebState {
+            version: "9.9.9",
+            sp_catalog: Arc::new(crate::search_params::SpCatalog::new(source.clone())),
+            nl: Arc::new(crate::NlSearch::default()),
+            compartments: Arc::new(crate::compartments::CompartmentCatalog::new(source.clone())),
+            conformance: source,
+            tenants: None,
+            provisioning: Default::default(),
+            data_dir: None,
+            public_base_url: "http://localhost:8080".to_string(),
+            self_base_url: "http://localhost:8080".to_string(),
+            outbound_auth: Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
+            tenant_path_routing: false,
+            fhir_version: helios_fhir::FhirVersion::R4,
+            default_tenant: "default".to_string(),
+            terminology: None,
+            settings: None,
+            bulk_provider: None,
+            write_observer: None,
+            patient_name_search: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            login: sessions.map(|sessions| Arc::new(LoginRuntime { sessions })),
+        }
+    }
+
+    fn cookie(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, HeaderValue::from_str(value).unwrap());
+        headers
+    }
+
+    #[tokio::test]
+    async fn session_authorization_is_the_session_bearer_only_for_a_valid_cookie() {
+        let state = web_state(Some(store()));
+        assert_eq!(
+            session_authorization(&state, &cookie("hfs_lang=es; hfs_session=sess-1")).await,
+            Some(format!("Bearer {TOKEN}"))
+        );
+        assert_eq!(session_authorization(&state, &HeaderMap::new()).await, None);
+        assert_eq!(
+            session_authorization(&state, &cookie("hfs_session=nope")).await,
+            None
+        );
+        // No login installed: the cookie means nothing.
+        let no_login = web_state(None);
+        assert_eq!(
+            session_authorization(&no_login, &cookie("hfs_session=sess-1")).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn caller_for_prefers_the_browser_header_then_the_session_then_nothing() {
+        let state = web_state(Some(store()));
+
+        let mut both = cookie("hfs_session=sess-1");
+        both.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer browser-token"),
+        );
+        let caller = caller_for(&state, &both, "clinic-a").await;
+        assert_eq!(
+            caller.authorization.as_deref(),
+            Some("Bearer browser-token")
+        );
+        assert_eq!(caller.tenant, "clinic-a");
+
+        let caller = caller_for(&state, &cookie("hfs_session=sess-1"), "clinic-a").await;
+        assert_eq!(
+            caller.authorization.as_deref(),
+            Some(format!("Bearer {TOKEN}").as_str())
+        );
+
+        let caller = caller_for(&state, &HeaderMap::new(), "clinic-a").await;
+        assert_eq!(caller.authorization, None);
+    }
+
+    async fn built_headers(state: &WebState, headers: &HeaderMap) -> reqwest::header::HeaderMap {
+        let request = reqwest::Client::new().get("http://127.0.0.1:1/Patient/$export");
+        crate::bulk_export::forward_identity(state, request, headers, "clinic-a", "aud")
+            .await
+            .expect("credential resolved")
+            .build()
+            .expect("request builds")
+            .headers()
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn forward_identity_runs_the_self_call_as_the_signed_in_user() {
+        let state = web_state(Some(store()));
+
+        // Session cookie, no browser header: the session's bearer goes on.
+        let sent = built_headers(&state, &cookie("hfs_session=sess-1")).await;
+        assert_eq!(
+            sent.get("authorization").and_then(|v| v.to_str().ok()),
+            Some(format!("Bearer {TOKEN}").as_str())
+        );
+        assert_eq!(
+            sent.get("x-tenant-id").and_then(|v| v.to_str().ok()),
+            Some("clinic-a")
+        );
+
+        // The browser's own header still wins, verbatim.
+        let mut both = cookie("hfs_session=sess-1");
+        both.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer browser-token"),
+        );
+        let sent = built_headers(&state, &both).await;
+        assert_eq!(
+            sent.get("authorization").and_then(|v| v.to_str().ok()),
+            Some("Bearer browser-token")
+        );
+
+        // No session: the outbound provider (a no-op here) is all there is.
+        let sent = built_headers(&state, &HeaderMap::new()).await;
+        assert!(sent.get("authorization").is_none());
+    }
+
+    async fn import_headers(
+        state: &WebState,
+        submission: &crate::bulk_import::Submission,
+        headers: &HeaderMap,
+    ) -> reqwest::header::HeaderMap {
+        let request = reqwest::Client::new().post("http://localhost:8080/$bulk-submit");
+        crate::bulk_import::authorize_self_call(state, submission, headers, request, "aud")
+            .await
+            .expect("credential resolved")
+            .build()
+            .expect("request builds")
+            .headers()
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn the_import_page_submits_to_this_server_as_the_signed_in_user_too() {
+        let state = web_state(Some(store()));
+        let to_self = crate::bulk_import::Submission {
+            auth: "none".to_string(),
+            recipient_base_url: "http://localhost:8080".to_string(),
+            ..Default::default()
+        };
+
+        // Same order as every other page: the session's bearer goes on.
+        let sent = import_headers(&state, &to_self, &cookie("hfs_session=sess-1")).await;
+        assert_eq!(
+            sent.get("authorization").and_then(|v| v.to_str().ok()),
+            Some(format!("Bearer {TOKEN}").as_str())
+        );
+
+        // The browser's own header still wins.
+        let mut both = cookie("hfs_session=sess-1");
+        both.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer browser-token"),
+        );
+        let sent = import_headers(&state, &to_self, &both).await;
+        assert_eq!(
+            sent.get("authorization").and_then(|v| v.to_str().ok()),
+            Some("Bearer browser-token")
+        );
+
+        // Another server never sees this server's user or service token.
+        let elsewhere = crate::bulk_import::Submission {
+            auth: "none".to_string(),
+            recipient_base_url: "https://recipient.example".to_string(),
+            ..Default::default()
+        };
+        let sent = import_headers(&state, &elsewhere, &cookie("hfs_session=sess-1")).await;
+        assert!(sent.get("authorization").is_none());
     }
 }

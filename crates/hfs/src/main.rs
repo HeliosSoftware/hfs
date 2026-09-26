@@ -355,6 +355,7 @@ where
         max_included_resources,
         index_build,
         app_name: MongoBackendConfig::default().app_name,
+        reindex_catch_up_margin_ms: MongoBackendConfig::default().reindex_catch_up_margin_ms,
     })
 }
 
@@ -750,6 +751,7 @@ async fn start_mongodb(
 
     backend.init_schema().await?;
     let backend = Arc::new(backend);
+    attach_login_sessions(auth_state.as_ref(), backend.clone());
     let observability = helios_rest::WriteObservability::new();
     seed_conformance_resources(&*backend, &config, Some(observability.observers.as_ref())).await;
     spawn_mongodb_search_param_refresh(backend.clone(), &config);
@@ -1186,6 +1188,43 @@ async fn init_login_sessions(
             cookie_secure: auth_config.web_cookie_secure,
         },
     ))))
+}
+
+/// Gives the web UI's login sessions a home in the primary store (#1481), so
+/// a session established on one node resolves on every other and outlives a
+/// restart. Called from a backend's `start_*` once its Arc exists: the store
+/// itself is built with the auth state, before any backend is. Nothing to
+/// attach when interactive login is off.
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "s3"
+))]
+fn attach_login_sessions(
+    auth_state: Option<&Arc<AuthMiddlewareState>>,
+    persistence: Arc<dyn helios_auth::SessionPersistence>,
+) {
+    if let Some(sessions) = auth_state.and_then(|state| state.sessions.as_ref()) {
+        sessions.attach_persistence(persistence);
+    }
+}
+
+/// A deployment with nowhere tenant-independent to keep them (S3
+/// bucket-per-tenant with no system bucket — the same case that leaves
+/// `/_user/settings` unwired) keeps login sessions in process: fine on one
+/// node, but a cluster needs sticky sessions and a restart signs everyone
+/// out. Said once at startup so an operator knows which mode they are in.
+/// This binary only ever builds `PrefixPerTenant` from its environment, so
+/// the branch is reached through the library's configuration alone (#1514).
+#[cfg(feature = "s3")]
+fn warn_login_sessions_in_process(auth_state: Option<&Arc<AuthMiddlewareState>>) {
+    if auth_state.is_some_and(|state| state.sessions.is_some()) {
+        warn!(
+            "web login sessions are held in process on this storage backend: a session is \
+             not shared across nodes and does not survive a restart"
+        );
+    }
 }
 
 /// Initializes the audit subsystem from environment configuration.
@@ -1671,6 +1710,7 @@ async fn start_sqlite(
 ) -> anyhow::Result<()> {
     let serve_audit_state = audit_state.clone();
     let backend = Arc::new(create_sqlite_backend(&config)?);
+    attach_login_sessions(auth_state.as_ref(), backend.clone());
     let observability = helios_rest::WriteObservability::new();
     seed_conformance_resources(&*backend, &config, Some(observability.observers.as_ref())).await;
     spawn_sqlite_search_param_refresh(backend.clone(), &config);
@@ -1916,13 +1956,45 @@ fn wire_reindex(
 /// Builds the deferred bulk-submit hook using the existing submit-worker
 /// concurrency as the per-process automatic reindex limit, plus where to clear
 /// the persisted "this manifest still owes a rebuild" marker when a generation
-/// finishes (#1125). Without a ledger (`None`) nothing is recorded and a restart
-/// cannot resume, as before.
+/// finishes (#1125). Without a ledger (`None`) nothing is recorded and a
+/// restart cannot resume, as before.
+///
+/// Split into this function and [`automatic_reindex_hook_with_ledger`] so a
+/// test can read the concrete `ReindexOnFinish`'s `batch_bytes()` (#1499)
+/// without downcasting the trait object every other caller uses.
 ///
 /// Gated exactly like [`wire_reindex`], which produces the `op` every caller
-/// passes in: any build with a reindex target. Keep the two in step rather than
-/// naming individual backends here — a narrower gate breaks the builds that
-/// leave that backend out (#1291).
+/// passes in: any build with a reindex target. Keep the two in step rather
+/// than naming individual backends here — a narrower gate breaks the builds
+/// that leave that backend out (#1291).
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "elasticsearch"
+))]
+fn build_automatic_reindex_hook(
+    op: Arc<ReindexOperation>,
+    config: &ServerConfig,
+    ledger: Option<Arc<dyn helios_persistence::search::DeferredReindexLedger>>,
+) -> helios_persistence::search::ReindexOnFinish {
+    let hook = helios_persistence::search::ReindexOnFinish::with_max_concurrency(
+        op,
+        config.bulk_submit.worker_concurrency as usize,
+    )
+    .with_batch_size(config.reindex_batch_size)
+    .with_batch_bytes(config.reindex_batch_bytes)
+    .with_bulk_index_rebuild(config.bulk_submit.bulk_index_rebuild);
+    match ledger {
+        Some(ledger) => hook.with_ledger(ledger),
+        None => hook,
+    }
+}
+
+/// Builds [`build_automatic_reindex_hook`]'s hook and erases it behind
+/// `Arc<dyn DeferredReindexHook>`, the shape every wiring site outside tests
+/// needs. See that function's doc comment for what it configures and why the
+/// two are split (#1499).
 #[cfg(any(
     feature = "sqlite",
     feature = "postgres",
@@ -1934,17 +2006,7 @@ fn automatic_reindex_hook_with_ledger(
     config: &ServerConfig,
     ledger: Option<Arc<dyn helios_persistence::search::DeferredReindexLedger>>,
 ) -> Arc<dyn helios_persistence::core::DeferredReindexHook> {
-    let hook = helios_persistence::search::ReindexOnFinish::with_max_concurrency(
-        op,
-        config.bulk_submit.worker_concurrency as usize,
-    )
-    .with_batch_size(config.reindex_batch_size)
-    .with_batch_bytes(config.reindex_batch_bytes)
-    .with_bulk_index_rebuild(config.bulk_submit.bulk_index_rebuild);
-    Arc::new(match ledger {
-        Some(ledger) => hook.with_ledger(ledger),
-        None => hook,
-    })
+    Arc::new(build_automatic_reindex_hook(op, config, ledger))
 }
 
 /// Ops bundle for a backend that indexes itself — the standalone deployments
@@ -2534,6 +2596,7 @@ async fn start_sqlite_elasticsearch(
     let mut sqlite = create_sqlite_backend(&config)?;
     sqlite.set_search_offloaded(true);
     let sqlite = Arc::new(sqlite);
+    attach_login_sessions(auth_state.as_ref(), sqlite.clone());
     info!("SQLite search indexing disabled (offloaded to Elasticsearch)");
     // Refresh reads from the primary; the ES backend shares its registry Arc.
     // Seeding waits for the composite below, so the writes also index into ES.
@@ -2778,6 +2841,7 @@ async fn start_postgres(
 
     backend.init_schema().await?;
     let backend = Arc::new(backend);
+    attach_login_sessions(auth_state.as_ref(), backend.clone());
     let observability = helios_rest::WriteObservability::new();
     seed_conformance_resources(&*backend, &config, Some(observability.observers.as_ref())).await;
     spawn_postgres_search_param_refresh(backend.clone(), &config);
@@ -2871,6 +2935,7 @@ async fn start_postgres_elasticsearch(
     let mut backend = backend;
     backend.set_search_offloaded(true);
     let pg = Arc::new(backend);
+    attach_login_sessions(auth_state.as_ref(), pg.clone());
     info!("PostgreSQL search indexing disabled (offloaded to Elasticsearch)");
     // Refresh reads from the primary; the ES backend shares its registry Arc.
     // Seeding waits for the composite below, so the writes also index into ES.
@@ -3096,6 +3161,7 @@ async fn start_mongodb_elasticsearch(
 
     // Offload search to Elasticsearch
     let mongo = Arc::new(backend);
+    attach_login_sessions(auth_state.as_ref(), mongo.clone());
     info!("MongoDB search indexing disabled (offloaded to Elasticsearch)");
     // Refresh reads from the primary; the ES backend shares its registry Arc.
     // Seeding waits for the composite below, so the writes also index into ES.
@@ -3362,6 +3428,11 @@ async fn start_s3(
     })?;
 
     let backend = Arc::new(backend);
+    if backend.supports_user_settings() {
+        attach_login_sessions(auth_state.as_ref(), backend.clone());
+    } else {
+        warn_login_sessions_in_process(auth_state.as_ref());
+    }
     let serve_audit_state = audit_state.clone();
     // Standalone S3 seeds no conformance resources, but its REST writes, bulk
     // submit, and UI purges still report to the one write observer (#1078).
@@ -3531,6 +3602,11 @@ async fn start_s3_elasticsearch(
             e
         )
     })?);
+    if s3.supports_user_settings() {
+        attach_login_sessions(auth_state.as_ref(), s3.clone());
+    } else {
+        warn_login_sessions_in_process(auth_state.as_ref());
+    }
     // Refresh reads from the primary; the ES backend shares its registry Arc
     // (wired below, once it's populated). Seeding waits for the composite
     // further down, so the writes also index into ES.
@@ -3861,6 +3937,34 @@ mod tests {
         let (targets, names) = sqlite_es_reindex_targets(&local, &es);
         assert_eq!(names, &["sqlite", "elasticsearch"]);
         assert_eq!(targets.len(), 2);
+    }
+
+    // ── Automatic reindex hook wiring (#1499) ──────────────────────
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn test_automatic_reindex_hook_gets_the_server_default_batch_bytes_when_unset() {
+        use clap::Parser;
+
+        let config = ServerConfig::try_parse_from(["rest-server"]).unwrap();
+        assert_eq!(
+            config.reindex_batch_bytes,
+            32 * 1024 * 1024,
+            "HFS_REINDEX_BATCH_BYTES server default (#1499)"
+        );
+
+        let backend = Arc::new(
+            create_sqlite_backend(&ServerConfig {
+                database_url: Some(":memory:".to_string()),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let registries = backend.tenant_registries().clone();
+        let op = Arc::new(ReindexOperation::new(backend, registries));
+
+        let hook = build_automatic_reindex_hook(op, &config, None);
+        assert_eq!(hook.batch_bytes(), 32 * 1024 * 1024);
     }
 
     // ── create_sqlite_backend() ───────────────────────────────────

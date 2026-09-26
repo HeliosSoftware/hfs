@@ -70,9 +70,11 @@ part of T4.
 | Rust 1.90+ (edition 2024), `cargo` | build |
 | Python 3 with dev headers, `maturin` not required | `--workspace` includes `pysof` (PyO3 cdylib); the build needs a Python interpreter on `PATH` |
 | Docker | Postgres, Elasticsearch, MongoDB, MinIO |
-| `curl`, `jq` | T1 smoke check only; `jq` optionally trims the import manifest in T3 |
-| `tar`, `python3` | unpack the corpora; `python3 -m http.server` serves the corpus to the Import page (unless T3 uses the hosted manifest, 7.1) and runs the webhook receiver in T8 |
+| `curl`, `jq` | T1 smoke check; T3 corpus and count checks (7.1, 7.5); `jq` optionally trims the import manifest in T3 |
+| `tar`, `python3` | unpack the corpora; `python3` runs the webhook receiver in T8 (not the corpus server, see 7.1) |
+| HTTP/1.1 keep-alive static server | serves the corpus to the Import page in T3 (7.1); `nginx:alpine` in Docker works |
 | ~45 GB free disk | corpus (3.6 GB tar.gz, 35 GB extracted) plus SQLite/Postgres data; the corpus share is not needed when T3 uses the hosted manifest (7.1) |
+| ≥ 16 GB RAM on `*-es` rows | 8 GB Elasticsearch heap (section 4) |
 | A modern browser with JavaScript on | every step from T2 on runs in `/ui`; the Batch / Transaction page needs JavaScript |
 
 Shell conventions used below:
@@ -134,7 +136,8 @@ Pass criteria: build exits 0; `hfs --help` prints usage.
 ## 4. Backend infrastructure
 
 Start only what the row under test needs. Ports below are the ones the start
-commands in section 5 assume. These match the images CI uses.
+commands in section 5 assume. These match the images CI uses, except the
+Elasticsearch heap, which is sized for T3.
 
 ```bash
 # PostgreSQL 16 (postgres, pg-es)
@@ -142,9 +145,13 @@ docker run -d --name hfs-pg -p 5432:5432 \
   -e POSTGRES_USER=helios -e POSTGRES_PASSWORD=helios -e POSTGRES_DB=helios postgres:16
 
 # Elasticsearch 8.15.0 (any *-es composite)
+# T3: 8 GB heap and a named volume (survives `docker rm -fv`)
+docker volume create hfs-es-data
 docker run -d --name hfs-es -p 9200:9200 \
   -e discovery.type=single-node -e xpack.security.enabled=false \
-  -e "ES_JAVA_OPTS=-Xms1g -Xmx1g" elasticsearch:8.15.0
+  -e "ES_JAVA_OPTS=-Xms8g -Xmx8g" \
+  -v hfs-es-data:/usr/share/elasticsearch/data \
+  elasticsearch:8.15.0
 
 # MongoDB 7.0 (mongodb, mongo-es) — a single-node replica set: transaction Bundles
 # need multi-document transactions, which a standalone mongod cannot run (T2 6.3).
@@ -170,9 +177,54 @@ docker exec hfs-mongo mongosh --quiet --eval 'rs.status().ok'    # 1
 curl -sf localhost:9000/minio/health/live && echo minio ok
 ```
 
+On a host with less than 16 GB of RAM use `-Xms4g -Xmx4g` and record the deviation.
+
 Reset between backend rows: `docker rm -fv hfs-pg hfs-es hfs-mongo hfs-minio` and
 recreate. For SQLite delete `data/hfs.db*` and `data/bulk_export.db*`; on every
-backend also delete `data/submit` (bulk-import status artifacts).
+backend also delete `data/submit` (bulk-import status artifacts). `hfs-es-data` survives
+`docker rm -fv`; for a clean index also run `docker volume rm hfs-es-data`.
+
+### 4.1 Elasticsearch preparation for `*-es` rows
+
+Do this before T3.
+
+**1. Give the run its own index prefix** in the shell that starts HFS (keep it
+exported for 7.5 and §14), so a retried T3 starts clean:
+
+```bash
+export ES_PREFIX=hfs_$(date +%Y%m%d_%H%M)          # e.g. hfs_20260916_1042
+export HFS_ELASTICSEARCH_INDEX_PREFIX=$ES_PREFIX   # default "hfs"
+```
+
+**2. Check the shard budget** before starting.
+
+```bash
+curl -s "localhost:9200/_cat/health?v"                       # green or yellow, never red
+curl -s "localhost:9200/_cat/shards" | wc -l                 # must be well under 1000
+curl -s "localhost:9200/_cat/indices?v&h=index,health,docs.count,store.size"
+```
+
+The shard count must stay well under 1,000 (a T3 run adds about 52). If the cluster
+is full, HFS never becomes ready and the log only shows `Sync attempt failed,
+retrying`. That is not an HFS defect: run step 3. Yellow is normal on a single node;
+only red is a failure.
+
+**3. Clean up at the end of the row.**
+
+```bash
+names=$(curl -s "localhost:9200/_cat/indices/${ES_PREFIX}_*?h=index" | tr -d ' ' | paste -sd, -)
+echo "$names"
+curl -sf -X DELETE "localhost:9200/$names"     # wildcard deletes are rejected, hence the names
+curl -s localhost:9200/_cat/shards | wc -l     # back down
+```
+
+If a run hits the shard limit mid-import, raise it for the session, finish, clean up
+and record that you did:
+
+```bash
+curl -sf -X PUT localhost:9200/_cluster/settings -H 'Content-Type: application/json' \
+  -d '{"persistent":{"cluster.max_shards_per_node":3000}}'
+```
 
 ---
 
@@ -189,8 +241,9 @@ export HFS_REQUEST_TIMEOUT=600            # large bundles on composite backends
 export HFS_SUBSCRIPTIONS_ENABLED=true
 export HFS_BULK_EXPORT_OUTPUT_DIR=$WORK/bulk-exports  # T5 local-fs output
 export HFS_EXPORT_DIR=$WORK/sql-exports               # T7 fs sink
-# composites: make searches read-your-write so T3 counts and T4 are deterministic
+# composites: read-your-write for T2 and T4; the rebuild skips the refresh wait
 export HFS_COMPOSITE_SYNC_MODE=synchronous HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for
+export HFS_ELASTICSEARCH_REINDEX_REFRESH=false
 ```
 
 `HFS_BASE_URL` matters more than usual in this pass: the Import page makes HFS
@@ -206,6 +259,29 @@ url`, because nothing is listening there. HFS does warn about the mismatch at
 startup (`HFS_BASE_URL '…' advertises a different port from listener …`), but it is
 a `warn!`, not a fatal, and it is easy to miss in the startup log. The rest of this
 document writes `http://localhost:8080`; substitute your own base URL throughout.
+
+### One environment for the whole pass
+
+Use these settings for the whole pass; do not restart HFS between T3 and T4:
+
+| Setting | Value | Why |
+|---|---|---|
+| `HFS_COMPOSITE_SYNC_MODE` | `synchronous` | T2 and T4 see their own writes |
+| `HFS_ELASTICSEARCH_WRITE_REFRESH` | `wait_for` | same, for the Elasticsearch leg |
+| `HFS_ELASTICSEARCH_REINDEX_REFRESH` | `false` | the rebuild does not wait for refreshes |
+
+Without `REINDEX_REFRESH=false` the search rebuild in 7.4 is several times slower.
+
+Leave `HFS_BULK_SUBMIT_DEFER_INDEXING` at its default (`true`): the import stores first
+and the search index is rebuilt afterwards (7.4). If a row runs with `false`, record
+it in the matrix cell, because it changes what 7.4 and §14 measure.
+
+### Cost of the status page during T3
+
+Keep the submission detail page open (7.3), but expect it to slow down. Its status
+card polls every 5 s, and each poll gets slower as the import grows; on SQLite, gaps
+of minutes between updates are expected, not a hang. The dashboard is safe to leave
+open (#1081).
 
 ### Per-backend environment
 
@@ -371,23 +447,21 @@ The corpus is a Bulk Data export of 11,704 Synthea patients (18,955,865 resource
 24 NDJSON files) plus a `manifest.json` that references those files at
 `http://localhost:8000/…`. HFS ingests it with the Bulk Data `$bulk-submit`
 operation, driven from the **Import** page, which makes HFS fetch the manifest and
-every file from a small HTTP server you run on port 8000 — or, alternatively,
+every file from a static HTTP server you run on port 8000 — or, alternatively,
 straight from the S3 bucket, where the archive has already been unpacked.
+
+Before starting, confirm HFS runs with the section 5 environment and, on `*-es` rows,
+that 4.1 is done.
 
 ### 7.1 Download, unpack, and serve the corpus
 
-**Alternative: use the hosted manifest and skip this section.** `fhir2.tar.gz` has
-been exploded in the S3 bucket: the 24 NDJSON files sit next to a manifest at
-<https://hfs-manual-test.s3.us-east-1.amazonaws.com/manifest.json> whose `output`
-URLs point at the bucket (`https://hfs-manual-test.s3.us-east-1.amazonaws.com/<Type>.ndjson`)
-instead of `http://localhost:8000/…`. The bucket is publicly readable, so no
-authentication is needed. To use it, do not download, unpack, or serve anything:
-go to 7.2 and enter that URL as the **Manifest URL**. The data is identical, so
-every count in 7.4 and T4 is unchanged. Two differences to allow for: the HFS
-process needs outbound internet access and pulls ~35 GB over it (so the elapsed
-time recorded in 7.3 includes the download and is not comparable with a
-locally-served run — note which source was used in the matrix cell), and there is
-no `$WORK/corpus-http.log` to watch in 7.3.
+**Alternative: use the hosted manifest and skip the download and the server.** The
+manifest at <https://hfs-manual-test.s3.us-east-1.amazonaws.com/manifest.json> is
+publicly readable and its `output` URLs point at the bucket. Record the per-type
+counts (below, hosted form), then go to 7.2 and enter that URL as the **Manifest
+URL**. Counts in 7.5 and T4 are unchanged. HFS needs outbound internet and pulls
+~35 GB; note the source in the matrix cell. There is no local server log to watch in
+7.3.
 
 Otherwise, host the corpus locally:
 
@@ -397,11 +471,63 @@ mkdir -p "$WORK/corpus" && cd "$WORK/corpus"
 tar -xzf fhir2.tar.gz                    # extracts a directory containing the 24 *.ndjson files and manifest.json
 cd fhir2 2>/dev/null || cd "$(dirname "$(find . -name manifest.json | head -1)")"
 ls | wc -l                               # 26 files (24 NDJSON, manifest.json, parameters.json)
-python3 -m http.server 8000 --bind 127.0.0.1 > "$WORK/corpus-http.log" 2>&1 &
-curl -sf http://localhost:8000/manifest.json | head -c 400   # the manifest is being served
+export CORPUS=$PWD
 ```
 
-Leave the HTTP server running until the import has finished.
+#### Serve it with an HTTP/1.1 keep-alive server, not `python3 -m http.server`
+
+```bash
+chmod -R a+rX "$CORPUS"                  # the container's worker must be able to read the files
+docker run -d --name hfs-corpus -p 8000:80 -v "$CORPUS":/usr/share/nginx/html:ro nginx:alpine
+```
+
+Any static server works (e.g. `caddy file-server --root "$CORPUS" --listen :8000`);
+on SELinux add `,z` to the mount. Stop it with `docker rm -f hfs-corpus` after T3 and
+its search rebuild, not before.
+
+`python3 -m http.server` truncates large files on this corpus (#1126), which fails T3
+after hours of ingest. Run the byte check below before the import.
+
+#### Check the server answers HTTP/1.1 and serves whole files
+
+```bash
+curl -s -o /dev/null -D - http://localhost:8000/manifest.json | head -3   # HTTP/1.1 200, no "Connection: close"
+curl -sf http://localhost:8000/manifest.json | head -c 400                # the manifest is being served
+```
+
+```bash
+jq -r '.output[].url' manifest.json | sed 's|.*/||' | sort -u |
+while read -r f; do
+  want=$(wc -c < "$f")
+  got=$(curl -s -o /dev/null -w '%{size_download}' "http://localhost:8000/$f")
+  if [ "$want" = "$got" ]; then echo "ok    $f $want"; else echo "TRUNC $f want=$want got=$got"; fi
+done | tee "$WORK/corpus-served-bytes.txt"
+grep -c '^ok' "$WORK/corpus-served-bytes.txt"     # must equal the number of NDJSON files
+grep '^TRUNC' "$WORK/corpus-served-bytes.txt"     # must print nothing
+```
+
+This reads the whole corpus once (a few minutes on NVMe). **A single `TRUNC` line
+means stop: fix the server and start T3 over.** Keep the file with the results.
+
+#### Record the per-type counts the run will be judged against
+
+```bash
+jq -r '.output[] | [.type, (.url | split("/") | last)] | @tsv' manifest.json |
+while IFS=$'\t' read -r type file; do printf '%s\t%s\n' "$type" "$(wc -l < "$file")"; done |
+sort > "$WORK/corpus-counts.tsv"
+cat "$WORK/corpus-counts.tsv"
+```
+
+These are the expected counts for 7.5. With the hosted manifest, use its `count` per
+output instead:
+
+```bash
+curl -sf https://hfs-manual-test.s3.us-east-1.amazonaws.com/manifest.json |
+  jq -r '.output[] | [.type, .count] | @tsv' | sort > "$WORK/corpus-counts.tsv"
+```
+
+Leave the HTTP server running until the import **and its search rebuild** have
+finished (7.4).
 
 **Optional reduced import.** The full corpus is ~35 GB of NDJSON; on a slow machine
 or a composite backend it can take hours. The later steps only need the file types
@@ -424,11 +550,12 @@ curl -sf https://hfs-manual-test.s3.us-east-1.amazonaws.com/manifest.json \
   | jq '.output |= map(select(.type | IN("Patient","Encounter","Condition","Observation","Procedure",
                                          "Organization","Practitioner","PractitionerRole","Location")))' \
   > manifest-core.json
-python3 -m http.server 8000 --bind 127.0.0.1 > "$WORK/corpus-http.log" 2>&1 &
+docker run -d --name hfs-corpus -p 8000:80 -v "$PWD":/usr/share/nginx/html:ro nginx:alpine
 ```
 
 Whichever manifest is used, the counts in T4 for `Patient`, `Encounter`,
-`Condition`, and `Observation` are unchanged.
+`Condition`, and `Observation` are unchanged. Regenerate `corpus-counts.tsv` from the
+manifest you actually serve.
 
 ### 7.2 Create the submission in the UI
 
@@ -466,7 +593,7 @@ On the detail page verify:
 - The status card shows **Processing** with a progress bar, and refreshes on its own
   every 5 s. Its text is the recipient's progress report (or *"Waiting for the
   recipient's first status report…"* right after kick-off).
-- In the HTTP server log (`$WORK/corpus-http.log`) the NDJSON files are being
+- In the corpus server's log (`docker logs hfs-corpus`) the NDJSON files are being
   requested one after another. (Not applicable with the hosted manifest: the files
   come from S3, so the log line quotes the S3 manifest URL and there is no local
   request log.)
@@ -475,7 +602,8 @@ Wait for the status card to change to **Result** → *"Processing finished at �
 **Output files** = 24 (or 9 for the reduced manifest) and **Error files** = 0, the
 summary **Status** = **Completed**, and the log to end with
 `Status: got 200 OK — processing finished cleanly (24 outputs); submission completed.`
-Record the elapsed time in the matrix.
+Record that instant as the end of the ingest time (§14). Do not run the counts yet:
+the search index is rebuilt in 7.4.
 
 If the status becomes **Failed**, the **Error files** count is non-zero, or the log
 shows `POST <your HFS_BASE_URL>/$bulk-submit → …` with an error, record the log text
@@ -483,13 +611,59 @@ and file an issue. One cause is not a bug: `error sending request for url` is a
 transport failure, meaning the Data Recipient points at a port with nothing behind
 it — re-check `HFS_BASE_URL` against `HFS_SERVER_PORT` before filing.
 
-### 7.4 Verify the data landed and is searchable
+### 7.4 Wait for the deferred search rebuild
+
+With `HFS_BULK_SUBMIT_DEFER_INDEXING=true` (this pass, section 5) the submission
+reports **Completed** once the resources are stored, and a separate job builds the
+search index afterwards. In the #1126 campaign it reported Completed with the index
+about 9 % built. Every count check belongs after this step.
+
+With `DEFER_INDEXING=false` on a `*-es` backend the batches were indexed during ingest
+and the log says `bulk-submit indexed every resource during ingest; no deferred
+reindex needed`; this step then only confirms there is nothing to wait for. Record
+which mode ran. The rest describes the default.
+
+1. **Watch the rebuild banner on `/ui`**: *"Search index rebuilding — N % (P of T
+   resources). Searches may miss stored resources until it finishes."*
+2. **The banner is also a result** (#1125): it stays up if the rebuild left resources
+   unindexed, and disappears on a clean `completed`, but also when the rebuild was
+   cancelled or never ran, and once the job is evicted (24 h or 1,024 jobs). An absent
+   banner alone proves nothing; go to step 3.
+3. **Confirm with `$reindex-status`.** The job id is in the banner and in the
+   `deferred reindex generation started` log line.
+
+   ```bash
+   curl -sf "$HFS/\$reindex-status/<job id>" |
+     jq -r '.parameter[] | "\(.name)=\(.valueString // .valueInteger // .valueCode // .valueDecimal // "")"'
+   ```
+
+   `status` is `queued`, `inprogress`, `completed`, `failed` or `cancelled`. **Pass
+   needs `completed` with `errorCount` 0.** Failing resources come back as `error`
+   parts (`resourceType`, `resourceId`, `message`, `retryable`), capped at 100.
+4. **Confirm the log** (`$WORK/hfs-<backend>.log`) carries `deferred reindex
+   generation completed` and none of these, each of which means the search index is
+   incomplete:
+
+   - `deferred reindex generation failed; retrying once`
+   - `deferred reindex failed twice; run $reindex manually …`
+   - `deferred reindex completed, but resources were rejected permanently …`
+   - `deferred reindex coordinator closed…; run $reindex manually`
+
+5. **Record the rebuild's elapsed time** separately from the ingest time (§14).
+
+A rebuild that ends `failed`, or `completed` with a non-zero `errorCount`, fails T3
+for this row; keep the `$reindex-status` output. Running `POST $HFS/$reindex` by hand
+to move on is allowed; record that it was needed. Since #1156 the expected result is a
+clean `completed`, so a shortfall is a regression to report.
+
+### 7.5 Verify the data landed and is searchable
 
 1. Open `$HFS/ui` (the dashboard). The stat cards and the resources-over-time chart
    must reflect the import; the **Patient** card reads 11,705 (the corpus plus the
    patient from T2).
 2. Click **Resources** in the sidebar. The **Resource Types** rail shows a live count
-   next to every type; compare against the manifest plus what T2 created:
+   next to every type. Compare **every type in `$WORK/corpus-counts.tsv`** plus what
+   T2 created, not only this table (it omits types such as `Provenance`):
 
    | Type | Expected count |
    |---|---|
@@ -501,17 +675,35 @@ it — re-check `HFS_BASE_URL` against `HFS_SERVER_PORT` before filing.
    | Organization / Practitioner / PractitionerRole | 1,140 each |
    | Location | 1,142 |
 
+   **A short type is a T3 failure.** Record which type and by how much.
+
 3. In the **QUERY** box type `GET /Patient?_id=7d24f7a0-6f2e-ce3b-5568-db7b14695583`
    and press **Run**. One row: Cari853 Esperanza675 Parker433, female, 2015-12-29.
    Click the id link; the **Edit Resource** modal opens with the JSON. Close it.
 4. Type `GET /Observation?_summary=count` and **Run**: the results header reads
    **7,699,987 results** and the table says *No results.* (a count-only Bundle has no
    entries; that is correct).
-5. On composites, confirm the Elasticsearch document counts match
-   (`curl localhost:9200/_cat/indices/hfs*` — an infrastructure check, not an HFS API
-   call).
+5. On composites, confirm the Elasticsearch counts per type. Use `_count`, not
+   `_cat/indices`, whose `docs.count` includes hidden nested documents (#991). This
+   is an infrastructure check, not an HFS API call:
 
-### 7.5 Optional: back to Batch / Transaction
+   ```bash
+   while IFS=$'\t' read -r type _; do
+     idx="${ES_PREFIX}_default_$(echo "$type" | tr 'A-Z' 'a-z')"
+     n=$(curl -s -H 'Content-Type: application/json' "localhost:9200/$idx/_count" -d '{
+           "query": {"bool": {
+             "filter":   [{"term": {"is_deleted": false}}],
+             "must_not": [{"term": {"is_contained": true}}]}}}' | jq -r '.count // "no index"')
+     printf '%s\t%s\n' "$type" "$n"
+   done < "$WORK/corpus-counts.tsv" | tee "$WORK/es-counts.tsv"
+   ```
+
+   The filter is the one HFS's own searches use (`query_builder.rs`); top-level
+   documents omit `is_contained`, so `must_not: true` is used, not `false`. Compare
+   `es-counts.tsv` with `corpus-counts.tsv` plus what T2 created; a shortfall in any
+   type is a failure.
+
+### 7.6 Optional: back to Batch / Transaction
 
 The corpus contains its own copy of every organisation and practitioner that T2
 created, each with the same identifier. Upload `Nicky270_Ann985_Larkin917_….json`
@@ -520,9 +712,13 @@ once more on **Batch / Transaction** and **Execute**: it must now be rejected wi
 more than one resource"*, and `GET /Patient?given=Nicky270&family=Larkin917` on
 **Resources** is still **1 result**. Click **Cancel**.
 
-Pass criteria: the submission finishes **Completed** with 0 error files; the rail
-counts match the table; the anchor patient is found by id; the dashboard reflects
-the import; the optional duplicate-reference upload is rejected without side effects.
+Pass criteria: the byte check in 7.1 reported no truncation (locally served corpus);
+the submission finishes **Completed** with 0 error files; the search rebuild reaches
+`completed` with `errorCount` 0; per-type counts match `corpus-counts.tsv` plus what
+T2 created, on the rail and (composites) in Elasticsearch; the anchor patient is
+found by id; the dashboard reflects the import; the optional duplicate-reference
+upload is rejected without side effects; ingest time, searchable time and final
+database size are recorded (§14). No restart is needed before T4.
 
 ---
 
@@ -1102,7 +1298,24 @@ For each backend row, attach to the release issue:
   card + log), the T2 **Per-Action Outcomes** stage for the transaction, the **SQL
   Exports** list with a completed card, `/ui` after import, and `/ui/subscriptions`
   after T9 step 3.
-- The T3 elapsed time and the T7 7.a *finished in* time.
+- **The T3 ingest time**: from the submission's creation instant (7.2) to
+  *Processing finished at …* (7.3).
+- **The T3 searchable time**: from the same start to the rebuild reaching `completed`
+  (7.4), plus the rebuild's own elapsed time and its `$reindex-status` summary.
+- **The final database size** and the resource count it holds:
+
+  ```bash
+  du -sh data/hfs.db* data/submit 2>/dev/null                                    # sqlite
+  docker exec hfs-pg psql -U helios -d helios -tAc \
+    "SELECT pg_size_pretty(pg_database_size('helios'))"                          # postgres
+  docker exec hfs-mongo mongosh --quiet \
+    --eval 'db.getSiblingDB("helios").stats().storageSize'                       # mongodb
+  curl -s "localhost:9200/_cat/indices/${ES_PREFIX}_*?h=index,store.size"        # elasticsearch
+  ```
+
+- `$WORK/corpus-served-bytes.txt` (the corpus byte check), `$WORK/corpus-counts.tsv`
+  and, on composites, `$WORK/es-counts.tsv`.
+- The T7 7.a *finished in* time.
 - One downloaded sample from T5 (5.1) and each format from T7.
 - For any `❌`: the page, what was entered, the exact on-screen message, and the log
   excerpt, filed as an issue and linked from the matrix cell.
@@ -1136,7 +1349,7 @@ For each backend row, attach to the release issue:
   the body limit is `HFS_MAX_BODY_SIZE` (10 MiB by default).
 - **T2 order matters**: the patient transaction fails until the two reference-data
   batches have run, and after the T3 import its conditional references match two
-  Organizations, so it is rejected again (7.5).
+  Organizations, so it is rejected again (7.6).
 - **SQL pages have no Run button**: results follow the editor text with a 500 ms
   delay, capped at 50 rows; the SQL Query preview cannot bind `:parameters` — values
   are supplied on the SQL Export page only.

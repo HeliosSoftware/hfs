@@ -7,11 +7,113 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
+use crate::error::{ConcurrencyError, StorageError};
 use crate::error::{StorageResult, TransactionError};
 use crate::tenant::TenantContext;
 use crate::types::StoredResource;
 
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
+use super::patch::PatchError;
 use super::storage::ResourceStorage;
+
+/// Checks the exact content a Bundle PATCH would write, while the target is
+/// still inside its transaction. An error carries the complete FHIR outcome.
+#[async_trait]
+pub trait PatchCandidateValidator: Send + Sync {
+    /// Return the full OperationOutcome when the candidate cannot be stored.
+    async fn validate_patch_candidate(
+        &self,
+        tenant: &TenantContext,
+        version: helios_fhir::FhirVersion,
+        resource_type: &str,
+        candidate: &Value,
+    ) -> Result<(), Value>;
+}
+
+/// Render an unapplied Bundle PATCH as a typed entry refusal. The transaction
+/// executors use its status and outcome after rolling back every sibling.
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
+pub(crate) fn patch_failure_entry(error: PatchError) -> Box<BundleEntryResult> {
+    let (status, code) = match error {
+        PatchError::TestFailed { .. } => (422, "processing"),
+        PatchError::UnsupportedFormat { .. } => (501, "not-supported"),
+        _ => (400, "invalid"),
+    };
+    Box::new(BundleEntryResult::error(
+        status,
+        serde_json::json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{
+                "severity": "error",
+                "code": code,
+                "details": {"text": error.to_string()}
+            }]
+        }),
+    ))
+}
+
+/// Keep a PATCH update's concurrency refusal attached to its Bundle entry so
+/// the transaction rolls back and returns the same status as a direct PATCH.
+/// Other storage errors retain their normal backend error path.
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
+pub(crate) fn patch_update_result(
+    result: StorageResult<StoredResource>,
+) -> StorageResult<BundleEntryResult> {
+    match result {
+        Ok(updated) => Ok(BundleEntryResult::updated(updated)),
+        Err(error) => {
+            let status = match &error {
+                StorageError::Concurrency(ConcurrencyError::VersionConflict { .. }) => 409,
+                StorageError::Concurrency(ConcurrencyError::OptimisticLockFailure { .. }) => 412,
+                _ => return Err(error),
+            };
+            Ok(BundleEntryResult::error(
+                status,
+                serde_json::json!({
+                    "resourceType": "OperationOutcome",
+                    "issue": [{
+                        "severity": "error",
+                        "code": "conflict",
+                        "details": {"text": error.to_string()}
+                    }]
+                }),
+            ))
+        }
+    }
+}
+
+/// Decode, apply and validate the candidate while its transaction remains
+/// open. The wire format follows the Bundle version; path evaluation and
+/// resource validation follow the stored target's FHIR version.
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
+pub(crate) async fn prepare_bundle_patch(
+    tenant: &TenantContext,
+    resource_type: &str,
+    current: &StoredResource,
+    document: Option<&Value>,
+    bundle_version: helios_fhir::FhirVersion,
+    validator: Option<&dyn PatchCandidateValidator>,
+) -> Result<Value, Box<BundleEntryResult>> {
+    let document = document.ok_or_else(|| {
+        patch_failure_entry(PatchError::MalformedDocument {
+            format: "Bundle PATCH",
+            message: "entry.resource is required".to_string(),
+        })
+    })?;
+    let patch = super::decode_bundle_patch_resource(document, bundle_version)
+        .map_err(patch_failure_entry)?;
+    let candidate =
+        super::apply_patch_for_version(current.content(), &patch, current.fhir_version())
+            .map_err(patch_failure_entry)?;
+    if let Some(validator) = validator {
+        validator
+            .validate_patch_candidate(tenant, current.fhir_version(), resource_type, &candidate)
+            .await
+            .map_err(|outcome| Box::new(BundleEntryResult::error(422, outcome)))?;
+    }
+    Ok(candidate)
+}
 
 /// Transaction isolation levels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -561,6 +663,19 @@ pub trait BundleProvider: ResourceStorage {
         tenant: &TenantContext,
         entries: Vec<BundleEntry>,
         fhir_version: helios_fhir::FhirVersion,
+    ) -> Result<BundleResult, TransactionError> {
+        self.process_transaction_with_patch_validator(tenant, entries, fhir_version, None)
+            .await
+    }
+
+    /// Transaction execution with a write-path check on each patched
+    /// candidate, after the in-transaction read and before the update.
+    async fn process_transaction_with_patch_validator(
+        &self,
+        tenant: &TenantContext,
+        entries: Vec<BundleEntry>,
+        fhir_version: helios_fhir::FhirVersion,
+        validator: Option<&dyn PatchCandidateValidator>,
     ) -> Result<BundleResult, TransactionError>;
 }
 
@@ -628,6 +743,57 @@ mod tests {
         assert!(result.outcome.is_some());
         assert!(result.resource.is_none());
         assert_eq!(result.effect, BundleEntryEffect::Failed);
+    }
+
+    #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
+    #[test]
+    fn patch_update_result_preserves_conflicts_and_other_errors() {
+        let version = patch_update_result(Err(StorageError::Concurrency(
+            ConcurrencyError::VersionConflict {
+                resource_type: "Patient".to_string(),
+                id: "123".to_string(),
+                expected_version: "1".to_string(),
+                actual_version: "2".to_string(),
+            },
+        )))
+        .unwrap();
+        assert_eq!(version.status, 409);
+        assert_eq!(version.effect, BundleEntryEffect::Failed);
+        assert_eq!(
+            version.outcome.as_ref().unwrap()["issue"][0]["code"],
+            "conflict"
+        );
+        assert!(
+            version.outcome.unwrap()["issue"][0]["details"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("expected 1, found 2")
+        );
+
+        let etag = patch_update_result(Err(StorageError::Concurrency(
+            ConcurrencyError::OptimisticLockFailure {
+                resource_type: "Patient".to_string(),
+                id: "123".to_string(),
+                expected_etag: "W/\"1\"".to_string(),
+                actual_etag: Some("W/\"2\"".to_string()),
+            },
+        )))
+        .unwrap();
+        assert_eq!(etag.status, 412);
+        assert_eq!(etag.outcome.unwrap()["issue"][0]["code"], "conflict");
+
+        let other = patch_update_result(Err(StorageError::Resource(
+            crate::error::ResourceError::NotFound {
+                resource_type: "Patient".to_string(),
+                id: "123".to_string(),
+            },
+        )));
+        assert!(matches!(
+            other,
+            Err(StorageError::Resource(
+                crate::error::ResourceError::NotFound { .. }
+            ))
+        ));
     }
 
     fn stored_patient() -> StoredResource {

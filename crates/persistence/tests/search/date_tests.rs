@@ -292,6 +292,65 @@ async fn test_date_precision_and_validation_suite() {
     super::date_precision_suite::sub_day_precision_and_validation(&backend, "date-precision").await;
 }
 
+/// The shared number/quantity `ap` tables (#1390);
+/// PostgreSQL, MongoDB and Elasticsearch run the same ones.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_ap_prefix_suite() {
+    let backend = super::make_sqlite_backend();
+    super::ap_prefix_suite::ap_prefix(&backend, "ap-prefix", true).await;
+}
+
+/// `ap` in the quantity component of a composite (#1390);
+/// PostgreSQL, MongoDB and Elasticsearch run the same tables.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_ap_composite_suite() {
+    let backend = super::make_sqlite_backend();
+    super::ap_relations_suite::ap_composite(&backend, "ap-composite").await;
+}
+
+/// `_filter` must keep the date range and the following token bind separate.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_fractional_date_filter_with_following_criterion() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+    for (id, performed, status) in [
+        ("inside-completed", "2024-01-01T10:00:00.55Z", "completed"),
+        ("inside-progress", "2024-01-01T10:00:00.55Z", "in-progress"),
+        ("outside-completed", "2024-01-01T10:00:00.60Z", "completed"),
+    ] {
+        backend
+            .create_or_update(
+                &tenant,
+                "Procedure",
+                id,
+                json!({
+                    "resourceType": "Procedure",
+                    "status": status,
+                    "subject": {"reference": "Patient/filter-subject"},
+                    "performedDateTime": performed,
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let query = SearchQuery::new("Procedure").with_parameter(SearchParameter {
+        name: "_filter".to_string(),
+        param_type: SearchParamType::Special,
+        values: vec![SearchValue::eq(
+            "date eq 2024-01-01T10:00:00.5Z and status eq completed",
+        )],
+        ..Default::default()
+    });
+    let result = backend.search(&tenant, &query).await.unwrap();
+    let ids: Vec<_> = result.resources.items.iter().map(|r| r.id()).collect();
+    assert_eq!(ids, ["inside-completed"]);
+}
+
 /// The shared table for stored dateTimes with minutes but no seconds (#1315);
 /// PostgreSQL and MongoDB run the same one. SQLite never had the gap — it
 /// indexes the text as stored and `strftime` reads `hh:mm` — so this pins it.

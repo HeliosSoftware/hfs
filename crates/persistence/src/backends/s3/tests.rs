@@ -22,7 +22,7 @@ use crate::backends::s3::client::{
 use crate::backends::s3::config::{S3BackendConfig, S3TenancyMode};
 use crate::backends::s3::keyspace::S3Keyspace;
 use crate::backends::s3::user_settings::settings_object_id;
-use crate::core::bulk_export::{ExportDataProvider, ExportRequest};
+use crate::core::bulk_export::{ExportDataProvider, ExportRequest, PatientExportProvider};
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
     BulkSubmitRollbackProvider, CANCELLED_ABORT_REASON, CancelToken, NdjsonEntry,
@@ -895,6 +895,118 @@ async fn bulk_export_fetch_batch_cursor() {
         .unwrap();
     assert_eq!(batch2.lines.len(), 1);
     assert!(batch2.is_last);
+}
+
+/// #1273: every exported NDJSON line carries the server's `meta.versionId`
+/// and `meta.lastUpdated` (the same `meta` a read returns) while keeping
+/// client-supplied `meta` members, on both the type-level and the
+/// patient-compartment export paths.
+#[tokio::test]
+async fn bulk_export_lines_carry_server_meta() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+    let tag = json!({"system": "http://example.org/tags", "code": "keep-me"});
+
+    let created = backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "p1", "meta": {"tag": [tag.clone()]}}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let updated = backend
+        .update(
+            &tenant,
+            &created,
+            json!({
+                "resourceType": "Patient",
+                "id": "p1",
+                "meta": {"tag": [tag.clone()]},
+                "active": true
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.version_id(), "2");
+    let observation = backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "o1",
+                "status": "final",
+                "code": {"text": "x"},
+                "subject": {"reference": "Patient/p1"}
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let assert_meta = |line: &str, version: &str, stored: &crate::types::StoredResource| {
+        let value: Value = serde_json::from_str(line).expect("NDJSON line is JSON");
+        let meta = &value["meta"];
+        assert_eq!(meta["versionId"], version, "line: {line}");
+        let last_updated = meta["lastUpdated"].as_str().expect("meta.lastUpdated");
+        assert_eq!(
+            last_updated,
+            stored
+                .last_modified()
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            "line: {line}"
+        );
+        assert!(last_updated.ends_with('Z'), "UTC with Z: {last_updated}");
+        assert_eq!(meta, &stored.content_with_meta()["meta"], "line: {line}");
+    };
+    let only_line = |lines: &[String]| {
+        assert_eq!(lines.len(), 1, "lines: {lines:?}");
+        lines[0].clone()
+    };
+
+    let request = ExportRequest::system();
+    let patient_line = only_line(
+        &backend
+            .fetch_export_batch(&tenant, &request, "Patient", None, 10)
+            .await
+            .unwrap()
+            .lines,
+    );
+    assert_meta(&patient_line, "2", &updated);
+    let patient_json: Value = serde_json::from_str(&patient_line).unwrap();
+    assert_eq!(patient_json["meta"]["tag"], json!([tag.clone()]));
+    let obs_line = only_line(
+        &backend
+            .fetch_export_batch(&tenant, &request, "Observation", None, 10)
+            .await
+            .unwrap()
+            .lines,
+    );
+    assert_meta(&obs_line, "1", &observation);
+
+    let request = ExportRequest::patient();
+    let patients = vec!["p1".to_string()];
+    let patient_line = only_line(
+        &backend
+            .fetch_patient_compartment_batch(&tenant, &request, "Patient", &patients, None, 10)
+            .await
+            .unwrap()
+            .lines,
+    );
+    assert_meta(&patient_line, "2", &updated);
+    let patient_json: Value = serde_json::from_str(&patient_line).unwrap();
+    assert_eq!(patient_json["meta"]["tag"], json!([tag]));
+    let obs_line = only_line(
+        &backend
+            .fetch_patient_compartment_batch(&tenant, &request, "Observation", &patients, None, 10)
+            .await
+            .unwrap()
+            .lines,
+    );
+    assert_meta(&obs_line, "1", &observation);
 }
 
 #[tokio::test]
@@ -3800,6 +3912,7 @@ async fn list_tenants_survives_tenants_named_after_control_plane_namespaces() {
         "history",
         "bulk",
         "_system.user-settings",
+        "_system.login-sessions",
     ] {
         let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
         let backend = make_prefix_backend(mock);

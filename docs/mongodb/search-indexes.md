@@ -3,9 +3,17 @@
 HFS keeps two kinds of index on the `search_index` collection.
 
 - **Inline** indexes (`idx_search_composite`, `idx_search_resource`, `idx_search_composite_slot_probe`) are created at every boot before the server serves. The slot probe index is partial and includes only composite rows.
-- **Generation 3** is the current generation: nine partial value indexes named `idx_search_*_v2`, built by HFS **after** boot in one `createIndexes` command that scans the collection once, plus contained rows living in their own collection since generation 3 (see "Contained rows" below) rather than a partial index on `search_index`. MongoDB 4.2 and later do not block reads or writes during the value-index build. When every generation-2 value index is ready, HFS drops the nine generation-1 value indexes (`idx_search_string`, `idx_search_token`, ...); once the contained-row move is also done, HFS records `search_indexes.generation: 3` in the `schema_version` document.
+- **Generation 4** is the current generation: nine partial value indexes (`idx_search_date_v3` and eight named `idx_search_*_v2`), built by HFS **after** boot in one `createIndexes` command that scans the collection once, plus contained rows living in their own collection since generation 3 (see "Contained rows" below) rather than a partial index on `search_index`. MongoDB 4.2 and later do not block reads or writes during the value-index build. When every generation-2 value index is ready, HFS drops the nine generation-1 value indexes (`idx_search_string`, `idx_search_token`, ...); once the contained-row move is also done, HFS records `search_indexes.generation: 4` in the `schema_version` document.
 
 Why: a generation-1 value index carried one entry for every row of the collection, even rows that had no value of that type, and no value index carried `resource_id`, so every search fetched one document per matching key. Generation-2 indexes are partial (one entry per row that has the value) and end in `resource_id`, so a value-filtered scan is covered. Issues #1059 and #1084 have the measurements.
+
+## Date ranges (generation 4)
+
+Since #1391 a date row stores the range it denotes, `[value_date, value_date_end)`, and a date search bounds either end (`gt` and `ge` bound `value_date_end`, for example). `idx_search_date_v3` carries `value_date_end` between `value_date` and `resource_id` so those searches stay covered; it is still partial on `value_date` existing. It replaces generation 2's `idx_search_date_v2`, which HFS drops once every generation-4 index is ready (under the same mode rules as the generation-1 drop). Until then date searches keep using `idx_search_date_v2`, fetching documents to check `value_date_end`. Every prefix is a covered scan of `idx_search_date_v3` (`docsExamined: 0`). The prefixes with two alternatives (`ge`, `le`, `ne`), and a comma list of date values, are sent as an `$or` at the top of the filter with every arm repeating the tenant, resource type and parameter name; nested under those shared conditions MongoDB 5.0 reads the documents instead of scanning the index.
+
+### Upgrading: reindex the date rows
+
+Rows written before #1391 have no `value_date_end`. They never match the prefixes that bound the end (`eq`, `ne`, `gt`, `ge`, `le`, `eb`, `ap`) until they are rewritten. A Period indexed before #1391 is also still two independent point rows, so even `lt` and `sa` compare each of its ends on its own until it is rewritten (point values are unaffected by those two). Run `$reindex` after the upgrade. HFS reminds you: when the builder records generation 4 on a database that was at an earlier generation (or had none recorded) and `search_index` is not empty, it logs one `warn` naming `$reindex`. The check reads the recorded generation and the collection's metadata count, never the rows, and only runs on that transition: it is silent on a new empty database and on every boot once generation 4 is recorded.
 
 ## `HFS_MONGODB_INDEX_BUILD`
 
@@ -49,7 +57,31 @@ A binary from before generation 3 reads contained matches from `search_index` on
 
 That script also resets the `schema_version` generation record, so rolling forward again re-runs the contained-row move instead of skipping it.
 
+A binary from before generation 4 needs no script: it sees `idx_search_date_v2` missing and rebuilds it in the background like any other missing generation-2 index, and ignores `idx_search_date_v3`.
+
 All four scripts are generated from `crates/persistence/src/backends/mongodb/search_index_catalog.rs`; a unit test fails if they drift.
+
+## How `$reindex` walks a type (#1403)
+
+`$reindex` and the rebuild that follows a fast-load import page each resource type in two phases:
+
+1. **Id order.** Every live resource whose `last_updated` is older than the walk's *floor*, in `id` order on `idx_resources_identity`. Value-index keys end in the resource id, so this order keeps each index's inserts clustered instead of random. That is the difference between a cache-resident rebuild and the 17-hour Observation rebuild of #1403.
+2. **Catch-up rounds.** Every live resource stamped at or after the floor, in `last_updated` order on `idx_resources_type_scan`. A round stops at a ceiling of *round start + margin*, or just past the newest live `last_updated` if a resource is stamped later than that. A round ends only when a query finds nothing more in its range. Another round runs, three at most, when the previous one took longer than half the margin.
+
+The floor is the earlier of two times: the type's newest live `last_updated` at the start plus 1 ms, and the start time minus the margin (two minutes). On a type nobody writes to while it is walked, every resource is written exactly once.
+
+A resource may be updated while the page holding its old version is being written. It is then read again after the update and indexed from its newest version. In the id-order phase that guarantee is exact, given two assumptions:
+
+- the clocks of the HFS processes writing to one database agree within one minute;
+- a write commits within one minute of its `last_updated`. MongoDB aborts a transaction after `transactionLifetimeLimitSeconds`, 60 s by default. A bulk-ingest batch is stamped when it is planned and can take longer under memory pressure, so do not run `$reindex` over a live non-deferred import of the same type. The walk reads from the primary.
+
+Inside a catch-up round, the guarantee holds as long as the update is stamped later than the documents already on the page.
+
+Outside those limits, a resource can keep stale search rows until it is next written or reindexed. The same holds when a resource is written again while the last round runs; the log then says `mongodb reindex catch-up stopped at its round limit`. That warning is expected and harmless when an import of the same type overlaps the rebuild: the follow-up generation (logged as `merged deferred reindex work into the pending generation`) walks the type again. A resource deleted while its page is being written can keep search rows. Searches never return it, because they only read live resources.
+
+`mongodb reindex found live resources stamped in the future` means that some live resources carry a `last_updated` later than the walk's start plus the margin, usually from an HFS node whose clock ran ahead. They are still indexed.
+
+The walk's position lives in memory: after a restart, a rebuild starts every type from the beginning.
 
 ## Composite parameters
 

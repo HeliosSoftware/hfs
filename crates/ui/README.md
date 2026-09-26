@@ -382,15 +382,15 @@ own `display: flex` override is the example). Not View Definitions' own: SQL
 Query and SQL View's Details section (below) renders its guided-form card
 the same inline, server-side way and carries the identical `needs-js`.
 
-### Details (#840): the SQL Query/SQL View Library minus its SQL attachment
+### Details (#840, #1233): the SQL Query/SQL View Library, in full
 
 `/ui/sql/queries` and `/ui/sql/views` (`pages/sql-library.html`, one template
 keyed by the route's own `LibraryKind`) give each stored `Library` a Details
-section — the same JSON editor + guided-form pairing described above, over a
-different document: the `Library` with its `application/sql` `content[]`
-attachment stripped out (`sql_libraries::strip_sql_attachment`), since the
-SQL card beside it owns that attachment on its own. `crate::
-render_lib_details_pane` calls the shared engine with `hidden: &["content"]`
+section — the same JSON editor + guided-form pairing described above, over
+the full stored document, `application/sql` `content[]` attachment
+included: the SQL card beside it is a second view of that same attachment
+(#1233). `crate::render_lib_details_pane` calls the shared engine with
+`hidden: &["content"]`
 (so the guided form neither shows nor offers to mutate it) and `legend:
 "sql-library"` (its own two-line legend — "checked on save" here names the
 Library type coding and the SQL attachment, not the generic constraints/
@@ -629,13 +629,16 @@ not just a closed IIFE.
 |---|---|
 | `theme.js` | Light/dark preference: stored choice → OS preference, plus the top-bar toggle. Also marks `<html class="js">` (#843), synchronously, before first paint — the signal `.needs-js` (above) hides against |
 | `busy.js` | The shared busy states (#679): `during(buttons, work)` and `region(el, label)` |
+| `unsaved.js` | Shared unsaved-changes tracker (#1240): `HfsUnsaved.track({ root, form?, read?, cue? })` keeps one dirty flag per form (normalized: trimmed values, JSON compared by content; `serialize(form)` is robust to a control named `elements`, which would otherwise shadow `HTMLFormElement.prototype.elements`), shows the `.tag--unsaved` pill, guards `beforeunload`, and `confirmDiscard(scope)` guards in-page closes (`addbox.js`, the Resources modal). No storage |
 | `saved-queries.js` | Saved queries, the visual search builder, the `/_user/settings` read/modify/write cycle, and — on Resources/Search/Saved Queries — writing `rails.<page>` back on an in-page rail click (#754/#755) |
 | `editor.js` | The schema-driven editor loop — posts the document to `/ui/editor/render` and swaps in the server's HTML |
+| `editor-add.js` | The "+ Add Element" picker shared by the standalone editor, the Resources modal and the pane=form guided form (#1239): open-picker state across re-renders, the filter typeahead, the extension-URL read, closing by outside click/Escape/×, and the "added" signal with Undo |
 | `json-view.js` | Delegated folding and accessibility state for every server-rendered JSON view |
 | `combobox.js` | Shared multi-select state, chips, keyboard/ARIA behavior, and progressive fallback upgrade; htmx owns transport and callers own result semantics. `data-combobox-max="1"` (#842, *Add table* only) switches a field to single-value mode — choosing an option replaces the current selection rather than adding to it — and fires `hfs:combobox-select` (`{value, label, name}`, `name` from the option's own optional `data-name`) on every actual choice, for a caller that needs to react to *which* option was picked rather than the whole-list `hfs:combobox-change` every field already emits. `data-combobox-form` (#842) gives every hidden input this field creates the same `form=` attribute its fallback textarea carries — needed only when the field's own fieldset sits outside the `<form>` it submits with, as `sql_tables_card.html`'s *Add table* field does (its siblings are each explicitly form-associated, `form="lib-editor-form"`, rather than DOM descendants of a `<form>` the way every caller before it is). `install()` also runs on every htmx `afterSwap` target (#842/04) — needed the moment the unknown-table lint's own OOB refresh replaces `#lib-tables`, and so its *Add table* field, with a fresh, un-enhanced one straight from the server; `initialize()`'s own `data-combobox-ready` guard makes this safe to call repeatedly |
 | `resources.js` | The Resources workspace edit modal and "Create new" |
 | `batch.js` | Bundle pick → lazy highlighted previews → execution plan → per-entry outcomes |
 | `bulk-export.js` | All Resources, individual resource types, and Since/Custom instant state on the Bulk Export builder |
+| `bulk-import.js` | Opts the Bulk Import create/edit dialogs into `HfsUnsaved` (#1240) |
 | `sql-export-form.js` | The SQL Export builder (`/ui/sql/export/new`, #834/#836): the subjects table's type switch, text filter, header select-all, and "n of m selected" count; independently, the CSV header switch's visibility (shown only for `format: csv`, never touching its `checked` state) and the Since custom instant's enabled state and `data-pattern` validation on submit — the same enable-only-for-"custom" rule as `bulk-export.js`'s own Since field, but without its fuller calendar-validity pass, which stays a server-side (`crate::lookup::since_instant`) concern |
 | `sql-export.js` | "Copy job id" on Active SQL Exports job cards — reveals the button only when the Clipboard API is available, writes the id, shows "Copied" |
 | `history.js` | Version selection and diff requests |

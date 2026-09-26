@@ -13,6 +13,7 @@ mod client;
 mod conditional;
 mod config;
 mod keyspace;
+mod login_sessions;
 mod models;
 mod output_store;
 mod storage;

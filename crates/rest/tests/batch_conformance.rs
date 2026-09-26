@@ -1212,6 +1212,103 @@ mod conditional_references {
         response.assert_status(StatusCode::BAD_REQUEST);
     }
 
+    /// Seeds `p1` and `p2`; only `p2` has an Observation with code 1234-5
+    /// and only `p2` is managed by the Organization named Acme.
+    async fn seed_chain_targets(backend: &SqliteBackend) {
+        let tenant = test_tenant();
+        seed_patient(backend, "p1", "CondRef").await;
+        for (ty, body) in [
+            (
+                "Organization",
+                json!({"resourceType": "Organization", "id": "org-acme", "name": "Acme"}),
+            ),
+            (
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "p2",
+                    "name": [{"family": "Chained"}],
+                    "managingOrganization": {"reference": "Organization/org-acme"}
+                }),
+            ),
+            (
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "o2",
+                    "status": "final",
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "1234-5"}]},
+                    "subject": {"reference": "Patient/p2"}
+                }),
+            ),
+        ] {
+            backend
+                .create(&tenant, ty, body, FhirVersion::R4)
+                .await
+                .expect("seed chain target");
+        }
+    }
+
+    /// Posts the Immunization bundle with `patient` set to `reference`.
+    async fn post_with_patient_reference(
+        server: &TestServer,
+        reference: &str,
+    ) -> axum_test::TestResponse {
+        let mut bundle = immunization_bundle();
+        bundle["entry"][0]["resource"]["location"] = Value::Null;
+        bundle["entry"][0]["resource"]["patient"] = json!({ "reference": reference });
+        server
+            .post("/")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .json(&bundle)
+            .await
+    }
+
+    /// A chained or `_has` conditional reference is resolved like a type
+    /// search (#1389). `search()` does not read chains, and this path used to
+    /// call it without resolving them: `_has` was dropped (so the reference
+    /// bound to whichever Patient happened to be unique) and a dotted chain
+    /// was misread as a plain reference (so it matched nothing).
+    #[tokio::test]
+    async fn chained_conditional_references_resolve_to_the_matching_resource() {
+        for reference in [
+            "Patient?_has:Observation:subject:code=1234-5",
+            "Patient?organization.name=Acme",
+        ] {
+            let (server, backend) = create_test_server().await;
+            seed_chain_targets(&backend).await;
+
+            let response = post_with_patient_reference(&server, reference).await;
+            response.assert_status_ok();
+
+            let stored = server
+                .get("/Immunization?_count=5")
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            let body: Value = stored.json();
+            let imm = &body["entry"][0]["resource"];
+            assert_eq!(
+                imm["patient"]["reference"], "Patient/p2",
+                "{reference} must resolve to the chained match: {imm}"
+            );
+        }
+    }
+
+    /// With no Observation behind it, a `_has` reference matches nothing and
+    /// the bundle is rejected. It used to bind to the only Patient present.
+    #[tokio::test]
+    async fn a_has_conditional_reference_with_no_match_rejects_the_bundle() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "CondRef").await;
+
+        let response =
+            post_with_patient_reference(&server, "Patient?_has:Observation:subject:code=1234-5")
+                .await;
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let text = response.text();
+        assert!(text.contains("matches no existing resource"), "got: {text}");
+    }
+
     #[tokio::test]
     async fn an_ambiguous_match_rejects_the_bundle() {
         let (server, backend) = create_test_server().await;
@@ -1822,10 +1919,9 @@ mod entry_methods {
         json!({ "resourceType": "Bundle", "type": "batch", "entry": entries })
     }
 
-    /// PATCH is declined at 501 — the status all three backends already return
-    /// from inside a transaction, and the one both READMEs already claimed.
+    /// A malformed PATCH payload fails only its batch entry and changes nothing.
     #[tokio::test]
-    async fn batch_patch_is_declined_at_501_and_changes_nothing() {
+    async fn malformed_batch_patch_is_400_and_changes_nothing() {
         let (server, backend) = create_test_server().await;
         seed_patient(&backend, "p1", "Nguyen").await;
 
@@ -1838,10 +1934,7 @@ mod entry_methods {
         )
         .await;
 
-        assert_eq!(
-            body["entry"][0]["response"]["status"],
-            "501 Not Implemented"
-        );
+        assert_eq!(body["entry"][0]["response"]["status"], "400 Bad Request");
         let stored = backend
             .read(&test_tenant(), "Patient", "p1")
             .await
@@ -1920,11 +2013,11 @@ mod entry_methods {
         );
     }
 
-    /// A PATCH transaction is declined before anything executes, so a sibling
-    /// create in the same bundle must not have landed.
+    /// A malformed PATCH rolls back a preceding create in the transaction.
     #[tokio::test]
-    async fn a_transaction_patch_is_declined_intact_at_501() {
+    async fn a_malformed_transaction_patch_rolls_back_at_400() {
         let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Nguyen").await;
         let before = patient_count(&backend).await;
 
         let response = post_bundle(
@@ -1946,10 +2039,10 @@ mod entry_methods {
         )
         .await;
 
-        response.assert_status(StatusCode::NOT_IMPLEMENTED);
+        response.assert_status(StatusCode::BAD_REQUEST);
         let body: Value = response.json();
         assert_eq!(body["resourceType"], "OperationOutcome");
-        assert_eq!(body["issue"][0]["code"], "not-supported");
+        assert_eq!(body["issue"][0]["code"], "invalid");
         assert!(
             body["issue"][0]["details"]["text"]
                 .as_str()

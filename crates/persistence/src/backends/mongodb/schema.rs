@@ -28,7 +28,7 @@ use super::search_index_catalog::{
 /// `search_index` indexes are versioned separately by `search_indexes.generation`
 /// on the same document (see `search_index_catalog.rs`); `SCHEMA_VERSION` does
 /// not change for them.
-pub const SCHEMA_VERSION: i32 = 10;
+pub const SCHEMA_VERSION: i32 = 11;
 
 /// Initialize MongoDB collections/indexes required by the backend.
 ///
@@ -60,6 +60,7 @@ pub async fn initialize_schema_async(database: &Database) -> StorageResult<()> {
     ensure_history_indexes(database).await?;
     ensure_search_indexes(database).await?;
     ensure_user_settings_indexes(database).await?;
+    ensure_login_sessions_indexes(database).await?;
     ensure_tenants_indexes(database).await?;
     ensure_bulk_submit_indexes(database).await?;
     set_schema_version(database, SCHEMA_VERSION).await?;
@@ -74,6 +75,7 @@ pub async fn migrate_schema_async(database: &Database) -> StorageResult<()> {
         ensure_history_indexes(database).await?;
         ensure_search_indexes(database).await?;
         ensure_user_settings_indexes(database).await?;
+        ensure_login_sessions_indexes(database).await?;
         ensure_tenants_indexes(database).await?;
         ensure_bulk_submit_indexes(database).await?;
         set_schema_version(database, SCHEMA_VERSION).await?;
@@ -105,13 +107,21 @@ async fn create_client(config: &MongoBackendConfig) -> StorageResult<Client> {
     })
 }
 
+/// Name of the unique `(tenant_id, resource_type, id)` index on `resources`;
+/// the `$reindex` id phase hints it (#1403).
+pub(crate) const RESOURCES_IDENTITY_INDEX: &str = "idx_resources_identity";
+/// Name of the `(tenant_id, resource_type, is_deleted, last_updated, id)`
+/// index on `resources`; the `$reindex` catch-up rounds and newest-live
+/// probe hint it (#1021, #1403).
+pub(crate) const RESOURCES_TYPE_SCAN_INDEX: &str = "idx_resources_type_scan";
+
 async fn ensure_resources_indexes(database: &Database) -> StorageResult<()> {
     let resources = database.collection::<Document>("resources");
 
     create_index(
         &resources,
         doc! { "tenant_id": 1_i32, "resource_type": 1_i32, "id": 1_i32 },
-        "idx_resources_identity",
+        RESOURCES_IDENTITY_INDEX,
         true,
     )
     .await?;
@@ -129,6 +139,11 @@ async fn ensure_resources_indexes(database: &Database) -> StorageResult<()> {
     // Measured at 300 000 resources: first page 676 ms examining 300 000
     // documents, against 2 ms examining 500 with this index.
     //
+    // Since #1403 the `$reindex` walk pages each type in `id` order on
+    // `idx_resources_identity`; this index still serves the walk's catch-up
+    // rounds (the `(last_updated, id)` keyset) and the newest-live probe that
+    // sets its floor and ceilings.
+    //
     // `idx_resources_type_deleted` was exactly this index's leading prefix, so
     // it is dropped rather than kept beside it: every query it served is served
     // here, and carrying both would cost a second B-tree on every write for no
@@ -142,7 +157,7 @@ async fn ensure_resources_indexes(database: &Database) -> StorageResult<()> {
             "last_updated": 1_i32,
             "id": 1_i32,
         },
-        "idx_resources_type_scan",
+        RESOURCES_TYPE_SCAN_INDEX,
         false,
     )
     .await?;
@@ -283,6 +298,24 @@ async fn ensure_user_settings_indexes(database: &Database) -> StorageResult<()> 
         doc! { "user_key": 1_i32 },
         "idx_user_settings_key",
         true,
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Index for the web UI's login sessions (#1481): one document per session or
+/// pending login keyed by `_id` (unique by construction), swept by
+/// `expires_at`. Separate from the FHIR collections like `user_settings`.
+async fn ensure_login_sessions_indexes(database: &Database) -> StorageResult<()> {
+    let login_sessions =
+        database.collection::<Document>(super::login_sessions::LOGIN_SESSIONS_COLLECTION);
+
+    create_index(
+        &login_sessions,
+        doc! { "expires_at": 1_i32 },
+        "idx_login_sessions_expires",
+        false,
     )
     .await?;
 

@@ -1006,6 +1006,71 @@ async fn test_invalid_since_rejected() {
 }
 
 #[tokio::test]
+async fn test_until_before_since_rejected() {
+    let (server, _backend, _output, _tmp) = create_bulk_export_server().await;
+
+    let resp = server
+        .get("/$export")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("prefer", "respond-async")
+        .add_query_param("_since", "2021-01-01T00:00:00Z")
+        .add_query_param("_until", "2020-01-01T00:00:00Z")
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST);
+    let text = resp.text();
+    assert!(
+        text.contains(
+            "_until '2020-01-01T00:00:00Z' is earlier than _since '2021-01-01T00:00:00Z'"
+        ),
+        "got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn test_until_before_since_rejected_in_post_parameters() {
+    let (server, _backend, _output, _tmp) = create_bulk_export_server().await;
+
+    let body = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "_since", "valueInstant": "2021-01-01T00:00:00Z"},
+            {"name": "_until", "valueInstant": "2020-12-31T23:59:59Z"}
+        ]
+    });
+    let resp = server
+        .post("/$export")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("prefer", "respond-async")
+        .json(&body)
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST);
+    let text = resp.text();
+    assert!(
+        text.contains(
+            "_until '2020-12-31T23:59:59Z' is earlier than _since '2021-01-01T00:00:00Z'"
+        ),
+        "got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn test_until_equal_to_since_accepted() {
+    let (server, backend, output, _tmp) = create_bulk_export_server().await;
+    seed_patients(&backend, 1).await;
+
+    let resp = server
+        .get("/$export")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("prefer", "respond-async")
+        .add_query_param("_since", "2020-01-01T00:00:00Z")
+        .add_query_param("_until", "2020-01-01T00:00:00Z")
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
+
+    drain_workers(&backend, &output).await;
+}
+
+#[tokio::test]
 async fn test_elements_parameter_accepted() {
     let (server, backend, output, _tmp) = create_bulk_export_server().await;
     seed_patients(&backend, 1).await;
@@ -1194,6 +1259,91 @@ async fn test_type_filter_is_applied_to_system_export() {
         !ids.contains(&"p-inactive"),
         "the inactive patient must not be in the filtered output"
     );
+}
+
+/// A `_typeFilter` carrying `_has` or a dotted chain is resolved by the worker
+/// before it filters (#1389). `search()` does not read chains, and the worker
+/// used to call it without resolving them: `_has` was dropped (every Patient
+/// exported) and a dotted chain was misread as a plain reference (none).
+#[tokio::test]
+async fn test_type_filter_with_a_chain_is_applied() {
+    for (filter, expected) in [
+        ("Patient?_has:Observation:subject:code=1234-5", "p-obs"),
+        ("Patient?organization.name=Acme", "p-acme"),
+    ] {
+        let (server, backend, output, _tmp) = create_bulk_export_server().await;
+        let tenant = test_tenant();
+        for (ty, body) in [
+            (
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p-plain"}),
+            ),
+            ("Patient", json!({"resourceType": "Patient", "id": "p-obs"})),
+            (
+                "Organization",
+                json!({"resourceType": "Organization", "id": "org-acme", "name": "Acme"}),
+            ),
+            (
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "p-acme",
+                    "managingOrganization": {"reference": "Organization/org-acme"}
+                }),
+            ),
+            (
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "o1",
+                    "status": "final",
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "1234-5"}]},
+                    "subject": {"reference": "Patient/p-obs"}
+                }),
+            ),
+        ] {
+            backend
+                .create(&tenant, ty, body, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+
+        let resp = server
+            .get("/$export")
+            .add_header("x-tenant-id", "test-tenant")
+            .add_header("prefer", "respond-async")
+            .add_query_param("_type", "Patient")
+            .add_query_param("_typeFilter", filter)
+            .await;
+        assert_eq!(resp.status_code(), StatusCode::ACCEPTED, "{filter}");
+        let status_url = resp
+            .headers()
+            .get("content-location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let status_path = status_url.strip_prefix("http://localhost:8080").unwrap();
+
+        drain_workers(&backend, &output).await;
+
+        let done = server
+            .get(status_path)
+            .add_header("x-tenant-id", "test-tenant")
+            .await;
+        assert_eq!(done.status_code(), StatusCode::OK, "{filter}");
+        let manifest: Value = done.json();
+        let output_files = manifest["output"].as_array().expect("output array");
+        assert_eq!(output_files.len(), 1, "{filter}: one Patient file");
+        let lines = fetch_ndjson_lines(
+            &server,
+            output_files[0]["url"].as_str().unwrap(),
+            "http://localhost:8080",
+        )
+        .await;
+        let ids: Vec<&str> = lines.iter().map(|v| v["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec![expected], "{filter}");
+    }
 }
 
 #[tokio::test]
@@ -1445,4 +1595,164 @@ async fn test_type_filter_is_applied_to_group_export() {
     )
     .await;
     assert_eq!(patient_lines.len(), 1, "the sole group member is exported");
+}
+
+/// Runs a `Patient` system export (optionally bounded by `_since`) to
+/// completion and returns every NDJSON line across all output parts.
+async fn run_patient_export(
+    server: &TestServer,
+    backend: &Arc<SqliteBackend>,
+    output: &Arc<LocalFsOutputStore>,
+    since: Option<&str>,
+) -> Vec<Value> {
+    let mut kickoff = server
+        .get("/$export")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("prefer", "respond-async")
+        .add_query_param("_type", "Patient");
+    if let Some(since) = since {
+        // `add_query_param` percent-encodes the value, so `:` (and a `+`
+        // offset, were there one) survive the round trip intact.
+        kickoff = kickoff.add_query_param("_since", since);
+    }
+    let resp = kickoff.await;
+    assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
+    let status_url = resp
+        .headers()
+        .get("content-location")
+        .expect("Content-Location header")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let status_path = status_url
+        .strip_prefix("http://localhost:8080")
+        .unwrap()
+        .to_string();
+
+    drain_workers(backend, output).await;
+
+    let done = server
+        .get(&status_path)
+        .add_header("x-tenant-id", "test-tenant")
+        .await;
+    assert_eq!(done.status_code(), StatusCode::OK);
+    let manifest: Value = done.json();
+    let mut lines = Vec::new();
+    for file in manifest["output"].as_array().expect("output array") {
+        let url = file["url"].as_str().expect("output url");
+        lines.extend(fetch_ndjson_lines(server, url, "http://localhost:8080").await);
+    }
+    lines
+}
+
+fn parse_instant(s: &str) -> chrono::DateTime<Utc> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .unwrap_or_else(|e| panic!("meta.lastUpdated {s:?} is not RFC3339: {e}"))
+        .with_timezone(&Utc)
+}
+
+/// The incremental round trip #1273 exists for: a consumer derives its next
+/// `_since` from the `meta.lastUpdated` of the lines it downloaded, and the
+/// follow-up export returns what changed after that instead of everything.
+///
+/// `_since` is inclusive (see `push_export_window`) and `meta.lastUpdated` is
+/// millisecond precision, so a resource sitting exactly on the cursor may come
+/// back once more: delivery is at-least-once at the boundary, never lossy.
+/// Anything strictly older than the cursor must not be re-downloaded.
+#[tokio::test]
+async fn test_incremental_export_since_derived_from_downloaded_meta() {
+    let (server, backend, output, _tmp) = create_bulk_export_server().await;
+
+    // 1. Create three Patients through the REST API; `pat-old` lands well
+    //    before the others so it is strictly older than any derived cursor.
+    for id in ["pat-old", "pat-a", "pat-b"] {
+        let resp = server
+            .put(&format!("/Patient/{id}"))
+            .add_header("x-tenant-id", "test-tenant")
+            .json(&json!({"resourceType": "Patient", "id": id, "active": true}))
+            .await;
+        assert!(
+            resp.status_code().is_success(),
+            "create {id}: {} {}",
+            resp.status_code(),
+            resp.text()
+        );
+        if id == "pat-old" {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    // 2. Full export: every line carries server meta equal to a plain read.
+    let lines = run_patient_export(&server, &backend, &output, None).await;
+    assert_eq!(lines.len(), 3, "every patient is exported: {lines:?}");
+    let mut cursor: Option<chrono::DateTime<Utc>> = None;
+    for line in &lines {
+        let id = line["id"].as_str().expect("line has an id");
+        let meta = &line["meta"];
+        assert!(meta["versionId"].is_string(), "{id}: no meta.versionId");
+        let last_updated = meta["lastUpdated"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{id}: no meta.lastUpdated"));
+
+        let read = server
+            .get(&format!("/Patient/{id}"))
+            .add_header("x-tenant-id", "test-tenant")
+            .await;
+        assert_eq!(read.status_code(), StatusCode::OK);
+        let read: Value = read.json();
+        assert_eq!(
+            meta, &read["meta"],
+            "{id}: exported meta differs from GET /Patient/{id}"
+        );
+
+        // 3. Cursor = max(meta.lastUpdated) over the downloaded lines.
+        let ts = parse_instant(last_updated);
+        cursor = Some(cursor.map_or(ts, |c| c.max(ts)));
+    }
+    let cursor = cursor.unwrap();
+    let cursor_str = cursor.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+    // 4. Update Patient A strictly after the cursor (meta is millisecond
+    //    resolution, so step past the cursor's millisecond first).
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let updated = server
+        .put("/Patient/pat-a")
+        .add_header("x-tenant-id", "test-tenant")
+        .json(&json!({"resourceType": "Patient", "id": "pat-a", "active": false}))
+        .await;
+    assert_eq!(updated.status_code(), StatusCode::OK, "{}", updated.text());
+    let read_a: Value = server
+        .get("/Patient/pat-a")
+        .add_header("x-tenant-id", "test-tenant")
+        .await
+        .json();
+    assert_eq!(read_a["meta"]["versionId"], "2");
+    let a_updated = parse_instant(read_a["meta"]["lastUpdated"].as_str().unwrap());
+    assert!(
+        a_updated > cursor,
+        "update {a_updated} must land after the cursor {cursor}"
+    );
+
+    // 5. Incremental export from the cursor: the changed Patient A, and not
+    //    the strictly older `pat-old`. Only a resource on the cursor itself
+    //    may repeat (inclusive `_since`).
+    let delta = run_patient_export(&server, &backend, &output, Some(&cursor_str)).await;
+    let ids: Vec<&str> = delta.iter().filter_map(|l| l["id"].as_str()).collect();
+    assert!(
+        !ids.contains(&"pat-old"),
+        "_since={cursor_str} re-downloaded a resource older than the cursor: {ids:?}"
+    );
+    let a = delta
+        .iter()
+        .find(|l| l["id"] == "pat-a")
+        .unwrap_or_else(|| panic!("_since={cursor_str} is missing the updated pat-a: {ids:?}"));
+    assert_eq!(a["meta"]["versionId"], "2");
+    assert_eq!(a["meta"], read_a["meta"]);
+    for line in delta.iter().filter(|l| l["id"] != "pat-a") {
+        let ts = parse_instant(line["meta"]["lastUpdated"].as_str().unwrap());
+        assert_eq!(
+            ts, cursor,
+            "only a resource on the cursor may repeat, got {line}"
+        );
+    }
 }

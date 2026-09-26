@@ -115,13 +115,15 @@ pub enum Phase {
     ReindexPage,
     /// Acquire the PostgreSQL connection used by a reindex page.
     ReindexConnection,
-    /// Extract and marshal every resource in a PostgreSQL reindex page.
+    /// Extract and marshal every resource in a PostgreSQL or MongoDB reindex page.
     ReindexExtract,
-    /// Grouped delete from `search_index` for a PostgreSQL reindex page.
+    /// Grouped delete from `search_index` (MongoDB: and `search_index_contained`)
+    /// for a PostgreSQL or MongoDB reindex page.
     ReindexSearchDelete,
     /// Grouped delete from `resource_fts` for a PostgreSQL reindex page.
     ReindexFtsDelete,
-    /// Batched insert into `search_index` for a PostgreSQL reindex page.
+    /// Batched insert into `search_index` (MongoDB: and `search_index_contained`)
+    /// for a PostgreSQL or MongoDB reindex page.
     ReindexSearchInsert,
     /// Rebuild full-text rows for a PostgreSQL reindex page.
     ReindexFts,

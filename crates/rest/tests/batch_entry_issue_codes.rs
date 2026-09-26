@@ -182,8 +182,8 @@ async fn a_batch_entry_reports_the_issue_code_for_its_failure() {
                 "request": { "method": "PATCH", "url": "Patient/p1" },
                 "resource": { "resourceType": "Patient" }
             }),
-            "501",
-            "not-supported",
+            "400",
+            "invalid",
         ),
     ];
 

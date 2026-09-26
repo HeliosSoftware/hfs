@@ -383,6 +383,8 @@ async fn embedded_assets_are_served() {
         "/ui/assets/htmx.min.js",
         "/ui/assets/app.css",
         "/ui/assets/fhir-search-value.js",
+        "/ui/assets/unsaved.js",
+        "/ui/assets/bulk-import.js",
     ] {
         let response = app()
             .oneshot(Request::get(asset).body(Body::empty()).unwrap())
@@ -390,6 +392,66 @@ async fn embedded_assets_are_served() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK, "{asset}");
     }
+}
+
+/// #1240: the shared unsaved-changes tracker loads from the layout, ahead of
+/// `addbox.js` (whose `close()` reads `window.HfsUnsaved` at click time), and
+/// the layout's `<body>` carries the two translated `data-msg-*` strings the
+/// tracker reads at runtime — the rendered copy, not the Fluent key, so a
+/// missing translation would be caught here too.
+#[tokio::test]
+async fn layout_carries_the_unsaved_changes_helper() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/assets/unsaved.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let js = body_text(response).await;
+    assert!(js.contains("HfsUnsaved"));
+
+    let response = app()
+        .oneshot(Request::get("/ui/queries").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"data-msg-unsaved="Unsaved changes""#));
+    assert!(html.contains(
+        r#"data-msg-unsaved-discard="You have unsaved changes. Discard them and close?""#
+    ));
+
+    let busy = html
+        .find(r#"src="/ui/assets/busy.js""#)
+        .expect("busy.js in the layout");
+    let unsaved = html
+        .find(r#"src="/ui/assets/unsaved.js""#)
+        .expect("unsaved.js in the layout");
+    let addbox = html
+        .find(r#"src="/ui/assets/addbox.js""#)
+        .expect("addbox.js in the layout");
+    assert!(busy < unsaved, "unsaved.js must load after busy.js");
+    assert!(unsaved < addbox, "unsaved.js must load before addbox.js");
+}
+
+/// #1240: the Bulk Import page loads `bulk-import.js`, which opts the New
+/// Submission dialog's form into the shared unsaved-changes tracker — even
+/// when this router registers no `BulkSubmitProvider` and the page renders
+/// its unavailable notice instead of the dialog, since the script tag itself
+/// sits outside that branch.
+#[tokio::test]
+async fn bulk_import_page_loads_the_unsaved_changes_script() {
+    let response = app()
+        .oneshot(Request::get("/ui/bulk-import").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"<script src="/ui/assets/bulk-import.js" defer></script>"#));
 }
 
 /// #753: the vendored CodeMirror 6 + lezer-fhirpath bundle is
@@ -2012,17 +2074,20 @@ async fn editor_pane_form_hidden_content_drops_its_rows_and_add_option_but_keeps
     assert!(doc_field.contains("aGVsbG8="));
 }
 
-/// `legend=sql-library` (#840) swaps in the SQL Query/SQL View pair of
+/// `legend=sql-library` (#840/#1233) swaps in the SQL Query/SQL View trio of
 /// legend lines — neither the Resource Editor's generic "constraints and
 /// terminology" line nor View Definitions' single line.
 #[tokio::test]
-async fn editor_pane_form_sql_library_legend_shows_its_own_two_lines() {
+async fn editor_pane_form_sql_library_legend_shows_its_own_three_lines() {
     let doc = serde_json::json!({ "resourceType": "Library", "status": "draft" });
     let html = edit(&form_pane_body(&doc, &[("legend", "sql-library")])).await;
 
     assert!(html.contains("editor-legend__live"));
     assert!(html.contains("editor-legend__save"));
     assert!(html.contains("SQL on FHIR Library type"));
+    assert!(html.contains(
+        "The SQL attachment (content) is not listed here: edit it in the SQL card below"
+    ));
     assert!(!html.contains("constraints and terminology"));
     assert!(!html.contains("FHIRPath syntax"));
 }
@@ -2686,7 +2751,7 @@ async fn editor_marks_the_created_node_for_focus() {
 async fn editor_opens_the_root_picker_on_an_empty_document() {
     let html = edit("doc=%7B%22resourceType%22%3A%22Patient%22%7D&op=").await;
     assert!(
-        html.contains(r#"<details class="editor-add" open>"#),
+        html.contains(r#"<details class="editor-add editor-add--picker" open>"#),
         "root picker auto-opens"
     );
 
@@ -2695,7 +2760,85 @@ async fn editor_opens_the_root_picker_on_an_empty_document() {
         "doc=%7B%22resourceType%22%3A%22Patient%22%2C%22birthDate%22%3A%222024-01-01%22%7D&op=",
     )
     .await;
-    assert!(!html.contains(r#"<details class="editor-add" open>"#));
+    assert!(!html.contains(r#"<details class="editor-add editor-add--picker" open>"#));
+}
+
+/* #1239: the picker panel gained a header close control, an inline "added"
+ * status (wired by the next change), and a two-group accordion — Elements
+ * open, Extensions folded with the ad-hoc extension URL row inside. */
+
+#[tokio::test]
+async fn editor_picker_renders_the_accordion_with_extensions_folded() {
+    let html = edit("doc=%7B%22resourceType%22%3A%22Patient%22%7D&op=").await;
+
+    assert!(
+        html.contains("editor-add__close") && html.contains(r#"aria-label="Close""#),
+        "close control present: {}",
+        &html[..400]
+    );
+    assert!(
+        html.contains(r#"<p class="editor-add__added" role="status" hidden>"#),
+        "added status present"
+    );
+
+    let elements_group = html
+        .find(r#"<details class="editor-add__group" open>"#)
+        .expect("Elements group present and open");
+    let elements_summary_end = html[elements_group..].find("</summary>").unwrap() + elements_group;
+    assert!(
+        html[elements_group..elements_summary_end].contains("Elements"),
+        "Elements group summary names the group"
+    );
+
+    let extensions_group = html
+        .find(r#"<details class="editor-add__group" data-add-group="extensions">"#)
+        .expect("Extensions group present and folded");
+    assert!(
+        !html[extensions_group..extensions_group + 80].contains(" open>"),
+        "Extensions group is not open"
+    );
+    let extensions_summary_end =
+        html[extensions_group..].find("</summary>").unwrap() + extensions_group;
+    assert!(
+        html[extensions_group..extensions_summary_end].contains("Extensions"),
+        "Extensions group summary names the group"
+    );
+
+    let ext_url = html
+        .find(r#"class="editor-add__ext-url""#)
+        .expect("extension URL input present");
+    assert!(
+        ext_url > extensions_group,
+        "extension URL input sits inside the Extensions group"
+    );
+
+    assert!(!html.contains("<script"), "fragment has no inline script");
+}
+
+#[tokio::test]
+async fn editor_picker_counts_match_the_options() {
+    let html = edit("doc=%7B%22resourceType%22%3A%22Patient%22%7D&op=").await;
+
+    let extensions_group = html
+        .find(r#"<details class="editor-add__group" data-add-group="extensions">"#)
+        .expect("Extensions group present");
+    let elements_section = &html[..extensions_group];
+    let option_count = elements_section.matches("data-add-name=").count();
+
+    let count_start = elements_section
+        .find(r#"<span class="editor-add__count">"#)
+        .expect("Elements count span present")
+        + r#"<span class="editor-add__count">"#.len();
+    let count_end = elements_section[count_start..].find("</span>").unwrap() + count_start;
+    let rendered_count: usize = elements_section[count_start..count_end]
+        .trim()
+        .parse()
+        .expect("count span holds a number");
+
+    assert_eq!(
+        rendered_count, option_count,
+        "Elements group count matches its addable options"
+    );
 }
 
 /// #649: SQL on FHIR is a top-level nav section whose four children are real
@@ -3117,9 +3260,10 @@ async fn sql_library_editor_results_and_failure_copy_differ_by_kind() {
 /// `sql_queries_run_previews_posted_content_and_offers_export_with_an_id`),
 /// present only for SQL Queries and only once the Library is saved — never
 /// for `?lib=new`'s unsaved starter, and never for SQL Views at all. The
-/// JSON fold, its `<details>`, and `?run=1` are gone; the resource — its
-/// own SQL attachment stripped out — travels as the Details card's own
-/// visible `name="json"` textarea (#840), not a hidden field.
+/// JSON fold, its `<details>`, and `?run=1` are gone; the resource — the
+/// full stored document, `application/sql` attachment included (#1233) —
+/// travels as the Details card's own visible `name="json"` textarea (#840),
+/// not a hidden field.
 #[tokio::test]
 async fn sql_library_page_offers_export_only_for_a_saved_query_and_drops_the_json_fold() {
     let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
@@ -3151,9 +3295,9 @@ async fn sql_library_page_offers_export_only_for_a_saved_query_and_drops_the_jso
     assert!(html.contains(r#"<textarea class="json-editor" name="json" form="lib-editor-form""#));
     assert!(!html.contains(r#"<input type="hidden" name="json""#));
     assert!(html_unescape(&html).contains(r#""resourceType": "Library""#));
-    // The SQL attachment is stripped out of the Details document — it lives
-    // only in the SQL card's own textarea, decoded (#840).
-    assert!(!html_unescape(&html).contains("application/sql"));
+    // The SQL attachment is part of the full document shown here — the SQL
+    // card's own textarea below is a second, decoded view of it (#1233).
+    assert!(html_unescape(&html).contains("application/sql"));
 
     // `?lib=new`: the starter is never saved, so Export never appears even
     // though the kind offers it.
@@ -3235,12 +3379,13 @@ fn lib_json_textarea_value(html: &str) -> String {
     html_unescape(&html[open_tag_end..open_tag_end + close])
 }
 
-/// #840: the Details JSON pane shows the Library minus its SQL attachment —
-/// a second, non-SQL attachment survives untouched — the guided form beside
-/// it never shows or offers to mutate `content`, its own legend names what
-/// Save actually gates, and the retired "Edit as JSON" link is gone.
+/// #840/#1233: the Details JSON pane shows the full stored Library — its
+/// `application/sql` attachment included, alongside a second, non-SQL
+/// attachment — while the guided form beside it still never shows or
+/// offers to mutate `content` (`hidden=["content"]`), its own legend names
+/// what Save actually gates, and the retired "Edit as JSON" link is gone.
 #[tokio::test]
-async fn sql_library_details_strips_the_sql_attachment_and_hides_content() {
+async fn sql_library_details_json_shows_the_full_library_while_the_form_hides_content() {
     let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
     let lib = serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
     "status": "active",
@@ -3271,10 +3416,94 @@ async fn sql_library_details_strips_the_sql_attachment_and_hides_content() {
     assert!(html.contains(r#"id="lib-details-grid""#));
     let json_field = lib_json_textarea_value(&html);
     assert!(json_field.contains("text/plain"), "{json_field}");
-    assert!(!json_field.contains("application/sql"), "{json_field}");
+    assert!(json_field.contains("application/sql"), "{json_field}");
     assert!(!html.contains(r#"data-path="content""#));
     assert!(html.contains("Checked on save: SQL on FHIR"));
     assert!(!html.contains("Edit as JSON"));
+}
+
+/// #1233: the guided form's legend says where the SQL attachment is
+/// actually edited (it never lists `content` itself), and the SQL card
+/// carries the "unreadable attachment" chip, server-painted hidden with no
+/// text of its own — `sql-library-sync.js` is the only thing that ever
+/// shows it, client-side, and only for its own "unreadable" state.
+#[tokio::test]
+async fn sql_library_details_legend_points_to_the_sql_card() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let lib = serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+    "status": "active",
+    "type": {"coding": [{"system": system, "code": "sql-query"}]},
+    "content": [
+        {"contentType": "application/sql", "data": BASE64.encode("SELECT 1")},
+    ]});
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        vec![lib],
+    );
+    let app = library_app(source);
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    assert!(html.contains(
+        "The SQL attachment (content) is not listed here: edit it in the SQL card below"
+    ));
+    assert!(html.contains(r#"id="sql-attachment-state""#));
+    assert!(html.contains(r#"<span class="editor-validity" id="sql-attachment-state" hidden"#));
+    assert!(html.contains(
+        r#"data-msg-unreadable="SQL attachment unreadable: the SQL card keeps its last readable text; typing here repairs it""#
+    ));
+}
+
+/// #1233: the Details JSON pane is the exact document `GET` returns for the
+/// API — `content[]` keeps every attachment, in the order the resource
+/// stored them, `application/sql` included — while the SQL pane below
+/// decodes that same attachment for editing.
+#[tokio::test]
+async fn sql_library_details_json_carries_the_sql_attachment() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let lib = serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+    "status": "active",
+    "type": {"coding": [{"system": system, "code": "sql-query"}]},
+    "content": [
+        {"contentType": "text/plain", "data": BASE64.encode("a note")},
+        {"contentType": "application/sql", "data": BASE64.encode("SELECT 1 FROM v")},
+    ]});
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        vec![lib],
+    );
+    let app = library_app(source);
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    let json_field = lib_json_textarea_value(&html);
+    let parsed: Value = serde_json::from_str(&json_field).expect("valid JSON");
+    let content = parsed["content"].as_array().expect("content array");
+    assert_eq!(content.len(), 2);
+    assert_eq!(content[0]["contentType"], "text/plain");
+    assert_eq!(content[1]["contentType"], "application/sql");
+    assert_eq!(content[1]["data"], BASE64.encode("SELECT 1 FROM v"));
+    assert_eq!(sql_textarea_value(&html), "SELECT 1 FROM v");
 }
 
 /// #840: the Details lede only shows for `?lib=new` — the hint that closes
@@ -3319,10 +3548,11 @@ async fn sql_library_details_new_lede_shows_only_for_the_starter() {
     assert!(!html.contains("Rename it and point relatedArtifact[0]"));
 }
 
-/// #840: Save fuses the posted Details document (no SQL attachment, a
-/// non-SQL one kept) with the posted SQL pane into one Library —
-/// `sql_libraries::embed_sql` appends the `application/sql` attachment
-/// alongside the surviving `text/plain` one — and redirects to it.
+/// #840/#1233: Save fuses the posted Details document (no SQL attachment, a
+/// non-SQL one kept) with the posted SQL pane into one Library — the
+/// Details JSON carries no readable `application/sql` attachment, so
+/// `sql_libraries::fill_sql_attachment` appends one alongside the
+/// surviving `text/plain` attachment — and redirects to it.
 /// `StaticConformanceSource::save_resource` does not persist (see
 /// `sql_editor_save_roundtrips_special_characters_byte_for_byte`'s own doc
 /// comment), so the merged document is read back off
@@ -3417,6 +3647,42 @@ async fn sql_library_save_rejects_the_other_kinds_coding() {
     }
 }
 
+/// #1233 regression guard: the coding-mismatch Save error re-render (see
+/// the case above) carries the exact document that was posted back into the
+/// JSON pane, its `application/sql` attachment included.
+#[tokio::test]
+async fn sql_library_save_error_rerender_keeps_the_sql_attachment() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let sql_data = BASE64.encode("SELECT 1 FROM v");
+    let wrong_kind = serde_json::json!({"resourceType": "Library", "name": "x",
+        "status": "active",
+        "type": {"coding": [{"system": system, "code": "sql-view"}]},
+        "content": [{"contentType": "application/sql", "data": sql_data.clone()}]});
+    let source = helios_ui::StaticConformanceSource::empty();
+    let app = library_app(source);
+
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "")
+        .append_pair("action", "save")
+        .append_pair("json", &wrong_kind.to_string())
+        .append_pair("sql", "SELECT 1 FROM v")
+        .finish();
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/queries")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    let json_field = lib_json_textarea_value(&html);
+    assert!(json_field.contains("application/sql"), "{json_field}");
+    assert!(json_field.contains(&sql_data), "{json_field}");
+}
+
 /// #840: invalid Details JSON re-renders with the guided-form card showing
 /// the invalid-JSON notice in place of rows — the same shape View
 /// Definitions' own Save-error path already proves — and both textareas
@@ -3453,10 +3719,11 @@ async fn sql_library_save_invalid_json_shows_the_invalid_form_card() {
     assert_eq!(sql_textarea_value(&html), "SELECT 3");
 }
 
-/// #840: `POST …/run` embeds the posted SQL into the posted (content-less)
-/// Details document exactly as Save does, before handing it to `$sql-run` —
-/// the same `sql_libraries::embed_sql` merge, proven here against the live
-/// preview endpoint rather than Save's redirect.
+/// #840/#1233: `POST …/run` folds the posted SQL into the posted
+/// (content-less) Details document exactly as Save does, before handing it
+/// to `$sql-run` — the Details JSON carries no readable `application/sql`
+/// attachment, so `sql_libraries::fill_sql_attachment` fills it in, proven
+/// here against the live preview endpoint rather than Save's redirect.
 #[tokio::test]
 async fn sql_queries_run_embeds_the_sql_into_the_content_less_document() {
     let source = helios_ui::StaticConformanceSource::empty()
@@ -3489,6 +3756,88 @@ async fn sql_queries_run_embeds_the_sql_into_the_content_less_document() {
     assert_eq!(
         String::from_utf8(decoded).unwrap(),
         "SELECT COUNT(*) AS n FROM v"
+    );
+}
+
+/// #1233: Save keeps the Details JSON's own readable `application/sql`
+/// attachment over the SQL card's posted text — the JSON is the document
+/// of record; the card only fills in when the JSON carries no readable
+/// attachment (proven separately by
+/// `sql_library_save_merges_details_and_sql_into_one_library`).
+#[tokio::test]
+async fn sql_library_save_keeps_the_json_sql_attachment_over_the_sql_card() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let details = serde_json::json!({"resourceType": "Library", "id": "q1", "name": "q1",
+        "status": "active",
+        "type": {"coding": [{"system": system, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT 1")}]});
+    let source = helios_ui::StaticConformanceSource::empty();
+    let app = library_app(source.clone());
+
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "q1")
+        .append_pair("action", "save")
+        .append_pair("json", &details.to_string())
+        .append_pair("sql", "SELECT 2")
+        .finish();
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/queries")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let saved = source.saved_resources();
+    assert_eq!(saved.len(), 1);
+    let content = saved[0]["content"].as_array().expect("content array");
+    let sql_attachments: Vec<&Value> = content
+        .iter()
+        .filter(|a| a["contentType"] == "application/sql")
+        .collect();
+    assert_eq!(sql_attachments.len(), 1);
+    assert_eq!(
+        sql_attachments[0]["data"].as_str().unwrap(),
+        BASE64.encode("SELECT 1")
+    );
+}
+
+/// #1233: `POST …/run` keeps the Details JSON's own readable
+/// `application/sql` attachment over the SQL card's posted text — the run
+/// executes and analyzes the JSON's SQL, not the card's.
+#[tokio::test]
+async fn sql_queries_run_keeps_the_json_sql_attachment_over_the_sql_card() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 1})]));
+    let app = library_app(source.clone());
+    let details = serde_json::json!({
+        "resourceType": "Library", "name": "unsaved_query", "status": "draft",
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT 1")}],
+    });
+
+    let response = app
+        .oneshot(post_run(
+            "/ui/sql/queries/run",
+            library_run_body("lib1", &details, "SELECT 2"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let calls = source.sql_run_calls();
+    assert_eq!(calls.len(), 1);
+    let content = calls[0]["content"].as_array().expect("content array");
+    let sql_attachments: Vec<&Value> = content
+        .iter()
+        .filter(|a| a["contentType"] == "application/sql")
+        .collect();
+    assert_eq!(sql_attachments.len(), 1);
+    assert_eq!(
+        sql_attachments[0]["data"].as_str().unwrap(),
+        BASE64.encode("SELECT 1")
     );
 }
 
@@ -5492,6 +5841,43 @@ async fn sql_query_page_shows_the_parameters_card_with_form_associated_fields() 
     assert!(html.contains(r#"name="params_sig" form="lib-editor-form" value="ward:string""#));
 }
 
+/// #1276: Create New (`?lib=new`) renders `#lib-params` for a SQL Query too,
+/// so `/run`'s out-of-band card has an element to replace once the pasted
+/// JSON declares a parameter. The starter declares none, so its signature is
+/// empty — the same one `/run` computes for the unedited starter. The SQL
+/// View route still never renders the card.
+#[tokio::test]
+async fn sql_query_create_new_renders_lib_params_card() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("Library", helios_fhir::FhirVersion::R4, Vec::new())
+        .with_sql_run(Ok(Vec::new()));
+
+    let response = library_app(source.clone())
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=new")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"id="lib-params""#));
+    assert!(html.contains(r#"name="params_sig" form="lib-editor-form" value="""#));
+
+    let response = library_app(source)
+        .oneshot(
+            Request::get("/ui/sql/views?lib=new")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(!html.contains(r#"id="lib-params""#));
+}
+
 /// #841: the same JSON, on the SQL View route, never shows `#lib-params` —
 /// `LibraryKind::declares_parameters` is `false` there, whatever
 /// `parameter[]` the stored document happens to carry.
@@ -7084,5 +7470,40 @@ async fn the_account_menu_is_the_shared_component_verbatim() {
          `crates/ui/templates/layouts/base.html`, or the layout is passing a \
          different `UserIdentity` than the signed-out one.\n\n\
          Expected to find:\n{expected}",
+    );
+}
+
+/// #1239: `editor-add.js` — the shared add-picker module — must load before
+/// each host script that reads `window.HfsEditorAdd` at mount time.
+#[tokio::test]
+async fn editor_pages_load_the_shared_picker_script_before_their_own() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/editor?type=Patient&id=abc")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("/ui/assets/editor-add.js"));
+    assert!(html.contains("/ui/assets/editor.js"));
+    assert!(
+        html.find("/ui/assets/editor-add.js") < html.find("/ui/assets/editor.js"),
+        "editor-add.js must load before editor.js"
+    );
+
+    let response = app()
+        .oneshot(Request::get("/ui/resources").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("/ui/assets/editor-add.js"));
+    assert!(html.contains("/ui/assets/resources.js"));
+    assert!(
+        html.find("/ui/assets/editor-add.js") < html.find("/ui/assets/resources.js"),
+        "editor-add.js must load before resources.js"
     );
 }
