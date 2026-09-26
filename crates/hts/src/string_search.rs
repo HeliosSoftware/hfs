@@ -84,6 +84,17 @@ impl ResourceStringSearch {
     pub(crate) fn is_empty(&self) -> bool {
         self.name.is_none() && self.title.is_none()
     }
+
+    /// Whether a resource with this `name` and `title` satisfies every
+    /// populated predicate. A missing value never matches a populated one.
+    pub(crate) fn matches(&self, name: Option<&str>, title: Option<&str>) -> bool {
+        let satisfies = |search: &Option<FhirStringSearch>, candidate: Option<&str>| {
+            search
+                .as_ref()
+                .is_none_or(|search| candidate.is_some_and(|candidate| search.matches(candidate)))
+        };
+        satisfies(&self.name, name) && satisfies(&self.title, title)
+    }
 }
 
 /// Metadata needed to apply name/title filters before pagination.
@@ -107,17 +118,7 @@ pub(crate) fn filter_rows(
     let count = query.count.unwrap_or(20) as usize;
 
     rows.into_iter()
-        .filter(|row| {
-            search.name.as_ref().is_none_or(|search| {
-                row.name
-                    .as_deref()
-                    .is_some_and(|candidate| search.matches(candidate))
-            }) && search.title.as_ref().is_none_or(|search| {
-                row.title
-                    .as_deref()
-                    .is_some_and(|candidate| search.matches(candidate))
-            })
-        })
+        .filter(|row| search.matches(row.name.as_deref(), row.title.as_deref()))
         .skip(offset)
         .take(count)
         .collect()

@@ -50,6 +50,11 @@ pub trait CodeSystemOperations: Send + Sync {
         query: ResourceSearchQuery,
     ) -> Result<Vec<serde_json::Value>, HtsError>;
 
+    /// Count the CodeSystem resources matching `query`, ignoring `_count` and
+    /// `_offset`. Used for `Bundle.total` and `_summary=count`.
+    async fn count(&self, ctx: &TenantContext, query: ResourceSearchQuery)
+    -> Result<u64, HtsError>;
+
     /// Test the subsumption relationship between two codes.
     ///
     /// Returns one of: `equivalent`, `subsumes`, `subsumed-by`, `not-subsumed`.

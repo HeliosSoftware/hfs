@@ -6,16 +6,16 @@
 //! `searchset`.
 //!
 //! Pagination is controlled by `_count` (page size, default 20) and `_offset`
-//! (zero-based start position, default 0).  The `total` field in the Bundle
-//! reflects the number of resources returned on this page (not the grand total
-//! across all pages), consistent with the lazy-count model used by most FHIR
-//! servers when a full count would be expensive.
+//! (zero-based start position, default 0).  `Bundle.total` is the number of
+//! resources matching the search across all pages, and the Bundle carries
+//! `self`, `previous`, and `next` links for navigating the pages.
+//! `_summary=count` returns only `total`, with no entries.
 
 use axum::{
     Json,
-    extract::{RawQuery, State},
-    http::StatusCode,
-    response::IntoResponse,
+    extract::{OriginalUri, RawQuery, State},
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
 };
 use helios_persistence::tenant::TenantContext;
 use serde_json::{Value, json};
@@ -151,20 +151,127 @@ fn parse_u32(parameter: &str, value: &str) -> Result<u32, HtsError> {
     })
 }
 
-/// Build a FHIR `Bundle` of type `searchset` from a list of resource values.
-fn build_searchset_bundle(resources: Vec<Value>) -> Value {
-    let total = resources.len() as u64;
-    let entries: Vec<Value> = resources
-        .into_iter()
-        .map(|resource| json!({ "resource": resource }))
-        .collect();
+/// Default page size when `_count` is absent, matching the backends.
+const DEFAULT_PAGE_SIZE: u32 = 20;
 
-    json!({
+/// Where the search was addressed, used to build `Bundle.link` URLs.
+struct SearchLinkBase {
+    /// `scheme://host/path` when a `Host` header is present, else the path.
+    url: String,
+    /// The request's query parameters minus `_count` and `_offset`, which
+    /// each link sets for its own page.
+    params: Vec<(String, String)>,
+}
+
+impl SearchLinkBase {
+    fn new(uri: &axum::http::Uri, headers: &HeaderMap, raw_query: Option<&str>) -> Self {
+        let path = uri.path();
+        let host = headers
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .filter(|host| !host.is_empty());
+        let url = match host {
+            Some(host) => {
+                let scheme = headers
+                    .get("x-forwarded-proto")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.split(',').next())
+                    .map(str::trim)
+                    .filter(|scheme| matches!(*scheme, "http" | "https"))
+                    .unwrap_or("http");
+                format!("{scheme}://{host}{path}")
+            }
+            None => path.to_string(),
+        };
+        let params = form_urlencoded::parse(raw_query.unwrap_or_default().as_bytes())
+            .filter(|(key, _)| key != "_count" && key != "_offset")
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
+        Self { url, params }
+    }
+
+    fn page_url(&self, count: u32, offset: u64) -> String {
+        let mut query = form_urlencoded::Serializer::new(String::new());
+        query.extend_pairs(&self.params);
+        query.append_pair("_count", &count.to_string());
+        query.append_pair("_offset", &offset.to_string());
+        format!("{}?{}", self.url, query.finish())
+    }
+}
+
+/// Build a FHIR `Bundle` of type `searchset`.
+///
+/// `total` is the number of matches across all pages. `resources` is the
+/// current page, or `None` for `_summary=count`, which omits `entry` and
+/// paging links.
+fn build_searchset_bundle(
+    query: &ResourceSearchQuery,
+    links: &SearchLinkBase,
+    total: u64,
+    resources: Option<Vec<Value>>,
+) -> Value {
+    let count = query.count.unwrap_or(DEFAULT_PAGE_SIZE);
+    let offset = u64::from(query.offset.unwrap_or(0));
+
+    let mut link = vec![json!({ "relation": "self", "url": links.page_url(count, offset) })];
+    let mut bundle = json!({
         "resourceType": "Bundle",
         "type": "searchset",
         "total": total,
-        "entry": entries
-    })
+    });
+
+    if let Some(resources) = resources {
+        if count > 0 {
+            let step = u64::from(count);
+            if offset > 0 {
+                let previous = offset.saturating_sub(step);
+                link.push(
+                    json!({ "relation": "previous", "url": links.page_url(count, previous) }),
+                );
+            }
+            if offset + step < total {
+                link.push(
+                    json!({ "relation": "next", "url": links.page_url(count, offset + step) }),
+                );
+            }
+        }
+        let entries: Vec<Value> = resources
+            .into_iter()
+            .map(|resource| json!({ "resource": resource }))
+            .collect();
+        bundle["entry"] = Value::Array(entries);
+    }
+
+    bundle["link"] = Value::Array(link);
+    bundle
+}
+
+/// Run a parsed search: count the matches, then fetch the page unless the
+/// client asked for `_summary=count`.
+async fn searchset_response<CountFut, SearchFut>(
+    query: ResourceSearchQuery,
+    links: SearchLinkBase,
+    count: impl FnOnce(ResourceSearchQuery) -> CountFut,
+    search: impl FnOnce(ResourceSearchQuery) -> SearchFut,
+) -> Response
+where
+    CountFut: std::future::Future<Output = Result<u64, HtsError>>,
+    SearchFut: std::future::Future<Output = Result<Vec<Value>, HtsError>>,
+{
+    let total = match count(query.clone()).await {
+        Ok(total) => total,
+        Err(error) => return error.into_response(),
+    };
+    let resources = if query.summary.as_deref() == Some("count") {
+        None
+    } else {
+        match search(query.clone()).await {
+            Ok(resources) => Some(resources),
+            Err(error) => return error.into_response(),
+        }
+    };
+    let bundle = build_searchset_bundle(&query, &links, total, resources);
+    (StatusCode::OK, Json(bundle)).into_response()
 }
 
 /// `GET /CodeSystem?url=...&name=...&status=...&version=...&title=...`
@@ -172,6 +279,8 @@ fn build_searchset_bundle(resources: Vec<Value>) -> Value {
 /// Returns a `searchset` Bundle containing matching CodeSystem resources.
 pub async fn search_code_systems<B>(
     State(state): State<AppState<B>>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> impl IntoResponse
 where
@@ -181,10 +290,16 @@ where
         Ok(query) => query,
         Err(error) => return error.into_response(),
     };
-    match CodeSystemOperations::search(state.backend(), &ctx(), query).await {
-        Ok(resources) => (StatusCode::OK, Json(build_searchset_bundle(resources))).into_response(),
-        Err(e) => e.into_response(),
-    }
+    let links = SearchLinkBase::new(&uri, &headers, raw.as_deref());
+    let backend = state.backend();
+    let ctx = ctx();
+    searchset_response(
+        query,
+        links,
+        |query| CodeSystemOperations::count(backend, &ctx, query),
+        |query| CodeSystemOperations::search(backend, &ctx, query),
+    )
+    .await
 }
 
 /// `GET /ValueSet?url=...&name=...&status=...&version=...&title=...`
@@ -192,6 +307,8 @@ where
 /// Returns a `searchset` Bundle containing matching ValueSet resources.
 pub async fn search_value_sets<B>(
     State(state): State<AppState<B>>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> impl IntoResponse
 where
@@ -201,10 +318,16 @@ where
         Ok(query) => query,
         Err(error) => return error.into_response(),
     };
-    match ValueSetOperations::search(state.backend(), &ctx(), query).await {
-        Ok(resources) => (StatusCode::OK, Json(build_searchset_bundle(resources))).into_response(),
-        Err(e) => e.into_response(),
-    }
+    let links = SearchLinkBase::new(&uri, &headers, raw.as_deref());
+    let backend = state.backend();
+    let ctx = ctx();
+    searchset_response(
+        query,
+        links,
+        |query| ValueSetOperations::count(backend, &ctx, query),
+        |query| ValueSetOperations::search(backend, &ctx, query),
+    )
+    .await
 }
 
 /// `GET /ConceptMap?url=...&name=...&status=...&version=...&title=...`
@@ -212,6 +335,8 @@ where
 /// Returns a `searchset` Bundle containing matching ConceptMap resources.
 pub async fn search_concept_maps<B>(
     State(state): State<AppState<B>>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> impl IntoResponse
 where
@@ -221,8 +346,64 @@ where
         Ok(query) => query,
         Err(error) => return error.into_response(),
     };
-    match ConceptMapOperations::search(state.backend(), &ctx(), query).await {
-        Ok(resources) => (StatusCode::OK, Json(build_searchset_bundle(resources))).into_response(),
-        Err(e) => e.into_response(),
+    let links = SearchLinkBase::new(&uri, &headers, raw.as_deref());
+    let backend = state.backend();
+    let ctx = ctx();
+    searchset_response(
+        query,
+        links,
+        |query| ConceptMapOperations::count(backend, &ctx, query),
+        |query| ConceptMapOperations::search(backend, &ctx, query),
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_links_are_absolute_when_host_is_known_and_keep_other_params() {
+        let uri: axum::http::Uri = "/ValueSet?name=cafe&_count=5&_offset=5".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "hts.example.org".parse().unwrap());
+        headers.insert("x-forwarded-proto", "https, http".parse().unwrap());
+
+        let links = SearchLinkBase::new(&uri, &headers, uri.query());
+        assert_eq!(
+            links.page_url(5, 10),
+            "https://hts.example.org/ValueSet?name=cafe&_count=5&_offset=10"
+        );
+
+        let relative = SearchLinkBase::new(&uri, &HeaderMap::new(), uri.query());
+        assert_eq!(
+            relative.page_url(5, 0),
+            "/ValueSet?name=cafe&_count=5&_offset=0"
+        );
+    }
+
+    #[test]
+    fn bundle_total_is_independent_of_the_page() {
+        let query = ResourceSearchQuery {
+            count: Some(2),
+            offset: Some(2),
+            ..ResourceSearchQuery::default()
+        };
+        let links = SearchLinkBase::new(&"/CodeSystem".parse().unwrap(), &HeaderMap::new(), None);
+        let bundle = build_searchset_bundle(&query, &links, 7, Some(vec![json!({}), json!({})]));
+        assert_eq!(bundle["total"], 7);
+        assert_eq!(bundle["entry"].as_array().unwrap().len(), 2);
+        let relations: Vec<_> = bundle["link"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|link| link["relation"].as_str().unwrap())
+            .collect();
+        assert_eq!(relations, ["self", "previous", "next"]);
+
+        let count_only = build_searchset_bundle(&query, &links, 7, None);
+        assert_eq!(count_only["total"], 7);
+        assert!(count_only.get("entry").is_none());
+        assert_eq!(count_only["link"].as_array().unwrap().len(), 1);
     }
 }

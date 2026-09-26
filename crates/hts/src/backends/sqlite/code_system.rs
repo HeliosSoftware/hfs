@@ -1130,6 +1130,14 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
         .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
     }
 
+    async fn count(
+        &self,
+        _ctx: &TenantContext,
+        query: ResourceSearchQuery,
+    ) -> Result<u64, HtsError> {
+        self.count_search_matches("code_systems", query).await
+    }
+
     /// Search CodeSystem resources by query parameters.
     ///
     /// `url`, `version`, and `status` use exact matching. `name` and `title`

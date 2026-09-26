@@ -86,6 +86,65 @@ pub const PG_SUBSUMES_RESPONSE_CACHE_MAX: usize = 16384;
 /// Soft cap on `translate_response_cache` entries.
 pub const PG_TRANSLATE_RESPONSE_CACHE_MAX: usize = 16384;
 
+/// Count the resources in `table` matching `query`, ignoring `_count` and
+/// `_offset`, so a searchset Bundle can report the full match count.
+///
+/// Uses the same predicates as the search paths: exact `url`/`version`/
+/// `status` in SQL and, when present, FHIR string matching of `name`/`title`
+/// over the metadata rows.
+async fn count_resources<C>(
+    client: &C,
+    table: &str,
+    query: &ResourceSearchQuery,
+) -> Result<u64, HtsError>
+where
+    C: GenericClient + Sync,
+{
+    let search = ResourceStringSearch::new(query);
+    let filter = "WHERE ($1::text IS NULL OR url = $1)
+           AND ($2::text IS NULL OR version = $2)
+           AND ($3::text IS NULL OR status = $3)";
+    let params: [&(dyn tokio_postgres::types::ToSql + Sync); 3] =
+        [&query.url, &query.version, &query.status];
+
+    if search.is_empty() {
+        let count: i64 = client
+            .query_one(&format!("SELECT COUNT(*) FROM {table} {filter}"), &params)
+            .await
+            .map_err(|error| HtsError::StorageError(error_chain(&error)))?
+            .get(0);
+        return Ok(count.max(0) as u64);
+    }
+
+    let rows = client
+        .query(
+            &format!("SELECT name, title FROM {table} {filter}"),
+            &params,
+        )
+        .await
+        .map_err(|error| HtsError::StorageError(error_chain(&error)))?;
+    Ok(rows
+        .iter()
+        .filter(|row| search.matches(row.get::<_, Option<&str>>(0), row.get::<_, Option<&str>>(1)))
+        .count() as u64)
+}
+
+impl PostgresTerminologyBackend {
+    /// Pooled wrapper around [`count_resources`] for the per-type search traits.
+    pub(super) async fn count_search_matches(
+        &self,
+        table: &str,
+        query: ResourceSearchQuery,
+    ) -> Result<u64, HtsError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
+        count_resources(&client, table, &query).await
+    }
+}
+
 /// Search metadata using backend-neutral FHIR string matching, then hydrate
 /// only the selected page. PostgreSQL search historically returns full
 /// resources even for `_summary=true`, which this path preserves.
