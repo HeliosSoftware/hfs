@@ -17651,6 +17651,76 @@ mod postgres_integration {
 
     /// The `Patient` branch of the compartment fetch applies `_since`, the way
     /// the non-Patient branch below it always has.
+    /// `Patient/$export` decides membership with the compartment's own
+    /// parameter set (#1122): a resource that joins through `recorder`,
+    /// `performer` or `link` is exported, one that merely mentions the patient
+    /// elsewhere is not, and the candidate prefilter tolerates a versioned
+    /// reference.
+    #[tokio::test]
+    async fn postgres_integration_export_compartment_membership_follows_the_compartment_definition()
+    {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-compartment-params");
+
+        for resource in [
+            serde_json::json!({"resourceType": "Patient", "id": "p1"}),
+            serde_json::json!({"resourceType": "Patient", "id": "other"}),
+            serde_json::json!({"resourceType": "Patient", "id": "linked",
+                "link": [{"other": {"reference": "Patient/p1"}, "type": "seealso"}]}),
+            serde_json::json!({"resourceType": "AllergyIntolerance", "id": "recorded",
+                "patient": {"reference": "Patient/other"},
+                "recorder": {"reference": "Patient/p1"}}),
+            serde_json::json!({"resourceType": "AllergyIntolerance", "id": "someone-elses",
+                "patient": {"reference": "Patient/other"}}),
+            serde_json::json!({"resourceType": "Observation", "id": "performed", "status": "final",
+                "code": {"text": "x"}, "subject": {"reference": "Patient/other"},
+                "performer": [{"reference": "Patient/p1/_history/2"}]}),
+            serde_json::json!({"resourceType": "Observation", "id": "about", "status": "final",
+                "code": {"text": "x"}, "subject": {"reference": "Patient/p1"}}),
+            serde_json::json!({"resourceType": "Observation", "id": "mentions-only", "status": "final",
+                "code": {"text": "x"}, "subject": {"reference": "Patient/other"},
+                "focus": [{"reference": "Patient/p1"}]}),
+        ] {
+            let resource_type = resource["resourceType"].as_str().unwrap().to_string();
+            backend
+                .create(&tenant, &resource_type, resource, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+
+        let request = ExportRequest::patient();
+        let ids = ["p1".to_string()];
+        let mut exported = std::collections::BTreeMap::new();
+        for resource_type in [
+            "AllergyIntolerance",
+            "Observation",
+            "Patient",
+            "Organization",
+        ] {
+            let batch = backend
+                .fetch_patient_compartment_batch(&tenant, &request, resource_type, &ids, None, 100)
+                .await
+                .unwrap();
+            let mut found: Vec<String> = batch
+                .lines
+                .iter()
+                .map(|line| {
+                    serde_json::from_str::<serde_json::Value>(line).unwrap()["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect();
+            found.sort();
+            exported.insert(resource_type, found);
+        }
+        assert_eq!(exported["AllergyIntolerance"], ["recorded"]);
+        assert_eq!(exported["Observation"], ["about", "performed"]);
+        assert_eq!(exported["Patient"], ["linked", "p1"]);
+        assert!(exported["Organization"].is_empty());
+    }
+
     #[tokio::test]
     async fn postgres_integration_since_bounds_the_patient_compartment_branch() {
         let _guard = BULK_EXPORT_TEST_LOCK.lock().await;

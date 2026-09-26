@@ -10900,7 +10900,7 @@ mod bulk_submit {
     static FAILPOINT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// A `failCommand` failpoint scoped to one client's `appName`.
-    struct FailPoint {
+    pub(super) struct FailPoint {
         admin: mongodb::Database,
         initial_count: i64,
         _lock: tokio::sync::MutexGuard<'static, ()>,
@@ -10911,7 +10911,11 @@ mod bulk_submit {
         /// Returns `None`, after printing why, when no Mongo is available or
         /// the server was not started with `enableTestCommands=1` (an
         /// external `HFS_TEST_MONGODB_URL`).
-        async fn enable(app_name: &str, mut data: Document, mode: Document) -> Option<FailPoint> {
+        pub(super) async fn enable(
+            app_name: &str,
+            mut data: Document,
+            mode: Document,
+        ) -> Option<FailPoint> {
             let lock = FAILPOINT_LOCK.lock().await;
             let Some(connection_string) = shared_mongo::connection_string().await else {
                 eprintln!("Skipping failpoint test (requires Docker or HFS_TEST_MONGODB_URL)");
@@ -10956,7 +10960,7 @@ mod bulk_submit {
         }
 
         /// Waits until this configuration has matched `additional` commands.
-        async fn wait_until_entered(&self, additional: i64) {
+        pub(super) async fn wait_until_entered(&self, additional: i64) {
             self.admin
                 .run_command(doc! {
                     "waitForFailPoint": "failCommand",
@@ -10970,7 +10974,7 @@ mod bulk_submit {
         /// Turns the failpoint off and releases the lock. Call at the end of
         /// every test; a `times`-bounded failpoint that is never turned off
         /// still only affects its own `appName`.
-        async fn off(self) {
+        pub(super) async fn off(self) {
             let _ = self
                 .admin
                 .run_command(doc! { "configureFailPoint": "failCommand", "mode": "off" })
@@ -17908,4 +17912,78 @@ async fn mongodb_sync_failure_ledger_contract() {
         &format!("ledger-1334-{}", uuid::Uuid::new_v4()),
     )
     .await;
+}
+
+/// `Patient/$export` decides membership with the compartment's own parameter
+/// set (#1122): a resource that joins through `recorder`, `performer` or
+/// `link` is exported, one that merely mentions the patient elsewhere is not.
+#[tokio::test]
+async fn mongodb_integration_export_compartment_membership_follows_the_compartment_definition() {
+    use helios_persistence::core::bulk_export::{ExportRequest, PatientExportProvider};
+
+    let Some(backend) = create_backend("export_compartment_params").await else {
+        eprintln!(
+            "Skipping mongodb_integration_export_compartment_membership_follows_the_compartment_definition (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("export-compartment-params");
+
+    for resource in [
+        serde_json::json!({"resourceType": "Patient", "id": "p1"}),
+        serde_json::json!({"resourceType": "Patient", "id": "other"}),
+        serde_json::json!({"resourceType": "Patient", "id": "linked",
+            "link": [{"other": {"reference": "Patient/p1"}, "type": "seealso"}]}),
+        serde_json::json!({"resourceType": "AllergyIntolerance", "id": "recorded",
+            "patient": {"reference": "Patient/other"},
+            "recorder": {"reference": "Patient/p1"}}),
+        serde_json::json!({"resourceType": "AllergyIntolerance", "id": "someone-elses",
+            "patient": {"reference": "Patient/other"}}),
+        serde_json::json!({"resourceType": "Observation", "id": "performed", "status": "final",
+            "code": {"text": "x"}, "subject": {"reference": "Patient/other"},
+            "performer": [{"reference": "Patient/p1/_history/2"}]}),
+        serde_json::json!({"resourceType": "Observation", "id": "about", "status": "final",
+            "code": {"text": "x"}, "subject": {"reference": "Patient/p1"}}),
+        serde_json::json!({"resourceType": "Observation", "id": "mentions-only", "status": "final",
+            "code": {"text": "x"}, "subject": {"reference": "Patient/other"},
+            "focus": [{"reference": "Patient/p1"}]}),
+    ] {
+        let resource_type = resource["resourceType"].as_str().unwrap().to_string();
+        backend
+            .create(&tenant, &resource_type, resource, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+
+    let request = ExportRequest::patient();
+    let ids = ["p1".to_string()];
+    let exported = |resource_type: &'static str| {
+        let backend = &backend;
+        let tenant = &tenant;
+        let request = &request;
+        let ids = &ids;
+        async move {
+            let batch = backend
+                .fetch_patient_compartment_batch(tenant, request, resource_type, ids, None, 100)
+                .await
+                .unwrap();
+            let mut out: Vec<String> = batch
+                .lines
+                .iter()
+                .map(|line| {
+                    serde_json::from_str::<serde_json::Value>(line).unwrap()["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect();
+            out.sort();
+            out
+        }
+    };
+
+    assert_eq!(exported("AllergyIntolerance").await, ["recorded"]);
+    assert_eq!(exported("Observation").await, ["about", "performed"]);
+    assert_eq!(exported("Patient").await, ["linked", "p1"]);
+    assert!(exported("Organization").await.is_empty());
 }

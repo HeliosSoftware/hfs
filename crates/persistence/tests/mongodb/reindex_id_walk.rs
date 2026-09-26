@@ -401,7 +401,7 @@ async fn snapshot(
 /// Routes `helios_persistence::backends::mongodb::storage` events at `debug`
 /// and above into `tracing-test`'s global buffer, once per test binary. Every
 /// walk test that asserts on log lines calls this before it starts its walk.
-fn capture_walk_logs() {
+pub(super) fn capture_walk_logs() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
         let writer = tracing_test::internal::MockWriter::new(tracing_test::internal::global_buf());
@@ -415,7 +415,7 @@ fn capture_walk_logs() {
 }
 
 /// Captured log lines containing every one of `needles`.
-fn walk_log_lines(needles: &[&str]) -> Vec<String> {
+pub(super) fn walk_log_lines(needles: &[&str]) -> Vec<String> {
     let buf = tracing_test::internal::global_buf().lock().unwrap();
     String::from_utf8_lossy(&buf)
         .lines()
@@ -683,7 +683,7 @@ async fn mongodb_reindex_id_walk_matches_the_legacy_walk_row_for_row() {
     assert_eq!(snapshot(&db, "walk-a", false).await, s_crud_a);
 }
 
-async fn wait_for_terminal(
+pub(super) async fn wait_for_terminal(
     op: &helios_persistence::search::ReindexOperation,
     job_id: &str,
 ) -> helios_persistence::search::ReindexProgress {

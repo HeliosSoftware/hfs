@@ -1,7 +1,6 @@
 //! ResourceStorage implementation for MongoDB.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
 
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -5248,6 +5247,64 @@ impl MongoBackend {
         })
     }
 
+    /// Runs only the id-phase continuation query, for both the serial walk
+    /// and the driver's ahead-of-time prefetch — so both paths build the same
+    /// page from the same query (#1403). `Ok(None)` means the id phase is
+    /// over; it logs nothing at all in that case (the empty check runs
+    /// before the capped-page debug line, so that line is never emitted for
+    /// an empty read, by either caller), per
+    /// [`ReindexSource::fetch_resources_page_ahead`]'s doc contract that a
+    /// source must not log or change state when it returns `Ok(None)`. The
+    /// phase transition itself is left to whichever caller runs the query
+    /// when it is *not* prefetched.
+    async fn reindex_id_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        floor: DateTime<Utc>,
+        after_id: Option<&str>,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<Option<ResourcePage>> {
+        let db = self.get_database().await?;
+        let resources = db.collection::<Document>(Self::RESOURCES_COLLECTION);
+        let tenant_id = tenant.tenant_id().as_str();
+        let found = self
+            .reindex_find_page(
+                &resources,
+                reindex_id_page_filter(tenant_id, resource_type, floor, after_id),
+                doc! { "id": 1 },
+                RESOURCES_IDENTITY_INDEX,
+                limit,
+                max_bytes,
+            )
+            .await?;
+        if found.docs.is_empty() {
+            return Ok(None);
+        }
+        if max_bytes > 0 {
+            log_capped_page_read(tenant_id, resource_type, &found);
+        }
+        let last_id = found
+            .docs
+            .last()
+            .and_then(|d| d.get_str("id").ok())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                internal_error("Missing id on the last row of an id-phase page".to_string())
+            })?;
+        reindex_page_from_docs(
+            &found.docs,
+            resource_type,
+            tenant,
+            ReindexWalkCursor::Id {
+                floor,
+                after_id: last_id,
+            },
+        )
+        .map(Some)
+    }
+
     /// Pages `resource_type` in id order with catch-up rounds (#1403), bounded
     /// by `max_bytes` as well as by `limit` (`max_bytes == 0` is the id-order
     /// walk's uncapped page, #1499). A page the byte cap stops before `limit` is still non-empty
@@ -5296,42 +5353,18 @@ impl MongoBackend {
                     }
                 }
                 WalkStep::IdPhase { floor, after_id } => {
-                    let filter = reindex_id_page_filter(
-                        tenant_id,
-                        resource_type,
-                        floor,
-                        after_id.as_deref(),
-                    );
-                    let found = self
-                        .reindex_find_page(
-                            &resources,
-                            filter,
-                            doc! { "id": 1 },
-                            RESOURCES_IDENTITY_INDEX,
+                    if let Some(page) = self
+                        .reindex_id_page(
+                            tenant,
+                            resource_type,
+                            floor,
+                            after_id.as_deref(),
                             limit,
                             max_bytes,
                         )
-                        .await?;
-                    if max_bytes > 0 {
-                        log_capped_page_read(tenant_id, resource_type, &found);
-                    }
-                    let docs = found.docs;
-                    if !docs.is_empty() {
-                        let last_id = docs
-                            .last()
-                            .expect("non-empty")
-                            .get_str("id")
-                            .map_err(|e| internal_error(format!("Missing id: {e}")))?
-                            .to_string();
-                        return reindex_page_from_docs(
-                            &docs,
-                            resource_type,
-                            tenant,
-                            ReindexWalkCursor::Id {
-                                floor,
-                                after_id: last_id,
-                            },
-                        );
+                        .await?
+                    {
+                        return Ok(page);
                     }
                     tracing::info!(
                         tenant = %tenant_id,
@@ -5617,6 +5650,51 @@ impl ReindexSource for MongoBackend {
         self.fetch_reindex_page(tenant, resource_type, cursor, limit, max_bytes)
             .await
     }
+
+    /// Only an id-phase continuation cursor may run ahead of the write in
+    /// flight (#1403): its query reads the `resources` collection, which the
+    /// page being written never touches (only `search_index` and
+    /// `search_index_contained` do), so prefetching it changes nothing the
+    /// write could observe. A catch-up round's query instead reads up to a
+    /// ceiling fixed when the round started, not "now" — but prefetching a
+    /// round page before the previous page's write has ended could still let
+    /// a write that lands between the two reads be missed by both the
+    /// current round and the next one, so rounds are excluded too. A cursor
+    /// that fails to parse is rejected the same way. `reindex_prefetch` and
+    /// search offload gate all of this off entirely.
+    fn may_prefetch_page(&self, cursor: &str) -> bool {
+        self.config().reindex_prefetch
+            && !self.is_search_offloaded()
+            && matches!(
+                ReindexWalkCursor::parse(cursor),
+                Ok(ReindexWalkCursor::Id { .. })
+            )
+    }
+
+    async fn fetch_resources_page_ahead(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: &str,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<Option<ResourcePage>> {
+        // Only an id continuation runs ahead. Everything else, including the
+        // end of the id phase, is fetched serially after the page in flight
+        // is written.
+        let Ok(ReindexWalkCursor::Id { floor, after_id }) = ReindexWalkCursor::parse(cursor) else {
+            return Ok(None);
+        };
+        self.reindex_id_page(
+            tenant,
+            resource_type,
+            floor,
+            Some(&after_id),
+            limit.max(1),
+            max_bytes,
+        )
+        .await
+    }
 }
 
 #[async_trait]
@@ -5744,13 +5822,35 @@ impl ReindexTarget for MongoBackend {
     ///
     /// A page-level failure — getting the database handle, the grouped
     /// delete, or an insert error the driver does not attribute to a specific
-    /// document — fans out to every resource as the same `Err`, because in
-    /// that case nothing was written for anybody (mirroring SQLite's
-    /// BEGIN/COMMIT fan-out and Elasticsearch's `ensure_index` fan-out for the
-    /// same reason). An unordered `insert_many` write error IS attributed to
-    /// just the document(s) it names, via the same per-op index mapping the
-    /// batched bulk-submit ingest uses (`bulk_ingest.rs`'s create-batch path)
-    /// and that Elasticsearch's `send_bulk_index` uses for the same purpose.
+    /// document — reports the same `Err` for every resource in the page,
+    /// because the failure cannot be attributed to individual documents
+    /// (mirroring SQLite's BEGIN/COMMIT fan-out and Elasticsearch's
+    /// `ensure_index` fan-out for the same reason). An unordered
+    /// `insert_many` write error IS attributed to just the document(s) it
+    /// names, via the same per-op index mapping the batched bulk-submit
+    /// ingest uses (`bulk_ingest.rs`'s create-batch path) and that
+    /// Elasticsearch's `send_bulk_index` uses for the same purpose.
+    ///
+    /// A page of `REINDEX_SUBBATCH_FIRST` resources or fewer, and every page
+    /// on a current-thread runtime, always runs through the serial writer:
+    /// one delete phase, then one insert phase (own rows, then contained
+    /// rows, each chunked into `SEARCH_INDEX_INSERT_CHUNK`-sized `insert_many`
+    /// commands). The delete completes fully before the insert phase starts,
+    /// but a chunked insert can still leave some rows behind even when it
+    /// goes on to fail: an earlier chunk that already committed keeps its
+    /// rows, and the chunk that actually errored may keep some, all, or none
+    /// of its own — an unordered `insert_many` failure (for example a
+    /// write-concern error reported after the documents were written, or a
+    /// transport error after partial application) does not guarantee the
+    /// failing chunk inserted nothing. A larger page on a multi-thread
+    /// runtime with the overlap
+    /// configuration on instead runs through the overlapped writer, which
+    /// splits the page into several sub-batches and inserts one while
+    /// extracting the next; there too, a sub-batch insert failure reports
+    /// `Err` for every resource in the page, but rows the earlier,
+    /// already-completed sub-batches — and any chunk of the failing
+    /// sub-batch that committed before the failure — inserted remain in the
+    /// database.
     async fn write_search_entries_page_timed(
         &self,
         tenant: &TenantContext,
@@ -5760,17 +5860,13 @@ impl ReindexTarget for MongoBackend {
         if resources.is_empty() {
             return Vec::new();
         }
-
         let _page_span = crate::perf::span(crate::perf::Phase::ReindexPage);
-
-        // Honors `is_search_offloaded()`, matching the guards in
-        // `delete_search_entries` and `write_search_entries`/`clear_search_index`
-        // above: a search-offloaded backend keeps no index of its own and must
-        // issue no commands here.
+        // Honors `is_search_offloaded()`: when Elasticsearch owns search,
+        // this backend keeps no index of its own, so there is nothing to
+        // delete or insert and every resource reports 0 entries written.
         if self.is_search_offloaded() {
             return resources.iter().map(|_| Ok(0)).collect();
         }
-
         let db = match self.get_database().await {
             Ok(db) => db,
             Err(e) => {
@@ -5781,178 +5877,21 @@ impl ReindexTarget for MongoBackend {
                     .collect();
             }
         };
-
         let tenant_id = tenant.tenant_id().as_str();
-
-        struct Prepared {
-            docs: SearchIndexDocuments,
-            failure: Option<String>,
+        let multi_thread = super::reindex_pipeline::tokio_multi_thread_runtime();
+        let overlapped = self.config().reindex_overlap
+            && multi_thread
+            && resources.len() > super::reindex_pipeline::REINDEX_SUBBATCH_FIRST;
+        if resources.len() > super::reindex_pipeline::REINDEX_SUBBATCH_FIRST {
+            self.log_reindex_mode_once(multi_thread, overlapped);
         }
-        let extract_started = Instant::now();
-        let prepared: Vec<Prepared> = resources
-            .iter()
-            .map(|resource| {
-                let (docs, failure) = self.search_index_documents_checked(
-                    tenant_id,
-                    resource.resource_type(),
-                    resource.id(),
-                    resource.content(),
-                );
-                Prepared { docs, failure }
-            })
-            .collect();
-        let extract_time = extract_started.elapsed();
-        stats.extract += extract_time;
-        crate::perf::record_duration(crate::perf::Phase::ReindexExtract, extract_time);
-
-        let collection = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
-        let contained_collection =
-            db.collection::<Document>(MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION);
-
-        // ONE delete per distinct resource_type in the page (a production
-        // page is single-type — `fetch_resources_page` filters on one type —
-        // so this is one command; grouping keeps a hypothetical
-        // heterogeneous slice correct too), run against both collections so
-        // stale contained rows don't outlive the page they belonged to
-        // (#1160 Task 4). A failure on either delete means stale rows may
-        // remain for the whole page, so it fans out to every resource.
-        let mut ids_by_type: HashMap<&str, Vec<Bson>> = HashMap::new();
-        for resource in resources {
-            ids_by_type
-                .entry(resource.resource_type())
-                .or_default()
-                .push(Bson::from(resource.id()));
+        if overlapped {
+            self.write_page_overlapped(&db, tenant_id, resources, stats)
+                .await
+        } else {
+            self.write_page_serial(&db, tenant_id, resources, stats, multi_thread)
+                .await
         }
-        let delete_started = Instant::now();
-        for (resource_type, ids) in ids_by_type {
-            let filter = doc! {
-                "tenant_id": tenant_id,
-                "resource_type": resource_type,
-                "resource_id": { "$in": ids },
-            };
-            match collection.delete_many(filter.clone()).await {
-                Ok(result) => stats.deleted_entries += result.deleted_count,
-                Err(e) => {
-                    stats.delete += delete_started.elapsed();
-                    let msg = format!("Failed to delete search entries: {e}");
-                    return resources
-                        .iter()
-                        .map(|_| Err(internal_error(msg.clone())))
-                        .collect();
-                }
-            }
-            match contained_collection.delete_many(filter).await {
-                Ok(result) => stats.deleted_entries += result.deleted_count,
-                Err(e) => {
-                    stats.delete += delete_started.elapsed();
-                    let msg = format!("Failed to delete search_index_contained entries: {e}");
-                    return resources
-                        .iter()
-                        .map(|_| Err(internal_error(msg.clone())))
-                        .collect();
-                }
-            }
-        }
-        let delete_time = delete_started.elapsed();
-        stats.delete += delete_time;
-        crate::perf::record_duration(crate::perf::Phase::ReindexSearchDelete, delete_time);
-
-        // Flatten every resource's own documents into one insert, chunked at
-        // SEARCH_INDEX_INSERT_CHUNK, tracking which resource each document
-        // belongs to so an unordered write error attributes back to just
-        // that resource instead of failing the whole page.
-        let mut own_owners: Vec<usize> =
-            Vec::with_capacity(prepared.iter().map(|p| p.docs.own.len()).sum());
-        let mut own_docs: Vec<Document> = Vec::with_capacity(own_owners.capacity());
-        for (i, p) in prepared.iter().enumerate() {
-            for d in &p.docs.own {
-                own_owners.push(i);
-                own_docs.push(d.clone());
-            }
-        }
-
-        let insert_started = Instant::now();
-        let own_result = insert_search_entries_chunk(
-            &collection,
-            &own_owners,
-            &own_docs,
-            "Failed to insert search index entries",
-            stats,
-        )
-        .await;
-        let mut insert_time = insert_started.elapsed();
-        stats.insert += insert_time;
-        let mut insert_failures = match own_result {
-            Ok(failures) => failures,
-            Err(msg) => {
-                return resources
-                    .iter()
-                    .map(|_| Err(internal_error(msg.clone())))
-                    .collect();
-            }
-        };
-
-        // Same flatten-and-chunked-insert for contained rows, into their own
-        // collection. A failed contained insert attributes back to its
-        // resource exactly like a failed own insert; if a resource already
-        // has an own-row failure recorded, that one wins (matching the
-        // "first write error found" semantics `insert_search_entries_chunk`
-        // already uses within one collection).
-        let mut contained_owners: Vec<usize> =
-            Vec::with_capacity(prepared.iter().map(|p| p.docs.contained.len()).sum());
-        let mut contained_docs: Vec<Document> = Vec::with_capacity(contained_owners.capacity());
-        for (i, p) in prepared.iter().enumerate() {
-            for d in &p.docs.contained {
-                contained_owners.push(i);
-                contained_docs.push(d.clone());
-            }
-        }
-
-        if !contained_docs.is_empty() {
-            let contained_started = Instant::now();
-            let contained_result = insert_search_entries_chunk(
-                &contained_collection,
-                &contained_owners,
-                &contained_docs,
-                "Failed to insert search_index_contained entries",
-                stats,
-            )
-            .await;
-            let contained_time = contained_started.elapsed();
-            stats.insert += contained_time;
-            insert_time += contained_time;
-            match contained_result {
-                Ok(failures) => {
-                    for (owner, msg) in failures {
-                        insert_failures.entry(owner).or_insert(msg);
-                    }
-                }
-                Err(msg) => {
-                    return resources
-                        .iter()
-                        .map(|_| Err(internal_error(msg.clone())))
-                        .collect();
-                }
-            }
-        }
-
-        crate::perf::record_duration(crate::perf::Phase::ReindexSearchInsert, insert_time);
-        crate::perf::add_rows(
-            crate::perf::Phase::ReindexSearchInsert,
-            (own_docs.len() + contained_docs.len()) as u64,
-        );
-
-        prepared
-            .into_iter()
-            .enumerate()
-            .map(|(i, p)| match p.failure {
-                Some(msg) => Err(internal_error(msg)),
-                None => match insert_failures.remove(&i) {
-                    Some(msg) => Err(internal_error(msg)),
-                    None => Ok(p.docs.own.len() + p.docs.contained.len()),
-                },
-            })
-            .collect()
     }
 
     /// Delegates to [`Self::write_search_entries_page_timed`] with a
@@ -5968,21 +5907,21 @@ impl ReindexTarget for MongoBackend {
     }
 }
 
-/// Documents per `insert_many` when [`MongoBackend`]'s
-/// [`ReindexTarget::write_search_entries_page`] flattens a page's index
-/// documents into one insert. Mirrors `bulk_ingest.rs`'s
-/// `INSERT_DOCS_PER_COMMAND` (same value, same rationale: bound how much the
-/// driver serializes per command) without depending on that module, since a
-/// page's `search_index` documents are built the same way a batch's are.
-const SEARCH_INDEX_INSERT_CHUNK: usize = 5_000;
+/// Documents per `insert_many` when the serial or overlapped writer's
+/// `insert_sub_batch` flattens a sub-batch's index documents into one
+/// insert. Mirrors `bulk_ingest.rs`'s `INSERT_DOCS_PER_COMMAND` (same value,
+/// same rationale: bound how much the driver serializes per command) without
+/// depending on that module, since a sub-batch's `search_index` documents
+/// are built the same way a batch's are.
+pub(super) const SEARCH_INDEX_INSERT_CHUNK: usize = 5_000;
 
 /// Chunked, unordered `insert_many` of `docs` into `collection`, attributing
 /// each document to the resource index at the same position in `owners`.
 ///
-/// Used by [`MongoBackend::write_search_entries_page`] once per destination
-/// collection (`search_index` for a page's own rows, `search_index_contained`
-/// for its contained rows) so a failed contained insert attributes back to
-/// its resource exactly like a failed own insert.
+/// Called by `insert_sub_batch` once per destination collection
+/// (`search_index` for a sub-batch's own rows, `search_index_contained` for
+/// its contained rows, if any) so a failed contained insert attributes back
+/// to its resource exactly like a failed own insert.
 ///
 /// Returns the per-resource write failures found, each message already
 /// carrying `error_context` (so a `search_index_contained` failure reads as
@@ -5991,7 +5930,7 @@ const SEARCH_INDEX_INSERT_CHUNK: usize = 5_000;
 /// attribute to specific documents — is returned as `Err`, for the caller to
 /// fan out to every resource in the page. Also counts each command it issues,
 /// and the documents in it, into `stats` (#1403).
-async fn insert_search_entries_chunk(
+pub(super) async fn insert_search_entries_chunk(
     collection: &mongodb::Collection<Document>,
     owners: &[usize],
     docs: &[Document],
@@ -7147,5 +7086,110 @@ mod reindex_page_cap_tests {
     #[test]
     fn saturating_sum_does_not_overflow() {
         assert!(reindex_page_admits(1, u64::MAX - 1, 10, u64::MAX));
+    }
+}
+
+#[cfg(test)]
+mod reindex_prefetch_tests {
+    use super::*;
+    use crate::backends::mongodb::MongoBackendConfig;
+    use crate::search::reindex::ReindexSource;
+    use crate::tenant::{TenantId, TenantPermissions};
+
+    /// A config that can never reach a real server. `MongoBackendConfig::default()`'s
+    /// connection string is `mongodb://localhost:27017`, which is a long-lived
+    /// corpus container that must never be touched by a unit test — so every
+    /// backend built in this module uses this instead, even where the code
+    /// path never actually calls the database today, in case a future change
+    /// moves a database call earlier (#1403).
+    fn unreachable_config() -> MongoBackendConfig {
+        MongoBackendConfig {
+            connection_string: "mongodb://127.0.0.1:1".to_string(),
+            server_selection_timeout_ms: 500,
+            ..Default::default()
+        }
+    }
+
+    fn id_cursor() -> String {
+        ReindexWalkCursor::Id {
+            floor: chrono::Utc::now(),
+            after_id: "p1".to_string(),
+        }
+        .encode()
+    }
+
+    fn round_cursor() -> String {
+        let t = chrono::Utc::now();
+        ReindexWalkCursor::Round {
+            round: 1,
+            floor: t,
+            ceiling: t + chrono::Duration::seconds(1),
+            walked: 0,
+            after_last_updated: t,
+            after_id: "p1".to_string(),
+        }
+        .encode()
+    }
+
+    #[test]
+    fn may_prefetch_page_accepts_only_id_cursors() {
+        assert!(matches!(
+            ReindexWalkCursor::parse(&round_cursor()),
+            Ok(ReindexWalkCursor::Round { .. })
+        ));
+        let backend = MongoBackend::new(unreachable_config()).expect("lazy client");
+        assert!(backend.may_prefetch_page(&id_cursor()));
+        assert!(!backend.may_prefetch_page(&round_cursor()));
+        assert!(!backend.may_prefetch_page("garbage"));
+
+        let no_prefetch = MongoBackend::new(MongoBackendConfig {
+            reindex_prefetch: false,
+            ..unreachable_config()
+        })
+        .expect("lazy client");
+        assert!(!no_prefetch.may_prefetch_page(&id_cursor()));
+
+        let offloaded = MongoBackend::new(MongoBackendConfig {
+            search_offloaded: true,
+            ..unreachable_config()
+        })
+        .expect("lazy client");
+        assert!(!offloaded.may_prefetch_page(&id_cursor()));
+    }
+
+    #[tokio::test]
+    async fn fetch_ahead_declines_round_and_malformed_cursors() {
+        // Both cases return before any database call: the Round cursor parses
+        // but does not match `Id`, and the malformed cursor fails to parse,
+        // before `get_database` is ever reached, so `unreachable_config`'s
+        // bogus connection string is exercised only as a defensive
+        // belt-and-suspenders, not because either case connects.
+        assert!(matches!(
+            ReindexWalkCursor::parse(&round_cursor()),
+            Ok(ReindexWalkCursor::Round { .. })
+        ));
+        let backend = MongoBackend::new(unreachable_config()).expect("lazy client");
+        let tenant = TenantContext::new(
+            TenantId::new("prefetch-test-tenant"),
+            TenantPermissions::full_access(),
+        );
+
+        let result = backend
+            .fetch_resources_page_ahead(&tenant, "Patient", &round_cursor(), 10, 0)
+            .await
+            .expect("no database error");
+        assert!(
+            result.is_none(),
+            "a Round cursor must never be fetched ahead"
+        );
+
+        let result = backend
+            .fetch_resources_page_ahead(&tenant, "Patient", "garbage", 10, 0)
+            .await
+            .expect("no database error");
+        assert!(
+            result.is_none(),
+            "a cursor that fails to parse must never be fetched ahead"
+        );
     }
 }
