@@ -7,6 +7,8 @@ import {
 } from "../pages/api";
 import type { ResourcesPage } from "../pages/resources";
 
+const noChartData = process.env.HFS_E2E_NO_CHART_DATA === "1";
+
 // The Resources workspace beyond the edit flows: the type rail (filter + live
 // counts), the modal's open/close/tab surface, the delete flow, and the promise
 // that every FHIR resource type is reachable — "test all the resources".
@@ -522,6 +524,7 @@ test("counts render next to each type from the dashboard snapshot", async ({
   resources,
   request,
 }) => {
+  test.skip(noChartData, "no count read path on this backend");
   // Seed one so the count is unambiguous and non-empty. The dashboard
   // snapshot is cached briefly (#541), so poll a fresh page load rather than
   // waiting on a client-side hydration fetch.
@@ -601,6 +604,7 @@ test("picking rail types repaints the recently-used group in MRU order, capped a
   resources,
   page,
 }) => {
+  test.skip(noChartData, "no count read path on this backend");
   await resources.goto("Patient");
   await resources.pickType("Account");
   await resources.pickType("ActivityDefinition");
