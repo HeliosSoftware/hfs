@@ -1149,6 +1149,10 @@ mod versioned_write_race_suite;
 #[path = "mongodb/reindex_id_walk.rs"]
 mod reindex_id_walk;
 
+/// #1499: MongoDB honours `HFS_REINDEX_BATCH_BYTES` (PR2a).
+#[path = "mongodb/reindex_pipeline.rs"]
+mod reindex_pipeline;
+
 /// #1405: of several writers holding the same version, one `update` writes and
 /// every loser is a `ConcurrencyError` — the server's `WriteConflict` used to
 /// reach them as `BackendError::Internal`.
