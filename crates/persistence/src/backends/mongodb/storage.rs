@@ -3432,6 +3432,14 @@ impl BundleProvider for MongoBackend {
         true
     }
 
+    /// The in-transaction matcher is the session-scoped one `ifNoneExist`
+    /// already uses: index-backed when search is local, and the
+    /// `_id`/`identifier` collection scan when it is offloaded, which refuses
+    /// the criteria shapes it cannot evaluate itself.
+    fn supports_conditional_in_transaction(&self) -> bool {
+        true
+    }
+
     async fn process_transaction_with_patch_validator(
         &self,
         tenant: &TenantContext,
@@ -3448,10 +3456,35 @@ impl BundleProvider for MongoBackend {
 
         let mut session = begin_required_bundle_transaction_session(&db).await?;
 
+        // URL-borne conditional entries (`PUT/DELETE [type]?[criteria]`)
+        // resolve against the transaction's starting view before any entry is
+        // written, and an overlap between resolved identities and the other
+        // entries fails the bundle (R4 §3.1.0.11.2; #859).
+        let targets = match self
+            .resolve_conditional_targets_in_bundle_transaction(&db, &mut session, tenant, &entries)
+            .await
+        {
+            Ok(targets) => targets,
+            Err(e) => {
+                let _ = session.abort_transaction().await;
+                return Err(e);
+            }
+        };
+
         let mut results = Vec::with_capacity(entries.len());
         let mut error_info: Option<(usize, String)> = None;
         let mut patch_error: Option<TransactionError> = None;
+        // A conditional entry that matched is known now, so `urn:uuid`
+        // references to it resolve regardless of entry order.
         let mut reference_map: HashMap<String, String> = HashMap::new();
+        for target in targets.values() {
+            if let (Some(full_url), Some(identity)) = (
+                entries[target.entry_index].full_url.as_ref(),
+                target.identity(),
+            ) {
+                reference_map.insert(full_url.clone(), identity);
+            }
+        }
         let mut pending_search_parameter_changes: Vec<PendingSearchParameterChange> = Vec::new();
         let mut entries = entries;
 
@@ -3471,6 +3504,7 @@ impl BundleProvider for MongoBackend {
                     },
                     entry,
                     &mut pending_search_parameter_changes,
+                    targets.get(&idx),
                 )
                 .await;
 
@@ -3491,7 +3525,9 @@ impl BundleProvider for MongoBackend {
                         break;
                     }
 
-                    if entry.method == BundleMethod::Post {
+                    // A create (POST, or a conditional PUT that created) with a
+                    // fullUrl records the assigned identity for later references.
+                    if matches!(entry.method, BundleMethod::Post | BundleMethod::Put) {
                         if let Some(full_url) = entry.full_url.as_ref() {
                             if let Some(location) = entry_result.location.as_ref() {
                                 let reference = location
@@ -3542,6 +3578,66 @@ impl BundleProvider for MongoBackend {
 }
 
 impl MongoBackend {
+    /// Resolves every URL-borne conditional entry inside the session, before
+    /// any write, and enforces the R4 §3.1.0.11.2 overlap rule (#859).
+    ///
+    /// The session-scoped matcher evaluates criteria in application memory
+    /// and understands plain `name=value` only, so a criterion with a
+    /// modifier, chain, prefix or OR-list refuses the entry with the `501`
+    /// the offloaded-search case answers on the other backends; #709 owns
+    /// an index-backed matcher.
+    async fn resolve_conditional_targets_in_bundle_transaction(
+        &self,
+        db: &mongodb::Database,
+        session: &mut ClientSession,
+        tenant: &TenantContext,
+        entries: &[BundleEntry],
+    ) -> Result<HashMap<usize, crate::core::ConditionalTarget>, TransactionError> {
+        let mut targets = Vec::new();
+        for (index, entry) in entries.iter().enumerate() {
+            let Some(criteria) = entry.criteria.as_deref() else {
+                continue;
+            };
+            let resource_type = crate::core::conditional_resource_type(entry)
+                .filter(|t| !t.is_empty())
+                .ok_or_else(|| TransactionError::BundleError {
+                    index,
+                    message: format!("Entry request.url '{}' names no resource type", entry.url),
+                })?
+                .to_string();
+            let matches = self
+                .find_matching_typed_in_bundle_transaction(
+                    db,
+                    session,
+                    tenant,
+                    &resource_type,
+                    criteria.to_vec(),
+                )
+                .await
+                .map_err(|e| TransactionError::BundleError {
+                    index,
+                    message: format!("Entry processing failed: {e}"),
+                })?;
+            targets.push(crate::core::conditional_target(
+                index,
+                entry,
+                &resource_type,
+                matches,
+            )?);
+        }
+        crate::core::check_identity_overlap(entries, &targets)?;
+        Ok(targets
+            .into_iter()
+            .map(|target| (target.entry_index, target))
+            .collect())
+    }
+
+    /// Process a single bundle entry within the session's transaction.
+    ///
+    /// `target` is the pre-pass resolution of a URL-borne conditional entry
+    /// (#859): its `PUT` updates the match or creates, its `DELETE` deletes
+    /// the match or is a no-op `204`, without re-resolving the criteria.
+    #[allow(clippy::too_many_arguments)]
     async fn process_bundle_entry_transaction(
         &self,
         db: &mongodb::Database,
@@ -3549,6 +3645,7 @@ impl MongoBackend {
         context: BundleEntryContext<'_>,
         entry: &BundleEntry,
         pending_search_parameter_changes: &mut Vec<PendingSearchParameterChange>,
+        target: Option<&crate::core::ConditionalTarget>,
     ) -> StorageResult<BundleEntryResult> {
         let BundleEntryContext {
             tenant,
@@ -3630,6 +3727,34 @@ impl MongoBackend {
                     })
                 })?;
 
+                if let Some(target) = target {
+                    return Ok(match &target.resolved {
+                        Some(existing) => crate::core::conditional_update_entry(
+                            self.update_resource_in_bundle_transaction(
+                                db,
+                                session,
+                                tenant,
+                                existing,
+                                resource,
+                                pending_search_parameter_changes,
+                            )
+                            .await?,
+                        ),
+                        None => BundleEntryResult::created(
+                            self.create_resource_in_bundle_transaction(
+                                db,
+                                session,
+                                tenant,
+                                &target.resource_type,
+                                resource,
+                                fhir_version,
+                                pending_search_parameter_changes,
+                            )
+                            .await?,
+                        ),
+                    });
+                }
+
                 let (resource_type, id) = self.parse_url(&entry.url)?;
 
                 match self
@@ -3688,6 +3813,24 @@ impl MongoBackend {
                 }
             }
             BundleMethod::Delete => {
+                if let Some(target) = target {
+                    return Ok(match &target.resolved {
+                        Some(existing) => {
+                            self.delete_resource_in_bundle_transaction(
+                                db,
+                                session,
+                                tenant,
+                                &target.resource_type,
+                                existing.id(),
+                                pending_search_parameter_changes,
+                            )
+                            .await?;
+                            crate::core::conditional_delete_entry(existing)
+                        }
+                        None => BundleEntryResult::deleted(),
+                    });
+                }
+
                 let (resource_type, id) = self.parse_url(&entry.url)?;
 
                 if let Some(if_match) = entry.if_match.as_ref() {
@@ -4282,30 +4425,44 @@ impl MongoBackend {
         if parsed_params.is_empty() {
             return Ok(Vec::new());
         }
-
-        if self.is_search_offloaded() {
-            // Typed first: the shared builder applies registry validation,
-            // type-aware parsing, OR splitting and modifier rules (#1312,
-            // #1321, #1323, #1360, #1366), so this path accepts and rejects
-            // the same criteria as `If-None-Exist` on the resource endpoint.
-            let typed_params =
-                self.build_search_parameters(tenant, resource_type, &parsed_params)?;
-            // Result-shaping names (`_format`, …) are not criteria; with
-            // nothing left, an empty filter would match the whole type.
-            if typed_params.is_empty() {
-                return Ok(Vec::new());
-            }
-            return self
-                .if_none_exist_offloaded_scan(db, session, tenant, resource_type, &typed_params)
-                .await;
-        }
-
+        // Typed through the shared builder, which applies registry validation,
+        // type-aware parsing, OR splitting and modifier rules (#1312, #1321,
+        // #1323, #1360, #1366), so this path accepts and rejects the same
+        // criteria as `If-None-Exist` on the resource endpoint.
         let typed_params = self.build_search_parameters(tenant, resource_type, &parsed_params)?;
+        self.find_matching_typed_in_bundle_transaction(
+            db,
+            session,
+            tenant,
+            resource_type,
+            typed_params,
+        )
+        .await
+    }
+
+    /// The session-scoped matcher both criteria forms end in: `ifNoneExist`'s
+    /// string, typed above, and a URL-borne conditional entry's criteria,
+    /// which the REST layer already typed (#859).
+    async fn find_matching_typed_in_bundle_transaction(
+        &self,
+        db: &mongodb::Database,
+        session: &mut ClientSession,
+        tenant: &TenantContext,
+        resource_type: &str,
+        typed_params: Vec<SearchParameter>,
+    ) -> StorageResult<Vec<StoredResource>> {
         // Result-shaping names (`_format`, …) are not criteria; with nothing
         // left, an empty filter would match the whole type.
         if typed_params.is_empty() {
             return Ok(Vec::new());
         }
+
+        if self.is_search_offloaded() {
+            return self
+                .if_none_exist_offloaded_scan(db, session, tenant, resource_type, &typed_params)
+                .await;
+        }
+
         self.preflight_legacy_composites(
             db,
             tenant.tenant_id().as_str(),

@@ -10,3 +10,7 @@ pub mod rollback_tests;
 /// Backend-agnostic `ifMatch` scenarios shared with the PostgreSQL suite, which
 /// `#[path]`-includes this same file (see the module docs).
 pub mod if_match_suite;
+
+/// Backend-agnostic `PUT/DELETE [type]?[criteria]` scenarios (#859), shared
+/// with the PostgreSQL and MongoDB suites the same way.
+pub mod conditional_url_suite;
