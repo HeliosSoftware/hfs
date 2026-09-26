@@ -91,6 +91,7 @@ impl S3Backend {
             BackendCapability::CursorPagination,
             BackendCapability::BulkExport,
             BackendCapability::BulkSubmitIngest,
+            BackendCapability::ConditionalCreate,
         ]
     }
 

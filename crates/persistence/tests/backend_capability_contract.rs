@@ -664,6 +664,7 @@ mod s3 {
                 BackendCapability::CursorPagination,
                 BackendCapability::BulkExport,
                 BackendCapability::BulkSubmitIngest,
+                BackendCapability::ConditionalCreate,
                 BackendCapability::BulkSubmitRestWorker,
                 BackendCapability::SharedSchema,
             ],
@@ -692,6 +693,7 @@ mod s3 {
                 BackendCapability::CursorPagination,
                 BackendCapability::BulkExport,
                 BackendCapability::BulkSubmitIngest,
+                BackendCapability::ConditionalCreate,
                 BackendCapability::DatabasePerTenant,
             ];
             if default_system_bucket.is_some() {
@@ -705,11 +707,12 @@ mod s3 {
         }
     }
 
-    /// None, in either tenancy mode: S3 has no search to resolve criteria with,
-    /// and every `ConditionalStorage` method answers `UnsupportedCapability`.
-    /// The CapabilityStatement advertised all of them anyway (#1384).
+    /// Conditional create is served identifier-scoped, by scan (#1435), in
+    /// every tenancy mode; update, delete and patch are not, since S3 has no
+    /// search to resolve their criteria with, and every one of those methods
+    /// answers `UnsupportedCapability` (#1384).
     #[test]
-    fn s3_declares_no_conditional_interaction() {
+    fn s3_declares_only_conditional_create() {
         for mode in [
             prefix_mode(),
             bucket_mode(None),
@@ -718,7 +721,7 @@ mod s3 {
             assert_declares_exactly_these_conditionals(
                 "s3",
                 &S3Backend::declared_capabilities_for(&mode),
-                &[],
+                &[BackendCapability::ConditionalCreate],
             );
         }
     }

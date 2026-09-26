@@ -4155,11 +4155,11 @@ fn tenant_location_matches_the_declared_tenancy_topology() {
     );
 }
 
-/// S3 has no search to resolve conditional criteria with. What it declares —
-/// the source of `rest.resource.conditional*` and of the REST layer's `501` —
-/// must be what its methods do: refuse, all four (#1384).
+/// Conditional create is the one conditional interaction S3 serves —
+/// identifier-scoped, by scan (#1435). Update, delete and patch still refuse,
+/// and what the declaration says is what the methods do (#1384).
 #[tokio::test]
-async fn no_conditional_interaction_is_declared_or_served() {
+async fn only_conditional_create_is_declared_and_served() {
     use crate::core::{ConditionalInteraction, ConditionalStorage, PatchFormat};
 
     let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
@@ -4167,7 +4167,12 @@ async fn no_conditional_interaction_is_declared_or_served() {
     let tenant = tenant("tenant-a");
     let patient = json!({"resourceType": "Patient", "active": true});
 
-    for interaction in ConditionalInteraction::ALL {
+    assert!(backend.supports_conditional(ConditionalInteraction::Create));
+    for interaction in [
+        ConditionalInteraction::Update,
+        ConditionalInteraction::Delete,
+        ConditionalInteraction::Patch,
+    ] {
         assert!(!backend.supports_conditional(interaction), "{interaction}");
     }
 
@@ -4177,19 +4182,6 @@ async fn no_conditional_interaction_is_declared_or_served() {
         ) => assert_eq!(c, capability),
         other => panic!("{capability}: expected UnsupportedCapability, got {other:?}"),
     };
-    refused(
-        "conditional_create",
-        backend
-            .conditional_create(
-                &tenant,
-                "Patient",
-                patient.clone(),
-                "active=true",
-                FhirVersion::R4,
-            )
-            .await
-            .unwrap_err(),
-    );
     refused(
         "conditional_update",
         backend
@@ -4230,6 +4222,260 @@ async fn no_conditional_interaction_is_declared_or_served() {
             .await
             .unwrap_err(),
     );
+}
+
+fn mrn_patient(value: &str) -> Value {
+    json!({
+        "resourceType": "Patient",
+        "identifier": [{"system": "http://example.org/mrn", "value": value}],
+        "active": true
+    })
+}
+
+/// The bulk-load idempotency case: the first `If-None-Exist` on an identifier
+/// creates, every later one answers the resource it created, and the
+/// criteria are read as token search reads them.
+#[tokio::test]
+async fn conditional_create_by_identifier_creates_once_and_then_matches() {
+    use crate::core::{ConditionalCreateResult, ConditionalStorage};
+
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+    let criteria = "identifier=http%3A%2F%2Fexample.org%2Fmrn%7C123";
+
+    let created = match backend
+        .conditional_create(
+            &tenant,
+            "Patient",
+            mrn_patient("123"),
+            criteria,
+            FhirVersion::R4,
+        )
+        .await
+        .unwrap()
+    {
+        ConditionalCreateResult::Created(stored) => stored,
+        other => panic!("expected Created, got {other:?}"),
+    };
+
+    for again in [criteria, "identifier=123", "identifier=999,123"] {
+        match backend
+            .conditional_create(
+                &tenant,
+                "Patient",
+                mrn_patient("123"),
+                again,
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap()
+        {
+            ConditionalCreateResult::Exists(stored) => {
+                assert_eq!(stored.id(), created.id(), "{again}")
+            }
+            other => panic!("{again}: expected Exists, got {other:?}"),
+        }
+    }
+
+    // A different system, or "no system", is a different identifier.
+    for elsewhere in ["identifier=http://other|123", "identifier=|123"] {
+        assert!(
+            matches!(
+                backend
+                    .conditional_create(
+                        &tenant,
+                        "Patient",
+                        mrn_patient("123"),
+                        elsewhere,
+                        FhirVersion::R4,
+                    )
+                    .await
+                    .unwrap(),
+                ConditionalCreateResult::Created(_)
+            ),
+            "{elsewhere}"
+        );
+    }
+}
+
+/// Two live resources under one identifier are the 412 the client gets; a
+/// deleted one no longer counts.
+#[tokio::test]
+async fn conditional_create_reports_multiple_matches_and_ignores_deleted_ones() {
+    use crate::core::{ConditionalCreateResult, ConditionalStorage};
+
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+    let first = backend
+        .create(&tenant, "Patient", mrn_patient("dup"), FhirVersion::R4)
+        .await
+        .unwrap();
+    let second = backend
+        .create(&tenant, "Patient", mrn_patient("dup"), FhirVersion::R4)
+        .await
+        .unwrap();
+    let criteria = "identifier=dup";
+
+    assert!(matches!(
+        backend
+            .conditional_create(
+                &tenant,
+                "Patient",
+                mrn_patient("dup"),
+                criteria,
+                FhirVersion::R4
+            )
+            .await
+            .unwrap(),
+        ConditionalCreateResult::MultipleMatches(2)
+    ));
+
+    backend
+        .delete(&tenant, "Patient", first.id())
+        .await
+        .unwrap();
+    match backend
+        .conditional_create(
+            &tenant,
+            "Patient",
+            mrn_patient("dup"),
+            criteria,
+            FhirVersion::R4,
+        )
+        .await
+        .unwrap()
+    {
+        ConditionalCreateResult::Exists(stored) => assert_eq!(stored.id(), second.id()),
+        other => panic!("expected Exists, got {other:?}"),
+    }
+
+    backend
+        .delete(&tenant, "Patient", second.id())
+        .await
+        .unwrap();
+    assert!(matches!(
+        backend
+            .conditional_create(
+                &tenant,
+                "Patient",
+                mrn_patient("dup"),
+                criteria,
+                FhirVersion::R4
+            )
+            .await
+            .unwrap(),
+        ConditionalCreateResult::Created(_)
+    ));
+}
+
+/// `_id` criteria read the objects they name, and an `identifier` beside
+/// them still has to hold.
+#[tokio::test]
+async fn conditional_create_by_id_reads_the_named_objects() {
+    use crate::core::{ConditionalCreateResult, ConditionalStorage};
+
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+    let existing = backend
+        .create(&tenant, "Patient", mrn_patient("1"), FhirVersion::R4)
+        .await
+        .unwrap();
+
+    let by_id = format!("_id={}", existing.id());
+    match backend
+        .conditional_create(
+            &tenant,
+            "Patient",
+            mrn_patient("1"),
+            &by_id,
+            FhirVersion::R4,
+        )
+        .await
+        .unwrap()
+    {
+        ConditionalCreateResult::Exists(stored) => assert_eq!(stored.id(), existing.id()),
+        other => panic!("expected Exists, got {other:?}"),
+    }
+
+    assert!(matches!(
+        backend
+            .conditional_create(
+                &tenant,
+                "Patient",
+                mrn_patient("1"),
+                "_id=absent",
+                FhirVersion::R4
+            )
+            .await
+            .unwrap(),
+        ConditionalCreateResult::Created(_)
+    ));
+    let with_other_identifier = format!("_id={}&identifier=other", existing.id());
+    assert!(matches!(
+        backend
+            .conditional_create(
+                &tenant,
+                "Patient",
+                mrn_patient("1"),
+                &with_other_identifier,
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap(),
+        ConditionalCreateResult::Created(_)
+    ));
+}
+
+/// A criterion the scan cannot evaluate is refused before anything is read or
+/// written; criteria that only shape a response leave nothing to match, so the
+/// create goes ahead.
+#[tokio::test]
+async fn conditional_create_refuses_criteria_a_scan_cannot_evaluate() {
+    use crate::core::{ConditionalCreateResult, ConditionalStorage};
+
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(Arc::clone(&mock));
+    let tenant = tenant("tenant-a");
+    let puts_before = mock.put_count();
+
+    for criteria in ["active=true", "identifier:exact=1", "identifier="] {
+        let err = backend
+            .conditional_create(
+                &tenant,
+                "Patient",
+                mrn_patient("1"),
+                criteria,
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::error::StorageError::Search(_)),
+            "{criteria}: {err:?}"
+        );
+    }
+    assert_eq!(
+        mock.put_count(),
+        puts_before,
+        "a refused create writes nothing"
+    );
+
+    assert!(matches!(
+        backend
+            .conditional_create(
+                &tenant,
+                "Patient",
+                mrn_patient("1"),
+                "_format=json",
+                FhirVersion::R4
+            )
+            .await
+            .unwrap(),
+        ConditionalCreateResult::Created(_)
+    ));
 }
 
 /// A transaction bundle must be refused outright, and refused *before* any
