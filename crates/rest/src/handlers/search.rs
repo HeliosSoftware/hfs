@@ -664,6 +664,9 @@ where
     // into its entry; `to_bundle` would deep-clone every one of them and then
     // drop the originals.
     let mut bundle = result.into_bundle(&public_base, &self_link);
+    if query.total == Some(TotalMode::None) {
+        bundle.total = None;
+    }
     crate::public_url::rewrite_bundle_full_urls(&mut bundle, |resource_type, id| {
         state.public_url_for_request(tenant, [resource_type, id])
     });
@@ -906,6 +909,9 @@ where
 
     // Convert result to FHIR Bundle (moving, not cloning, each resource).
     let mut bundle = result.into_bundle(&public_base, &self_link);
+    if query.total == Some(TotalMode::None) {
+        bundle.total = None;
+    }
     crate::public_url::rewrite_bundle_full_urls(&mut bundle, |resource_type, id| {
         state.public_url_for_request(&tenant, [resource_type, id])
     });

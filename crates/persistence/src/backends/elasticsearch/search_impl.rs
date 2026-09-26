@@ -806,7 +806,9 @@ impl SearchProvider for ElasticsearchBackend {
             result = result.with_scores(scores);
         }
 
-        if let Some(t) = total {
+        if let Some(t) = total
+            && query.total != Some(crate::types::TotalMode::None)
+        {
             result = result.with_total(t);
         }
 
@@ -969,7 +971,9 @@ impl ElasticsearchBackend {
 
         let page = Page::new(items, PageInfo::end());
         let mut result = SearchResult::new(page);
-        if let Some(t) = total {
+        if let Some(t) = total
+            && query.total != Some(crate::types::TotalMode::None)
+        {
             result = result.with_total(t);
         }
         Ok(result)

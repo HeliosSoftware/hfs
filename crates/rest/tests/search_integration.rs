@@ -4824,6 +4824,31 @@ mod summary_count {
         );
     }
 
+    /// `_total=none` means no total on a plain search either, whatever the
+    /// backend can produce for free (Elasticsearch always has one, and the
+    /// MongoDB backend used to count for it), so the header a client derives
+    /// from the Bundle reads the same on every backend.
+    #[tokio::test]
+    async fn test_plain_search_respects_explicit_total_none() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let response = server
+            .get("/Patient?_count=1&_total=none")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        assert!(
+            body.get("total").is_none(),
+            "no total with _total=none: {body}"
+        );
+        assert!(
+            body.get("entry").is_some(),
+            "entries are still returned: {body}"
+        );
+    }
+
     /// An explicit `_total` still wins over the implication.
     #[tokio::test]
     async fn test_summary_count_respects_explicit_total_none() {

@@ -317,6 +317,18 @@ jobs:
           HFS_LOG="$RESULTS_DIR/hfs.log"
           echo "HFS_LOG=$HFS_LOG" >> "$GITHUB_ENV"
 
+          # The SQLite legs ran on an in-memory database, which the backend
+          # opens as a shared-cache database so its pool sees one store. Shared
+          # cache locks per table and answers a contended write with
+          # SQLITE_LOCKED at once — busy_timeout never applies — so the specs
+          # that write while the dashboard reconciles got 500s ("database
+          # table is locked: resources"). A file on tmpfs is what the per-PR
+          # suite runs (boot.mjs) and is as fast; WAL takes the concurrency.
+          if [ -d /dev/shm ]; then HFS_DB_DIR=/dev/shm; else HFS_DB_DIR="$RUNNER_TEMP"; fi
+          HFS_DB="$HFS_DB_DIR/hfs-ui-matrix-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}.db"
+          rm -f "$HFS_DB" "$HFS_DB-wal" "$HFS_DB-shm"
+          echo "HFS_DB=$HFS_DB" >> "$GITHUB_ENV"
+
           # Defensive, and logged so a future incident can rule it in or out:
           # if a pool runner ever carries http(s)_proxy with the private
           # ranges excluded via CIDR in no_proxy, curl (the probes) honors the
@@ -369,7 +381,7 @@ jobs:
           if [ "${{ matrix.backend }}" = "sqlite-elasticsearch" ]; then
             HFS_STORAGE_BACKEND=sqlite-elasticsearch \
             HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
-            ./target/debug/hfs --database-url :memory: --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+            ./target/debug/hfs --database-url "$HFS_DB" --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "postgres-elasticsearch" ]; then
             HFS_STORAGE_BACKEND=postgres-elasticsearch \
             HFS_PG_HOST="$DOCKER_HOST_IP" \
@@ -410,7 +422,7 @@ jobs:
             ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           else
             HFS_STORAGE_BACKEND=sqlite \
-            ./target/debug/hfs --database-url :memory: --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+            ./target/debug/hfs --database-url "$HFS_DB" --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           fi
 
           echo $! > /tmp/hfs-ui-matrix-${{ matrix.backend }}.pid
@@ -522,6 +534,7 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
+          if [ -n "${HFS_DB:-}" ]; then rm -f "$HFS_DB" "$HFS_DB-wal" "$HFS_DB-shm"; fi
           # Non-silent by design. On 2026-07-30 this host was over its disk
           # quota, containerd could not write meta.db, and `docker rm -f`
           # failed with "disk quota exceeded" — but the error went to

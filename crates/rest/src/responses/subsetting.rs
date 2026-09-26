@@ -169,41 +169,40 @@ pub fn apply_elements(resource: &Value, elements: &[&str]) -> Value {
 
 /// Filters a resource to include only specified top-level elements.
 fn filter_resource(resource: &Value, elements: &[&str]) -> Value {
-    if let Value::Object(obj) = resource {
-        let mut result = Map::new();
-
-        for (key, value) in obj {
-            // Check if this key is in the elements list
-            // Also handle nested paths (e.g., "name" should include "name" object)
-            if elements
-                .iter()
-                .any(|e| *e == key || e.starts_with(&format!("{}.", key)) || key == "resourceType")
-            {
-                // If there's a nested path, filter the nested object
-                let nested_paths: Vec<&str> = elements
-                    .iter()
-                    .filter_map(|e| {
-                        if e.starts_with(&format!("{}.", key)) {
-                            Some(&e[key.len() + 1..])
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-
-                if !nested_paths.is_empty() && value.is_object() {
-                    // Filter nested object
-                    result.insert(key.clone(), filter_nested(value, &nested_paths));
-                } else {
-                    result.insert(key.clone(), value.clone());
-                }
-            }
-        }
-
-        Value::Object(result)
-    } else {
-        resource.clone()
+    let Value::Object(obj) = resource else {
+        return resource.clone();
+    };
+    // Kept elements come out in the order `elements` names them (the
+    // specification order for _summary, the requested order for _elements),
+    // not in the order the store happened to return the keys: a jsonb column
+    // hands them back sorted by length, which is no order a reader expects.
+    let mut order: Vec<&str> = Vec::new();
+    if obj.contains_key("resourceType") {
+        order.push("resourceType");
     }
+    for element in elements {
+        let top = element.split('.').next().unwrap_or(element);
+        if !order.contains(&top) {
+            order.push(top);
+        }
+    }
+
+    let mut result = Map::new();
+    for key in order {
+        let Some(value) = obj.get(key) else {
+            continue;
+        };
+        let nested_paths: Vec<&str> = elements
+            .iter()
+            .filter_map(|e| e.strip_prefix(key).and_then(|rest| rest.strip_prefix('.')))
+            .collect();
+        if !nested_paths.is_empty() && value.is_object() {
+            result.insert(key.to_string(), filter_nested(value, &nested_paths));
+        } else {
+            result.insert(key.to_string(), value.clone());
+        }
+    }
+    Value::Object(result)
 }
 
 /// Filters nested objects based on path components.
@@ -493,5 +492,66 @@ mod tests {
         assert!(result.get("id").is_some());
         assert!(result.get("name").is_some());
         assert!(result.get("text").is_none());
+    }
+
+    /// A jsonb column returns keys sorted by length, so a PostgreSQL-backed
+    /// server used to emit a `_summary=true` Patient as name, active, gender,
+    /// address, ... The subset follows the specification order instead, with
+    /// `resourceType` first, whatever order the store returned.
+    #[test]
+    fn summary_keeps_the_specification_element_order_not_the_stores() {
+        let stored = serde_json::json!({
+            "id": "p1",
+            "meta": {"versionId": "1"},
+            "name": [{"family": "Columns"}],
+            "active": true,
+            "gender": "female",
+            "address": [{"city": "Quito"}],
+            "telecom": [{"system": "phone", "value": "555"}],
+            "birthDate": "1990-05-11",
+            "identifier": [{"system": "urn:test", "value": "1"}],
+            "resourceType": "Patient"
+        });
+        let summary = apply_summary(&stored, SummaryMode::True, FhirVersion::R4);
+        let keys: Vec<&str> = summary
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys[0], "resourceType");
+        let order = [
+            "identifier",
+            "active",
+            "name",
+            "telecom",
+            "gender",
+            "birthDate",
+            "address",
+        ];
+        let positions: Vec<usize> = order
+            .iter()
+            .map(|k| keys.iter().position(|key| key == k).unwrap())
+            .collect();
+        assert!(positions.windows(2).all(|w| w[0] < w[1]), "{keys:?}");
+    }
+
+    #[test]
+    fn elements_come_out_in_the_requested_order() {
+        let stored = serde_json::json!({
+            "birthDate": "1990-05-11",
+            "gender": "female",
+            "id": "p1",
+            "name": [{"family": "Columns", "given": ["A"]}],
+            "resourceType": "Patient"
+        });
+        let subset = apply_elements(&stored, &["gender", "name.family", "birthDate"]);
+        let keys: Vec<&str> = subset
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["resourceType", "id", "gender", "name", "birthDate"]);
     }
 }
