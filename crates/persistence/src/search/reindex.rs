@@ -2956,40 +2956,41 @@ async fn walk_type(
     // `ReindexRequest` is public and deserialisable, so its setter's clamp
     // can be bypassed: clamp again here.
     let write_streams = request.write_streams.min(REINDEX_MAX_WRITE_STREAMS);
-    if write_streams <= 1 {
-        return walk_range(ctx, resource_type, None, request.batch_bytes, &mut || {
-            cancel_rx.try_recv().is_ok()
-        })
-        .await;
-    }
-    let plan_started = Instant::now();
-    let plan = ctx
-        .source
-        .plan_type_walk(
-            &ctx.tenant,
-            resource_type,
-            TypeWalkRequest {
-                streams: write_streams,
-                min_resources_per_stream: request.min_resources_per_stream,
-                concurrent_runs: request.concurrent_runs,
-            },
-        )
-        .await
-        .map_err(|e| RunExit::Failed(format!("Failed to plan the walk of {resource_type}: {e}")))?;
-    // A broken plan fails before it is recorded, so the type's L3 line never
-    // reports `streams=0`.
-    let streams = match &plan {
-        TypeWalkPlan::Single => 1,
-        TypeWalkPlan::Ranges { ranges, .. } if ranges.is_empty() => {
-            return Err(RunExit::Failed(format!(
-                "The walk plan of {resource_type} has no id ranges"
-            )));
-        }
-        TypeWalkPlan::Ranges { ranges, .. } => u32::try_from(ranges.len()).unwrap_or(u32::MAX),
+    let plan = if write_streams <= 1 {
+        TypeWalkPlan::Single
+    } else {
+        let plan_started = Instant::now();
+        let plan = ctx
+            .source
+            .plan_type_walk(
+                &ctx.tenant,
+                resource_type,
+                TypeWalkRequest {
+                    streams: write_streams,
+                    min_resources_per_stream: request.min_resources_per_stream,
+                    concurrent_runs: request.concurrent_runs,
+                },
+            )
+            .await
+            .map_err(|e| {
+                RunExit::Failed(format!("Failed to plan the walk of {resource_type}: {e}"))
+            })?;
+        // A broken plan fails before it is recorded, so the type's L3 line
+        // never reports `streams=0`.
+        let streams = match &plan {
+            TypeWalkPlan::Single => 1,
+            TypeWalkPlan::Ranges { ranges, .. } if ranges.is_empty() => {
+                return Err(RunExit::Failed(format!(
+                    "The walk plan of {resource_type} has no id ranges"
+                )));
+            }
+            TypeWalkPlan::Ranges { ranges, .. } => u32::try_from(ranges.len()).unwrap_or(u32::MAX),
+        };
+        ctx.stats
+            .lock()
+            .set_type_plan(streams, plan_started.elapsed());
+        plan
     };
-    ctx.stats
-        .lock()
-        .set_type_plan(streams, plan_started.elapsed());
     match plan {
         TypeWalkPlan::Single => {
             walk_range(ctx, resource_type, None, request.batch_bytes, &mut || {
@@ -6678,7 +6679,7 @@ mod tests {
             reject: BTreeSet::from(["c1".to_string()]),
             ..RangedWriter::new(seq)
         });
-        let op = ranged_operation(source, writer);
+        let op = ranged_operation(source.clone(), writer);
         let job = op
             .start(
                 named_tenant("streams-attribution"),
@@ -6693,6 +6694,8 @@ mod tests {
         assert_eq!(progress.errors[0].resource_type, "Observation");
         assert_eq!(progress.errors[0].resource_id, "c1");
         assert!(!progress.errors[0].retryable);
+        assert_eq!(source.plans.load(Ordering::SeqCst), 1);
+        assert!(source.fetched_cursors("<start>").is_empty());
     }
 
     #[tokio::test]
@@ -6718,6 +6721,7 @@ mod tests {
                 .unwrap();
             let progress = await_finished(&op, &job).await;
             assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+            assert_eq!(source.plans.load(Ordering::SeqCst), 1);
             source
                 .fetched()
                 .into_iter()
@@ -6835,7 +6839,10 @@ mod tests {
             )
             .with_prefetch(),
         );
-        let writer = Arc::new(RangedWriter::new(seq));
+        let writer = Arc::new(RangedWriter {
+            delay: Duration::from_millis(5),
+            ..RangedWriter::new(seq)
+        });
         let op = ranged_operation(source.clone(), writer.clone());
         let job = op
             .start(named_tenant("streams-prefetch"), streams_request(3), None)
@@ -6845,10 +6852,10 @@ mod tests {
         assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
         assert_eq!(progress.processed_resources, 18);
 
-        let cursors: Vec<String> = source
-            .fetched()
-            .into_iter()
-            .map(|(_, cursor, _)| cursor)
+        let fetches = source.fetched();
+        let cursors: Vec<String> = fetches
+            .iter()
+            .map(|(_, cursor, _)| cursor.clone())
             .collect();
         let unique: BTreeSet<&String> = cursors.iter().collect();
         assert_eq!(
@@ -6856,10 +6863,10 @@ mod tests {
             cursors.len(),
             "a page was fetched twice: {cursors:?}"
         );
+        let writes = writer.page_writes();
         for prefix in ["a", "b", "c"] {
-            let firsts: Vec<String> = writer
-                .page_writes()
-                .into_iter()
+            let firsts: Vec<String> = writes
+                .iter()
                 .filter(|(_, ids)| ids[0].starts_with(prefix))
                 .map(|(_, ids)| ids[0].clone())
                 .collect();
@@ -6872,6 +6879,31 @@ mod tests {
                 ],
                 "range {prefix} must be written in fetch order"
             );
+        }
+        // Each range's next page is fetched ahead of the write in flight: the
+        // fetch of page k+1 must be sequenced before the write of page k
+        // finishes, not merely before it starts.
+        for (prefix, r) in [("a", 0), ("b", 1), ("c", 2)] {
+            for k in 2..=3 {
+                let fetch_cursor = format!("r:{r}:{k}");
+                let fetch_seq = fetches
+                    .iter()
+                    .find(|(_, cursor, _)| *cursor == fetch_cursor)
+                    .map(|(seq, _, _)| *seq)
+                    .unwrap_or_else(|| panic!("cursor {fetch_cursor} was never fetched"));
+                let write_first_id = format!("{prefix}{}", 2 * (k - 2));
+                let write_seq = writes
+                    .iter()
+                    .find(|(_, ids)| ids[0] == write_first_id)
+                    .map(|(seq, _)| *seq)
+                    .unwrap_or_else(|| panic!("no write with first id {write_first_id}"));
+                assert!(
+                    fetch_seq < write_seq,
+                    "range {prefix} page {k} must be fetched before the write of \
+                     page {} ends: fetch seq {fetch_seq} vs write seq {write_seq}",
+                    k - 1
+                );
+            }
         }
     }
 
