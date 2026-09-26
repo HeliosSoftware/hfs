@@ -45,8 +45,9 @@ chrono.workspace = true
 async-trait = "0.1"
 
 # The dashboard snapshot cache refreshes in a background task ("rt") and paces
-# its cold-start wait ("time"); see `dashboard::snapshot`.
-tokio = { version = "1", features = ["rt", "time"] }
+# its cold-start wait ("time"); see `dashboard::snapshot`. `shutdown::signal`
+# needs "signal" and "macros" (for `select!`).
+tokio = { version = "1", features = ["rt", "time", "signal", "macros"] }
 
 # OpenTelemetry (feature-gated). Versions pinned to a mutually compatible set:
 # core 0.32 / tracing-opentelemetry 0.33 (runs one minor ahead of core).

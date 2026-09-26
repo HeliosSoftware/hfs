@@ -875,21 +875,27 @@ async fn serve(
     // Peer address in request extensions: the natural-language search rate
     // limiter falls back to it when auth is disabled and there is no principal
     // to bill a request to.
-    axum::serve(
+    let served = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        info!("Shutdown signal received, draining connections");
-        if let Some(state) = audit_state {
-            lifecycle::record_shutdown(&*state.sink, &state.config.source_observer).await;
-            state.sink.flush().await;
-        }
-        // Flush any buffered OTLP spans (no-op without the `otel` feature).
-        helios_observability::telemetry::shutdown();
+    .with_graceful_shutdown(async {
+        let signal = helios_observability::shutdown::signal().await;
+        info!(signal, "Shutdown signal received, draining connections");
     })
-    .await?;
+    .await;
+
+    // Flush only once the drain is over. axum awaits the shutdown future above
+    // before it stops accepting or winds down a single connection, so a flush
+    // inside it ran while requests were still in flight and lost every audit
+    // event and span they produced. Flush on a serve error too.
+    if let Some(state) = audit_state {
+        lifecycle::record_shutdown(&*state.sink, &state.config.source_observer).await;
+        state.sink.flush().await;
+    }
+    // Flush any buffered OTLP spans (no-op without the `otel` feature).
+    helios_observability::telemetry::shutdown();
+    served?;
     Ok(())
 }
 

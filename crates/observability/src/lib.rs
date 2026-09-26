@@ -23,6 +23,7 @@
 //! - [`composite_metrics`] — process-level Prometheus metrics for composite
 //!   storage's secondary sync: final failures by backend and operation, and
 //!   the number of resources recorded as needing a reindex (#1334).
+//! - [`shutdown`] — the SIGINT/SIGTERM future every server drains on.
 //!
 //! ## Typical wiring
 //!
@@ -36,7 +37,12 @@
 //!     .merge(helios_observability::metrics::router())
 //!     .layer(axum::middleware::from_fn(helios_observability::middleware::track));
 //!
-//! // on graceful shutdown:
+//! axum::serve(listener, app)
+//!     .with_graceful_shutdown(async {
+//!         helios_observability::shutdown::signal().await;
+//!     })
+//!     .await?;
+//! // after the drain, not inside the shutdown future:
 //! helios_observability::telemetry::shutdown();
 //! ```
 //!
@@ -55,6 +61,7 @@ pub mod metrics;
 pub mod middleware;
 pub mod mode;
 pub mod reqlog;
+pub mod shutdown;
 pub mod subscriptions;
 pub mod telemetry;
 pub mod uptime;
