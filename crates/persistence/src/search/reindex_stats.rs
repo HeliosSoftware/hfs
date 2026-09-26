@@ -327,6 +327,15 @@ impl ReindexRunStats {
         }
     }
 
+    /// Records how the open type is walked: its write streams and the time
+    /// spent planning them (#1403). Does nothing when no type is open.
+    pub(super) fn set_type_plan(&mut self, streams: u32, plan: Duration) {
+        if let Some(open) = self.current.as_mut() {
+            open.streams = streams;
+            open.plan = plan;
+        }
+    }
+
     pub(super) fn finish_type(
         &mut self,
         outcome: &'static str,
@@ -424,6 +433,20 @@ mod tests {
                 .finish_type(OUTCOME_COMPLETED, t0 + Duration::from_secs(5))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn set_type_plan_is_reported_when_the_type_finishes() {
+        let t0 = Instant::now();
+        let mut stats = ReindexRunStats::new(t0, 1, 1, Duration::from_secs(60));
+        stats.set_type_plan(4, Duration::from_millis(7)); // no type open: ignored
+        stats.start_type("Observation", 1, t0);
+        stats.set_type_plan(3, Duration::from_millis(12));
+        let summary = stats
+            .finish_type(OUTCOME_COMPLETED, t0 + Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(summary.streams, 3);
+        assert_eq!(summary.plan, Duration::from_millis(12));
     }
 
     #[test]

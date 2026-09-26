@@ -2720,6 +2720,12 @@ impl Drop for PrefetchedPage {
     }
 }
 
+/// Byte cap of a split type's pages when the run's `batch_bytes` is 0 (count
+/// only): each of K concurrent walks holds up to two pages, so those pages
+/// are never left uncapped (#1403). Equal to the server default of
+/// `HFS_REINDEX_BATCH_BYTES`.
+const REINDEX_MULTI_STREAM_BATCH_BYTES: u64 = 33_554_432;
+
 /// What one walk of a resource type needs, behind an `Arc` so the concurrent
 /// walks of one type can share it (#1403). The run's failure log and
 /// statistics sit behind short-lived locks: no guard is held across an
@@ -2735,6 +2741,12 @@ struct RangeWalk {
     batch_size: u32,
     failures: parking_lot::Mutex<ResourceFailureLog>,
     stats: parking_lot::Mutex<ReindexRunStats>,
+    /// Raised to stop the concurrent walks of a split type at their next page
+    /// boundary: on cancellation, or once one of them has failed.
+    stop: AtomicBool,
+    /// Whether this run has already warned that it capped a split type's
+    /// pages because `batch_bytes` was 0.
+    cap_warned: AtomicBool,
 }
 
 /// Rebuilds exactly the named resources of `resource_type`, fetched in
@@ -2931,14 +2943,166 @@ async fn walk_range(
     }
 }
 
-/// Walks every page of `resource_type` (#1403).
+/// Walks every page of `resource_type` (#1403): one walk when the run asks
+/// for a single write stream or the source keeps the type whole; otherwise
+/// the source's id ranges concurrently, one stream each, then one catch-up
+/// walk once every range has finished.
 async fn walk_type(
     ctx: &Arc<RangeWalk>,
     resource_type: &str,
     request: &ReindexRequest,
     cancel_rx: &mut mpsc::Receiver<()>,
 ) -> Result<(), RunExit> {
-    walk_range(ctx, resource_type, None, request.batch_bytes, &mut || {
+    // `ReindexRequest` is public and deserialisable, so its setter's clamp
+    // can be bypassed: clamp again here.
+    let write_streams = request.write_streams.min(REINDEX_MAX_WRITE_STREAMS);
+    if write_streams <= 1 {
+        return walk_range(ctx, resource_type, None, request.batch_bytes, &mut || {
+            cancel_rx.try_recv().is_ok()
+        })
+        .await;
+    }
+    let plan_started = Instant::now();
+    let plan = ctx
+        .source
+        .plan_type_walk(
+            &ctx.tenant,
+            resource_type,
+            TypeWalkRequest {
+                streams: write_streams,
+                min_resources_per_stream: request.min_resources_per_stream,
+                concurrent_runs: request.concurrent_runs,
+            },
+        )
+        .await
+        .map_err(|e| RunExit::Failed(format!("Failed to plan the walk of {resource_type}: {e}")))?;
+    // A broken plan fails before it is recorded, so the type's L3 line never
+    // reports `streams=0`.
+    let streams = match &plan {
+        TypeWalkPlan::Single => 1,
+        TypeWalkPlan::Ranges { ranges, .. } if ranges.is_empty() => {
+            return Err(RunExit::Failed(format!(
+                "The walk plan of {resource_type} has no id ranges"
+            )));
+        }
+        TypeWalkPlan::Ranges { ranges, .. } => u32::try_from(ranges.len()).unwrap_or(u32::MAX),
+    };
+    ctx.stats
+        .lock()
+        .set_type_plan(streams, plan_started.elapsed());
+    match plan {
+        TypeWalkPlan::Single => {
+            walk_range(ctx, resource_type, None, request.batch_bytes, &mut || {
+                cancel_rx.try_recv().is_ok()
+            })
+            .await
+        }
+        TypeWalkPlan::Ranges { ranges, catch_up } => {
+            let page_bytes = multi_stream_page_bytes(ctx, request.batch_bytes);
+            walk_ranges(ctx, resource_type, ranges, catch_up, page_bytes, cancel_rx).await
+        }
+    }
+}
+
+/// A split type's page byte cap: the run's own, or
+/// [`REINDEX_MULTI_STREAM_BATCH_BYTES`] when the run asked for none, with one
+/// warning per run (#1403).
+fn multi_stream_page_bytes(ctx: &RangeWalk, batch_bytes: u64) -> u64 {
+    if batch_bytes > 0 {
+        return batch_bytes;
+    }
+    if !ctx.cap_warned.swap(true, Ordering::SeqCst) {
+        tracing::warn!(
+            tenant = %ctx.tenant_label,
+            job_id = %ctx.job_id,
+            "HFS_REINDEX_BATCH_BYTES=0 with concurrent streams; capping rebuild pages at 32 MiB"
+        );
+    }
+    REINDEX_MULTI_STREAM_BATCH_BYTES
+}
+
+/// Walks every range of a split type concurrently, one stream each, then the
+/// catch-up (#1403).
+///
+/// Every stream is drained before this returns: the set is never dropped,
+/// aborted or left early, because dropping it would abort a stream between a
+/// page's delete and its insert. A cancellation, a failure or a panic raises
+/// `stop`, which each stream checks at its next page boundary, so a page
+/// that has been fetched is always written in full. Then, in order of
+/// precedence: a panic resumes here (the job's own unwind guard fails it, as
+/// for a single walk); the first failure's message fails the type; a
+/// cancellation cancels it. Only when every range completed does the
+/// catch-up walk run, so it starts after the last range page is written. A
+/// cancel that arrived while the type was being planned returns before any
+/// stream is spawned.
+async fn walk_ranges(
+    ctx: &Arc<RangeWalk>,
+    resource_type: &str,
+    ranges: Vec<String>,
+    catch_up: String,
+    page_bytes: u64,
+    cancel_rx: &mut mpsc::Receiver<()>,
+) -> Result<(), RunExit> {
+    if cancel_rx.try_recv().is_ok() {
+        return Err(RunExit::Cancelled);
+    }
+    ctx.stop.store(false, Ordering::SeqCst);
+    let mut set: tokio::task::JoinSet<Result<(), RunExit>> = tokio::task::JoinSet::new();
+    for cursor in ranges {
+        let ctx = ctx.clone();
+        let resource_type = resource_type.to_string();
+        set.spawn(async move {
+            let mut stop = || ctx.stop.load(Ordering::SeqCst);
+            walk_range(&ctx, &resource_type, Some(cursor), page_bytes, &mut stop).await
+        });
+    }
+
+    let mut cancelled = false;
+    let mut failed: Option<String> = None;
+    let mut panicked: Option<Box<dyn std::any::Any + Send + 'static>> = None;
+    loop {
+        tokio::select! {
+            biased;
+            // A closed channel yields `None`, which is not a cancellation.
+            Some(()) = cancel_rx.recv(), if !cancelled => {
+                cancelled = true;
+                ctx.stop.store(true, Ordering::SeqCst);
+            }
+            joined = set.join_next() => match joined {
+                None => break,
+                Some(Ok(Ok(()))) | Some(Ok(Err(RunExit::Cancelled))) => {}
+                Some(Ok(Err(RunExit::Failed(message)))) => {
+                    if failed.is_none() {
+                        failed = Some(message);
+                    }
+                    ctx.stop.store(true, Ordering::SeqCst);
+                }
+                Some(Err(e)) if e.is_panic() => {
+                    if panicked.is_none() {
+                        panicked = Some(e.into_panic());
+                    }
+                    ctx.stop.store(true, Ordering::SeqCst);
+                }
+                Some(Err(e)) => {
+                    if failed.is_none() {
+                        failed = Some(format!("reindex stream ended without a result: {e}"));
+                    }
+                    ctx.stop.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+    }
+
+    if let Some(payload) = panicked {
+        std::panic::resume_unwind(payload);
+    }
+    if let Some(message) = failed {
+        return Err(RunExit::Failed(message));
+    }
+    if cancelled {
+        return Err(RunExit::Cancelled);
+    }
+    walk_range(ctx, resource_type, Some(catch_up), page_bytes, &mut || {
         cancel_rx.try_recv().is_ok()
     })
     .await
@@ -3120,6 +3284,8 @@ async fn run_reindex(
         batch_size: request.batch_size.max(1),
         failures: parking_lot::Mutex::new(ResourceFailureLog::new(&job_id, &tenant)),
         stats: parking_lot::Mutex::new(stats),
+        stop: AtomicBool::new(false),
+        cap_warned: AtomicBool::new(false),
     });
     let outcome: Result<(), RunExit> = async {
         // Process each resource type
@@ -5865,6 +6031,970 @@ mod tests {
             op.get_progress(&job_id).await.expect("progress").status,
             ReindexStatus::Cancelled
         );
+    }
+
+    // --- #1403: concurrent write streams over id ranges ------------------
+
+    /// How [`RangedSource::plan_type_walk`] answers (#1403).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum RangedPlan {
+        /// One range per entry of `ranges`, then the catch-up.
+        Ranges,
+        /// The single walk.
+        Single,
+        /// A `Ranges` plan with no range: a broken source.
+        NoRanges,
+        /// A planning error.
+        Fail,
+        /// Panics: the driver must not plan at all.
+        Panic,
+    }
+
+    /// A scripted source for the multi-stream driver tests (#1403).
+    /// `ranges[r]` holds range `r`'s pages of ids, walked from cursor
+    /// `"r:{r}:1"`; `catch_up` holds the catch-up walk's pages, from
+    /// `"catchup:1"`. The page after a walk's last is empty with no next
+    /// cursor, as a source that ends a walk on an empty query returns it. A
+    /// `None` cursor — the single walk — returns every range id in one page.
+    /// Every fetch, serial or ahead, is recorded as `(seq, cursor, max_bytes)`
+    /// from a sequence shared with [`RangedWriter`], so a test can order
+    /// fetches against page writes. Every plan request is kept in
+    /// `requests`, and `plan_gate`, when set, holds `plan_type_walk` until a
+    /// permit is added.
+    struct RangedSource {
+        ranges: Vec<Vec<Vec<String>>>,
+        catch_up: Vec<Vec<String>>,
+        plan: RangedPlan,
+        prefetch: bool,
+        seq: Arc<std::sync::atomic::AtomicU64>,
+        fetches: parking_lot::Mutex<Vec<(u64, String, u64)>>,
+        fail: parking_lot::Mutex<std::collections::HashSet<String>>,
+        panic: parking_lot::Mutex<std::collections::HashSet<String>>,
+        plans: std::sync::atomic::AtomicUsize,
+        requests: parking_lot::Mutex<Vec<TypeWalkRequest>>,
+        plan_gate: Option<Arc<Semaphore>>,
+    }
+
+    /// `pages` pages of `per_page` ids each: `"{prefix}0"`, `"{prefix}1"`, …
+    fn range_pages(prefix: &str, pages: usize, per_page: usize) -> Vec<Vec<String>> {
+        (0..pages)
+            .map(|p| {
+                (0..per_page)
+                    .map(|i| format!("{prefix}{}", p * per_page + i))
+                    .collect()
+            })
+            .collect()
+    }
+
+    impl RangedSource {
+        fn new(
+            ranges: Vec<Vec<Vec<String>>>,
+            catch_up: Vec<Vec<String>>,
+            seq: Arc<std::sync::atomic::AtomicU64>,
+        ) -> Self {
+            Self {
+                ranges,
+                catch_up,
+                plan: RangedPlan::Ranges,
+                prefetch: false,
+                seq,
+                fetches: parking_lot::Mutex::new(Vec::new()),
+                fail: parking_lot::Mutex::new(std::collections::HashSet::new()),
+                panic: parking_lot::Mutex::new(std::collections::HashSet::new()),
+                plans: std::sync::atomic::AtomicUsize::new(0),
+                requests: parking_lot::Mutex::new(Vec::new()),
+                plan_gate: None,
+            }
+        }
+
+        fn with_plan(mut self, plan: RangedPlan) -> Self {
+            self.plan = plan;
+            self
+        }
+
+        fn with_prefetch(mut self) -> Self {
+            self.prefetch = true;
+            self
+        }
+
+        fn fail_cursor(&self, cursor: &str) {
+            self.fail.lock().insert(cursor.to_string());
+        }
+
+        fn panic_cursor(&self, cursor: &str) {
+            self.panic.lock().insert(cursor.to_string());
+        }
+
+        fn fetched(&self) -> Vec<(u64, String, u64)> {
+            self.fetches.lock().clone()
+        }
+
+        fn fetched_cursors(&self, prefix: &str) -> Vec<String> {
+            self.fetched()
+                .into_iter()
+                .map(|(_, cursor, _)| cursor)
+                .filter(|cursor| cursor.starts_with(prefix))
+                .collect()
+        }
+
+        fn total(&self) -> u64 {
+            self.ranges
+                .iter()
+                .flatten()
+                .map(|page| page.len() as u64)
+                .sum()
+        }
+
+        fn page(&self, cursor: Option<&str>) -> (Vec<String>, Option<String>) {
+            let Some(cursor) = cursor else {
+                return (
+                    self.ranges.iter().flatten().flatten().cloned().collect(),
+                    None,
+                );
+            };
+            let (pages, prefix, page) = if let Some(page) = cursor.strip_prefix("catchup:") {
+                (&self.catch_up, "catchup:".to_string(), page)
+            } else {
+                let rest = cursor
+                    .strip_prefix("r:")
+                    .unwrap_or_else(|| panic!("unexpected cursor {cursor}"));
+                let (range, page) = rest.split_once(':').expect("r:{range}:{page}");
+                let range: usize = range.parse().expect("range index");
+                (&self.ranges[range], format!("r:{range}:"), page)
+            };
+            let page: usize = page.parse().expect("page number");
+            match pages.get(page - 1) {
+                Some(ids) => (ids.clone(), Some(format!("{prefix}{}", page + 1))),
+                None => (Vec::new(), None),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ReindexSource for RangedSource {
+        async fn list_resource_types(&self, _: &TenantContext) -> StorageResult<Vec<String>> {
+            Ok(vec!["Observation".to_string()])
+        }
+
+        async fn count_resources(&self, _: &TenantContext, _: &str) -> StorageResult<u64> {
+            Ok(self.total())
+        }
+
+        async fn fetch_resources_page(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            cursor: Option<&str>,
+            limit: u32,
+        ) -> StorageResult<ResourcePage> {
+            self.fetch_resources_page_capped(tenant, resource_type, cursor, limit, 0)
+                .await
+        }
+
+        async fn fetch_resources_page_capped(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            cursor: Option<&str>,
+            _limit: u32,
+            max_bytes: u64,
+        ) -> StorageResult<ResourcePage> {
+            let label = cursor.unwrap_or("<start>").to_string();
+            let seq = self.seq.fetch_add(1, Ordering::SeqCst);
+            self.fetches.lock().push((seq, label.clone(), max_bytes));
+            if self.panic.lock().contains(&label) {
+                panic!("RangedSource: scripted panic at {label}");
+            }
+            if self.fail.lock().contains(&label) {
+                return Err(crate::error::BackendError::Internal {
+                    backend_name: "ranged-source".into(),
+                    message: format!("scripted fetch failure at {label}"),
+                    source: None,
+                }
+                .into());
+            }
+            tokio::task::yield_now().await;
+            let (ids, next_cursor) = self.page(cursor);
+            Ok(ResourcePage {
+                resources: ids
+                    .into_iter()
+                    .map(|id| {
+                        StoredResource::new(
+                            resource_type,
+                            &id,
+                            tenant.tenant_id().clone(),
+                            serde_json::json!({"resourceType": resource_type, "id": id}),
+                            helios_fhir::FhirVersion::default(),
+                        )
+                    })
+                    .collect(),
+                next_cursor,
+                skipped: Vec::new(),
+            })
+        }
+
+        fn may_prefetch_page(&self, cursor: &str) -> bool {
+            self.prefetch && cursor.starts_with("r:")
+        }
+
+        async fn plan_type_walk(
+            &self,
+            _: &TenantContext,
+            _: &str,
+            request: TypeWalkRequest,
+        ) -> StorageResult<TypeWalkPlan> {
+            self.requests.lock().push(request);
+            self.plans.fetch_add(1, Ordering::SeqCst);
+            if let Some(gate) = &self.plan_gate {
+                gate.acquire()
+                    .await
+                    .expect("ranged plan gate remains open")
+                    .forget();
+            }
+            match self.plan {
+                RangedPlan::Ranges => Ok(TypeWalkPlan::Ranges {
+                    ranges: (0..self.ranges.len()).map(|r| format!("r:{r}:1")).collect(),
+                    catch_up: "catchup:1".to_string(),
+                }),
+                RangedPlan::Single => Ok(TypeWalkPlan::Single),
+                RangedPlan::NoRanges => Ok(TypeWalkPlan::Ranges {
+                    ranges: Vec::new(),
+                    catch_up: "catchup:1".to_string(),
+                }),
+                RangedPlan::Fail => Err(crate::error::BackendError::Unavailable {
+                    backend_name: "ranged-source".into(),
+                    message: "scripted plan failure".into(),
+                }
+                .into()),
+                RangedPlan::Panic => panic!("plan_type_walk must not be called"),
+            }
+        }
+    }
+
+    /// Pairs with [`RangedSource`]: records each page write as `(seq, ids)`
+    /// on the shared sequence when the write finishes, can hold each write on
+    /// `gate` (one permit per page) or for `delay`, and rejects the ids in
+    /// `reject` as permanent failures (#1403).
+    struct RangedWriter {
+        seq: Arc<std::sync::atomic::AtomicU64>,
+        writes: parking_lot::Mutex<Vec<(u64, Vec<String>)>>,
+        started: std::sync::atomic::AtomicUsize,
+        ended: std::sync::atomic::AtomicUsize,
+        gate: Option<Arc<Semaphore>>,
+        delay: Duration,
+        reject: BTreeSet<String>,
+    }
+
+    impl RangedWriter {
+        fn new(seq: Arc<std::sync::atomic::AtomicU64>) -> Self {
+            Self {
+                seq,
+                writes: parking_lot::Mutex::new(Vec::new()),
+                started: std::sync::atomic::AtomicUsize::new(0),
+                ended: std::sync::atomic::AtomicUsize::new(0),
+                gate: None,
+                delay: Duration::ZERO,
+                reject: BTreeSet::new(),
+            }
+        }
+
+        fn page_writes(&self) -> Vec<(u64, Vec<String>)> {
+            self.writes.lock().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ReindexTarget for RangedWriter {
+        async fn delete_search_entries(
+            &self,
+            _: &TenantContext,
+            _: &str,
+            _: &str,
+        ) -> StorageResult<u64> {
+            Ok(0)
+        }
+
+        async fn write_search_entries(
+            &self,
+            _: &TenantContext,
+            _: &StoredResource,
+        ) -> StorageResult<usize> {
+            Ok(1)
+        }
+
+        async fn clear_search_index(&self, _: &TenantContext) -> StorageResult<u64> {
+            Ok(0)
+        }
+
+        async fn write_search_entries_page(
+            &self,
+            _: &TenantContext,
+            resources: &[StoredResource],
+        ) -> Vec<StorageResult<usize>> {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            if let Some(gate) = &self.gate {
+                gate.acquire()
+                    .await
+                    .expect("ranged write gate remains open")
+                    .forget();
+            }
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            let ids: Vec<String> = resources.iter().map(|r| r.id().to_string()).collect();
+            let seq = self.seq.fetch_add(1, Ordering::SeqCst);
+            self.writes.lock().push((seq, ids));
+            self.ended.fetch_add(1, Ordering::SeqCst);
+            resources
+                .iter()
+                .map(|r| {
+                    if self.reject.contains(r.id()) {
+                        Err(crate::error::BackendError::Internal {
+                            backend_name: "ranged-writer".into(),
+                            message: format!("scripted rejection of {}", r.id()),
+                            source: None,
+                        }
+                        .into())
+                    } else {
+                        Ok(1)
+                    }
+                })
+                .collect()
+        }
+    }
+
+    fn ranged_operation(
+        source: Arc<RangedSource>,
+        writer: Arc<RangedWriter>,
+    ) -> Arc<ReindexOperation> {
+        Arc::new(ReindexOperation::with_parts(
+            source,
+            vec![writer as Arc<dyn ReindexTarget>],
+            Arc::new(crate::search::TenantSearchRegistries::base_only()),
+        ))
+    }
+
+    fn streams_request(streams: u32) -> ReindexRequest {
+        ReindexRequest::for_types(vec!["Observation".to_string()])
+            .with_batch_size(2)
+            .with_write_streams(streams)
+    }
+
+    fn new_seq() -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::new(std::sync::atomic::AtomicU64::new(0))
+    }
+
+    #[tokio::test]
+    async fn write_streams_one_never_plans() {
+        let seq = new_seq();
+        let source = Arc::new(
+            RangedSource::new(
+                vec![range_pages("a", 2, 2), range_pages("b", 2, 2)],
+                Vec::new(),
+                seq.clone(),
+            )
+            .with_plan(RangedPlan::Panic),
+        );
+        let op = ranged_operation(source.clone(), Arc::new(RangedWriter::new(seq)));
+        let job = op
+            .start(named_tenant("streams-one"), streams_request(1), None)
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+        assert_eq!(progress.total_resources, 8);
+        assert_eq!(progress.processed_resources, 8);
+        assert_eq!(source.plans.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn single_plan_walks_the_type_once_under_write_streams() {
+        let source = Arc::new(PagedSource::new(9));
+        let target = Arc::new(RecordingTarget::default());
+        let op = recording_operation(source.clone(), target.clone());
+        let job = op
+            .start(
+                named_tenant("streams-single-plan"),
+                ReindexRequest::for_types(vec!["Patient".to_string()])
+                    .with_batch_size(2)
+                    .with_write_streams(4),
+                None,
+            )
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+        assert_eq!(progress.total_resources, 9);
+        assert_eq!(progress.processed_resources, 9);
+        assert_eq!(
+            source.pages.load(Ordering::SeqCst),
+            5,
+            "one walk, no double walk"
+        );
+        assert_eq!(target.written.lock().len(), 9);
+    }
+
+    #[tokio::test]
+    async fn ranges_run_then_catch_up_runs_last() {
+        let seq = new_seq();
+        let source = Arc::new(RangedSource::new(
+            vec![
+                range_pages("a", 2, 2),
+                range_pages("b", 2, 2),
+                range_pages("c", 2, 2),
+            ],
+            vec![vec!["z0".to_string()]],
+            seq.clone(),
+        ));
+        let writer = Arc::new(RangedWriter::new(seq));
+        let op = ranged_operation(source.clone(), writer.clone());
+        let job = op
+            .start(named_tenant("streams-order"), streams_request(3), None)
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+        assert_eq!(progress.total_resources, 12);
+        assert_eq!(
+            progress.processed_resources, 13,
+            "the catch-up's row is processed on top of the ranges'"
+        );
+        assert_eq!(source.plans.load(Ordering::SeqCst), 1);
+
+        let last_range_write = writer
+            .page_writes()
+            .iter()
+            .filter(|(_, ids)| !ids[0].starts_with('z'))
+            .map(|(seq, _)| *seq)
+            .max()
+            .expect("range pages were written");
+        let catch_up_fetches: Vec<u64> = source
+            .fetched()
+            .into_iter()
+            .filter(|(_, cursor, _)| cursor.starts_with("catchup:"))
+            .map(|(seq, _, _)| seq)
+            .collect();
+        assert_eq!(catch_up_fetches.len(), 2, "one page, then the empty one");
+        assert!(
+            catch_up_fetches.iter().all(|seq| *seq > last_range_write),
+            "the catch-up must fetch only after every range page is written: \
+             {catch_up_fetches:?} vs last range write {last_range_write}"
+        );
+        let mut written: Vec<String> = writer
+            .page_writes()
+            .into_iter()
+            .flat_map(|(_, ids)| ids)
+            .collect();
+        written.sort();
+        written.dedup();
+        assert_eq!(written.len(), 13, "every id written exactly once");
+    }
+
+    #[tokio::test]
+    async fn failed_range_fails_job_and_skips_catch_up() {
+        let seq = new_seq();
+        let source = Arc::new(RangedSource::new(
+            vec![
+                range_pages("a", 2, 2),
+                range_pages("b", 2, 2),
+                range_pages("c", 2, 2),
+            ],
+            vec![vec!["z0".to_string()]],
+            seq.clone(),
+        ));
+        source.fail_cursor("r:1:2");
+        let op = ranged_operation(source.clone(), Arc::new(RangedWriter::new(seq)));
+        let job = op
+            .start(
+                named_tenant("streams-range-fails"),
+                streams_request(3),
+                None,
+            )
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Failed, "{progress:?}");
+        let message = progress.error_message.as_deref().unwrap_or("");
+        assert!(
+            message.starts_with("Failed to fetch resources:")
+                && message.contains("scripted fetch failure at r:1:2"),
+            "{message}"
+        );
+        assert!(source.fetched_cursors("catchup:").is_empty());
+    }
+
+    #[tokio::test]
+    async fn first_real_error_wins_over_cancelled_streams() {
+        let seq = new_seq();
+        let source = Arc::new(RangedSource::new(
+            vec![
+                range_pages("a", 1, 2),
+                range_pages("b", 40, 2),
+                range_pages("c", 40, 2),
+            ],
+            vec![vec!["z0".to_string()]],
+            seq.clone(),
+        ));
+        source.fail_cursor("r:0:1");
+        let op = ranged_operation(source.clone(), Arc::new(RangedWriter::new(seq)));
+        let job = op
+            .start(
+                named_tenant("streams-first-error"),
+                streams_request(3),
+                None,
+            )
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Failed, "{progress:?}");
+        let message = progress.error_message.as_deref().unwrap_or("");
+        assert!(
+            message.contains("scripted fetch failure at r:0:1"),
+            "{message}"
+        );
+        let fetched = source.fetched_cursors("r:");
+        assert!(
+            !fetched.iter().any(|c| c == "r:1:41" || c == "r:2:41"),
+            "the other streams must stop at a page boundary, long before their end: {fetched:?}"
+        );
+        assert!(source.fetched_cursors("catchup:").is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancel_during_streams_finishes_in_flight_pages_and_skips_catch_up() {
+        let seq = new_seq();
+        let source = Arc::new(RangedSource::new(
+            vec![
+                range_pages("a", 2, 2),
+                range_pages("b", 2, 2),
+                range_pages("c", 2, 2),
+            ],
+            vec![vec!["z0".to_string()]],
+            seq.clone(),
+        ));
+        let gate = Arc::new(Semaphore::new(0));
+        let writer = Arc::new(RangedWriter {
+            gate: Some(gate.clone()),
+            ..RangedWriter::new(seq)
+        });
+        let op = ranged_operation(source.clone(), writer.clone());
+        let job = op
+            .start(named_tenant("streams-cancel"), streams_request(3), None)
+            .await
+            .unwrap();
+
+        // Every stream is inside its first page's write, held by the gate.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while writer.started.load(Ordering::SeqCst) < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all three streams must reach their first page write");
+
+        op.cancel(&job).await.expect("cancel");
+        gate.add_permits(3);
+
+        // The task releases its cancellation channel when it returns: the
+        // only signal that every stream has stopped for good.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while op.cancel_channels.read().contains_key(&job) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the cancelled reindex task did not return");
+
+        assert_eq!(
+            writer.ended.load(Ordering::SeqCst),
+            3,
+            "each page in flight is written in full"
+        );
+        assert_eq!(
+            source.fetched_cursors("r:").len(),
+            3,
+            "no stream fetches past the page it was writing"
+        );
+        assert!(source.fetched_cursors("catchup:").is_empty());
+        let progress = op.get_progress(&job).await.expect("progress");
+        assert_eq!(progress.status, ReindexStatus::Cancelled);
+        assert_eq!(progress.processed_resources, 6);
+    }
+
+    #[tokio::test]
+    async fn stream_panic_fails_job_like_a_serial_panic() {
+        let seq = new_seq();
+        let source = Arc::new(RangedSource::new(
+            vec![
+                range_pages("a", 3, 2),
+                range_pages("b", 3, 2),
+                range_pages("c", 3, 2),
+            ],
+            vec![vec!["z0".to_string()]],
+            seq.clone(),
+        ));
+        source.panic_cursor("r:1:1");
+        let writer = Arc::new(RangedWriter {
+            delay: Duration::from_millis(20),
+            ..RangedWriter::new(seq)
+        });
+        let op = ranged_operation(source.clone(), writer.clone());
+        let job = op
+            .start(named_tenant("streams-panic"), streams_request(3), None)
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Failed, "{progress:?}");
+        assert_eq!(
+            progress.error_message.as_deref(),
+            Some("Reindex task panicked before completing")
+        );
+        let started = writer.started.load(Ordering::SeqCst);
+        assert!(
+            started >= 1,
+            "another stream was writing when range b panicked"
+        );
+        assert_eq!(
+            writer.ended.load(Ordering::SeqCst),
+            started,
+            "the driver must let the other streams finish their pages before failing"
+        );
+        assert!(source.fetched_cursors("catchup:").is_empty());
+    }
+
+    #[tokio::test]
+    async fn resource_failure_attribution_under_streams() {
+        let seq = new_seq();
+        let source = Arc::new(RangedSource::new(
+            vec![
+                range_pages("a", 2, 2),
+                range_pages("b", 2, 2),
+                range_pages("c", 2, 2),
+            ],
+            Vec::new(),
+            seq.clone(),
+        ));
+        let writer = Arc::new(RangedWriter {
+            reject: BTreeSet::from(["c1".to_string()]),
+            ..RangedWriter::new(seq)
+        });
+        let op = ranged_operation(source, writer);
+        let job = op
+            .start(
+                named_tenant("streams-attribution"),
+                streams_request(3),
+                None,
+            )
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+        assert_eq!(progress.errors.len(), 1, "{:?}", progress.errors);
+        assert_eq!(progress.errors[0].resource_type, "Observation");
+        assert_eq!(progress.errors[0].resource_id, "c1");
+        assert!(!progress.errors[0].retryable);
+    }
+
+    #[tokio::test]
+    async fn multi_stream_types_cap_uncapped_pages() {
+        async fn fetched_caps(plan: RangedPlan, batch_bytes: u64, tenant: &str) -> Vec<u64> {
+            let seq = new_seq();
+            let source = Arc::new(
+                RangedSource::new(
+                    vec![range_pages("a", 2, 2), range_pages("b", 2, 2)],
+                    vec![vec!["z0".to_string()]],
+                    seq.clone(),
+                )
+                .with_plan(plan),
+            );
+            let op = ranged_operation(source.clone(), Arc::new(RangedWriter::new(seq)));
+            let job = op
+                .start(
+                    named_tenant(tenant),
+                    streams_request(4).with_batch_bytes(batch_bytes),
+                    None,
+                )
+                .await
+                .unwrap();
+            let progress = await_finished(&op, &job).await;
+            assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+            source
+                .fetched()
+                .into_iter()
+                .map(|(_, _, max_bytes)| max_bytes)
+                .collect()
+        }
+
+        let ranged = fetched_caps(RangedPlan::Ranges, 0, "streams-cap-ranges").await;
+        assert!(
+            !ranged.is_empty() && ranged.iter().all(|b| *b == 33_554_432),
+            "range and catch-up pages of a split type are never uncapped: {ranged:?}"
+        );
+        let single = fetched_caps(RangedPlan::Single, 0, "streams-cap-single").await;
+        assert_eq!(single, vec![0], "a single walk keeps the run's own cap");
+        let explicit = fetched_caps(RangedPlan::Ranges, 4096, "streams-cap-explicit").await;
+        assert!(explicit.iter().all(|b| *b == 4096), "{explicit:?}");
+    }
+
+    #[tokio::test]
+    async fn type_finished_line_reports_streams_and_plan_ms() {
+        let (_guard, events) = capture_contract();
+        let seq = new_seq();
+        let source = Arc::new(RangedSource::new(
+            vec![
+                range_pages("a", 2, 2),
+                range_pages("b", 2, 2),
+                range_pages("c", 2, 2),
+            ],
+            vec![vec!["z0".to_string()]],
+            seq.clone(),
+        ));
+        let op = ranged_operation(source, Arc::new(RangedWriter::new(seq)));
+        let job = op
+            .start(named_tenant("streams-contract"), streams_request(4), None)
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+
+        let events = events.lock().unwrap().clone();
+        assert_contract(&events);
+        let job_started = events
+            .iter()
+            .find(|e| e.message == "reindex job started")
+            .expect("reindex job started");
+        assert_eq!(job_started.values["write_streams"], "4");
+        let type_finished = events
+            .iter()
+            .find(|e| e.message == "reindex type finished")
+            .expect("reindex type finished");
+        assert_eq!(type_finished.values["streams"], "3");
+        assert!(type_finished.values.contains_key("plan_ms"));
+        let pages = events
+            .iter()
+            .filter(|e| e.message == "reindex page")
+            .count();
+        assert_eq!(type_finished.values["pages"], pages.to_string());
+    }
+
+    #[tokio::test]
+    async fn a_plan_without_ranges_fails_the_type() {
+        let seq = new_seq();
+        let source = Arc::new(
+            RangedSource::new(vec![range_pages("a", 1, 2)], Vec::new(), seq.clone())
+                .with_plan(RangedPlan::NoRanges),
+        );
+        let op = ranged_operation(source.clone(), Arc::new(RangedWriter::new(seq)));
+        let job = op
+            .start(named_tenant("streams-no-ranges"), streams_request(4), None)
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Failed, "{progress:?}");
+        assert_eq!(
+            progress.error_message.as_deref(),
+            Some("The walk plan of Observation has no id ranges")
+        );
+        assert!(source.fetched().is_empty(), "nothing is fetched");
+    }
+
+    #[tokio::test]
+    async fn a_failed_plan_fails_the_job() {
+        let seq = new_seq();
+        let source = Arc::new(
+            RangedSource::new(vec![range_pages("a", 1, 2)], Vec::new(), seq.clone())
+                .with_plan(RangedPlan::Fail),
+        );
+        let op = ranged_operation(source.clone(), Arc::new(RangedWriter::new(seq)));
+        let job = op
+            .start(named_tenant("streams-plan-fails"), streams_request(4), None)
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Failed, "{progress:?}");
+        let message = progress.error_message.as_deref().unwrap_or("");
+        assert!(
+            message.starts_with("Failed to plan the walk of Observation: backend unavailable"),
+            "{message}"
+        );
+        assert!(source.fetched().is_empty(), "nothing is fetched");
+    }
+
+    #[tokio::test]
+    async fn ranges_prefetch_their_own_next_page_and_write_in_fetch_order() {
+        let seq = new_seq();
+        let source = Arc::new(
+            RangedSource::new(
+                vec![
+                    range_pages("a", 3, 2),
+                    range_pages("b", 3, 2),
+                    range_pages("c", 3, 2),
+                ],
+                Vec::new(),
+                seq.clone(),
+            )
+            .with_prefetch(),
+        );
+        let writer = Arc::new(RangedWriter::new(seq));
+        let op = ranged_operation(source.clone(), writer.clone());
+        let job = op
+            .start(named_tenant("streams-prefetch"), streams_request(3), None)
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+        assert_eq!(progress.processed_resources, 18);
+
+        let cursors: Vec<String> = source
+            .fetched()
+            .into_iter()
+            .map(|(_, cursor, _)| cursor)
+            .collect();
+        let unique: BTreeSet<&String> = cursors.iter().collect();
+        assert_eq!(
+            unique.len(),
+            cursors.len(),
+            "a page was fetched twice: {cursors:?}"
+        );
+        for prefix in ["a", "b", "c"] {
+            let firsts: Vec<String> = writer
+                .page_writes()
+                .into_iter()
+                .filter(|(_, ids)| ids[0].starts_with(prefix))
+                .map(|(_, ids)| ids[0].clone())
+                .collect();
+            assert_eq!(
+                firsts,
+                vec![
+                    format!("{prefix}0"),
+                    format!("{prefix}2"),
+                    format!("{prefix}4")
+                ],
+                "range {prefix} must be written in fetch order"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_automatic_hook_plans_with_its_write_streams_and_concurrency() {
+        let seq = new_seq();
+        let source = Arc::new(RangedSource::new(
+            vec![range_pages("a", 1, 2), range_pages("b", 1, 2)],
+            Vec::new(),
+            seq.clone(),
+        ));
+        let writer = Arc::new(RangedWriter::new(seq));
+        let op = ranged_operation(source.clone(), writer.clone());
+        // The production path: hook -> coordinator -> `GenerationScope::request`
+        // -> the driver's `TypeWalkRequest`.
+        let hook = ReindexOnFinish::with_max_concurrency(op.clone(), 2).with_write_streams(4);
+        hook.reindex_types(
+            &named_tenant("streams-automatic"),
+            vec!["Observation".to_string()],
+        )
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while source.plans.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the automatic generation must plan the type");
+        await_automatic_idle(&op).await;
+
+        assert_eq!(
+            source.requests.lock().clone(),
+            vec![TypeWalkRequest {
+                streams: 4,
+                min_resources_per_stream: DEFAULT_MIN_RESOURCES_PER_STREAM,
+                concurrent_runs: 2,
+            }]
+        );
+        let mut written: Vec<String> = writer
+            .page_writes()
+            .into_iter()
+            .flat_map(|(_, ids)| ids)
+            .collect();
+        written.sort();
+        assert_eq!(
+            written,
+            ["a0", "a1", "b0", "b1"],
+            "the generation ran to its end"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_streams_above_the_maximum_plan_at_the_maximum() {
+        let seq = new_seq();
+        let source = Arc::new(RangedSource::new(
+            vec![range_pages("a", 1, 2), range_pages("b", 1, 2)],
+            Vec::new(),
+            seq.clone(),
+        ));
+        let op = ranged_operation(source.clone(), Arc::new(RangedWriter::new(seq)));
+        // A deserialized request bypasses `with_write_streams`' clamp.
+        let mut request = streams_request(1);
+        request.write_streams = 40;
+        let job = op
+            .start(named_tenant("streams-over-max"), request, None)
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+        let planned: Vec<u32> = source.requests.lock().iter().map(|r| r.streams).collect();
+        assert_eq!(planned, vec![REINDEX_MAX_WRITE_STREAMS]);
+    }
+
+    #[tokio::test]
+    async fn cancel_during_planning_fetches_no_range() {
+        let seq = new_seq();
+        let gate = Arc::new(Semaphore::new(0));
+        let source = Arc::new(RangedSource {
+            plan_gate: Some(gate.clone()),
+            ..RangedSource::new(
+                vec![range_pages("a", 2, 2), range_pages("b", 2, 2)],
+                vec![vec!["z0".to_string()]],
+                seq.clone(),
+            )
+        });
+        let op = ranged_operation(source.clone(), Arc::new(RangedWriter::new(seq)));
+        let job = op
+            .start(
+                named_tenant("streams-cancel-plan"),
+                streams_request(2),
+                None,
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while source.plans.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the driver must reach plan_type_walk");
+        op.cancel(&job).await.expect("cancel");
+        gate.add_permits(1);
+
+        // The task releases its cancellation channel when it returns.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while op.cancel_channels.read().contains_key(&job) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the cancelled reindex task did not return");
+
+        // On this current-thread runtime the streams' own first stop check
+        // would also catch the cancel; the check before spawning matters on
+        // a multi-thread runtime, where a spawned stream can fetch before the
+        // driver polls the cancellation. This pins the observable outcome.
+        assert!(source.fetched().is_empty(), "{:?}", source.fetched());
+        let progress = op.get_progress(&job).await.expect("progress");
+        assert_eq!(progress.status, ReindexStatus::Cancelled);
+        assert_eq!(progress.processed_resources, 0);
     }
 
     #[tokio::test]
