@@ -1963,6 +1963,36 @@ mod postgres_integration {
         ));
     }
 
+    mod release_contract {
+        use helios_persistence as persistence;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/bulk_submit/release_contract.rs"
+        ));
+    }
+
+    /// See `release_contract::release_requeues_and_fences_out_a_zombie` (#1531).
+    #[tokio::test]
+    async fn postgres_bulk_submit_release_requeues_and_fences_out_a_zombie() {
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        release_contract::release_requeues_and_fences_out_a_zombie(
+            &create_backend().await,
+            &create_tenant("submit-release"),
+        )
+        .await;
+    }
+
+    /// See `release_contract::release_after_abort_is_a_no_op` (#1531).
+    #[tokio::test]
+    async fn postgres_bulk_submit_release_after_abort_is_a_no_op() {
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        release_contract::release_after_abort_is_a_no_op(
+            &create_backend().await,
+            &create_tenant("submit-release-abort"),
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn postgres_bulk_submit_worker_exact_artifacts_across_pages() {
         let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
@@ -18318,6 +18348,115 @@ mod postgres_integration {
                 .is_empty(),
             "no part of the abandoned attempt survives into the manifest"
         );
+
+        backend
+            .finish_export_job(&tenant, &job_id, &worker_b, lease_b.fencing_token)
+            .await
+            .unwrap();
+    }
+
+    /// A lease released on shutdown gives its attempt back and discards the
+    /// run's rows, so the next claim, by any worker, starts the job cleanly
+    /// with the same attempt count it would have had (#1531). A zombie
+    /// release after that reclaim changes nothing.
+    #[tokio::test]
+    async fn postgres_integration_export_release_refunds_the_attempt_and_discards_the_run() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-release");
+
+        let job_id = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        // A cap of one: a release that kept the attempt would retire the job
+        // on the next claim.
+        let worker_a = WorkerId::new(format!("pg-release-a-{}", uuid::Uuid::new_v4()));
+        let lease_a =
+            claim_specific_with_cap(&backend, &worker_a, &job_id, StdDuration::from_secs(60), 1)
+                .await;
+        backend
+            .mark_export_in_progress(&tenant, &job_id, &worker_a, lease_a.fencing_token)
+            .await
+            .unwrap();
+        let mut patient = TypeExportProgress::new("Patient");
+        patient.exported_count = 200;
+        patient.cursor_state = Some("page-3".to_string());
+        record_type_progress(
+            &backend,
+            &tenant,
+            &job_id,
+            &worker_a,
+            lease_a.fencing_token,
+            patient,
+        )
+        .await;
+        for part_index in 0..2 {
+            record_output_part(
+                &backend,
+                &tenant,
+                &job_id,
+                &worker_a,
+                lease_a.fencing_token,
+                "Patient",
+                part_index,
+                100,
+            )
+            .await;
+        }
+        assert_eq!(export_attempts(&backend, &job_id).await, 1);
+        assert_eq!(export_row_counts(&backend, &job_id).await, (1, 2));
+
+        assert!(
+            ExportClaimStrategy::release(&backend, lease_a.clone())
+                .await
+                .unwrap()
+        );
+        assert_eq!(export_attempts(&backend, &job_id).await, 0);
+        assert_eq!(
+            export_row_counts(&backend, &job_id).await,
+            (0, 0),
+            "the released run's progress and file rows are gone"
+        );
+        let status = backend.get_export_status(&tenant, &job_id).await.unwrap();
+        assert_eq!(status.status, ExportStatus::Accepted);
+
+        let worker_b = WorkerId::new(format!("pg-release-b-{}", uuid::Uuid::new_v4()));
+        let lease_b =
+            claim_specific_with_cap(&backend, &worker_b, &job_id, StdDuration::from_secs(60), 1)
+                .await;
+        assert!(lease_b.fencing_token > lease_a.fencing_token);
+        assert_eq!(export_attempts(&backend, &job_id).await, 1);
+        let view = backend
+            .get_export_job_for_worker(&tenant, &job_id, &worker_b, lease_b.fencing_token)
+            .await
+            .unwrap();
+        assert!(view.type_progress.is_empty(), "nothing to resume from");
+
+        // Worker B writes; worker A, a zombie now, releases again.
+        record_output_part(
+            &backend,
+            &tenant,
+            &job_id,
+            &worker_b,
+            lease_b.fencing_token,
+            "Patient",
+            0,
+            100,
+        )
+        .await;
+        assert!(
+            !ExportClaimStrategy::release(&backend, lease_a)
+                .await
+                .unwrap()
+        );
+        assert_eq!(export_attempts(&backend, &job_id).await, 1, "no refund");
+        assert_eq!(export_row_counts(&backend, &job_id).await, (0, 1));
+        backend
+            .heartbeat(&lease_b)
+            .await
+            .expect("worker B still holds its lease");
 
         backend
             .finish_export_job(&tenant, &job_id, &worker_b, lease_b.fencing_token)

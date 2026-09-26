@@ -923,7 +923,7 @@ impl SubmitClaimStrategy for CompositeSubmitJobs {
         self.primary.heartbeat(lease).await
     }
 
-    async fn release(&self, lease: ManifestLease) -> StorageResult<()> {
+    async fn release(&self, lease: ManifestLease) -> StorageResult<bool> {
         self.primary.release(lease).await
     }
 }

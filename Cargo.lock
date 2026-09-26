@@ -3539,6 +3539,7 @@ dependencies = [
  "serde_json",
  "sqlparser",
  "tokio",
+ "tokio-util",
  "tower",
  "tracing",
 ]
@@ -3684,6 +3685,7 @@ dependencies = [
  "tokio-postgres",
  "tokio-stream",
  "tokio-test",
+ "tokio-util",
  "tower-http",
  "tracing",
  "tracing-subscriber",

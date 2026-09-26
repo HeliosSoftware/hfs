@@ -775,12 +775,22 @@ impl ExportClaimStrategy for PostgresBackend {
         }
     }
 
-    async fn release(&self, lease: ExportJobLease) -> StorageResult<()> {
-        let client = self.get_client().await?;
-        client
+    async fn release(&self, lease: ExportJobLease) -> StorageResult<bool> {
+        let mut client = self.get_client().await?;
+        // The fenced UPDATE and the wipe commit together: a claim that saw the
+        // job `accepted` again but still found this run's rows would resume
+        // from them (#1041). The fence also keeps a zombie from refunding or
+        // wiping an attempt that another worker now runs.
+        let txn = client
+            .transaction()
+            .await
+            .map_err(|e| internal_error(format!("Failed to begin release txn: {}", e)))?;
+        let released = txn
             .execute(
                 "UPDATE bulk_export_jobs
-                 SET status = 'accepted', worker_id = NULL, lease_expiry = NULL
+                 SET status = 'accepted', worker_id = NULL, lease_expiry = NULL,
+                     attempts = GREATEST(attempts - 1, 0),
+                     current_type = NULL, types_done = 0
                  WHERE id = $1 AND worker_id = $2 AND fencing_token = $3
                    AND status = 'in-progress'",
                 &[
@@ -790,8 +800,26 @@ impl ExportClaimStrategy for PostgresBackend {
                 ],
             )
             .await
-            .map_err(|e| internal_error(format!("Failed to release lease: {}", e)))?;
-        Ok(())
+            .map_err(|e| internal_error(format!("Failed to release lease: {}", e)))?
+            == 1;
+        if released {
+            txn.execute(
+                "DELETE FROM bulk_export_progress WHERE job_id = $1",
+                &[&lease.job_id.as_str()],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to clear released progress: {}", e)))?;
+            txn.execute(
+                "DELETE FROM bulk_export_files WHERE job_id = $1",
+                &[&lease.job_id.as_str()],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to clear released file rows: {}", e)))?;
+        }
+        txn.commit()
+            .await
+            .map_err(|e| internal_error(format!("Failed to commit release txn: {}", e)))?;
+        Ok(released)
     }
 }
 

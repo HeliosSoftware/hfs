@@ -2347,9 +2347,9 @@ impl SubmitClaimStrategy for PostgresBackend {
         }
     }
 
-    async fn release(&self, lease: ManifestLease) -> StorageResult<()> {
+    async fn release(&self, lease: ManifestLease) -> StorageResult<bool> {
         let client = self.get_client().await?;
-        client
+        let released = client
             .execute(
                 "UPDATE bulk_manifests
                  SET status = 'pending', worker_id = NULL, lease_expiry = NULL
@@ -2367,7 +2367,7 @@ impl SubmitClaimStrategy for PostgresBackend {
             )
             .await
             .map_err(|e| internal_error(format!("Failed to release manifest lease: {}", e)))?;
-        Ok(())
+        Ok(released == 1)
     }
 }
 

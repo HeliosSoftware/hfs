@@ -20,6 +20,8 @@
 
 use std::sync::Arc;
 
+mod worker_shutdown;
+
 use helios_audit::{
     AuditBackend, AuditConfig, AuditMiddlewareState, AuditSink, ExclusionFilter, lifecycle,
 };
@@ -877,14 +879,37 @@ async fn serve(
     .with_graceful_shutdown(async move {
         let _ = tokio::signal::ctrl_c().await;
         info!("Shutdown signal received, draining connections");
-        if let Some(state) = audit_state {
-            lifecycle::record_shutdown(&*state.sink, &state.config.source_observer).await;
-            state.sink.flush().await;
-        }
-        // Flush any buffered OTLP spans (no-op without the `otel` feature).
-        helios_observability::telemetry::shutdown();
+        // The bulk workers stop now, in parallel with the HTTP drain: they
+        // stop claiming and wind their jobs down to a point where the lease
+        // can be handed back (#1531).
+        worker_shutdown::pools().begin_shutdown();
     })
     .await?;
+
+    // Wait for the workers to release their leases before the final audit
+    // and trace flush, so what they log on the way out is flushed too.
+    let pools = worker_shutdown::pools();
+    let timeout = worker_shutdown::drain_timeout();
+    let running = pools.running();
+    if pools.drain(timeout).await {
+        if running > 0 {
+            info!(workers = running, "Bulk workers stopped");
+        }
+    } else {
+        warn!(
+            still_running = pools.running(),
+            timeout_secs = timeout.as_secs(),
+            "Bulk workers did not stop in time (HFS_WORKER_SHUTDOWN_TIMEOUT); their leases \
+             will lapse and the jobs resume on another instance after the lease duration"
+        );
+    }
+
+    if let Some(state) = audit_state {
+        lifecycle::record_shutdown(&*state.sink, &state.config.source_observer).await;
+        state.sink.flush().await;
+    }
+    // Flush any buffered OTLP spans (no-op without the `otel` feature).
+    helios_observability::telemetry::shutdown();
     Ok(())
 }
 
@@ -2080,30 +2105,38 @@ fn spawn_export_workers<Dp>(
     let lease = std::time::Duration::from_secs(cfg.lease_duration_secs);
     let heartbeat = std::time::Duration::from_secs(cfg.heartbeat_interval_secs);
     let max_attempts = cfg.max_attempts;
+    let pools = worker_shutdown::pools();
     for i in 0..cfg.worker_concurrency {
         let jobs = jobs.clone();
         let data = data.clone();
         let output = output.clone();
         let worker_id = WorkerId::new(format!("hfs-worker-{i}"));
         let exclude_newly_added = cfg.since_newly_added.eq_ignore_ascii_case("exclude");
-        tokio::spawn(async move {
+        let shutdown = pools.token();
+        pools.spawn(async move {
             let worker = DefaultExportWorker::new(jobs.clone(), data, output, worker_id.clone())
                 .with_exclude_since_newly_added(exclude_newly_added)
-                .with_heartbeat_interval(heartbeat);
-            loop {
-                match jobs.claim_next(&worker_id, lease, max_attempts).await {
+                .with_heartbeat_interval(heartbeat)
+                .with_shutdown(shutdown.clone());
+            // The claim itself is never raced against shutdown: a claim that
+            // commits after its future was dropped would leave a leased job
+            // that nobody runs.
+            while !shutdown.is_cancelled() {
+                let pause = match jobs.claim_next(&worker_id, lease, max_attempts).await {
                     Ok(Some(claimed)) => {
                         if let Err(e) = worker.run_job(claimed).await {
                             tracing::error!("export worker job failed: {e}");
                         }
+                        continue;
                     }
-                    Ok(None) => {
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    }
+                    Ok(None) => std::time::Duration::from_secs(2),
                     Err(e) => {
                         tracing::error!("export worker claim failed: {e}");
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        std::time::Duration::from_secs(5)
                     }
+                };
+                if worker_shutdown::idle(&shutdown, pause).await {
+                    break;
                 }
             }
         });
@@ -2499,31 +2532,39 @@ fn spawn_submit_workers(
         let reindex_hook = reindex_hook.clone();
         let write_observer = write_observer.clone();
         let worker_id = WorkerId::new(format!("hfs-submit-worker-{i}"));
-        tokio::spawn(async move {
+        let pools = worker_shutdown::pools();
+        let shutdown = pools.token();
+        pools.spawn(async move {
             let mut worker =
                 DefaultSubmitWorker::new(jobs.clone(), fetcher, output, worker_id.clone())
                     .with_deferred_indexing(defer_indexing, reindex_hook.clone())
                     .with_write_observer(Some(write_observer))
                     .with_file_concurrency(file_concurrency)
                     .with_batch_size(batch_size)
-                    .with_skip_unchanged(skip_unchanged);
+                    .with_skip_unchanged(skip_unchanged)
+                    .with_shutdown(shutdown.clone());
             if file_scheduling.independent_tasks {
                 worker = worker.with_independent_file_tasks();
             }
-            loop {
-                match jobs.claim_next_manifest(&worker_id, lease).await {
+            // The claim itself is never raced against shutdown: a claim that
+            // commits after its future was dropped would leave a leased
+            // manifest that nobody runs.
+            while !shutdown.is_cancelled() {
+                let pause = match jobs.claim_next_manifest(&worker_id, lease).await {
                     Ok(Some(claimed)) => {
                         if let Err(e) = worker.run_job(claimed).await {
                             tracing::error!("submit worker job failed: {e}");
                         }
+                        continue;
                     }
-                    Ok(None) => {
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    }
+                    Ok(None) => std::time::Duration::from_secs(2),
                     Err(e) => {
                         tracing::error!("submit worker claim failed: {e}");
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        std::time::Duration::from_secs(5)
                     }
+                };
+                if worker_shutdown::idle(&shutdown, pause).await {
+                    break;
                 }
             }
         });

@@ -944,21 +944,46 @@ impl ExportClaimStrategy for SqliteBackend {
         }
     }
 
-    async fn release(&self, lease: ExportJobLease) -> StorageResult<()> {
-        let conn = self.get_connection()?;
-        conn.execute(
-            "UPDATE bulk_export_jobs
-             SET status = 'accepted', worker_id = NULL, lease_expiry = NULL
-             WHERE id = ?1 AND worker_id = ?2 AND fencing_token = ?3
-               AND status = 'in-progress'",
-            params![
-                lease.job_id.as_str(),
-                lease.worker_id.as_str(),
-                lease.fencing_token as i64
-            ],
-        )
-        .or_query_error("Failed to release lease")?;
-        Ok(())
+    async fn release(&self, lease: ExportJobLease) -> StorageResult<bool> {
+        let mut conn = self.get_connection()?;
+        // The fenced UPDATE and the wipe commit together: a claim that saw the
+        // job `accepted` again but still found this run's rows would resume
+        // from them (#1041). The fence also keeps a zombie from refunding or
+        // wiping an attempt that another worker now runs.
+        let txn = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .or_query_error("Failed to begin release txn")?;
+        let released = txn
+            .execute(
+                "UPDATE bulk_export_jobs
+                 SET status = 'accepted', worker_id = NULL, lease_expiry = NULL,
+                     attempts = MAX(attempts - 1, 0),
+                     current_type = NULL, types_done = 0
+                 WHERE id = ?1 AND worker_id = ?2 AND fencing_token = ?3
+                   AND status = 'in-progress'",
+                params![
+                    lease.job_id.as_str(),
+                    lease.worker_id.as_str(),
+                    lease.fencing_token as i64
+                ],
+            )
+            .or_query_error("Failed to release lease")?
+            == 1;
+        if released {
+            txn.execute(
+                "DELETE FROM bulk_export_progress WHERE job_id = ?1",
+                params![lease.job_id.as_str()],
+            )
+            .or_query_error("Failed to clear released progress")?;
+            txn.execute(
+                "DELETE FROM bulk_export_files WHERE job_id = ?1",
+                params![lease.job_id.as_str()],
+            )
+            .or_query_error("Failed to clear released file rows")?;
+        }
+        txn.commit()
+            .or_query_error("Failed to commit release txn")?;
+        Ok(released)
     }
 }
 
@@ -3790,5 +3815,182 @@ mod tests {
             matches!(err, StorageError::Backend(_)),
             "unexpected error: {err:?}"
         );
+    }
+
+    /// Seeds a claimed job with a half-finished run: one progress row with a
+    /// cursor, and two recorded output parts.
+    async fn half_finished_run(
+        backend: &SqliteBackend,
+        tenant: &TenantContext,
+        lease: &ExportJobLease,
+    ) {
+        backend
+            .mark_export_in_progress(tenant, &lease.job_id, &lease.worker_id, lease.fencing_token)
+            .await
+            .unwrap();
+        let mut patient = TypeExportProgress::new("Patient");
+        patient.exported_count = 200;
+        patient.cursor_state = Some("page-3".to_string());
+        record_type_progress(
+            backend,
+            tenant,
+            &lease.job_id,
+            &lease.worker_id,
+            lease.fencing_token,
+            patient,
+        )
+        .await;
+        for part in 0..2 {
+            record_output_part(
+                backend,
+                tenant,
+                &lease.job_id,
+                &lease.worker_id,
+                lease.fencing_token,
+                "Patient",
+                part,
+                100,
+            )
+            .await;
+        }
+        backend
+            .set_export_current_type(
+                tenant,
+                &lease.job_id,
+                &lease.worker_id,
+                lease.fencing_token,
+                Some("Patient"),
+                0,
+                2,
+            )
+            .await
+            .unwrap();
+    }
+
+    /// A lease released on shutdown gives its attempt back and discards the
+    /// run's rows, so the next claim, by any worker, starts the job cleanly
+    /// with the same attempt count it would have had (#1531).
+    #[tokio::test]
+    async fn test_release_refunds_the_attempt_and_discards_the_run() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let job_id = backend
+            .start_export(&tenant, test_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        // A cap of one: a release that kept the attempt would retire the job
+        // on the next claim.
+        let worker_a = WorkerId::new("worker-a");
+        let lease_a = backend
+            .claim_next(&worker_a, StdDuration::from_secs(60), 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempts_of(&backend, &job_id), 1);
+        half_finished_run(&backend, &tenant, &lease_a).await;
+        assert_eq!(attempt_row_counts(&backend, &job_id), (1, 2));
+
+        assert!(backend.release(lease_a.clone()).await.unwrap());
+        assert_eq!(attempts_of(&backend, &job_id), 0, "the attempt is refunded");
+        assert_eq!(
+            attempt_row_counts(&backend, &job_id),
+            (0, 0),
+            "the released run's progress and file rows are gone"
+        );
+        let status = backend.get_export_status(&tenant, &job_id).await.unwrap();
+        assert_eq!(status.status, ExportStatus::Accepted);
+        assert_eq!(status.current_type, None);
+
+        let worker_b = WorkerId::new("worker-b");
+        let lease_b = backend
+            .claim_next(&worker_b, StdDuration::from_secs(60), 1)
+            .await
+            .unwrap()
+            .expect("a released job is claimable at once, cap notwithstanding");
+        assert_eq!(lease_b.job_id, job_id);
+        assert!(lease_b.fencing_token > lease_a.fencing_token);
+        assert_eq!(attempts_of(&backend, &job_id), 1);
+        let view = backend
+            .get_export_job_for_worker(&tenant, &job_id, &worker_b, lease_b.fencing_token)
+            .await
+            .unwrap();
+        assert!(view.type_progress.is_empty(), "nothing to resume from");
+        assert!(
+            backend
+                .get_export_manifest(&tenant, &job_id)
+                .await
+                .unwrap()
+                .output
+                .is_empty()
+        );
+    }
+
+    /// A zombie whose lease was already reclaimed cannot release it: no
+    /// attempt is refunded and the new run's rows stay (#1531).
+    #[tokio::test]
+    async fn test_release_by_a_zombie_after_reclaim_is_a_no_op() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let job_id = backend
+            .start_export(&tenant, test_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        let worker_a = WorkerId::new("worker-a");
+        let lease_a = backend
+            .claim_next(&worker_a, StdDuration::from_millis(1), TEST_MAX_ATTEMPTS)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let worker_b = WorkerId::new("worker-b");
+        let lease_b = backend
+            .claim_next(&worker_b, StdDuration::from_secs(60), TEST_MAX_ATTEMPTS)
+            .await
+            .unwrap()
+            .expect("the lapsed lease is reclaimed");
+        assert_eq!(lease_b.job_id, job_id);
+        half_finished_run(&backend, &tenant, &lease_b).await;
+        assert_eq!(attempts_of(&backend, &job_id), 2);
+
+        assert!(!backend.release(lease_a).await.unwrap());
+        assert_eq!(attempts_of(&backend, &job_id), 2, "no attempt refunded");
+        assert_eq!(attempt_row_counts(&backend, &job_id), (1, 2));
+        let status = backend.get_export_status(&tenant, &job_id).await.unwrap();
+        assert_eq!(status.status, ExportStatus::InProgress);
+        backend
+            .heartbeat(&lease_b)
+            .await
+            .expect("worker B still holds its lease");
+    }
+
+    /// Releasing a job that already finished changes nothing: only an
+    /// `in-progress` job can go back to the queue.
+    #[tokio::test]
+    async fn test_release_after_finish_is_a_no_op() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let job_id = backend
+            .start_export(&tenant, test_input(ExportRequest::system()))
+            .await
+            .unwrap();
+        let worker = WorkerId::new("worker-a");
+        let lease = backend
+            .claim_next(&worker, StdDuration::from_secs(60), TEST_MAX_ATTEMPTS)
+            .await
+            .unwrap()
+            .unwrap();
+        half_finished_run(&backend, &tenant, &lease).await;
+        backend
+            .finish_export_job(&tenant, &job_id, &worker, lease.fencing_token)
+            .await
+            .unwrap();
+
+        assert!(!backend.release(lease).await.unwrap());
+        assert_eq!(attempts_of(&backend, &job_id), 1);
+        assert_eq!(attempt_row_counts(&backend, &job_id), (1, 2));
+        let status = backend.get_export_status(&tenant, &job_id).await.unwrap();
+        assert_eq!(status.status, ExportStatus::Complete);
     }
 }

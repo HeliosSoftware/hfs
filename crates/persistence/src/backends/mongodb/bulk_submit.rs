@@ -1765,10 +1765,11 @@ impl SubmitClaimStrategy for MongoBackend {
         Ok(new_expiry)
     }
 
-    async fn release(&self, lease: ManifestLease) -> StorageResult<()> {
+    async fn release(&self, lease: ManifestLease) -> StorageResult<bool> {
         let mut filter = fenced_filter(&lease);
         filter.insert("status", ManifestStatus::Processing.to_string());
-        self.manifests()
+        let released = self
+            .manifests()
             .await?
             .update_one(
                 filter,
@@ -1780,7 +1781,7 @@ impl SubmitClaimStrategy for MongoBackend {
             )
             .await
             .map_err(|e| internal_error(format!("release manifest lease: {e}")))?;
-        Ok(())
+        Ok(released.modified_count == 1)
     }
 }
 

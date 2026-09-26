@@ -4538,6 +4538,29 @@ async fn transaction_bundle_is_refused_without_writing_anything() {
 mod bulk_submit_worker {
     use super::*;
 
+    mod release_contract {
+        use crate as persistence;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/bulk_submit/release_contract.rs"
+        ));
+    }
+
+    /// See `release_contract::release_requeues_and_fences_out_a_zombie` (#1531).
+    #[tokio::test]
+    async fn release_requeues_and_fences_out_a_zombie() {
+        let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+        release_contract::release_requeues_and_fences_out_a_zombie(&backend, &tenant("tenant-a"))
+            .await;
+    }
+
+    /// See `release_contract::release_after_abort_is_a_no_op` (#1531).
+    #[tokio::test]
+    async fn release_after_abort_is_a_no_op() {
+        let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+        release_contract::release_after_abort_is_a_no_op(&backend, &tenant("tenant-a")).await;
+    }
+
     use std::time::Duration;
 
     use crate::core::bulk_export_worker::WorkerId;

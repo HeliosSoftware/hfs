@@ -647,19 +647,25 @@ impl SubmitClaimStrategy for S3Backend {
         Ok(new_expiry)
     }
 
-    async fn release(&self, lease: ManifestLease) -> StorageResult<()> {
-        // Best-effort: a lease we no longer hold has already been reclaimed by
-        // someone else, and there is nothing to give back.
-        let _ = self
-            .fenced_mutate(&lease, |state| {
-                if state.manifest.status == ManifestStatus::Processing {
+    async fn release(&self, lease: ManifestLease) -> StorageResult<bool> {
+        // A lease we no longer hold was reclaimed or aborted under us; there is
+        // nothing to give back.
+        match self
+            .fenced_mutate_if(
+                &lease,
+                |state| state.manifest.status == ManifestStatus::Processing,
+                |state| {
                     state.manifest.status = ManifestStatus::Pending;
                     state.worker_id = None;
                     state.lease_expiry = None;
-                }
-            })
-            .await;
-        Ok(())
+                },
+            )
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(LeaseError::LeaseLost { .. }) => Ok(false),
+            Err(LeaseError::Storage(e)) => Err(e),
+        }
     }
 }
 

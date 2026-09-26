@@ -78,6 +78,7 @@ axum = "0.8"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 
 # CLI and configuration
 clap = { version = "4.0", features = ["derive", "env"] }

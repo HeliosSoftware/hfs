@@ -12055,6 +12055,40 @@ mod bulk_submit {
         ));
     }
 
+    mod release_contract {
+        use helios_persistence as persistence;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/bulk_submit/release_contract.rs"
+        ));
+    }
+
+    /// See `release_contract::release_requeues_and_fences_out_a_zombie` (#1531).
+    #[tokio::test]
+    async fn test_submit_release_requeues_and_fences_out_a_zombie() {
+        let Some(backend) = create_backend("submit_release").await else {
+            return;
+        };
+        release_contract::release_requeues_and_fences_out_a_zombie(
+            &backend,
+            &create_tenant("submit-release"),
+        )
+        .await;
+    }
+
+    /// See `release_contract::release_after_abort_is_a_no_op` (#1531).
+    #[tokio::test]
+    async fn test_submit_release_after_abort_is_a_no_op() {
+        let Some(backend) = create_backend("submit_release_abort").await else {
+            return;
+        };
+        release_contract::release_after_abort_is_a_no_op(
+            &backend,
+            &create_tenant("submit-release-abort"),
+        )
+        .await;
+    }
+
     #[async_trait::async_trait]
     impl receipt_paging_contract::ReceiptFixture for MongoBackend {
         async fn seed_receipts(

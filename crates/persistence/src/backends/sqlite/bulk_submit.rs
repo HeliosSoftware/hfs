@@ -2292,24 +2292,26 @@ impl SubmitClaimStrategy for SqliteBackend {
         }
     }
 
-    async fn release(&self, lease: ManifestLease) -> StorageResult<()> {
+    async fn release(&self, lease: ManifestLease) -> StorageResult<bool> {
         let conn = self.get_connection()?;
-        conn.execute(
-            "UPDATE bulk_manifests
-             SET status = 'pending', worker_id = NULL, lease_expiry = NULL
-             WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3 AND manifest_id = ?4
-               AND worker_id = ?5 AND fencing_token = ?6 AND status = 'processing'",
-            params![
-                lease.tenant.tenant_id().as_str(),
-                lease.submission_id.submitter,
-                lease.submission_id.submission_id,
-                lease.manifest_id,
-                lease.worker_id.as_str(),
-                lease.fencing_token as i64
-            ],
-        )
-        .map_err(|e| internal_error(format!("Failed to release manifest lease: {}", e)))?;
-        Ok(())
+        let released = conn
+            .execute(
+                "UPDATE bulk_manifests
+                 SET status = 'pending', worker_id = NULL, lease_expiry = NULL
+                 WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3
+                   AND manifest_id = ?4 AND worker_id = ?5 AND fencing_token = ?6
+                   AND status = 'processing'",
+                params![
+                    lease.tenant.tenant_id().as_str(),
+                    lease.submission_id.submitter,
+                    lease.submission_id.submission_id,
+                    lease.manifest_id,
+                    lease.worker_id.as_str(),
+                    lease.fencing_token as i64
+                ],
+            )
+            .map_err(|e| internal_error(format!("Failed to release manifest lease: {}", e)))?;
+        Ok(released == 1)
     }
 }
 

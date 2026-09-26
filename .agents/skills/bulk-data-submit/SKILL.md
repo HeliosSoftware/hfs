@@ -79,6 +79,7 @@ status-only kick-off (no `manifestUrl`) they have nothing to attach to and are i
 | `HFS_ELASTICSEARCH_REQUEST_TIMEOUT_MS` | `30000` | ES composites: timeout of every Elasticsearch request, `_bulk` included. A timed-out `_bulk` is split in half and resent, down to one document |
 | `HFS_ELASTICSEARCH_REINDEX_REFRESH` | unset | ES composites: `refresh` for `$reindex` and deferred-rebuild writes (`false`/`wait_for`/`true`); unset follows `HFS_ELASTICSEARCH_WRITE_REFRESH`. `false` skips the per-request refresh wait during a rebuild only |
 | `HFS_BULK_SUBMIT_LEASE_DURATION` | `60` | Manifest lease length in seconds; must exceed heartbeat |
+| `HFS_WORKER_SHUTDOWN_TIMEOUT` | `20` | Seconds a graceful shutdown waits for the bulk export and submit workers to stop and release their leases (#1531). A released manifest is claimable by another instance at once and re-walks its files; entries it already committed upsert idempotently. Past the deadline, leases lapse after the lease duration as before |
 | `HFS_BULK_SUBMIT_HEARTBEAT_INTERVAL` | `20` | Worker heartbeat cadence in seconds |
 | `HFS_BULK_SUBMIT_CLEANUP_INTERVAL` | `300` | Cleanup scan interval in seconds |
 | `HFS_BULK_SUBMIT_OUTPUT_TTL` | `86400` | Artifact retention in seconds |
