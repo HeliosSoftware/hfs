@@ -2116,10 +2116,13 @@ mod conditional_entries {
         assert_eq!(patient_count(&backend).await, before + 1);
     }
 
-    /// A `_` parameter that shapes results rather than matching is refused:
-    /// dropped, it would match every resource of the type (#866).
+    /// A result parameter (`_count`, `_sort`, `_format`, …) is not a criterion.
+    /// Beside real criteria it is dropped, as in a batch; alone it leaves
+    /// nothing to match on, which is a `400` rather than "matches nothing" —
+    /// a `PUT` would otherwise create, and a `_`-name once matched everything
+    /// (#866).
     #[tokio::test]
-    async fn a_result_parameter_in_transaction_criteria_is_400_and_writes_nothing() {
+    async fn a_result_parameter_in_transaction_criteria_is_dropped() {
         let (server, backend) = create_test_server().await;
         seed_patient_with_identifier(&backend, "p1", "Nguyen").await;
         let before = patient_count(&backend).await;
@@ -2135,7 +2138,7 @@ mod conditional_entries {
             assert!(
                 body["issue"][0]["details"]["text"]
                     .as_str()
-                    .is_some_and(|t| t.contains("not a search criterion")),
+                    .is_some_and(|t| t.contains("no usable criteria")),
                 "{url}: {body}"
             );
         }
@@ -2146,7 +2149,22 @@ mod conditional_entries {
         .await;
         assert!(response.status_code() != StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(patient_count(&backend).await, before, "nothing was deleted");
-        assert_eq!(family_of(&backend, "p1").await, "Nguyen");
+
+        let body = post_batch(
+            &server,
+            transaction(vec![put_entry(
+                &format!("{CRITERIA_URL}&_format=json&_count=5"),
+                "Updated",
+            )]),
+        )
+        .await;
+        assert_eq!(body["entry"][0]["response"]["status"], "200 OK", "{body}");
+        assert_eq!(family_of(&backend, "p1").await, "Updated");
+        assert_eq!(
+            patient_count(&backend).await,
+            before,
+            "updated, not created"
+        );
     }
 
     #[tokio::test]
@@ -2165,7 +2183,7 @@ mod conditional_entries {
         assert!(
             body["issue"][0]["details"]["text"]
                 .as_str()
-                .is_some_and(|t| t.contains("unknown search parameter")),
+                .is_some_and(|t| t.contains("'ident'ifier', which is not known")),
             "{body}"
         );
         assert_eq!(patient_count(&backend).await, before);
@@ -2193,23 +2211,69 @@ mod conditional_entries {
         assert!(
             body["issue"][0]["details"]["text"]
                 .as_str()
-                .is_some_and(|t| t.contains("invalid criteria")),
+                .is_some_and(|t| t.contains("':contains' is not supported")),
             "{body}"
         );
         assert_eq!(patient_count(&backend).await, before);
     }
 
+    /// `ifMatch` on a conditional entry is evaluated against the resource the
+    /// criteria resolve to, as in a batch (#1381): the current version writes.
     #[tokio::test]
-    async fn if_match_on_a_transaction_conditional_entry_is_400() {
+    async fn if_match_on_a_transaction_conditional_entry_is_honoured() {
         let (server, backend) = create_test_server().await;
         seed_patient_with_identifier(&backend, "p1", "Nguyen").await;
 
         let mut put = put_entry(CRITERIA_URL, "Guarded");
         put["request"]["ifMatch"] = json!("W/\"1\"");
-        let response = post_bundle(&server, transaction(vec![sibling_post(), put])).await;
+        let body = post_batch(&server, transaction(vec![put])).await;
 
-        response.assert_status(StatusCode::BAD_REQUEST);
+        assert_eq!(body["entry"][0]["response"]["status"], "200 OK", "{body}");
+        assert_eq!(family_of(&backend, "p1").await, "Guarded");
+    }
+
+    /// A stale `ifMatch` fails the whole bundle with `412` before anything is
+    /// written, rolling back a sibling that would otherwise have committed.
+    #[tokio::test]
+    async fn a_stale_if_match_on_a_transaction_conditional_entry_is_412() {
+        let (server, backend) = create_test_server().await;
+        seed_patient_with_identifier(&backend, "p1", "Nguyen").await;
+        let before = patient_count(&backend).await;
+
+        for method in ["PUT", "DELETE"] {
+            let mut entry = if method == "PUT" {
+                put_entry(CRITERIA_URL, "Guarded")
+            } else {
+                delete_entry(CRITERIA_URL)
+            };
+            entry["request"]["ifMatch"] = json!("W/\"7\"");
+            let response = post_bundle(&server, transaction(vec![sibling_post(), entry])).await;
+
+            response.assert_status(StatusCode::PRECONDITION_FAILED);
+            let body: Value = response.json();
+            assert_eq!(body["issue"][0]["code"], "conflict", "{method}: {body}");
+        }
+        assert_eq!(
+            patient_count(&backend).await,
+            before,
+            "sibling POST rolled back"
+        );
         assert_eq!(family_of(&backend, "p1").await, "Nguyen");
+    }
+
+    /// Criteria that match nothing fail any supplied `ifMatch`, `*` included:
+    /// the guarded `PUT` does not fall through to a create (#1381).
+    #[tokio::test]
+    async fn if_match_on_an_unmatched_transaction_conditional_put_does_not_create() {
+        let (server, backend) = create_test_server().await;
+        let before = patient_count(&backend).await;
+
+        let mut put = put_entry(CRITERIA_URL, "Guarded");
+        put["request"]["ifMatch"] = json!("*");
+        let response = post_bundle(&server, transaction(vec![put])).await;
+
+        response.assert_status(StatusCode::PRECONDITION_FAILED);
+        assert_eq!(patient_count(&backend).await, before);
     }
 
     #[tokio::test]

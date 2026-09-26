@@ -470,6 +470,18 @@ pub enum TransactionError {
         outcome: serde_json::Value,
     },
 
+    /// A conditional entry's `ifMatch` was not satisfied by the resource its
+    /// criteria resolved to — or its criteria resolved to nothing, which no
+    /// `ifMatch` (`*` included) is satisfied by (#1381). Raised while the
+    /// entries are being resolved, before any is written.
+    #[error("precondition failed at entry {index}: {message}")]
+    PreconditionFailed {
+        /// Zero-based index of the bundle entry whose precondition failed.
+        index: usize,
+        /// Human-readable failure detail.
+        message: String,
+    },
+
     /// Conditional operation matched multiple resources.
     #[error("conditional {operation} matched {count} resources, expected at most 1")]
     MultipleMatches {

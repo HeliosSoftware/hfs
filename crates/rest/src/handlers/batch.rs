@@ -29,7 +29,7 @@ use serde_json::Value;
 use tracing::{debug, error, warn};
 
 use crate::error::{RestError, RestResult, create_operation_outcome};
-use crate::extractors::{FhirVersionExtractor, SearchParams, TenantExtractor};
+use crate::extractors::{FhirVersionExtractor, TenantExtractor};
 use crate::fhir_types::{
     admit_resource_type, is_valid_resource_type, is_valid_resource_type_for_version,
 };
@@ -1798,39 +1798,24 @@ impl AuditTarget {
     }
 }
 
-/// `_`-prefixed names a conditional interaction may carry: the search
-/// criteria among FHIR's common parameters. Everything else that starts with
-/// `_` shapes a result (`_count`, `_sort`, `_include`, …) or is not evaluated
-/// by the backends' conditional query (`_has`, `_list`), and either one would
-/// silently widen the match — `_count` alone would match every resource of the
-/// type — so it is refused instead.
-const CONDITIONAL_COMMON_PARAMS: &[&str] = &[
-    "_id",
-    "_lastUpdated",
-    "_tag",
-    "_profile",
-    "_security",
-    "_source",
-    "_language",
-    "_text",
-    "_content",
-];
-
 /// Admits and parses a transaction entry's URL-borne conditional criteria.
 ///
 /// `Ok(None)` for an entry that carries none: an instance URL (its query, if
 /// any, is a control parameter) or a bare type URL. `Ok(Some)` carries the
 /// typed criteria a backend resolves inside its transaction (#859).
 ///
-/// The refusals mirror the batch arm's (#511): criteria on a `POST` (a
-/// conditional create is `ifNoneExist`), an empty query (`Patient?` would
-/// match everything), and `ifMatch` on a conditional entry (it names a version
-/// of an instance the server has yet to resolve). Beyond those, the criteria
-/// are parsed with the search parser against the tenant's registry, so a
-/// modifier the parameter's type does not define, an unknown parameter, or a
-/// result-shaping `_` parameter is a `400` here rather than a silent
-/// "matches nothing" — which on a conditional write is a duplicate (#865) and
-/// on a `_`-name matched everything (#866).
+/// The criteria go through [`build_conditional_query`], the builder every
+/// backend's `ConditionalStorage` uses for the batch arm and the resource
+/// endpoints, so a transaction admits exactly what a batch admits: unknown
+/// parameters, modifiers the type does not define and valueless criteria are
+/// refused, result parameters (`_format`, `_count`, …) are dropped, and a chain
+/// is `501`. Criteria that leave nothing to match on are a `400` rather than
+/// "matches nothing", which on a `PUT` would create.
+///
+/// `ifMatch` is allowed: the backend evaluates it against the resource the
+/// criteria resolve to, as the batch arm does (#1381).
+///
+/// [`build_conditional_query`]: helios_persistence::search::build_conditional_query
 fn conditional_entry_criteria<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
@@ -1871,67 +1856,36 @@ where
             ),
         });
     }
-    let Some(raw) = conditional_criteria(url, &id) else {
-        return Err(RestError::BadRequest {
-            message: format!("Entry {index}: {method} {url} carries no usable criteria"),
-        });
+    let no_usable_criteria = || RestError::BadRequest {
+        message: format!("Entry {index}: {method} {url} carries no usable criteria"),
     };
-    if entry.if_match.is_some() {
-        return Err(RestError::BadRequest {
-            message: format!(
-                "Entry {index}: ifMatch cannot be combined with a conditional interaction \
-                 ({method} {url}); address the instance directly"
-            ),
-        });
-    }
+    let Some(raw) = conditional_criteria(url, &id) else {
+        return Err(no_usable_criteria());
+    };
 
-    let pairs = crate::extractors::query_pairs::parse_query_pairs(Some(raw));
-    for (name, _) in &pairs {
-        let base = name.split(':').next().unwrap_or(name);
-        if base.starts_with('_') && !CONDITIONAL_COMMON_PARAMS.contains(&base) {
-            return Err(RestError::BadRequest {
-                message: format!(
-                    "Entry {index}: {method} {url}: '{name}' is not a search criterion a \
-                     conditional interaction can be resolved by"
-                ),
-            });
-        }
-    }
     let registry = state.storage().search_param_registry(tenant.context());
     let registry = registry.read();
-    let params = SearchParams::from_pairs(pairs.clone());
-    let unknown = crate::extractors::search_query_builder::unknown_search_params(
-        &resource_type,
-        &params,
+    let query = helios_persistence::search::build_conditional_query(
         &registry,
-    );
-    if !unknown.is_empty() {
-        return Err(RestError::BadRequest {
-            message: format!(
-                "Entry {index}: {method} {url}: unknown search parameter(s) for \
-                 {resource_type}: {}",
-                unknown.join(", ")
-            ),
-        });
-    }
-    let query = crate::extractors::build_search_query_from_pairs(
         &resource_type,
-        &pairs,
-        &registry,
-        fhir_version,
+        raw,
+        helios_persistence::search::ResourceTypeScope::version(fhir_version),
     )
-    .map_err(|e| RestError::BadRequest {
-        message: format!(
-            "Entry {index}: {method} {url}: invalid criteria: {}",
-            e.client_response().2
-        ),
+    .map_err(|e| {
+        let error = RestError::from(e);
+        let (status, _, message) = error.client_response();
+        if status == StatusCode::BAD_REQUEST {
+            RestError::BadRequest {
+                message: format!("Entry {index}: {method} {url}: {message}"),
+            }
+        } else {
+            error
+        }
     })?;
-    if query.parameters.is_empty() {
-        return Err(RestError::BadRequest {
-            message: format!("Entry {index}: {method} {url} carries no usable criteria"),
-        });
+    match query {
+        Some(query) => Ok(Some(query.parameters)),
+        None => Err(no_usable_criteria()),
     }
-    Ok(Some(query.parameters))
 }
 
 fn admit_bundle_mutation(
@@ -3060,6 +3014,13 @@ fn transaction_error_response_parts(err: &TransactionError) -> (StatusCode, &'st
             StatusCode::PRECONDITION_FAILED,
             "multiple-matches",
             format!("Conditional {} matched {} resources", operation, count),
+        ),
+        // `conflict`, as `RestError::PreconditionFailed` renders an unsatisfied
+        // `If-Match` everywhere else.
+        TransactionError::PreconditionFailed { index, message } => (
+            StatusCode::PRECONDITION_FAILED,
+            "conflict",
+            format!("Transaction failed at entry {}: {}", index, message),
         ),
         TransactionError::InvalidTransaction => (
             StatusCode::INTERNAL_SERVER_ERROR,

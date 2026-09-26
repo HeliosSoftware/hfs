@@ -1046,6 +1046,11 @@ impl From<TransactionError> for RestError {
             TransactionError::BundleError { index, message } => RestError::BadRequest {
                 message: format!("Bundle entry {}: {}", index, message),
             },
+            TransactionError::PreconditionFailed { index, message } => {
+                RestError::PreconditionFailed {
+                    message: format!("Bundle entry {}: {}", index, message),
+                }
+            }
             TransactionError::PatchEntry {
                 status, outcome, ..
             } => RestError::BundlePatchFailed {

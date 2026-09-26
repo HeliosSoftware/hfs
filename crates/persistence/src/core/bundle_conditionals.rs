@@ -29,6 +29,7 @@
 
 use std::collections::HashMap;
 
+use super::preconditions::{EntityTagPrecondition, conditional_if_match_gate};
 use super::transaction::{BundleEntry, BundleEntryResult, BundleMethod, ConditionalTransaction};
 use crate::error::TransactionError;
 use crate::types::{SearchParameter, SearchQuery, StoredResource};
@@ -88,24 +89,64 @@ impl ConditionalTarget {
 }
 
 /// Turns a conditional entry's match set into its pinned target, or into the
-/// whole-bundle `412` several matches call for.
+/// whole-bundle `412` several matches, or an unsatisfied `ifMatch`, call for.
+///
+/// `ifMatch` is evaluated here, against the resource the criteria resolved
+/// to, with the rules [`conditional_if_match_gate`] applies to the batch arm
+/// and the resource endpoints (#1381): no match fails any supplied `ifMatch`
+/// (`*` included), so a guarded conditional `PUT` never falls through to a
+/// create, and a malformed field value fails closed. Every executor holds its
+/// tenant's write lock for the whole transaction and the overlap rule keeps
+/// other entries off a resolved identity, so the version checked here is the
+/// version the entry then writes over.
+///
+/// [`conditional_if_match_gate`]: crate::core::conditional_if_match_gate
 pub fn conditional_target(
     entry_index: usize,
     entry: &BundleEntry,
     resource_type: &str,
     matches: Vec<StoredResource>,
 ) -> Result<ConditionalTarget, TransactionError> {
-    match matches.len() {
-        0 | 1 => Ok(ConditionalTarget {
-            entry_index,
-            resource_type: resource_type.to_string(),
-            resolved: matches.into_iter().next(),
-        }),
-        count => Err(TransactionError::MultipleMatches {
+    if matches.len() > 1 {
+        return Err(TransactionError::MultipleMatches {
             operation: conditional_operation(entry.method).to_string(),
-            count,
-        }),
+            count: matches.len(),
+        });
     }
+    let resolved = matches.into_iter().next();
+    if let Some(raw) = entry.if_match.as_deref() {
+        let precondition_failed = |message: String| TransactionError::PreconditionFailed {
+            index: entry_index,
+            message,
+        };
+        let precondition = EntityTagPrecondition::parse([raw])
+            .map_err(|e| precondition_failed(format!("If-Match precondition failed: {e}")))?;
+        conditional_if_match_gate(&precondition, resource_type, resolved.as_ref()).map_err(
+            |_| {
+                precondition_failed(match &resolved {
+                    Some(current) => format!(
+                        "If-Match precondition failed: supplied {raw}, but {} {} resolved \
+                         to {}/{} at version {}",
+                        entry.method,
+                        entry.url,
+                        current.resource_type(),
+                        current.id(),
+                        current.version_id()
+                    ),
+                    None => format!(
+                        "If-Match precondition failed: supplied {raw}, but {} {} matched \
+                         no resource",
+                        entry.method, entry.url
+                    ),
+                })
+            },
+        )?;
+    }
+    Ok(ConditionalTarget {
+        entry_index,
+        resource_type: resource_type.to_string(),
+        resolved,
+    })
 }
 
 /// R4 §3.1.0.11.2: a conditional entry whose resolved identity is also

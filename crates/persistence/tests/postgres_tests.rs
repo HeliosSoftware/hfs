@@ -27114,6 +27114,10 @@ mod postgres_integration {
         postgres_integration_matched_conditional_put_resolves_urn_references,
         matched_conditional_put_resolves_urn_references
     );
+    pg_conditional_url_test!(
+        postgres_integration_conditional_put_honours_if_match,
+        conditional_put_honours_if_match
+    );
 
     pg_if_match_test!(
         postgres_integration_multi_valued_if_match_matches_any_member,

@@ -1341,6 +1341,7 @@ sqlite_conditional_url_test!(conditional_delete_with_several_matches_rolls_back)
 sqlite_conditional_url_test!(overlap_with_an_instance_entry_fails_the_bundle);
 sqlite_conditional_url_test!(two_conditional_entries_resolving_to_one_resource_fail);
 sqlite_conditional_url_test!(matched_conditional_put_resolves_urn_references);
+sqlite_conditional_url_test!(conditional_put_honours_if_match);
 
 /// With search offloaded the local index is empty, so a URL-borne conditional
 /// entry is refused with the same 501 `ifNoneExist` gets, before any write.

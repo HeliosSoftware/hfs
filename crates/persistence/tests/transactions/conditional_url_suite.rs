@@ -401,3 +401,43 @@ pub async fn matched_conditional_put_resolves_urn_references<B: BundleProvider>(
         "a urn:uuid reference to the matched entry resolves to the match"
     );
 }
+
+/// `ifMatch` on a conditional entry is gated against the resolved match before
+/// anything is written: a stale tag fails the bundle with `PreconditionFailed`
+/// (`412`), rolling back the sibling create; the current tag writes (#1381).
+pub async fn conditional_put_honours_if_match<B: BundleProvider>(
+    backend: &B,
+    tenant: &TenantContext,
+) {
+    seed_identified_patient(backend, tenant, "p1", "Original").await;
+
+    let mut stale = conditional_put("Stale", None);
+    stale.if_match = Some("W/\"9\"".to_string());
+    let err = backend
+        .process_transaction(
+            tenant,
+            vec![plain_post("Sibling"), stale],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("a stale ifMatch fails the bundle");
+    assert!(
+        matches!(err, TransactionError::PreconditionFailed { .. }),
+        "{err:?}"
+    );
+    assert_eq!(
+        patient_count(backend, tenant).await,
+        1,
+        "sibling rolled back"
+    );
+    assert_eq!(family_of(backend, tenant, "p1").await, "Original");
+
+    let mut current = conditional_put("Guarded", None);
+    current.if_match = Some("W/\"1\"".to_string());
+    let result = backend
+        .process_transaction(tenant, vec![current], FhirVersion::default())
+        .await
+        .expect("the current version satisfies ifMatch");
+    assert_eq!(result.entries[0].status, 200, "{:?}", result.entries[0]);
+    assert_eq!(family_of(backend, tenant, "p1").await, "Guarded");
+}

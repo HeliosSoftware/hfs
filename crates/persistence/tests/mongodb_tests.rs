@@ -14408,6 +14408,10 @@ mongodb_conditional_url_test!(
     mongodb_integration_matched_conditional_put_resolves_urn_references,
     matched_conditional_put_resolves_urn_references
 );
+mongodb_conditional_url_test!(
+    mongodb_integration_conditional_put_honours_if_match,
+    conditional_put_honours_if_match
+);
 
 /// A modifier is evaluated, not refused: the session-scoped matcher builds the
 /// same index filter direct search does, so `family:exact` finds the seeded
