@@ -121,6 +121,41 @@ pub struct SkippedResource {
     pub reason: String,
 }
 
+/// Most concurrent write streams one resource type's rebuild may use;
+/// `HFS_REINDEX_WRITE_STREAMS` is clamped to it (#1403).
+pub const REINDEX_MAX_WRITE_STREAMS: u32 = 16;
+
+/// Fewest resources, tombstones included, that each write stream of a type
+/// must cover, so a small type keeps its single walk (#1403).
+pub const DEFAULT_MIN_RESOURCES_PER_STREAM: u64 = 50_000;
+
+/// How the rebuild walks one resource type (#1403).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypeWalkPlan {
+    /// One walk from a `None` cursor: the only plan before #1403.
+    Single,
+    /// Disjoint id ranges walked concurrently, one write stream each, then
+    /// one catch-up walk that starts only after every range has finished.
+    Ranges {
+        /// The first cursor of each range. Never empty.
+        ranges: Vec<String>,
+        /// The cursor the catch-up walk starts from.
+        catch_up: String,
+    },
+}
+
+/// What the driver asks of [`ReindexSource::plan_type_walk`] (#1403).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TypeWalkRequest {
+    /// Write streams the run asked for; at least 2 whenever the driver plans.
+    pub streams: u32,
+    /// Fewest resources each stream must cover.
+    pub min_resources_per_stream: u64,
+    /// Automatic rebuilds that may run at once, sharing the source's
+    /// connection pool.
+    pub concurrent_runs: u32,
+}
+
 /// What one writer measured while rebuilding one page, reported through
 /// [`ReindexTarget::write_search_entries_page_timed`] (#1403). A writer adds to
 /// it as each phase completes, so a page that fails part-way still reports the
@@ -291,6 +326,23 @@ pub trait ReindexSource: Send + Sync {
         self.fetch_resources_page_capped(tenant, resource_type, Some(cursor), limit, max_bytes)
             .await
             .map(Some)
+    }
+
+    /// Splits one type's walk into concurrent id ranges (#1403). The default
+    /// keeps the single walk, as does any source that cannot split. A source
+    /// that splits returns disjoint ranges that together cover every resource
+    /// its single walk would reach, apart from writes the catch-up picks up,
+    /// plus the cursor the catch-up walk starts from. The driver walks every
+    /// range to its end before it starts the catch-up, and it calls this only
+    /// when the run asks for more than one write stream.
+    async fn plan_type_walk(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        request: TypeWalkRequest,
+    ) -> StorageResult<TypeWalkPlan> {
+        let _ = (tenant, resource_type, request);
+        Ok(TypeWalkPlan::Single)
     }
 
     /// Fetches the current, non-deleted resources of `resource_type` whose
@@ -505,10 +557,40 @@ pub struct ReindexRequest {
     /// source returns at least one resource per page (#1125).
     #[serde(default)]
     pub batch_bytes: u64,
+
+    /// Concurrent write streams per resource type, `1..=`
+    /// [`REINDEX_MAX_WRITE_STREAMS`] (#1403). Above 1 the driver asks the
+    /// source to split each type into id ranges
+    /// ([`ReindexSource::plan_type_walk`]); a source that does not split,
+    /// and a run scoped to named resources, walk each type once.
+    /// `POST $reindex` always uses 1.
+    #[serde(default = "default_write_streams")]
+    pub write_streams: u32,
+
+    /// Fewest resources each write stream of a type must cover (#1403).
+    #[serde(default = "default_min_resources_per_stream")]
+    pub min_resources_per_stream: u64,
+
+    /// Automatic rebuilds that may run at once, so a source that plans
+    /// streams can divide its connection pool between them (#1403).
+    #[serde(default = "default_concurrent_runs")]
+    pub concurrent_runs: u32,
 }
 
 fn default_batch_size() -> u32 {
     100
+}
+
+fn default_write_streams() -> u32 {
+    1
+}
+
+fn default_min_resources_per_stream() -> u64 {
+    DEFAULT_MIN_RESOURCES_PER_STREAM
+}
+
+fn default_concurrent_runs() -> u32 {
+    1
 }
 
 impl Default for ReindexRequest {
@@ -521,6 +603,9 @@ impl Default for ReindexRequest {
             bulk_index_rebuild: false,
             resource_ids: None,
             batch_bytes: 0,
+            write_streams: default_write_streams(),
+            min_resources_per_stream: default_min_resources_per_stream(),
+            concurrent_runs: default_concurrent_runs(),
         }
     }
 }
@@ -592,6 +677,27 @@ impl ReindexRequest {
     /// Sets the byte cap of one page (see [`Self::batch_bytes`]).
     pub fn with_batch_bytes(mut self, bytes: u64) -> Self {
         self.batch_bytes = bytes;
+        self
+    }
+
+    /// Sets the write streams per type (see [`Self::write_streams`]), clamped
+    /// to `1..=`[`REINDEX_MAX_WRITE_STREAMS`].
+    pub fn with_write_streams(mut self, streams: u32) -> Self {
+        self.write_streams = streams.clamp(1, REINDEX_MAX_WRITE_STREAMS);
+        self
+    }
+
+    /// Sets the fewest resources per write stream (see
+    /// [`Self::min_resources_per_stream`]); at least 1.
+    pub fn with_min_resources_per_stream(mut self, resources: u64) -> Self {
+        self.min_resources_per_stream = resources.max(1);
+        self
+    }
+
+    /// Sets how many automatic rebuilds may run at once (see
+    /// [`Self::concurrent_runs`]); at least 1, saturating at `u32::MAX`.
+    pub fn with_concurrent_runs(mut self, runs: usize) -> Self {
+        self.concurrent_runs = u32::try_from(runs).unwrap_or(u32::MAX).max(1);
         self
     }
 }
@@ -951,6 +1057,8 @@ pub(crate) struct AutomaticRunOptions {
     pub(crate) bulk_index_rebuild: bool,
     /// `ReindexRequest::batch_bytes` for the runs the hook starts.
     pub(crate) batch_bytes: u64,
+    /// `ReindexRequest::write_streams` for the type-scoped runs the hook starts.
+    pub(crate) write_streams: u32,
 }
 
 impl Default for AutomaticRunOptions {
@@ -959,6 +1067,7 @@ impl Default for AutomaticRunOptions {
             batch_size: DEFERRED_REINDEX_BATCH_SIZE,
             bulk_index_rebuild: false,
             batch_bytes: 0,
+            write_streams: 1,
         }
     }
 }
@@ -1498,12 +1607,16 @@ enum GenerationScope {
 }
 
 impl GenerationScope {
-    fn request(&self, options: AutomaticRunOptions) -> ReindexRequest {
+    fn request(&self, options: AutomaticRunOptions, concurrent_runs: usize) -> ReindexRequest {
         match self {
             Self::Types(types) => ReindexRequest::for_types(types.clone())
-                .with_bulk_index_rebuild(options.bulk_index_rebuild),
+                .with_bulk_index_rebuild(options.bulk_index_rebuild)
+                .with_write_streams(options.write_streams)
+                .with_concurrent_runs(concurrent_runs),
             // Dropping and rebuilding a writer's value indexes costs a pass
             // over its whole index: out of proportion for a handful of ids.
+            // A retry of named resources fetches them by id, so there is no
+            // type walk to split either: it keeps one write stream (#1403).
             Self::Resources(resources) => ReindexRequest::for_resources(resources.clone()),
         }
         .with_batch_size(options.batch_size)
@@ -1798,7 +1911,11 @@ impl AutomaticReindexCoordinator {
             }
 
             let started = op
-                .start_tracked(tenant.clone(), scope.request(options), None)
+                .start_tracked(
+                    tenant.clone(),
+                    scope.request(options, limits.max_concurrency),
+                    None,
+                )
                 .await;
             let (job_id, outcome) = match started {
                 Ok((job_id, task_exit)) => {
@@ -3135,6 +3252,21 @@ impl ReindexOnFinish {
     /// what `with_batch_bytes` actually set (#1499).
     pub fn batch_bytes(&self) -> u64 {
         self.options.batch_bytes
+    }
+
+    /// Concurrent write streams per resource type for this hook's type-scoped
+    /// rebuilds (`HFS_REINDEX_WRITE_STREAMS`), clamped to
+    /// `1..=`[`REINDEX_MAX_WRITE_STREAMS`] (#1403). Only a source that splits
+    /// a type (standalone MongoDB) uses more than one.
+    pub fn with_write_streams(mut self, streams: u32) -> Self {
+        self.options.write_streams = streams.clamp(1, REINDEX_MAX_WRITE_STREAMS);
+        self
+    }
+
+    /// The write streams this hook's type-scoped rebuilds ask for (#1403);
+    /// exposed for the same reason as [`Self::batch_bytes`].
+    pub fn write_streams(&self) -> u32 {
+        self.options.write_streams
     }
 
     async fn enqueue(
@@ -6093,6 +6225,111 @@ mod tests {
         assert_eq!(req.resource_types.as_ref().unwrap().len(), 2);
         assert_eq!(req.batch_size, 50);
         assert!(req.clear_existing);
+    }
+
+    #[test]
+    fn write_stream_fields_default_clamp_and_deserialize() {
+        let request = ReindexRequest::default();
+        assert_eq!(request.write_streams, 1);
+        assert_eq!(
+            request.min_resources_per_stream,
+            DEFAULT_MIN_RESOURCES_PER_STREAM
+        );
+        assert_eq!(request.concurrent_runs, 1);
+
+        // A request serialized before these fields existed still deserializes.
+        let legacy: ReindexRequest = serde_json::from_value(
+            serde_json::json!({"resource_types": null, "search_param_urls": null}),
+        )
+        .unwrap();
+        assert_eq!(legacy.write_streams, 1);
+        assert_eq!(legacy.min_resources_per_stream, 50_000);
+        assert_eq!(legacy.concurrent_runs, 1);
+
+        let streams = |n: u32| {
+            ReindexRequest::default()
+                .with_write_streams(n)
+                .write_streams
+        };
+        assert_eq!(streams(0), 1);
+        assert_eq!(streams(4), 4);
+        assert_eq!(streams(40), REINDEX_MAX_WRITE_STREAMS);
+        assert_eq!(
+            ReindexRequest::default()
+                .with_min_resources_per_stream(0)
+                .min_resources_per_stream,
+            1
+        );
+        let runs = |n: usize| {
+            ReindexRequest::default()
+                .with_concurrent_runs(n)
+                .concurrent_runs
+        };
+        assert_eq!(runs(0), 1);
+        assert_eq!(runs(3), 3);
+        assert_eq!(runs(usize::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn resource_scoped_generations_ignore_write_streams() {
+        let options = AutomaticRunOptions {
+            write_streams: 4,
+            ..AutomaticRunOptions::default()
+        };
+        let types = GenerationScope::Types(vec!["Observation".to_string()]).request(options, 2);
+        assert_eq!(types.write_streams, 4);
+        assert_eq!(types.concurrent_runs, 2);
+        assert_eq!(
+            types.min_resources_per_stream,
+            DEFAULT_MIN_RESOURCES_PER_STREAM
+        );
+
+        let resources = GenerationScope::Resources(vec![ResourceRef::new("Observation", "o1")])
+            .request(options, 2);
+        assert_eq!(resources.write_streams, 1);
+        assert_eq!(resources.concurrent_runs, 1);
+    }
+
+    #[tokio::test]
+    async fn plan_type_walk_defaults_to_the_single_walk() {
+        let plan = PagedSource::new(3)
+            .plan_type_walk(
+                &named_tenant("default-plan"),
+                "Patient",
+                TypeWalkRequest {
+                    streams: 4,
+                    min_resources_per_stream: 1,
+                    concurrent_runs: 1,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(plan, TypeWalkPlan::Single);
+    }
+
+    #[test]
+    fn the_automatic_hook_clamps_its_write_streams() {
+        let (backend, _events) = ControlledBackend::new(Vec::new(), 0);
+        let op = controlled_operation(backend);
+        assert_eq!(ReindexOnFinish::new(op.clone()).write_streams(), 1);
+        assert_eq!(
+            ReindexOnFinish::new(op.clone())
+                .with_write_streams(0)
+                .write_streams(),
+            1
+        );
+        assert_eq!(
+            ReindexOnFinish::new(op.clone())
+                .with_write_streams(4)
+                .write_streams(),
+            4
+        );
+        assert_eq!(
+            ReindexOnFinish::new(op)
+                .with_write_streams(99)
+                .write_streams(),
+            REINDEX_MAX_WRITE_STREAMS
+        );
     }
 
     #[test]

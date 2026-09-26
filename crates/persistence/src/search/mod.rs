@@ -115,9 +115,11 @@ pub use registry::{
     SearchParameterStatus, fallback_param_type, resolve_param_targets, resolve_param_type,
 };
 pub use reindex::{
-    DEFERRED_REINDEX_BATCH_SIZE, DeferredReindexLedger, ReindexOnFinish, ReindexOperation,
-    ReindexPageStats, ReindexProgress, ReindexProgressError, ReindexRequest, ReindexSource,
-    ReindexStatus, ReindexTarget, ReindexableStorage, ResourcePage, ResourceRef, SkippedResource,
+    DEFAULT_MIN_RESOURCES_PER_STREAM, DEFERRED_REINDEX_BATCH_SIZE, DeferredReindexLedger,
+    REINDEX_MAX_WRITE_STREAMS, ReindexOnFinish, ReindexOperation, ReindexPageStats,
+    ReindexProgress, ReindexProgressError, ReindexRequest, ReindexSource, ReindexStatus,
+    ReindexTarget, ReindexableStorage, ResourcePage, ResourceRef, SkippedResource, TypeWalkPlan,
+    TypeWalkRequest,
 };
 pub use seeder::{
     SeedOutcome, seed_spec_compartment_definitions, seed_spec_search_parameters,
