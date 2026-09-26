@@ -2584,6 +2584,58 @@ mod postgres_integration {
         TenantContext::new(TenantId::new(&unique_id), TenantPermissions::full_access())
     }
 
+    /// A quote in a search parameter name — a `_revinclude` directive's, or a
+    /// criterion's — is part of the name, never SQL: the query runs and
+    /// matches nothing.
+    #[tokio::test]
+    async fn postgres_integration_a_quoted_parameter_name_is_not_spliced_into_sql() {
+        use helios_persistence::core::{RevincludeProvider, SearchProvider};
+        use helios_persistence::types::{
+            IncludeDirective, IncludeType, SearchParamType, SearchParameter, SearchQuery,
+            SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("quoted_name");
+        let patient = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p1"}),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("create patient");
+
+        let included = backend
+            .resolve_revincludes(
+                &tenant,
+                std::slice::from_ref(&patient),
+                &[IncludeDirective {
+                    include_type: IncludeType::Revinclude,
+                    source_type: "Observation".to_string(),
+                    search_param: "subj'ect".to_string(),
+                    target_type: None,
+                    iterate: false,
+                }],
+            )
+            .await
+            .expect("a quoted revinclude name is not a SQL error");
+        assert!(included.is_empty());
+
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "fam'ily".to_string(),
+            param_type: SearchParamType::String,
+            values: vec![SearchValue::eq("x")],
+            ..Default::default()
+        });
+        let result = backend
+            .search(&tenant, &query)
+            .await
+            .expect("a quoted parameter name is not a SQL error");
+        assert!(result.resources.items.is_empty());
+    }
+
     #[tokio::test]
     async fn postgres_bulk_submit_status_uses_the_complete_identity_and_preserves_summary() {
         use std::collections::HashMap;
