@@ -334,7 +334,9 @@ pub trait ReindexSource: Send + Sync {
     /// its single walk would reach, apart from writes the catch-up picks up,
     /// plus the cursor the catch-up walk starts from. The driver walks every
     /// range to its end before it starts the catch-up, and it calls this only
-    /// when the run asks for more than one write stream.
+    /// when the run asks for more than one write stream. A [`TypeWalkPlan::Ranges`]
+    /// must never hold more ranges than `request.streams`; the driver fails
+    /// the type when it does, the same as an empty plan.
     async fn plan_type_walk(
         &self,
         tenant: &TenantContext,
@@ -2429,12 +2431,12 @@ fn log_type_started(tenant: &str, job_id: &str, s: &TypeStarted) {
 /// delete_ms, insert_ms, writer_other_ms, yield_ms, other_ms, deleted,
 /// inserted, insert_commands, fetch_wait_ms, db_wait_ms, sub_batches,
 /// pool_sub_batches, streams, plan_ms`. `outcome` is this type's own exit
-/// path — a type that finished all its pages is always `completed`, even if
-/// a later type or the
-/// job as a whole fails or is cancelled. Every counter and phase field
-/// (`entries` through `pool_sub_batches`) is scoped to this type only, since
-/// its L2. `type_elapsed_ms` is this type's own clock; `elapsed_ms` is always
-/// the job clock. `writer_other_ms = write − (extract + db_wait_or_busy)` and
+/// path — a type that finished all its pages is always `completed`, even
+/// if a later type or the job as a whole fails or is cancelled. Every
+/// counter and phase field (`entries` through `pool_sub_batches`) is
+/// scoped to this type only, since its L2. `type_elapsed_ms` is this
+/// type's own clock; `elapsed_ms` is always the job clock.
+/// `writer_other_ms = write − (extract + db_wait_or_busy)` and
 /// `other_ms = type_elapsed − (fetch_wait + write + yield)`, both computed by
 /// subtracting on `Duration`s, saturating at zero, and truncating to whole
 /// milliseconds only afterward (never truncate-then-subtract). They equal
@@ -2984,6 +2986,12 @@ async fn walk_type(
                     "The walk plan of {resource_type} has no id ranges"
                 )));
             }
+            TypeWalkPlan::Ranges { ranges, .. } if ranges.len() > write_streams as usize => {
+                return Err(RunExit::Failed(format!(
+                    "The walk plan of {resource_type} has {} id ranges, more than the {write_streams} requested",
+                    ranges.len()
+                )));
+            }
             TypeWalkPlan::Ranges { ranges, .. } => u32::try_from(ranges.len()).unwrap_or(u32::MAX),
         };
         ctx.stats
@@ -3244,7 +3252,7 @@ async fn run_reindex(
         named_resources.is_some(),
         writers.len(),
         run_started.elapsed(),
-        request.write_streams,
+        request.write_streams.clamp(1, REINDEX_MAX_WRITE_STREAMS),
     );
 
     // Clear existing indexes if requested — in every writer, not just the first.
@@ -6700,16 +6708,23 @@ mod tests {
 
     #[tokio::test]
     async fn multi_stream_types_cap_uncapped_pages() {
-        async fn fetched_caps(plan: RangedPlan, batch_bytes: u64, tenant: &str) -> Vec<u64> {
+        async fn fetched_caps_with(
+            plan: RangedPlan,
+            batch_bytes: u64,
+            tenant: &str,
+            prefetch: bool,
+        ) -> Vec<u64> {
             let seq = new_seq();
-            let source = Arc::new(
-                RangedSource::new(
-                    vec![range_pages("a", 2, 2), range_pages("b", 2, 2)],
-                    vec![vec!["z0".to_string()]],
-                    seq.clone(),
-                )
-                .with_plan(plan),
-            );
+            let mut source = RangedSource::new(
+                vec![range_pages("a", 2, 2), range_pages("b", 2, 2)],
+                vec![vec!["z0".to_string()]],
+                seq.clone(),
+            )
+            .with_plan(plan);
+            if prefetch {
+                source = source.with_prefetch();
+            }
+            let source = Arc::new(source);
             let op = ranged_operation(source.clone(), Arc::new(RangedWriter::new(seq)));
             let job = op
                 .start(
@@ -6729,6 +6744,10 @@ mod tests {
                 .collect()
         }
 
+        async fn fetched_caps(plan: RangedPlan, batch_bytes: u64, tenant: &str) -> Vec<u64> {
+            fetched_caps_with(plan, batch_bytes, tenant, false).await
+        }
+
         let ranged = fetched_caps(RangedPlan::Ranges, 0, "streams-cap-ranges").await;
         assert!(
             !ranged.is_empty() && ranged.iter().all(|b| *b == 33_554_432),
@@ -6738,6 +6757,12 @@ mod tests {
         assert_eq!(single, vec![0], "a single walk keeps the run's own cap");
         let explicit = fetched_caps(RangedPlan::Ranges, 4096, "streams-cap-explicit").await;
         assert!(explicit.iter().all(|b| *b == 4096), "{explicit:?}");
+        let prefetched =
+            fetched_caps_with(RangedPlan::Ranges, 0, "streams-cap-prefetch", true).await;
+        assert!(
+            !prefetched.is_empty() && prefetched.iter().all(|b| *b == 33_554_432),
+            "range pages fetched ahead are never uncapped either: {prefetched:?}"
+        );
     }
 
     #[tokio::test]
@@ -6798,6 +6823,36 @@ mod tests {
         assert_eq!(
             progress.error_message.as_deref(),
             Some("The walk plan of Observation has no id ranges")
+        );
+        assert!(source.fetched().is_empty(), "nothing is fetched");
+    }
+
+    #[tokio::test]
+    async fn a_plan_with_more_ranges_than_streams_fails_the_type() {
+        let seq = new_seq();
+        let source = Arc::new(RangedSource::new(
+            vec![
+                range_pages("a", 1, 2),
+                range_pages("b", 1, 2),
+                range_pages("c", 1, 2),
+            ],
+            Vec::new(),
+            seq.clone(),
+        ));
+        let op = ranged_operation(source.clone(), Arc::new(RangedWriter::new(seq)));
+        let job = op
+            .start(
+                named_tenant("streams-too-many-ranges"),
+                streams_request(2),
+                None,
+            )
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Failed, "{progress:?}");
+        assert_eq!(
+            progress.error_message.as_deref(),
+            Some("The walk plan of Observation has 3 id ranges, more than the 2 requested")
         );
         assert!(source.fetched().is_empty(), "nothing is fetched");
     }
@@ -6958,6 +7013,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_streams_above_the_maximum_plan_at_the_maximum() {
+        let (_guard, events) = capture_contract();
         let seq = new_seq();
         let source = Arc::new(RangedSource::new(
             vec![range_pages("a", 1, 2), range_pages("b", 1, 2)],
@@ -6976,6 +7032,51 @@ mod tests {
         assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
         let planned: Vec<u32> = source.requests.lock().iter().map(|r| r.streams).collect();
         assert_eq!(planned, vec![REINDEX_MAX_WRITE_STREAMS]);
+        let events = events.lock().unwrap().clone();
+        let job_started = events
+            .iter()
+            .find(|e| e.message == "reindex job started")
+            .expect("reindex job started");
+        assert_eq!(
+            job_started.values["write_streams"],
+            REINDEX_MAX_WRITE_STREAMS.to_string(),
+            "the job line must report the clamped value the driver actually used"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_streams_of_zero_plans_and_logs_one() {
+        let (_guard, events) = capture_contract();
+        let seq = new_seq();
+        let source = Arc::new(RangedSource::new(
+            vec![range_pages("a", 1, 2)],
+            Vec::new(),
+            seq.clone(),
+        ));
+        let op = ranged_operation(source.clone(), Arc::new(RangedWriter::new(seq)));
+        // A deserialized request bypasses `with_write_streams`' clamp.
+        let mut request = streams_request(1);
+        request.write_streams = 0;
+        let job = op
+            .start(named_tenant("streams-zero"), request, None)
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+        assert_eq!(
+            source.plans.load(Ordering::SeqCst),
+            0,
+            "0 stays a single walk"
+        );
+        let events = events.lock().unwrap().clone();
+        let job_started = events
+            .iter()
+            .find(|e| e.message == "reindex job started")
+            .expect("reindex job started");
+        assert_eq!(
+            job_started.values["write_streams"], "1",
+            "the job line must report the clamped value the driver actually used"
+        );
     }
 
     #[tokio::test]

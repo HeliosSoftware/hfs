@@ -4971,8 +4971,9 @@ impl MongoBackend {
 
     /// Runs only the id-phase continuation query, for both the serial walk
     /// and the driver's ahead-of-time prefetch — so both paths build the same
-    /// page from the same query (#1403). The phase transition itself is left
-    /// to whichever caller runs the query when it is *not* prefetched.
+    /// page from the same query (#1403). `Ok(None)` means the id phase is
+    /// over. The phase transition itself is left to whichever caller runs
+    /// the query when it is *not* prefetched.
     async fn reindex_id_page(
         &self,
         tenant: &TenantContext,
@@ -5552,8 +5553,10 @@ impl ReindexSource for MongoBackend {
                 .reindex_streams_clamp_warned()
                 .swap(true, std::sync::atomic::Ordering::Relaxed)
         {
-            let needed =
-                2 * u64::from(request.streams) * u64::from(request.concurrent_runs.max(1)) + 2;
+            let needed = 2u64
+                .saturating_mul(u64::from(request.streams))
+                .saturating_mul(u64::from(request.concurrent_runs.max(1)))
+                .saturating_add(2);
             tracing::warn!(
                 tenant = %tenant_id,
                 resource_type = %resource_type,
@@ -6186,12 +6189,7 @@ fn reindex_id_range_page_filter(
     hi: Option<&str>,
     after_id: Option<&str>,
 ) -> Document {
-    let mut filter = doc! {
-        "tenant_id": tenant_id,
-        "resource_type": resource_type,
-        "is_deleted": false,
-        "last_updated": { "$lt": chrono_to_bson(floor) },
-    };
+    let mut filter = reindex_id_page_filter(tenant_id, resource_type, floor, None);
     let mut id = Document::new();
     match (after_id, lo) {
         (Some(after_id), _) => {
@@ -6900,6 +6898,20 @@ mod reindex_walk_tests {
         );
     }
 
+    #[test]
+    fn id_range_page_filter_shares_the_base_id_phase_filter() {
+        // The range walk must cover the same rows before the floor as the
+        // single walk, or a split type would index a different set; sharing
+        // one base predicate keeps the two from drifting apart.
+        let floor = ts("2026-01-01T00:00:00.000Z");
+        let base = reindex_id_page_filter("t1", "Observation", floor, None);
+        let range =
+            reindex_id_range_page_filter("t1", "Observation", floor, Some("m"), Some("t"), None);
+        for field in ["tenant_id", "resource_type", "is_deleted", "last_updated"] {
+            assert_eq!(range.get(field), base.get(field), "field {field} diverged");
+        }
+    }
+
     // --- Floor / ceiling / margin / round decision ---
 
     #[test]
@@ -7264,11 +7276,12 @@ mod reindex_prefetch_tests {
 
     #[tokio::test]
     async fn fetch_ahead_declines_round_and_malformed_cursors() {
-        // Both cases return before any database call: the Round cursor parses
-        // but does not match `Id`, and the malformed cursor fails to parse,
-        // before `get_database` is ever reached, so `unreachable_config`'s
-        // bogus connection string is exercised only as a defensive
-        // belt-and-suspenders, not because either case connects.
+        // All three cases return before any database call: the Round cursor
+        // and the id-phase-done cursor each parse but do not match `Id` or
+        // `IdRange`, and the malformed cursor fails to parse, before
+        // `get_database` is ever reached, so `unreachable_config`'s bogus
+        // connection string is exercised only as a defensive
+        // belt-and-suspenders, not because any case connects.
         assert!(matches!(
             ReindexWalkCursor::parse(&round_cursor()),
             Ok(ReindexWalkCursor::Round { .. })
