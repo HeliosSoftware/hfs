@@ -65,11 +65,14 @@
     undeclared constant, duplicate column names, ...) alongside the
     validator's own structural checks.
 
-    SQL Query / SQL View (#840) get their own two-line legend: "checked on
+    SQL Query / SQL View (#840) get their own three-line legend: "checked on
     save" there names the SQL on FHIR Library type and the SQL attachment —
     what actually gates Save on those pages — rather than the generic
     constraints/terminology promise below, which would be misleading with
-    `HFS_VALIDATION_MODE` off (the default).
+    `HFS_VALIDATION_MODE` off (the default). Its third line (#1233) says
+    where the SQL attachment itself is edited, since `hidden=["content"]`
+    (`render_lib_details_pane`, `crates/ui/src/lib.rs`) keeps this guided
+    form from ever listing it.
   -->
   <p class="editor-legend">
     {% match legend %}
@@ -78,6 +81,7 @@
     {% when Legend::SqlLibrary %}
     <span class="editor-legend__live">{{ i18n.t("lib-form-legend-live") }}</span>
     <span class="editor-legend__save">{{ i18n.t("lib-form-legend-save") }}</span>
+    <span class="editor-legend__save">{{ i18n.t("lib-form-legend-content") }}</span>
     {% when Legend::Resource %}
     <span class="editor-legend__live">{{ i18n.t("editor-legend-live") }}</span>
     <span class="editor-legend__save">{{ i18n.t("editor-legend-save") }}</span>
@@ -179,62 +183,78 @@
       {% endfor %}
 
       {% if !row.addable.is_empty() %}
-      <details class="editor-add"{% if row.path.is_empty() && auto_open_add %} open{% endif %}>
+      <details class="editor-add editor-add--picker"{% if row.path.is_empty() && auto_open_add %} open{% endif %}>
         <summary class="editor-add__toggle">+ {{ i18n.t("editor-add") }}</summary>
         <div class="editor-add__panel">
+          <div class="editor-add__head">
+            <span class="editor-add__title">{{ i18n.t("editor-add") }}</span>
+            <button type="button" class="editor-add__close" data-add-close aria-label="{{ i18n.t("editor-add-close") }}">×</button>
+          </div>
+          <p class="editor-add__added" role="status" hidden>
+            <strong data-add-added-name></strong> {{ i18n.t("editor-add-added") }}
+            <button type="button" class="editor-add__undo" data-add-undo>{{ i18n.t("editor-add-undo") }}</button>
+          </p>
           <input type="search" class="editor-add__filter"
                  placeholder="{{ i18n.t("editor-add-filter") }}"
                  aria-label="{{ i18n.t("editor-add-filter") }}">
-          <div class="editor-add__list">
-            {% for option in row.addable %}
-            {% if option.kind == "choice" %}
-            <div class="editor-add__choice" data-add-name="{{ option.name }}">
-              <span class="editor-add__name">{{ option.name }}[x]{% if option.required %} <em>*</em>{% endif %}</span>
-              <select data-choose="{{ row.path }}" data-declarer="{{ option.name }}"
-                      aria-label="{{ option.name }}[x] — {{ i18n.t("editor-pick-type") }}">
-                <option value="">{{ i18n.t("editor-pick-type") }}</option>
-                {% for arm in option.arms %}
-                <option value="{{ arm }}">{{ arm }}</option>
-                {% endfor %}
-              </select>
-            </div>
-            {% else %}
-            <button type="button" class="editor-add__item{% if option.must_support %} editor-add__item--ms{% endif %}" data-add-name="{{ option.name }}{% if !option.slice.is_empty() %} {{ option.slice }}{% endif %}"
-                    data-add="{{ row.path }}" data-name="{{ option.name }}"{% if !option.slice.is_empty() %} data-slice="{{ option.slice }}"{% endif %}{% if !option.short.is_empty() %} title="{{ option.short }}"{% endif %}>
-              <span class="editor-add__name">{{ option.name }}{% if !option.slice.is_empty() %} <span class="editor-add__slicename">· {{ option.slice }}</span>{% endif %}{% if option.required %} <em>*</em>{% endif %}{% if option.must_support %} <span class="editor-add__ms">{{ i18n.t("editor-must-support-badge") }}</span>{% endif %}</span>
-              <span class="editor-add__type">{{ option.type_label }}</span>
-              {% if !option.short.is_empty() %}
-              <span class="editor-add__short">{{ option.short }}</span>
-              {% endif %}
-              {% if option.kind == "another" %}
-              <span class="editor-add__again">{{ i18n.t("editor-add-another") }}</span>
-              {% endif %}
-            </button>
-            {% endif %}
-            {% endfor %}
-          </div>
-
-          {% if row.accepts_extension %}
-          <div class="editor-add__ext">
-            {% if !row.ext_options.is_empty() %}
-            <div>
-              {% for ext in row.ext_options %}
-              <button type="button" class="editor-add__item" data-add-name="{{ ext.name }}"
-                      data-extension="{{ row.path }}" data-url="{{ ext.url }}"
-                      {% if !ext.short.is_empty() %}title="{{ ext.short }}"{% endif %}>
-                <span class="editor-add__name">{{ ext.name }}</span>
-                {% if !ext.short.is_empty() %}<span class="editor-add__short">{{ ext.short }}</span>{% endif %}
+          <details class="editor-add__group" open>
+            <summary class="editor-add__group-head">{{ i18n.t("editor-add-elements") }} <span class="editor-add__count">{{ row.addable.len() }}</span></summary>
+            <div class="editor-add__list">
+              {% for option in row.addable %}
+              {% if option.kind == "choice" %}
+              <div class="editor-add__choice" data-add-name="{{ option.name }}">
+                <span class="editor-add__name">{{ option.name }}[x]{% if option.required %} <em>*</em>{% endif %}</span>
+                <select data-choose="{{ row.path }}" data-declarer="{{ option.name }}"
+                        aria-label="{{ option.name }}[x] — {{ i18n.t("editor-pick-type") }}">
+                  <option value="">{{ i18n.t("editor-pick-type") }}</option>
+                  {% for arm in option.arms %}
+                  <option value="{{ arm }}">{{ arm }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+              {% else %}
+              <button type="button" class="editor-add__item{% if option.must_support %} editor-add__item--ms{% endif %}" data-add-name="{{ option.name }}{% if !option.slice.is_empty() %} {{ option.slice }}{% endif %}"
+                      data-add="{{ row.path }}" data-name="{{ option.name }}"{% if !option.slice.is_empty() %} data-slice="{{ option.slice }}"{% endif %}{% if !option.short.is_empty() %} title="{{ option.short }}"{% endif %}>
+                <span class="editor-add__name">{{ option.name }}{% if !option.slice.is_empty() %} <span class="editor-add__slicename">· {{ option.slice }}</span>{% endif %}{% if option.required %} <em>*</em>{% endif %}{% if option.must_support %} <span class="editor-add__ms">{{ i18n.t("editor-must-support-badge") }}</span>{% endif %}</span>
+                <span class="editor-add__type">{{ option.type_label }}</span>
+                {% if !option.short.is_empty() %}
+                <span class="editor-add__short">{{ option.short }}</span>
+                {% endif %}
+                {% if option.kind == "another" %}
+                <span class="editor-add__again">{{ i18n.t("editor-add-another") }}</span>
+                {% endif %}
               </button>
+              {% endif %}
               {% endfor %}
             </div>
-            {% endif %}
-            <label>{{ i18n.t("editor-extension-url") }}</label>
-            <input type="url" class="editor-add__ext-url"
-                   placeholder="http://example.org/fhir/StructureDefinition/…">
-            <button type="button" class="btn" data-extension="{{ row.path }}">
-              {{ i18n.t("editor-add-extension") }}
-            </button>
-          </div>
+          </details>
+          {% if row.accepts_extension %}
+          <details class="editor-add__group" data-add-group="extensions">
+            <summary class="editor-add__group-head">{{ i18n.t("editor-add-extensions") }} <span class="editor-add__count">{{ row.ext_options.len() }}</span></summary>
+            <div class="editor-add__ext">
+              {% if !row.ext_options.is_empty() %}
+              <div class="editor-add__list">
+                {% for ext in row.ext_options %}
+                <button type="button" class="editor-add__item" data-add-name="{{ ext.name }}"
+                        data-extension="{{ row.path }}" data-url="{{ ext.url }}"
+                        {% if !ext.short.is_empty() %}title="{{ ext.short }}"{% endif %}>
+                  <span class="editor-add__name">{{ ext.name }}</span>
+                  {% if !ext.short.is_empty() %}<span class="editor-add__short">{{ ext.short }}</span>{% endif %}
+                </button>
+                {% endfor %}
+              </div>
+              {% endif %}
+              <div class="editor-add__ext-row">
+                <label class="editor-add__ext-label">{{ i18n.t("editor-extension-url") }}
+                  <input type="url" class="editor-add__ext-url"
+                         placeholder="http://example.org/fhir/StructureDefinition/…">
+                </label>
+                <button type="button" class="btn" data-extension="{{ row.path }}">
+                  {{ i18n.t("editor-add-extension") }}
+                </button>
+              </div>
+            </div>
+          </details>
           {% endif %}
         </div>
       </details>

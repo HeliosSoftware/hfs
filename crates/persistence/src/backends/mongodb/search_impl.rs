@@ -17,7 +17,7 @@ use crate::core::{
     IncludeProvider, ResourceStorage, RevincludeProvider, SearchProvider, SearchResult,
 };
 use crate::error::{BackendError, QueryErrorExt, SearchError, StorageError, StorageResult};
-use crate::search::{DatePredicate, FhirDateValue, StorageResolution};
+use crate::search::{DatePredicate, FhirDateValue, RangeCondition, StorageResolution};
 use crate::tenant::TenantContext;
 use crate::types::{
     CompartmentMembership, CursorDirection, CursorValue, IncludeDirective, IncludeType, Page,
@@ -26,6 +26,9 @@ use crate::types::{
 };
 
 use super::MongoBackend;
+use super::search_index_catalog::{
+    COMPOSITE_SLOT_PROBE_INDEX, CONTAINED_COMPOSITE_SLOT_PROBE_INDEX,
+};
 
 /// Candidate ids per `$in` chunk when the parameter-sort aggregation is
 /// bounded to a matched set (#1040). Keeps each aggregate command well under
@@ -52,8 +55,30 @@ fn chrono_to_bson(dt: DateTime<Utc>) -> BsonDateTime {
     BsonDateTime::from_millis(dt.timestamp_millis())
 }
 
-/// The date filter document for one search value (#519). A free function so
-/// the range semantics are unit-testable without a live MongoDB.
+/// The `search_index` field a date row stores the end of its range in
+/// (#1391); `value_date` holds the start.
+const VALUE_DATE_END: &str = "value_date_end";
+
+/// Reads a date search value with the grammar every backend shares.
+///
+/// A value that is not a date is an error here, never a filter. The search
+/// gate (`validate_date_values`) reports it first on every ordinary path;
+/// this is what the in-transaction conditional paths, which build filters
+/// without passing the gate, fall back on.
+fn parse_date_search_value(value: &SearchValue, param: &str) -> StorageResult<FhirDateValue> {
+    FhirDateValue::parse(&value.value).map_err(|error| {
+        StorageError::Search(SearchError::InvalidDateValue {
+            param: param.to_string(),
+            value: value.value.clone(),
+            reason: error.to_string(),
+        })
+    })
+}
+
+/// The date filter document for one search value against a stored *point*
+/// in `field` (#519): `_lastUpdated` on the resources collection, and a date
+/// component of a composite parameter. A free function so the semantics are
+/// unit-testable without a live MongoDB.
 ///
 /// The value is read by [`FhirDateValue`], the grammar and precision range
 /// every backend shares. A search value names a *range*, never an instant:
@@ -64,26 +89,14 @@ fn chrono_to_bson(dt: DateTime<Utc>) -> BsonDateTime {
 /// milliseconds, so the range is clamped to that: a microsecond search value
 /// still finds the millisecond-truncated date stored for it.
 ///
-/// A value that is not a date is an error here, never a filter. The search
-/// gate (`validate_date_values`) reports it first on every ordinary path;
-/// this is what the in-transaction conditional paths, which build filters
-/// without passing the gate, fall back on.
+/// `ap` accepts a point inside [`FhirDateValue::approx_window`], the window
+/// every backend shares (#1391; it used to be ±12h around the start here).
 fn build_date_filter_doc(value: &SearchValue, param: &str, field: &str) -> StorageResult<Document> {
-    let parsed = FhirDateValue::parse(&value.value).map_err(|error| {
-        StorageError::Search(SearchError::InvalidDateValue {
-            param: param.to_string(),
-            value: value.value.clone(),
-            reason: error.to_string(),
-        })
-    })?;
+    let parsed = parse_date_search_value(value, param)?;
 
     let Some(predicate) = parsed.predicate(value.prefix, StorageResolution::Millis) else {
-        // `ap`, which the shared layer leaves to each backend: ±12h around
-        // the start of the range, as before.
-        let (start, _) = parsed.range_at(StorageResolution::Millis);
-        let lower = chrono_to_bson(start - chrono::Duration::hours(12));
-        let upper = chrono_to_bson(start + chrono::Duration::hours(12));
-        return Ok(doc! { field: { "$gte": lower, "$lte": upper } });
+        let (low, high) = parsed.approx_window(StorageResolution::Millis);
+        return Ok(doc! { field: { "$gte": chrono_to_bson(low), "$lt": chrono_to_bson(high) } });
     };
 
     Ok(match predicate {
@@ -99,6 +112,111 @@ fn build_date_filter_doc(value: &SearchValue, param: &str, field: &str) -> Stora
         DatePredicate::AtOrAfter(bound) => doc! { field: { "$gte": chrono_to_bson(bound) } },
         DatePredicate::Before(bound) => doc! { field: { "$lt": chrono_to_bson(bound) } },
     })
+}
+
+/// The date filter document for one search value against the *range* a
+/// `search_index` row stores, `[value_date, value_date_end)` (#1391): a
+/// `Period` is one row, not two unrelated points, and every prefix follows
+/// the FHIR rule for a range target ([`FhirDateValue::range_predicate`]).
+///
+/// A row indexed before #1391 has no `value_date_end` and fails every
+/// condition on the end until it is reindexed (`$reindex`); treating the
+/// missing end as open would make it match `gt` for any date.
+fn build_date_range_filter_doc(value: &SearchValue, param: &str) -> StorageResult<Document> {
+    let parsed = parse_date_search_value(value, param)?;
+    let predicate = parsed.range_predicate(value.prefix, StorageResolution::Millis);
+
+    let mut arms: Vec<Document> = predicate
+        .any_of
+        .iter()
+        .map(|group| {
+            let mut arm = Document::new();
+            let mut bound_on = |field: &str, op: &str, bound| {
+                if let Ok(ops) = arm.get_document_mut(field) {
+                    ops.insert(op, chrono_to_bson(bound));
+                } else {
+                    arm.insert(field, doc! { op: chrono_to_bson(bound) });
+                }
+            };
+            for condition in group {
+                match *condition {
+                    RangeCondition::StartAtOrAfter(bound) => bound_on("value_date", "$gte", bound),
+                    RangeCondition::StartBefore(bound) => bound_on("value_date", "$lt", bound),
+                    RangeCondition::EndAfter(bound) => bound_on(VALUE_DATE_END, "$gt", bound),
+                    RangeCondition::EndAtOrBefore(bound) => {
+                        // Implied, since every stored range is at least one
+                        // unit wide; it lets `eq` and `eb` seek on
+                        // `idx_search_date_v3`, which leads with `value_date`.
+                        bound_on("value_date", "$lt", bound);
+                        bound_on(VALUE_DATE_END, "$lte", bound);
+                    }
+                }
+            }
+            if arm.contains_key("value_date") {
+                arm
+            } else {
+                // `idx_search_date_v3` is partial on `value_date` existing; a
+                // filter on the end alone would not imply it and would scan
+                // every row of the resource type instead. `$ne: null` rather
+                // than `$exists: true`, which the index cannot answer without
+                // reading the document.
+                let mut with_start = doc! { "value_date": { "$ne": null } };
+                with_start.extend(arm);
+                with_start
+            }
+        })
+        .collect();
+
+    Ok(if arms.len() == 1 {
+        arms.remove(0)
+    } else {
+        doc! { "$or": arms }
+    })
+}
+
+/// Flattens the date filters of one parameter's values into a single
+/// top-level `$or` whose arms each repeat the `scope` conjuncts (tenant,
+/// resource type, parameter name), so that every arm is a plain conjunction
+/// the `idx_search_date_v3` index can seek on, covered (#1391).
+///
+/// A value filter is either one conjunction or `{ "$or": [conjunction, ..] }`
+/// (see [`build_date_range_filter_doc`]); comma-separated values are OR'd, so
+/// the union of all arms is the same set of rows as the nested form matched.
+fn scoped_date_alternatives(scope: &Document, value_filters: Vec<Document>) -> Document {
+    let mut arms: Vec<Bson> = Vec::new();
+    for value_filter in value_filters {
+        let alternatives = match value_filter.get_array("$or") {
+            Ok(alternatives) if value_filter.len() == 1 => alternatives.clone(),
+            _ => vec![Bson::Document(value_filter)],
+        };
+        for alternative in alternatives {
+            if let Bson::Document(conditions) = alternative {
+                let mut arm = scope.clone();
+                arm.extend(conditions);
+                arms.push(Bson::Document(arm));
+            }
+        }
+    }
+    doc! { "$or": arms }
+}
+
+/// Drops the `tenant_id` / `resource_type` scope from a filter built by
+/// `build_search_index_filter`: at the top and, for a date filter, in each arm
+/// of its top-level `$or` ([`scoped_date_alternatives`]).
+fn strip_index_scope(filter: &mut Document, param_type: SearchParamType) {
+    filter.remove("tenant_id");
+    filter.remove("resource_type");
+    if param_type != SearchParamType::Date {
+        return;
+    }
+    if let Ok(arms) = filter.get_array_mut("$or") {
+        for arm in arms {
+            if let Bson::Document(arm) = arm {
+                arm.remove("tenant_id");
+                arm.remove("resource_type");
+            }
+        }
+    }
 }
 
 /// The error for a number or quantity search value whose number is not one.
@@ -331,6 +449,18 @@ pub(super) fn value_field_for(param_type: SearchParamType) -> Option<&'static st
     }
 }
 
+/// What a parameter sort aggregates per resource: the value field, except
+/// that a descending date sort reads the end of each stored range (#1391) —
+/// a `Period` sorts by where it ends, as the SQL backends' `MAX` over the end
+/// column. A row indexed before #1391 has no end and falls back to its start.
+fn sort_key_expression(value_field: &str, direction: crate::types::SortDirection) -> Bson {
+    if value_field == "value_date" && direction == crate::types::SortDirection::Descending {
+        Bson::Document(doc! { "$ifNull": [format!("${VALUE_DATE_END}"), "$value_date"] })
+    } else {
+        Bson::String(format!("${value_field}"))
+    }
+}
+
 /// The envelope filter for a `:missing` presence check
 /// (`{tenant_id, resource_type, param_name}`, matching every row `search_index`
 /// carries for the parameter regardless of value), plus — when the parameter
@@ -363,20 +493,13 @@ pub(super) fn missing_presence_filter(
     filter
 }
 
-/// Rejects `_contained=true|both` combined with a composite search parameter
-/// (#1206 review finding 3).
+/// Rejects the `_contained=true|both` constraints that select *top-level*
+/// resources, which a contained resource never is (#1383, #1407).
 ///
-/// The top-level half of `_contained=both` is filtered by
-/// `matching_resource_ids` (composite-aware), but the contained half is
-/// resolved by `matching_contained`, which `continue`s straight past
-/// `Composite`/`Special` parameters (they are never indexed under
-/// `contained_type` rows the way a plain parameter is). Left unguarded,
-/// `_contained=both` would silently filter only its top-level half by the
-/// composite and let the contained half ignore it entirely. Composite
-/// parameters could in principle gain `_contained` support by teaching
-/// `matching_contained` the grouped pair check too, but that is unbuilt
-/// today, so this is a clear 400 rather than a silent under- or
-/// over-match.
+/// Kept as a separate gate from `matching_contained`'s per-parameter refusals
+/// because these constraints live outside `query.parameters` and `both` can
+/// fill a page without entering `matching_contained`. Supported composites
+/// pair their components per contained entity over `search_index_contained`.
 fn reject_contained_composite(query: &SearchQuery) -> StorageResult<()> {
     if query.contained == crate::types::ContainedMode::Off {
         return Ok(());
@@ -408,17 +531,18 @@ fn reject_contained_composite(query: &SearchQuery) -> StorageResult<()> {
                 .to_string(),
         }));
     }
-    match query
+    // In `both` mode the top-level page can be full, so matching_contained
+    // may never run. Refuse composites the contained index cannot interpret
+    // before either branch is executed.
+    if let Some((param, reason)) = query
         .parameters
         .iter()
-        .find(|p| p.param_type == SearchParamType::Composite)
+        .filter(|param| param.param_type == SearchParamType::Composite)
+        .find_map(|param| contained_unsupported_reason(param).map(|reason| (param, reason)))
     {
-        Some(param) => Err(reject_contained_parameter(
-            param,
-            "composite parameters are",
-        )),
-        None => Ok(()),
+        return Err(reject_contained_parameter(param, &reason));
     }
+    Ok(())
 }
 
 /// Why `matching_contained` cannot apply `param`, if it cannot (#1363).
@@ -432,15 +556,23 @@ fn reject_contained_composite(query: &SearchQuery) -> StorageResult<()> {
 ///   own, and the container's is not on these documents;
 /// - `_text`, `_content` and the other `_`-parameters resolved against
 ///   `resources`, which only knows the container;
-/// - composites (see [`reject_contained_composite`]) and chains;
+/// - chains (composite components are paired per contained entity instead);
 /// - `:not` and `:missing`, which the standard path resolves as a complement
 ///   over *resources* (`matching_resource_ids_complement_only`), never as a
 ///   `search_index` filter. There is no such complement over contained
 ///   entities yet.
 ///
-/// Every other modifier goes to `build_search_index_filter`, which honours or
-/// refuses it exactly as it does for a top-level search.
+/// Other modifiers on ordinary parameters go to their value filter builder.
+/// Composite modifiers are refused because `component_param` removes them
+/// before building the typed predicates.
 fn contained_unsupported_reason(param: &SearchParameter) -> Option<String> {
+    if param.param_type == SearchParamType::Composite {
+        if let Some(modifier) = &param.modifier {
+            // component_param removes the composite modifier before building
+            // typed predicates; no modifier can be honoured on this path.
+            return Some(format!("the ':{modifier}' composite modifier is"));
+        }
+    }
     if !param.chain.is_empty() {
         return Some("chained parameters are".to_string());
     }
@@ -459,7 +591,6 @@ fn contained_unsupported_reason(param: &SearchParameter) -> Option<String> {
         return Some("this parameter is".to_string());
     }
     match (&param.modifier, param.param_type) {
-        (_, SearchParamType::Composite) => Some("composite parameters are".to_string()),
         (_, SearchParamType::Special) => Some("special parameters are".to_string()),
         (Some(m @ (SearchModifier::Not | SearchModifier::Missing)), _) => {
             Some(format!("the ':{m}' modifier is"))
@@ -926,7 +1057,161 @@ struct ComponentFilter {
     negated: bool,
 }
 
+/// One composite component's `search_index_contained` filter, scoped to
+/// `(tenant_id, contained_type, param_name)` instead of
+/// `(tenant_id, resource_type, param_name)`: contained rows carry the
+/// *container's* `resource_type`, so scoping by the searched type would match
+/// nothing. Built by [`MongoBackend::contained_composite_component_filters`].
+#[derive(Debug)]
+struct ContainedComponentFilter {
+    filter: Document,
+}
+
+/// Builds the aggregation stages matching one composite value's entities over
+/// `search_index_contained` (#1407).
+///
+/// Takes one value's already-scoped component filters (see
+/// [`MongoBackend::contained_composite_component_filters`]) and returns the
+/// stages matching every contained entity whose rows pair all components
+/// within a single `composite_group`: one `$match` arm per component, tagged
+/// with its `component_idx`, joined by `$unionWith`, then grouped by
+/// `(resource_type, resource_id, contained_local_id, composite_group)` with
+/// all component indices required, and finally collapsed to the entity shape
+/// `_id = {rtype, rid, lid}` the contained pipeline groups on.
+///
+/// Each arm keeps its full scoped filter (tenant, contained type, parameter
+/// name, typed predicate), so no arm can leak rows across tenants or
+/// parameters. `Ne` components need no special casing here: their filter is
+/// the same existence-bounded predicate the top-level pair check runs, and
+/// these arms only ever feed the grouped pair check, never a driver probe.
+/// An empty component list is a closed failure, never a vacuous match.
+fn contained_composite_value_stages(
+    components: &[ContainedComponentFilter],
+) -> StorageResult<Vec<Document>> {
+    if components.is_empty() {
+        return Err(StorageError::Search(SearchError::InvalidComposite {
+            message: "composite value has no components to match".to_string(),
+        }));
+    }
+    let arm = |index: usize, filter: &Document| {
+        vec![
+            doc! { "$match": filter.clone() },
+            doc! { "$addFields": { "component_idx": index as i32 } },
+        ]
+    };
+    let required: Vec<Bson> = (0..components.len())
+        .map(|index| Bson::Int32(index as i32))
+        .collect();
+    let mut first = components
+        .first()
+        .map(|component| arm(0, &component.filter))
+        .unwrap_or_default();
+    for (index, component) in components.iter().enumerate().skip(1) {
+        first.push(doc! { "$unionWith": {
+            "coll": MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION,
+            "pipeline": arm(index, &component.filter),
+        }});
+    }
+    first.push(doc! { "$group": {
+        "_id": {
+            "rtype": "$resource_type",
+            "rid": "$resource_id",
+            "lid": "$contained_local_id",
+            "grp": "$composite_group",
+        },
+        "components": { "$addToSet": "$component_idx" },
+    }});
+    first.push(doc! { "$match": { "components": { "$all": required } } });
+    first.push(doc! { "$group": {
+        "_id": {
+            "rtype": "$_id.rtype",
+            "rid": "$_id.rid",
+            "lid": "$_id.lid",
+        },
+    }});
+    Ok(first)
+}
+
 impl MongoBackend {
+    /// Builds every component's scoped `search_index_contained` filter for a
+    /// composite parameter under `_contained` (#1407) — outer index is the
+    /// (comma-OR'd) value, inner index is the component, in declaration order.
+    ///
+    /// Reuses [`Self::composite_component_filters`] so composite value
+    /// splitting, per-type prefix handling, quantity/date/number predicates
+    /// and the `{value_field: {"$ne": null}}` scoping conjunct stay on one
+    /// code path. Each returned filter is then re-scoped from the top-level
+    /// `(tenant_id, resource_type)` slice to the contained
+    /// `(tenant_id, contained_type)` slice: `resource_type` is removed (a
+    /// contained row carries its container's type, never the searched type)
+    /// and the composite's own `param_name` is kept, since every component
+    /// row shares it.
+    /// Modifier and chain validation happens before this builder; unsupported value types are checked by
+    /// `composite_component_filters`.
+    fn contained_composite_component_filters(
+        &self,
+        tenant_id: &str,
+        contained_type: &str,
+        param: &SearchParameter,
+    ) -> StorageResult<Vec<Vec<ContainedComponentFilter>>> {
+        let per_value = self.composite_component_filters(tenant_id, contained_type, param)?;
+        let mut result = Vec::with_capacity(per_value.len());
+        for per_component in per_value {
+            let mut rescoped = Vec::with_capacity(per_component.len());
+            for component in per_component {
+                let mut filter = component.filter;
+                filter.remove("resource_type");
+                filter.insert("tenant_id", tenant_id);
+                filter.insert("contained_type", contained_type);
+                filter.insert("param_name", param.name.clone());
+                rescoped.push(ContainedComponentFilter { filter });
+            }
+            result.push(rescoped);
+        }
+        Ok(result)
+    }
+
+    /// Builds the aggregation stages matching one composite parameter's entities
+    /// over `search_index_contained` (#1407): one value pipeline per
+    /// comma-separated value (see `contained_composite_value_stages`), joined
+    /// by `$unionWith` and de-duplicated by a final `$group` on `$_id`.
+    ///
+    /// Comma is OR: an entity matching any value matches the parameter. The
+    /// final `$group` collapses entities matched by several values (e.g. an
+    /// entity pairing both `A$gt5` and `B$gt5` groups) to one slot, in the
+    /// same `_id = {rtype, rid, lid}` shape `matching_contained` groups on.
+    /// No values is a closed failure, never a vacuous match.
+    fn contained_composite_stages(
+        &self,
+        tenant_id: &str,
+        contained_type: &str,
+        param: &SearchParameter,
+    ) -> StorageResult<Vec<Document>> {
+        let per_value =
+            self.contained_composite_component_filters(tenant_id, contained_type, param)?;
+        if per_value.is_empty() {
+            return Err(StorageError::Search(SearchError::InvalidComposite {
+                message: format!("composite search parameter '{}' has no values", param.name),
+            }));
+        }
+        let mut values = per_value.iter();
+        let first = values
+            .next()
+            .map(|value| contained_composite_value_stages(value))
+            .transpose()?
+            .unwrap_or_default();
+        let mut stages = first;
+        for value in values {
+            let pipeline = contained_composite_value_stages(value)?;
+            stages.push(doc! { "$unionWith": {
+                "coll": MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION,
+                "pipeline": pipeline,
+            }});
+        }
+        stages.push(doc! { "$group": { "_id": "$_id" } });
+        Ok(stages)
+    }
+
     /// Executes a `_contained=true|both` search (see the SQLite backend's
     /// `search_contained` for shared semantics). Returns containers (default) or
     /// contained resources (`_containedType=contained`); `both` merges top-level
@@ -941,6 +1226,15 @@ impl MongoBackend {
         let db = self.get_database().await?;
         let tenant_id = tenant.tenant_id().as_str();
         let contained_type = query.resource_type.as_str();
+        self.preflight_legacy_composites(
+            &db,
+            tenant_id,
+            contained_type,
+            &query.parameters,
+            true,
+            None,
+        )
+        .await?;
         let count = query.count.unwrap_or(100).max(1) as usize;
         let offset = query.offset.unwrap_or(0) as usize;
         let want_total = query.wants_total();
@@ -949,10 +1243,7 @@ impl MongoBackend {
             ContainedMode::Both => {
                 // Top-level matches come first, contained matches second. The
                 // standard search is asked for its total so the boundary is
-                // known, and each source is paged on the server. Dedupe below
-                // is against the current top-level *page* only, as before
-                // this change, so a container that was a top-level match on
-                // an earlier page can still appear in a later contained page.
+                // known, and each source is paged on the server.
                 let mut top_query = query.clone();
                 top_query.contained = ContainedMode::Off;
                 top_query.contained_return = ContainedReturn::Container;
@@ -964,7 +1255,25 @@ impl MongoBackend {
                     )
                 })? as usize;
                 let mut items = top.resources.items;
-                let top_urls: HashSet<String> = items.iter().map(|r| r.url()).collect();
+
+                // A container of the searched type can also satisfy the
+                // top-level query. Resolve that query's full predicate, not
+                // just the current top-level page, so the contained pipeline
+                // can discard overlaps before its offset and count stages.
+                let top_filter = if query.contained_return == ContainedReturn::Container {
+                    let matched_ids = self
+                        .matching_resource_ids(&db, tenant_id, contained_type, &top_query)
+                        .await?;
+                    Some(self.build_resource_filter(
+                        tenant_id,
+                        contained_type,
+                        &top_query,
+                        matched_ids.as_ref(),
+                        None,
+                    )?)
+                } else {
+                    None
+                };
 
                 let (c_offset, c_limit) = if offset < top_total {
                     (0, count.saturating_sub(items.len()))
@@ -983,10 +1292,11 @@ impl MongoBackend {
                             c_offset,
                             c_limit,
                             want_total,
+                            top_filter.as_ref(),
                         )
                         .await?;
                     contained_total = page.total;
-                    let mut contained = self
+                    let contained = self
                         .materialize_contained(
                             &db,
                             tenant,
@@ -995,17 +1305,6 @@ impl MongoBackend {
                             &page.keys,
                         )
                         .await?;
-                    // Containers already on the top-level page are dropped
-                    // here rather than refilled: they are still within
-                    // [c_offset, c_offset + c_limit), so an offset-based
-                    // refill would just re-fetch the same keys on a later
-                    // page. The page may come back short by that many items.
-                    // Only a *container* can be a top-level match too; a
-                    // contained resource whose local id equals a top-level
-                    // id is a different resource (#1383).
-                    if query.contained_return == ContainedReturn::Container {
-                        contained.retain(|r| !top_urls.contains(&r.url()));
-                    }
                     items.extend(contained);
                 } else if want_total {
                     // No room left on this page for contained items, but the
@@ -1020,6 +1319,7 @@ impl MongoBackend {
                             c_offset,
                             1,
                             true,
+                            top_filter.as_ref(),
                         )
                         .await?;
                     contained_total = page.total;
@@ -1042,6 +1342,7 @@ impl MongoBackend {
                         offset,
                         count,
                         want_total,
+                        None,
                     )
                     .await?;
                 let items = self
@@ -1090,7 +1391,8 @@ impl MongoBackend {
     /// per-entity stage is instead one `$unionWith` arm per occurrence, and an
     /// entity must come back from all of them (#1362). A criterion this path
     /// cannot apply is refused, never skipped (#1363) — see
-    /// [`contained_unsupported_reason`].
+    /// [`contained_unsupported_reason`]. Composite parameters use their own
+    /// grouped component checks, then join this per-occurrence intersection.
     #[allow(clippy::too_many_arguments)]
     async fn matching_contained(
         &self,
@@ -1102,6 +1404,7 @@ impl MongoBackend {
         offset: usize,
         limit: usize,
         want_total: bool,
+        exclude_top_level: Option<&Document>,
     ) -> StorageResult<ContainedPage> {
         use crate::types::ContainedReturn;
         let contained_rows =
@@ -1112,8 +1415,10 @@ impl MongoBackend {
         // are ORed by `build_search_index_filter`.
         let mut branches: Vec<Document> = Vec::new();
         let mut distinct_names: Vec<String> = Vec::new();
+        let mut composite_branches: Vec<Vec<Document>> = Vec::new();
         // `_id` is the contained resource's local id, a field of every row.
         let mut id_clauses: Vec<Bson> = Vec::new();
+        let mut composite_id_clauses: Vec<Bson> = Vec::new();
         for param in &query.parameters {
             if let Some(reason) = contained_unsupported_reason(param) {
                 return Err(reject_contained_parameter(param, &reason));
@@ -1121,15 +1426,23 @@ impl MongoBackend {
             if param.name == "_id" {
                 let ids: Vec<&str> = param.values.iter().map(|v| v.value.as_str()).collect();
                 id_clauses.push(Bson::Document(
-                    doc! { "contained_local_id": { "$in": ids } },
+                    doc! { "contained_local_id": { "$in": ids.clone() } },
                 ));
+                composite_id_clauses.push(Bson::Document(doc! { "_id.lid": { "$in": ids } }));
+                continue;
+            }
+            if param.param_type == SearchParamType::Composite {
+                composite_branches.push(self.contained_composite_stages(
+                    tenant_id,
+                    contained_type,
+                    param,
+                )?);
                 continue;
             }
             // Reuse the standard per-param value filter, dropping the tenant /
             // resource_type scoping (handled by the pipeline's top `$match`).
             let mut branch = self.build_search_index_filter("", "", param)?;
-            branch.remove("tenant_id");
-            branch.remove("resource_type");
+            strip_index_scope(&mut branch, param.param_type);
             branches.push(branch);
             if !distinct_names.contains(&param.name) {
                 distinct_names.push(param.name.clone());
@@ -1160,6 +1473,7 @@ impl MongoBackend {
         if !id_clauses.is_empty() {
             entity_scope.insert("$and", id_clauses);
         }
+        let has_plain_branches = !branches.is_empty();
 
         let entity = doc! {
             "rtype": "$resource_type",
@@ -1225,6 +1539,41 @@ impl MongoBackend {
             stages.push(doc! { "$match": { "occurrences": { "$all": required } } });
             stages
         };
+        if !composite_branches.is_empty() {
+            // Each composite has already paired its components within one
+            // contained entity. Intersect those entities with every plain
+            // criterion, including repeated names and compartment membership.
+            // `_id` is a local contained id and must constrain composite-only
+            // searches too; the plain arm applies it in `entity_scope`.
+            let mut occurrence_count = 0;
+            if has_plain_branches {
+                pipeline.push(doc! { "$addFields": { "occurrence": occurrence_count } });
+                occurrence_count += 1;
+            } else {
+                pipeline.clear();
+            }
+            for mut composite in composite_branches {
+                if !composite_id_clauses.is_empty() {
+                    composite.push(doc! { "$match": { "$and": composite_id_clauses.clone() } });
+                }
+                composite.push(doc! { "$addFields": { "occurrence": occurrence_count } });
+                if occurrence_count == 0 {
+                    pipeline = composite;
+                } else {
+                    pipeline.push(doc! { "$unionWith": {
+                        "coll": MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION,
+                        "pipeline": composite,
+                    }});
+                }
+                occurrence_count += 1;
+            }
+            let required: Vec<i32> = (0..occurrence_count).collect();
+            pipeline.push(doc! { "$group": {
+                "_id": "$_id",
+                "occurrences": { "$addToSet": "$occurrence" },
+            }});
+            pipeline.push(doc! { "$match": { "occurrences": { "$all": required } } });
+        }
         let sort = match contained_return {
             ContainedReturn::Container => {
                 // Collapse the surviving per-entity slots to one per
@@ -1232,6 +1581,27 @@ impl MongoBackend {
                 pipeline.push(doc! { "$group": {
                     "_id": { "rtype": "$_id.rtype", "rid": "$_id.rid" },
                 }});
+                if let Some(top_filter) = exclude_top_level {
+                    // Check every container against the full live top-level
+                    // predicate before pagination and the total facet. A
+                    // different container type may use the same id, so only
+                    // containers of the searched type can be overlaps.
+                    pipeline.push(doc! { "$lookup": {
+                        "from": MongoBackend::RESOURCES_COLLECTION,
+                        "localField": "_id.rid",
+                        "foreignField": "id",
+                        "pipeline": [
+                            { "$match": top_filter.clone() },
+                            { "$limit": 1 },
+                            { "$project": { "_id": 1 } },
+                        ],
+                        "as": "top_overlap",
+                    }});
+                    pipeline.push(doc! { "$match": { "$or": [
+                        { "_id.rtype": { "$ne": contained_type } },
+                        { "top_overlap": { "$eq": [] } },
+                    ] } });
+                }
                 doc! { "_id.rtype": 1, "_id.rid": 1 }
             }
             ContainedReturn::Contained => doc! { "_id.rtype": 1, "_id.rid": 1, "_id.lid": 1 },
@@ -1727,6 +2097,7 @@ impl MongoBackend {
             SortDirection::Ascending => ("$min", 1),
             SortDirection::Descending => ("$max", -1),
         };
+        let sort_key = sort_key_expression(value_field, directive.direction);
         let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
 
         if let Some(allowed) = allowed {
@@ -1749,7 +2120,7 @@ impl MongoBackend {
                     }},
                     doc! { "$group": {
                         "_id": "$resource_id",
-                        "key": { accumulator: format!("${value_field}") },
+                        "key": { accumulator: sort_key.clone() },
                     }},
                 ];
                 let cursor = search_index
@@ -1792,7 +2163,7 @@ impl MongoBackend {
             }},
             doc! { "$group": {
                 "_id": "$resource_id",
-                "key": { accumulator: format!("${value_field}") },
+                "key": { accumulator: sort_key.clone() },
             }},
             doc! { "$sort": { "key": order, "_id": 1 } },
             doc! { "$project": { "_id": 1 } },
@@ -1838,6 +2209,16 @@ impl MongoBackend {
         if query.parameters.iter().any(crate::search::has_empty_value) {
             return Ok(Some(HashSet::new()));
         }
+
+        self.preflight_legacy_composites(
+            db,
+            tenant_id,
+            resource_type,
+            &query.parameters,
+            false,
+            None,
+        )
+        .await?;
 
         let mut normal: Vec<&SearchParameter> = Vec::new();
         let mut missing: Vec<&SearchParameter> = Vec::new();
@@ -2315,6 +2696,18 @@ impl MongoBackend {
             .map(|value| self.build_index_value_filter(param, value, &targets))
             .collect::<StorageResult<Vec<_>>>()?;
 
+        // #1391: a date value can be several alternatives of its own (`ge`,
+        // `le`, `ne`), and a comma list adds more. MongoDB 5.0 answers an
+        // `$or` nested under the shared tenant/type/param conjuncts by
+        // reading the documents, not as a covered scan; an `$or` at the top,
+        // every arm carrying the scope itself, plans one index scan per arm.
+        // The alternatives and their OR are unchanged; only where they sit.
+        if param.param_type == SearchParamType::Date
+            && (value_filters.len() > 1 || value_filters.iter().any(|f| f.contains_key("$or")))
+        {
+            return Ok(scoped_date_alternatives(&filter, value_filters));
+        }
+
         if value_filters.len() == 1 {
             if let Some(single) = value_filters.into_iter().next() {
                 for (key, value) in single {
@@ -2355,8 +2748,8 @@ impl MongoBackend {
     /// Each returned document is a *full* filter (`tenant_id`,
     /// `resource_type`, `param_name` = the composite's own name, plus the
     /// component's typed predicate) — every row for every component of a
-    /// composite shares `param_name` with the composite itself, since the
-    /// extractor never stores a per-component slot.
+    /// composite shares `param_name` with the composite itself. Repeated
+    /// component types also require their declared `composite_slot`.
     ///
     /// Every predicate is additionally ANDed with `{value_field: {"$ne":
     /// null}}` for the component's own value field (review finding: an
@@ -2404,11 +2797,19 @@ impl MongoBackend {
         }
 
         let mut result = Vec::with_capacity(param.values.len());
+        // Match the extractor's per-type, declaration-order slot numbering.
+        // A unique type does not need a slot predicate, so old rows for
+        // composites with distinct component types remain searchable.
+        let mut counts = HashMap::<SearchParamType, usize>::new();
+        for component in &param.components {
+            *counts.entry(component.param_type).or_default() += 1;
+        }
         for value in &param.values {
             let component_values =
                 super::composite_search::split_composite_value(&value.value, &param.components)?;
 
             let mut per_component = Vec::with_capacity(param.components.len());
+            let mut seen = HashMap::<SearchParamType, i32>::new();
             for (component, component_value) in param.components.iter().zip(component_values) {
                 let negated = component_value.prefix == SearchPrefix::Ne;
                 let value_field = value_field_for(component.param_type).ok_or_else(|| {
@@ -2439,14 +2840,25 @@ impl MongoBackend {
                     component,
                     component_value.clone(),
                 );
-                let predicate =
-                    self.build_index_value_filter(&synthetic, &component_value, &targets)?;
+                // A composite's date component is compared as a point on
+                // `value_date`, as on every backend: only a standalone date
+                // parameter is range-aware (#1391).
+                let predicate = if component.param_type == SearchParamType::Date {
+                    self.build_date_filter(&component_value, &synthetic.name, "value_date")?
+                } else {
+                    self.build_index_value_filter(&synthetic, &component_value, &targets)?
+                };
 
                 let mut scoped = doc! {
                     "tenant_id": tenant_id,
                     "resource_type": resource_type,
                     "param_name": &param.name,
                 };
+                let slot = seen.entry(component.param_type).or_default();
+                *slot += 1;
+                if counts[&component.param_type] > 1 {
+                    scoped.insert("composite_slot", *slot);
+                }
                 scoped.insert(
                     "$and",
                     vec![
@@ -2462,6 +2874,103 @@ impl MongoBackend {
             result.push(per_component);
         }
         Ok(result)
+    }
+
+    /// Reject a repeated-type composite if an older matching component row
+    /// lacks its slot. Without this probe a slot-constrained query can report
+    /// a false negative until the tenant's index is rebuilt with `$reindex`.
+    pub(super) async fn preflight_legacy_composites(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        resource_type: &str,
+        parameters: &[SearchParameter],
+        contained: bool,
+        mut session: Option<&mut mongodb::ClientSession>,
+    ) -> StorageResult<()> {
+        let collection = db.collection::<Document>(if contained {
+            MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION
+        } else {
+            MongoBackend::SEARCH_INDEX_COLLECTION
+        });
+        let probe_index = if contained {
+            CONTAINED_COMPOSITE_SLOT_PROBE_INDEX
+        } else {
+            COMPOSITE_SLOT_PROBE_INDEX
+        };
+        for param in parameters
+            .iter()
+            .filter(|p| p.param_type == SearchParamType::Composite && p.modifier.is_none())
+        {
+            let mut seen = HashSet::new();
+            if !param
+                .components
+                .iter()
+                .any(|component| !seen.insert(component.param_type))
+            {
+                continue;
+            }
+            let normal_filters =
+                self.composite_component_filters(tenant_id, resource_type, param)?;
+            if !contained
+                && normal_filters
+                    .iter()
+                    .any(|value| value.iter().all(|c| c.negated))
+            {
+                // The driver planner's existing all-ne error takes precedence.
+                continue;
+            }
+            let filters = if contained {
+                self.contained_composite_component_filters(tenant_id, resource_type, param)?
+                    .into_iter()
+                    .map(|value| value.into_iter().map(|c| c.filter).collect::<Vec<_>>())
+                    .collect::<Vec<_>>()
+            } else {
+                normal_filters
+                    .into_iter()
+                    .map(|value| value.into_iter().map(|c| c.filter).collect::<Vec<_>>())
+                    .collect::<Vec<_>>()
+            };
+            for value in filters {
+                for mut filter in value {
+                    if filter.remove("composite_slot").is_none() {
+                        continue;
+                    }
+                    // Keep the typed value predicate: a row for another
+                    // candidate value does not require this query to fail.
+                    let legacy = doc! { "$and": [
+                        filter,
+                        { "composite_slot": { "$exists": false } },
+                        { "composite_group": { "$exists": true } },
+                    ] };
+                    let found = match session.as_deref_mut() {
+                        Some(s) => {
+                            collection
+                                .find_one(legacy)
+                                .hint(mongodb::options::Hint::Name(probe_index.to_string()))
+                                .session(s)
+                                .await
+                        }
+                        None => {
+                            collection
+                                .find_one(legacy)
+                                .hint(mongodb::options::Hint::Name(probe_index.to_string()))
+                                .await
+                        }
+                    }
+                    .or_query_error("Failed to probe legacy MongoDB composite rows")?;
+                    if found.is_some() {
+                        return Err(StorageError::Search(SearchError::InvalidComposite {
+                            message: format!(
+                                "composite search parameter '{}' has rows without component slots; run $reindex for this tenant",
+                                param.name
+                            ),
+                        }));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Counts documents matching `filter`, bounded by `limit`, using
@@ -2731,7 +3240,7 @@ impl MongoBackend {
         match param.param_type {
             SearchParamType::String => self.build_string_filter(param, value),
             SearchParamType::Token => self.build_token_filter(param, value),
-            SearchParamType::Date => self.build_date_filter(value, &param.name, "value_date"),
+            SearchParamType::Date => build_date_range_filter_doc(value, &param.name),
             SearchParamType::Number => self.build_number_filter(&param.name, value),
             SearchParamType::Reference => {
                 self.build_reference_filter(param, value, reference_targets)
@@ -2843,7 +3352,19 @@ impl MongoBackend {
 
         if let Some((system, code)) = value.value.split_once('|') {
             if system.is_empty() {
-                Ok(doc! { "value_token_code": code })
+                // |code - match code with no system (#1388). An absent field
+                // matches `null`; a `code` element has no system property
+                // either, and its row carries the marker (#1379).
+                Ok(doc! {
+                    "value_token_system": {
+                        "$in": [
+                            Bson::Null,
+                            Bson::String(String::new()),
+                            crate::search::IMPLICIT_TOKEN_SYSTEM,
+                        ]
+                    },
+                    "value_token_code": code,
+                })
             } else if code.is_empty() {
                 Ok(doc! { "value_token_system": system })
             } else {
@@ -3315,8 +3836,8 @@ impl MongoBackend {
         let parsed = number.value;
         Ok(match prefix {
             SearchPrefix::Ap => {
-                let delta = (parsed.abs() * 0.1).max(0.1);
-                doc! { "$gte": parsed - delta, "$lte": parsed + delta }
+                let (lo, hi) = number.approx_range();
+                doc! { "$gte": lo, "$lte": hi }
             }
             SearchPrefix::Eq => {
                 let (lo, hi) = number.implicit_range();
@@ -3345,7 +3866,10 @@ impl MongoBackend {
             SearchPrefix::Lt | SearchPrefix::Eb => Ok("$lt"),
             SearchPrefix::Ge => Ok("$gte"),
             SearchPrefix::Le => Ok("$lte"),
-            SearchPrefix::Ap => Ok("$eq"),
+            SearchPrefix::Ap => Err(internal_error(
+                "`ap` has no single MongoDB operator; numeric_condition builds its range"
+                    .to_string(),
+            )),
         }
     }
 
@@ -4169,17 +4693,120 @@ mod date_filter_tests {
         );
     }
 
-    /// ap: ±12h around the start, unchanged semantics.
+    /// ap on a point: the shared window, the range widened by one unit of a
+    /// date-only precision on each side (#1391; it was ±12h around the start).
     #[test]
-    fn ap_keeps_the_twelve_hour_window() {
+    fn ap_on_a_point_uses_the_shared_window() {
         let ap = filter("ap1995-10-02");
         assert_eq!(
             bounds(&ap).get_datetime("$gte").unwrap(),
-            &at("1995-10-01T12:00:00Z")
+            &at("1995-10-01T00:00:00Z")
         );
         assert_eq!(
-            bounds(&ap).get_datetime("$lte").unwrap(),
-            &at("1995-10-02T12:00:00Z")
+            bounds(&ap).get_datetime("$lt").unwrap(),
+            &at("1995-10-04T00:00:00Z")
+        );
+    }
+
+    fn range_filter(raw: &str) -> Document {
+        build_date_range_filter_doc(&SearchValue::parse(raw), "date").expect("valid date")
+    }
+
+    /// #1391: a standalone date parameter compares the stored range
+    /// `[value_date, value_date_end)` per the FHIR rules for a range target.
+    /// `2020` spans [2020-01-01, 2021-01-01).
+    #[test]
+    fn range_prefixes_compare_both_ends_of_the_stored_range() {
+        let (s, e) = (at("2020-01-01T00:00:00Z"), at("2021-01-01T00:00:00Z"));
+        let contained = doc! {
+            "value_date": { "$gte": s, "$lt": e },
+            "value_date_end": { "$lte": e },
+        };
+        let end_after = doc! {
+            "value_date": { "$ne": null },
+            "value_date_end": { "$gt": e },
+        };
+        assert_eq!(range_filter("2020"), contained);
+        assert_eq!(
+            range_filter("ne2020"),
+            doc! { "$or": [ { "value_date": { "$lt": s } }, end_after.clone() ] }
+        );
+        assert_eq!(range_filter("gt2020"), end_after);
+        assert_eq!(range_filter("lt2020"), doc! { "value_date": { "$lt": s } });
+        assert_eq!(
+            range_filter("ge2020"),
+            doc! { "$or": [ end_after.clone(), contained.clone() ] }
+        );
+        assert_eq!(
+            range_filter("le2020"),
+            doc! { "$or": [ { "value_date": { "$lt": s } }, contained.clone() ] }
+        );
+        assert_eq!(range_filter("sa2020"), doc! { "value_date": { "$gte": e } });
+        assert_eq!(
+            range_filter("eb2020"),
+            doc! {
+                "value_date": { "$lt": s },
+                "value_date_end": { "$lte": s },
+            }
+        );
+        assert_eq!(
+            range_filter("ap2020"),
+            doc! {
+                "value_date": { "$lt": at("2022-01-01T00:00:00Z") },
+                "value_date_end": { "$gt": at("2019-01-01T00:00:00Z") },
+            }
+        );
+    }
+
+    /// The filters agree with the shared predicate on the cases #1391 is
+    /// about: a Period straddling the search range, and open ends.
+    #[test]
+    fn range_filters_decide_the_issue_cases() {
+        let matches = |raw: &str, ts: &str, te: &str| {
+            let parsed = FhirDateValue::parse(&SearchValue::parse(raw).value).unwrap();
+            parsed
+                .range_predicate(SearchValue::parse(raw).prefix, StorageResolution::Millis)
+                .matches(bson_to_chrono(&at(ts)), bson_to_chrono(&at(te)))
+        };
+        let open_end = crate::search::open_end(StorageResolution::Millis).to_rfc3339();
+        let open_start = crate::search::open_start().to_rfc3339();
+        // A Period from 2019-06 to the end of 2020-03 is not "in" 2020.
+        assert!(!matches(
+            "2020",
+            "2019-06-01T00:00:00Z",
+            "2020-04-01T00:00:00Z"
+        ));
+        // One that only ends in 2021 does not start after 2020.
+        assert!(!matches(
+            "sa2020",
+            "2020-06-01T00:00:00Z",
+            "2021-06-01T00:00:00Z"
+        ));
+        // Open ends are unbounded.
+        assert!(matches("gt2030", "2019-01-01T00:00:00Z", &open_end));
+        assert!(matches("lt1900", &open_start, "2020-01-01T00:00:00Z"));
+        // Every prefix yields a filter.
+        for prefix in ["", "ne", "gt", "lt", "ge", "le", "sa", "eb", "ap"] {
+            range_filter(&format!("{prefix}2020-06-15T10:00Z"));
+        }
+    }
+
+    /// Descending date sorts read the end of the stored range; everything
+    /// else, and ascending date sorts, read the value field itself.
+    #[test]
+    fn descending_date_sort_reads_the_range_end() {
+        use crate::types::SortDirection;
+        assert_eq!(
+            sort_key_expression("value_date", SortDirection::Descending),
+            Bson::Document(doc! { "$ifNull": ["$value_date_end", "$value_date"] })
+        );
+        assert_eq!(
+            sort_key_expression("value_date", SortDirection::Ascending),
+            Bson::String("$value_date".to_string())
+        );
+        assert_eq!(
+            sort_key_expression("value_string", SortDirection::Descending),
+            Bson::String("$value_string".to_string())
         );
     }
 
@@ -4205,6 +4832,15 @@ mod date_filter_tests {
                         if param == "date"
                 ),
                 "{raw}: {error:?}"
+            );
+            let error =
+                build_date_range_filter_doc(&SearchValue::parse(raw), "date").expect_err(raw);
+            assert!(
+                matches!(
+                    &error,
+                    StorageError::Search(SearchError::InvalidDateValue { .. })
+                ),
+                "{raw} (range): {error:?}"
             );
         }
     }
@@ -4590,6 +5226,157 @@ mod value_list_tests {
         }
     }
 
+    fn date_param(values: &[&str]) -> SearchParameter {
+        SearchParameter {
+            name: "date".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: values.iter().map(|v| SearchValue::parse(v)).collect(),
+            chain: vec![],
+            components: vec![],
+        }
+    }
+
+    fn at_date(rfc3339: &str) -> BsonDateTime {
+        chrono_to_bson(
+            DateTime::parse_from_rfc3339(rfc3339)
+                .expect("test instant")
+                .with_timezone(&Utc),
+        )
+    }
+
+    /// The arms of a date filter's top-level `$or`, as documents.
+    fn top_level_arms(filter: &Document) -> Vec<Document> {
+        assert_eq!(filter.len(), 1, "only the $or at the top: {filter:?}");
+        filter
+            .get_array("$or")
+            .expect("top-level $or")
+            .iter()
+            .map(|arm| arm.as_document().expect("arm").clone())
+            .collect()
+    }
+
+    /// #1391: a date value with alternatives (`ge`, `le`, `ne`) puts its `$or`
+    /// at the top, each arm repeating tenant/type/param, so MongoDB plans one
+    /// covered `idx_search_date_v3` scan per arm; nested under the shared
+    /// conjuncts it reads the documents instead.
+    #[test]
+    fn two_branch_date_prefixes_scope_every_arm() {
+        let backend = backend();
+        let (s, e) = (
+            at_date("2020-01-01T00:00:00Z"),
+            at_date("2021-01-01T00:00:00Z"),
+        );
+        let scope = doc! { "tenant_id": "t1", "resource_type": "Patient", "param_name": "date" };
+        let expect = |arm: Document| {
+            let mut scoped = scope.clone();
+            scoped.extend(arm);
+            Bson::Document(scoped)
+        };
+        let end_after = doc! { "value_date": { "$ne": null }, "value_date_end": { "$gt": e } };
+        let contained = doc! {
+            "value_date": { "$gte": s, "$lt": e },
+            "value_date_end": { "$lte": e },
+        };
+        let before = doc! { "value_date": { "$lt": s } };
+
+        let cases = [
+            ("ge2020", vec![end_after.clone(), contained.clone()]),
+            ("le2020", vec![before.clone(), contained.clone()]),
+            ("ne2020", vec![before.clone(), end_after.clone()]),
+        ];
+        for (raw, arms) in cases {
+            let filter = backend
+                .build_search_index_filter("t1", "Patient", &date_param(&[raw]))
+                .expect(raw);
+            let expected = doc! { "$or": arms.into_iter().map(expect).collect::<Vec<_>>() };
+            assert_eq!(filter, expected, "date={raw}");
+        }
+    }
+
+    /// One-condition and both-end prefixes keep the flat shape: the
+    /// conjuncts and the value condition side by side, no `$or` at all.
+    #[test]
+    fn single_branch_date_prefixes_stay_flat() {
+        let backend = backend();
+        for raw in ["gt2020", "lt2020", "sa2020", "eb2020", "2020", "ap2020"] {
+            let filter = backend
+                .build_search_index_filter("t1", "Patient", &date_param(&[raw]))
+                .expect(raw);
+            assert!(!filter.contains_key("$or"), "date={raw}: {filter:?}");
+            assert_eq!(filter.get_str("tenant_id"), Ok("t1"), "date={raw}");
+            assert_eq!(filter.get_str("resource_type"), Ok("Patient"), "date={raw}");
+            assert_eq!(filter.get_str("param_name"), Ok("date"), "date={raw}");
+        }
+    }
+
+    /// A comma list is the OR of its values' alternatives, every one a
+    /// self-contained scoped arm at the top: `ge2020,lt2019` is
+    /// `[ge-end-arm, ge-contained-arm, lt-arm]`, not an `$or` of an `$or`.
+    #[test]
+    fn comma_list_of_date_values_flattens_into_one_top_level_or() {
+        let backend = backend();
+        let filter = backend
+            .build_search_index_filter("t1", "Patient", &date_param(&["ge2020", "lt2019"]))
+            .expect("filter");
+        let arms = top_level_arms(&filter);
+        assert_eq!(arms.len(), 3, "{arms:?}");
+        for arm in &arms {
+            assert_eq!(arm.get_str("tenant_id"), Ok("t1"), "{arm:?}");
+            assert_eq!(arm.get_str("resource_type"), Ok("Patient"), "{arm:?}");
+            assert_eq!(arm.get_str("param_name"), Ok("date"), "{arm:?}");
+            assert!(!arm.contains_key("$or"), "no nested $or: {arm:?}");
+            assert!(arm.contains_key("value_date"), "{arm:?}");
+        }
+        // The same alternatives, in the same order, as the values alone.
+        let alone: Vec<Document> = ["ge2020", "lt2019"]
+            .iter()
+            .flat_map(|raw| {
+                let one = backend
+                    .build_search_index_filter("t1", "Patient", &date_param(&[raw]))
+                    .unwrap();
+                if one.contains_key("$or") {
+                    top_level_arms(&one)
+                } else {
+                    vec![one]
+                }
+            })
+            .collect();
+        assert_eq!(arms, alone);
+    }
+
+    /// A repeated parameter (`date=ge2020&date=le2021`) is still two separate
+    /// filters, one per occurrence; nothing is merged across them.
+    #[test]
+    fn repeated_date_parameters_stay_separate_filters() {
+        let backend = backend();
+        let first = backend
+            .build_search_index_filter("t1", "Patient", &date_param(&["ge2020"]))
+            .unwrap();
+        let second = backend
+            .build_search_index_filter("t1", "Patient", &date_param(&["le2021"]))
+            .unwrap();
+        assert_eq!(top_level_arms(&first).len(), 2);
+        assert_eq!(top_level_arms(&second).len(), 2);
+        assert_ne!(first, second);
+    }
+
+    /// The contained-resource search reuses the filter under its own scope:
+    /// tenant and type come off every arm, the parameter name stays.
+    #[test]
+    fn stripping_the_scope_reaches_into_date_arms() {
+        let backend = backend();
+        let mut filter = backend
+            .build_search_index_filter("", "", &date_param(&["ge2020"]))
+            .unwrap();
+        strip_index_scope(&mut filter, SearchParamType::Date);
+        for arm in top_level_arms(&filter) {
+            assert!(!arm.contains_key("tenant_id"), "{arm:?}");
+            assert!(!arm.contains_key("resource_type"), "{arm:?}");
+            assert_eq!(arm.get_str("param_name"), Ok("date"), "{arm:?}");
+        }
+    }
+
     /// A regression a partial fix could pass: dropping only `Date` from the
     /// old `matches!` would leave `Number` ANDed and this test red.
     #[test]
@@ -4913,11 +5700,12 @@ mod composite_component_filter_tests {
             "Observation"
         );
         // Every component's row shares `param_name` with the composite
-        // itself -- there is no per-component slot.
+        // itself. This distinct-type composite can also use historical rows.
         assert_eq!(
             token_filter.get_str("param_name").unwrap(),
             "code-value-quantity"
         );
+        assert!(!token_filter.contains_key("composite_slot"));
         let and_arms = token_filter.get_array("$and").expect("$and conjunction");
         assert_eq!(and_arms.len(), 2, "not-null guard + typed predicate");
         let not_null = and_arms[0].as_document().expect("not-null arm");
@@ -5031,6 +5819,33 @@ mod composite_component_filter_tests {
             "expected QueryParseError like build_search_index_filter's own empty-values guard, \
              got {err:?}"
         );
+    }
+
+    #[test]
+    fn repeated_type_components_are_scoped_by_declared_slot() {
+        let backend = backend();
+        let param = SearchParameter {
+            name: "code-value-concept".to_string(),
+            param_type: SearchParamType::Composite,
+            modifier: None,
+            values: vec![SearchValue::eq("A$B")],
+            chain: vec![],
+            components: vec![
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "code".to_string(),
+                },
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "value-concept".to_string(),
+                },
+            ],
+        };
+        let filters = backend
+            .composite_component_filters("t1", "Observation", &param)
+            .unwrap();
+        assert_eq!(filters[0][0].filter.get_i32("composite_slot"), Ok(1));
+        assert_eq!(filters[0][1].filter.get_i32("composite_slot"), Ok(2));
     }
 }
 
@@ -6159,6 +6974,42 @@ mod modifier_parity_filter_tests {
                 "value_token_system": { "$in": [Bson::Null, Bson::String(String::new())] },
                 "value_token_code": "12345",
             }
+        );
+    }
+
+    /// `|code` means "no system" (#1388): absent, empty, or the implicit
+    /// marker of a `code` element — never any system, as a bare `code` does.
+    #[test]
+    fn token_without_system_matches_only_rows_without_one() {
+        let backend = MongoBackend::new(MongoBackendConfig::default()).unwrap();
+        let param = SearchParameter {
+            name: "code".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![],
+            chain: vec![],
+            components: vec![],
+        };
+        assert_eq!(
+            backend
+                .build_token_filter(&param, &SearchValue::eq("|1234-5"))
+                .unwrap(),
+            doc! {
+                "value_token_system": {
+                    "$in": [
+                        Bson::Null,
+                        Bson::String(String::new()),
+                        crate::search::IMPLICIT_TOKEN_SYSTEM,
+                    ]
+                },
+                "value_token_code": "1234-5",
+            }
+        );
+        assert_eq!(
+            backend
+                .build_token_filter(&param, &SearchValue::eq("1234-5"))
+                .unwrap(),
+            doc! { "value_token_code": "1234-5" }
         );
     }
 

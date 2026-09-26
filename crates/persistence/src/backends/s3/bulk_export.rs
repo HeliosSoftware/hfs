@@ -130,11 +130,13 @@ impl ExportDataProvider for S3Backend {
                 }
             }
 
-            lines.push(serde_json::to_string(resource.content()).map_err(|e| {
-                StorageError::BulkExport(BulkExportError::WriteError {
-                    message: format!("failed to serialize NDJSON line: {e}"),
-                })
-            })?);
+            lines.push(
+                serde_json::to_string(&resource.content_with_meta()).map_err(|e| {
+                    StorageError::BulkExport(BulkExportError::WriteError {
+                        message: format!("failed to serialize NDJSON line: {e}"),
+                    })
+                })?,
+            );
         }
 
         let offset = parse_export_cursor(cursor)?;
@@ -289,11 +291,13 @@ impl PatientExportProvider for S3Backend {
             if !in_compartment {
                 continue;
             }
-            lines.push(serde_json::to_string(resource.content()).map_err(|e| {
-                StorageError::BulkExport(BulkExportError::WriteError {
-                    message: format!("failed to serialize NDJSON line: {e}"),
-                })
-            })?);
+            lines.push(
+                serde_json::to_string(&resource.content_with_meta()).map_err(|e| {
+                    StorageError::BulkExport(BulkExportError::WriteError {
+                        message: format!("failed to serialize NDJSON line: {e}"),
+                    })
+                })?,
+            );
         }
 
         let offset = parse_export_cursor(cursor)?;

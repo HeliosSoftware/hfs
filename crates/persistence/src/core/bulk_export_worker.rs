@@ -887,7 +887,7 @@ where
         // rather than silently exporting an unfiltered set. When two filters
         // target the same resource type, the first one wins — the kick-off
         // path does not combine multiple filters for one type today.
-        let mut filters: HashMap<&str, &SearchQuery> = HashMap::new();
+        let mut filters: HashMap<&str, SearchQuery> = HashMap::new();
         for tf in &request.type_filters {
             let Some(compiled) = tf.compiled.as_ref() else {
                 return Err(LeaseError::Storage(StorageError::BulkExport(
@@ -899,7 +899,20 @@ where
                     },
                 )));
             };
-            filters.entry(tf.resource_type.as_str()).or_insert(compiled);
+            if filters.contains_key(tf.resource_type.as_str()) {
+                continue;
+            }
+            // A filter may carry a chain or `_has`, which `search()` does not
+            // read (#1389). Resolve it once per job into an `_id` filter, as
+            // REST does for a type search, so every batch is intersected with
+            // what the filter asks for rather than failing on it.
+            let resolving = crate::search::resolve_chains(self.data.as_ref(), tenant, compiled);
+            let resolved = tokio::select! {
+                biased;
+                _ = keeper.lost() => return Ok(JobOutcome::Abandoned),
+                resolved = resolving => resolved.map_err(LeaseError::Storage)?,
+            };
+            filters.insert(tf.resource_type.as_str(), resolved);
         }
 
         // For Group exports, resolve the member patient IDs once.
@@ -1311,8 +1324,9 @@ fn in_patient_compartment(version: helios_fhir::FhirVersion, resource_type: &str
 /// Applies `_elements` projection to an NDJSON line.
 ///
 /// When `elements` is non-empty, keeps `resourceType`, `id`, `meta` and the
-/// listed top-level element names, and adds a `SUBSETTED` `meta.tag`. On any
-/// parse failure the original line is returned unchanged.
+/// listed top-level element names, and adds a `SUBSETTED` `meta.tag`. Server
+/// meta (`versionId`/`lastUpdated`, #1273) is kept so consumers can derive the
+/// next `_since`. On any parse failure the original line is returned unchanged.
 fn apply_elements(line: &str, elements: &[String]) -> String {
     if elements.is_empty() {
         return line.to_string();
@@ -1400,6 +1414,26 @@ mod tests {
         assert!(v.get("name").is_some());
         assert!(v.get("gender").is_none());
         assert_eq!(v["meta"]["tag"][0]["code"], "SUBSETTED");
+    }
+
+    #[test]
+    fn test_apply_elements_keeps_server_meta_and_client_tags() {
+        let line = r#"{"resourceType":"Patient","id":"p1","name":[{"family":"X"}],"gender":"male","meta":{"versionId":"2","lastUpdated":"2026-09-24T15:05:52.648Z","tag":[{"system":"http://example.org/tags","code":"keep-me"}]}}"#;
+        let out = apply_elements(line, &["name".to_string()]);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("gender").is_none());
+        assert_eq!(v["name"][0]["family"], "X");
+        assert_eq!(v["meta"]["versionId"], "2");
+        assert_eq!(v["meta"]["lastUpdated"], "2026-09-24T15:05:52.648Z");
+        let tags = v["meta"]["tag"].as_array().unwrap();
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0]["system"], "http://example.org/tags");
+        assert_eq!(tags[0]["code"], "keep-me");
+        assert_eq!(
+            tags[1]["system"],
+            "http://terminology.hl7.org/CodeSystem/v3-ObservationValue"
+        );
+        assert_eq!(tags[1]["code"], "SUBSETTED");
     }
 
     #[test]

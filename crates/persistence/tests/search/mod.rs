@@ -47,12 +47,25 @@ pub fn make_sqlite_backend_for(fhir_version: FhirVersion) -> SqliteBackend {
     backend
 }
 
+/// Backend-agnostic scenarios, shared with the PostgreSQL, MongoDB and
+/// Elasticsearch test binaries via `#[path]` (#1390).
+pub mod ap_prefix_suite;
+/// Backend-agnostic `ap` scenarios for quantity composites,
+/// shared with the PostgreSQL, MongoDB and Elasticsearch test binaries via
+/// `#[path]` (#1390).
+pub mod ap_relations_suite;
 pub mod chained_tests;
+/// The date component of a composite compares as a point on a Period's start,
+/// not as the range a date parameter compares (#1391).
+pub mod composite_period_pin;
 /// Backend-agnostic scenarios, shared with the PostgreSQL, MongoDB and
 /// Elasticsearch test binaries via `#[path]` (#1293, #1295, #1296, #1297).
 /// Backend-agnostic scenarios, shared with the PostgreSQL and MongoDB test
 /// binaries via `#[path]` (#1315).
 pub mod date_minute_index_suite;
+/// Backend-agnostic scenarios for Period and Timing targets, shared with the
+/// PostgreSQL, MongoDB and Elasticsearch test binaries via `#[path]` (#1391).
+pub mod date_period_suite;
 pub mod date_precision_suite;
 pub mod date_tests;
 /// Backend-agnostic scenarios, shared with the PostgreSQL, MongoDB and
@@ -89,3 +102,24 @@ pub mod string_tests;
 /// Elasticsearch test binaries via `#[path]` (#1379).
 pub mod token_code_system_suite;
 pub mod token_tests;
+
+/// The shared Period table (#1391): a Period is one range, a missing side is
+/// unbounded, and every prefix follows the FHIR rules for range targets.
+/// PostgreSQL, MongoDB and Elasticsearch run the same one.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn date_period_targets_are_ranges() {
+    let backend = make_sqlite_backend();
+    date_period_suite::period_targets_are_ranges(&backend, "date-period").await;
+}
+
+/// A composite's date component is a point on a Period's start, where the plain
+/// date parameter is a range (#1391); `Observation?code-value-date` is the
+/// registry composite that admits a Period there.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn date_composite_component_is_a_point_on_a_period() {
+    let backend = make_sqlite_backend();
+    composite_period_pin::composite_date_component_is_a_point(&backend, "date-composite-period")
+        .await;
+}

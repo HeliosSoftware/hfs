@@ -19,9 +19,10 @@ attempt unverified, keeps its raw timings labelled incomplete, and stops the
 run instead of continuing to the next job.
 
 Safety: starts one HFS process in its own process group plus an in-process
-loopback provider, and stops exactly those.  The PostgreSQL container is
-inspected and queried, never stopped or reconfigured.  Credentials are never
-logged or written to the output directory.
+loopback provider (or reads from a caller-owned ``--provider-url`` server), and
+stops exactly those.  The PostgreSQL container is inspected and queried, never
+stopped or reconfigured.  Credentials are never logged or written to the
+output directory.
 """
 
 from __future__ import annotations
@@ -1126,6 +1127,8 @@ class PgClient:
 
 
 class FixtureProvider:
+    """Serve the NDJSON corpus over loopback HTTP/1.1 (HTTP/1.0 truncated large bodies, #1126)."""
+
     def __init__(self, root: Path, preferred_port: int, log: RunLog, log_path: Path):
         self.root = root
         self.preferred_port = preferred_port
@@ -1139,6 +1142,9 @@ class FixtureProvider:
         provider = self
 
         class Handler(http.server.SimpleHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"  # HTTP/1.0 truncated large bodies (#1126)
+            timeout = 300  # reap idle keep-alive connections
+
             def log_message(self, fmt: str, *args: Any) -> None:
                 provider._record(f"{self.address_string()} {fmt % args}")
 
@@ -1569,6 +1575,43 @@ class Controller:
         }
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         return f"{self.provider_base}/{manifest_path.name}"
+
+    def start_provider(self) -> None:
+        """Point ``provider_base`` at an external server, or start the built-in one."""
+        if not self.args.provider_url:
+            self.provider = FixtureProvider(
+                self.fixtures_dir, self.args.provider_port, self.log, self.out / "provider.log"
+            )
+            self.provider_base = self.provider.start()
+            return
+        self.provider_base = self.args.provider_url
+        self.log.line(
+            "provider_external", base=self.provider_base, root=str(self.fixtures_dir)
+        )
+        self.verify_external_provider()
+
+    def verify_external_provider(self) -> None:
+        """Fail fast unless ``--provider-url`` serves this run's fixtures directory."""
+        probe = self.fixtures_dir / ".provider-probe"
+        token = os.urandom(16).hex()
+        probe.write_text(token, encoding="ascii")
+        url = f"{self.provider_base}/{probe.name}"
+        try:
+            with urllib.request.urlopen(url, timeout=30) as response:
+                served = response.read().decode("ascii", "replace").strip()
+        except (urllib.error.URLError, OSError) as exc:
+            raise ConfigError(
+                f"--provider-url {self.provider_base} did not serve {probe.name}: {exc}; "
+                f"the server must be rooted at {self.fixtures_dir}"
+            ) from exc
+        finally:
+            probe.unlink(missing_ok=True)
+        if served != token:
+            raise ConfigError(
+                f"--provider-url {self.provider_base} served unexpected bytes for "
+                f"{probe.name}; the server must be rooted at {self.fixtures_dir}"
+            )
+        self.log.line("provider_probe_ok", base=self.provider_base)
 
     # -- outputs ----------------------------------------------------------
 
@@ -3177,6 +3220,12 @@ class Controller:
                 "expected_source_fingerprint": self.args.expected_source_fingerprint,
                 "idle_seconds": self.args.idle_seconds,
                 "file_concurrency": self.args.file_concurrency,
+                # Which server delivered the corpus (#1126).
+                "corpus_provider": (
+                    {"kind": "external", "url": self.args.provider_url}
+                    if self.args.provider_url
+                    else {"kind": "builtin", "base": self.provider_base}
+                ),
                 "pg_container": self.args.pg_container,
                 "database_url": redact_db_url(self.args.database_url),
                 "hfs_env": {
@@ -3262,10 +3311,7 @@ class Controller:
                 "mode": self.args.fixture_mode,
             }
             self.log.line("fixture_plan", plan=json.dumps(fixture_plan))
-            self.provider = FixtureProvider(
-                self.fixtures_dir, self.args.provider_port, self.log, self.out / "provider.log"
-            )
-            self.provider_base = self.provider.start()
+            self.start_provider()
             self.sampler = Sampler(self)
             self.sampler.start()
             for job in range(1, self.args.jobs + 1):
@@ -3381,6 +3427,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--hfs-port", type=int, default=0, help="0 picks a free loopback port")
     parser.add_argument("--provider-port", type=int, default=0, help="0 starts at 19200")
+    parser.add_argument(
+        "--provider-url",
+        help=(
+            "serve the fixtures from an external HTTP/1.1 static server instead of the "
+            "built-in one; it must be rooted at <output-dir>/fixtures"
+        ),
+    )
     parser.add_argument("--hfs-log-level", default="info")
     parser.add_argument("--sample-interval", type=float, default=0.5, help="HFS RSS cadence, seconds")
     parser.add_argument("--host-interval", type=float, default=5.0, help="host vitals cadence, seconds")
@@ -3493,6 +3546,11 @@ def dry_run_plan(args: argparse.Namespace) -> dict[str, Any]:
         "jobs": args.jobs,
         "mode": args.mode,
         "batch_size": args.batch_size,
+        "corpus_provider": (
+            {"kind": "external", "url": args.provider_url}
+            if args.provider_url
+            else {"kind": "builtin", "preferred_port": args.provider_port or 19200}
+        ),
         "defer_indexing": bool(args.defer_indexing),
         "postgres_reindex_evidence": bool(args.postgres_reindex_evidence),
         "postgres_grouped_create_evidence": bool(
@@ -3602,6 +3660,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         r"[0-9a-f]{64}", args.expected_source_fingerprint
     ):
         parser.error("--expected-source-fingerprint must be 64 lowercase hexadecimal characters")
+    if args.provider_url:
+        if args.provider_port:
+            parser.error("--provider-url and --provider-port are mutually exclusive")
+        parsed_provider = urllib.parse.urlparse(args.provider_url)
+        if parsed_provider.scheme not in ("http", "https") or not parsed_provider.netloc:
+            parser.error("--provider-url must be an absolute http:// or https:// URL")
+        args.provider_url = args.provider_url.rstrip("/")
     if args.jobs < 1:
         parser.error("--jobs must be >= 1")
     if args.batch_size is not None and args.batch_size < 1:

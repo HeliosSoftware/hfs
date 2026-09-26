@@ -145,11 +145,29 @@ mod tests {
 
     #[test]
     fn test_number_ap() {
-        let value = SearchValue::new(SearchPrefix::Ap, "100");
-        let frag = NumberHandler::build_sql(&value, 0);
+        // The shared window (#1390): 10% of the value, never narrower than
+        // half its implicit precision, so `ap0` still has a width.
+        for (raw, lo, hi) in [
+            ("100", 90.0, 110.0),
+            ("0", -0.5, 0.5),
+            ("-5.4", -5.94, -4.86),
+        ] {
+            let value = SearchValue::new(SearchPrefix::Ap, raw);
+            let frag = NumberHandler::build_sql(&value, 0);
 
-        assert!(frag.sql.contains("BETWEEN"));
-        assert_eq!(frag.params.len(), 2);
+            assert!(frag.sql.contains("BETWEEN"), "{raw}: {}", frag.sql);
+            let bounds: Vec<f64> = frag
+                .params
+                .iter()
+                .map(|p| match p {
+                    SqlParam::Float(f) => *f,
+                    other => panic!("{raw}: expected a float bound, got {other:?}"),
+                })
+                .collect();
+            assert_eq!(bounds.len(), 2, "{raw}");
+            assert!((bounds[0] - lo).abs() < 1e-9, "{raw}: {bounds:?}");
+            assert!((bounds[1] - hi).abs() < 1e-9, "{raw}: {bounds:?}");
+        }
     }
 
     #[test]

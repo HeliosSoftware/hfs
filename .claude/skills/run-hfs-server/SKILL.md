@@ -150,16 +150,18 @@ optional `HFS_S3_PREFIX`):
 | `{tenant}/bulk/submit/` | Bulk-submit staging |
 | `tenants/` | Tenant registry |
 | `_system.user-settings/` | Per-user UI settings (`/_user/settings`) |
+| `_system.login-sessions/` | Web UI login sessions and pending logins (#1481) |
 
-The last two are **cross-tenant** and sit outside any tenant prefix. A
+The last three are **cross-tenant** and sit outside any tenant prefix. A
 least-privilege bucket policy scoped only to the FHIR prefixes will pass startup
 validation (which only issues `HeadBucket`) and then return `AccessDenied` — a
 500 on every affected request. Grant the policy these prefixes too.
 
 Note also that a **bucket-wide** lifecycle rule (expiration or Glacier
-transition) will apply to `_system.user-settings/` as well: expiry silently resets
-users' preferences, and a Glacier transition makes them unreadable. Scope lifecycle
-rules to the FHIR prefixes.
+transition) will apply to `_system.user-settings/` and `_system.login-sessions/`
+as well: expiry silently resets users' preferences or signs everyone out, and a
+Glacier transition makes them unreadable. Scope lifecycle rules to the FHIR
+prefixes.
 
 ## Per-user UI settings
 

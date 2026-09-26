@@ -414,21 +414,7 @@ async fn if_match_is_honoured_rather_than_refused() {
 async fn patch_documents_are_held_to_the_instance_endpoints_rules() {
     let server = test_server().await;
     seed(&server).await;
-    let fhirpath_patch = json!({
-        "resourceType": "Parameters",
-        "parameter": [{"name": "operation", "part": [
-            {"name": "type", "valueCode": "replace"},
-            {"name": "path", "valueString": "Patient.name[0].family"},
-            {"name": "value", "valueString": "Changed"}
-        ]}]
-    });
-
     for url in ["/Patient/target", "/Patient?identifier=ne123"] {
-        // FHIRPath Patch is not implemented.
-        patch(&server, url, "application/fhir+json", &fhirpath_patch)
-            .await
-            .assert_status(StatusCode::NOT_IMPLEMENTED);
-
         // `resourceType` cannot be patched, nor can `id` (#1406: a patched
         // `id` used to be silently undone by the backend and answered `200`).
         for (content_type, body) in [
@@ -450,12 +436,15 @@ async fn patch_documents_are_held_to_the_instance_endpoints_rules() {
         // A patch that does not apply, and one that is not a patch.
         for body in [
             json!([{"op": "replace", "path": "/nope/deeper", "value": 1}]),
-            json!([{"op": "test", "path": "/active", "value": true}]),
             json!({"not": "a patch"}),
         ] {
             let response = patch(&server, url, JSON_PATCH, &body).await;
             assert_outcome(&response, StatusCode::BAD_REQUEST, &format!("{url} {body}"));
         }
+
+        let failed_test = json!([{"op": "test", "path": "/active", "value": true}]);
+        let response = patch(&server, url, JSON_PATCH, &failed_test).await;
+        assert_outcome(&response, StatusCode::UNPROCESSABLE_ENTITY, url);
 
         patch(&server, url, "text/plain", &activate())
             .await
@@ -470,6 +459,27 @@ async fn patch_documents_are_held_to_the_instance_endpoints_rules() {
     }
 
     assert_eq!(snapshot(&server).await, untouched());
+}
+
+#[tokio::test]
+async fn fhirpath_patch_works_on_instance_and_conditional_routes() {
+    let server = test_server().await;
+    seed(&server).await;
+    let body = json!({
+        "resourceType": "Parameters",
+        "parameter": [{"name": "operation", "part": [
+            {"name": "type", "valueCode": "replace"},
+            {"name": "path", "valueString": "Patient.name[0].family"},
+            {"name": "value", "valueString": "Changed"}
+        ]}]
+    });
+
+    for url in ["/Patient/target", "/Patient?identifier=ne123"] {
+        let response = patch(&server, url, "application/fhir+json", &body).await;
+        response.assert_status(StatusCode::OK);
+        let patched: Value = response.json();
+        assert_eq!(patched["name"][0]["family"], "Changed");
+    }
 }
 
 // =============================================================================

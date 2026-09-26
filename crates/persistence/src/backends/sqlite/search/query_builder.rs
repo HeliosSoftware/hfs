@@ -17,6 +17,9 @@ use super::parameter_handlers::{
     TokenHandler, UriHandler,
 };
 
+// Keep generated SQL and bind counts small well before SQLite's 32,766-variable limit.
+const LARGE_ID_SET_THRESHOLD: usize = 1_000;
+
 /// How a sort key's value is typed for cursor (keyset) binding and comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortValueKind {
@@ -836,21 +839,37 @@ impl QueryBuilder {
                 // a nested OR of N terms parses to a tree of depth N, and SQLite
                 // refuses to prepare past depth 1000, so a chained/`_has`
                 // resolution that injects thousands of ids as an `_id` filter
-                // used to 500 (#943). An `IN` list is a single node of any
-                // length.
+                // used to 500 (#943). An `IN` predicate avoids that depth
+                // limit; wide lists still need to respect the bind limit.
                 if param.values.is_empty() {
                     return None;
                 }
-                let mut params = Vec::with_capacity(param.values.len());
-                let placeholders: Vec<String> = param
-                    .values
-                    .iter()
-                    .enumerate()
-                    .map(|(i, value)| {
-                        params.push(SqlParam::string(&value.value));
-                        format!("?{}", param_offset + i + 1)
-                    })
-                    .collect();
+                // SQLite limits the number of bound variables in a statement.
+                // A chain can resolve to more ids than that limit, so pass wide
+                // sets as one JSON value and expand it inside SQLite.
+                let (id_set, params) = if param.values.len() > LARGE_ID_SET_THRESHOLD {
+                    let ids: Vec<&str> = param
+                        .values
+                        .iter()
+                        .map(|value| value.value.as_str())
+                        .collect();
+                    let json = serde_json::to_string(&ids).expect("string ids serialize to JSON");
+                    (
+                        format!("SELECT value FROM json_each(?{})", param_offset + 1),
+                        vec![SqlParam::String(json)],
+                    )
+                } else {
+                    let params = param
+                        .values
+                        .iter()
+                        .map(|value| SqlParam::string(&value.value))
+                        .collect();
+                    let placeholders = (1..=param.values.len())
+                        .map(|i| format!("?{}", param_offset + i))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    (placeholders, params)
+                };
 
                 // `_id` is dispatched here rather than through the generic
                 // `:not` handling in `build_parameter_condition` (the
@@ -875,7 +894,7 @@ impl QueryBuilder {
                 Some(SqlFragment::with_params(
                     format!(
                         "resource_key {not_kw}IN (SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id IN ({}))",
-                        placeholders.join(", ")
+                        id_set
                     ),
                     params,
                 ))
@@ -984,7 +1003,9 @@ impl QueryBuilder {
         // a value that is not a date binds none.
         let mut offset = param_offset;
         for value in values {
-            let cond = DateHandler::build_sql(value, offset);
+            // `_lastUpdated` is an instant on the resource row: a point
+            // comparison, not the range a date parameter's index row holds.
+            let cond = DateHandler::build_point_sql("last_updated", value, offset);
             if !cond.is_empty() {
                 offset += cond.params.len();
                 conditions.push(cond);
@@ -1003,7 +1024,7 @@ impl QueryBuilder {
         Some(SqlFragment::with_params(
             format!(
                 "resource_key IN (SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND ({}))",
-                combined.sql.replace("value_date", "last_updated")
+                combined.sql
             ),
             combined.params,
         ))
@@ -1200,9 +1221,14 @@ impl QueryBuilder {
         let column = directive.param_type.and_then(sort_value_column);
         match column {
             Some(col) => {
-                let agg = match directive.direction {
-                    crate::types::SortDirection::Ascending => "MIN",
-                    crate::types::SortDirection::Descending => "MAX",
+                let (agg, col) = match directive.direction {
+                    crate::types::SortDirection::Ascending => ("MIN", col),
+                    // A date row is a range (#1391): descending sorts on where
+                    // the latest one ends, not where it starts.
+                    crate::types::SortDirection::Descending if col == "value_date" => {
+                        ("MAX", "value_date_end")
+                    }
+                    crate::types::SortDirection::Descending => ("MAX", col),
                 };
                 format!(
                     "(SELECT {}({}) FROM search_index si WHERE si.tenant_id = ?1 AND si.resource_type = ?2 AND si.resource_key = resources.rowid AND si.param_name = '{}')",
@@ -1513,6 +1539,34 @@ mod tests {
         assert_eq!(fragment.params.len(), 2);
         assert_eq!(id_param_string(&fragment.params[0]), "a");
         assert_eq!(id_param_string(&fragment.params[1]), "b");
+    }
+
+    #[test]
+    fn large_id_set_uses_one_json_bind() {
+        let builder = QueryBuilder::new("tenant1", "Patient");
+        let mut values: Vec<SearchValue> = (0..32_767)
+            .map(|i| SearchValue::eq(format!("id-{i}")))
+            .collect();
+        values.push(SearchValue::eq("a\"b"));
+        let param = SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::Not),
+            values,
+            ..Default::default()
+        };
+
+        let fragment = builder.build_parameter_condition(&param, 2).unwrap();
+        assert!(
+            fragment
+                .sql
+                .contains("id IN (SELECT value FROM json_each(?3))")
+        );
+        assert!(fragment.sql.starts_with("resource_key NOT IN"));
+        assert_eq!(fragment.params.len(), 1);
+        let ids: Vec<String> = serde_json::from_str(id_param_string(&fragment.params[0])).unwrap();
+        assert_eq!(ids.len(), 32_768);
+        assert_eq!(ids.last().unwrap(), "a\"b");
     }
 
     #[test]

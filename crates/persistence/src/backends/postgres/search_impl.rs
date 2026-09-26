@@ -4,7 +4,8 @@
 //! - Basic single-type search
 //! - Multi-type search
 //! - _include and _revinclude support
-//! - Chained search parameter support
+//! - Chained search (`ChainedSearchProvider`); `search()` itself refuses a
+//!   query whose chains were not resolved first (#1389)
 //! - Full-text search using tsvector/tsquery
 
 use std::collections::HashSet;
@@ -74,7 +75,40 @@ fn reject_unsupported_metadata_modifier(query: &SearchQuery) -> StorageResult<()
     crate::search::validate_numeric_values(query)?;
     // And a value that is empty, or has an empty alternative: `family=Zzz,`
     // is a prefix match on `""`, which is every family name (#1380).
-    crate::search::validate_value_presence(query)
+    crate::search::validate_value_presence(query)?;
+    // And a chain nobody resolved (#1389).
+    reject_unresolved_chains(query)
+}
+
+/// Refuses a query that still carries chained or reverse-chained (`_has`)
+/// parameters (#1389). The query builder reads neither: an unresolved `_has`
+/// was silently dropped (every resource of the type matched) and a forward
+/// chain was read as a plain reference predicate on its first hop. Callers
+/// resolve chains first (`crate::search::resolve_chains`, as REST does), which
+/// strips both; anything that reaches here with one is an error, never a
+/// wrong answer. Runs after the `_contained` refusal so that path keeps its
+/// more specific error.
+fn reject_unresolved_chains(query: &SearchQuery) -> StorageResult<()> {
+    if let Some(param) = query.parameters.iter().find(|p| !p.chain.is_empty()) {
+        let mut chain = param.name.clone();
+        for link in &param.chain {
+            if let Some(target_type) = &link.target_type {
+                chain.push(':');
+                chain.push_str(target_type);
+            }
+            chain.push('.');
+            chain.push_str(&link.target_param);
+        }
+        return Err(StorageError::Search(
+            SearchError::ChainedSearchNotSupported {
+                chain: format!("{chain} (unresolved; resolve chains before search)"),
+            },
+        ));
+    }
+    if !query.reverse_chains.is_empty() {
+        return Err(StorageError::Search(SearchError::ReverseChainNotSupported));
+    }
+    Ok(())
 }
 
 /// Refuses what `_contained` matching cannot apply. `:missing` was once the
@@ -178,7 +212,9 @@ fn fast_index_pred(
 /// `Observation?date=gt2070-01-01T00:00:00` and `Patient?birthdate=gt2070-01-01`
 /// — both zero-match, one over a 689,080-row slice — and both stay at p99
 /// 17 ms because the planner correctly estimates zero and picks the value-first
-/// index. The same latent failure exists for date if a deployment ever mixes
+/// index. (Since #1391 a date `gt` compares the end of the indexed range,
+/// `value_date_end`, and v43's `idx_search_date_end` is that value-first index
+/// for it; this measurement predates the change and should be repeated.) The same latent failure exists for date if a deployment ever mixes
 /// wildly different date ranges under one column, but it is not present here
 /// and a guard is not free.
 ///
@@ -402,6 +438,7 @@ impl PostgresBackend {
         for param in &search_params {
             match param {
                 SqlParam::Text(s) => params.push(Box::new(s.clone())),
+                SqlParam::TextArray(ids) => params.push(Box::new(ids.clone())),
                 SqlParam::Float(f) => params.push(Box::new(*f)),
                 SqlParam::Integer(i) => params.push(Box::new(*i)),
                 SqlParam::Bool(b) => params.push(Box::new(*b)),
@@ -541,6 +578,126 @@ impl SearchProvider for PostgresBackend {
         self.search_with_client(&client, tenant, query, total).await
     }
 
+    async fn search_ids(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<Page<String>> {
+        let cursor = query
+            .cursor
+            .as_ref()
+            .and_then(|value| PageCursor::decode(value).ok());
+        if !query.sort.is_empty()
+            || query.offset.is_some()
+            || query.contained != crate::types::ContainedMode::Off
+            || !query.includes.is_empty()
+            || query.total.is_some()
+            || query.summary.is_some()
+            || !query.elements.is_empty()
+            || query.compartment.is_some()
+            || !query.list.is_empty()
+            || !query.reverse_chains.is_empty()
+            || (query.cursor.is_some() && cursor.is_none())
+            || cursor
+                .as_ref()
+                .is_some_and(|value| value.direction() != CursorDirection::Next)
+        {
+            return Ok(self
+                .search(tenant, query)
+                .await?
+                .resources
+                .map(|resource| resource.id().to_string()));
+        }
+
+        reject_contained_missing(query)?;
+        reject_unsupported_metadata_modifier(query)?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let resource_type = &query.resource_type;
+        let param_offset = if cursor.is_some() { 4 } else { 2 };
+        let search_filter = if !query.parameters.is_empty() {
+            PostgresQueryBuilder::build_search_query_for(query, param_offset, self.index_layout())
+        } else {
+            None
+        };
+        let filter_clause = search_filter
+            .as_ref()
+            .map(|fragment| format!(" AND ({})", fragment.sql))
+            .unwrap_or_default();
+        let search_params = search_filter
+            .map(|fragment| fragment.params)
+            .unwrap_or_default();
+        let cursor_clause = if cursor.is_some() {
+            " AND (last_updated < $3 OR (last_updated = $3 AND id > $4))"
+        } else {
+            ""
+        };
+        let count = query.count.unwrap_or(100) as usize;
+        let sql = format!(
+            "SELECT id, last_updated FROM resources \
+             WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{filter_clause}{cursor_clause} \
+             ORDER BY last_updated DESC, id ASC LIMIT {}",
+            count + 1
+        );
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
+            Box::new(tenant_id.to_string()),
+            Box::new(resource_type.to_string()),
+        ];
+        if let Some(cursor) = &cursor {
+            Self::bind_cursor_value(&mut params, SortValueKind::Timestamp, cursor)?;
+            params.push(Box::new(cursor.resource_id().to_string()));
+        }
+        for param in &search_params {
+            match param {
+                SqlParam::Text(value) => params.push(Box::new(value.clone())),
+                SqlParam::TextArray(ids) => params.push(Box::new(ids.clone())),
+                SqlParam::Float(value) => params.push(Box::new(*value)),
+                SqlParam::Integer(value) => params.push(Box::new(*value)),
+                SqlParam::Bool(value) => params.push(Box::new(*value)),
+                SqlParam::Timestamp(value) => params.push(Box::new(*value)),
+                SqlParam::Null => params.push(Box::new(Option::<String>::None)),
+            }
+        }
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|param| param.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+        let client = self.get_client().await?;
+        let rows = query_dyn_cached(&client, &sql, &param_refs)
+            .await
+            .or_query_error("Failed to execute id-only search")?;
+        let mut rows: Vec<(String, chrono::DateTime<Utc>)> =
+            rows.iter().map(|row| (row.get(0), row.get(1))).collect();
+        let has_next = rows.len() > count;
+        if has_next {
+            rows.pop();
+        }
+        let has_previous = cursor.is_some();
+        let next_cursor = if has_next {
+            rows.last().map(|(id, updated)| {
+                PageCursor::new(vec![CursorValue::String(updated.to_rfc3339())], id).encode()
+            })
+        } else {
+            None
+        };
+        let previous_cursor = if has_previous {
+            rows.first().map(|(id, updated)| {
+                PageCursor::previous(vec![CursorValue::String(updated.to_rfc3339())], id).encode()
+            })
+        } else {
+            None
+        };
+        Ok(Page::new(
+            rows.into_iter().map(|(id, _)| id).collect(),
+            PageInfo {
+                next_cursor,
+                previous_cursor,
+                total: None,
+                has_next,
+                has_previous,
+            },
+        ))
+    }
+
     async fn search_count(
         &self,
         tenant: &TenantContext,
@@ -576,6 +733,7 @@ impl SearchProvider for PostgresBackend {
                 for param in &fragment.params {
                     match param {
                         SqlParam::Text(s) => params.push(Box::new(s.clone())),
+                        SqlParam::TextArray(ids) => params.push(Box::new(ids.clone())),
                         SqlParam::Float(f) => params.push(Box::new(*f)),
                         SqlParam::Integer(i) => params.push(Box::new(*i)),
                         SqlParam::Bool(b) => params.push(Box::new(*b)),
@@ -901,6 +1059,7 @@ impl ChainedSearchProvider for PostgresBackend {
         for p in &fragment.params {
             match p {
                 SqlParam::Text(s) => params.push(Box::new(s.clone())),
+                SqlParam::TextArray(ids) => params.push(Box::new(ids.clone())),
                 SqlParam::Float(f) => params.push(Box::new(*f)),
                 SqlParam::Integer(i) => params.push(Box::new(*i)),
                 SqlParam::Bool(b) => params.push(Box::new(*b)),
@@ -913,15 +1072,14 @@ impl ChainedSearchProvider for PostgresBackend {
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        // Deliberately NOT cached: `chain_builder` splices a token's *system*
-        // into the SQL as a literal (search/chain_builder.rs, the `Token` arms of
-        // `build_terminal_condition` and its reverse twin). The value is
-        // quote-escaped, so this is a cache-key problem rather than an injection
-        // one — but a client-supplied value in the text means a distinct
-        // statement per system, which is exactly the unbounded key to avoid.
-        // Binding it instead means renumbering the chain builder's placeholder
-        // accounting, which another seat is already inside; recorded rather than
-        // fixed here.
+        // Not cached. Every client-supplied value is bound, the token system
+        // included (the `Token` arms of `build_terminal_condition` and its
+        // reverse twin in search/chain_builder.rs); what the text still inlines
+        // is resource types and parameter names checked against the registry,
+        // and the chain's shape. That key is bounded, but a distinct statement
+        // per chain shape buys little here: REST resolves chains through the
+        // shared resolver, so this path is reached only through the
+        // `ChainedSearchProvider` API (#1341).
         let rows = client
             .query(&sql, &param_refs)
             .await
@@ -958,6 +1116,7 @@ impl ChainedSearchProvider for PostgresBackend {
         for p in &fragment.params {
             match p {
                 SqlParam::Text(s) => params.push(Box::new(s.clone())),
+                SqlParam::TextArray(ids) => params.push(Box::new(ids.clone())),
                 SqlParam::Float(f) => params.push(Box::new(*f)),
                 SqlParam::Integer(i) => params.push(Box::new(*i)),
                 SqlParam::Bool(b) => params.push(Box::new(*b)),
@@ -1323,6 +1482,7 @@ impl PostgresBackend {
                     for param in &fragment.params {
                         match param {
                             SqlParam::Text(s) => params.push(Box::new(s.clone())),
+                            SqlParam::TextArray(ids) => params.push(Box::new(ids.clone())),
                             SqlParam::Float(f) => params.push(Box::new(*f)),
                             SqlParam::Integer(i) => params.push(Box::new(*i)),
                             SqlParam::Bool(b) => params.push(Box::new(*b)),
@@ -1498,7 +1658,7 @@ mod fast_path_tests {
         let pred = fast_index_pred(&q, Some(&filter_of(&q)), IndexLayout::Denormalized, false);
         assert_eq!(
             pred.as_deref(),
-            Some("param_name = 'date' AND value_date >= $3")
+            Some("param_name = 'date' AND value_date_end > $3")
         );
     }
 

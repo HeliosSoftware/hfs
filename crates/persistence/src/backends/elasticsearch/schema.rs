@@ -5,7 +5,7 @@
 
 use elasticsearch::indices::{
     IndicesCreateParts, IndicesExistsParts, IndicesGetMappingParts, IndicesGetSettingsParts,
-    IndicesPutMappingParts, IndicesPutSettingsParts, IndicesPutTemplateParts,
+    IndicesPutMappingParts, IndicesPutSettingsParts, IndicesPutTemplateParts, IndicesStatsParts,
 };
 use serde_json::{Value, json};
 
@@ -66,7 +66,13 @@ use super::backend::ElasticsearchBackend;
 /// - `1` — first versioned mapping; delivers `ignore_malformed` on
 ///   `search_params.date.value` and `search_params.composite.date` (#1314) to
 ///   indices created before it.
-pub const SCHEMA_VERSION: u64 = 1;
+/// - `2` — `search_params.date.end`, the end of the range a date value covers
+///   (#1391). Documents indexed before it have no `end`, and a date search
+///   compares against it for every prefix but `lt` and `sa`: they are not
+///   found by those prefixes until a `$reindex`. A `Period` indexed before it
+///   is still two independent points, so `lt` and `sa` are only right for
+///   point values until then.
+pub const SCHEMA_VERSION: u64 = 2;
 
 /// The key, in an index mapping's `_meta`, that holds [`SCHEMA_VERSION`].
 pub const SCHEMA_VERSION_META_KEY: &str = "hfs_schema_version";
@@ -188,6 +194,15 @@ pub fn create_index_mapping(config: &super::backend::ElasticsearchConfig) -> ser
                                 // document (#1314). Existing indices get it
                                 // from the reconcile pass (#1335).
                                 "value": {
+                                    "type": "date",
+                                    "format": "strict_date_optional_time||epoch_millis||yyyy||yyyy-MM||yyyy-MM-dd",
+                                    "ignore_malformed": true
+                                },
+                                // Where the range the value covers ends
+                                // (exclusive): one unit of its precision after
+                                // `value` for a point, the end of a `Period`
+                                // (#1391).
+                                "end": {
                                     "type": "date",
                                     "format": "strict_date_optional_time||epoch_millis||yyyy||yyyy-MM||yyyy-MM-dd",
                                     "ignore_malformed": true
@@ -655,6 +670,114 @@ fn note_reconcile_outcome(backend: &ElasticsearchBackend, index: &str, outcome: 
     }
 }
 
+/// The first [`SCHEMA_VERSION`] whose documents carry `search_params.date.end`
+/// (#1391). A document in an index recorded below it has no `end`.
+const DATE_END_SCHEMA_VERSION: u64 = 2;
+
+/// Whether an index whose mapping `_meta` is `meta` was laid out before
+/// [`DATE_END_SCHEMA_VERSION`], so that the documents it holds were indexed
+/// without `search_params.date.end`. Not the same question as "is stale": an
+/// index recorded at a later version than that one is stale for other reasons
+/// and its dates are fine.
+fn predates_date_range_end(meta: Option<&Value>) -> bool {
+    stored_schema_version(meta) < DATE_END_SCHEMA_VERSION
+}
+
+/// Document counts per index out of a filtered `GET {indices}/_stats/docs`
+/// response (`indices.<name>.primaries.docs.count`). An index the response does
+/// not list has no entry.
+fn parse_document_counts(body: &Value) -> std::collections::BTreeMap<String, u64> {
+    body.get("indices")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, stats)| {
+            let count = stats.pointer("/primaries/docs/count")?.as_u64()?;
+            Some((name.clone(), count))
+        })
+        .collect()
+}
+
+/// Which of `candidates` — indices that predate `search_params.date.end`
+/// ([`predates_date_range_end`]) — hold any document. An index whose count is
+/// unknown (`counts` has no entry: it could not be read) is kept, since a
+/// warning that turns out to be moot costs less than silence about documents
+/// that cannot be found.
+fn indices_holding_documents(
+    candidates: &[String],
+    counts: &std::collections::BTreeMap<String, u64>,
+) -> Vec<String> {
+    candidates
+        .iter()
+        .filter(|name| counts.get(*name).is_none_or(|count| *count > 0))
+        .cloned()
+        .collect()
+}
+
+/// The number of documents in each of `indices`, read with one filtered
+/// `_stats` request per chunk (the chunk keeps the URL short). Infallible: an
+/// index whose count could not be read is missing from the result.
+async fn document_counts(
+    backend: &ElasticsearchBackend,
+    indices: &[String],
+) -> std::collections::BTreeMap<String, u64> {
+    /// Index names per `_stats` request.
+    const INDICES_PER_STATS: usize = 50;
+
+    let mut counts = std::collections::BTreeMap::new();
+    for chunk in indices.chunks(INDICES_PER_STATS) {
+        let names: Vec<&str> = chunk.iter().map(String::as_str).collect();
+        let response = backend
+            .client()
+            .indices()
+            .stats(IndicesStatsParts::IndexMetric(&names, &["docs"]))
+            .filter_path(&["indices.*.primaries.docs.count"])
+            .send()
+            .await;
+        match response {
+            Ok(response) if response.status_code().is_success() => {
+                if let Ok(body) = response.json::<Value>().await {
+                    counts.extend(parse_document_counts(&body));
+                }
+            }
+            Ok(response) => tracing::debug!(
+                status = response.status_code().as_u16(),
+                "could not count the documents of Elasticsearch indices being reconciled"
+            ),
+            Err(e) => tracing::debug!(
+                error = %e,
+                "could not count the documents of Elasticsearch indices being reconciled"
+            ),
+        }
+    }
+    counts
+}
+
+/// Warns, once, that the documents of `indices` were indexed before #1391
+/// (schema version `2`) and so have no `search_params.date.end`: a date search
+/// with `eq`, `ne`, `gt`, `ge`, `le`, `eb` or `ap` compares against it, so
+/// they are not found by those prefixes until `$reindex` indexes them again.
+/// (`lt` and `sa` read only the start, so they are unaffected for point values;
+/// a `Period` indexed before #1391 is still two independent points.)
+///
+/// Does nothing for no indices: an empty or new index holds nothing to reindex.
+fn warn_reindex_needed(indices: &[String]) {
+    if indices.is_empty() {
+        return;
+    }
+    const SAMPLE: usize = 5;
+    tracing::warn!(
+        indices = indices.len(),
+        sample = indices[..indices.len().min(SAMPLE)].join(", "),
+        schema_version = SCHEMA_VERSION,
+        "Elasticsearch indices holding documents indexed before #1391 were upgraded to a \
+         mapping with `search_params.date.end`, but those documents have no such field and \
+         will not match date searches with the eq, ne, gt, ge, le, eb or ap prefixes until \
+         `$reindex` is run, and a Period indexed before #1391 is still two independent \
+         point rows, so even lt and sa compare each of its ends on its own"
+    );
+}
+
 /// Brings every existing HFS index under the configured prefix up to
 /// [`SCHEMA_VERSION`]. Run at startup; see [`SCHEMA_VERSION`] for the
 /// convention and the failure policy.
@@ -683,6 +806,9 @@ pub async fn reconcile_index_mappings(backend: &ElasticsearchBackend) -> Reconci
     };
     let (stale, current) = stale_indices(&body);
     report.current = current;
+    let previous: std::collections::BTreeMap<String, Option<Value>> =
+        stale.iter().cloned().collect();
+    let mut updated_names: Vec<String> = Vec::new();
 
     // Indices with nothing of their own in `_meta` share one body, so they go
     // out in chunks; a failed chunk is redone index by index so the error
@@ -699,6 +825,7 @@ pub async fn reconcile_index_mappings(backend: &ElasticsearchBackend) -> Reconci
             for name in names {
                 note_reconcile_outcome(backend, name, &ReconcileOutcome::Updated);
             }
+            updated_names.extend(chunk.iter().map(|(name, _)| name.clone()));
             report.updated += chunk.len();
         } else {
             singly.extend(chunk.iter().cloned());
@@ -709,12 +836,26 @@ pub async fn reconcile_index_mappings(backend: &ElasticsearchBackend) -> Reconci
         let outcome = put_mapping(backend, &[&name], body).await;
         note_reconcile_outcome(backend, &name, &outcome);
         match outcome {
-            ReconcileOutcome::Updated => report.updated += 1,
+            ReconcileOutcome::Updated => {
+                updated_names.push(name);
+                report.updated += 1;
+            }
             ReconcileOutcome::Current | ReconcileOutcome::Gone => {}
             ReconcileOutcome::Transient(_) | ReconcileOutcome::Rejected(_) => report.failed += 1,
         }
     }
 
+    // One warning for the whole pass, and only for indices that held documents
+    // written before `search_params.date.end` existed.
+    let predating: Vec<String> = updated_names
+        .iter()
+        .filter(|name| predates_date_range_end(previous.get(*name).and_then(Option::as_ref)))
+        .cloned()
+        .collect();
+    if !predating.is_empty() {
+        let counts = document_counts(backend, &predating).await;
+        warn_reindex_needed(&indices_holding_documents(&predating, &counts));
+    }
     if report.updated > 0 || report.failed > 0 {
         tracing::info!(
             schema_version = SCHEMA_VERSION,
@@ -737,11 +878,13 @@ async fn reconcile_index(backend: &ElasticsearchBackend, index: &str) {
     if backend.is_schema_checked(index) {
         return;
     }
+    let mut predates_end = false;
     let outcome = match read_schema_versions(backend, index).await {
         Err(outcome) => outcome,
         Ok(body) => match stale_indices(&body) {
             (stale, _) if !stale.is_empty() => {
                 let meta = stale[0].1.as_ref();
+                predates_end = predates_date_range_end(meta);
                 let body = reconcile_mapping_body(backend.config(), meta);
                 put_mapping(backend, &[index], body).await
             }
@@ -756,6 +899,11 @@ async fn reconcile_index(backend: &ElasticsearchBackend, index: &str) {
             schema_version = SCHEMA_VERSION,
             "reconciled Elasticsearch index mapping"
         );
+        if predates_end {
+            let names = [index.to_string()];
+            let counts = document_counts(backend, &names).await;
+            warn_reindex_needed(&indices_holding_documents(&names, &counts));
+        }
     }
     note_reconcile_outcome(backend, index, &outcome);
 }
@@ -1122,6 +1270,330 @@ mod tests {
                 "{status}"
             );
         }
+    }
+
+    /// #1391: only an index laid out before `search_params.date.end` holds
+    /// documents without it — no marker is version 0, version 1 predates it,
+    /// version 2 and later do not.
+    #[test]
+    fn test_predates_date_range_end() {
+        assert!(predates_date_range_end(None));
+        assert!(predates_date_range_end(Some(&json!({ "owner": "ops" }))));
+        assert!(predates_date_range_end(Some(
+            &json!({ SCHEMA_VERSION_META_KEY: 0 })
+        )));
+        assert!(predates_date_range_end(Some(
+            &json!({ SCHEMA_VERSION_META_KEY: 1 })
+        )));
+        assert!(!predates_date_range_end(Some(
+            &json!({ SCHEMA_VERSION_META_KEY: 2 })
+        )));
+        assert!(!predates_date_range_end(Some(
+            &json!({ SCHEMA_VERSION_META_KEY: 3 })
+        )));
+    }
+
+    /// #1391: an empty index has nothing to reindex; one whose count could not
+    /// be read is assumed to hold documents.
+    #[test]
+    fn test_indices_holding_documents() {
+        let names = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        let counts = parse_document_counts(&json!({ "indices": {
+            "hfs_t_full": { "primaries": { "docs": { "count": 7 } } },
+            "hfs_t_empty": { "primaries": { "docs": { "count": 0 } } },
+            "hfs_t_garbled": { "primaries": {} },
+        } }));
+        assert_eq!(counts.len(), 2);
+        assert_eq!(
+            indices_holding_documents(
+                &names(&[
+                    "hfs_t_empty",
+                    "hfs_t_full",
+                    "hfs_t_unknown",
+                    "hfs_t_garbled"
+                ]),
+                &counts
+            ),
+            names(&["hfs_t_full", "hfs_t_unknown", "hfs_t_garbled"])
+        );
+        assert!(indices_holding_documents(&names(&["hfs_t_empty"]), &counts).is_empty());
+        assert!(parse_document_counts(&json!({})).is_empty());
+        assert!(parse_document_counts(&json!("nope")).is_empty());
+    }
+
+    /// #1391: the warning names what is lost and how to get it back, in one
+    /// event, and is never emitted for no index.
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_warn_reindex_needed_message() {
+        warn_reindex_needed(&[]);
+        assert!(!logs_contain("#1391"));
+
+        let many: Vec<String> = (0..8).map(|n| format!("hfs_t_type{n}")).collect();
+        warn_reindex_needed(&many);
+        logs_assert(|lines: &[&str]| {
+            let warnings: Vec<_> = lines.iter().filter(|l| l.contains("WARN")).collect();
+            assert_eq!(warnings.len(), 1, "{lines:?}");
+            let line = warnings[0];
+            for needle in [
+                "before #1391",
+                "search_params.date.end",
+                "eq, ne, gt, ge, le, eb or ap",
+                "$reindex",
+                "indices=8",
+                "hfs_t_type0, hfs_t_type1, hfs_t_type2, hfs_t_type3, hfs_t_type4",
+            ] {
+                assert!(line.contains(needle), "{needle:?} missing from {line}");
+            }
+            assert!(
+                !line.contains("hfs_t_type5"),
+                "the sample is capped: {line}"
+            );
+            Ok(())
+        });
+    }
+
+    // -- The whole pass, against a stub cluster ------------------------------
+
+    use wiremock::matchers::{method, path, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A stub cluster whose `_mapping` lists `indices` (name, `_meta`), whose
+    /// `PUT _mapping` answers `put_status`, and whose `_stats` answers with the
+    /// given document counts (`None`: the request fails with a `500`).
+    async fn stub_cluster(
+        indices: &[(&str, Option<Value>)],
+        put_status: u16,
+        counts: Option<&[(&str, u64)]>,
+    ) -> MockServer {
+        let server = MockServer::start().await;
+        let listing: serde_json::Map<String, Value> = indices
+            .iter()
+            .map(|(name, meta)| {
+                let mut mappings =
+                    json!({ "properties": { "resource_type": { "type": "keyword" } } });
+                if let Some(meta) = meta {
+                    mappings["_meta"] = meta.clone();
+                }
+                (name.to_string(), json!({ "mappings": mappings }))
+            })
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/hfs_*/_mapping"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(Value::Object(listing)))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path_regex("^/.+/_mapping$"))
+            .respond_with(
+                ResponseTemplate::new(put_status).set_body_json(json!({ "acknowledged": true })),
+            )
+            .mount(&server)
+            .await;
+        let stats = match counts {
+            Some(counts) => ResponseTemplate::new(200).set_body_json(json!({
+                "indices": counts.iter().map(|(name, count)| (
+                    name.to_string(),
+                    json!({ "primaries": { "docs": { "count": count } } }),
+                )).collect::<serde_json::Map<_, _>>()
+            })),
+            None => ResponseTemplate::new(500).set_body_string("stubbed"),
+        };
+        Mock::given(method("GET"))
+            .and(path_regex("^/.+/_stats/docs$"))
+            .respond_with(stats)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn backend_on(server: &MockServer) -> ElasticsearchBackend {
+        ElasticsearchBackend::new(ElasticsearchConfig {
+            nodes: vec![server.uri()],
+            request_timeout_ms: 2_000,
+            ..Default::default()
+        })
+        .expect("client construction is lazy")
+    }
+
+    /// The `WARN` lines about documents lacking `search_params.date.end`.
+    fn reindex_warnings(lines: &[&str]) -> Vec<String> {
+        lines
+            .iter()
+            .filter(|l| l.contains("WARN") && l.contains("before #1391"))
+            .map(|l| l.to_string())
+            .collect()
+    }
+
+    fn v(version: u64) -> Option<Value> {
+        Some(json!({ SCHEMA_VERSION_META_KEY: version }))
+    }
+
+    /// #1391: several old indices with documents give one warning for the
+    /// pass, naming the indices that hold documents and not the empty one.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn startup_warns_once_for_old_indices_that_hold_documents() {
+        let server = stub_cluster(
+            &[
+                ("hfs_t_patient", v(1)),
+                ("hfs_t_encounter", None),
+                ("hfs_t_empty", v(1)),
+                ("hfs_t_current", v(SCHEMA_VERSION)),
+            ],
+            200,
+            Some(&[
+                ("hfs_t_patient", 12),
+                ("hfs_t_encounter", 3),
+                ("hfs_t_empty", 0),
+            ]),
+        )
+        .await;
+
+        let report = reconcile_index_mappings(&backend_on(&server)).await;
+        assert_eq!((report.updated, report.current, report.failed), (3, 1, 0));
+
+        logs_assert(|lines: &[&str]| {
+            let warnings = reindex_warnings(lines);
+            assert_eq!(warnings.len(), 1, "{lines:?}");
+            assert!(warnings[0].contains("indices=2"), "{}", warnings[0]);
+            assert!(
+                warnings[0].contains("hfs_t_encounter, hfs_t_patient"),
+                "{}",
+                warnings[0]
+            );
+            assert!(!warnings[0].contains("hfs_t_empty"), "{}", warnings[0]);
+            Ok(())
+        });
+    }
+
+    /// #1391: an index with nothing in it, or already at version 2, is not
+    /// worth a warning — and a current one is not even counted.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn startup_does_not_warn_for_an_empty_or_current_index() {
+        let server = stub_cluster(
+            &[("hfs_t_empty", v(1)), ("hfs_t_unmarked_empty", None)],
+            200,
+            Some(&[("hfs_t_empty", 0), ("hfs_t_unmarked_empty", 0)]),
+        )
+        .await;
+        assert_eq!(
+            reconcile_index_mappings(&backend_on(&server)).await.updated,
+            2
+        );
+
+        let current = stub_cluster(
+            &[("hfs_t_patient", v(SCHEMA_VERSION))],
+            200,
+            Some(&[("hfs_t_patient", 100)]),
+        )
+        .await;
+        assert_eq!(
+            reconcile_index_mappings(&backend_on(&current))
+                .await
+                .current,
+            1
+        );
+        let stats_requests = current
+            .received_requests()
+            .await
+            .expect("request recording is on")
+            .into_iter()
+            .filter(|r| r.url.path().contains("_stats"))
+            .count();
+        assert_eq!(stats_requests, 0);
+
+        logs_assert(|lines: &[&str]| {
+            assert!(reindex_warnings(lines).is_empty(), "{lines:?}");
+            Ok(())
+        });
+    }
+
+    /// #1391: when the documents cannot be counted the warning is given
+    /// anyway.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn startup_warns_when_the_count_is_unknown() {
+        let uncounted = stub_cluster(&[("hfs_t_patient", v(1))], 200, None).await;
+        reconcile_index_mappings(&backend_on(&uncounted)).await;
+        logs_assert(|lines: &[&str]| {
+            assert_eq!(reindex_warnings(lines).len(), 1, "{lines:?}");
+            Ok(())
+        });
+    }
+
+    /// When the mapping could not be updated there is no warning: the failure
+    /// has its own error, and the index is retried.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn startup_does_not_warn_when_the_mapping_update_failed() {
+        let refused = stub_cluster(
+            &[("hfs_t_patient", v(1))],
+            400,
+            Some(&[("hfs_t_patient", 5)]),
+        )
+        .await;
+        let report = reconcile_index_mappings(&backend_on(&refused)).await;
+        assert_eq!((report.updated, report.failed), (0, 1));
+        logs_assert(|lines: &[&str]| {
+            assert!(reindex_warnings(lines).is_empty(), "{lines:?}");
+            Ok(())
+        });
+    }
+
+    /// #1391: the write path reconciles an index the startup pass did not see;
+    /// the same rule applies there, once per index.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn reconcile_index_warns_only_for_an_old_index_with_documents() {
+        let server = stub_cluster(
+            &[("hfs_t_patient", v(1))],
+            200,
+            Some(&[("hfs_t_patient", 4)]),
+        )
+        .await;
+        let backend = backend_on(&server);
+        // The listing above answers `hfs_t_patient` for any single-index read.
+        Mock::given(method("GET"))
+            .and(path("/hfs_t_patient/_mapping"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "hfs_t_patient": { "mappings": {
+                    "_meta": { SCHEMA_VERSION_META_KEY: 1 },
+                    "properties": { "resource_type": { "type": "keyword" } }
+                } }
+            })))
+            .mount(&server)
+            .await;
+        reconcile_index(&backend, "hfs_t_patient").await;
+        reconcile_index(&backend, "hfs_t_patient").await;
+
+        logs_assert(|lines: &[&str]| {
+            assert_eq!(reindex_warnings(lines).len(), 1, "{lines:?}");
+            Ok(())
+        });
+
+        let empty = stub_cluster(
+            &[("hfs_t_patient", v(1))],
+            200,
+            Some(&[("hfs_t_patient", 0)]),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path("/hfs_t_patient/_mapping"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "hfs_t_patient": { "mappings": {
+                    "_meta": { SCHEMA_VERSION_META_KEY: 1 },
+                    "properties": { "resource_type": { "type": "keyword" } }
+                } }
+            })))
+            .mount(&empty)
+            .await;
+        reconcile_index(&backend_on(&empty), "hfs_t_patient").await;
+        logs_assert(|lines: &[&str]| {
+            assert_eq!(reindex_warnings(lines).len(), 1, "still the one: {lines:?}");
+            Ok(())
+        });
     }
 
     /// #1050: which existing indices the startup pass raises. An explicit

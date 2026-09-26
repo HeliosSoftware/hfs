@@ -3454,6 +3454,12 @@ tr:hover .result-id__copy,
   color: var(--warn);
 }
 
+/* Unsaved-changes pill (#1240), same tokens as .tag--draft. */
+.tag--unsaved {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
 .tag--retired {
   background: var(--input-bg);
   border: 1px solid var(--surface-border);
@@ -5350,6 +5356,169 @@ details.card > summary.card-head::-webkit-details-marker {
   border: 1px solid var(--surface-border);
   border-radius: 8px;
   outline: none;
+}
+
+/* ---- picker panel (#1239): header with a close control, an inline "added"
+   status wired by editor-add.js, and an Elements/Extensions accordion so the
+   form around the panel stays in view. Everything here hangs off
+   .editor-add--picker; the SQL library cards keep sharing the bare
+   .editor-add markup and rules above, untouched. ---- */
+
+.editor-add--picker .editor-add__panel {
+  max-width: 560px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.editor-add--picker .editor-add__filter {
+  margin-bottom: 0;
+}
+
+.editor-add__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.editor-add__title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+/* Not `.icon-button` (#1239): that class is a hard 30x30/9px contract
+   (`design-system.spec.ts`'s "canonical button scale" check) shared by
+   every other icon-only control in the crate, and this close control needs
+   to sit smaller, inline with the picker's title. Same recipe as the
+   CodeMirror lint panel's own 24x24 close button below (`#821`) instead of
+   a one-off. */
+.editor-add__close {
+  display: inline-grid;
+  place-items: center;
+  margin-left: auto;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  font-size: 18px;
+  line-height: 1;
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  border-radius: 9px;
+  cursor: pointer;
+}
+
+.editor-add__close:hover {
+  color: var(--text);
+  background: var(--accent-soft);
+}
+
+.editor-add__added {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 6px 8px;
+  font-size: 12px;
+  color: var(--ok);
+  background: var(--ok-soft);
+  border: 1px solid var(--ok);
+  border-radius: 8px;
+}
+
+.editor-add__added strong {
+  font-weight: 600;
+}
+
+.editor-add__undo {
+  margin-left: auto;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  color: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.editor-add__group {
+  border: 1px solid var(--surface-border);
+  border-radius: 8px;
+}
+
+.editor-add__group-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  background: var(--input-bg);
+  border-radius: 8px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.editor-add__group-head::-webkit-details-marker {
+  display: none;
+}
+
+.editor-add__group-head::before {
+  content: "▸";
+  display: inline-block;
+  color: var(--muted);
+  transition: transform 0.1s ease;
+}
+
+.editor-add__group[open] > .editor-add__group-head::before {
+  transform: rotate(90deg);
+}
+
+.editor-add__count {
+  margin-left: auto;
+  font-weight: 400;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.editor-add--picker .editor-add__list {
+  max-height: 200px;
+  padding: 4px;
+}
+
+.editor-add--picker .editor-add__ext {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  margin-top: 0;
+  padding: 4px;
+  border-top: 0;
+}
+
+.editor-add__ext-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--surface-border);
+}
+
+.editor-add__ext-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.editor-add__ext-label .editor-add__ext-url {
+  flex: 1;
 }
 
 /* ---- source view & validity rail ---- */

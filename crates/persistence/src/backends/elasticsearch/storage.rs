@@ -12,20 +12,20 @@ use std::time::Duration;
 use futures::StreamExt;
 
 use async_trait::async_trait;
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use elasticsearch::params::Refresh;
 use elasticsearch::{BulkParts, DeleteByQueryParts, DeleteParts, IndexParts};
 use helios_fhir::FhirVersion;
 use serde_json::{Value, json};
 
-use crate::core::{PurgableStorage, ResourceStorage};
+use crate::core::{DailyResourceCount, PurgableStorage, ResourceStorage, WriteMarker};
 use crate::error::{BackendError, ResourceError, StorageError, StorageResult};
 use crate::search::converters::IndexValue;
 use crate::search::extractor::ExtractedValue;
 use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
-use crate::search::{FhirDateValue, StorageResolution};
+use crate::search::{DateEnd, FhirDateValue, StorageResolution, indexed_end};
 use crate::tenant::{Operation, TenantContext};
-use crate::types::StoredResource;
+use crate::types::{DatePrecision, StoredResource};
 
 use super::backend::ElasticsearchBackend;
 use super::schema;
@@ -292,16 +292,20 @@ struct ValueOrigin<'a> {
 /// rest of the document indexes normally. Index-side code must never fail a
 /// write because of odd data.
 fn es_index_date(origin: ValueOrigin<'_>, raw: &str) -> Option<String> {
+    es_date_range(origin, raw).map(|(start, _)| es_instant(start))
+}
+
+/// The range `[start, end)` a stored date names at millisecond resolution,
+/// read as leniently as [`es_index_date`] reads it; `None`, with a warning,
+/// when it is not a date.
+fn es_date_range(origin: ValueOrigin<'_>, raw: &str) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
     let parsed = FhirDateValue::parse(raw).or_else(|error| {
         repair_iso_date(raw)
             .and_then(|repaired| FhirDateValue::parse(&repaired).ok())
             .ok_or(error)
     });
     match parsed {
-        Ok(parsed) => {
-            let (start, _) = parsed.range_at(StorageResolution::Millis);
-            Some(start.to_rfc3339_opts(SecondsFormat::Millis, true))
-        }
+        Ok(parsed) => Some(parsed.range_at(StorageResolution::Millis)),
         Err(error) => {
             tracing::warn!(
                 resource_type = origin.resource_type,
@@ -312,6 +316,44 @@ fn es_index_date(origin: ValueOrigin<'_>, raw: &str) -> Option<String> {
             None
         }
     }
+}
+
+/// The stored range of a standalone date index value: `(start, end)` as the
+/// `value` and `end` of a `search_params.date` entry (#1391). A point ends one
+/// unit of its own precision after it starts; a `Period` at the end of its own
+/// `end`, or at [`crate::search::open_end`] when it has none.
+///
+/// `None` when either end is not a date: the whole value is skipped, like a
+/// bad point, because indexing a `Period` with an unreadable `end` as open
+/// would match every later search range.
+fn es_index_range(
+    origin: ValueOrigin<'_>,
+    raw: &str,
+    precision: DatePrecision,
+    end: &DateEnd,
+) -> Option<(String, String)> {
+    let (start, point_end) = es_date_range(origin, raw)?;
+    let end = match end {
+        DateEnd::Precision => point_end,
+        other => match indexed_end(start, precision, other, StorageResolution::Millis) {
+            Some(end) => end,
+            None => {
+                tracing::warn!(
+                    resource_type = origin.resource_type,
+                    resource_id = origin.resource_id,
+                    param = origin.param,
+                    "Skipping a Period in the Elasticsearch index: its end is not a date"
+                );
+                return None;
+            }
+        },
+    };
+    Some((es_instant(start), es_instant(end)))
+}
+
+/// An instant as the `date` mapping stores it: RFC 3339 UTC, milliseconds.
+fn es_instant(instant: DateTime<Utc>) -> String {
+    instant.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
 /// Rewrites the ISO 8601 spellings that are not FHIR but that the `date`
@@ -462,11 +504,16 @@ pub(crate) fn build_es_document(
                 }
                 token_params.push(token);
             }
-            IndexValue::Date { value, precision } => {
-                if let Some(value) = es_index_date(origin, value) {
+            IndexValue::Date {
+                value,
+                precision,
+                end,
+            } => {
+                if let Some((start, end)) = es_index_range(origin, value, *precision, end) {
                     date_params.push(json!({
                         "name": ev.param_name,
-                        "value": value,
+                        "value": start,
+                        "end": end,
                         "precision": format!("{:?}", precision).to_lowercase(),
                     }));
                 }
@@ -1617,6 +1664,139 @@ impl ResourceStorage for ElasticsearchBackend {
         }
     }
 
+    /// Every stored resource of the tenant, counted per type in one
+    /// aggregation over the tenant's indices — what the dashboard needs from
+    /// a composite whose primary keeps no counts (#1280). Contained documents
+    /// are synthetic copies and do not count; a tenant with no indices is an
+    /// empty list, a failed request an error, never zeros (#1364).
+    async fn count_all_types(&self, tenant: &TenantContext) -> StorageResult<Vec<(String, u64)>> {
+        let tenant_id = tenant.tenant_id().as_str();
+        let pattern = tenant_index_pattern(self, tenant_id);
+        let body = json!({
+            "size": 0,
+            "query": stored_documents_of(tenant_id),
+            "aggs": { "types": { "terms": { "field": "resource_type", "size": 1000 } } }
+        });
+        let Some(body) = send_read_with_retry(self, ReadOp::Search, &pattern, body).await? else {
+            return Ok(Vec::new());
+        };
+        aggregation_buckets(&body, "types")?
+            .iter()
+            .map(|bucket| {
+                let key = bucket.get("key").and_then(Value::as_str).ok_or_else(|| {
+                    internal_error(format!("Type bucket carries no key: {bucket}"))
+                })?;
+                Ok((key.to_string(), bucket_doc_count(bucket)?))
+            })
+            .collect()
+    }
+
+    fn supports_type_counts(&self) -> bool {
+        true
+    }
+
+    /// Stored resources of `resource_type` per UTC day of their `last_updated`
+    /// — the day of each resource's current version, as the contract asks.
+    async fn count_by_day(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        since: DateTime<Utc>,
+    ) -> StorageResult<Vec<DailyResourceCount>> {
+        let tenant_id = tenant.tenant_id().as_str();
+        let index = self.index_name(tenant_id, resource_type);
+        let mut query = stored_documents_of(tenant_id);
+        if let Some(filters) = query["bool"]["filter"].as_array_mut() {
+            filters.push(json!({ "range": { "last_updated": { "gte": since.to_rfc3339() } } }));
+        }
+        let body = json!({
+            "size": 0,
+            "query": query,
+            "aggs": { "days": { "date_histogram": {
+                "field": "last_updated",
+                "calendar_interval": "day",
+                "time_zone": "UTC",
+                "min_doc_count": 1
+            } } }
+        });
+        let Some(body) = send_read_with_retry(self, ReadOp::Search, &index, body).await? else {
+            return Ok(Vec::new());
+        };
+        aggregation_buckets(&body, "days")?
+            .iter()
+            .map(|bucket| {
+                let day = bucket
+                    .get("key_as_string")
+                    .and_then(Value::as_str)
+                    .and_then(|s| s.get(..10))
+                    .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+                    .ok_or_else(|| {
+                        internal_error(format!("Day bucket carries no day: {bucket}"))
+                    })?;
+                Ok(DailyResourceCount {
+                    day,
+                    count: bucket_doc_count(bucket)?,
+                })
+            })
+            .collect()
+    }
+
+    /// The newest `last_updated` across the tenant's documents, plus how many
+    /// were written since `recent_since` when asked — one aggregation request
+    /// over the tenant's indices, no scan.
+    async fn latest_write_marker(
+        &self,
+        tenant: &TenantContext,
+        recent_since: Option<DateTime<Utc>>,
+    ) -> StorageResult<Option<WriteMarker>> {
+        let tenant_id = tenant.tenant_id().as_str();
+        let pattern = tenant_index_pattern(self, tenant_id);
+        let mut aggs = json!({ "latest": { "max": { "field": "last_updated" } } });
+        if let Some(since) = recent_since {
+            aggs["recent"] =
+                json!({ "filter": { "range": { "last_updated": { "gte": since.to_rfc3339() } } } });
+        }
+        let body = json!({
+            "size": 0,
+            "query": { "bool": {
+                "filter": [ { "term": { "tenant_id": tenant_id } } ],
+                "must_not": [ { "term": { "is_contained": true } } ]
+            }},
+            "aggs": aggs
+        });
+        let Some(body) = send_read_with_retry(self, ReadOp::Search, &pattern, body).await? else {
+            return Ok(Some(WriteMarker {
+                latest: None,
+                recent_writes: recent_since.map(|_| 0),
+            }));
+        };
+        let latest = body
+            .pointer("/aggregations/latest/value_as_string")
+            .and_then(Value::as_str)
+            .map(|s| {
+                DateTime::parse_from_rfc3339(s)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .map_err(|e| {
+                        internal_error(format!("Latest write marker is not a timestamp ({s}): {e}"))
+                    })
+            })
+            .transpose()?;
+        let recent_writes = match recent_since {
+            None => None,
+            Some(_) => Some(
+                body.pointer("/aggregations/recent/doc_count")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| {
+                        internal_error(format!("Marker response carries no recent count: {body}"))
+                    })?,
+            ),
+        };
+        Ok(Some(WriteMarker {
+            latest,
+            recent_writes,
+        }))
+    }
+
     // `supports_tenant_registry` stays `false`: ES is a search secondary, never
     // the registry of record. Only the data purge is implemented, so that
     // composite storage can clear a purged tenant's offloaded search documents
@@ -2546,6 +2726,35 @@ async fn delete_by_query_scoped(
     }
 }
 
+/// The query selecting `tenant_id`'s stored resources: live documents, minus
+/// the synthetic copies extracted for `_contained` search.
+fn stored_documents_of(tenant_id: &str) -> Value {
+    json!({ "bool": {
+        "filter": [
+            { "term": { "tenant_id": tenant_id } },
+            { "term": { "is_deleted": false } }
+        ],
+        "must_not": [ { "term": { "is_contained": true } } ]
+    }})
+}
+
+fn aggregation_buckets<'a>(body: &'a Value, name: &str) -> StorageResult<&'a Vec<Value>> {
+    body.pointer(&format!("/aggregations/{name}/buckets"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            internal_error(format!(
+                "Aggregation response carries no {name} buckets: {body}"
+            ))
+        })
+}
+
+fn bucket_doc_count(bucket: &Value) -> StorageResult<u64> {
+    bucket
+        .get("doc_count")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| internal_error(format!("Aggregation bucket carries no doc_count: {bucket}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2677,6 +2886,7 @@ mod tests {
             json!([{
                 "name": "death-date",
                 "value": "2024-03-15T05:00:00.000Z",
+                "end": "2024-03-15T05:00:01.000Z",
                 "precision": "second",
             }])
         );
@@ -2686,6 +2896,97 @@ mod tests {
                 { "name": "combo", "group_id": 0, "string": ["kept"] },
                 { "name": "combo", "group_id": 1, "date": ["2017-01-01T00:00:00.000Z"] },
             ])
+        );
+    }
+
+    /// #1391: a `Period` indexes as one range, its open ends at the edges of
+    /// the supported years, and a `Period` with an end that is not a date is
+    /// skipped whole rather than indexed as open.
+    #[test]
+    fn document_indexes_a_period_as_one_range() {
+        let period = |start: Option<&str>, end: Option<&str>| {
+            let value = IndexValue::date_range(start, end).expect("a Period with an end");
+            ExtractedValue::new(
+                "date",
+                "http://hl7.org/fhir/SearchParameter/clinical-date",
+                value.param_type(),
+                value,
+            )
+        };
+        let doc = build_es_document(
+            "t1",
+            "Encounter",
+            "e1",
+            "1",
+            &json!({ "resourceType": "Encounter", "id": "e1" }),
+            FhirVersion::default(),
+            &[
+                period(Some("2020-01-15"), Some("2020-06")),
+                period(Some("2021-03-01T10:00:00Z"), None),
+                period(None, Some("1999")),
+                period(Some("2022-01-01"), Some("not-a-date")),
+            ],
+        );
+
+        let ranges: Vec<(&str, &str)> = doc["search_params"]["date"]
+            .as_array()
+            .expect("date entries")
+            .iter()
+            .map(|entry| {
+                (
+                    entry["value"].as_str().unwrap(),
+                    entry["end"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            ranges,
+            vec![
+                ("2020-01-15T00:00:00.000Z", "2020-07-01T00:00:00.000Z"),
+                ("2021-03-01T10:00:00.000Z", "9999-12-31T23:59:59.999Z"),
+                ("0001-01-01T00:00:00.000Z", "2000-01-01T00:00:00.000Z"),
+            ]
+        );
+    }
+
+    /// A `Period` bound is read strictly: the extractor indexes a `Period` only
+    /// when both bounds are valid FHIR dates, and an `end` that is not one —
+    /// ISO 8601 spellings outside the grammar included — drops the whole
+    /// `Period` rather than being read as open.
+    #[test]
+    fn a_period_with_an_end_that_is_not_a_fhir_date_is_skipped_whole() {
+        let period = |start: &str, end: &str| {
+            let value = IndexValue::date_range(Some(start), Some(end)).expect("a Period");
+            ExtractedValue::new(
+                "date",
+                "http://hl7.org/fhir/SearchParameter/clinical-date",
+                value.param_type(),
+                value,
+            )
+        };
+        let doc = build_es_document(
+            "t1",
+            "Encounter",
+            "e1",
+            "1",
+            &json!({ "resourceType": "Encounter", "id": "e1" }),
+            FhirVersion::default(),
+            &[
+                period("2024-03-15", "2024-03-15T12:00:00+05:30"),
+                period("2024-03-15", "2024-03-15T12Z"),
+                period("2024-03-15", "2024-03-15T12:00:00+0530"),
+                period("2024-03-15", "not-a-date"),
+            ],
+        );
+        let ranges: Vec<(&str, &str)> = doc["search_params"]["date"]
+            .as_array()
+            .expect("date entries")
+            .iter()
+            .map(|e| (e["value"].as_str().unwrap(), e["end"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            ranges,
+            vec![("2024-03-15T00:00:00.000Z", "2024-03-15T06:30:01.000Z")]
         );
     }
 
