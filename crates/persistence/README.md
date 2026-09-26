@@ -687,7 +687,7 @@ HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
 
 ### S3 + Elasticsearch
 
-S3 handles CRUD, versioning, history, and the whole `$bulk-submit` surface (ingestion and job state alike). Elasticsearch handles all search operations. For bulk export, this topology can use S3 as the resource data provider for system-level exports and `S3OutputStore` as the output-file store; export job state still lives in the configured SQLite or PostgreSQL bulk-export job store.
+S3 handles CRUD, versioning, history, and the whole `$bulk-submit` surface (ingestion and job state alike). Elasticsearch handles all search operations, and — since the S3 primary keeps no counts — the Home dashboard's totals, per-type breakdown and write marker (#1280); it keeps no history, so the dashboard's creation-time series is empty on this topology. For bulk export, this topology can use S3 as the resource data provider for system-level exports and `S3OutputStore` as the output-file store; export job state still lives in the configured SQLite or PostgreSQL bulk-export job store.
 
 - CRUD persistence via S3 objects (current pointer + immutable history versions)
 - Versioning (`vread`, optimistic locking via version checks)
