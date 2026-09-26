@@ -2358,11 +2358,13 @@ fn record_and_log_page(
 /// Logs L1 `reindex job started` (INFO), once per run, after counting and
 /// before `clear_existing` or `begin_bulk_index_rebuild`. Field order:
 /// `tenant, job_id, types, total, batch_size, batch_bytes, bulk_index_rebuild,
-/// clear_existing, resource_scoped, writers, setup_ms`. `types`/`total` come
-/// from `stats` (job-scoped, fixed for the run); the rest mirror the
-/// request's shape so each arm's configuration is visible in the log.
-/// `setup_ms` is the time from entry into `run_reindex` to the end of
-/// counting. Fields are appended only, never renamed, removed or reordered
+/// clear_existing, resource_scoped, writers, setup_ms, write_streams`.
+/// `types`/`total` come from `stats` (job-scoped, fixed for the run); the rest
+/// mirror the request's shape so each arm's configuration is visible in the
+/// log. `setup_ms` is the time from entry into `run_reindex` to the end of
+/// counting. `write_streams` is the write streams per type the run asked for;
+/// the streams a type actually used are its `reindex type finished` line's
+/// `streams`. Fields are appended only, never renamed, removed or reordered
 /// (#1403).
 #[allow(clippy::too_many_arguments)]
 fn log_job_started(
@@ -2376,6 +2378,7 @@ fn log_job_started(
     resource_scoped: bool,
     writers: usize,
     setup: Duration,
+    write_streams: u32,
 ) {
     tracing::info!(
         tenant = %tenant,
@@ -2389,6 +2392,7 @@ fn log_job_started(
         resource_scoped = resource_scoped,
         writers = writers as u64,
         setup_ms = millis(setup),
+        write_streams = u64::from(write_streams),
         "reindex job started"
     );
 }
@@ -2421,8 +2425,9 @@ fn log_type_started(tenant: &str, job_id: &str, s: &TypeStarted) {
 /// elapsed_ms, entries, failed, pages, fetch_ms, write_ms, extract_ms,
 /// delete_ms, insert_ms, writer_other_ms, yield_ms, other_ms, deleted,
 /// inserted, insert_commands, fetch_wait_ms, db_wait_ms, sub_batches,
-/// pool_sub_batches`. `outcome` is this type's own exit path — a type that
-/// finished all its pages is always `completed`, even if a later type or the
+/// pool_sub_batches, streams, plan_ms`. `outcome` is this type's own exit
+/// path — a type that finished all its pages is always `completed`, even if
+/// a later type or the
 /// job as a whole fails or is cancelled. Every counter and phase field
 /// (`entries` through `pool_sub_batches`) is scoped to this type only, since
 /// its L2. `type_elapsed_ms` is this type's own clock; `elapsed_ms` is always
@@ -2436,7 +2441,14 @@ fn log_type_started(tenant: &str, job_id: &str, s: &TypeStarted) {
 /// unless the source prefetched it); `db_wait_ms` is
 /// `writer.db_wait_or_busy()`; `sub_batches`/`pool_sub_batches` are the
 /// extraction units this type's pages ran, and how many of those ran on the
-/// rayon pool. `deleted`/`inserted`/`insert_commands` come from the type's
+/// rayon pool. `streams` is the number of write streams the type was walked
+/// with (1 unless the source split it into id ranges) and `plan_ms` the time
+/// spent planning them (0 when it was not planned). With `streams` above 1
+/// every phase field (`fetch_ms` through `pool_sub_batches`) is summed over
+/// the streams while `type_elapsed_ms` stays wall time, so `other_ms`
+/// saturates to 0 and must not be read; `(fetch_wait_ms + write_ms +
+/// yield_ms) / type_elapsed_ms` is then the type's effective concurrency.
+/// `deleted`/`inserted`/`insert_commands` come from the type's
 /// accumulated `ReindexPageStats` (writer-reported; zero for a writer that
 /// does not measure). Fields are appended only, never renamed, removed or
 /// reordered — the one sanctioned exception is the redefinition of
@@ -2472,6 +2484,8 @@ fn log_type_finished(tenant: &str, job_id: &str, s: &TypeSummary) {
         db_wait_ms = phases.db_wait_ms,
         sub_batches = s.counters.writer.sub_batches,
         pool_sub_batches = s.counters.writer.pool_sub_batches,
+        streams = u64::from(s.streams),
+        plan_ms = millis(s.plan),
         "reindex type finished"
     );
 }
@@ -2838,6 +2852,7 @@ async fn run_reindex(
         named_resources.is_some(),
         writers.len(),
         run_started.elapsed(),
+        request.write_streams,
     );
 
     // Clear existing indexes if requested — in every writer, not just the first.
@@ -6455,6 +6470,7 @@ mod tests {
         "resource_scoped",
         "writers",
         "setup_ms",
+        "write_streams",
     ];
     const TYPE_STARTED_FIELDS: &[&str] = &[
         "tenant",
@@ -6494,6 +6510,8 @@ mod tests {
         "db_wait_ms",
         "sub_batches",
         "pool_sub_batches",
+        "streams",
+        "plan_ms",
     ];
     const PROGRESS_FIELDS: &[&str] = &[
         "tenant",
@@ -6693,7 +6711,7 @@ mod tests {
     #[test]
     fn field_lists_append_fetch_wait_and_db_wait() {
         assert_eq!(
-            &TYPE_FINISHED_FIELDS[TYPE_FINISHED_FIELDS.len() - 4..],
+            &TYPE_FINISHED_FIELDS[TYPE_FINISHED_FIELDS.len() - 6..TYPE_FINISHED_FIELDS.len() - 2],
             [
                 "fetch_wait_ms",
                 "db_wait_ms",
@@ -6727,6 +6745,52 @@ mod tests {
                 "pool_sub_batches"
             ]
         );
+    }
+
+    #[test]
+    fn field_lists_append_write_streams_streams_and_plan_ms() {
+        assert_eq!(JOB_STARTED_FIELDS.last(), Some(&"write_streams"));
+        assert_eq!(
+            &TYPE_FINISHED_FIELDS[TYPE_FINISHED_FIELDS.len() - 2..],
+            ["streams", "plan_ms"]
+        );
+        // 30 fields plus `message` stays inside a line's 32-field budget.
+        assert_eq!(TYPE_FINISHED_FIELDS.len(), 30);
+    }
+
+    #[tokio::test]
+    async fn a_single_walk_type_logs_one_stream_and_no_plan_time() {
+        let (_guard, events) = capture_contract();
+        let source = Arc::new(PagedSource::new(3));
+        let op = Arc::new(ReindexOperation::with_parts(
+            source,
+            vec![Arc::new(MeasuringTarget)],
+            Arc::new(crate::search::TenantSearchRegistries::base_only()),
+        ));
+        let job_id = op
+            .start(
+                named_tenant("single-walk-streams"),
+                ReindexRequest::for_types(vec!["Patient".to_string()]).with_batch_size(2),
+                None,
+            )
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job_id).await;
+        assert_eq!(progress.status, ReindexStatus::Completed);
+
+        let events = events.lock().unwrap().clone();
+        assert_contract(&events);
+        let job_started = events
+            .iter()
+            .find(|e| e.message == "reindex job started")
+            .expect("reindex job started");
+        assert_eq!(job_started.values["write_streams"], "1");
+        let type_finished = events
+            .iter()
+            .find(|e| e.message == "reindex type finished")
+            .expect("reindex type finished");
+        assert_eq!(type_finished.values["streams"], "1");
+        assert_eq!(type_finished.values["plan_ms"], "0");
     }
 
     #[test]

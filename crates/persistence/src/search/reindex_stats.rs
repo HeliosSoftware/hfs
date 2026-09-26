@@ -153,6 +153,12 @@ pub(super) struct TypeSummary {
     pub(super) type_elapsed: Duration,
     pub(super) elapsed: Duration,
     pub(super) counters: Counters,
+    /// Write streams the type was walked with: 1 unless the source split it
+    /// into id ranges (#1403).
+    pub(super) streams: u32,
+    /// Time spent planning the type's streams; zero when it was not planned
+    /// (#1403).
+    pub(super) plan: Duration,
 }
 
 pub(super) struct JobSummary {
@@ -170,6 +176,8 @@ struct OpenType {
     type_total: u64,
     started: Instant,
     counters: Counters,
+    streams: u32,
+    plan: Duration,
 }
 
 /// Local, single-job accounting: nothing here is a process-global, unlike
@@ -239,6 +247,8 @@ impl ReindexRunStats {
             type_total,
             started: now,
             counters: Counters::default(),
+            streams: 1,
+            plan: Duration::ZERO,
         });
         TypeStarted {
             resource_type: resource_type.to_string(),
@@ -334,6 +344,8 @@ impl ReindexRunStats {
             type_elapsed: now.saturating_duration_since(open.started),
             elapsed: now.saturating_duration_since(self.started),
             counters: open.counters,
+            streams: open.streams,
+            plan: open.plan,
         })
     }
 
@@ -721,5 +733,17 @@ mod tests {
         assert_eq!(summary.counters.yielded, Duration::from_millis(5));
         let job = stats.finish_job(OUTCOME_COMPLETED, t0);
         assert_eq!(job.counters.yielded, Duration::from_millis(5));
+    }
+
+    #[test]
+    fn a_type_reports_one_stream_and_no_plan_time_by_default() {
+        let t0 = Instant::now();
+        let mut stats = ReindexRunStats::new(t0, 1, 1, Duration::from_secs(60));
+        stats.start_type("Patient", 1, t0);
+        let summary = stats
+            .finish_type(OUTCOME_COMPLETED, t0 + Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(summary.streams, 1);
+        assert_eq!(summary.plan, Duration::ZERO);
     }
 }
