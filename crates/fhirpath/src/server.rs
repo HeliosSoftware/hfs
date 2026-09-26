@@ -256,8 +256,15 @@ pub async fn run_server(config: ServerConfig) -> Result<(), Box<dyn std::error::
     // Create the server
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
-    // Start the server
-    axum::serve(listener, app).await?;
+    // Start the server; drain on Ctrl-C or SIGTERM.
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let signal = helios_observability::shutdown::signal().await;
+            info!(signal, "Shutdown signal received, draining connections");
+        })
+        .await?;
+    // After the drain, so spans from the draining requests are exported too.
+    helios_observability::telemetry::shutdown();
 
     Ok(())
 }
