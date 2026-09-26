@@ -20,6 +20,7 @@ use crate::core::bulk_export::{
 };
 use crate::error::{BackendError, BulkExportError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
+use crate::types::StoredResource;
 
 use super::MongoBackend;
 
@@ -104,16 +105,25 @@ fn ndjson_from_docs(docs: Vec<Document>, batch_size: u32) -> StorageResult<Ndjso
         let data = d
             .get_document("data")
             .map_err(|e| internal_error(format!("missing data payload: {e}")))?;
-        let val = document_to_value(data)?;
-        let line =
-            serde_json::to_string(&val).map_err(|e| internal_error(format!("serialize: {e}")))?;
-        lines.push(line);
         let last_updated = d
             .get_datetime("last_updated")
             .map_err(|e| internal_error(format!("missing last_updated: {e}")))?;
+        let version_id = d
+            .get_str("version_id")
+            .map_err(|e| internal_error(format!("missing version_id: {e}")))?;
         let id = d
             .get_str("id")
             .map_err(|e| internal_error(format!("missing id: {e}")))?;
+        // The payload is stored as submitted; versionId/lastUpdated live in their
+        // own fields and must be merged back in (#1273).
+        let val = StoredResource::merge_meta(
+            document_to_value(data)?,
+            version_id,
+            bson_to_chrono(last_updated),
+        );
+        let line =
+            serde_json::to_string(&val).map_err(|e| internal_error(format!("serialize: {e}")))?;
+        lines.push(line);
         last_cursor = Some(make_cursor(last_updated, id));
     }
     Ok(NdjsonBatch {

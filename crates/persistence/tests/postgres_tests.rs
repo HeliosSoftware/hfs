@@ -17827,6 +17827,110 @@ mod postgres_integration {
         assert!(batch.lines[0].contains(&early));
     }
 
+    /// Exported lines carry `meta.versionId` / `meta.lastUpdated` from the row
+    /// (#1273) on all three export queries, and client-supplied `meta` members
+    /// survive the merge.
+    #[tokio::test]
+    async fn postgres_integration_export_lines_carry_server_meta() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-meta");
+
+        let tag = serde_json::json!([{"system": "http://example.org/tags", "code": "keep"}]);
+        let v1 = backend
+            .create(
+                &tenant,
+                "Patient",
+                serde_json::json!({"resourceType": "Patient", "meta": {"tag": tag.clone()}}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let patient_id = v1.id().to_string();
+        backend
+            .update(
+                &tenant,
+                &v1,
+                serde_json::json!({
+                    "resourceType": "Patient",
+                    "id": patient_id,
+                    "meta": {"tag": tag.clone()}
+                }),
+            )
+            .await
+            .unwrap();
+        pin_last_updated(&backend, &patient_id, instant("2026-02-01T12:00:00Z")).await;
+
+        let obs = backend
+            .create(
+                &tenant,
+                "Observation",
+                serde_json::json!({
+                    "resourceType": "Observation",
+                    "status": "final",
+                    "code": {"text": "x"},
+                    "subject": {"reference": format!("Patient/{patient_id}")}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let obs_id = obs.id().to_string();
+        pin_last_updated(&backend, &obs_id, instant("2026-02-02T08:30:00Z")).await;
+
+        fn meta_of(line: &str) -> serde_json::Value {
+            let resource: serde_json::Value = serde_json::from_str(line).unwrap();
+            resource["meta"].clone()
+        }
+
+        let system = backend
+            .fetch_export_batch(&tenant, &ExportRequest::system(), "Patient", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(system.lines.len(), 1);
+        let meta = meta_of(&system.lines[0]);
+        assert_eq!(meta["versionId"], "2", "system export carries versionId");
+        assert_eq!(meta["lastUpdated"], "2026-02-01T12:00:00.000Z");
+        assert_eq!(meta["tag"], tag, "client meta.tag is preserved");
+
+        let ids = vec![patient_id.clone()];
+        let patient_branch = backend
+            .fetch_patient_compartment_batch(
+                &tenant,
+                &ExportRequest::patient(),
+                "Patient",
+                &ids,
+                None,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(patient_branch.lines.len(), 1);
+        let meta = meta_of(&patient_branch.lines[0]);
+        assert_eq!(meta["versionId"], "2", "Patient branch carries versionId");
+        assert_eq!(meta["lastUpdated"], "2026-02-01T12:00:00.000Z");
+        assert_eq!(meta["tag"], tag);
+
+        let compartment = backend
+            .fetch_patient_compartment_batch(
+                &tenant,
+                &ExportRequest::patient(),
+                "Observation",
+                &ids,
+                None,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(compartment.lines.len(), 1);
+        let meta = meta_of(&compartment.lines[0]);
+        assert_eq!(
+            meta["versionId"], "1",
+            "compartment branch carries versionId"
+        );
+        assert_eq!(meta["lastUpdated"], "2026-02-02T08:30:00.000Z");
+    }
+
     #[tokio::test]
     async fn postgres_integration_export_stale_worker_fenced_out() {
         let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
