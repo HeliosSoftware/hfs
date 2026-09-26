@@ -1,0 +1,315 @@
+# Deploys one release binary to its host. Called by ci.yml's deploy-hts and
+# deploy jobs on version tags; the github context (ref_name, run_id, ...) is
+# the caller's, so the tag and release lookups below resolve as before.
+name: Deploy server
+
+on:
+  workflow_call:
+    inputs:
+      server:
+        description: fhirpath-server, sof-server, hfs or hts
+        required: true
+        type: string
+
+jobs:
+  deploy:
+    name: ${{ inputs.server }}
+    runs-on: [self-hosted, Linux, Deploy]
+    steps:
+      - name: Download release binary
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require('fs');
+            const tag = '${{ github.ref_name }}';
+
+            console.log(`Fetching release for tag: ${tag}`);
+
+            const { data: release } = await github.rest.repos.getReleaseByTag({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag: tag
+            });
+
+            const version = tag.startsWith('v') ? tag.substring(1) : tag;
+
+            const asset = release.assets.find(asset =>
+              asset.name === `hfs-${version}-x86_64-unknown-linux-gnu.tar.gz`
+            );
+
+            if (!asset) {
+              throw new Error(`Linux archive not found. Expected: hfs-${version}-x86_64-unknown-linux-gnu.tar.gz`);
+            }
+
+            const { data } = await github.rest.repos.getReleaseAsset({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              asset_id: asset.id,
+              headers: {
+                Accept: 'application/octet-stream'
+              }
+            });
+
+            fs.writeFileSync('release-binary.tar.gz', Buffer.from(data));
+            console.log(`Downloaded: ${asset.name}`);
+
+      - name: Extract release archive
+        run: |
+          mkdir -p extracted
+          tar -xzf release-binary.tar.gz -C extracted
+          mv extracted/${{ inputs.server }} .
+          chmod +x ${{ inputs.server }}
+          # Preserve data directory (search parameters, etc.) if present
+          if [ -d extracted/data ]; then
+            cp -r extracted/data .
+          fi
+          # Preserve bundled terminology distributions (hts bootstrap-on-startup)
+          if [ -d extracted/terminology-data ]; then
+            cp -r extracted/terminology-data .
+          fi
+          rm -rf extracted
+
+      - name: Deploy binary and create service
+        env:
+          DEPLOY_HOST: ${{ inputs.server == 'fhirpath-server' && secrets.FHIRPATH_DEPLOY_HOST || inputs.server == 'sof-server' && secrets.SOF_DEPLOY_HOST || inputs.server == 'hts' && secrets.HTS_DEPLOY_HOST || secrets.HFS_DEPLOY_HOST }}
+          DEPLOY_USER: ${{ inputs.server == 'fhirpath-server' && secrets.FHIRPATH_DEPLOY_USER || inputs.server == 'sof-server' && secrets.SOF_DEPLOY_USER || inputs.server == 'hts' && secrets.HTS_DEPLOY_USER || secrets.HFS_DEPLOY_USER }}
+          DEPLOY_PORT: ${{ inputs.server == 'fhirpath-server' && secrets.FHIRPATH_DEPLOY_PORT || inputs.server == 'sof-server' && secrets.SOF_DEPLOY_PORT || inputs.server == 'hts' && secrets.HTS_DEPLOY_PORT || secrets.HFS_DEPLOY_PORT || 22 }}
+          SERVER_NAME: ${{ inputs.server }}
+          HFS_PUBLIC_URL: ${{ secrets.HFS_PUBLIC_URL }}
+          # Terminology backend for the three FHIR services. Each binary reads its own
+          # variable name (FHIRPATH_/SOF_/HFS_TERMINOLOGY_SERVER); sof and hfs propagate
+          # theirs into the embedded FHIRPath engine. Since #217 there is no built-in
+          # default, so an unset value is not a fallback -- %terminologies, memberOf,
+          # subsumes and the :in/:not-in search modifiers all fail outright.
+          # HTS serves operations at the root of its base URL: no /r4 or /r5 segment.
+          TERMINOLOGY_SERVER_URL: https://hts.heliossoftware.com
+          # LLM provider key for hfs natural-language search. Only the hfs leg receives
+          # it. It is never written into the unit file (world-readable, and echoed by
+          # `systemctl show`); see the EnvironmentFile step below.
+          HFS_NL_SEARCH_API_KEY: ${{ inputs.server == 'hfs' && secrets.HFS_NL_SEARCH_API_KEY || '' }}
+        run: |
+          # Define SSH command with proper options (runner's own key is trusted by targets)
+          SSH_CMD="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $DEPLOY_PORT $DEPLOY_USER@$DEPLOY_HOST"
+          SCP_CMD="scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P $DEPLOY_PORT"
+
+          # Create deployment directory on remote
+          $SSH_CMD "sudo mkdir -p /opt/$SERVER_NAME"
+
+          # Stop existing service (if running)
+          $SSH_CMD "sudo systemctl stop $SERVER_NAME || true"
+
+          # Reset the database on each deploy so the server starts clean.
+          # For hts this also clears the bootstrap_imports ledger, so the
+          # HTS_BOOTSTRAP_DIR sync below re-imports every bundled terminology.
+          if [ "$SERVER_NAME" = "hfs" ]; then
+            $SSH_CMD "sudo rm -f /opt/$SERVER_NAME/fhir.db /opt/$SERVER_NAME/fhir.db-wal /opt/$SERVER_NAME/fhir.db-shm \
+                                 /opt/$SERVER_NAME/data/hfs.db /opt/$SERVER_NAME/data/hfs.db-wal /opt/$SERVER_NAME/data/hfs.db-shm"
+          elif [ "$SERVER_NAME" = "hts" ]; then
+            $SSH_CMD "sudo rm -f /opt/$SERVER_NAME/data/hts.db /opt/$SERVER_NAME/data/hts.db-wal /opt/$SERVER_NAME/data/hts.db-shm"
+          fi
+
+          # Backup current version
+          $SSH_CMD "sudo cp /opt/$SERVER_NAME/$SERVER_NAME \
+             /opt/$SERVER_NAME/$SERVER_NAME.backup || true"
+
+          # Copy new binary to remote
+          $SCP_CMD $SERVER_NAME $DEPLOY_USER@$DEPLOY_HOST:/tmp/
+
+          # Copy data directory (search parameters, etc.) if present
+          if [ -d data ]; then
+            $SCP_CMD -r data $DEPLOY_USER@$DEPLOY_HOST:/tmp/hfs-data
+          fi
+
+          # Copy bundled terminology distributions for hts bootstrap-on-startup
+          if [ "$SERVER_NAME" = "hts" ] && [ -d terminology-data ]; then
+            $SSH_CMD "rm -rf /tmp/hts-terminology-data"
+            $SCP_CMD -r terminology-data $DEPLOY_USER@$DEPLOY_HOST:/tmp/hts-terminology-data
+          fi
+
+          # Move binary to final location and set permissions
+          $SSH_CMD "sudo mv /tmp/$SERVER_NAME /opt/$SERVER_NAME/ && \
+                    sudo chown $DEPLOY_USER:$DEPLOY_USER /opt/$SERVER_NAME/$SERVER_NAME && \
+                    sudo chmod +x /opt/$SERVER_NAME/$SERVER_NAME"
+
+          # Deploy data directory if present
+          $SSH_CMD "if [ -d /tmp/hfs-data ]; then
+            sudo rm -rf /opt/$SERVER_NAME/data
+            sudo mv /tmp/hfs-data /opt/$SERVER_NAME/data
+            sudo chown -R $DEPLOY_USER:$DEPLOY_USER /opt/$SERVER_NAME/data
+          fi"
+
+          # Deploy bundled terminology distributions (hts) for bootstrap-on-startup
+          $SSH_CMD "if [ -d /tmp/hts-terminology-data ]; then
+            sudo rm -rf /opt/$SERVER_NAME/terminology-data
+            sudo mv /tmp/hts-terminology-data /opt/$SERVER_NAME/terminology-data
+            sudo chown -R $DEPLOY_USER:$DEPLOY_USER /opt/$SERVER_NAME/terminology-data
+          fi"
+
+          # Ensure the directory is owned by deploy user so the service can write data files (e.g. fhir.db)
+          $SSH_CMD "sudo chown $DEPLOY_USER:$DEPLOY_USER /opt/$SERVER_NAME"
+
+          # Build the systemd unit definition for this server
+          if [ "$SERVER_NAME" = "fhirpath-server" ]; then
+            SERVICE_DESCRIPTION="FHIRPath Server"
+            SERVICE_EXEC_START="/opt/$SERVER_NAME/$SERVER_NAME --host 0.0.0.0"
+            SERVICE_ENV="Environment=\"FHIRPATH_SERVER_HOST=0.0.0.0\"\nEnvironment=\"FHIRPATH_TERMINOLOGY_SERVER=${TERMINOLOGY_SERVER_URL}\""
+          elif [ "$SERVER_NAME" = "sof-server" ]; then
+            SERVICE_DESCRIPTION="SQL-on-FHIR Server"
+            SERVICE_EXEC_START="/opt/$SERVER_NAME/$SERVER_NAME --host 0.0.0.0"
+            SERVICE_ENV="Environment=\"SOF_SERVER_HOST=0.0.0.0\"\nEnvironment=\"SOF_TERMINOLOGY_SERVER=${TERMINOLOGY_SERVER_URL}\""
+          elif [ "$SERVER_NAME" = "hfs" ]; then
+            SERVICE_DESCRIPTION="Helios FHIR Server"
+            SERVICE_EXEC_START="/opt/$SERVER_NAME/$SERVER_NAME --host 0.0.0.0"
+            # HFS_SUBSCRIPTIONS_ENABLED is off by default; the release binary is built
+            # with --all-features, so the `subscriptions` feature is already compiled in.
+            SERVICE_ENV="Environment=\"HFS_SERVER_HOST=0.0.0.0\"\nEnvironment=\"HFS_BASE_URL=${HFS_PUBLIC_URL}\"\nEnvironment=\"HFS_TERMINOLOGY_SERVER=${TERMINOLOGY_SERVER_URL}\"\nEnvironment=\"HFS_SUBSCRIPTIONS_ENABLED=true\"\nEnvironment=\"HFS_NL_SEARCH_MODEL=claude-opus-4-8\"\nEnvironmentFile=-/etc/hfs/hfs.env"
+
+            # Secrets live in a root-only EnvironmentFile, fed over stdin so the key
+            # never appears in a command line, the unit file, or the repo. With the
+            # secret unset the file is left alone, so a hand-managed key on the server
+            # survives deploys; the leading "-" above makes a missing file non-fatal.
+            if [ -n "$HFS_NL_SEARCH_API_KEY" ]; then
+              printf 'HFS_NL_SEARCH_API_KEY=%s\n' "$HFS_NL_SEARCH_API_KEY" | \
+                $SSH_CMD "sudo sh -c 'umask 077; mkdir -p /etc/hfs; cat > /etc/hfs/hfs.env'"
+            fi
+          elif [ "$SERVER_NAME" = "hts" ]; then
+            SERVICE_DESCRIPTION="Helios Terminology Server"
+            # hts uses a subcommand CLI: host/port/db flags live under `run`
+            # (top-level `hts` only takes an optional subcommand), unlike the
+            # other servers which accept --host at the top level.
+            SERVICE_EXEC_START="/opt/$SERVER_NAME/$SERVER_NAME run --host 0.0.0.0"
+            # SQLite backend (default); DB lives under the service WorkingDirectory (/opt/hts/data/hts.db).
+            # HTS_BOOTSTRAP_DIR points at the bundled terminology distributions so
+            # the server auto-imports them on startup (idempotent via the
+            # bootstrap_imports ledger, which the DB reset above clears each deploy).
+            SERVICE_ENV="Environment=\"HTS_SERVER_HOST=0.0.0.0\"\nEnvironment=\"HTS_STORAGE_BACKEND=sqlite\"\nEnvironment=\"HTS_DATABASE_URL=/opt/$SERVER_NAME/data/hts.db\"\nEnvironment=\"HTS_BOOTSTRAP_DIR=/opt/$SERVER_NAME/terminology-data\""
+          fi
+
+          # Always (re)write the unit so env changes (e.g. HTS_BOOTSTRAP_DIR)
+          # are reconciled on every deploy rather than only on first install.
+          $SSH_CMD "sudo tee /etc/systemd/system/$SERVER_NAME.service > /dev/null <<EOF
+          [Unit]
+          Description=$SERVICE_DESCRIPTION
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=$DEPLOY_USER
+          Group=$DEPLOY_USER
+          WorkingDirectory=/opt/$SERVER_NAME
+          ExecStart=$SERVICE_EXEC_START
+          Restart=always
+          RestartSec=5
+          $(echo -e "$SERVICE_ENV")
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          sudo systemctl daemon-reload
+          sudo systemctl enable $SERVER_NAME"
+
+          # Start the service
+          $SSH_CMD "sudo systemctl start $SERVER_NAME"
+
+          # Verify deployment
+          sleep 5
+          if $SSH_CMD "sudo systemctl is-active --quiet $SERVER_NAME"; then
+            echo "Deployment successful - $SERVER_NAME is running"
+            $SSH_CMD "sudo systemctl status $SERVER_NAME"
+          else
+            echo "Deployment failed - $SERVER_NAME is not running"
+            $SSH_CMD "sudo journalctl -u $SERVER_NAME --lines=20"
+            exit 1
+          fi
+
+      # Seed the freshly reset hfs with the manual-test corpus. The deploy step
+      # above wipes hfs.db, so every release starts empty. HFS is the Data
+      # Consumer: it fetches the manifest and its NDJSON files from S3 itself,
+      # so this only kicks the submission off. The corpus is ~19M resources and
+      # ingests for hours, so the job does not wait for it to finish; follow it
+      # with POST /$bulk-submit-status or on the UI's Import page.
+      - name: Seed hfs via $bulk-submit
+        if: inputs.server == 'hfs'
+        env:
+          HFS_PUBLIC_URL: ${{ secrets.HFS_PUBLIC_URL }}
+          MANIFEST_URL: https://hfs-manual-test.s3.us-east-1.amazonaws.com/manifest.json
+          SUBMISSION_ID: deploy-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          if [ -z "$HFS_PUBLIC_URL" ]; then
+            echo "HFS_PUBLIC_URL secret is not set - cannot seed"
+            exit 1
+          fi
+          HFS_URL="${HFS_PUBLIC_URL%/}"
+
+          # systemd reports "active" before the listener is bound, and the
+          # proxy in front of the public URL answers 502 until it is.
+          up=0
+          for _ in $(seq 1 60); do
+            if curl -sf -o /dev/null "$HFS_URL/health"; then
+              up=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$up" != "1" ]; then
+            echo "hfs did not answer $HFS_URL/health within 120s - cannot seed"
+            exit 1
+          fi
+
+          # fhirBaseUrl is required whenever manifestUrl is present. "completed"
+          # closes the submission with this single manifest.
+          PAYLOAD=$(cat <<JSON
+          { "resourceType": "Parameters", "parameter": [
+            { "name": "submitter", "valueIdentifier": { "system": "https://github.com/${{ github.repository }}", "value": "ci-deploy" } },
+            { "name": "submissionId", "valueString": "$SUBMISSION_ID" },
+            { "name": "manifestUrl", "valueUrl": "$MANIFEST_URL" },
+            { "name": "fhirBaseUrl", "valueUrl": "${MANIFEST_URL%/manifest.json}" },
+            { "name": "submissionStatus", "valueCoding": { "system": "http://hl7.org/fhir/event-status", "code": "completed" } } ] }
+          JSON
+          )
+
+          RESPONSE=$(printf '%s' "$PAYLOAD" | curl -sS -w '\n%{http_code}' -X POST \
+            -H 'Content-Type: application/fhir+json' -H 'Accept: application/fhir+json' \
+            --data-binary @- "$HFS_URL/\$bulk-submit")
+          STATUS=$(printf '%s' "$RESPONSE" | tail -n1)
+          echo "$RESPONSE" | sed '$d'
+
+          if [ "$STATUS" != "200" ]; then
+            echo "\$bulk-submit kick-off failed with HTTP $STATUS"
+            exit 1
+          fi
+          echo "Bulk submit accepted - submissionId $SUBMISSION_ID, ingestion continues on the server"
+
+      # HTS binds its listener only after the bootstrap re-import finishes
+      # (the deploy above wiped hts.db and its bootstrap_imports ledger), so
+      # "systemctl is-active" goes green minutes before HTS can answer. The
+      # client deploys wait on this job (#1534): poll until HTS serves, then
+      # confirm the bundled content was imported, and fail the release if not.
+      - name: Wait for hts to finish its bootstrap import
+        if: inputs.server == 'hts'
+        env:
+          HTS_URL: https://hts.heliossoftware.com
+          # Every bundled distribution (VSAC, NCI Thesaurus, NDC, ICD-10-CM,
+          # ...) is re-imported on each deploy; leave generous headroom.
+          TIMEOUT_SECS: 1200
+        run: |
+          deadline=$(( $(date +%s) + TIMEOUT_SECS ))
+          until HEALTH=$(curl -sf --max-time 10 "$HTS_URL/health"); do
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "hts did not answer $HTS_URL/health within ${TIMEOUT_SECS}s"
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "hts is up: $HEALTH"
+
+          # /health only proves the process is serving. A code from the bundled
+          # R4 core package proves the terminology content is there too.
+          PROBE="$HTS_URL/CodeSystem/\$validate-code?url=http://hl7.org/fhir/administrative-gender&code=male"
+          BODY=$(curl -sS --max-time 30 -H 'Accept: application/fhir+json' "$PROBE")
+          if ! printf '%s' "$BODY" | tr -d ' \n\t' | grep -q '{"name":"result","valueBoolean":true}'; then
+            echo "hts is up but \$validate-code did not validate administrative-gender#male:"
+            echo "$BODY"
+            exit 1
+          fi
+          echo "hts validated administrative-gender#male - terminology content is loaded"
