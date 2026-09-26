@@ -25,6 +25,7 @@ use crate::error::{
     classify_sqlite_error,
 };
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
+use crate::types::StoredResource;
 
 use super::SqliteBackend;
 
@@ -37,6 +38,20 @@ fn parse_dt(s: &str) -> StorageResult<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.with_timezone(&Utc))
         .map_err(|e| internal_error(format!("invalid timestamp '{s}': {e}")))
+}
+
+/// Builds one NDJSON export line from a `resources` row.
+///
+/// The stored blob carries no server `meta`: `versionId` and `lastUpdated`
+/// live in their own columns. Merge them in the same way the REST read paths
+/// do, so exported resources match `GET /<Type>/<id>` and consumers can derive
+/// their next `_since` from the downloaded parts (#1273).
+fn export_line(data: &[u8], version_id: &str, last_updated: &str) -> StorageResult<String> {
+    let resource: Value = serde_json::from_slice(data)
+        .map_err(|e| internal_error(format!("Failed to parse resource: {}", e)))?;
+    let resource = StoredResource::merge_meta(resource, version_id, parse_dt(last_updated)?);
+    serde_json::to_string(&resource)
+        .map_err(|e| internal_error(format!("Failed to serialize resource: {}", e)))
 }
 
 /// Parses an optional RFC3339 timestamp column.
@@ -1384,7 +1399,7 @@ impl ExportDataProvider for SqliteBackend {
         let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
 
-        let mut query = "SELECT id, data, last_updated FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0".to_string();
+        let mut query = "SELECT id, data, last_updated, version_id FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0".to_string();
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![
             Box::new(tenant_id.to_string()),
             Box::new(resource_type.to_string()),
@@ -1413,12 +1428,13 @@ impl ExportDataProvider for SqliteBackend {
             .prepare(&query)
             .or_query_error("Failed to prepare batch query")?;
 
-        let rows: Vec<(String, Vec<u8>, String)> = stmt
+        let rows: Vec<(String, Vec<u8>, String, String)> = stmt
             .query_map(params_slice.as_slice(), |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, Vec<u8>>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             })
             .or_query_error("Failed to query batch")?
@@ -1435,12 +1451,8 @@ impl ExportDataProvider for SqliteBackend {
         let mut lines = Vec::new();
         let mut last_cursor = None;
 
-        for (id, data, last_updated) in rows {
-            let resource: Value = serde_json::from_slice(data)
-                .map_err(|e| internal_error(format!("Failed to parse resource: {}", e)))?;
-            let line = serde_json::to_string(&resource)
-                .map_err(|e| internal_error(format!("Failed to serialize resource: {}", e)))?;
-            lines.push(line);
+        for (id, data, last_updated, version_id) in rows {
+            lines.push(export_line(data, version_id, last_updated)?);
             last_cursor = Some(format!("{}|{}", last_updated, id));
         }
 
@@ -1550,7 +1562,7 @@ impl PatientExportProvider for SqliteBackend {
             Box::new(tenant_id.to_string()),
             Box::new(resource_type.to_string()),
         ];
-        let mut query = "SELECT id, data, last_updated FROM resources \
+        let mut query = "SELECT id, data, last_updated, version_id FROM resources \
              WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0"
             .to_string();
 
@@ -1609,12 +1621,13 @@ impl PatientExportProvider for SqliteBackend {
             .prepare(&query)
             .or_query_error("Failed to prepare compartment query")?;
 
-        let rows: Vec<(String, Vec<u8>, String)> = stmt
+        let rows: Vec<(String, Vec<u8>, String, String)> = stmt
             .query_map(params_slice.as_slice(), |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, Vec<u8>>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             })
             .or_query_error("Failed to query compartment")?
@@ -1634,7 +1647,7 @@ impl PatientExportProvider for SqliteBackend {
         let mut lines = Vec::new();
         let mut last_cursor = None;
 
-        for (id, data, last_updated) in rows {
+        for (id, data, last_updated, version_id) in rows {
             last_cursor = Some(format!("{}|{}", last_updated, id));
             let resource: Value = serde_json::from_slice(data)
                 .map_err(|e| internal_error(format!("Failed to parse resource: {}", e)))?;
@@ -1643,6 +1656,10 @@ impl PatientExportProvider for SqliteBackend {
             if !in_compartment {
                 continue;
             }
+            // Same server `meta` the other export paths emit (#1273); merged
+            // on the value the matcher already parsed, not a second parse.
+            let resource =
+                StoredResource::merge_meta(resource, version_id, parse_dt(last_updated)?);
             let line = serde_json::to_string(&resource)
                 .map_err(|e| internal_error(format!("Failed to serialize resource: {}", e)))?;
             lines.push(line);
@@ -3217,6 +3234,94 @@ mod tests {
 
         assert_eq!(batch2.lines.len(), 2);
         assert!(batch2.is_last);
+    }
+
+    /// Exported lines carry the server `meta.versionId` / `meta.lastUpdated`
+    /// from the row's columns, on every fetch path, while client `meta`
+    /// members survive (#1273). The stored blob holds neither field, so before
+    /// this fix they never reached the NDJSON output.
+    #[tokio::test]
+    async fn exported_lines_carry_server_meta() {
+        // The spec-loaded registry, because compartment membership is now
+        // decided from the CompartmentDefinition (#1122): with only the
+        // embedded minimal params the Observation compartment is empty.
+        let backend = create_spec_backend();
+        let tenant = create_test_tenant();
+
+        let tag = json!([{"system": "http://example.org/tags", "code": "keep-me"}]);
+        let created = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p1", "meta": {"tag": tag.clone()}}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        // A second version, so `versionId` is not the trivial "1".
+        backend
+            .update(
+                &tenant,
+                &created,
+                json!({"resourceType": "Patient", "id": "p1", "meta": {"tag": tag.clone()}, "active": true}),
+            )
+            .await
+            .unwrap();
+        pin_last_updated(&backend, "p1", "2026-03-04T05:06:07.123456+02:00");
+
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({"resourceType": "Observation", "id": "o1", "status": "final",
+                       "code": {"text": "x"}, "subject": {"reference": "Patient/p1"}}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        pin_last_updated(&backend, "o1", "2026-03-05T00:00:00+00:00");
+
+        let parse = |line: &str| -> Value { serde_json::from_str(line).unwrap() };
+        let ids = vec!["p1".to_string()];
+
+        let system = backend
+            .fetch_export_batch(&tenant, &ExportRequest::system(), "Patient", None, 10)
+            .await
+            .unwrap();
+        let compartment_patient = backend
+            .fetch_patient_compartment_batch(
+                &tenant,
+                &ExportRequest::patient(),
+                "Patient",
+                &ids,
+                None,
+                10,
+            )
+            .await
+            .unwrap();
+        for batch in [&system, &compartment_patient] {
+            assert_eq!(batch.lines.len(), 1);
+            let meta = &parse(&batch.lines[0])["meta"];
+            assert_eq!(meta["versionId"], "2");
+            assert_eq!(meta["lastUpdated"], "2026-03-04T03:06:07.123Z");
+            assert_eq!(meta["tag"], tag, "client meta members are preserved");
+        }
+
+        let compartment_other = backend
+            .fetch_patient_compartment_batch(
+                &tenant,
+                &ExportRequest::patient(),
+                "Observation",
+                &ids,
+                None,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(compartment_other.lines.len(), 1);
+        let meta = &parse(&compartment_other.lines[0])["meta"];
+        assert_eq!(meta["versionId"], "1");
+        assert_eq!(meta["lastUpdated"], "2026-03-05T00:00:00.000Z");
     }
 
     /// Pins a stored resource's `last_updated` so a window test does not depend

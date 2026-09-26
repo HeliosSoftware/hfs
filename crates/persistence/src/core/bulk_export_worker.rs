@@ -1324,8 +1324,9 @@ fn in_patient_compartment(version: helios_fhir::FhirVersion, resource_type: &str
 /// Applies `_elements` projection to an NDJSON line.
 ///
 /// When `elements` is non-empty, keeps `resourceType`, `id`, `meta` and the
-/// listed top-level element names, and adds a `SUBSETTED` `meta.tag`. On any
-/// parse failure the original line is returned unchanged.
+/// listed top-level element names, and adds a `SUBSETTED` `meta.tag`. Server
+/// meta (`versionId`/`lastUpdated`, #1273) is kept so consumers can derive the
+/// next `_since`. On any parse failure the original line is returned unchanged.
 fn apply_elements(line: &str, elements: &[String]) -> String {
     if elements.is_empty() {
         return line.to_string();
@@ -1413,6 +1414,26 @@ mod tests {
         assert!(v.get("name").is_some());
         assert!(v.get("gender").is_none());
         assert_eq!(v["meta"]["tag"][0]["code"], "SUBSETTED");
+    }
+
+    #[test]
+    fn test_apply_elements_keeps_server_meta_and_client_tags() {
+        let line = r#"{"resourceType":"Patient","id":"p1","name":[{"family":"X"}],"gender":"male","meta":{"versionId":"2","lastUpdated":"2026-09-24T15:05:52.648Z","tag":[{"system":"http://example.org/tags","code":"keep-me"}]}}"#;
+        let out = apply_elements(line, &["name".to_string()]);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("gender").is_none());
+        assert_eq!(v["name"][0]["family"], "X");
+        assert_eq!(v["meta"]["versionId"], "2");
+        assert_eq!(v["meta"]["lastUpdated"], "2026-09-24T15:05:52.648Z");
+        let tags = v["meta"]["tag"].as_array().unwrap();
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0]["system"], "http://example.org/tags");
+        assert_eq!(tags[0]["code"], "keep-me");
+        assert_eq!(
+            tags[1]["system"],
+            "http://terminology.hl7.org/CodeSystem/v3-ObservationValue"
+        );
+        assert_eq!(tags[1]["code"], "SUBSETTED");
     }
 
     #[test]

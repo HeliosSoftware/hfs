@@ -355,6 +355,7 @@ where
         max_included_resources,
         index_build,
         app_name: MongoBackendConfig::default().app_name,
+        reindex_catch_up_margin_ms: MongoBackendConfig::default().reindex_catch_up_margin_ms,
     })
 }
 
@@ -1955,13 +1956,45 @@ fn wire_reindex(
 /// Builds the deferred bulk-submit hook using the existing submit-worker
 /// concurrency as the per-process automatic reindex limit, plus where to clear
 /// the persisted "this manifest still owes a rebuild" marker when a generation
-/// finishes (#1125). Without a ledger (`None`) nothing is recorded and a restart
-/// cannot resume, as before.
+/// finishes (#1125). Without a ledger (`None`) nothing is recorded and a
+/// restart cannot resume, as before.
+///
+/// Split into this function and [`automatic_reindex_hook_with_ledger`] so a
+/// test can read the concrete `ReindexOnFinish`'s `batch_bytes()` (#1499)
+/// without downcasting the trait object every other caller uses.
 ///
 /// Gated exactly like [`wire_reindex`], which produces the `op` every caller
-/// passes in: any build with a reindex target. Keep the two in step rather than
-/// naming individual backends here — a narrower gate breaks the builds that
-/// leave that backend out (#1291).
+/// passes in: any build with a reindex target. Keep the two in step rather
+/// than naming individual backends here — a narrower gate breaks the builds
+/// that leave that backend out (#1291).
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "elasticsearch"
+))]
+fn build_automatic_reindex_hook(
+    op: Arc<ReindexOperation>,
+    config: &ServerConfig,
+    ledger: Option<Arc<dyn helios_persistence::search::DeferredReindexLedger>>,
+) -> helios_persistence::search::ReindexOnFinish {
+    let hook = helios_persistence::search::ReindexOnFinish::with_max_concurrency(
+        op,
+        config.bulk_submit.worker_concurrency as usize,
+    )
+    .with_batch_size(config.reindex_batch_size)
+    .with_batch_bytes(config.reindex_batch_bytes)
+    .with_bulk_index_rebuild(config.bulk_submit.bulk_index_rebuild);
+    match ledger {
+        Some(ledger) => hook.with_ledger(ledger),
+        None => hook,
+    }
+}
+
+/// Builds [`build_automatic_reindex_hook`]'s hook and erases it behind
+/// `Arc<dyn DeferredReindexHook>`, the shape every wiring site outside tests
+/// needs. See that function's doc comment for what it configures and why the
+/// two are split (#1499).
 #[cfg(any(
     feature = "sqlite",
     feature = "postgres",
@@ -1973,17 +2006,7 @@ fn automatic_reindex_hook_with_ledger(
     config: &ServerConfig,
     ledger: Option<Arc<dyn helios_persistence::search::DeferredReindexLedger>>,
 ) -> Arc<dyn helios_persistence::core::DeferredReindexHook> {
-    let hook = helios_persistence::search::ReindexOnFinish::with_max_concurrency(
-        op,
-        config.bulk_submit.worker_concurrency as usize,
-    )
-    .with_batch_size(config.reindex_batch_size)
-    .with_batch_bytes(config.reindex_batch_bytes)
-    .with_bulk_index_rebuild(config.bulk_submit.bulk_index_rebuild);
-    Arc::new(match ledger {
-        Some(ledger) => hook.with_ledger(ledger),
-        None => hook,
-    })
+    Arc::new(build_automatic_reindex_hook(op, config, ledger))
 }
 
 /// Ops bundle for a backend that indexes itself — the standalone deployments
@@ -3914,6 +3937,34 @@ mod tests {
         let (targets, names) = sqlite_es_reindex_targets(&local, &es);
         assert_eq!(names, &["sqlite", "elasticsearch"]);
         assert_eq!(targets.len(), 2);
+    }
+
+    // ── Automatic reindex hook wiring (#1499) ──────────────────────
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn test_automatic_reindex_hook_gets_the_server_default_batch_bytes_when_unset() {
+        use clap::Parser;
+
+        let config = ServerConfig::try_parse_from(["rest-server"]).unwrap();
+        assert_eq!(
+            config.reindex_batch_bytes,
+            32 * 1024 * 1024,
+            "HFS_REINDEX_BATCH_BYTES server default (#1499)"
+        );
+
+        let backend = Arc::new(
+            create_sqlite_backend(&ServerConfig {
+                database_url: Some(":memory:".to_string()),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let registries = backend.tenant_registries().clone();
+        let op = Arc::new(ReindexOperation::new(backend, registries));
+
+        let hook = build_automatic_reindex_hook(op, &config, None);
+        assert_eq!(hook.batch_bytes(), 32 * 1024 * 1024);
     }
 
     // ── create_sqlite_backend() ───────────────────────────────────

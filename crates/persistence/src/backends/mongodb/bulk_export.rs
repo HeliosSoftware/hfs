@@ -22,6 +22,7 @@ use crate::core::bulk_export::{
 use crate::core::patient_compartment::PatientCompartmentMatcher;
 use crate::error::{BackendError, BulkExportError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
+use crate::types::StoredResource;
 
 use super::MongoBackend;
 
@@ -118,6 +119,9 @@ fn ndjson_from_docs_where(
         let last_updated = d
             .get_datetime("last_updated")
             .map_err(|e| internal_error(format!("missing last_updated: {e}")))?;
+        let version_id = d
+            .get_str("version_id")
+            .map_err(|e| internal_error(format!("missing version_id: {e}")))?;
         let id = d
             .get_str("id")
             .map_err(|e| internal_error(format!("missing id: {e}")))?;
@@ -129,6 +133,9 @@ fn ndjson_from_docs_where(
         if !keep(id, &val) {
             continue;
         }
+        // The payload is stored as submitted; versionId/lastUpdated live in their
+        // own fields and must be merged back in (#1273).
+        let val = StoredResource::merge_meta(val, version_id, bson_to_chrono(last_updated));
         let line =
             serde_json::to_string(&val).map_err(|e| internal_error(format!("serialize: {e}")))?;
         lines.push(line);

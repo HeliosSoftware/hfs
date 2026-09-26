@@ -108,6 +108,8 @@ fn test_mongodb_config_defaults() {
     assert_eq!(config.server_selection_timeout_ms, 15_000);
     assert!(!config.search_offloaded);
     assert_eq!(config.fhir_version, FhirVersion::default());
+    // #1403: the `$reindex` walk's clock-skew and commit-lag allowance.
+    assert_eq!(config.reindex_catch_up_margin_ms, 120_000);
 }
 
 #[test]
@@ -1142,6 +1144,14 @@ async fn mongodb_conditional_patch() {
 /// Same `#[path]` arrangement.
 #[path = "search/versioned_write_race_suite.rs"]
 mod versioned_write_race_suite;
+
+/// #1403: the id-order `$reindex` walk and its catch-up rounds.
+#[path = "mongodb/reindex_id_walk.rs"]
+mod reindex_id_walk;
+
+/// #1499: MongoDB honours `HFS_REINDEX_BATCH_BYTES` (PR2a).
+#[path = "mongodb/reindex_pipeline.rs"]
+mod reindex_pipeline;
 
 /// #1405: of several writers holding the same version, one `update` writes and
 /// every loser is a `ConcurrencyError` — the server's `WriteConflict` used to
@@ -8970,6 +8980,135 @@ async fn mongodb_integration_reindex_page_counts_contained_entries() {
     );
 }
 
+/// #1403 PR0: MongoDB is the only writer that measures its own phases in this
+/// PR. Every call goes through `&dyn ReindexTarget` to prove dynamic dispatch
+/// reaches MongoDB's override rather than the trait's zero-measuring default
+/// (S1 "default-method trap").
+#[tokio::test]
+async fn mongodb_integration_reindex_page_reports_phase_stats() {
+    use helios_persistence::search::{ReindexPageStats, ReindexTarget};
+    use helios_persistence::types::StoredResource;
+
+    let Some(backend) = create_backend_with_full_registry("reindex_page_phase_stats").await else {
+        eprintln!(
+            "Skipping mongodb_integration_reindex_page_reports_phase_stats (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("reindex-phase-stats-tenant");
+    let target: &dyn ReindexTarget = &backend;
+
+    // Step 1: seed 8 Patients.
+    let patients: Vec<StoredResource> = (0..8)
+        .map(|i| {
+            StoredResource::from_storage(
+                "Patient",
+                format!("phase-stats-{i}"),
+                "1",
+                tenant.tenant_id().clone(),
+                json!({
+                    "resourceType": "Patient",
+                    "id": format!("phase-stats-{i}"),
+                    "name": [{"family": "Stats"}],
+                    "gender": "female",
+                    "birthDate": "1990-01-01"
+                }),
+                chrono::Utc::now(),
+                chrono::Utc::now(),
+                None,
+                FhirVersion::default(),
+            )
+        })
+        .collect();
+    let mut first = ReindexPageStats::default();
+    let outcomes = target
+        .write_search_entries_page_timed(&tenant, &patients, &mut first)
+        .await;
+    assert!(outcomes.iter().all(|r| r.is_ok()), "{outcomes:?}");
+    assert_eq!(first.deleted_entries, 0, "the database is unique per test");
+    assert!(first.inserted_entries > 0);
+    assert_eq!(first.insert_commands, 1);
+    assert!(first.extract > std::time::Duration::ZERO);
+    assert!(first.delete > std::time::Duration::ZERO);
+    assert!(first.insert > std::time::Duration::ZERO);
+
+    // Step 2: rewrite the same page.
+    let mut second = ReindexPageStats::default();
+    let outcomes = target
+        .write_search_entries_page_timed(&tenant, &patients, &mut second)
+        .await;
+    assert!(outcomes.iter().all(|r| r.is_ok()), "{outcomes:?}");
+    assert_eq!(second.deleted_entries, first.inserted_entries);
+    assert_eq!(second.inserted_entries, first.inserted_entries);
+    let mut total_after_rewrite = 0u64;
+    for p in &patients {
+        total_after_rewrite += search_index_entry_count(&backend, &tenant, "Patient", p.id()).await;
+    }
+    assert_eq!(total_after_rewrite, first.inserted_entries);
+
+    // Step 3: contained.
+    let with_contained = StoredResource::from_storage(
+        "Observation",
+        "phase-stats-contained",
+        "1",
+        tenant.tenant_id().clone(),
+        json!({
+            "resourceType": "Observation",
+            "id": "phase-stats-contained",
+            "status": "final",
+            "contained": [{
+                "resourceType": "Patient",
+                "id": "inner",
+                "name": [{"family": "Contained"}]
+            }],
+            "subject": {"reference": "#inner"},
+            "code": {"coding": [{"system": "http://loinc.org", "code": "1234-5"}]}
+        }),
+        chrono::Utc::now(),
+        chrono::Utc::now(),
+        None,
+        FhirVersion::default(),
+    );
+    let mut third = ReindexPageStats::default();
+    let outcomes = target
+        .write_search_entries_page_timed(&tenant, std::slice::from_ref(&with_contained), &mut third)
+        .await;
+    assert!(outcomes.iter().all(|r| r.is_ok()), "{outcomes:?}");
+    let own_rows =
+        search_index_entry_count(&backend, &tenant, "Observation", "phase-stats-contained").await;
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect MongoDB client for search_index_contained assertions");
+    let database = client.database(&backend.config().database_name);
+    let contained_rows = database
+        .collection::<Document>("search_index_contained")
+        .count_documents(doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": "Observation",
+            "resource_id": "phase-stats-contained",
+        })
+        .await
+        .expect("failed to count search_index_contained rows");
+    assert!(contained_rows > 0);
+    assert_eq!(third.inserted_entries, own_rows + contained_rows);
+    assert_eq!(third.insert_commands, 2);
+
+    // Step 4: offloaded.
+    let Some(offloaded) =
+        create_backend_with_search_offloaded("reindex_page_phase_stats_offloaded", true).await
+    else {
+        eprintln!("Skipping the offloaded step (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let offloaded_target: &dyn ReindexTarget = &offloaded;
+    let mut offloaded_stats = ReindexPageStats::default();
+    let outcomes = offloaded_target
+        .write_search_entries_page_timed(&tenant, &patients, &mut offloaded_stats)
+        .await;
+    assert!(outcomes.iter().all(|r| matches!(r, Ok(0))), "{outcomes:?}");
+    assert_eq!(offloaded_stats, ReindexPageStats::default());
+}
+
 /// Guard for the `is_search_offloaded()` short-circuit the batched override
 /// needs. The default loop honors the flag via `delete_search_entries` and
 /// `write_search_entries`'s own guards; the page override has to reproduce
@@ -10677,7 +10816,13 @@ mod bulk_submit {
 
     /// Creates a submission with one fetchable manifest — the shape the REST
     /// kickoff handler produces.
-    async fn seed(backend: &MongoBackend, tenant: &TenantContext) -> (SubmissionId, String) {
+    ///
+    /// `pub(super)` so the sibling `#[path]`-included `reindex_id_walk.rs`
+    /// module can reach it as `super::bulk_submit::seed` (#1403 P11).
+    pub(super) async fn seed(
+        backend: &MongoBackend,
+        tenant: &TenantContext,
+    ) -> (SubmissionId, String) {
         let id = SubmissionId::generate("data-provider");
         backend.create_submission(tenant, &id, None).await.unwrap();
         let manifest = backend
@@ -14173,6 +14318,118 @@ async fn mongodb_integration_export_until_is_inclusive() {
         1,
         "a resource exactly on the bound is included"
     );
+}
+
+/// Exported lines carry `meta.versionId` / `meta.lastUpdated` from the stored
+/// document (#1273) on all three export queries, and client-supplied `meta`
+/// members survive the merge.
+#[tokio::test]
+async fn mongodb_integration_export_lines_carry_server_meta() {
+    use helios_persistence::core::bulk_export::{
+        ExportDataProvider, ExportRequest, PatientExportProvider,
+    };
+
+    let Some(backend) = create_backend("export_meta").await else {
+        eprintln!(
+            "Skipping mongodb_integration_export_lines_carry_server_meta (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("export-meta");
+
+    let tag = serde_json::json!([{"system": "http://example.org/tags", "code": "keep"}]);
+    let v1 = backend
+        .create(
+            &tenant,
+            "Patient",
+            serde_json::json!({"resourceType": "Patient", "meta": {"tag": tag.clone()}}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let patient_id = v1.id().to_string();
+    backend
+        .update(
+            &tenant,
+            &v1,
+            serde_json::json!({
+                "resourceType": "Patient",
+                "id": patient_id,
+                "meta": {"tag": tag.clone()}
+            }),
+        )
+        .await
+        .unwrap();
+    pin_last_updated(&backend, &patient_id, instant("2026-02-01T12:00:00Z")).await;
+
+    let obs = backend
+        .create(
+            &tenant,
+            "Observation",
+            serde_json::json!({
+                "resourceType": "Observation",
+                "status": "final",
+                "code": {"text": "x"},
+                "subject": {"reference": format!("Patient/{patient_id}")}
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let obs_id = obs.id().to_string();
+    pin_last_updated(&backend, &obs_id, instant("2026-02-02T08:30:00Z")).await;
+
+    fn meta_of(line: &str) -> serde_json::Value {
+        let resource: serde_json::Value = serde_json::from_str(line).unwrap();
+        resource["meta"].clone()
+    }
+
+    let system = backend
+        .fetch_export_batch(&tenant, &ExportRequest::system(), "Patient", None, 10)
+        .await
+        .unwrap();
+    assert_eq!(system.lines.len(), 1);
+    let meta = meta_of(&system.lines[0]);
+    assert_eq!(meta["versionId"], "2", "system export carries versionId");
+    assert_eq!(meta["lastUpdated"], "2026-02-01T12:00:00.000Z");
+    assert_eq!(meta["tag"], tag, "client meta.tag is preserved");
+
+    let ids = vec![patient_id.clone()];
+    let patient_branch = backend
+        .fetch_patient_compartment_batch(
+            &tenant,
+            &ExportRequest::patient(),
+            "Patient",
+            &ids,
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(patient_branch.lines.len(), 1);
+    let meta = meta_of(&patient_branch.lines[0]);
+    assert_eq!(meta["versionId"], "2", "Patient branch carries versionId");
+    assert_eq!(meta["lastUpdated"], "2026-02-01T12:00:00.000Z");
+    assert_eq!(meta["tag"], tag);
+
+    let compartment = backend
+        .fetch_patient_compartment_batch(
+            &tenant,
+            &ExportRequest::patient(),
+            "Observation",
+            &ids,
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(compartment.lines.len(), 1);
+    let meta = meta_of(&compartment.lines[0]);
+    assert_eq!(
+        meta["versionId"], "1",
+        "compartment branch carries versionId"
+    );
+    assert_eq!(meta["lastUpdated"], "2026-02-02T08:30:00.000Z");
 }
 
 #[tokio::test]

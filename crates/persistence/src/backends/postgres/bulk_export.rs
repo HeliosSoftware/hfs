@@ -20,6 +20,7 @@ use crate::core::bulk_export_worker::{
 use crate::core::patient_compartment::PatientCompartmentMatcher;
 use crate::error::{BackendError, BulkExportError, StorageError, StorageResult};
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
+use crate::types::StoredResource;
 
 use super::PostgresBackend;
 
@@ -1205,7 +1206,7 @@ impl ExportDataProvider for PostgresBackend {
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
 
-        let mut sql = "SELECT id, data, last_updated FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE".to_string();
+        let mut sql = "SELECT id, data, last_updated, version_id FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE".to_string();
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
             Box::new(tenant_id.to_string()),
             Box::new(resource_type.to_string()),
@@ -1256,6 +1257,9 @@ impl ExportDataProvider for PostgresBackend {
             let id: String = row.get(0);
             let resource: Value = row.get(1);
             let last_updated: chrono::DateTime<Utc> = row.get(2);
+            let version_id: String = row.get(3);
+            // The blob carries no server meta; merge it from the row (#1273).
+            let resource = StoredResource::merge_meta(resource, &version_id, last_updated);
 
             let line = serde_json::to_string(&resource)
                 .map_err(|e| internal_error(format!("Failed to serialize resource: {}", e)))?;
@@ -1365,7 +1369,7 @@ impl PatientExportProvider for PostgresBackend {
         // `reference` (or are the patients themselves); `matcher` then applies
         // the compartment's own parameters to each candidate.
         let client = self.get_client().await?;
-        let mut sql = "SELECT id, data, last_updated FROM resources
+        let mut sql = "SELECT id, data, last_updated, version_id FROM resources
              WHERE tenant_id = $1
                 AND resource_type = $2
                 AND is_deleted = FALSE"
@@ -1446,6 +1450,7 @@ impl PatientExportProvider for PostgresBackend {
             let id: String = row.get(0);
             let resource: Value = row.get(1);
             let last_updated: chrono::DateTime<Utc> = row.get(2);
+            let version_id: String = row.get(3);
             last_cursor = Some(format!("{}|{}", last_updated.to_rfc3339(), id));
 
             let in_compartment = (is_patient && patient_ids.contains(&id))
@@ -1453,6 +1458,8 @@ impl PatientExportProvider for PostgresBackend {
             if !in_compartment {
                 continue;
             }
+            // The blob carries no server meta; merge it from the row (#1273).
+            let resource = StoredResource::merge_meta(resource, &version_id, last_updated);
             let line = serde_json::to_string(&resource)
                 .map_err(|e| internal_error(format!("Failed to serialize: {}", e)))?;
             lines.push(line);

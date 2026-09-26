@@ -107,6 +107,12 @@ python3 crates/hfs/tests/bulk_submit/summarize_memory.py \
   target/issue-995/new-series
 ```
 
+The built-in fixture provider speaks HTTP/1.1 with keep-alive; the stdlib HTTP/1.0
+default truncated multi-gigabyte bodies (#1126). `--provider-url` uses a
+caller-owned static server rooted at `<output-dir>/fixtures` instead. The controller
+probes it before measuring and never starts or stops it. `run.json` records the
+choice under `config.corpus_provider`.
+
 `--dry-run` prints configuration without launching anything. Each output directory
 must be new. `run.json`, phase/host/RSS/container CSV files, logs and validation
 results remain on failure. A root-managed local trust-auth database was used for
