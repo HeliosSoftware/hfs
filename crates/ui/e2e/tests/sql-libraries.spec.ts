@@ -982,6 +982,259 @@ test.describe("Parameters card", () => {
     await expect(wardField).toBeFocused();
     await expect(paramsCard).toHaveAttribute("data-e2e-marker", "untouched");
   });
+
+  // #1276: an unsaved `?lib=new` document must render the card too — the
+  // `/run` fragment only ever returns it as an `hx-swap-oob` companion, which
+  // htmx silently drops when no `#lib-params` is already on the page, so a
+  // required parameter declared before the first Save could never be given
+  // a value.
+  test("Create New: a required parameter declared in the unsaved JSON gets a value field, and filling it runs the query", async ({
+    page,
+    request,
+  }) => {
+    const patientId = await createResource(request, "Patient", { name: [{ family: "NewParamE2E" }] });
+    const canonical = `http://example.org/ViewDefinition/e2e-params-new-${Date.now()}`;
+    const vdId = await createResource(request, "ViewDefinition", {
+      name: "e2e_params_new_source",
+      url: canonical,
+      status: "active",
+      resource: "Patient",
+      select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+    });
+    await waitSearchable(request, "ViewDefinition", vdId);
+    await waitSearchable(request, "Patient", patientId);
+
+    await page.goto("/ui/sql/queries?lib=new");
+
+    const library = {
+      resourceType: "Library",
+      name: `e2e_params_new_${Date.now()}`,
+      status: "active",
+      type: {
+        coding: [
+          {
+            system: "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes",
+            code: "sql-query",
+          },
+        ],
+      },
+      relatedArtifact: [{ type: "depends-on", resource: canonical, label: "v" }],
+      parameter: [{ name: "min_height", use: "in", type: "decimal" }],
+    };
+    await page.locator("#lib-details-editor .cm-content").click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText(JSON.stringify(library, null, 2));
+
+    await page.locator(".sql-editor .cm-content[role='textbox']").click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText("SELECT id FROM v WHERE :min_height > 0");
+
+    // Declared, required, no default: the run waits — and the card offers
+    // the field to end the wait with.
+    const minHeight = page.locator("#lib-params input[name='param:min_height']");
+    await expect(minHeight).toBeVisible({ timeout: 3000 });
+    await expect(page.locator("#run-notice")).toContainText("Waiting for a value for :min_height", {
+      timeout: 3000,
+    });
+
+    await minHeight.fill("150");
+    await expect(page.locator("#run-notice")).not.toContainText("Waiting for a value", {
+      timeout: 3000,
+    });
+    await expect(page.locator("#run-results .data-table")).toBeVisible({ timeout: 3000 });
+  });
+
+  // #1276: with the card now on `?lib=new`, its *Declare :name* hint shows
+  // there too — and has to work before the first Save, posting the unsaved
+  // document to the `document` endpoint and coming back with a value field.
+  test("Create New: Declare on an undeclared placeholder adds a value field, and filling it runs the query", async ({
+    page,
+    request,
+  }) => {
+    const family = `NewDeclareE2E${Date.now()}`;
+    const patientId = await createResource(request, "Patient", { name: [{ family }] });
+    const canonical = `http://example.org/ViewDefinition/e2e-params-new-declare-${Date.now()}`;
+    const vdId = await createResource(request, "ViewDefinition", {
+      name: "e2e_params_new_declare_source",
+      url: canonical,
+      status: "active",
+      resource: "Patient",
+      select: [
+        {
+          column: [
+            { name: "id", path: "getResourceKey()" },
+            { name: "family", path: "name.first().family" },
+          ],
+        },
+      ],
+    });
+    await waitSearchable(request, "ViewDefinition", vdId);
+    await waitSearchable(request, "Patient", patientId);
+
+    await page.goto("/ui/sql/queries?lib=new");
+
+    const library = {
+      resourceType: "Library",
+      name: `e2e_params_new_declare_${Date.now()}`,
+      status: "active",
+      type: {
+        coding: [
+          {
+            system: "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes",
+            code: "sql-query",
+          },
+        ],
+      },
+      relatedArtifact: [{ type: "depends-on", resource: canonical, label: "v" }],
+    };
+    await page.locator("#lib-details-editor .cm-content").click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText(JSON.stringify(library, null, 2));
+
+    await page.locator(".sql-editor .cm-content[role='textbox']").click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText("SELECT id, family FROM v WHERE family = :fam");
+
+    const declareButton = page.locator("#lib-params").getByRole("button", { name: "Declare :fam" });
+    await expect(declareButton).toBeVisible({ timeout: 3000 });
+    await declareButton.click();
+
+    await expect(page.locator("textarea[name='json']")).toHaveValue(/"name": "fam"/, { timeout: 3000 });
+    const famField = page.locator("#lib-params input[name='param:fam']");
+    await expect(famField).toBeVisible({ timeout: 3000 });
+    await famField.fill(family);
+    await expect(page.locator("#run-results .data-table td", { hasText: family })).toBeVisible({
+      timeout: 3000,
+    });
+  });
+
+  // #1276's own report (MANUAL_TESTING_MATRIX §11.2): a Create New SQL Query
+  // reading a SQL View Library plus a ViewDefinition, with a decimal
+  // parameter. The value must reach the SQL itself — a bound 150 keeps the
+  // 160 cm row, a bound 170 drops it — not merely end the wait. The SQL View
+  // dependency resolves by canonical, which each backend does its own way.
+  test("Create New: a decimal parameter over a SQL View dependency filters the joined rows by its value", async ({
+    page,
+    request,
+  }) => {
+    const stamp = Date.now();
+    const city = `TallCity${stamp}`;
+    const patientId = await createResource(request, "Patient", {
+      gender: "female",
+      address: [{ city }],
+    });
+    const observationId = await createResource(request, "Observation", {
+      status: "final",
+      code: { coding: [{ system: "http://loinc.org", code: "8302-2" }] },
+      subject: { reference: `Patient/${patientId}` },
+      valueQuantity: { value: 160, unit: "cm" },
+    });
+    const patients = `http://example.org/ViewDefinition/e2e-params-new-pd-${stamp}`;
+    const observations = `http://example.org/ViewDefinition/e2e-params-new-obs-${stamp}`;
+    const femalePatients = `http://example.org/Library/e2e-params-new-fp-${stamp}`;
+    const pdId = await createResource(request, "ViewDefinition", {
+      name: `e2e_params_new_pd_${stamp}`,
+      url: patients,
+      status: "active",
+      resource: "Patient",
+      select: [
+        {
+          column: [
+            { name: "id", path: "getResourceKey()" },
+            { name: "gender", path: "gender" },
+            { name: "city", path: "address.first().city" },
+          ],
+        },
+      ],
+    });
+    const obsId = await createResource(request, "ViewDefinition", {
+      name: `e2e_params_new_obs_${stamp}`,
+      url: observations,
+      status: "active",
+      resource: "Observation",
+      select: [
+        {
+          column: [
+            { name: "patient_id", path: "subject.getReferenceKey(Patient)" },
+            { name: "code", path: "code.coding.first().code" },
+            { name: "value", path: "value.ofType(Quantity).value", type: "decimal" },
+          ],
+        },
+      ],
+    });
+    const fpId = await createResource(request, "Library", {
+      name: `e2e_params_new_fp_${stamp}`,
+      url: femalePatients,
+      status: "active",
+      type: {
+        coding: [
+          {
+            system: "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes",
+            code: "sql-view",
+          },
+        ],
+      },
+      relatedArtifact: [{ type: "depends-on", resource: patients, label: "pd" }],
+      content: [
+        {
+          contentType: "application/sql",
+          data: Buffer.from("SELECT id, city FROM pd WHERE gender = 'female'").toString("base64"),
+        },
+      ],
+    });
+    await waitSearchable(request, "ViewDefinition", pdId);
+    await waitSearchable(request, "ViewDefinition", obsId);
+    await waitSearchable(request, "Library", fpId);
+    await waitSearchable(request, "Patient", patientId);
+    await waitSearchable(request, "Observation", observationId);
+
+    await page.goto("/ui/sql/queries?lib=new");
+
+    const library = {
+      resourceType: "Library",
+      name: `e2e_params_new_tall_${stamp}`,
+      status: "active",
+      type: {
+        coding: [
+          {
+            system: "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes",
+            code: "sql-query",
+          },
+        ],
+      },
+      relatedArtifact: [
+        { type: "depends-on", resource: observations, label: "obs" },
+        { type: "depends-on", resource: femalePatients, label: "fp" },
+      ],
+      parameter: [{ name: "min_height", use: "in", type: "decimal" }],
+    };
+    await page.locator("#lib-details-editor .cm-content").click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText(JSON.stringify(library, null, 2));
+
+    await page.locator(".sql-editor .cm-content[role='textbox']").click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText(
+      [
+        "SELECT fp.id, fp.city, MAX(obs.value) AS height",
+        "FROM fp JOIN obs ON obs.patient_id = fp.id",
+        "WHERE obs.code = '8302-2' AND obs.value > :min_height",
+        "GROUP BY fp.id, fp.city",
+      ].join("\n"),
+    );
+
+    const minHeight = page.locator("#lib-params input[name='param:min_height']");
+    await expect(minHeight).toBeVisible({ timeout: 3000 });
+    await expect(page.locator("#run-notice")).toContainText("Waiting for a value for :min_height", {
+      timeout: 3000,
+    });
+
+    const cityCell = page.locator("#run-results .data-table td", { hasText: city });
+    await minHeight.fill("150");
+    await expect(cityCell).toBeVisible({ timeout: 3000 });
+    await minHeight.fill("170");
+    await expect(cityCell).toHaveCount(0, { timeout: 3000 });
+  });
 });
 
 // Tables panel (#842, both kinds): Reads from / Used by, resolved against
