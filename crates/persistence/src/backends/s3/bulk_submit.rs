@@ -1461,7 +1461,7 @@ impl S3Backend {
     /// holding the lease handle — `process_entries` — must therefore never
     /// write back a copy it read earlier: it goes through here, and `mutate`
     /// states its change relative to whatever is stored (#1229).
-    async fn mutate_manifest_state<F>(
+    pub(super) async fn mutate_manifest_state<F>(
         &self,
         location: &TenantLocation,
         submission_id: &SubmissionId,

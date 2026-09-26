@@ -2167,9 +2167,13 @@ impl SubmitClaimStrategy for SqliteBackend {
                  -- registered ones should be dropped. `aborted` stays excluded.
                  WHERE m.manifest_url IS NOT NULL
                    AND s.status IN ('in-progress', 'complete')
+                 -- A `processing` manifest is reclaimable only once its lease
+                 -- lapses. One with no lease at all is being ingested right now
+                 -- by a synchronous `process_entries` caller, which promotes
+                 -- `pending` without taking a lease; every worker path writes
+                 -- the lease together with `processing` (#1530).
                    AND (m.status = 'pending'
-                        OR (m.status = 'processing'
-                            AND (m.lease_expiry IS NULL OR m.lease_expiry < ?1)))
+                        OR (m.status = 'processing' AND m.lease_expiry < ?1))
                  ORDER BY m.added_at LIMIT 1",
                 params![now_str],
                 |row| {
@@ -3759,6 +3763,14 @@ mod tests {
         ));
     }
 
+    mod claim_contract {
+        use crate as persistence;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/bulk_submit/claim_contract.rs"
+        ));
+    }
+
     mod publication {
         use super::*;
         use crate::core::bulk_submit_publication::ManifestPublicationResult;
@@ -4996,6 +5008,16 @@ mod tests {
             assert_eq!(status, "replaced");
             assert_eq!(worker.as_deref(), Some(lease.worker_id.as_str()));
         }
+    }
+
+    /// See `claim_contract::unleased_processing_is_not_claimable` (#1530).
+    #[tokio::test]
+    async fn test_unleased_processing_manifest_is_not_claimable() {
+        claim_contract::unleased_processing_is_not_claimable(
+            &create_test_backend(),
+            &create_test_tenant(),
+        )
+        .await;
     }
 
     #[tokio::test]

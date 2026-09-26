@@ -1660,17 +1660,17 @@ impl SubmitClaimStrategy for MongoBackend {
                 .unwrap_or_else(|_| chrono::Duration::seconds(60));
 
         // Eligible: has something to fetch, and is either untouched or held by a
-        // worker that stopped heartbeating.
+        // worker that stopped heartbeating. A `processing` manifest with no lease
+        // is not eligible: a synchronous `process_entries` caller is ingesting it
+        // right now, having promoted it from `pending` without taking a lease
+        // (#1530). `$lt` never matches a null or missing `lease_expiry`.
         let eligible = doc! {
             "manifest_url": { "$ne": null },
             "$or": [
                 { "status": ManifestStatus::Pending.to_string() },
                 {
                     "status": ManifestStatus::Processing.to_string(),
-                    "$or": [
-                        { "lease_expiry": null },
-                        { "lease_expiry": { "$lt": to_bson_time(now) } },
-                    ],
+                    "lease_expiry": { "$lt": to_bson_time(now) },
                 },
             ],
         };
