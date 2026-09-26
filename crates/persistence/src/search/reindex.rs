@@ -2174,18 +2174,24 @@ fn push_error(
 }
 
 /// Records a per-resource error against the job and in the log.
-#[allow(clippy::too_many_arguments)]
 fn record_resource_failure(
-    jobs: &Arc<RwLock<HashMap<String, ReindexProgress>>>,
-    job_id: &str,
-    failures: &mut ResourceFailureLog,
+    ctx: &RangeWalk,
     resource_type: &str,
     resource_id: &str,
     error: String,
     retryable: bool,
 ) {
-    failures.record(resource_type, resource_id, &error, retryable);
-    push_error(jobs, job_id, resource_type, resource_id, error, retryable);
+    ctx.failures
+        .lock()
+        .record(resource_type, resource_id, &error, retryable);
+    push_error(
+        &ctx.jobs,
+        &ctx.job_id,
+        resource_type,
+        resource_id,
+        error,
+        retryable,
+    );
 }
 
 /// What one batch cost and produced, for the run's accounting (#1403).
@@ -2212,13 +2218,8 @@ struct BatchOutcome {
 /// of the batch that were read but not written (skipped, or deleted since
 /// they were named), and returns the batch's accounting for the run's log
 /// lines (#1403).
-#[allow(clippy::too_many_arguments)]
 async fn write_resource_batch(
-    tenant: &TenantContext,
-    writers: &[Arc<dyn ReindexTarget>],
-    jobs: &Arc<RwLock<HashMap<String, ReindexProgress>>>,
-    job_id: &str,
-    failures: &mut ResourceFailureLog,
+    ctx: &RangeWalk,
     resource_type: &str,
     resources: &[StoredResource],
     extra_processed: u64,
@@ -2227,11 +2228,11 @@ async fn write_resource_batch(
     let mut entry_counts: Vec<u64> = vec![0; resources.len()];
     let mut batch = BatchOutcome::default();
     if !resources.is_empty() {
-        for writer in writers {
+        for writer in &ctx.writers {
             let mut page_stats = ReindexPageStats::default();
             let started = Instant::now();
             let outcomes = writer
-                .write_search_entries_page_timed(tenant, resources, &mut page_stats)
+                .write_search_entries_page_timed(&ctx.tenant, resources, &mut page_stats)
                 .await;
             batch.write += started.elapsed();
             batch.writer.accumulate(&page_stats);
@@ -2244,9 +2245,7 @@ async fn write_resource_batch(
                     Err(e) => {
                         batch.failed += 1;
                         record_resource_failure(
-                            jobs,
-                            job_id,
-                            failures,
+                            ctx,
                             resource_type,
                             resources[i].id(),
                             format!("Failed to rebuild index entries: {e}"),
@@ -2266,8 +2265,8 @@ async fn write_resource_batch(
         .sum();
     batch.entries = entries;
 
-    let mut jobs_guard = jobs.write();
-    if let Some(progress) = jobs_guard.get_mut(job_id) {
+    let mut jobs_guard = ctx.jobs.write();
+    if let Some(progress) = jobs_guard.get_mut(&ctx.job_id) {
         progress.processed_resources += resources.len() as u64 + extra_processed;
         progress.entries_created += entries;
     }
@@ -2341,17 +2340,21 @@ fn log_job_end(
     log_job_finished(tenant, job_id, &stats.finish_job(outcome, Instant::now()));
 }
 
-fn record_and_log_page(
-    stats: &mut ReindexRunStats,
-    tenant: &str,
-    job_id: &str,
-    resource_type: &str,
-    record: PageRecord,
-) {
-    let recorded = stats.record_page(record, Instant::now());
-    log_page(tenant, job_id, resource_type, &recorded, &record);
+/// Folds one page into the run's statistics, then logs its `reindex page`
+/// line and, when one is due, a `reindex progress` line — after the
+/// statistics lock is released, so concurrent walks never log under it
+/// (#1403).
+fn record_and_log_page_shared(ctx: &RangeWalk, resource_type: &str, record: PageRecord) {
+    let recorded = ctx.stats.lock().record_page(record, Instant::now());
+    log_page(
+        &ctx.tenant_label,
+        &ctx.job_id,
+        resource_type,
+        &recorded,
+        &record,
+    );
     if let Some(p) = &recorded.progress {
-        log_progress(tenant, job_id, p);
+        log_progress(&ctx.tenant_label, &ctx.job_id, p);
     }
 }
 
@@ -2717,6 +2720,230 @@ impl Drop for PrefetchedPage {
     }
 }
 
+/// What one walk of a resource type needs, behind an `Arc` so the concurrent
+/// walks of one type can share it (#1403). The run's failure log and
+/// statistics sit behind short-lived locks: no guard is held across an
+/// `.await`.
+struct RangeWalk {
+    tenant: TenantContext,
+    tenant_label: String,
+    job_id: String,
+    source: Arc<dyn ReindexSource>,
+    writers: Vec<Arc<dyn ReindexTarget>>,
+    jobs: Arc<RwLock<HashMap<String, ReindexProgress>>>,
+    /// Resources per page: the request's `batch_size`, at least 1.
+    batch_size: u32,
+    failures: parking_lot::Mutex<ResourceFailureLog>,
+    stats: parking_lot::Mutex<ReindexRunStats>,
+}
+
+/// Rebuilds exactly the named resources of `resource_type`, fetched in
+/// batches of the run's page size; an id deleted since it was named is
+/// simply absent, and counts as processed with nothing to index (#1125).
+async fn walk_named_resources(
+    ctx: &RangeWalk,
+    resource_type: &str,
+    ids: &[String],
+    cancel_rx: &mut mpsc::Receiver<()>,
+) -> Result<(), RunExit> {
+    for (batch_index, batch) in ids.chunks(ctx.batch_size as usize).enumerate() {
+        if cancel_rx.try_recv().is_ok() {
+            return Err(RunExit::Cancelled);
+        }
+        // Between two batches only, never before the first or after the
+        // last: the gap exists to let a foreground writer take the lock, and
+        // there is nothing to yield to once this run has stopped writing.
+        if batch_index > 0 {
+            let yielded = Instant::now();
+            yield_between_pages().await;
+            ctx.stats.lock().add_yield(yielded.elapsed());
+        }
+        let fetch_started = Instant::now();
+        let fetch_span = crate::perf::span(crate::perf::Phase::ReindexFetch);
+        let fetched = ctx
+            .source
+            .fetch_resources_by_ids(&ctx.tenant, resource_type, batch)
+            .await;
+        drop(fetch_span);
+        let fetch_time = fetch_started.elapsed();
+        let resources = match fetched {
+            Ok(resources) => resources,
+            Err(e) => {
+                return Err(RunExit::Failed(format!("Failed to fetch resources: {e}")));
+            }
+        };
+        let missing = (batch.len() as u64).saturating_sub(resources.len() as u64);
+        let batch_outcome = write_resource_batch(ctx, resource_type, &resources, missing).await;
+        record_and_log_page_shared(
+            ctx,
+            resource_type,
+            PageRecord {
+                resources: batch.len() as u64,
+                entries: batch_outcome.entries,
+                failed: batch_outcome.failed,
+                fetch: fetch_time,
+                fetch_wait: fetch_time,
+                write: batch_outcome.write,
+                writer: batch_outcome.writer,
+            },
+        );
+    }
+    Ok(())
+}
+
+/// Pages one walk of `resource_type` from `start` (`None` = the type's first
+/// page) until the source returns no next cursor, rebuilding every page
+/// through every writer (#1403). `should_stop` is asked once per page, before
+/// the page is fetched or taken from the prefetch, so a page that has been
+/// fetched is always written in full. The next page of this walk may be
+/// fetched while this one is written, when the source allows it; the walk's
+/// pages are still written one at a time, in fetch order. `page_bytes` caps a
+/// page by bytes of stored content (`0` = count only).
+async fn walk_range(
+    ctx: &RangeWalk,
+    resource_type: &str,
+    start: Option<String>,
+    page_bytes: u64,
+    should_stop: &mut (dyn FnMut() -> bool + Send),
+) -> Result<(), RunExit> {
+    let mut cursor: Option<String> = start;
+    let mut prefetched: Option<PrefetchedPage> = None;
+    loop {
+        if should_stop() {
+            return Err(RunExit::Cancelled); // dropping `prefetched` aborts it
+        }
+        let wait_started = Instant::now();
+        let (fetched, fetch, fetch_wait) = match prefetched.take() {
+            Some(next) => {
+                let (ahead, ahead_fetch) = next.wait().await;
+                match ahead {
+                    Ok(Some(page)) => (Ok(page), ahead_fetch, wait_started.elapsed()),
+                    Ok(None) => {
+                        // The source would not fetch this cursor ahead of the write
+                        // (it ends a phase). The previous page's write has finished,
+                        // so fetch it now.
+                        let serial_started = Instant::now();
+                        let fetch_span = crate::perf::span(crate::perf::Phase::ReindexFetch);
+                        let fetched = ctx
+                            .source
+                            .fetch_resources_page_capped(
+                                &ctx.tenant,
+                                resource_type,
+                                cursor.as_deref(),
+                                ctx.batch_size,
+                                page_bytes,
+                            )
+                            .await;
+                        drop(fetch_span);
+                        (
+                            fetched,
+                            ahead_fetch + serial_started.elapsed(),
+                            wait_started.elapsed(),
+                        )
+                    }
+                    Err(e) => (Err(e), ahead_fetch, wait_started.elapsed()),
+                }
+            }
+            None => {
+                let fetch_span = crate::perf::span(crate::perf::Phase::ReindexFetch);
+                let fetched = ctx
+                    .source
+                    .fetch_resources_page_capped(
+                        &ctx.tenant,
+                        resource_type,
+                        cursor.as_deref(),
+                        ctx.batch_size,
+                        page_bytes,
+                    )
+                    .await;
+                drop(fetch_span);
+                let fetch = wait_started.elapsed();
+                (fetched, fetch, fetch) // exactly equal when nothing was prefetched
+            }
+        };
+        let page = match fetched {
+            Ok(page) => page,
+            Err(e) => {
+                return Err(RunExit::Failed(format!("Failed to fetch resources: {e}")));
+            }
+        };
+        // Fetch the next page of THIS walk while this one is written, when the source allows it.
+        if let Some(next) = page.next_cursor.as_deref()
+            && ctx.source.may_prefetch_page(next)
+        {
+            prefetched = Some(PrefetchedPage::spawn(
+                ctx.source.clone(),
+                ctx.tenant.clone(),
+                resource_type.to_string(),
+                next.to_string(),
+                ctx.batch_size,
+                page_bytes,
+            ));
+        }
+        // A row the source read but could not decode is a resource that
+        // stays unsearchable until the row is repaired: a permanent
+        // failure, recorded rather than silently dropped (#1125).
+        for skipped in &page.skipped {
+            record_resource_failure(
+                ctx,
+                resource_type,
+                &skipped.resource_id,
+                format!("Failed to read stored resource: {}", skipped.reason),
+                false,
+            );
+        }
+
+        // Rebuild the page through every writer.
+        let batch_outcome = write_resource_batch(
+            ctx,
+            resource_type,
+            &page.resources,
+            page.skipped.len() as u64,
+        )
+        .await;
+
+        record_and_log_page_shared(
+            ctx,
+            resource_type,
+            PageRecord {
+                resources: (page.resources.len() + page.skipped.len()) as u64,
+                entries: batch_outcome.entries,
+                failed: page.skipped.len() as u64 + batch_outcome.failed,
+                fetch,
+                fetch_wait,
+                write: batch_outcome.write,
+                writer: batch_outcome.writer,
+            },
+        );
+
+        match page.next_cursor {
+            Some(next) => {
+                cursor = Some(next);
+                // Stand back before re-taking the write lock for the next
+                // page. Only between pages of one walk: the last page has no
+                // successor to hold the lock against.
+                let yielded = Instant::now();
+                yield_between_pages().await;
+                ctx.stats.lock().add_yield(yielded.elapsed());
+            }
+            None => return Ok(()),
+        }
+    }
+}
+
+/// Walks every page of `resource_type` (#1403).
+async fn walk_type(
+    ctx: &Arc<RangeWalk>,
+    resource_type: &str,
+    request: &ReindexRequest,
+    cancel_rx: &mut mpsc::Receiver<()>,
+) -> Result<(), RunExit> {
+    walk_range(ctx, resource_type, None, request.batch_bytes, &mut || {
+        cancel_rx.try_recv().is_ok()
+    })
+    .await
+}
+
 /// Drives a reindex job to completion in the background.
 ///
 /// Reads resources from `source` and rewrites the search entries for each one
@@ -2783,7 +3010,7 @@ async fn run_reindex(
         });
 
     // Determine resource types to process
-    let resource_types = match (&named_resources, request.resource_types) {
+    let resource_types = match (&named_resources, request.resource_types.clone()) {
         (Some(named), _) => named.keys().cloned().collect(),
         (None, Some(types)) => types,
         (None, None) => match source.list_resource_types(&tenant).await {
@@ -2883,7 +3110,17 @@ async fn run_reindex(
     }
 
     stats.mark_pages_started(Instant::now());
-    let mut failures = ResourceFailureLog::new(&job_id, &tenant);
+    let ctx = Arc::new(RangeWalk {
+        tenant: tenant.clone(),
+        tenant_label: tenant_label.clone(),
+        job_id: job_id.clone(),
+        source: source.clone(),
+        writers: writers.clone(),
+        jobs: jobs.clone(),
+        batch_size: request.batch_size.max(1),
+        failures: parking_lot::Mutex::new(ResourceFailureLog::new(&job_id, &tenant)),
+        stats: parking_lot::Mutex::new(stats),
+    });
     let outcome: Result<(), RunExit> = async {
         // Process each resource type
         for resource_type in &resource_types {
@@ -2899,220 +3136,29 @@ async fn run_reindex(
                     progress.current_resource_type = Some(resource_type.clone());
                 }
             }
-            failures.start_type(resource_type);
+            ctx.failures.lock().start_type(resource_type);
             let type_total = type_totals
                 .get(resource_type.as_str())
                 .copied()
                 .unwrap_or(0);
-            log_type_started(
-                &tenant_label,
-                &job_id,
-                &stats.start_type(resource_type, type_total, Instant::now()),
-            );
+            let type_started =
+                ctx.stats
+                    .lock()
+                    .start_type(resource_type, type_total, Instant::now());
+            log_type_started(&tenant_label, &job_id, &type_started);
 
-            // A run scoped to named resources fetches them in batches of
-            // `batch_size` ids; an id deleted since it was named is simply
-            // absent, and counts as processed with nothing to index.
-            if let Some(ids) = named_resources
+            match named_resources
                 .as_ref()
                 .and_then(|named| named.get(resource_type))
             {
-                for (batch_index, batch) in
-                    ids.chunks(request.batch_size.max(1) as usize).enumerate()
-                {
-                    if cancel_rx.try_recv().is_ok() {
-                        return Err(RunExit::Cancelled);
-                    }
-                    // Between two batches only, never before the first or
-                    // after the last: the gap exists to let a foreground
-                    // writer take the lock, and there is nothing to yield to
-                    // once this run has stopped writing.
-                    if batch_index > 0 {
-                        let yielded = Instant::now();
-                        yield_between_pages().await;
-                        stats.add_yield(yielded.elapsed());
-                    }
-                    let fetch_started = Instant::now();
-                    let fetch_span = crate::perf::span(crate::perf::Phase::ReindexFetch);
-                    let fetched = source
-                        .fetch_resources_by_ids(&tenant, resource_type, batch)
-                        .await;
-                    drop(fetch_span);
-                    let fetch_time = fetch_started.elapsed();
-                    let resources = match fetched {
-                        Ok(resources) => resources,
-                        Err(e) => {
-                            return Err(RunExit::Failed(format!("Failed to fetch resources: {e}")));
-                        }
-                    };
-                    let missing = (batch.len() as u64).saturating_sub(resources.len() as u64);
-                    let batch_outcome = write_resource_batch(
-                        &tenant,
-                        &writers,
-                        &jobs,
-                        &job_id,
-                        &mut failures,
-                        resource_type,
-                        &resources,
-                        missing,
-                    )
-                    .await;
-                    record_and_log_page(
-                        &mut stats,
-                        &tenant_label,
-                        &job_id,
-                        resource_type,
-                        PageRecord {
-                            resources: batch.len() as u64,
-                            entries: batch_outcome.entries,
-                            failed: batch_outcome.failed,
-                            fetch: fetch_time,
-                            fetch_wait: fetch_time,
-                            write: batch_outcome.write,
-                            writer: batch_outcome.writer,
-                        },
-                    );
-                }
-                if let Some(summary) = stats.finish_type(OUTCOME_COMPLETED, Instant::now()) {
-                    log_type_finished(&tenant_label, &job_id, &summary);
-                }
-                continue;
+                Some(ids) => walk_named_resources(&ctx, resource_type, ids, &mut cancel_rx).await?,
+                None => walk_type(&ctx, resource_type, &request, &mut cancel_rx).await?,
             }
-
-            // Process resources in batches
-            let page_limit = request.batch_size.max(1);
-            let mut cursor: Option<String> = None;
-            let mut prefetched: Option<PrefetchedPage> = None;
-            loop {
-                if cancel_rx.try_recv().is_ok() {
-                    return Err(RunExit::Cancelled); // dropping `prefetched` aborts it
-                }
-                let wait_started = Instant::now();
-                let (fetched, fetch, fetch_wait) = match prefetched.take() {
-                    Some(next) => {
-                        let (ahead, ahead_fetch) = next.wait().await;
-                        match ahead {
-                            Ok(Some(page)) => (Ok(page), ahead_fetch, wait_started.elapsed()),
-                            Ok(None) => {
-                                // The source would not fetch this cursor ahead of the write
-                                // (it ends a phase). The previous page's write has finished,
-                                // so fetch it now.
-                                let serial_started = Instant::now();
-                                let fetch_span =
-                                    crate::perf::span(crate::perf::Phase::ReindexFetch);
-                                let fetched = source
-                                    .fetch_resources_page_capped(
-                                        &tenant,
-                                        resource_type,
-                                        cursor.as_deref(),
-                                        page_limit,
-                                        request.batch_bytes,
-                                    )
-                                    .await;
-                                drop(fetch_span);
-                                (
-                                    fetched,
-                                    ahead_fetch + serial_started.elapsed(),
-                                    wait_started.elapsed(),
-                                )
-                            }
-                            Err(e) => (Err(e), ahead_fetch, wait_started.elapsed()),
-                        }
-                    }
-                    None => {
-                        let fetch_span = crate::perf::span(crate::perf::Phase::ReindexFetch);
-                        let fetched = source
-                            .fetch_resources_page_capped(
-                                &tenant,
-                                resource_type,
-                                cursor.as_deref(),
-                                page_limit,
-                                request.batch_bytes,
-                            )
-                            .await;
-                        drop(fetch_span);
-                        let fetch = wait_started.elapsed();
-                        (fetched, fetch, fetch) // exactly equal when nothing was prefetched
-                    }
-                };
-                let page = match fetched {
-                    Ok(page) => page,
-                    Err(e) => {
-                        return Err(RunExit::Failed(format!("Failed to fetch resources: {e}")));
-                    }
-                };
-                // Fetch the next page of THIS type while this one is written, when the source allows it.
-                if let Some(next) = page.next_cursor.as_deref()
-                    && source.may_prefetch_page(next)
-                {
-                    prefetched = Some(PrefetchedPage::spawn(
-                        source.clone(),
-                        tenant.clone(),
-                        resource_type.to_string(),
-                        next.to_string(),
-                        page_limit,
-                        request.batch_bytes,
-                    ));
-                }
-                // A row the source read but could not decode is a resource that
-                // stays unsearchable until the row is repaired: a permanent
-                // failure, recorded rather than silently dropped (#1125).
-                for skipped in &page.skipped {
-                    record_resource_failure(
-                        &jobs,
-                        &job_id,
-                        &mut failures,
-                        resource_type,
-                        &skipped.resource_id,
-                        format!("Failed to read stored resource: {}", skipped.reason),
-                        false,
-                    );
-                }
-
-                // Rebuild the page through every writer.
-                let batch_outcome = write_resource_batch(
-                    &tenant,
-                    &writers,
-                    &jobs,
-                    &job_id,
-                    &mut failures,
-                    resource_type,
-                    &page.resources,
-                    page.skipped.len() as u64,
-                )
-                .await;
-
-                record_and_log_page(
-                    &mut stats,
-                    &tenant_label,
-                    &job_id,
-                    resource_type,
-                    PageRecord {
-                        resources: (page.resources.len() + page.skipped.len()) as u64,
-                        entries: batch_outcome.entries,
-                        failed: page.skipped.len() as u64 + batch_outcome.failed,
-                        fetch,
-                        fetch_wait,
-                        write: batch_outcome.write,
-                        writer: batch_outcome.writer,
-                    },
-                );
-
-                // Check if there are more pages
-                match page.next_cursor {
-                    Some(next) => {
-                        cursor = Some(next);
-                        // Stand back before re-taking the write lock for the
-                        // next page. Only between pages: the last page has no
-                        // successor to hold the lock against.
-                        let yielded = Instant::now();
-                        yield_between_pages().await;
-                        stats.add_yield(yielded.elapsed());
-                    }
-                    None => break,
-                }
-            }
-            if let Some(summary) = stats.finish_type(OUTCOME_COMPLETED, Instant::now()) {
+            let summary = ctx
+                .stats
+                .lock()
+                .finish_type(OUTCOME_COMPLETED, Instant::now());
+            if let Some(summary) = summary {
                 log_type_finished(&tenant_label, &job_id, &summary);
             }
         }
@@ -3120,15 +3166,25 @@ async fn run_reindex(
         Ok(())
     }
     .await;
-    failures.finish_type();
-    if let Some(summary) = stats.finish_type(exit_outcome(&outcome), Instant::now()) {
+    ctx.failures.lock().finish_type();
+    let summary = ctx
+        .stats
+        .lock()
+        .finish_type(exit_outcome(&outcome), Instant::now());
+    if let Some(summary) = summary {
         log_type_finished(&tenant_label, &job_id, &summary);
     }
 
     if request.bulk_index_rebuild {
         for writer in &writers {
             if let Err(e) = writer.end_bulk_index_rebuild().await {
-                log_job_end(&stats, &jobs, &tenant_label, &job_id, OUTCOME_FAILED);
+                log_job_end(
+                    &ctx.stats.lock(),
+                    &jobs,
+                    &tenant_label,
+                    &job_id,
+                    OUTCOME_FAILED,
+                );
                 mark_failed(
                     &jobs,
                     &job_id,
@@ -3141,11 +3197,23 @@ async fn run_reindex(
 
     match outcome {
         Err(RunExit::Cancelled) => {
-            log_job_end(&stats, &jobs, &tenant_label, &job_id, OUTCOME_CANCELLED);
+            log_job_end(
+                &ctx.stats.lock(),
+                &jobs,
+                &tenant_label,
+                &job_id,
+                OUTCOME_CANCELLED,
+            );
             return mark_cancelled(&jobs, &job_id);
         }
         Err(RunExit::Failed(msg)) => {
-            log_job_end(&stats, &jobs, &tenant_label, &job_id, OUTCOME_FAILED);
+            log_job_end(
+                &ctx.stats.lock(),
+                &jobs,
+                &tenant_label,
+                &job_id,
+                OUTCOME_FAILED,
+            );
             return mark_failed(&jobs, &job_id, msg);
         }
         Ok(()) => {}
@@ -3170,7 +3238,13 @@ async fn run_reindex(
         );
     }
 
-    log_job_end(&stats, &jobs, &tenant_label, &job_id, OUTCOME_COMPLETED);
+    log_job_end(
+        &ctx.stats.lock(),
+        &jobs,
+        &tenant_label,
+        &job_id,
+        OUTCOME_COMPLETED,
+    );
 
     // Mark as completed
     {
