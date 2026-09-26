@@ -4584,6 +4584,45 @@ mod bulk_submit_worker {
         (id, manifest.manifest_id)
     }
 
+    /// A synchronous `process_entries` call holds its manifest in `processing`
+    /// with no lease until it settles the terminal status on its way out. No
+    /// worker may claim it in that window (#1530). The SQL and MongoDB suites
+    /// pin the same rule through `tests/bulk_submit/claim_contract.rs`; S3 needs
+    /// its own test because the window closes before the call returns.
+    #[tokio::test]
+    async fn an_unleased_processing_manifest_is_not_claimable() {
+        let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+        let t = tenant("tenant-a");
+        let (id, in_flight) = seed(&backend, &t).await;
+        let location = backend.tenant_location(&t).expect("location");
+        backend
+            .mutate_manifest_state(&location, &id, &in_flight, |state| {
+                state.manifest.status = ManifestStatus::Processing;
+            })
+            .await
+            .expect("mark processing");
+        let queued = backend
+            .add_manifest(&t, &id, Some("https://provider.example/queued.json"), None)
+            .await
+            .expect("add manifest")
+            .manifest_id;
+
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("worker-1"), lease_duration())
+            .await
+            .expect("claim")
+            .expect("the pending manifest queued behind it stays claimable");
+        assert_eq!(lease.manifest_id, queued);
+        assert!(
+            backend
+                .claim_next_manifest(&WorkerId::new("worker-2"), lease_duration())
+                .await
+                .expect("claim")
+                .is_none(),
+            "a processing manifest with no lease must not be claimable"
+        );
+    }
+
     #[tokio::test]
     async fn claim_leases_a_queued_manifest_and_excludes_other_workers() {
         let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));

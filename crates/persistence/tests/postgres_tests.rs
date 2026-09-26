@@ -1963,6 +1963,25 @@ mod postgres_integration {
         ));
     }
 
+    mod claim_contract {
+        use helios_persistence as persistence;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/bulk_submit/claim_contract.rs"
+        ));
+    }
+
+    /// See `claim_contract::unleased_processing_is_not_claimable` (#1530).
+    #[tokio::test]
+    async fn postgres_bulk_submit_unleased_processing_manifest_is_not_claimable() {
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        claim_contract::unleased_processing_is_not_claimable(
+            &create_backend().await,
+            &create_tenant("unleased-processing"),
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn postgres_bulk_submit_worker_exact_artifacts_across_pages() {
         let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;

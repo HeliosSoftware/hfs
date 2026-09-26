@@ -2263,9 +2263,13 @@ impl SubmitClaimStrategy for PostgresBackend {
                  -- registered ones should be dropped. `aborted` stays excluded.
                  WHERE m.manifest_url IS NOT NULL
                    AND s.status IN ('in-progress', 'complete')
+                 -- A `processing` manifest is reclaimable only once its lease
+                 -- lapses. One with no lease at all is being ingested right now
+                 -- by a synchronous `process_entries` caller, which promotes
+                 -- `pending` without taking a lease; every worker path writes
+                 -- the lease together with `processing` (#1530).
                    AND (m.status = 'pending'
-                        OR (m.status = 'processing'
-                            AND (m.lease_expiry IS NULL OR m.lease_expiry < $1)))
+                        OR (m.status = 'processing' AND m.lease_expiry < $1))
                  ORDER BY m.added_at
                  LIMIT 1
                  FOR UPDATE OF m SKIP LOCKED",
