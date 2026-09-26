@@ -1050,7 +1050,7 @@ fn capture_writer_config_log() -> (&'static Mutex<Vec<u8>>, tracing::dispatcher:
 
 /// The value substring `line` gives for `field=`, up to the next space:
 /// panics if the field is missing.
-fn log_field_value<'a>(line: &'a str, field: &str) -> &'a str {
+pub(super) fn log_field_value<'a>(line: &'a str, field: &str) -> &'a str {
     let needle = format!(" {field}=");
     let start = line
         .find(&needle)

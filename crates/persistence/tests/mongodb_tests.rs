@@ -826,6 +826,10 @@ mod reindex_id_walk;
 #[path = "mongodb/reindex_pipeline.rs"]
 mod reindex_pipeline;
 
+/// #1403: concurrent write streams over disjoint id ranges.
+#[path = "mongodb/reindex_streams.rs"]
+mod reindex_streams;
+
 /// #1405: of several writers holding the same version, one `update` writes and
 /// every loser is a `ConcurrencyError` — the server's `WriteConflict` used to
 /// reach them as `BackendError::Internal`.

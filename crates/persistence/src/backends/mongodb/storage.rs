@@ -4813,6 +4813,37 @@ impl MongoBackend {
         }
     }
 
+    /// The walk's catch-up margin: the configured one, clamped (#1403).
+    fn reindex_margin(&self) -> chrono::Duration {
+        reindex_catch_up_margin(self.config().reindex_catch_up_margin_ms)
+    }
+
+    /// Fixes a type's floor when its walk starts — `min(newest live
+    /// last_updated + 1 ms, now − margin)` — and logs `mongodb reindex walk
+    /// started` (#1403). A single walk calls it from its first page; a split
+    /// type calls it once, from its plan, before the ranges are cut.
+    async fn reindex_walk_floor(
+        &self,
+        resources: &Collection<Document>,
+        tenant_id: &str,
+        resource_type: &str,
+    ) -> StorageResult<DateTime<Utc>> {
+        let t0 = Utc::now();
+        let newest_live = self
+            .reindex_newest_live_last_updated(resources, tenant_id, resource_type)
+            .await?;
+        let floor = reindex_catch_up_floor(t0, newest_live, self.reindex_margin());
+        tracing::info!(
+            tenant = %tenant_id,
+            resource_type = %resource_type,
+            t0 = %format_walk_instant(t0),
+            newest_live = %newest_live.map(format_walk_instant).unwrap_or_else(|| "none".to_string()),
+            floor = %format_walk_instant(floor),
+            "mongodb reindex walk started"
+        );
+        Ok(floor)
+    }
+
     /// One hinted, sorted, limited find (#1403). The page is drained up to
     /// `limit` rows, or until `max_bytes` (`0` = no cap, #1499) rejects the
     /// next row — the first row is always admitted.
@@ -4860,24 +4891,23 @@ impl MongoBackend {
         })
     }
 
-    /// Runs only the id-phase continuation query, for both the serial walk
-    /// and the driver's ahead-of-time prefetch — so both paths build the same
-    /// page from the same query (#1403). `Ok(None)` means the id phase is
-    /// over; it logs nothing at all in that case (the empty check runs
-    /// before the capped-page debug line, so that line is never emitted for
-    /// an empty read, by either caller), per
+    /// One id-order continuation query, turned into a page (#1403): shared by
+    /// the id phase's own continuation and one write stream's id range, so
+    /// both build their page from the same read. `Ok(None)` means the query
+    /// came back empty; it logs nothing at all in that case (the empty check
+    /// runs before the capped-page debug line, so that line is never emitted
+    /// for an empty read), per
     /// [`ReindexSource::fetch_resources_page_ahead`]'s doc contract that a
     /// source must not log or change state when it returns `Ok(None)`. The
-    /// phase transition itself is left to whichever caller runs the query
-    /// when it is *not* prefetched.
-    async fn reindex_id_page(
+    /// caller decides what an empty read means for its own phase.
+    async fn reindex_id_order_page(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
-        floor: DateTime<Utc>,
-        after_id: Option<&str>,
+        filter: Document,
         limit: u32,
         max_bytes: u64,
+        next: impl FnOnce(String) -> ReindexWalkCursor,
     ) -> StorageResult<Option<ResourcePage>> {
         let db = self.get_database().await?;
         let resources = db.collection::<Document>(Self::RESOURCES_COLLECTION);
@@ -4885,7 +4915,7 @@ impl MongoBackend {
         let found = self
             .reindex_find_page(
                 &resources,
-                reindex_id_page_filter(tenant_id, resource_type, floor, after_id),
+                filter,
                 doc! { "id": 1 },
                 RESOURCES_IDENTITY_INDEX,
                 limit,
@@ -4904,18 +4934,81 @@ impl MongoBackend {
             .and_then(|d| d.get_str("id").ok())
             .map(str::to_string)
             .ok_or_else(|| {
-                internal_error("Missing id on the last row of an id-phase page".to_string())
+                internal_error("Missing id on the last row of an id-order page".to_string())
             })?;
-        reindex_page_from_docs(
-            &found.docs,
-            resource_type,
-            tenant,
+        reindex_page_from_docs(&found.docs, resource_type, tenant, next(last_id)).map(Some)
+    }
+
+    /// Runs only the id-phase continuation query, for both the serial walk
+    /// and the driver's ahead-of-time prefetch — so both paths build the same
+    /// page from the same query (#1403). The phase transition itself is left
+    /// to whichever caller runs the query when it is *not* prefetched.
+    async fn reindex_id_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        floor: DateTime<Utc>,
+        after_id: Option<&str>,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<Option<ResourcePage>> {
+        let filter =
+            reindex_id_page_filter(tenant.tenant_id().as_str(), resource_type, floor, after_id);
+        self.reindex_id_order_page(tenant, resource_type, filter, limit, max_bytes, |last_id| {
             ReindexWalkCursor::Id {
                 floor,
                 after_id: last_id,
-            },
-        )
-        .map(Some)
+            }
+        })
+        .await
+    }
+
+    /// One page of one write stream's id range (#1403), for both the serial
+    /// walk and the driver's ahead-of-time prefetch. A range never moves on
+    /// to another phase — the driver starts the catch-up once every range has
+    /// finished — so an empty query simply ends it: that call logs `mongodb
+    /// reindex id range finished` and returns an empty page with no next
+    /// cursor.
+    async fn reindex_id_range_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        range: &ReindexIdRange,
+        after_id: Option<&str>,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<ResourcePage> {
+        let tenant_id = tenant.tenant_id().as_str();
+        let filter = reindex_id_range_page_filter(
+            tenant_id,
+            resource_type,
+            range.floor,
+            range.lo.as_deref(),
+            range.hi.as_deref(),
+            after_id,
+        );
+        let page = self
+            .reindex_id_order_page(tenant, resource_type, filter, limit, max_bytes, |last_id| {
+                ReindexWalkCursor::IdRange {
+                    range: range.clone(),
+                    after_id: Some(last_id),
+                }
+            })
+            .await?;
+        match page {
+            Some(page) => Ok(page),
+            None => {
+                tracing::info!(
+                    tenant = %tenant_id,
+                    resource_type = %resource_type,
+                    floor = %format_walk_instant(range.floor),
+                    lo = %range.lo.as_deref().unwrap_or("*"),
+                    hi = %range.hi.as_deref().unwrap_or("*"),
+                    "mongodb reindex id range finished"
+                );
+                Ok(ResourcePage::default())
+            }
+        }
     }
 
     /// Pages `resource_type` in id order with catch-up rounds (#1403), bounded
@@ -4925,6 +5018,10 @@ impl MongoBackend {
     /// exactly as a full page would — it never ends a phase and never returns
     /// `None` on its own account. `fetch_resources_page` and
     /// `fetch_resources_page_capped` are both thin calls to this method.
+    ///
+    /// An id-range cursor walks one write stream's slice of the id phase and
+    /// ends on an empty query without moving on; an id-phase-done cursor logs
+    /// the end of the id phase and starts catch-up round 1 in the same call.
     async fn fetch_reindex_page(
         &self,
         tenant: &TenantContext,
@@ -4937,7 +5034,7 @@ impl MongoBackend {
         let resources: Collection<Document> = db.collection(MongoBackend::RESOURCES_COLLECTION);
         let tenant_id = tenant.tenant_id().as_str();
         let limit = limit.max(1); // MongoDB treats limit(0) as "no limit"
-        let margin = reindex_catch_up_margin(self.config().reindex_catch_up_margin_ms);
+        let margin = self.reindex_margin();
 
         let mut step = match cursor {
             None => WalkStep::Start,
@@ -4946,25 +5043,12 @@ impl MongoBackend {
 
         loop {
             step = match step {
-                WalkStep::Start => {
-                    let t0 = Utc::now();
-                    let newest_live = self
-                        .reindex_newest_live_last_updated(&resources, tenant_id, resource_type)
-                        .await?;
-                    let floor = reindex_catch_up_floor(t0, newest_live, margin);
-                    tracing::info!(
-                        tenant = %tenant_id,
-                        resource_type = %resource_type,
-                        t0 = %format_walk_instant(t0),
-                        newest_live = %newest_live.map(format_walk_instant).unwrap_or_else(|| "none".to_string()),
-                        floor = %format_walk_instant(floor),
-                        "mongodb reindex walk started"
-                    );
-                    WalkStep::IdPhase {
-                        floor,
-                        after_id: None,
-                    }
-                }
+                WalkStep::Start => WalkStep::IdPhase {
+                    floor: self
+                        .reindex_walk_floor(&resources, tenant_id, resource_type)
+                        .await?,
+                    after_id: None,
+                },
                 WalkStep::IdPhase { floor, after_id } => {
                     if let Some(page) = self
                         .reindex_id_page(
@@ -4979,6 +5063,9 @@ impl MongoBackend {
                     {
                         return Ok(page);
                     }
+                    WalkStep::IdPhaseDone { floor }
+                }
+                WalkStep::IdPhaseDone { floor } => {
                     tracing::info!(
                         tenant = %tenant_id,
                         resource_type = %resource_type,
@@ -4986,6 +5073,18 @@ impl MongoBackend {
                         "mongodb reindex id phase finished"
                     );
                     WalkStep::RoundStart { round: 1, floor }
+                }
+                WalkStep::IdRange { range, after_id } => {
+                    return self
+                        .reindex_id_range_page(
+                            tenant,
+                            resource_type,
+                            &range,
+                            after_id.as_deref(),
+                            limit,
+                            max_bytes,
+                        )
+                        .await;
                 }
                 WalkStep::RoundStart { round, floor } => {
                     let now = Utc::now();
@@ -5132,11 +5231,20 @@ impl MongoBackend {
 }
 
 /// One step of the walk inside a single call (#1403); never leaves the
-/// call — only `ReindexWalkCursor::Id`/`Round` do, as an encoded cursor.
+/// call — only a `ReindexWalkCursor` does, as an encoded cursor.
 enum WalkStep {
     Start,
     IdPhase {
         floor: DateTime<Utc>,
+        after_id: Option<String>,
+    },
+    /// The id phase is over: log it, then start round 1.
+    IdPhaseDone {
+        floor: DateTime<Utc>,
+    },
+    /// One page of one write stream's id range.
+    IdRange {
+        range: ReindexIdRange,
         after_id: Option<String>,
     },
     RoundStart {
@@ -5173,6 +5281,8 @@ impl From<ReindexWalkCursor> for WalkStep {
                 walked,
                 after: Some((after_last_updated, after_id)),
             },
+            ReindexWalkCursor::IdRange { range, after_id } => WalkStep::IdRange { range, after_id },
+            ReindexWalkCursor::IdPhaseDone { floor } => WalkStep::IdPhaseDone { floor },
         }
     }
 }
@@ -5264,23 +5374,24 @@ impl ReindexSource for MongoBackend {
             .await
     }
 
-    /// Only an id-phase continuation cursor may run ahead of the write in
-    /// flight (#1403): its query reads the `resources` collection, which the
-    /// page being written never touches (only `search_index` and
+    /// Only an id-phase or id-range continuation may run ahead of the write
+    /// in flight (#1403): its query reads the `resources` collection, which
+    /// the page being written never touches (only `search_index` and
     /// `search_index_contained` do), so prefetching it changes nothing the
     /// write could observe. A catch-up round's query instead reads up to a
     /// ceiling fixed when the round started, not "now" — but prefetching a
     /// round page before the previous page's write has ended could still let
     /// a write that lands between the two reads be missed by both the
-    /// current round and the next one, so rounds are excluded too. A cursor
-    /// that fails to parse is rejected the same way. `reindex_prefetch` and
-    /// search offload gate all of this off entirely.
+    /// current round and the next one, so rounds are excluded too, and so is
+    /// the catch-up's first cursor, which starts round 1. A cursor that fails
+    /// to parse is rejected the same way. `reindex_prefetch` and search
+    /// offload gate all of this off entirely.
     fn may_prefetch_page(&self, cursor: &str) -> bool {
         self.config().reindex_prefetch
             && !self.is_search_offloaded()
             && matches!(
                 ReindexWalkCursor::parse(cursor),
-                Ok(ReindexWalkCursor::Id { .. })
+                Ok(ReindexWalkCursor::Id { .. } | ReindexWalkCursor::IdRange { .. })
             )
     }
 
@@ -5292,21 +5403,35 @@ impl ReindexSource for MongoBackend {
         limit: u32,
         max_bytes: u64,
     ) -> StorageResult<Option<ResourcePage>> {
-        // Only an id continuation runs ahead. Everything else, including the
-        // end of the id phase, is fetched serially after the page in flight
-        // is written.
-        let Ok(ReindexWalkCursor::Id { floor, after_id }) = ReindexWalkCursor::parse(cursor) else {
-            return Ok(None);
-        };
-        self.reindex_id_page(
-            tenant,
-            resource_type,
-            floor,
-            Some(&after_id),
-            limit.max(1),
-            max_bytes,
-        )
-        .await
+        match ReindexWalkCursor::parse(cursor) {
+            // The end of the id phase is fetched serially, after the page in
+            // flight is written.
+            Ok(ReindexWalkCursor::Id { floor, after_id }) => {
+                self.reindex_id_page(
+                    tenant,
+                    resource_type,
+                    floor,
+                    Some(&after_id),
+                    limit.max(1),
+                    max_bytes,
+                )
+                .await
+            }
+            // A range never moves on to another phase, so every one of its
+            // pages — the empty one that ends it included — may run ahead.
+            Ok(ReindexWalkCursor::IdRange { range, after_id }) => self
+                .reindex_id_range_page(
+                    tenant,
+                    resource_type,
+                    &range,
+                    after_id.as_deref(),
+                    limit.max(1),
+                    max_bytes,
+                )
+                .await
+                .map(Some),
+            _ => Ok(None),
+        }
     }
 }
 
@@ -5585,6 +5710,32 @@ const REINDEX_CATCH_UP_MARGIN_MIN_MS: u64 = 1_000;
 /// Largest catch-up margin honoured, so `t0 - margin` stays in range.
 const REINDEX_CATCH_UP_MARGIN_MAX_MS: u64 = 86_400_000;
 
+/// One write stream's slice of a type's id phase (#1403): live resources
+/// stamped before `floor` whose id lies in `[lo, hi)`; an unset bound is open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReindexIdRange {
+    floor: DateTime<Utc>,
+    lo: Option<String>,
+    hi: Option<String>,
+}
+
+impl ReindexIdRange {
+    /// Whether the bounds are ordered and `after_id` — the last id a page of
+    /// this range took — lies inside them.
+    fn admits(&self, after_id: Option<&str>) -> bool {
+        if let (Some(lo), Some(hi)) = (&self.lo, &self.hi)
+            && lo >= hi
+        {
+            return false;
+        }
+        let Some(after_id) = after_id else {
+            return true;
+        };
+        self.lo.as_deref().is_none_or(|lo| lo <= after_id)
+            && self.hi.as_deref().is_none_or(|hi| after_id < hi)
+    }
+}
+
 /// The walk position handed to the driver between calls (#1403). `v2|` and a
 /// tag version the grammar; anything else is a foreign or corrupt cursor.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5601,6 +5752,15 @@ enum ReindexWalkCursor {
         after_last_updated: DateTime<Utc>,
         after_id: String,
     },
+    /// A write stream's position in its id range (#1403); `after_id` is
+    /// `None` before the range's first page.
+    IdRange {
+        range: ReindexIdRange,
+        after_id: Option<String>,
+    },
+    /// Every id range of a split type has been written; the catch-up rounds
+    /// start from `floor` (#1403).
+    IdPhaseDone { floor: DateTime<Utc> },
 }
 
 impl ReindexWalkCursor {
@@ -5625,6 +5785,16 @@ impl ReindexWalkCursor {
                 format_walk_instant(*after_last_updated),
                 after_id
             ),
+            ReindexWalkCursor::IdRange { range, after_id } => format!(
+                "v2|r|{}|{}|{}|{}",
+                format_walk_instant(range.floor),
+                range.lo.as_deref().unwrap_or(""),
+                range.hi.as_deref().unwrap_or(""),
+                after_id.as_deref().unwrap_or("")
+            ),
+            ReindexWalkCursor::IdPhaseDone { floor } => {
+                format!("v2|d|{}", format_walk_instant(*floor))
+            }
         }
     }
 
@@ -5688,6 +5858,35 @@ impl ReindexWalkCursor {
                     after_last_updated,
                     after_id: after_id.to_string(),
                 })
+            }
+            "r" => {
+                let fields: Vec<&str> = rest.splitn(4, '|').collect();
+                let [floor, lo, hi, after_id] = fields[..] else {
+                    return Err(invalid());
+                };
+                let floor = DateTime::parse_from_rfc3339(floor)
+                    .map_err(|_| invalid())?
+                    .with_timezone(&Utc);
+                let set = |s: &str| (!s.is_empty()).then(|| s.to_string());
+                let range = ReindexIdRange {
+                    floor,
+                    lo: set(lo),
+                    hi: set(hi),
+                };
+                let after_id = set(after_id);
+                if !range.admits(after_id.as_deref()) {
+                    return Err(invalid());
+                }
+                Ok(ReindexWalkCursor::IdRange { range, after_id })
+            }
+            "d" => {
+                if rest.contains('|') {
+                    return Err(invalid());
+                }
+                let floor = DateTime::parse_from_rfc3339(rest)
+                    .map_err(|_| invalid())?
+                    .with_timezone(&Utc);
+                Ok(ReindexWalkCursor::IdPhaseDone { floor })
             }
             _ => Err(invalid()),
         }
@@ -5781,6 +5980,43 @@ fn reindex_id_page_filter(
     };
     if let Some(after_id) = after_id {
         filter.insert("id", doc! { "$gt": after_id });
+    }
+    filter
+}
+
+/// One write stream's filter (#1403): the id phase's predicate plus its
+/// range's bounds. Once a page has been returned (`after_id` set),
+/// `$gt: after_id` replaces `$gte: lo`; an unset bound adds no operator, and
+/// with no operator at all the `id` key is omitted.
+fn reindex_id_range_page_filter(
+    tenant_id: &str,
+    resource_type: &str,
+    floor: DateTime<Utc>,
+    lo: Option<&str>,
+    hi: Option<&str>,
+    after_id: Option<&str>,
+) -> Document {
+    let mut filter = doc! {
+        "tenant_id": tenant_id,
+        "resource_type": resource_type,
+        "is_deleted": false,
+        "last_updated": { "$lt": chrono_to_bson(floor) },
+    };
+    let mut id = Document::new();
+    match (after_id, lo) {
+        (Some(after_id), _) => {
+            id.insert("$gt", after_id);
+        }
+        (None, Some(lo)) => {
+            id.insert("$gte", lo);
+        }
+        (None, None) => {}
+    }
+    if let Some(hi) = hi {
+        id.insert("$lt", hi);
+    }
+    if !id.is_empty() {
+        filter.insert("id", id);
     }
     filter
 }
@@ -6310,6 +6546,120 @@ mod reindex_walk_tests {
         }
     }
 
+    // --- Id-range and id-phase-done cursors (#1403) ---
+
+    fn id_range(lo: Option<&str>, hi: Option<&str>) -> ReindexIdRange {
+        ReindexIdRange {
+            floor: ts("2026-01-01T00:00:00.000Z"),
+            lo: lo.map(str::to_string),
+            hi: hi.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn id_range_cursor_round_trips() {
+        for (lo, hi, after_id) in [
+            (None, None, None),
+            (None, Some("m"), Some("a-1")),
+            (Some("A.1"), Some("m"), Some("Zz-9.x")),
+            (Some("m"), None, None),
+            (Some("m"), None, Some("m")),
+        ] {
+            let cursor = ReindexWalkCursor::IdRange {
+                range: id_range(lo, hi),
+                after_id: after_id.map(str::to_string),
+            };
+            assert_eq!(ReindexWalkCursor::parse(&cursor.encode()).unwrap(), cursor);
+        }
+        assert_eq!(
+            ReindexWalkCursor::IdRange {
+                range: id_range(None, Some("obs-020")),
+                after_id: None,
+            }
+            .encode(),
+            "v2|r|2026-01-01T00:00:00.000Z||obs-020|"
+        );
+    }
+
+    #[test]
+    fn id_range_cursor_rejects_bad_bounds_and_shapes() {
+        let floor = "2026-01-01T00:00:00.000Z";
+        let bad: Vec<String> = vec![
+            format!("v2|r|{floor}|m|m|"),  // lo == hi
+            format!("v2|r|{floor}|t|m|"),  // lo > hi
+            format!("v2|r|{floor}|m|t|a"), // after_id below lo
+            format!("v2|r|{floor}|m|t|t"), // after_id == hi
+            format!("v2|r|{floor}||m|z"),  // after_id above hi
+            format!("v2|r|{floor}|m|t"),   // three fields
+            format!("v2|r|{floor}"),       // one field
+            "v2|r|not-a-time|||".to_string(),
+            "v2|r||||".to_string(), // empty floor
+        ];
+        for cursor in bad {
+            match ReindexWalkCursor::parse(&cursor) {
+                Err(StorageError::Search(SearchError::InvalidCursor { .. })) => {}
+                other => panic!("expected InvalidCursor for {cursor:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn id_phase_done_cursor_round_trips_and_rejects_extra_fields() {
+        let cursor = ReindexWalkCursor::IdPhaseDone {
+            floor: ts("2026-01-01T00:00:00.123Z"),
+        };
+        assert_eq!(cursor.encode(), "v2|d|2026-01-01T00:00:00.123Z");
+        assert_eq!(ReindexWalkCursor::parse(&cursor.encode()).unwrap(), cursor);
+        for bad in [
+            "v2|d",
+            "v2|d|",
+            "v2|d|not-a-time",
+            "v2|d|2026-01-01T00:00:00.000Z|x",
+        ] {
+            match ReindexWalkCursor::parse(bad) {
+                Err(StorageError::Search(SearchError::InvalidCursor { .. })) => {}
+                other => panic!("expected InvalidCursor for {bad:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn id_range_page_filter_shapes() {
+        let floor = ts("2026-01-01T00:00:00.000Z");
+        let id_of = |lo: Option<&str>, hi: Option<&str>, after_id: Option<&str>| {
+            reindex_id_range_page_filter("t1", "Observation", floor, lo, hi, after_id)
+                .get_document("id")
+                .ok()
+                .cloned()
+        };
+        assert_eq!(id_of(None, None, None), None);
+        assert_eq!(id_of(Some("m"), None, None), Some(doc! { "$gte": "m" }));
+        assert_eq!(id_of(None, Some("t"), None), Some(doc! { "$lt": "t" }));
+        assert_eq!(
+            id_of(Some("m"), Some("t"), None),
+            Some(doc! { "$gte": "m", "$lt": "t" })
+        );
+        assert_eq!(id_of(None, None, Some("p")), Some(doc! { "$gt": "p" }));
+        assert_eq!(id_of(Some("m"), None, Some("p")), Some(doc! { "$gt": "p" }));
+        assert_eq!(
+            id_of(None, Some("t"), Some("p")),
+            Some(doc! { "$gt": "p", "$lt": "t" })
+        );
+        assert_eq!(
+            id_of(Some("m"), Some("t"), Some("p")),
+            Some(doc! { "$gt": "p", "$lt": "t" })
+        );
+
+        let full = reindex_id_range_page_filter("t1", "Observation", floor, Some("m"), None, None);
+        assert_eq!(full.get_str("tenant_id").unwrap(), "t1");
+        assert_eq!(full.get_str("resource_type").unwrap(), "Observation");
+        assert!(!full.get_bool("is_deleted").unwrap());
+        assert_eq!(
+            full.get_document("last_updated").unwrap(),
+            &doc! { "$lt": chrono_to_bson(floor) }
+        );
+    }
+
     // --- Floor / ceiling / margin / round decision ---
 
     #[test]
@@ -6623,6 +6973,25 @@ mod reindex_prefetch_tests {
         .encode()
     }
 
+    fn id_range_cursor() -> String {
+        ReindexWalkCursor::IdRange {
+            range: ReindexIdRange {
+                floor: chrono::Utc::now(),
+                lo: Some("a".to_string()),
+                hi: Some("m".to_string()),
+            },
+            after_id: Some("b".to_string()),
+        }
+        .encode()
+    }
+
+    fn id_phase_done_cursor() -> String {
+        ReindexWalkCursor::IdPhaseDone {
+            floor: chrono::Utc::now(),
+        }
+        .encode()
+    }
+
     #[test]
     fn may_prefetch_page_accepts_only_id_cursors() {
         assert!(matches!(
@@ -6633,6 +7002,8 @@ mod reindex_prefetch_tests {
         assert!(backend.may_prefetch_page(&id_cursor()));
         assert!(!backend.may_prefetch_page(&round_cursor()));
         assert!(!backend.may_prefetch_page("garbage"));
+        assert!(backend.may_prefetch_page(&id_range_cursor()));
+        assert!(!backend.may_prefetch_page(&id_phase_done_cursor()));
 
         let no_prefetch = MongoBackend::new(MongoBackendConfig {
             reindex_prefetch: false,
@@ -6640,6 +7011,7 @@ mod reindex_prefetch_tests {
         })
         .expect("lazy client");
         assert!(!no_prefetch.may_prefetch_page(&id_cursor()));
+        assert!(!no_prefetch.may_prefetch_page(&id_range_cursor()));
 
         let offloaded = MongoBackend::new(MongoBackendConfig {
             search_offloaded: true,
@@ -6647,6 +7019,7 @@ mod reindex_prefetch_tests {
         })
         .expect("lazy client");
         assert!(!offloaded.may_prefetch_page(&id_cursor()));
+        assert!(!offloaded.may_prefetch_page(&id_range_cursor()));
     }
 
     #[tokio::test]
@@ -6682,6 +7055,15 @@ mod reindex_prefetch_tests {
         assert!(
             result.is_none(),
             "a cursor that fails to parse must never be fetched ahead"
+        );
+
+        let result = backend
+            .fetch_resources_page_ahead(&tenant, "Patient", &id_phase_done_cursor(), 10, 0)
+            .await
+            .expect("no database error");
+        assert!(
+            result.is_none(),
+            "the catch-up's first cursor must never be fetched ahead"
         );
     }
 }

@@ -21,8 +21,8 @@ use std::collections::{BTreeMap, BTreeSet};
 // ===========================================================================
 
 /// Live and tombstoned ids per type, as seeded by [`seed_walk_fixture`].
-struct WalkFixture {
-    live: BTreeMap<String, BTreeSet<String>>,
+pub(super) struct WalkFixture {
+    pub(super) live: BTreeMap<String, BTreeSet<String>>,
     tombstones: BTreeMap<String, BTreeSet<String>>,
 }
 
@@ -31,7 +31,7 @@ struct WalkFixture {
 /// `observations` Observations, and tombstones on two Patients and every
 /// tenth Observation. Ids are NOT yet backdated — call [`backdate_fixture`]
 /// separately so a test can inspect CRUD-time snapshots first.
-async fn seed_walk_fixture(
+pub(super) async fn seed_walk_fixture(
     backend: &MongoBackend,
     tenant: &TenantContext,
     observations: usize,
@@ -134,7 +134,11 @@ async fn seed_walk_fixture(
 /// (live and tombstoned) so the fast-load shape holds: three groups of equal
 /// `last_updated`, interleaved with id order. Observation `i` goes to second
 /// `i % 3`; every Patient goes to second 3.
-async fn backdate_fixture(backend: &MongoBackend, tenant: &TenantContext, fixture: &WalkFixture) {
+pub(super) async fn backdate_fixture(
+    backend: &MongoBackend,
+    tenant: &TenantContext,
+    fixture: &WalkFixture,
+) {
     let db = backend.get_database().await.unwrap();
     let resources = db.collection::<Document>("resources");
     let tenant_id = tenant.tenant_id().as_str();
@@ -387,7 +391,7 @@ fn canonical(v: serde_json::Value) -> serde_json::Value {
     }
 }
 
-async fn snapshot(
+pub(super) async fn snapshot(
     db: &mongodb::Database,
     tenant_id: &str,
     strip_tenant: bool,
