@@ -906,6 +906,20 @@ async fn bulk_export_lines_carry_server_meta() {
     let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
     let backend = make_prefix_backend(mock);
     let tenant = tenant("tenant-a");
+    // Compartment membership is decided from the CompartmentDefinition (#1122),
+    // and a bare `S3Backend` carries no spec parameters, so the Observation
+    // compartment would be empty without loading them first.
+    {
+        let loader = crate::search::SearchParameterLoader::new(FhirVersion::default());
+        let data_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let mut registry = backend.tenant_registries().base().write();
+        for param in loader.load_embedded().unwrap() {
+            let _ = registry.register(param);
+        }
+        for param in loader.load_from_spec_file(&data_dir).unwrap() {
+            let _ = registry.register(param);
+        }
+    }
     let tag = json!({"system": "http://example.org/tags", "code": "keep-me"});
 
     let created = backend

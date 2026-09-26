@@ -1905,3 +1905,90 @@ async fn test_minio_sof_patient_filter() {
         "patient filters must return non-overlapping observations"
     );
 }
+
+/// `Patient/$export` on S3 decides membership with the compartment's own
+/// parameter set (#1122), read from the payload the same way the other
+/// backends do. A bare `S3Backend` carries no spec parameters (a composite
+/// starter or the server's `populate_base_search_registry` loads them), so
+/// the test loads the workspace spec file into its base registry first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_patient_export_follows_the_compartment_definition() {
+    if skip_if_disabled("test_minio_patient_export_follows_the_compartment_definition") {
+        return;
+    }
+    use helios_persistence::core::bulk_export::PatientExportProvider;
+    use helios_persistence::search::SearchParameterLoader;
+
+    let harness = make_prefix_backend("compartment").await;
+    let tenant = tenant("minio-tenant-compartment");
+    {
+        let loader = SearchParameterLoader::new(FhirVersion::default());
+        let data_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let mut registry = harness.backend.tenant_registries().base().write();
+        for param in loader.load_embedded().unwrap() {
+            let _ = registry.register(param);
+        }
+        for param in loader.load_from_spec_file(&data_dir).unwrap() {
+            let _ = registry.register(param);
+        }
+    }
+
+    for resource in [
+        json!({"resourceType": "Patient", "id": "p1"}),
+        json!({"resourceType": "Patient", "id": "other"}),
+        json!({"resourceType": "Patient", "id": "linked",
+            "link": [{"other": {"reference": "Patient/p1"}, "type": "seealso"}]}),
+        json!({"resourceType": "AllergyIntolerance", "id": "recorded",
+            "patient": {"reference": "Patient/other"},
+            "recorder": {"reference": "Patient/p1"}}),
+        json!({"resourceType": "AllergyIntolerance", "id": "someone-elses",
+            "patient": {"reference": "Patient/other"}}),
+        json!({"resourceType": "Observation", "id": "performed", "status": "final",
+            "code": {"text": "x"}, "subject": {"reference": "Patient/other"},
+            "performer": [{"reference": "Patient/p1/_history/2"}]}),
+        json!({"resourceType": "Observation", "id": "about", "status": "final",
+            "code": {"text": "x"}, "subject": {"reference": "Patient/p1"}}),
+        json!({"resourceType": "Observation", "id": "mentions-only", "status": "final",
+            "code": {"text": "x"}, "subject": {"reference": "Patient/other"},
+            "focus": [{"reference": "Patient/p1"}]}),
+    ] {
+        let resource_type = resource["resourceType"].as_str().unwrap().to_string();
+        harness
+            .backend
+            .create(&tenant, &resource_type, resource, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+
+    let request = ExportRequest::patient();
+    let ids = ["p1".to_string()];
+    let mut exported = std::collections::BTreeMap::new();
+    for resource_type in [
+        "AllergyIntolerance",
+        "Observation",
+        "Patient",
+        "Organization",
+    ] {
+        let batch = harness
+            .backend
+            .fetch_patient_compartment_batch(&tenant, &request, resource_type, &ids, None, 100)
+            .await
+            .unwrap();
+        let mut found: Vec<String> = batch
+            .lines
+            .iter()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        found.sort();
+        exported.insert(resource_type, found);
+    }
+    assert_eq!(exported["AllergyIntolerance"], ["recorded"]);
+    assert_eq!(exported["Observation"], ["about", "performed"]);
+    assert_eq!(exported["Patient"], ["linked", "p1"]);
+    assert!(exported["Organization"].is_empty());
+}
