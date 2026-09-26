@@ -1325,6 +1325,18 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_REINDEX_BATCH_BYTES", default_value = "33554432")]
     pub reindex_batch_bytes: u64,
 
+    /// Concurrent insert streams per resource type in the automatic
+    /// post-import rebuild, standalone MongoDB only (#1403). Each stream walks
+    /// its own contiguous id range, then one catch-up pass runs. `1` (the
+    /// default) is the single walk. Values above 16 are clamped, and the
+    /// backend lowers it to fit `HFS_MONGODB_MAX_CONNECTIONS` (2 connections
+    /// per stream per concurrent rebuild, plus 2). A type split across
+    /// streams never pages uncapped: with `HFS_REINDEX_BATCH_BYTES=0` its
+    /// pages are capped at 32 MiB. Ignored by other backends and by
+    /// `POST $reindex`.
+    #[arg(long, env = "HFS_REINDEX_WRITE_STREAMS", default_value = "1")]
+    pub reindex_write_streams: u32,
+
     /// Enable SQL-on-FHIR operations ($sql-run, $sql-export).
     /// When enabled, the configured storage backend MUST provide an in-DB
     /// SOF runner (sqlite or postgres) — there is no in-process fallback.
@@ -1600,6 +1612,7 @@ impl Default for ServerConfig {
             elasticsearch_reindex_refresh: None,
             reindex_batch_size: 1000,
             reindex_batch_bytes: 32 * 1024 * 1024,
+            reindex_write_streams: 1,
             sof_enabled: true,
             ui_enabled: true,
             dashboard_reconcile_interval_secs: 30,
@@ -1870,6 +1883,7 @@ impl ServerConfig {
             elasticsearch_reindex_refresh: None,
             reindex_batch_size: 1000,
             reindex_batch_bytes: 32 * 1024 * 1024,
+            reindex_write_streams: 1,
             sof_enabled: true,
             ui_enabled: true,
             dashboard_reconcile_interval_secs: 30,
@@ -2478,6 +2492,22 @@ mod tests {
             assert_eq!(config.reindex_batch_bytes, 32 * 1024 * 1024);
             assert_eq!(config.elasticsearch_bulk_concurrency, 1);
         }
+    }
+
+    #[test]
+    fn test_reindex_write_streams_default_and_flag() {
+        let parsed = ServerConfig::try_parse_from(["rest-server"]).unwrap();
+        for config in [parsed, ServerConfig::default(), ServerConfig::for_testing()] {
+            assert_eq!(config.reindex_write_streams, 1);
+        }
+        let parsed =
+            ServerConfig::try_parse_from(["rest-server", "--reindex-write-streams", "4"]).unwrap();
+        assert_eq!(parsed.reindex_write_streams, 4);
+        assert!(parsed.validate().is_ok());
+        assert!(
+            ServerConfig::try_parse_from(["rest-server", "--reindex-write-streams", "many"])
+                .is_err()
+        );
     }
 
     /// The CLI default of the rebuild page is the persistence constant the

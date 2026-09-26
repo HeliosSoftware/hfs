@@ -1950,6 +1950,7 @@ fn build_automatic_reindex_hook(
     )
     .with_batch_size(config.reindex_batch_size)
     .with_batch_bytes(config.reindex_batch_bytes)
+    .with_write_streams(config.reindex_write_streams)
     .with_bulk_index_rebuild(config.bulk_submit.bulk_index_rebuild);
     match ledger {
         Some(ledger) => hook.with_ledger(ledger),
@@ -3917,6 +3918,32 @@ mod tests {
 
         let hook = build_automatic_reindex_hook(op, &config, None);
         assert_eq!(hook.batch_bytes(), 32 * 1024 * 1024);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn test_automatic_reindex_hook_gets_the_write_streams_setting() {
+        use clap::Parser;
+
+        let backend = Arc::new(
+            create_sqlite_backend(&ServerConfig {
+                database_url: Some(":memory:".to_string()),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let registries = backend.tenant_registries().clone();
+        let op = Arc::new(ReindexOperation::new(backend, registries));
+
+        for (args, expected) in [
+            (vec!["rest-server"], 1),
+            (vec!["rest-server", "--reindex-write-streams", "4"], 4),
+            (vec!["rest-server", "--reindex-write-streams", "40"], 16),
+        ] {
+            let config = ServerConfig::try_parse_from(args.clone()).unwrap();
+            let hook = build_automatic_reindex_hook(op.clone(), &config, None);
+            assert_eq!(hook.write_streams(), expected, "{args:?}");
+        }
     }
 
     // ── create_sqlite_backend() ───────────────────────────────────
