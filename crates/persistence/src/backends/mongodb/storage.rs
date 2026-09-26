@@ -1,6 +1,7 @@
 //! ResourceStorage implementation for MongoDB.
 
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -26,7 +27,7 @@ use crate::error::{
 };
 use crate::search::converters::IndexValue;
 use crate::search::extractor::ExtractedValue;
-use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
+use crate::search::reindex::{ReindexPageStats, ReindexSource, ReindexTarget, ResourcePage};
 use crate::tenant::{Operation, TenantContext};
 use crate::types::{
     CursorValue, Page, PageCursor, PageInfo, SearchParamType, SearchParameter, SearchPrefix,
@@ -5223,14 +5224,17 @@ impl ReindexTarget for MongoBackend {
     /// just the document(s) it names, via the same per-op index mapping the
     /// batched bulk-submit ingest uses (`bulk_ingest.rs`'s create-batch path)
     /// and that Elasticsearch's `send_bulk_index` uses for the same purpose.
-    async fn write_search_entries_page(
+    async fn write_search_entries_page_timed(
         &self,
         tenant: &TenantContext,
         resources: &[StoredResource],
+        stats: &mut ReindexPageStats,
     ) -> Vec<StorageResult<usize>> {
         if resources.is_empty() {
             return Vec::new();
         }
+
+        let _page_span = crate::perf::span(crate::perf::Phase::ReindexPage);
 
         // Honors `is_search_offloaded()`, matching the guards in
         // `delete_search_entries` and `write_search_entries`/`clear_search_index`
@@ -5257,6 +5261,7 @@ impl ReindexTarget for MongoBackend {
             docs: SearchIndexDocuments,
             failure: Option<String>,
         }
+        let extract_started = Instant::now();
         let prepared: Vec<Prepared> = resources
             .iter()
             .map(|resource| {
@@ -5269,6 +5274,9 @@ impl ReindexTarget for MongoBackend {
                 Prepared { docs, failure }
             })
             .collect();
+        let extract_time = extract_started.elapsed();
+        stats.extract += extract_time;
+        crate::perf::record_duration(crate::perf::Phase::ReindexExtract, extract_time);
 
         let collection = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
         let contained_collection =
@@ -5288,27 +5296,39 @@ impl ReindexTarget for MongoBackend {
                 .or_default()
                 .push(Bson::from(resource.id()));
         }
+        let delete_started = Instant::now();
         for (resource_type, ids) in ids_by_type {
             let filter = doc! {
                 "tenant_id": tenant_id,
                 "resource_type": resource_type,
                 "resource_id": { "$in": ids },
             };
-            if let Err(e) = collection.delete_many(filter.clone()).await {
-                let msg = format!("Failed to delete search entries: {e}");
-                return resources
-                    .iter()
-                    .map(|_| Err(internal_error(msg.clone())))
-                    .collect();
+            match collection.delete_many(filter.clone()).await {
+                Ok(result) => stats.deleted_entries += result.deleted_count,
+                Err(e) => {
+                    stats.delete += delete_started.elapsed();
+                    let msg = format!("Failed to delete search entries: {e}");
+                    return resources
+                        .iter()
+                        .map(|_| Err(internal_error(msg.clone())))
+                        .collect();
+                }
             }
-            if let Err(e) = contained_collection.delete_many(filter).await {
-                let msg = format!("Failed to delete search_index_contained entries: {e}");
-                return resources
-                    .iter()
-                    .map(|_| Err(internal_error(msg.clone())))
-                    .collect();
+            match contained_collection.delete_many(filter).await {
+                Ok(result) => stats.deleted_entries += result.deleted_count,
+                Err(e) => {
+                    stats.delete += delete_started.elapsed();
+                    let msg = format!("Failed to delete search_index_contained entries: {e}");
+                    return resources
+                        .iter()
+                        .map(|_| Err(internal_error(msg.clone())))
+                        .collect();
+                }
             }
         }
+        let delete_time = delete_started.elapsed();
+        stats.delete += delete_time;
+        crate::perf::record_duration(crate::perf::Phase::ReindexSearchDelete, delete_time);
 
         // Flatten every resource's own documents into one insert, chunked at
         // SEARCH_INDEX_INSERT_CHUNK, tracking which resource each document
@@ -5324,14 +5344,18 @@ impl ReindexTarget for MongoBackend {
             }
         }
 
-        let mut insert_failures = match insert_search_entries_chunk(
+        let insert_started = Instant::now();
+        let own_result = insert_search_entries_chunk(
             &collection,
             &own_owners,
             &own_docs,
             "Failed to insert search index entries",
+            stats,
         )
-        .await
-        {
+        .await;
+        let mut insert_time = insert_started.elapsed();
+        stats.insert += insert_time;
+        let mut insert_failures = match own_result {
             Ok(failures) => failures,
             Err(msg) => {
                 return resources
@@ -5358,14 +5382,19 @@ impl ReindexTarget for MongoBackend {
         }
 
         if !contained_docs.is_empty() {
-            match insert_search_entries_chunk(
+            let contained_started = Instant::now();
+            let contained_result = insert_search_entries_chunk(
                 &contained_collection,
                 &contained_owners,
                 &contained_docs,
                 "Failed to insert search_index_contained entries",
+                stats,
             )
-            .await
-            {
+            .await;
+            let contained_time = contained_started.elapsed();
+            stats.insert += contained_time;
+            insert_time += contained_time;
+            match contained_result {
                 Ok(failures) => {
                     for (owner, msg) in failures {
                         insert_failures.entry(owner).or_insert(msg);
@@ -5380,6 +5409,12 @@ impl ReindexTarget for MongoBackend {
             }
         }
 
+        crate::perf::record_duration(crate::perf::Phase::ReindexSearchInsert, insert_time);
+        crate::perf::add_rows(
+            crate::perf::Phase::ReindexSearchInsert,
+            (own_docs.len() + contained_docs.len()) as u64,
+        );
+
         prepared
             .into_iter()
             .enumerate()
@@ -5391,6 +5426,18 @@ impl ReindexTarget for MongoBackend {
                 },
             })
             .collect()
+    }
+
+    /// Delegates to [`Self::write_search_entries_page_timed`] with a
+    /// throwaway `ReindexPageStats`, so the two cannot diverge (#1403).
+    async fn write_search_entries_page(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+    ) -> Vec<StorageResult<usize>> {
+        let mut stats = ReindexPageStats::default();
+        self.write_search_entries_page_timed(tenant, resources, &mut stats)
+            .await
     }
 }
 
@@ -5415,16 +5462,20 @@ const SEARCH_INDEX_INSERT_CHUNK: usize = 5_000;
 /// that, not as "Failed to insert search index entries" regardless of which
 /// collection actually failed). A page-level error — one the driver did not
 /// attribute to specific documents — is returned as `Err`, for the caller to
-/// fan out to every resource in the page.
+/// fan out to every resource in the page. Also counts each command it issues,
+/// and the documents in it, into `stats` (#1403).
 async fn insert_search_entries_chunk(
     collection: &mongodb::Collection<Document>,
     owners: &[usize],
     docs: &[Document],
     error_context: &str,
+    stats: &mut ReindexPageStats,
 ) -> Result<HashMap<usize, String>, String> {
     let mut insert_failures: HashMap<usize, String> = HashMap::new();
     let mut offset = 0usize;
     for chunk in docs.chunks(SEARCH_INDEX_INSERT_CHUNK) {
+        stats.insert_commands += 1;
+        stats.inserted_entries += chunk.len() as u64;
         match collection.insert_many(chunk).ordered(false).await {
             Ok(_) => {}
             Err(e) => match e.kind.as_ref() {
