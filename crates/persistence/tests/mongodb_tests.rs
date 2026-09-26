@@ -1194,9 +1194,20 @@ fn storage_err_is_mongo_unavailable(err: &StorageError) -> bool {
 /// A short bounded retry absorbs a transient dropped handshake ("unexpected end
 /// of file") that can hit `createCollection`/`createIndexes` (not retryable
 /// writes) under load, without masking real bugs — those fail every attempt.
-async fn build_backend(mut config: MongoBackendConfig) -> Option<MongoBackend> {
+async fn build_backend(config: MongoBackendConfig) -> Option<MongoBackend> {
+    build_backend_with_pool(config, TEST_BACKEND_MAX_POOL).await
+}
+
+/// [`build_backend`] with the pool capped at `max_pool` instead of
+/// [`TEST_BACKEND_MAX_POOL`]. The `$reindex` write-stream tests pass a larger
+/// pool: a rebuild's stream budget is `(max_connections - 2) / 2`, so at the
+/// suite-wide cap every plan would be a single walk (#1403).
+async fn build_backend_with_pool(
+    mut config: MongoBackendConfig,
+    max_pool: u32,
+) -> Option<MongoBackend> {
     const MAX_ATTEMPTS: u32 = 3;
-    config.max_connections = config.max_connections.min(TEST_BACKEND_MAX_POOL);
+    config.max_connections = config.max_connections.min(max_pool);
     // Generation-2 indexes are built after boot by default; tests assert
     // winning plans right after boot, so they wait for the build.
     config.index_build = IndexBuildMode::Inline;

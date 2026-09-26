@@ -26,7 +26,9 @@ use crate::error::{
 };
 use crate::search::converters::IndexValue;
 use crate::search::extractor::ExtractedValue;
-use crate::search::reindex::{ReindexPageStats, ReindexSource, ReindexTarget, ResourcePage};
+use crate::search::reindex::{
+    ReindexPageStats, ReindexSource, ReindexTarget, ResourcePage, TypeWalkPlan, TypeWalkRequest,
+};
 use crate::tenant::{Operation, TenantContext};
 use crate::types::{
     CursorValue, Page, PageCursor, PageInfo, SearchParamType, SearchQuery, StoredResource,
@@ -4781,6 +4783,34 @@ fn log_capped_page_read(tenant_id: &str, resource_type: &str, found: &ReindexFou
     );
 }
 
+/// Logs INFO `mongodb reindex streams planned` (#1403). Fields, in order:
+/// `tenant, resource_type, requested, allowed, resources, streams, plan_ms`.
+/// `allowed` is what the connection pool admits; `resources` is the type's
+/// count on `idx_resources_identity`, tombstones included (0 when the pool
+/// alone settled on one stream, before counting); `streams` is the number of
+/// ranges the plan returns, 1 for a single walk; `plan_ms` is the planning
+/// time in whole milliseconds, truncated.
+fn log_streams_planned(
+    tenant_id: &str,
+    resource_type: &str,
+    request: TypeWalkRequest,
+    allowed: u32,
+    resources: u64,
+    streams: usize,
+    plan: std::time::Duration,
+) {
+    tracing::info!(
+        tenant = %tenant_id,
+        resource_type = %resource_type,
+        requested = u64::from(request.streams),
+        allowed = u64::from(allowed),
+        resources = resources,
+        streams = streams as u64,
+        plan_ms = u64::try_from(plan.as_millis()).unwrap_or(u64::MAX),
+        "mongodb reindex streams planned"
+    );
+}
+
 impl MongoBackend {
     /// The newest-live probe (#1403): a covered reverse scan of
     /// `idx_resources_type_scan` for the `last_updated` of the newest live
@@ -5009,6 +5039,58 @@ impl MongoBackend {
                 Ok(ResourcePage::default())
             }
         }
+    }
+
+    /// The first id of every range but the first (#1403): chained, covered
+    /// probes of `idx_resources_identity`, each skipping one range's worth of
+    /// keys past the previous boundary, so a whole plan reads about one pass
+    /// of the type's identity keys (a single `skip` from the start for each
+    /// boundary would read about half as many again at four streams). Fewer
+    /// boundaries come back only when the type shrank since it was counted.
+    /// Boundaries decide balance only: whatever they are, every id falls in
+    /// exactly one range. `distinct` with a hint needs MongoDB 7.1, so it is
+    /// not used.
+    async fn reindex_range_boundaries(
+        &self,
+        resources: &Collection<Document>,
+        tenant_id: &str,
+        resource_type: &str,
+        counted: u64,
+        streams: u32,
+    ) -> StorageResult<Vec<String>> {
+        let step = counted / u64::from(streams.max(1));
+        let mut boundaries: Vec<String> = Vec::new();
+        for _ in 1..streams {
+            let (filter, skip) = match boundaries.last() {
+                None => (
+                    doc! { "tenant_id": tenant_id, "resource_type": resource_type },
+                    step,
+                ),
+                Some(previous) => (
+                    doc! {
+                        "tenant_id": tenant_id,
+                        "resource_type": resource_type,
+                        "id": { "$gt": previous.as_str() },
+                    },
+                    step.saturating_sub(1),
+                ),
+            };
+            let found = resources
+                .find_one(filter)
+                .sort(doc! { "id": 1 })
+                .skip(skip)
+                .projection(doc! { "_id": 0, "id": 1 })
+                .hint(Hint::Name(RESOURCES_IDENTITY_INDEX.to_string()))
+                .await
+                .map_err(|e| {
+                    internal_error(format!("Failed to probe a reindex range boundary: {e}"))
+                })?;
+            match found.as_ref().and_then(|doc| doc.get_str("id").ok()) {
+                Some(id) => boundaries.push(id.to_string()),
+                None => break,
+            }
+        }
+        Ok(boundaries)
     }
 
     /// Pages `resource_type` in id order with catch-up rounds (#1403), bounded
@@ -5432,6 +5514,114 @@ impl ReindexSource for MongoBackend {
                 .map(Some),
             _ => Ok(None),
         }
+    }
+
+    /// Splits a type into up to `request.streams` contiguous id ranges, one
+    /// write stream each (#1403). Only standalone MongoDB splits: with search
+    /// offloaded to Elasticsearch the walk stays whole. The streams fit the
+    /// connection pool — 2 connections per stream (one write, one prefetch)
+    /// for each concurrent rebuild, plus 2 for foreground requests; the first
+    /// time the pool lowers the request, one WARN says so — and each covers
+    /// at least `request.min_resources_per_stream` resources. The floor is
+    /// fixed once, before the ranges are cut; every range walks the live
+    /// resources stamped before it, and the catch-up cursor runs the catch-up
+    /// rounds from that floor once every range has been written.
+    async fn plan_type_walk(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        request: TypeWalkRequest,
+    ) -> StorageResult<TypeWalkPlan> {
+        let tenant_id = tenant.tenant_id().as_str();
+        if self.is_search_offloaded() {
+            tracing::debug!(
+                tenant = %tenant_id,
+                resource_type = %resource_type,
+                "mongodb reindex streams skipped"
+            );
+            return Ok(TypeWalkPlan::Single);
+        }
+        if request.streams <= 1 {
+            return Ok(TypeWalkPlan::Single);
+        }
+        let started = std::time::Instant::now();
+        let allowed = reindex_stream_budget(self.config().max_connections, request.concurrent_runs);
+        let streams = request.streams.min(allowed);
+        if streams < request.streams
+            && !self
+                .reindex_streams_clamp_warned()
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            let needed =
+                2 * u64::from(request.streams) * u64::from(request.concurrent_runs.max(1)) + 2;
+            tracing::warn!(
+                tenant = %tenant_id,
+                resource_type = %resource_type,
+                "HFS_REINDEX_WRITE_STREAMS={} needs HFS_MONGODB_MAX_CONNECTIONS ≥ {}; using {}",
+                request.streams,
+                needed,
+                streams
+            );
+        }
+        if streams <= 1 {
+            log_streams_planned(
+                tenant_id,
+                resource_type,
+                request,
+                allowed,
+                0,
+                1,
+                started.elapsed(),
+            );
+            return Ok(TypeWalkPlan::Single);
+        }
+
+        let db = self.get_database().await?;
+        let resources: Collection<Document> = db.collection(MongoBackend::RESOURCES_COLLECTION);
+        let counted = resources
+            .count_documents(doc! { "tenant_id": tenant_id, "resource_type": resource_type })
+            .hint(Hint::Name(RESOURCES_IDENTITY_INDEX.to_string()))
+            .await
+            .map_err(|e| {
+                internal_error(format!("Failed to count resources for a reindex plan: {e}"))
+            })?;
+        let streams = streams.min(reindex_streams_for_size(
+            counted,
+            request.min_resources_per_stream,
+        ));
+        if streams <= 1 {
+            log_streams_planned(
+                tenant_id,
+                resource_type,
+                request,
+                allowed,
+                counted,
+                1,
+                started.elapsed(),
+            );
+            return Ok(TypeWalkPlan::Single);
+        }
+
+        let floor = self
+            .reindex_walk_floor(&resources, tenant_id, resource_type)
+            .await?;
+        let boundaries = self
+            .reindex_range_boundaries(&resources, tenant_id, resource_type, counted, streams)
+            .await?;
+        let ranges = reindex_id_range_cursors(floor, &boundaries);
+        log_streams_planned(
+            tenant_id,
+            resource_type,
+            request,
+            allowed,
+            counted,
+            ranges.len(),
+            started.elapsed(),
+        );
+        Ok(TypeWalkPlan::Ranges {
+            ranges,
+            catch_up: ReindexWalkCursor::IdPhaseDone { floor }.encode(),
+        })
     }
 }
 
@@ -6019,6 +6209,56 @@ fn reindex_id_range_page_filter(
         filter.insert("id", id);
     }
     filter
+}
+
+/// Streams one rebuild may run so that every concurrent automatic rebuild
+/// together keeps 2 connections per stream (one write, one prefetch) and
+/// leaves 2 for foreground requests (#1403). Never below 1.
+fn reindex_stream_budget(max_connections: u32, concurrent_runs: u32) -> u32 {
+    let per_stream = 2u32.saturating_mul(concurrent_runs.max(1));
+    (max_connections.saturating_sub(2) / per_stream).max(1)
+}
+
+/// Most streams a type of `resources` rows (tombstones included) can use when
+/// each must cover at least `min_per_stream` of them; never below 1 (#1403).
+fn reindex_streams_for_size(resources: u64, min_per_stream: u64) -> u32 {
+    u32::try_from(resources / min_per_stream.max(1))
+        .unwrap_or(u32::MAX)
+        .max(1)
+}
+
+/// Encodes the ranges `boundaries` cut a type into (#1403): `[.., b1)`,
+/// `[b1, b2)`, …, `[bm, ..)`, each over live resources stamped before
+/// `floor`; no boundary is one unbounded range. Every id falls in exactly one.
+fn reindex_id_range_cursors(floor: DateTime<Utc>, boundaries: &[String]) -> Vec<String> {
+    let mut cursors = Vec::with_capacity(boundaries.len() + 1);
+    let mut lo: Option<String> = None;
+    for boundary in boundaries {
+        cursors.push(
+            ReindexWalkCursor::IdRange {
+                range: ReindexIdRange {
+                    floor,
+                    lo: lo.clone(),
+                    hi: Some(boundary.clone()),
+                },
+                after_id: None,
+            }
+            .encode(),
+        );
+        lo = Some(boundary.clone());
+    }
+    cursors.push(
+        ReindexWalkCursor::IdRange {
+            range: ReindexIdRange {
+                floor,
+                lo,
+                hi: None,
+            },
+            after_id: None,
+        }
+        .encode(),
+    );
+    cursors
 }
 
 /// A catch-up round's filter over `[floor, ceiling)`, keyset on
@@ -6944,7 +7184,7 @@ mod reindex_prefetch_tests {
     /// backend built in this module uses this instead, even where the code
     /// path never actually calls the database today, in case a future change
     /// moves a database call earlier (#1403).
-    fn unreachable_config() -> MongoBackendConfig {
+    pub(super) fn unreachable_config() -> MongoBackendConfig {
         MongoBackendConfig {
             connection_string: "mongodb://127.0.0.1:1".to_string(),
             server_selection_timeout_ms: 500,
@@ -7064,6 +7304,138 @@ mod reindex_prefetch_tests {
         assert!(
             result.is_none(),
             "the catch-up's first cursor must never be fetched ahead"
+        );
+    }
+}
+
+#[cfg(test)]
+mod reindex_streams_tests {
+    //! Docker-free tests for #1403's stream plan: the pure budget, size and
+    //! range rules, and the plan's early returns, none of which reaches the
+    //! database.
+
+    use super::reindex_prefetch_tests::unreachable_config;
+    use super::*;
+    use crate::backends::mongodb::MongoBackendConfig;
+    use crate::search::reindex::ReindexSource;
+    use crate::tenant::{TenantId, TenantPermissions};
+
+    fn tenant() -> TenantContext {
+        TenantContext::new(
+            TenantId::new("streams-unit-tenant"),
+            TenantPermissions::full_access(),
+        )
+    }
+
+    fn request(streams: u32) -> TypeWalkRequest {
+        TypeWalkRequest {
+            streams,
+            min_resources_per_stream: 1,
+            concurrent_runs: 1,
+        }
+    }
+
+    #[test]
+    fn reindex_stream_budget_cases() {
+        assert_eq!(reindex_stream_budget(0, 1), 1);
+        assert_eq!(reindex_stream_budget(1, 1), 1);
+        assert_eq!(reindex_stream_budget(4, 1), 1);
+        assert_eq!(reindex_stream_budget(6, 1), 2);
+        assert_eq!(reindex_stream_budget(10, 1), 4);
+        assert_eq!(reindex_stream_budget(10, 2), 2);
+        assert_eq!(reindex_stream_budget(18, 2), 4);
+        assert!(reindex_stream_budget(u32::MAX, 0) >= 16);
+    }
+
+    #[test]
+    fn reindex_streams_for_size_cases() {
+        assert_eq!(reindex_streams_for_size(0, 50_000), 1);
+        assert_eq!(reindex_streams_for_size(99_999, 50_000), 1);
+        assert_eq!(reindex_streams_for_size(100_000, 50_000), 2);
+        assert_eq!(reindex_streams_for_size(400_000, 50_000), 8);
+        assert_eq!(reindex_streams_for_size(10, 0), 10);
+        assert_eq!(reindex_streams_for_size(u64::MAX, 1), u32::MAX);
+    }
+
+    #[test]
+    fn id_range_cursors_cover_the_boundaries_in_order() {
+        let floor = DateTime::parse_from_rfc3339("2026-01-01T00:00:00.000Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let range = |lo: Option<&str>, hi: Option<&str>| ReindexWalkCursor::IdRange {
+            range: ReindexIdRange {
+                floor,
+                lo: lo.map(str::to_string),
+                hi: hi.map(str::to_string),
+            },
+            after_id: None,
+        };
+        let parsed: Vec<ReindexWalkCursor> =
+            reindex_id_range_cursors(floor, &["m".to_string(), "t".to_string()])
+                .iter()
+                .map(|c| ReindexWalkCursor::parse(c).unwrap())
+                .collect();
+        assert_eq!(
+            parsed,
+            vec![
+                range(None, Some("m")),
+                range(Some("m"), Some("t")),
+                range(Some("t"), None)
+            ]
+        );
+        assert_eq!(
+            reindex_id_range_cursors(floor, &[]),
+            vec![range(None, None).encode()]
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_type_walk_is_single_when_search_is_offloaded() {
+        let backend = MongoBackend::new(MongoBackendConfig {
+            search_offloaded: true,
+            ..unreachable_config()
+        })
+        .expect("lazy client");
+        let plan = backend
+            .plan_type_walk(&tenant(), "Observation", request(4))
+            .await
+            .expect("no database call");
+        assert_eq!(plan, TypeWalkPlan::Single);
+    }
+
+    #[tokio::test]
+    async fn plan_type_walk_is_single_for_one_stream() {
+        let backend = MongoBackend::new(unreachable_config()).expect("lazy client");
+        let plan = backend
+            .plan_type_walk(&tenant(), "Observation", request(1))
+            .await
+            .expect("no database call");
+        assert_eq!(plan, TypeWalkPlan::Single);
+    }
+
+    #[tokio::test]
+    async fn plan_type_walk_fits_the_pool_before_any_query() {
+        let backend = MongoBackend::new(MongoBackendConfig {
+            max_connections: 4,
+            ..unreachable_config()
+        })
+        .expect("lazy client");
+        assert!(
+            !backend
+                .reindex_streams_clamp_warned()
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        for _ in 0..2 {
+            let plan = backend
+                .plan_type_walk(&tenant(), "Observation", request(4))
+                .await
+                .expect("a pool of 4 admits one stream, decided before any query");
+            assert_eq!(plan, TypeWalkPlan::Single);
+        }
+        assert!(
+            backend
+                .reindex_streams_clamp_warned()
+                .load(std::sync::atomic::Ordering::Relaxed)
         );
     }
 }

@@ -32,15 +32,27 @@ async fn create_backend_with(
     test_name: &str,
     configure: impl FnOnce(&mut MongoBackendConfig),
 ) -> Option<Arc<MongoBackend>> {
+    create_backend_with_pool(test_name, TEST_BACKEND_MAX_POOL, configure).await
+}
+
+/// [`create_backend_with`] with the connection pool set to, and capped at,
+/// `pool` instead of the suite-wide [`TEST_BACKEND_MAX_POOL`]; the `$reindex`
+/// write-stream tests need room for more than one stream (#1403).
+pub(super) async fn create_backend_with_pool(
+    test_name: &str,
+    pool: u32,
+    configure: impl FnOnce(&mut MongoBackendConfig),
+) -> Option<Arc<MongoBackend>> {
     let connection_string = shared_mongo::connection_string().await?;
     let mut config = MongoBackendConfig {
         connection_string,
         database_name: build_test_database_name(test_name),
         data_dir: Some(repo_data_dir()),
+        max_connections: pool,
         ..Default::default()
     };
     configure(&mut config);
-    build_backend(config).await.map(Arc::new)
+    build_backend_with_pool(config, pool).await.map(Arc::new)
 }
 
 /// Builds a `MongoBackend` with the catch-up margin shortened to 1 s, so a

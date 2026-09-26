@@ -108,6 +108,9 @@ pub struct MongoBackend {
     /// Whether `mongodb reindex writer configuration` has already been logged
     /// for this instance (#1403).
     reindex_mode_logged: std::sync::atomic::AtomicBool,
+    /// Whether the `HFS_REINDEX_WRITE_STREAMS` clamp warning has already been
+    /// logged for this instance (#1403).
+    reindex_streams_clamp_warned: std::sync::atomic::AtomicBool,
     /// `(resources, docs)` of each resource type's previous successful
     /// overlapped page, for the sub-batch planner's seed (#1403).
     reindex_docs_per_resource: std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>>,
@@ -180,6 +183,12 @@ impl MongoBackend {
     /// for this backend instance (#1403).
     pub(super) fn reindex_mode_logged(&self) -> &std::sync::atomic::AtomicBool {
         &self.reindex_mode_logged
+    }
+
+    /// Whether the `HFS_REINDEX_WRITE_STREAMS` clamp warning has already been
+    /// logged for this backend instance (#1403).
+    pub(super) fn reindex_streams_clamp_warned(&self) -> &std::sync::atomic::AtomicBool {
+        &self.reindex_streams_clamp_warned
     }
 }
 
@@ -477,6 +486,7 @@ impl MongoBackend {
             prepare_pool: std::sync::OnceLock::new(),
             prepare_gate: tokio::sync::Semaphore::new(1),
             reindex_mode_logged: std::sync::atomic::AtomicBool::new(false),
+            reindex_streams_clamp_warned: std::sync::atomic::AtomicBool::new(false),
             reindex_docs_per_resource: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
