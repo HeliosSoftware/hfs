@@ -177,6 +177,75 @@ fn search_resources_in_transaction(
     Ok(results)
 }
 
+/// Count the resources in `table` matching `query`, ignoring `_count` and
+/// `_offset`, so a searchset Bundle can report the full match count.
+///
+/// Uses the same predicates as the search paths: exact `url`/`version`/
+/// `status` in SQL and, when present, FHIR string matching of `name`/`title`
+/// over the metadata rows.
+fn count_resources(
+    conn: &rusqlite::Connection,
+    table: &str,
+    query: &ResourceSearchQuery,
+) -> Result<u64, HtsError> {
+    let search = ResourceStringSearch::new(query);
+    let params = rusqlite::params![
+        query.url.as_deref(),
+        query.version.as_deref(),
+        query.status.as_deref()
+    ];
+    let filter = "WHERE (?1 IS NULL OR url = ?1)
+           AND (?2 IS NULL OR version = ?2)
+           AND (?3 IS NULL OR status = ?3)";
+
+    if search.is_empty() {
+        let count: i64 = conn
+            .prepare_cached(&format!("SELECT COUNT(*) FROM {table} {filter}"))
+            .and_then(|mut statement| statement.query_row(params, |row| row.get(0)))
+            .map_err(|error| HtsError::StorageError(error.to_string()))?;
+        return Ok(count.max(0) as u64);
+    }
+
+    let mut statement = conn
+        .prepare_cached(&format!("SELECT name, title FROM {table} {filter}"))
+        .map_err(|error| HtsError::StorageError(error.to_string()))?;
+    let rows = statement
+        .query_map(params, |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        })
+        .map_err(|error| HtsError::StorageError(error.to_string()))?;
+    let mut count = 0;
+    for row in rows {
+        let (name, title) = row.map_err(|error| HtsError::StorageError(error.to_string()))?;
+        if search.matches(name.as_deref(), title.as_deref()) {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+impl SqliteTerminologyBackend {
+    /// Async wrapper around [`count_resources`] for the per-type search traits.
+    pub(super) async fn count_search_matches(
+        &self,
+        table: &'static str,
+        query: ResourceSearchQuery,
+    ) -> Result<u64, HtsError> {
+        let pool = self.pool().clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = pool
+                .get()
+                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            count_resources(&conn, table, &query)
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
+    }
+}
+
 /// Insert `(key, value)` into a bounded cache, evicting one existing entry when
 /// the map is already at `max` capacity.
 ///
