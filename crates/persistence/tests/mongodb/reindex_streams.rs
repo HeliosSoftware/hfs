@@ -32,19 +32,21 @@ fn ids_of(page: &ResourcePage) -> Vec<String> {
 
 /// Pages one Observation walk from `cursor` to its end, checking the walk's
 /// page contract on the way: every page with a next cursor holds at least
-/// one resource, and the walk ends on one empty page with none. Returns every
-/// id, in fetch order.
+/// one resource, and the walk ends on one empty page with none. Returns the
+/// ids of each page that had a next cursor, in fetch order — the empty page
+/// that ends the walk contributes no entry.
 async fn walk_ids(
     backend: &MongoBackend,
     tenant: &TenantContext,
     cursor: &str,
     limit: u32,
-) -> Vec<String> {
-    let mut ids = Vec::new();
+    max_bytes: u64,
+) -> Vec<Vec<String>> {
+    let mut pages = Vec::new();
     let mut cursor = cursor.to_string();
-    for _ in 0..500 {
+    for _ in 0..1000 {
         let page = backend
-            .fetch_resources_page_capped(tenant, "Observation", Some(&cursor), limit, 0)
+            .fetch_resources_page_capped(tenant, "Observation", Some(&cursor), limit, max_bytes)
             .await
             .unwrap();
         let page_ids = ids_of(&page);
@@ -54,16 +56,16 @@ async fn walk_ids(
                     !page_ids.is_empty(),
                     "a page with a next cursor must hold a resource"
                 );
-                ids.extend(page_ids);
+                pages.push(page_ids);
                 cursor = next;
             }
             None => {
                 assert!(page_ids.is_empty(), "a walk ends on one empty page");
-                return ids;
+                return pages;
             }
         }
     }
-    panic!("the walk from {cursor} did not end within 500 pages");
+    panic!("the walk from {cursor} did not end within 1000 pages");
 }
 
 #[tokio::test]
@@ -80,7 +82,9 @@ async fn mongodb_id_range_cursors_partition_the_id_phase() {
     let bounds = [("", "obs-020"), ("obs-020", "obs-040"), ("obs-040", "")];
     let mut seen = BTreeSet::new();
     for (lo, hi) in bounds {
-        let ids = walk_ids(&backend, &tenant, &range_cursor(lo, hi), 7).await;
+        let ids = walk_ids(&backend, &tenant, &range_cursor(lo, hi), 7, 0)
+            .await
+            .concat();
         assert!(!ids.is_empty(), "[{lo}, {hi}) is empty");
         assert!(
             ids.windows(2).all(|w| w[0] < w[1]),
@@ -163,10 +167,12 @@ async fn mongodb_id_phase_done_cursor_runs_the_catch_up_from_its_floor() {
 
     // The backdated fixture stamps Observation `i` at second `i % 3`, so a
     // catch-up from second 1 walks exactly the Observations of seconds 1 and 2.
-    let walked: BTreeSet<String> = walk_ids(&backend, &tenant, "v2|d|2020-01-01T00:00:01.000Z", 50)
-        .await
-        .into_iter()
-        .collect();
+    let walked: BTreeSet<String> =
+        walk_ids(&backend, &tenant, "v2|d|2020-01-01T00:00:01.000Z", 50, 0)
+            .await
+            .concat()
+            .into_iter()
+            .collect();
     let expected: BTreeSet<String> = fixture.live["Observation"]
         .iter()
         .filter(|id| {
