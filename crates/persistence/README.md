@@ -354,7 +354,7 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
 | [Batch Bundles](https://build.fhir.org/http.html#batch)                     | ✓      | ✓          | ✓       | ○         | ○     | ○             | ✓   |
 | [Transaction Bundles](https://build.fhir.org/http.html#transaction)         | ✓      | ✓          | ✓       | ✗         | ○     | ✗             | ◐   |
 | [Conditional Operations](https://build.fhir.org/http.html#cond-update)      | ✓      | ✓          | ✓       | ✗         | ○     | ○             | ✗   |
-| [Conditional Patch](https://build.fhir.org/http.html#patch)                 | ✓      | ✓          | ○       | ✗         | ○     | ○             | ✗   |
+| [Conditional Patch](https://build.fhir.org/http.html#patch)                 | ✓      | ✓          | ✓       | ✗         | ○     | ○             | ✗   |
 | [Delete History](https://build.fhir.org/http.html#delete)                   | ✓      | ✓          | ○       | ✗         | ○     | ✗             | ✗   |
 | Per-User Settings (`/_user/settings`)                                       | ✓      | ✓          | ✓       | ✗         | ✗     | ✗             | ✓   |
 | **Multitenancy**                                                            |
@@ -434,7 +434,7 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
   each instance as one nested object with inline component values and matches with a single nested
   query. See `docs/search-spec-assessment.md`.
 
-The S3 backend is intentionally storage-focused (CRUD/version/history and the full `$bulk-submit` surface) and does not act as a full FHIR search engine. For bulk export, S3 can feed system-level batches through `ExportDataProvider` and can store output files through `S3OutputStore`, but export job state belongs to SQLite or PostgreSQL. `$bulk-submit` is different: S3 hosts its own job state, since the submission and manifest objects the ingestion engine writes *are* the job state — leases are compare-and-swapped against those objects' ETags, with a small cross-tenant index for claim/poll-token/TTL lookups. Patient-level and Group-level export compartment enumeration are not supported by S3 as the resource store. For query-heavy deployments, use a DB/search backend as primary query engine and compose S3 as archive/history/output storage.
+The S3 backend is intentionally storage-focused (CRUD/version/history and the full `$bulk-submit` surface) and does not act as a full FHIR search engine; the one conditional interaction it serves is an identifier-scoped conditional create (`_id` and `identifier` criteria, decided by reading the stored objects, #1435). For bulk export, S3 can feed system-level batches through `ExportDataProvider` and can store output files through `S3OutputStore`, but export job state belongs to SQLite or PostgreSQL. `$bulk-submit` is different: S3 hosts its own job state, since the submission and manifest objects the ingestion engine writes *are* the job state — leases are compare-and-swapped against those objects' ETags, with a small cross-tenant index for claim/poll-token/TTL lookups. Patient-level and Group-level export compartment enumeration are not supported by S3 as the resource store. For query-heavy deployments, use a DB/search backend as primary query engine and compose S3 as archive/history/output storage.
 
 **Multitenancy notes.** The four Multitenancy rows describe *where a tenant's records physically live*, not how strongly the boundary is enforced; a deployment sits in exactly one of the first three.
 
@@ -659,6 +659,8 @@ MongoDB remains the canonical write/read store while Elasticsearch owns delegate
 - MongoDB search index population is automatically disabled via `search_offloaded`
 - Composite routing preserves MongoDB as the source of truth for reads and writes
 
+> **MongoDB + Elasticsearch note:** with search offloaded, an in-transaction `ifNoneExist` is resolved by scanning the raw `resources` documents inside the transaction session. Only `_id`, `_lastUpdated` and plain `identifier` values (`code`, `|code`, or `system|code`, with a nonempty code) are evaluated; `|code` matches any system, same as Mongo direct search. Every other shape is rejected so the bundle rolls back instead of matching the wrong set (#1394).
+
 **Prerequisites:** Running MongoDB and Elasticsearch 8.x instances.
 
 ```bash
@@ -685,7 +687,7 @@ HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
 
 ### S3 + Elasticsearch
 
-S3 handles CRUD, versioning, history, and the whole `$bulk-submit` surface (ingestion and job state alike). Elasticsearch handles all search operations. For bulk export, this topology can use S3 as the resource data provider for system-level exports and `S3OutputStore` as the output-file store; export job state still lives in the configured SQLite or PostgreSQL bulk-export job store.
+S3 handles CRUD, versioning, history, and the whole `$bulk-submit` surface (ingestion and job state alike). Elasticsearch handles all search operations, and — since the S3 primary keeps no counts — the Home dashboard's totals, per-type breakdown and write marker (#1280); it keeps no history, so the dashboard's creation-time series is empty on this topology. For bulk export, this topology can use S3 as the resource data provider for system-level exports and `S3OutputStore` as the output-file store; export job state still lives in the configured SQLite or PostgreSQL bulk-export job store.
 
 - CRUD persistence via S3 objects (current pointer + immutable history versions)
 - Versioning (`vread`, optimistic locking via version checks)
@@ -927,6 +929,38 @@ Bulk submit objects:
 - Optimistic locking relies on version checks plus S3 preconditions (`If-Match`, `If-None-Match`) where applicable.
 - Transaction bundle behavior is best-effort: entries are applied sequentially, rollback is attempted in reverse order on failure, but rollback is not guaranteed under concurrent writes or partial failures.
 
+### Bulk Submit Result Receipts
+
+When a manifest finishes, its worker turns the stored per-entry results into `output` receipts — one
+NDJSON part per resource type, alphabetically ordered with a dense part index — plus a single
+aggregated `error` part. Those parts are built through temporary spool files rather than in-memory
+vectors, so a submission with millions of entries no longer grows the worker's heap with its whole
+receipt set. All backends share the same path.
+
+- Memory for receipt construction is `O(Pmax + Lmax + B + M)`. `Pmax` is the largest materialized
+  entry page in bytes; `Lmax` is the largest serialized entry in bytes; `B` is fixed I/O workspace,
+  including the local output writer; `M` is retained metadata in bytes for resource types, issue
+  severities, artifacts, and input files. Requesting at most 1000 results limits the row count,
+  not page or entry bytes. This change adds no per-entry size cap.
+- Up to 8 spool files stay open (64 KiB writer buffer each; the underlying Tokio file copy buffer and
+  the fixed replay chunk are each bounded by the same 64 KiB). The least recently written spool is
+  flushed and closed before another opens, so a manifest with more resource types than that never
+  widens the handle set. Replay opens one reader at a time, after every writer is closed.
+- Replay copies each spool to the output store in fixed 64 KiB chunks instead of re-serializing or
+  parsing rows, and assigns the part's line and byte counters from the spool bookkeeping those bytes
+  were counted with. A spool that does not replay exactly its counted bytes fails the manifest
+  rather than publishing counts that disagree with the artifact.
+- Spools live in a per-run temporary directory (`TMPDIR` picks its parent on Unix) that is removed when the
+  run ends, including on lease loss and cancellation. An abrupt process kill can leave one behind,
+  and disk use grows with the manifest's receipt bytes (rows plus one newline each) while it runs.
+
+This bounds the receipt path only, and is not a whole-process bound: a `deleted` file's references
+are still collected in memory, the S3 **primary** backend loads a manifest's stored results as one
+object, the S3 output store writes each part to a scratch file and then reads that whole file back
+into memory for the upload, and composite `finish_manifest` synchronization (including the
+`mongo-es`/`s3-es` wrappers) still materializes the resource set. The REST artifact download handler
+also reads the requested part into memory before returning it.
+
 ### AWS Credentials and Region
 
 Uses the AWS SDK for Rust ([`aws_sdk_s3`](https://docs.rs/aws-sdk-s3/latest/aws_sdk_s3/)) with standard provider chain:
@@ -998,11 +1032,14 @@ The suite is opt-in and env-gated:
 
 Optional overrides:
 
-- `MINIO_IMAGE` (default: `minio/minio`)
-- `MINIO_TAG` (default: `RELEASE.2025-02-28T09-55-16Z`)
+- `MINIO_IMAGE` (default: `ghcr.io/coollabsio/minio`)
+- `MINIO_TAG` (default: `RELEASE.2025-10-15T17-29-55Z`)
 - `MINIO_ROOT_USER` (default: `minioadmin`)
 - `MINIO_ROOT_PASSWORD` (default: `minioadmin`)
 - `HFS_MINIO_TEST_BUCKET` (if unset, tests auto-generate a unique bucket)
+
+The default GHCR image replaces the Quay image after anonymous pulls from Quay
+started returning 401 in CI ([run 36024486722](https://github.com/HeliosSoftware/hfs/actions/runs/36024486722)).
 
 Example:
 
@@ -1116,6 +1153,77 @@ The SQLite backend includes a complete FHIR search implementation using pre-comp
 - [x] `_include` and `_revinclude` resolution
 - [x] Cursor-based and offset pagination
 - [x] Single-field sorting
+
+**Number and quantity prefix semantics:**
+
+- `eq`/`ne` bound the *implicit-precision range* of the search value as
+  written: the number of significant decimals sets the range's width, so
+  `value=100` matches `[99.5, 100.5)` while `value=100.0` matches the
+  narrower `[99.95, 100.05)`. `ne` matches everything outside that range.
+- `gt`, `lt`, `ge`, `le`, `sa`, `eb` compare against the exact search value
+  and ignore its written precision, per the [FHIR number search
+  spec](https://hl7.org/fhir/R4/search.html#number): *"When a comparison
+  prefix in the set gt, lt, ge, le, sa & eb is provided, the implicit
+  precision of the number is ignored, and they are treated as if they have
+  arbitrarily high precision."* So `value-quantity=gt60` and
+  `value-quantity=gt60.0` are equivalent. On SQLite, PostgreSQL, and
+  Elasticsearch, quantity comparators additionally apply the rule after UCUM
+  unit conversion (e.g. `gt60|http://unitsofmeasure.org|kg` and
+  `gt60000|http://unitsofmeasure.org|g` are equivalent). MongoDB does not
+  perform UCUM conversion: it compares the raw stored quantity value against
+  the search value as written, and filters on the unit code verbatim, so on
+  MongoDB `gt60000|http://unitsofmeasure.org|g` matches nothing against data
+  stored as `kg`.
+- The eq/ne-vs-comparator precision rule itself (implicit-precision range for
+  `eq`/`ne`, exact value for the other comparators) is unified across
+  SQLite, PostgreSQL, Elasticsearch, and MongoDB. The exception is `ap`
+  (approximately equal), whose tolerance is not unified across backends.
+- Date parameters are unaffected by this rule and keep their own
+  calendar-precision range comparison.
+
+**Date prefix semantics (range targets, #1391):**
+
+- Every indexed date value is a range `[start, end)`. A point value such as
+  `birthDate` or `effectiveDateTime` runs to the end of its own precision
+  (`2020-03` is `[2020-03-01, 2020-04-01)`). A `Period`, and a `Timing`'s
+  `repeat.boundsPeriod`, is **one** range from its `start` to the end of its
+  `end` at that value's precision. A missing `start` or `end` is unbounded,
+  stored as the supported-range limit (year 1 / year 9999). One rule for all
+  four backends: a Period whose `start` or `end` is not a valid FHIR
+  date/dateTime (as the search grammar reads it, so minute precision is fine
+  but `2024-03-15T10Z` or `+0530` is not) is not indexed at all, rather than
+  read as open. Before #1391 each end was indexed as its own point and a
+  backend could be lenient about the format.
+- With search range `[s, e)` and indexed range `[ts, te)`, all four backends
+  apply the FHIR rules for range targets: `eq` `s ≤ ts ∧ te ≤ e`, `ne` its
+  negation, `gt` `te > e`, `lt` `ts < s`, `ge` `gt ∨ eq`, `le` `lt ∨ eq`,
+  `sa` `ts ≥ e`, `eb` `te ≤ s`. So `date=2020` no longer finds a Period that
+  merely starts or ends in 2020, and `date=gt2030` finds a Period with no end.
+- `ap` matches when the ranges overlap once the search range is widened by a
+  margin that follows its precision, shared by all backends: 1 year, 1 month,
+  1 day, 10 minutes, or 10 seconds for year, month, day, minute and
+  second-or-finer values.
+- Descending `_sort` on a date parameter orders by the largest range end.
+- SQLite keeps an index on the range end and start (`idx_search_date_end`, created by the
+  v35 migration) and adds the implied `end > start-bound` term to every group
+  that bounds the start, so `eq`, `gt` and `sa` seek instead of scanning the
+  parameter's rows (2M date rows: `eq` 0.9 s -> 0.1 s). Conditions that bound
+  only the start (`lt`, `ge`, `ne`, `ap`) still evaluate a normalizing
+  expression per row and are slower than before on very large
+  date slices (measured 1.3x-2.5x).
+- `_lastUpdated` and the date components of composite parameters are still
+  compared as points.
+- SQLite rows indexed before `value_date_precision` existed (or by the fallback
+  indexer) have no recorded precision, and a padded `T00:00:00` value cannot
+  say whether it was a year, month, day or second. The v35 backfill does not
+  guess: such a row gets a one-second range, the migration logs how many it
+  filled, and `ne`/`ap` on them can differ until `$reindex`.
+- **After upgrading, run `$reindex`.** The SQLite (v35) and PostgreSQL (v43)
+  migrations fill in the range end of existing rows, so point values keep
+  working, but a Period indexed before the upgrade is still two point rows
+  until the resource is reindexed. MongoDB and Elasticsearch documents
+  indexed before the upgrade have no range end at all, so they fail every
+  condition on it (`eq`, `ne`, `gt`, `ge`, `le`, `eb`, `ap`) until reindexed.
 
 **Full-Text Search (FTS5):**
 
@@ -1374,6 +1482,107 @@ immediate follow-up search misses the write. The `hfs` binary exposes these as
 `HFS_COMPOSITE_SYNC_MODE`, `HFS_ELASTICSEARCH_REFRESH_INTERVAL`, and
 `HFS_ELASTICSEARCH_WRITE_REFRESH` (see the
 [hfs README](../hfs/README.md#environment-variables)).
+
+That window applies to *client* searches. Server-side lookups that resolve a
+write against existing content do not inherit it: a transaction Bundle's
+conditional references (`"reference": "Organization?identifier=…"`) and the
+composite's conditional create/update/delete (`If-None-Exist`,
+`PUT [type]?[criteria]`) first call
+`SearchProvider::ensure_writes_visible` for the types they name. The composite
+drains its asynchronous sync queue up to that point, then the Elasticsearch
+backend refreshes those indices (a no-op under `WaitFor`/`True`, where the
+write was already searchable when it returned). A resource the server has
+acknowledged is therefore always found by such a lookup, on every sync mode
+and every `write_refresh` setting, and the cost is paid only by requests that
+carry such criteria (#1047).
+
+#### Very large resources on Elasticsearch-backed composites
+
+Every indexed search-parameter value is a nested object in the resource's
+Elasticsearch document, and Elasticsearch rejects the **whole document** once it
+holds more than `index.mapping.nested_objects.limit` of them. The resource stays
+stored in the primary and readable by id, but is absent from every search.
+Elasticsearch's own default of 10000 is exceeded by real data: 458 of the 11,704
+Synthea `Provenance` resources carry more than 10000 `target` references (the
+largest, 28,192).
+
+`ElasticsearchConfig::nested_objects_limit` (default 50000) is written into the
+index template, so new indices get it, and is raised during backend
+initialization on existing indices that are below it. The setting is dynamic,
+so resources that already indexed need no reindex. Resources rejected before the
+raise can be reindexed with `POST /{type}/$reindex`, but raising the limit alone
+does not guarantee that repair: `$reindex` sends the same documents through the
+`_bulk` path described below. Before #1125, on `sqlite-elasticsearch`, every
+500-document `Provenance` request failed as a whole at the transport level
+(`backend unavailable: elasticsearch`, `retryable: true`), so `$reindex` indexed
+none of them. Treat a rebuild as a repair only once `GET /$reindex-status/{job_id}`
+reports `errorCount` 0 for the type. The `hfs` binary exposes the limit as
+`HFS_ELASTICSEARCH_NESTED_OBJECTS_LIMIT`.
+
+#### Bulk writes and rebuilds on Elasticsearch-backed composites
+
+`create_many` and `ReindexTarget::write_search_entries_page` put documents on the
+wire through one `_bulk` path. Each request is capped at 500 operations **and**
+at `ElasticsearchConfig::bulk_max_bytes` (default 10 MiB); a single document
+larger than the byte cap is sent alone. The cap exists because the client's
+`ElasticsearchConfig::request_timeout_ms` (default 30000) covers the whole
+request: 500 Synthea `Provenance` resources average ~108 KB each, and the ~54 MB
+body that produced timed out on every attempt.
+
+Failures are classified by shape:
+
+- **Transport timeout, `413`, or a proxy's `408`/`504`**: the chunk is split in
+  half and each half is resent, recursively, down to a single document, so an
+  oversized chunk is never resent unchanged nor reported as hundreds of
+  rejected resources. A single document still answered `413` is permanent; one
+  that still times out is transient, and on the client's own timeout the rest
+  of the page is failed as transient too rather than split further (the
+  cluster is stalled, and every halving would wait out another timeout).
+- **`429`**, for the whole request or per item: retried with bounded exponential
+  back-off, resending only the rejected items.
+- **Connection error, `5xx` for the whole request, or a `429` that outlasts its
+  retries**: every document of that request fails as transient.
+- **Per-document `4xx`** (for example the nested-object limit above): permanent,
+  so a rebuild that has only those is not retried.
+- **`ensure_index` transport failures**: transient (`BackendError::Unavailable`),
+  not `Internal`.
+
+A client-side timeout does not cancel the `_bulk` Elasticsearch is already
+executing, so a resource reported as failed may still end up indexed; confirm
+with a count before rebuilding again.
+
+`ElasticsearchConfig::reindex_refresh` sets the `refresh` parameter for rebuild
+writes separately from `write_refresh`; `None` (default) follows `write_refresh`.
+
+On a primary whose search is offloaded (`set_search_offloaded(true)`), the
+reindex writers `write_search_entries_on`, `write_search_entries_page` and
+`clear_search_index` are no-ops, as `begin/end_bulk_index_rebuild` already were,
+and `hfs` wires only Elasticsearch as the reindex target on
+`sqlite-elasticsearch`. Before #1125 the rebuild also wrote the SQLite
+`search_index`/FTS rows that no query there reads, and because the matching
+delete was already a no-op the rows accumulated on every run (≥ 11 KB per
+resource). A SQLite row `fetch_resources_page` cannot parse is reported as a
+per-resource error and no longer ends the rebuild of its type.
+
+A manifest ingested with indexing deferred records that it still owes a
+rebuild, in `bulk_manifests.index_pending` (SQLite schema v30), inside the
+transaction that publishes it. `SubmitWorkerStorage::list_manifests_awaiting_reindex`
+is what a restarted server scans to re-fire those rebuilds, and the marker is
+cleared once a generation finishes; backends that do not implement the three
+defaulted methods simply never resume, as before #1125.
+
+The `hfs` binary exposes these as `HFS_ELASTICSEARCH_REQUEST_TIMEOUT_MS`,
+`HFS_ELASTICSEARCH_BULK_MAX_BYTES`, `HFS_ELASTICSEARCH_BULK_CONCURRENCY` and
+`HFS_ELASTICSEARCH_REINDEX_REFRESH`, and the deferred rebuild's page as
+`HFS_REINDEX_BATCH_SIZE` plus `HFS_REINDEX_BATCH_BYTES` (see the
+[hfs README](../hfs/README.md#environment-variables)).
+
+Measured on `sqlite-elasticsearch` with a 228,580-resource Synthea cut
+(Elasticsearch 8.15, 4 GB heap): the rebuild completes in one generation with
+every Provenance indexed, against `main` losing 2,500 of them and failing
+twice. With `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for` the rebuild takes 806 s;
+adding `HFS_ELASTICSEARCH_REINDEX_REFRESH=false` takes it to 145 s
+(1,576 resources/s), which is the recommended pair.
 
 ### Cost-Based Optimization
 

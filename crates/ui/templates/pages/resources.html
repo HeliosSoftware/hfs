@@ -19,6 +19,11 @@
   <div>
     <h1 class="page-head__title">{{ i18n.t("resources-heading") }}</h1>
     <p class="page-head__lede" id="resources-subtitle">{{ i18n.t("resources-lede") }}</p>
+    {# #1065: results may miss stored resources while the search index rebuilds,
+       #1125: or after the last rebuild left resources unindexed. #}
+    {% if let Some(activity) = rebuild %}
+    <p class="notice notice--warn" role="status" data-rebuild-notice data-rebuild-state="{{ self.rebuild_state(activity) }}">{{ self.rebuild_text(activity) }}</p>
+    {% endif %}
   </div>
   <div class="resources-create-wrap">
     <button type="button" class="btn btn--primary resources-create" id="resource-create"
@@ -53,11 +58,11 @@
              placeholder="{{ i18n.t("queries-rail-filter") }}"
              aria-label="{{ i18n.t("queries-rail-filter") }}">
     </div>
-    {% call recent::group("type-rail-recent", "type-rail-list", rail_page, max_recent, i18n.t("sp-rail-recent"), recent_entries) %}{% endcall %}
+    {% call recent::group("type-rail-recent", "type-rail-list", rail_page, max_recent, i18n.t("sp-rail-recent"), recent_entries, rail_counts_approximate) %}{% endcall %}
     <div class="filter-rail__divider" aria-hidden="true"></div>
     <div class="filter-rail__heading filter-rail__heading--group">{{ i18n.t("rail-all-types-heading") }}</div>
     <div class="filter-rail__list" id="type-rail-list">
-      {% call rail::rail_items(rail_entries) %}{% endcall %}
+      {% call rail::rail_items(rail_entries, rail_counts_approximate) %}{% endcall %}
     </div>
   </aside>
 
@@ -85,7 +90,7 @@
           <input type="text" id="nl-text" maxlength="500" autocomplete="off"
                  placeholder="{{ i18n.t("search-nl-placeholder") }}"
                  aria-label="{{ i18n.t("search-nl-label") }}">
-          <button class="btn btn--primary" type="button" id="nl-submit">
+          <button class="btn btn--primary btn--busy-slot" type="button" id="nl-submit">
             <span class="icon">{% include "icons/search.svg" %}</span>
             {{ i18n.t("action-search") }}
           </button>
@@ -151,8 +156,8 @@ HFS_NL_SEARCH_MODEL={{ nl.model }}</code></pre>
         <span class="modal__subject" id="resource-modal-subject"></span>
       </div>
       <div class="modal__tabs" role="tablist">
-        <button type="button" class="modal__tab modal__tab--on" data-modal-tab="edit" aria-selected="true">{{ i18n.t("resources-tab-edit") }}</button>
-        <button type="button" class="modal__tab" data-modal-tab="history" aria-selected="false">{{ i18n.t("resources-tab-history") }}</button>
+        <button type="button" role="tab" class="modal__tab modal__tab--on" data-modal-tab="edit" aria-selected="true">{{ i18n.t("resources-tab-edit") }}</button>
+        <button type="button" role="tab" class="modal__tab" data-modal-tab="history" aria-selected="false">{{ i18n.t("resources-tab-history") }}</button>
       </div>
       <div class="modal__actions">
         <button type="button" class="btn" id="resource-delete">{{ i18n.t("editor-delete") }}</button>
@@ -198,7 +203,9 @@ HFS_NL_SEARCH_MODEL={{ nl.model }}</code></pre>
 
 <script src="/ui/assets/fhir-search-value.js" defer></script>
 <script src="/ui/assets/saved-queries.js" defer></script>
+<script src="/ui/assets/row-navigation.js" defer></script>
 {% if nl.configured %}<script src="/ui/assets/nl-search.js" defer></script>{% endif %}
 <script src="/ui/assets/resource-filter.js" defer></script>
+<script src="/ui/assets/editor-add.js" defer></script>
 <script src="/ui/assets/resources.js" defer></script>
 {% endblock %}

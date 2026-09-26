@@ -11,9 +11,29 @@ use chrono::{DateTime, NaiveDate, Utc};
 use helios_fhir::FhirVersion;
 use serde_json::Value;
 
+use crate::core::preconditions::EntityTagPrecondition;
 use crate::core::sof_runner::SofRunner;
-use crate::error::{BackendError, ResourceError, StorageError, StorageResult};
+use crate::error::{BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
+
+/// A cheap per-tenant change detector for committed writes (#1078).
+///
+/// Lets a consumer holding figures for a tenant — the dashboard's in-memory
+/// counters — notice that storage changed without its knowledge (another
+/// server instance sharing the database, or a write that bypassed the write
+/// observer). Compare two markers for equality only; never use one as a cursor:
+/// a purge can move `latest` backwards, and instances stamp writes with their
+/// own clocks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteMarker {
+    /// Timestamp of the tenant's newest history row, if it has any.
+    pub latest: Option<DateTime<Utc>>,
+    /// History rows written at or after the `recent_since` bound the caller
+    /// asked for, capped by the backend. Catches writes stamped earlier than
+    /// `latest` (a lagging clock, a long transaction committing late), which
+    /// leave `latest` unchanged. `None` when no bound was asked for.
+    pub recent_writes: Option<u64>,
+}
 use crate::types::StoredResource;
 
 /// A registered tenant, as returned by the tenant registry.
@@ -526,6 +546,70 @@ pub trait ResourceStorage: Send + Sync {
         id: &str,
     ) -> StorageResult<()>;
 
+    /// Deletes a resource (soft delete) only if `expected_version` is still its
+    /// current version — the delete half of optimistic locking, as
+    /// [`update`](Self::update) is the update half.
+    ///
+    /// This is what a `DELETE` carrying `If-Match` must go through. Evaluating
+    /// the precondition against one read and then calling
+    /// [`delete`](Self::delete) is check-then-act: a writer landing in between
+    /// is deleted along with the version the client named, a version the
+    /// client never saw (#1404).
+    ///
+    /// `expected_version` is a bare version id (`3`), not an `If-Match` field
+    /// value; [`VersionedStorage::delete_with_match`] takes the latter.
+    ///
+    /// # Atomicity
+    ///
+    /// SQLite, PostgreSQL and MongoDB implement this as ONE conditional write
+    /// carrying the version in its predicate, so the comparison and the delete
+    /// cannot be separated. S3 makes the tombstone write conditional on the
+    /// object it compared. The **default implementation is not atomic**: it
+    /// reads, compares and calls [`delete`](Self::delete), which narrows the
+    /// window to this call but does not close it. It exists so that stores
+    /// which are never the system of record for a version (search secondaries,
+    /// test doubles) need not invent a guarantee they cannot give; a wrapper
+    /// around a real backend MUST delegate rather than inherit it.
+    ///
+    /// # Errors
+    ///
+    /// * `StorageError::Resource(NotFound)` - If no live resource exists
+    ///   (never created, or already deleted; S3 reports the latter as `Gone`,
+    ///   as its `delete` does)
+    /// * `StorageError::Concurrency(VersionConflict)` - If the current version
+    ///   is not `expected_version`; nothing is deleted. S3 reports a writer
+    ///   that lands after its comparison as `OptimisticLockFailure`.
+    /// * `StorageError::Tenant` - If the tenant doesn't have delete permission
+    async fn delete_versioned(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: &str,
+    ) -> StorageResult<()> {
+        let current = match self.read(tenant, resource_type, id).await {
+            Ok(Some(current)) => current,
+            Ok(None) | Err(StorageError::Resource(ResourceError::Gone { .. })) => {
+                return Err(StorageError::Resource(ResourceError::NotFound {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                }));
+            }
+            Err(e) => return Err(e),
+        };
+        if current.version_id() != expected_version {
+            return Err(StorageError::Concurrency(
+                ConcurrencyError::VersionConflict {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                    expected_version: expected_version.to_string(),
+                    actual_version: current.version_id().to_string(),
+                },
+            ));
+        }
+        self.delete(tenant, resource_type, id).await
+    }
+
     /// Checks if a resource exists.
     ///
     /// This is more efficient than `read` when you only need to check existence.
@@ -573,7 +657,12 @@ pub trait ResourceStorage: Send + Sync {
     ///
     /// # Returns
     ///
-    /// A vector of found resources (missing/deleted resources are omitted).
+    /// A vector of found resources. A missing id (`Ok(None)`) and a
+    /// soft-deleted id (`Err(Gone)`) are both omitted rather than failing the
+    /// batch — one deleted target must not sink the reads of every other id, so
+    /// callers resolving a set of references (`$everything` supporting resources,
+    /// SOF reference resolution, the ingest index sink) get the resources that
+    /// do exist. Any other error still propagates.
     async fn read_batch(
         &self,
         tenant: &TenantContext,
@@ -582,8 +671,11 @@ pub trait ResourceStorage: Send + Sync {
     ) -> StorageResult<Vec<StoredResource>> {
         let mut results = Vec::with_capacity(ids.len());
         for id in ids {
-            if let Some(resource) = self.read(tenant, resource_type, id).await? {
-                results.push(resource);
+            match self.read(tenant, resource_type, id).await {
+                Ok(Some(resource)) => results.push(resource),
+                Ok(None) => {}
+                Err(StorageError::Resource(ResourceError::Gone { .. })) => {}
+                Err(e) => return Err(e),
             }
         }
         Ok(results)
@@ -613,6 +705,20 @@ pub trait ResourceStorage: Send + Sync {
     ///
     /// The default implementation returns `None`.
     fn sof_runner(&self) -> Option<Arc<dyn SofRunner>> {
+        None
+    }
+
+    /// Returns a whole-type scan for backends that have no search index.
+    ///
+    /// A backend without search cannot answer `url=` lookups, yet the
+    /// SQL-on-FHIR operations must still resolve a canonical — a
+    /// `subjectCanonical`, or the `relatedArtifact.depends-on` of every SQL
+    /// View / SQL Query Library. Such a backend returns `Some`, and callers
+    /// that get `UnsupportedCapability` from `search` fall back to scanning
+    /// the (small, operator-authored) definition type and matching in process
+    /// (#1228). Backends with a search index keep the default `None`: their
+    /// index answers the lookup and a scan would only be slower.
+    fn resource_scan(&self) -> Option<Arc<dyn crate::sof::in_process::ResourceScan>> {
         None
     }
 
@@ -719,6 +825,59 @@ pub trait ResourceStorage: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// [`count_deltas_by_bucket`](Self::count_deltas_by_bucket) for several
+    /// resource types at once, returned as `(resource_type, delta)` pairs.
+    ///
+    /// Each pair has exactly the semantics of that method's result for its
+    /// type — epoch-aligned `bucket_start`, creation `+1` / delete `-1` / plain
+    /// update `0`, the same flooring of `since` to a bucket boundary, and only
+    /// buckets whose net delta is non-zero — so the result is the union of the
+    /// per-type calls. A requested type with no such bucket contributes no
+    /// pair. Buckets are ascending within a type; the order across types is
+    /// unspecified. A type listed twice is counted once.
+    ///
+    /// The web UI's Home dashboard loads every charted type's history ring of a
+    /// window with one call (#1078), so a tenant seed costs one history query
+    /// per window rather than one per type per window. The SQLite, PostgreSQL
+    /// and MongoDB backends override this with a single grouped query over the
+    /// `(tenant_id, last_updated)` history range; the default implementation
+    /// calls [`count_deltas_by_bucket`](Self::count_deltas_by_bucket) once per
+    /// type, so a backend without an override behaves exactly as those calls
+    /// would. An empty `resource_types` returns an empty list without querying.
+    ///
+    /// # Arguments
+    ///
+    /// * `tenant` - The tenant context for this operation
+    /// * `resource_types` - The FHIR resource types to bucket
+    /// * `since` - Inclusive lower bound on version `last_updated`
+    /// * `bucket_seconds` - Bucket width in seconds, as for
+    ///   [`count_deltas_by_bucket`](Self::count_deltas_by_bucket). Must be
+    ///   positive.
+    async fn count_deltas_by_type_and_bucket(
+        &self,
+        tenant: &TenantContext,
+        resource_types: &[&str],
+        since: DateTime<Utc>,
+        bucket_seconds: i64,
+    ) -> StorageResult<Vec<(String, ResourceCountDelta)>> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for resource_type in resource_types {
+            if !seen.insert(*resource_type) {
+                continue;
+            }
+            let deltas = self
+                .count_deltas_by_bucket(tenant, resource_type, since, bucket_seconds)
+                .await?;
+            out.extend(
+                deltas
+                    .into_iter()
+                    .map(|delta| ((*resource_type).to_string(), delta)),
+            );
+        }
+        Ok(out)
+    }
+
     /// Buckets write activity into a weekly-rhythm grid by UTC weekday and hour.
     ///
     /// Every resource version (create, update, or delete) recorded in
@@ -761,6 +920,38 @@ pub trait ResourceStorage: Send + Sync {
     /// * `tenant` - The tenant context for this operation
     async fn count_all_types(&self, _tenant: &TenantContext) -> StorageResult<Vec<(String, u64)>> {
         Ok(Vec::new())
+    }
+
+    /// Whether [`count_all_types`](Self::count_all_types) and
+    /// [`count_deltas_by_bucket`](Self::count_deltas_by_bucket) are real
+    /// aggregates on this backend, rather than the provided defaults that
+    /// return empty lists.
+    ///
+    /// Those defaults are indistinguishable from an empty tenant, so a caller
+    /// that presents counts as measurements (the web UI's Home dashboard) asks
+    /// this first and says the figures are unavailable instead of showing
+    /// zeros (#1078). Default `false`; the SQLite, PostgreSQL and MongoDB
+    /// backends override it, and composite storage forwards the primary's
+    /// answer. A wrapper that delegates the two count methods must delegate
+    /// this too.
+    fn supports_type_counts(&self) -> bool {
+        false
+    }
+
+    /// The tenant's [`WriteMarker`], or `None` when this backend cannot provide
+    /// one cheaply (#1078).
+    ///
+    /// Must be a single index probe (plus, when `recent_since` is given, a
+    /// capped index range count), never a scan: callers read it on every
+    /// dashboard reconcile pass. Default `Ok(None)`; the SQLite, PostgreSQL and
+    /// MongoDB backends override it, and a wrapper that delegates the count
+    /// methods must delegate this too.
+    async fn latest_write_marker(
+        &self,
+        _tenant: &TenantContext,
+        _recent_since: Option<DateTime<Utc>>,
+    ) -> StorageResult<Option<WriteMarker>> {
+        Ok(None)
     }
 
     /// Counts non-deleted resources grouped by tenant across the entire backend.
@@ -989,6 +1180,25 @@ pub enum ConditionalPatchResult {
     MultipleMatches(usize),
 }
 
+/// A conditional PATCH candidate resolved against the authoritative stored row.
+/// The caller may inspect or validate `patched` before passing `current` to
+/// `ResourceStorage::update`, whose version check closes the read/write race.
+#[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
+pub enum ConditionalPatchPreparation {
+    /// The selected current row and the patched content, before any write.
+    Ready {
+        /// The authoritative row whose version the subsequent update must match.
+        current: StoredResource,
+        /// The candidate content produced by applying the patch to `current`.
+        patched: Value,
+    },
+    /// No resource matched the condition.
+    NoMatch,
+    /// Multiple resources matched the condition.
+    MultipleMatches(usize),
+}
+
 /// Patch format for conditional patch operations.
 #[derive(Debug, Clone)]
 pub enum PatchFormat {
@@ -1019,9 +1229,126 @@ pub enum PatchFormat {
     MergePatch(Value),
 }
 
+/// One of the four conditional interactions a [`ConditionalStorage`] may or
+/// may not really implement.
+///
+/// What the CapabilityStatement advertises in `rest.resource.conditional*`
+/// and what the REST layer answers `501` for are both read from
+/// [`ConditionalStorage::supports_conditional`], so the two cannot disagree
+/// (#1384).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConditionalInteraction {
+    /// `POST [type]` with `If-None-Exist`.
+    Create,
+    /// `PUT [type]?criteria`.
+    Update,
+    /// `DELETE [type]?criteria`.
+    Delete,
+    /// `PATCH [type]?criteria`.
+    Patch,
+}
+
+impl ConditionalInteraction {
+    /// Every conditional interaction, in CapabilityStatement element order.
+    pub const ALL: [ConditionalInteraction; 4] = [
+        ConditionalInteraction::Create,
+        ConditionalInteraction::Update,
+        ConditionalInteraction::Delete,
+        ConditionalInteraction::Patch,
+    ];
+
+    /// The [`BackendCapability`](crate::core::BackendCapability) a backend
+    /// declares when it implements this interaction.
+    pub fn capability(self) -> crate::core::BackendCapability {
+        use crate::core::BackendCapability;
+        match self {
+            ConditionalInteraction::Create => BackendCapability::ConditionalCreate,
+            ConditionalInteraction::Update => BackendCapability::ConditionalUpdate,
+            ConditionalInteraction::Delete => BackendCapability::ConditionalDelete,
+            ConditionalInteraction::Patch => BackendCapability::ConditionalPatch,
+        }
+    }
+}
+
+impl std::fmt::Display for ConditionalInteraction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ConditionalInteraction::Create => "conditional create",
+            ConditionalInteraction::Update => "conditional update",
+            ConditionalInteraction::Delete => "conditional delete",
+            ConditionalInteraction::Patch => "conditional patch",
+        })
+    }
+}
+
 /// Extension trait for conditional operations based on search criteria.
+///
+/// Every `search_params` argument is the query portion of a search URL as it
+/// appears on the wire — form-urlencoded, exactly what `If-None-Exist` and a
+/// conditional URL carry. Callers pass it through undecoded; it is decoded
+/// once, by [`crate::search::parse_conditional_criteria`] (#1322).
+///
+/// # `If-Match`
+///
+/// The update, delete and patch methods take the request's `If-Match`
+/// precondition ([`EntityTagPrecondition::Absent`] when none was sent). The
+/// criteria are resolved *inside* these methods, so only they ever hold the
+/// resource the precondition is about; a caller comparing versions itself
+/// would be checking a row the write never sees (#1381). Implementations call
+/// [`conditional_if_match_gate`](super::conditional_if_match_gate) on the
+/// resolved match before writing and fail with
+/// `StorageError::Concurrency(OptimisticLockFailure)` — `412` — when it is not
+/// satisfied.
+///
+/// When nothing matched, each method answers what its instance twin answers
+/// for a resource that does not exist. Update and delete fail the precondition
+/// (RFC 9110 §13.1.1: no current representation satisfies `If-Match`, `*`
+/// included), so a conditional update does **not** fall through to its create.
+/// Patch reports `NoMatch` — `404`, as `PATCH [type]/[id]` does — and writes
+/// nothing either way.
 #[async_trait]
 pub trait ConditionalStorage: ResourceStorage {
+    /// Whether this storage really implements `interaction`, as opposed to
+    /// answering `UnsupportedCapability` for it.
+    ///
+    /// The default mirrors the trait itself: `conditional_create`,
+    /// `conditional_update` and `conditional_delete` are required methods,
+    /// while `conditional_patch` works only once
+    /// [`resolve_conditional_matches`](Self::resolve_conditional_matches) is
+    /// provided. A backend whose methods differ from that — S3 refuses all
+    /// four; SQLite, PostgreSQL and MongoDB serve patch — overrides it from its
+    /// declared [`BackendCapability`](crate::core::BackendCapability) list, the
+    /// same list `tests/backend_capability_contract.rs` pins.
+    fn supports_conditional(&self, interaction: ConditionalInteraction) -> bool {
+        !matches!(interaction, ConditionalInteraction::Patch)
+    }
+
+    /// Resolves conditional criteria to the resources they select — every
+    /// match, so the caller can tell one from several.
+    ///
+    /// This is the primitive the provided
+    /// [`conditional_patch`](Self::conditional_patch) is written in terms of.
+    /// Implementations build the query with
+    /// [`crate::search::build_conditional_query`], so criteria mean what they
+    /// mean as a direct search (#1312), and answer no match for empty criteria.
+    ///
+    /// The default refuses: a storage that cannot search cannot resolve
+    /// criteria.
+    async fn resolve_conditional_matches(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        search_params: &str,
+    ) -> StorageResult<Vec<StoredResource>> {
+        let _ = (tenant, resource_type, search_params);
+        Err(StorageError::Backend(
+            crate::error::BackendError::UnsupportedCapability {
+                backend_name: self.backend_name().to_string(),
+                capability: "conditional_patch".to_string(),
+            },
+        ))
+    }
+
     /// Creates a resource only if no matching resource exists.
     ///
     /// # Arguments
@@ -1056,6 +1383,7 @@ pub trait ConditionalStorage: ResourceStorage {
     /// * `search_params` - Search parameters to find the resource
     /// * `upsert` - If true, create if no match found
     /// * `fhir_version` - The FHIR specification version for this resource (used if creating)
+    /// * `if_match` - The `If-Match` version precondition; see the trait docs
     ///
     /// # Returns
     ///
@@ -1063,6 +1391,7 @@ pub trait ConditionalStorage: ResourceStorage {
     /// * `Created` - If no match was found and upsert is true
     /// * `NoMatch` - If no match was found and upsert is false
     /// * `MultipleMatches` - If multiple matches were found (error)
+    #[allow(clippy::too_many_arguments)]
     async fn conditional_update(
         &self,
         tenant: &TenantContext,
@@ -1071,6 +1400,7 @@ pub trait ConditionalStorage: ResourceStorage {
         search_params: &str,
         upsert: bool,
         fhir_version: FhirVersion,
+        if_match: &EntityTagPrecondition,
     ) -> StorageResult<ConditionalUpdateResult>;
 
     /// Deletes a resource based on search criteria.
@@ -1080,6 +1410,7 @@ pub trait ConditionalStorage: ResourceStorage {
     /// * `tenant` - The tenant context
     /// * `resource_type` - The FHIR resource type
     /// * `search_params` - Search parameters to find the resource
+    /// * `if_match` - The `If-Match` version precondition; see the trait docs
     ///
     /// # Returns
     ///
@@ -1091,6 +1422,7 @@ pub trait ConditionalStorage: ResourceStorage {
         tenant: &TenantContext,
         resource_type: &str,
         search_params: &str,
+        if_match: &EntityTagPrecondition,
     ) -> StorageResult<ConditionalDeleteResult>;
 
     /// Patches a resource based on search criteria.
@@ -1104,6 +1436,7 @@ pub trait ConditionalStorage: ResourceStorage {
     /// * `resource_type` - The FHIR resource type
     /// * `search_params` - Search parameters to find the resource
     /// * `patch` - The patch to apply (JSON Patch, FHIRPath Patch, or Merge Patch)
+    /// * `if_match` - The `If-Match` version precondition; see the trait docs
     ///
     /// # Returns
     ///
@@ -1113,23 +1446,106 @@ pub trait ConditionalStorage: ResourceStorage {
     ///
     /// # Errors
     ///
-    /// * `StorageError::Validation` - If the patch is invalid or would create invalid resource
-    /// * `StorageError::Backend(NotSupported)` - If conditional patch is not supported
+    /// * `StorageError::Validation(ValidationError::Patch(_))` - the patch is
+    ///   malformed, does not apply, or changes `resourceType` / `id`; see
+    ///   [`PatchError`](super::PatchError)
+    /// * `StorageError::Concurrency(OptimisticLockFailure)` - `If-Match` was
+    ///   supplied and is not satisfied
+    /// * `StorageError::Concurrency(VersionConflict)` - the resource changed
+    ///   between resolving the criteria and writing
+    /// * `StorageError::Backend(UnsupportedCapability)` - this storage cannot
+    ///   resolve criteria
+    ///
+    /// # Provided implementation
+    ///
+    /// The one implementation every backend uses (#1406), in terms of
+    /// primitives each already has:
+    ///
+    /// 1. [`resolve_conditional_matches`](Self::resolve_conditional_matches);
+    ///    none is `NoMatch`, several `MultipleMatches`.
+    /// 2. `read` the match. On a [`CompositeStorage`](crate::composite) the
+    ///    criteria are resolved by the search backend while `read` and `update`
+    ///    go to the primary, so this is the authoritative content — the one the
+    ///    patch has to apply to. A search copy of another version than the
+    ///    primary's is a `VersionConflict`: the criteria were judged against
+    ///    content that is no longer current, and whether the current content
+    ///    still matches them is unknown. (Conditional update and delete reach
+    ///    the same answer through the primary's compare-and-swap.)
+    /// 3. [`conditional_if_match_gate`](super::conditional_if_match_gate).
+    /// 4. [`apply_patch_for_version`](super::apply_patch_for_version).
+    /// The caller then runs `update(current, patched)`, which
+    /// compares-and-swaps on `current`'s version: a writer landing after the
+    /// authoritative read ends in `VersionConflict`.
+    async fn prepare_conditional_patch(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        search_params: &str,
+        patch: &PatchFormat,
+        if_match: &EntityTagPrecondition,
+    ) -> StorageResult<ConditionalPatchPreparation> {
+        let mut matches = self
+            .resolve_conditional_matches(tenant, resource_type, search_params)
+            .await?;
+
+        let matched = match matches.len() {
+            0 => return Ok(ConditionalPatchPreparation::NoMatch),
+            1 => matches.remove(0),
+            n => return Ok(ConditionalPatchPreparation::MultipleMatches(n)),
+        };
+
+        let current = match self.read(tenant, resource_type, matched.id()).await {
+            Ok(Some(current)) => current,
+            // Deleted since the index last saw it: there is no match any more.
+            Ok(None) | Err(StorageError::Resource(crate::error::ResourceError::Gone { .. })) => {
+                return Ok(ConditionalPatchPreparation::NoMatch);
+            }
+            Err(e) => return Err(e),
+        };
+        if current.version_id() != matched.version_id() {
+            return Err(StorageError::Concurrency(
+                crate::error::ConcurrencyError::VersionConflict {
+                    resource_type: resource_type.to_string(),
+                    id: current.id().to_string(),
+                    expected_version: matched.version_id().to_string(),
+                    actual_version: current.version_id().to_string(),
+                },
+            ));
+        }
+
+        super::conditional_if_match_gate(if_match, resource_type, Some(&current))?;
+
+        let patched =
+            super::apply_patch_for_version(current.content(), patch, current.fhir_version())
+                .map_err(crate::error::ValidationError::from)?;
+
+        Ok(ConditionalPatchPreparation::Ready { current, patched })
+    }
+
+    /// Applies a conditional PATCH without a caller-side validation step.
+    /// REST uses `prepare_conditional_patch` to validate the candidate first;
+    /// storage callers retain this operation and the same compare-and-swap.
     async fn conditional_patch(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         search_params: &str,
         patch: &PatchFormat,
+        if_match: &EntityTagPrecondition,
     ) -> StorageResult<ConditionalPatchResult> {
-        // Default implementation returns NotSupported
-        let _ = (tenant, resource_type, search_params, patch);
-        Err(StorageError::Backend(
-            crate::error::BackendError::UnsupportedCapability {
-                backend_name: "unknown".to_string(),
-                capability: "conditional_patch".to_string(),
-            },
-        ))
+        match self
+            .prepare_conditional_patch(tenant, resource_type, search_params, patch, if_match)
+            .await?
+        {
+            ConditionalPatchPreparation::Ready { current, patched } => {
+                let updated = self.update(tenant, &current, patched).await?;
+                Ok(ConditionalPatchResult::Patched(updated))
+            }
+            ConditionalPatchPreparation::NoMatch => Ok(ConditionalPatchResult::NoMatch),
+            ConditionalPatchPreparation::MultipleMatches(n) => {
+                Ok(ConditionalPatchResult::MultipleMatches(n))
+            }
+        }
     }
 }
 
@@ -1169,5 +1585,159 @@ mod tests {
         ));
         let _no_match = ConditionalDeleteResult::NoMatch;
         let _multiple = ConditionalDeleteResult::MultipleMatches(5);
+    }
+
+    /// A backend that only implements the per-type `count_deltas_by_bucket`,
+    /// recording each type it is asked for and answering with a fixed series
+    /// per type.
+    #[derive(Default)]
+    struct PerTypeDeltasOnly {
+        asked: std::sync::Mutex<Vec<(String, DateTime<Utc>, i64)>>,
+    }
+
+    #[async_trait]
+    impl ResourceStorage for PerTypeDeltasOnly {
+        fn backend_name(&self) -> &'static str {
+            "per-type-deltas-only"
+        }
+
+        async fn create(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _resource: Value,
+            _fhir_version: FhirVersion,
+        ) -> StorageResult<StoredResource> {
+            unimplemented!("not used by these tests")
+        }
+
+        async fn create_or_update(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+            _resource: Value,
+            _fhir_version: FhirVersion,
+        ) -> StorageResult<(StoredResource, bool)> {
+            unimplemented!("not used by these tests")
+        }
+
+        async fn read(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<Option<StoredResource>> {
+            Ok(None)
+        }
+
+        async fn update(
+            &self,
+            _tenant: &TenantContext,
+            _current: &StoredResource,
+            _resource: Value,
+        ) -> StorageResult<StoredResource> {
+            unimplemented!("not used by these tests")
+        }
+
+        async fn delete(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<()> {
+            Ok(())
+        }
+
+        async fn count(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: Option<&str>,
+        ) -> StorageResult<u64> {
+            Ok(0)
+        }
+
+        async fn count_deltas_by_bucket(
+            &self,
+            _tenant: &TenantContext,
+            resource_type: &str,
+            since: DateTime<Utc>,
+            bucket_seconds: i64,
+        ) -> StorageResult<Vec<ResourceCountDelta>> {
+            self.asked
+                .lock()
+                .unwrap()
+                .push((resource_type.to_string(), since, bucket_seconds));
+            if resource_type == "Empty" {
+                return Ok(Vec::new());
+            }
+            let base = bucket_floor(since, bucket_seconds);
+            Ok(vec![
+                ResourceCountDelta {
+                    bucket_start: base,
+                    delta: resource_type.len() as i64,
+                },
+                ResourceCountDelta {
+                    bucket_start: base + chrono::Duration::seconds(bucket_seconds),
+                    delta: -1,
+                },
+            ])
+        }
+    }
+
+    fn tenant() -> TenantContext {
+        TenantContext::new(
+            crate::tenant::TenantId::new("t1"),
+            crate::tenant::TenantPermissions::full_access(),
+        )
+    }
+
+    /// #1078: the provided `count_deltas_by_type_and_bucket` is the per-type
+    /// method called once per distinct type, with the same bounds, its rows
+    /// tagged with their type — so a backend without an override answers
+    /// exactly as the per-type calls would.
+    #[tokio::test]
+    async fn count_deltas_by_type_and_bucket_default_loops_over_the_types() {
+        let storage = PerTypeDeltasOnly::default();
+        let since = DateTime::from_timestamp(1_700_000_123, 0).unwrap();
+        let types = ["Patient", "Empty", "Observation", "Patient"];
+
+        let grouped = storage
+            .count_deltas_by_type_and_bucket(&tenant(), &types, since, 60)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *storage.asked.lock().unwrap(),
+            vec![
+                ("Patient".to_string(), since, 60),
+                ("Empty".to_string(), since, 60),
+                ("Observation".to_string(), since, 60),
+            ],
+            "one per-type call per distinct type, in order, with the same bounds"
+        );
+        let mut expected = Vec::new();
+        for rt in ["Patient", "Observation"] {
+            for delta in storage
+                .count_deltas_by_bucket(&tenant(), rt, since, 60)
+                .await
+                .unwrap()
+            {
+                expected.push((rt.to_string(), delta));
+            }
+        }
+        assert_eq!(grouped, expected);
+    }
+
+    /// An empty type list is answered without asking the backend anything.
+    #[tokio::test]
+    async fn count_deltas_by_type_and_bucket_default_with_no_types_does_not_query() {
+        let storage = PerTypeDeltasOnly::default();
+        let grouped = storage
+            .count_deltas_by_type_and_bucket(&tenant(), &[], Utc::now(), 60)
+            .await
+            .unwrap();
+        assert!(grouped.is_empty());
+        assert!(storage.asked.lock().unwrap().is_empty());
     }
 }

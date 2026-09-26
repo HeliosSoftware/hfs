@@ -7,9 +7,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use deadpool_postgres::{Config, Pool, Runtime, SslMode};
+use deadpool_postgres::{Config, GenericClient, Pool, Runtime, SslMode};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 use tokio_postgres::NoTls;
 
 use helios_fhir::FhirVersion;
@@ -18,7 +19,7 @@ use crate::core::{Backend, BackendCapability, BackendKind};
 use crate::error::{BackendError, StorageResult};
 use crate::search::{
     SearchParameterDefinition, SearchParameterExtractor, SearchParameterLoader,
-    SearchParameterRegistry, TenantSearchRegistries,
+    SearchParameterRegistry, SearchParameterSource, SearchParameterStatus, TenantSearchRegistries,
 };
 
 /// Sync in-memory cache of each tenant's stored (POSTed) active SearchParameter
@@ -28,6 +29,7 @@ use crate::search::{
 type StoredByTenant = Arc<RwLock<HashMap<String, Vec<SearchParameterDefinition>>>>;
 
 /// PostgreSQL backend for FHIR resource storage.
+#[derive(Clone)]
 pub struct PostgresBackend {
     pool: Pool,
     config: PostgresConfig,
@@ -46,6 +48,16 @@ pub struct PostgresBackend {
     /// run. The answer only changes when the schema is created or migrated,
     /// both of which happen before the instance serves traffic.
     pub(super) fts_table_exists: Arc<std::sync::OnceLock<bool>>,
+    /// Reindex admission is shared by clones and by every reindex entry point.
+    pub(super) reindex_admission: Arc<Semaphore>,
+    pub(super) reindex_width: usize,
+    pub(super) cleanup_tracker: Arc<super::cleanup::CleanupTracker>,
+    #[cfg(test)]
+    pub(super) reindex_test_hook: Option<Arc<super::storage::ReindexTestHook>>,
+    #[cfg(test)]
+    pub(super) reindex_test_pause: Option<Arc<tokio::sync::Notify>>,
+    #[cfg(test)]
+    pub(super) reindex_test_entered: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl Debug for PostgresBackend {
@@ -406,6 +418,10 @@ impl PostgresBackend {
             BackendCapability::Include,
             BackendCapability::Revinclude,
             BackendCapability::InDbSofRunner,
+            BackendCapability::ConditionalCreate,
+            BackendCapability::ConditionalUpdate,
+            BackendCapability::ConditionalDelete,
+            BackendCapability::ConditionalPatch,
             BackendCapability::SharedSchema,
         ]
     }
@@ -459,7 +475,39 @@ impl PostgresBackend {
             stored_by_tenant,
             index_layout: Arc::new(std::sync::OnceLock::new()),
             fts_table_exists: Arc::new(std::sync::OnceLock::new()),
+            reindex_admission: Arc::new(Semaphore::new(1)),
+            reindex_width: 1,
+            cleanup_tracker: super::cleanup::CleanupTracker::new(),
+            #[cfg(test)]
+            reindex_test_hook: None,
+            #[cfg(test)]
+            reindex_test_pause: None,
+            #[cfg(test)]
+            reindex_test_entered: None,
         })
+    }
+
+    /// Selects the maximum number of concurrent reindex writers on this instance.
+    /// Clones share one semaphore, including manual jobs, automatic jobs, and
+    /// per-resource fallback. The effective width is capped by the connection
+    /// pool. Ordinary library construction remains serial. HFS calls this only
+    /// for standalone PostgreSQL, using the effective bulk-submit file
+    /// concurrency; deployments configured above one opt in on upgrade.
+    pub fn with_reindex_concurrency(mut self, requested: usize) -> Self {
+        let width = requested
+            .max(1)
+            .min(self.config.max_connections.max(1))
+            .min(u32::MAX as usize);
+        self.reindex_admission = Arc::new(Semaphore::new(width));
+        self.reindex_width = width;
+        self
+    }
+
+    /// Waits until exceptional rollback tasks have settled or discarded their
+    /// managed PostgreSQL sessions. A discarded server session may still be
+    /// finishing a request; this is not a server-idle guarantee.
+    pub async fn wait_postgres_cleanup(&self) {
+        self.cleanup_tracker.wait().await;
     }
 
     /// Creates a backend from a connection string.
@@ -799,8 +847,81 @@ impl PostgresBackend {
         Ok(count)
     }
 
+    /// Builds a fresh tenant registry using the caller's guarded transaction.
+    ///
+    /// The process-local overlay cache can lag writes from another HFS process.
+    /// Reindex groups and guarded mutations therefore read the persisted overlay
+    /// after taking the tenant gate. The caller keeps this extractor for one
+    /// immutable extraction phase; this method never writes the cache or checks
+    /// out another connection.
+    pub(crate) async fn authoritative_extractor<C>(
+        &self,
+        client: &C,
+        tenant_id: &str,
+    ) -> StorageResult<SearchParameterExtractor>
+    where
+        C: GenericClient + Sync + ?Sized,
+    {
+        let rows = client
+            .query(
+                "SELECT data FROM resources
+                 WHERE tenant_id = $1 AND resource_type = 'SearchParameter'
+                   AND is_deleted = FALSE
+                 ORDER BY id",
+                &[&tenant_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::error::StorageError::Backend(BackendError::Internal {
+                    backend_name: "postgres".to_string(),
+                    message: format!("Failed to query tenant SearchParameters: {e}"),
+                    source: None,
+                })
+            })?;
+
+        let base = self.registries.base().clone();
+        let overlays: Vec<serde_json::Value> = {
+            let registry = base.read();
+            rows.into_iter()
+                .filter_map(|row| {
+                    let data: serde_json::Value = row.get(0);
+                    // Seeded core definitions cannot override their canonical
+                    // URL in the base. Skip parsing them on every write.
+                    let duplicate = data
+                        .get("url")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|url| registry.get_by_url(url).is_some());
+                    (!duplicate).then_some(data)
+                })
+                .collect()
+        };
+        if overlays.is_empty() {
+            // The common case has no tenant overlay. The base is loaded at
+            // construction and remains shared, so a write need not clone its
+            // 1,389 definitions before extracting one resource.
+            return Ok(SearchParameterExtractor::new(base));
+        }
+        let loader = SearchParameterLoader::new(self.config.fhir_version);
+        let mut registry = base.read().clone();
+        for data in overlays {
+            if let Ok(mut definition) = loader.parse_resource(&data) {
+                if definition.status == SearchParameterStatus::Active {
+                    definition.source = SearchParameterSource::Stored;
+                    // Match TenantSearchRegistries::build_and_cache: a stored
+                    // duplicate canonical URL cannot override the base entry.
+                    let _ = registry.register(definition);
+                }
+            }
+        }
+        Ok(SearchParameterExtractor::new(Arc::new(RwLock::new(
+            registry,
+        ))))
+    }
+
     /// TTL-cache refresh (#235): reload the stored-param cache from storage and
     /// drop the cached per-tenant registries. Returns the stored-param count.
+    /// PostgreSQL reindex reads authoritative definitions within its guarded
+    /// transaction, even if this cache has not yet refreshed.
     pub async fn refresh_stored_search_parameters(&self) -> StorageResult<usize> {
         self.reload_stored_cache().await
     }
@@ -810,12 +931,15 @@ impl PostgresBackend {
     /// `#[doc(hidden)] pub` rather than `pub(crate)` only so the out-of-crate
     /// pool-timeout regression test (`tests/postgres_tests.rs`) can hold several
     /// pooled connections at once. It hands out a raw connection that bypasses
-    /// tenant scoping, so it is not stable API — workspace callers should use the
-    /// `ResourceStorage`/`SearchProvider` methods instead.
+    /// tenant scoping and the write lock protocol, so it is not stable API —
+    /// workspace callers should use the `ResourceStorage`/`SearchProvider`
+    /// methods instead. Maintenance SQL must provide its own transaction,
+    /// advisory locks, and current-row checks.
     #[doc(hidden)]
     pub async fn get_client(&self) -> StorageResult<deadpool_postgres::Client> {
         use deadpool_postgres::{PoolError, TimeoutType};
 
+        let _checkout = crate::perf::span(crate::perf::Phase::PostgresPoolCheckout);
         self.pool.get().await.map_err(|e| match e {
             // Every connection is busy and the wait timeout elapsed. The database
             // is healthy — we are simply over capacity — so this is a retryable
@@ -834,24 +958,31 @@ impl PostgresBackend {
         })
     }
 
+    pub(super) async fn guarded_client(&self) -> StorageResult<super::cleanup::GuardedClient> {
+        Ok(super::cleanup::GuardedClient::new(
+            self.get_client().await?,
+            self.cleanup_tracker.clone(),
+            None,
+        ))
+    }
+
     /// The per-tenant registry container (shared with a co-located ES backend).
+    /// Direct cache changes are outside guarded PostgreSQL indexing: those
+    /// writes read persisted SearchParameters under the tenant write gate.
     pub fn tenant_registries(&self) -> &Arc<TenantSearchRegistries> {
         &self.registries
     }
 
     /// The shared base registry (embedded + spec + custom), tenant-independent.
+    /// Treat it as immutable after construction while guarded writes run.
     pub(crate) fn base_registry(&self) -> &Arc<RwLock<SearchParameterRegistry>> {
         self.registries.base()
     }
 
-    /// The registry for a tenant (base + that tenant's stored overlay).
+    /// The cached registry for a tenant (base + that tenant's stored overlay).
+    /// Guarded PostgreSQL indexing reads the persisted overlay instead.
     pub(crate) fn tenant_registry(&self, tenant_id: &str) -> Arc<RwLock<SearchParameterRegistry>> {
         self.registries.for_tenant(tenant_id)
-    }
-
-    /// A value extractor over a tenant's registry.
-    pub(crate) fn tenant_extractor(&self, tenant_id: &str) -> SearchParameterExtractor {
-        SearchParameterExtractor::new(self.tenant_registry(tenant_id))
     }
 
     /// Returns the backend configuration.

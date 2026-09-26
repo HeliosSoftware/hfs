@@ -18,7 +18,7 @@
 //! | Collection | Holds |
 //! |---|---|
 //! | `bulk_submissions` | one document per submission: status, kickoff metadata, poll token |
-//! | `bulk_manifests` | one per manifest: status, worker lease + fencing token, fetch parameters |
+//! | `bulk_manifests` | one per manifest: status, worker lease + fencing token, fetch parameters, per-file charged-line progress |
 //! | `bulk_entry_results` | one per ingested NDJSON line, keyed by `(manifest, file_url, line)` |
 //! | `bulk_submission_changes` | the rollback change log |
 //! | `bulk_submit_files` | finalized status-manifest artifacts (`output` / `error` / `deleted`) |
@@ -37,6 +37,7 @@ use mongodb::{
     options::{FindOptions, ReturnDocument},
 };
 use serde_json::Value;
+use std::collections::HashMap;
 use std::time::Duration as StdDuration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use uuid::Uuid;
@@ -46,10 +47,11 @@ use crate::core::bulk_export::ExportJobId;
 use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
-    BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, EntryResultContinuation,
-    EntryResultPage, ManifestPhase, ManifestStatus, NdjsonEntry, PagedEntryResult,
-    StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange, SubmissionId,
-    SubmissionManifest, SubmissionStatus, SubmissionSummary, invalid_entry_result_page,
+    BulkSubmitRollbackProvider, CANCELLED_ABORT_REASON, ChangeType, EntryCountSummary,
+    EntryResultContinuation, EntryResultCursor, EntryResultPage, ManifestPhase, ManifestStatus,
+    NdjsonEntry, PagedEntryResult, StreamProcessingResult, StreamingBulkSubmitProvider,
+    SubmissionChange, SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary,
+    UnindexedEntry, invalid_entry_result_page,
 };
 use crate::core::bulk_submit_publication::{
     ManifestPublicationResult, ManifestPublicationStatus, canonical_publication_files,
@@ -63,6 +65,7 @@ use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 
 use super::MongoBackend;
 use super::bulk_ingest::BatchOutcome;
+use super::retry::{BULK_INGEST_RETRY, or_exhausted, retry_transient_with};
 
 /// Submissions: one document per `(tenant, submitter, submission_id)`.
 pub(crate) const SUBMISSIONS_COLLECTION: &str = "bulk_submissions";
@@ -218,6 +221,196 @@ fn decode_manifest(doc: &Document) -> StorageResult<SubmissionManifest> {
     })
 }
 
+/// One submission's manifest counters, summed by [`MongoBackend::manifest_totals`].
+///
+/// These are the same counters `list_manifests` reports, so the submission
+/// summary and the per-manifest progress agree. They are maintained per
+/// committed batch (plus the worker's deltas for file-level failures and
+/// unindexed entries), not recomputed from receipts.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ManifestTotals {
+    manifests: u64,
+    total: u64,
+    processed: u64,
+    failed: u64,
+    skipped: u64,
+}
+
+impl ManifestTotals {
+    fn from_group(group: &Document) -> Self {
+        Self {
+            manifests: bson_count(group, "manifests"),
+            total: bson_count(group, "total"),
+            processed: bson_count(group, "processed"),
+            failed: bson_count(group, "failed"),
+            skipped: bson_count(group, "skipped"),
+        }
+    }
+}
+
+/// A non-negative count from a numeric BSON field of any width.
+///
+/// `$sum` returns an `int32` while the total fits and widens to `int64` (or a
+/// `double` on mixed input), so a strict `get_i64` would read small sums as 0.
+fn bson_count(doc: &Document, key: &str) -> u64 {
+    match doc.get(key) {
+        Some(Bson::Int32(n)) => (*n).max(0) as u64,
+        Some(Bson::Int64(n)) => (*n).max(0) as u64,
+        Some(Bson::Double(n)) if n.is_finite() && *n > 0.0 => *n as u64,
+        _ => 0,
+    }
+}
+
+/// Manifest field holding `[{ file_url, max_line }]`: per input file, the
+/// highest line already charged to the manifest's counters (#1127).
+///
+/// An array of sub-documents rather than a map keyed by URL, because BSON
+/// forbids `.` and `$` in keys and URLs routinely contain both.
+const FILE_PROGRESS_FIELD: &str = "file_progress";
+
+/// How many compare-and-swap rounds [`MongoBackend::charge_batch`] runs before
+/// giving up. Each lost round means another writer advanced the same file, so
+/// this is only reached under pathological contention.
+const FILE_CHARGE_ATTEMPTS: usize = 32;
+
+/// What one batch adds to its manifest's counters.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct BatchTally {
+    entries: i64,
+    succeeded: i64,
+    failed: i64,
+    skipped: i64,
+    /// The highest line charged so far, this batch included.
+    last_line: i64,
+}
+
+impl BatchTally {
+    /// Tallies the entries of `results` whose line lies beyond `counted`, the
+    /// highest line an earlier pass over the same file already charged.
+    /// `None` charges every entry.
+    fn beyond(results: &[BulkEntryResult], counted: Option<u64>) -> Self {
+        let floor = counted.unwrap_or(0);
+        let mut tally = Self {
+            last_line: i64::try_from(floor).unwrap_or(i64::MAX),
+            ..Self::default()
+        };
+        for result in results
+            .iter()
+            .filter(|r| counted.is_none_or(|c| r.line_number > c))
+        {
+            tally.entries += 1;
+            match result.outcome {
+                BulkEntryOutcome::Success => tally.succeeded += 1,
+                // Skipped lines are neither processed nor failed; counted apart
+                // so the submission summary can report them without receipts.
+                BulkEntryOutcome::Skipped => tally.skipped += 1,
+                _ if result.is_error() => tally.failed += 1,
+                _ => {}
+            }
+            tally.last_line = tally
+                .last_line
+                .max(i64::try_from(result.line_number).unwrap_or(i64::MAX));
+        }
+        tally
+    }
+
+    /// The `$inc` body charging this tally. `last_processed_line` advances by
+    /// the entries newly charged (#969, #954).
+    fn counters(&self) -> Document {
+        doc! {
+            "total_entries": self.entries,
+            "processed_entries": self.succeeded,
+            "failed_entries": self.failed,
+            "skipped_entries": self.skipped,
+            "last_processed_line": self.entries,
+        }
+    }
+}
+
+/// The `max_line` recorded for `file_url` on a manifest document, or `None`
+/// when no pass over that file has been charged yet.
+fn recorded_max_line(manifest: &Document, file_url: &str) -> Option<i64> {
+    manifest
+        .get_array(FILE_PROGRESS_FIELD)
+        .ok()?
+        .iter()
+        .filter_map(Bson::as_document)
+        .find(|entry| entry.get_str("file_url").ok() == Some(file_url))
+        .map(|entry| match entry.get("max_line") {
+            Some(Bson::Int32(n)) => i64::from(*n),
+            Some(Bson::Int64(n)) => *n,
+            Some(Bson::Double(n)) if n.is_finite() => *n as i64,
+            _ => 0,
+        })
+}
+
+/// The guarded filter and update that charge `tally` for `file_url`, given the
+/// `counted` line read beforehand.
+///
+/// The filter only matches while the file's progress is still what was read
+/// (`counted`, or no entry at all), so a concurrent writer that got there first
+/// turns this into a no-op the caller detects and retries.
+fn file_charge(
+    manifest: Document,
+    file_url: &str,
+    counted: Option<i64>,
+    tally: &BatchTally,
+) -> (Document, Document) {
+    let mut filter = manifest;
+    let update = match counted {
+        Some(prior) => {
+            filter.insert(
+                FILE_PROGRESS_FIELD,
+                doc! { "$elemMatch": { "file_url": file_url, "max_line": prior } },
+            );
+            doc! {
+                "$set": { format!("{FILE_PROGRESS_FIELD}.$.max_line"): tally.last_line },
+                "$inc": tally.counters(),
+            }
+        }
+        None => {
+            filter.insert(
+                format!("{FILE_PROGRESS_FIELD}.file_url"),
+                doc! { "$ne": file_url },
+            );
+            doc! {
+                "$push": {
+                    FILE_PROGRESS_FIELD: { "file_url": file_url, "max_line": tally.last_line },
+                },
+                "$inc": tally.counters(),
+            }
+        }
+    };
+    (filter, update)
+}
+
+/// Builds a [`SubmissionSummary`] from a submission document and its manifests'
+/// summed counters.
+fn submission_summary(
+    document: &Document,
+    id: SubmissionId,
+    totals: &ManifestTotals,
+) -> StorageResult<SubmissionSummary> {
+    let status: SubmissionStatus = document
+        .get_str("status")
+        .unwrap_or("in-progress")
+        .parse()
+        .map_err(|e: String| internal_error(e))?;
+    Ok(SubmissionSummary {
+        id,
+        status,
+        created_at: opt_time(document, "created_at").unwrap_or_else(Utc::now),
+        updated_at: opt_time(document, "updated_at").unwrap_or_else(Utc::now),
+        completed_at: opt_time(document, "completed_at"),
+        manifest_count: u32::try_from(totals.manifests).unwrap_or(u32::MAX),
+        total_entries: totals.total,
+        success_count: totals.processed,
+        error_count: totals.failed,
+        skipped_count: totals.skipped,
+        metadata: opt_json(document, "metadata"),
+    })
+}
+
 fn decode_entry_result(doc: &Document) -> BulkEntryResult {
     let outcome: BulkEntryOutcome = doc
         .get_str("outcome")
@@ -232,9 +425,38 @@ fn decode_entry_result(doc: &Document) -> BulkEntryResult {
             .to_string(),
         resource_id: opt_str(doc, "resource_id"),
         created: doc.get_bool("created").unwrap_or(false),
+        unchanged: false,
         outcome,
         operation_outcome: opt_json(doc, "operation_outcome"),
     }
+}
+
+/// Decodes a receipt together with its stored `(file_url, line_number)`
+/// identity, the key receipt pages continue from.
+///
+/// Every receipt has carried both fields since MongoDB hosted `$bulk-submit`
+/// (#521), so one without them — or with a negative line — is corrupt. It is an
+/// error rather than a default: a keyset cursor built from an invented identity
+/// would silently skip or repeat receipts.
+fn decode_paged_entry_result(doc: &Document) -> StorageResult<PagedEntryResult> {
+    let file_url = doc
+        .get_str("file_url")
+        .map_err(|e| internal_error(format!("entry result missing file_url: {e}")))?
+        .to_string();
+    let line = doc
+        .get_i64("line_number")
+        .map_err(|e| internal_error(format!("entry result missing line_number: {e}")))?;
+    let line_number = u64::try_from(line)
+        .map_err(|_| internal_error("Negative stored receipt line number".to_string()))?;
+    let mut result = decode_entry_result(doc);
+    result.line_number = line_number;
+    Ok(PagedEntryResult {
+        result,
+        stored_identity: Some(EntryResultCursor {
+            file_url,
+            line_number,
+        }),
+    })
 }
 
 fn decode_change(doc: &Document) -> SubmissionChange {
@@ -311,20 +533,173 @@ impl MongoBackend {
         tenant: &TenantContext,
         id: &SubmissionId,
     ) -> StorageResult<()> {
-        self.submissions()
-            .await?
-            .update_one(
-                submission_filter(tenant, id),
-                doc! { "$set": { "updated_at": to_bson_time(Utc::now()) } },
-            )
-            .await
-            .map_err(|e| internal_error(format!("touch submission: {e}")))?;
+        let submissions = self.submissions().await?;
+        let filter = submission_filter(tenant, id);
+        or_exhausted(
+            "touch submission",
+            retry_transient_with(&BULK_INGEST_RETRY, None, "touch submission", || async {
+                submissions
+                    .update_one(
+                        filter.clone(),
+                        doc! { "$set": { "updated_at": to_bson_time(Utc::now()) } },
+                    )
+                    .await
+            })
+            .await,
+        )?;
         Ok(())
     }
 
+    /// Charges one committed batch to its manifest's counters.
+    ///
+    /// Counters accumulate across runs and never move backwards (#969), but a
+    /// line of a file is charged only once: the manifest's `file_progress`
+    /// array remembers the highest line already counted per file URL, and a
+    /// re-walk of that file (lost lease, reclaim, whole-file retry) adds only
+    /// the lines beyond it. Without that, every pass added the whole file again
+    /// and `total_entries` reported a multiple of the manifest (#1127). Callers
+    /// without a file URL have no line identity to key on and keep plain
+    /// accumulation.
+    ///
+    /// The progress lives on the manifest document itself, so raising
+    /// `max_line` and `$inc`-ing the counters is one atomic single-document
+    /// update, it needs no index or cleanup of its own, and it goes wherever
+    /// the manifest goes. Two writers on the same file are serialized by a
+    /// compare-and-swap on the `max_line` that was read: the loser matches
+    /// nothing, re-reads, and charges only what is still uncounted. The same
+    /// guard makes a retry after a lost acknowledgement charge nothing twice.
+    async fn charge_batch(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        results: &[BulkEntryResult],
+        options: &BulkProcessingOptions,
+    ) -> StorageResult<()> {
+        let manifests = self.manifests().await?;
+        let cancel = options.cancel.as_ref();
+        let filter = manifest_filter(tenant, submission_id, manifest_id);
+
+        let Some(file_url) = options.file_url.as_deref() else {
+            let tally = BatchTally::beyond(results, None);
+            if tally.entries == 0 {
+                return Ok(());
+            }
+            // Not idempotent: an attempt whose acknowledgement was lost
+            // double-counts this batch on retry. Accepted for callers without
+            // a file URL — the receipts stay authoritative.
+            let update = doc! { "$inc": tally.counters() };
+            or_exhausted(
+                "update manifest counts",
+                retry_transient_with(
+                    &BULK_INGEST_RETRY,
+                    cancel,
+                    "update manifest counts",
+                    || async { manifests.update_one(filter.clone(), update.clone()).await },
+                )
+                .await,
+            )?;
+            return Ok(());
+        };
+
+        let projection = doc! {
+            FILE_PROGRESS_FIELD: { "$elemMatch": { "file_url": file_url } },
+        };
+        for _ in 0..FILE_CHARGE_ATTEMPTS {
+            let manifest = or_exhausted(
+                "read file progress",
+                retry_transient_with(&BULK_INGEST_RETRY, cancel, "read file progress", || async {
+                    manifests
+                        .find_one(filter.clone())
+                        .projection(projection.clone())
+                        .await
+                })
+                .await,
+            )?;
+            // A manifest that is gone has nothing to charge, exactly as the
+            // unconditional update used to match nothing.
+            let Some(manifest) = manifest else {
+                return Ok(());
+            };
+            let counted = recorded_max_line(&manifest, file_url);
+            let tally = BatchTally::beyond(results, counted.map(|c| c.max(0) as u64));
+            if tally.entries == 0 {
+                return Ok(());
+            }
+            let (guarded, update) = file_charge(filter.clone(), file_url, counted, &tally);
+            let applied = or_exhausted(
+                "update manifest counts",
+                retry_transient_with(
+                    &BULK_INGEST_RETRY,
+                    cancel,
+                    "update manifest counts",
+                    || async { manifests.update_one(guarded.clone(), update.clone()).await },
+                )
+                .await,
+            )?;
+            if applied.matched_count > 0 {
+                return Ok(());
+            }
+        }
+        Err(internal_error(format!(
+            "update manifest counts: file progress for {file_url} kept changing \
+             after {FILE_CHARGE_ATTEMPTS} attempts"
+        )))
+    }
+
+    /// Sums the manifest counters per submission for every manifest `filter`
+    /// matches, keyed by `(submitter, submission_id)`.
+    ///
+    /// The filter always starts with `tenant_id` (and usually the submitter and
+    /// submission), so the `$match` rides `idx_bulk_manifests_id`. `$sum` of a
+    /// field a document lacks adds nothing, so manifests written before
+    /// `skipped_entries` existed simply report no skips.
+    async fn manifest_totals(
+        &self,
+        filter: Document,
+    ) -> StorageResult<HashMap<(String, String), ManifestTotals>> {
+        let pipeline = vec![
+            doc! { "$match": filter },
+            doc! { "$group": {
+                "_id": { "submitter": "$submitter", "submission_id": "$submission_id" },
+                "manifests": { "$sum": 1_i32 },
+                "total": { "$sum": "$total_entries" },
+                "processed": { "$sum": "$processed_entries" },
+                "failed": { "$sum": "$failed_entries" },
+                "skipped": { "$sum": "$skipped_entries" },
+            }},
+        ];
+        let cursor = self
+            .manifests()
+            .await?
+            .aggregate(pipeline)
+            .await
+            .map_err(|e| internal_error(format!("sum manifest counters: {e}")))?;
+        let mut out = HashMap::new();
+        for group in collect(cursor).await? {
+            let Ok(key) = group.get_document("_id") else {
+                continue;
+            };
+            let (Ok(submitter), Ok(submission_id)) =
+                (key.get_str("submitter"), key.get_str("submission_id"))
+            else {
+                continue;
+            };
+            out.insert(
+                (submitter.to_string(), submission_id.to_string()),
+                ManifestTotals::from_group(&group),
+            );
+        }
+        Ok(out)
+    }
+
     /// Counts entry results for a submission (optionally one manifest), grouped
-    /// into the outcome buckets both `get_submission` and `get_entry_counts`
-    /// report.
+    /// into the outcome buckets `get_entry_counts` reports.
+    ///
+    /// Four `count_documents` over a collection holding one document per
+    /// ingested line: fine for one manifest's receipt summary, far too slow for
+    /// a status poll. `get_submission` reads the manifest counters instead
+    /// ([`ManifestTotals`], #998, #1127).
     async fn count_outcomes(
         &self,
         tenant: &TenantContext,
@@ -443,9 +818,39 @@ impl MongoBackend {
         lease: &ManifestLease,
         update: Document,
     ) -> Result<(), LeaseError> {
+        self.fenced_update_filtered(lease, fenced_filter(lease), update)
+            .await
+    }
+
+    /// [`Self::fenced_update`] with `status: processing` added to the guard, for
+    /// the two writes that settle a manifest's final outcome.
+    ///
+    /// `abort_submission` moves in-flight manifests to `failed` without clearing
+    /// `worker_id`/`fencing_token`, so the lease fence alone would let a worker
+    /// finishing just after an abort rewrite that verdict. With the status in the
+    /// guard the write matches nothing and the caller sees `LeaseLost`, which
+    /// callers already read as "someone else owns the outcome" (#968).
+    async fn fenced_update_while_processing(
+        &self,
+        lease: &ManifestLease,
+        update: Document,
+    ) -> Result<(), LeaseError> {
+        let mut filter = fenced_filter(lease);
+        filter.insert("status", ManifestStatus::Processing.to_string());
+        self.fenced_update_filtered(lease, filter, update).await
+    }
+
+    /// Shared body of the fenced updates: apply `update` under `filter`, and
+    /// report `LeaseLost` when the guard matches nothing.
+    async fn fenced_update_filtered(
+        &self,
+        lease: &ManifestLease,
+        filter: Document,
+        update: Document,
+    ) -> Result<(), LeaseError> {
         let manifests = self.manifests().await.map_err(LeaseError::Storage)?;
         let result = manifests
-            .update_one(fenced_filter(lease), update)
+            .update_one(filter, update)
             .await
             .map_err(|e| LeaseError::Storage(internal_error(format!("fenced update: {e}"))))?;
         if result.matched_count == 0 {
@@ -527,32 +932,48 @@ impl BulkSubmitProvider for MongoBackend {
             return Ok(None);
         };
 
-        let status: SubmissionStatus = document
+        // One aggregate over this submission's manifest documents, never a scan
+        // of `bulk_entry_results`: the status poll and the lease keeper's
+        // submission watch call this every few seconds, and four
+        // `count_documents` over 11 M receipts took 26 s (#998).
+        let totals = self
+            .manifest_totals(submission_filter(tenant, id))
+            .await?
+            .remove(&(id.submitter.clone(), id.submission_id.clone()))
+            .unwrap_or_default();
+        submission_summary(&document, id.clone(), &totals).map(Some)
+    }
+
+    /// Reads only the submission document's `status` field.
+    ///
+    /// The trait default goes through [`get_submission`](Self::get_submission),
+    /// whose summary counts every receipt document of the submission four
+    /// times over (`count_outcomes`). At 11M receipts that is ~26s per call —
+    /// and this method is on every hot path that only needs the status: the
+    /// `$bulk-submit-status` poll, the status-only kick-off behind *Mark
+    /// completed*, and the lease keeper's 3s abort watch (#998). One indexed
+    /// point read instead.
+    async fn get_submission_status(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+    ) -> StorageResult<Option<SubmissionStatus>> {
+        let Some(document) = self
+            .submissions()
+            .await?
+            .find_one(submission_filter(tenant, id))
+            .projection(doc! { "_id": 0, "status": 1 })
+            .await
+            .map_err(|e| internal_error(format!("read submission status: {e}")))?
+        else {
+            return Ok(None);
+        };
+        document
             .get_str("status")
             .unwrap_or("in-progress")
             .parse()
-            .map_err(|e: String| internal_error(e))?;
-        let manifest_count = self
-            .manifests()
-            .await?
-            .count_documents(submission_filter(tenant, id))
-            .await
-            .map_err(|e| internal_error(format!("count manifests: {e}")))?;
-        let counts = self.count_outcomes(tenant, id, None).await?;
-
-        Ok(Some(SubmissionSummary {
-            id: id.clone(),
-            status,
-            created_at: opt_time(&document, "created_at").unwrap_or_else(Utc::now),
-            updated_at: opt_time(&document, "updated_at").unwrap_or_else(Utc::now),
-            completed_at: opt_time(&document, "completed_at"),
-            manifest_count: manifest_count as u32,
-            total_entries: counts.total,
-            success_count: counts.success,
-            error_count: counts.error_count(),
-            skipped_count: counts.skipped,
-            metadata: opt_json(&document, "metadata"),
-        }))
+            .map(Some)
+            .map_err(|e: String| internal_error(e))
     }
 
     async fn list_submissions(
@@ -584,27 +1005,55 @@ impl BulkSubmitProvider for MongoBackend {
             .await
             .map_err(|e| internal_error(format!("list submissions: {e}")))?;
 
-        let mut out = Vec::new();
-        for document in collect(cursor).await? {
-            let (Ok(submitter), Ok(submission_id)) = (
-                document.get_str("submitter"),
-                document.get_str("submission_id"),
-            ) else {
-                continue;
-            };
-            let id = SubmissionId::new(submitter, submission_id);
-            if let Some(summary) = self.get_submission(tenant, &id).await? {
-                out.push(summary);
-            }
+        let page: Vec<(SubmissionId, Document)> = collect(cursor)
+            .await?
+            .into_iter()
+            .filter_map(|document| {
+                let id = SubmissionId::new(
+                    document.get_str("submitter").ok()?,
+                    document.get_str("submission_id").ok()?,
+                );
+                Some((id, document))
+            })
+            .collect();
+        if page.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(out)
+
+        // One aggregate for the whole page instead of a `get_submission` per
+        // row. Matching on both key fields keeps the `$match` on the
+        // `idx_bulk_manifests_id` prefix; the cross product of the two `$in`
+        // lists can also match another submitter's same-named submission, which
+        // the group key keeps apart and the lookup below ignores.
+        let mut submitters: Vec<&str> = page.iter().map(|(id, _)| id.submitter.as_str()).collect();
+        submitters.sort_unstable();
+        submitters.dedup();
+        let submission_ids: Vec<&str> = page
+            .iter()
+            .map(|(id, _)| id.submission_id.as_str())
+            .collect();
+        let mut totals = self
+            .manifest_totals(doc! {
+                "tenant_id": tenant.tenant_id().as_str(),
+                "submitter": { "$in": submitters },
+                "submission_id": { "$in": submission_ids },
+            })
+            .await?;
+
+        page.into_iter()
+            .map(|(id, document)| {
+                let key = (id.submitter.clone(), id.submission_id.clone());
+                let manifest_totals = totals.remove(&key).unwrap_or_default();
+                submission_summary(&document, id, &manifest_totals)
+            })
+            .collect()
     }
 
     async fn complete_submission(
         &self,
         tenant: &TenantContext,
         id: &SubmissionId,
-    ) -> StorageResult<SubmissionSummary> {
+    ) -> StorageResult<()> {
         let document = self.load_submission_doc(tenant, id).await?;
         if document.get_str("status").unwrap_or_default()
             != SubmissionStatus::InProgress.to_string()
@@ -627,10 +1076,7 @@ impl BulkSubmitProvider for MongoBackend {
             )
             .await
             .map_err(|e| internal_error(format!("complete submission: {e}")))?;
-
-        self.get_submission(tenant, id)
-            .await?
-            .ok_or_else(|| internal_error("submission disappeared while completing"))
+        Ok(())
     }
 
     async fn abort_submission(
@@ -738,6 +1184,7 @@ impl BulkSubmitProvider for MongoBackend {
         document.insert("total_entries", 0_i64);
         document.insert("processed_entries", 0_i64);
         document.insert("failed_entries", 0_i64);
+        document.insert("skipped_entries", 0_i64);
         document.insert("fencing_token", 0_i64);
         document.insert("last_processed_line", 0_i64);
         document.insert("bytes_processed", 0_i64);
@@ -797,11 +1244,17 @@ impl BulkSubmitProvider for MongoBackend {
         entries: Vec<NdjsonEntry>,
         options: &BulkProcessingOptions,
     ) -> StorageResult<Vec<BulkEntryResult>> {
-        if self
-            .get_manifest(tenant, submission_id, manifest_id)
-            .await?
-            .is_none()
-        {
+        let manifests = self.manifests().await?;
+        let cancel = options.cancel.as_ref();
+        let filter = manifest_filter(tenant, submission_id, manifest_id);
+        let present = or_exhausted(
+            "load manifest",
+            retry_transient_with(&BULK_INGEST_RETRY, cancel, "load manifest", || async {
+                manifests.find_one(filter.clone()).await
+            })
+            .await,
+        )?;
+        if present.is_none() {
             return Err(StorageError::BulkSubmit(
                 BulkSubmitError::ManifestNotFound {
                     submission_id: submission_id.submission_id.clone(),
@@ -810,14 +1263,36 @@ impl BulkSubmitProvider for MongoBackend {
             ));
         }
 
-        let manifests = self.manifests().await?;
-        manifests
-            .update_one(
-                manifest_filter(tenant, submission_id, manifest_id),
-                doc! { "$set": { "status": ManifestStatus::Processing.to_string() } },
+        // A promotion, not a reset: this runs on *every* batch, so without the
+        // `pending`/`processing` guard the batch that lands right after
+        // `abort_submission` moved the manifest to `failed` would quietly put
+        // it back to `processing` and the abort would read as if it had never
+        // happened (#968).
+        let mut promote = manifest_filter(tenant, submission_id, manifest_id);
+        promote.insert(
+            "status",
+            doc! { "$in": [
+                ManifestStatus::Pending.to_string(),
+                ManifestStatus::Processing.to_string(),
+            ]},
+        );
+        or_exhausted(
+            "mark manifest processing",
+            retry_transient_with(
+                &BULK_INGEST_RETRY,
+                cancel,
+                "mark manifest processing",
+                || async {
+                    manifests
+                        .update_one(
+                            promote.clone(),
+                            doc! { "$set": { "status": ManifestStatus::Processing.to_string() } },
+                        )
+                        .await
+                },
             )
-            .await
-            .map_err(|e| internal_error(format!("mark manifest processing: {e}")))?;
+            .await,
+        )?;
 
         // One batch, a fixed number of commands (#1000). The per-entry pipeline
         // this replaces made ~9 round trips per resource, which held ingest at
@@ -825,7 +1300,33 @@ impl BulkSubmitProvider for MongoBackend {
         let outcome = self
             .ingest_batch(tenant, submission_id, manifest_id, &entries, options)
             .await?;
-        if outcome.aborted_on_max_errors {
+        // The batch's writes are in: report them before the max-errors return
+        // and the counter update below (#1078).
+        // MongoDB's batch planner does not keep the written resources, so
+        // observers that need them re-read the ids from the primary (#1127).
+        options
+            .notify_batch_committed(tenant, submission_id, manifest_id, &outcome.results, &[])
+            .await;
+        let BatchOutcome {
+            results,
+            error_count,
+            aborted_on_max_errors,
+        } = outcome;
+
+        // Charged before the max-errors return: the aborting batch's receipts
+        // are already written, so its counts belong in the summary too (#1127).
+        self.charge_batch(tenant, submission_id, manifest_id, &results, options)
+            .await?;
+        self.touch_submission(tenant, submission_id).await?;
+
+        if aborted_on_max_errors {
+            tracing::debug!(
+                submission_id = %submission_id.submission_id,
+                manifest_id,
+                error_count,
+                max_errors = options.max_errors,
+                "bulk submit batch stopped at max errors"
+            );
             return Err(StorageError::BulkSubmit(
                 BulkSubmitError::MaxErrorsExceeded {
                     submission_id: submission_id.submission_id.clone(),
@@ -833,25 +1334,6 @@ impl BulkSubmitProvider for MongoBackend {
                 },
             ));
         }
-        let BatchOutcome {
-            results,
-            error_count,
-            ..
-        } = outcome;
-
-        manifests
-            .update_one(
-                manifest_filter(tenant, submission_id, manifest_id),
-                doc! { "$inc": {
-                    "total_entries": results.len() as i64,
-                    "processed_entries": results.iter().filter(|r| r.is_success()).count() as i64,
-                    "failed_entries": error_count as i64,
-                    "last_processed_line": results.len() as i64,
-                }},
-            )
-            .await
-            .map_err(|e| internal_error(format!("update manifest counts: {e}")))?;
-        self.touch_submission(tenant, submission_id).await?;
 
         Ok(results)
     }
@@ -870,12 +1352,17 @@ impl BulkSubmitProvider for MongoBackend {
                 "Receipt page limit must be greater than zero",
             ));
         }
-        let offset = match continuation {
-            None => 0,
-            Some(EntryResultContinuation::Offset(offset)) => *offset,
-            Some(EntryResultContinuation::Keyset(_)) => {
+        let after = match continuation {
+            None => None,
+            Some(EntryResultContinuation::Keyset(cursor)) => Some((
+                cursor.file_url.as_str(),
+                i64::try_from(cursor.line_number).map_err(|_| {
+                    invalid_entry_result_page("Receipt cursor line exceeds MongoDB int64 range")
+                })?,
+            )),
+            Some(EntryResultContinuation::Offset(_)) => {
                 return Err(invalid_entry_result_page(
-                    "mongodb receipt pages require an offset continuation",
+                    "MongoDB receipt pages require a keyset continuation",
                 ));
             }
         };
@@ -883,10 +1370,25 @@ impl BulkSubmitProvider for MongoBackend {
         if let Some(outcome) = outcome_filter {
             filter.insert("outcome", outcome.to_string());
         }
+        // Strictly after the last stored identity. Each branch is a bounded
+        // range on an index ending in `(file_url, line_number)`, so a page costs
+        // the same at any depth — unlike `skip`, which rescanned every earlier
+        // receipt on every page (#1046).
+        if let Some((file_url, line)) = after {
+            filter.insert(
+                "$or",
+                vec![
+                    doc! { "file_url": { "$gt": file_url } },
+                    doc! { "file_url": file_url, "line_number": { "$gt": line } },
+                ],
+            );
+        }
+        // The key order both receipt indexes end in, so no page needs a blocking
+        // in-memory sort. The old `{line_number, file_url}` order could not use
+        // either index.
         let options = FindOptions::builder()
-            .sort(doc! { "line_number": 1_i32, "file_url": 1_i32 })
-            .skip(Some(offset as u64))
-            .limit(Some(limit as i64))
+            .sort(doc! { "file_url": 1_i32, "line_number": 1_i32 })
+            .limit(Some(i64::from(limit)))
             .build();
         let cursor = self
             .entry_results()
@@ -895,30 +1397,20 @@ impl BulkSubmitProvider for MongoBackend {
             .with_options(options)
             .await
             .map_err(|e| internal_error(format!("query entry results: {e}")))?;
-        let results: Vec<_> = collect(cursor)
+        let entries = collect(cursor)
             .await?
             .iter()
-            .map(decode_entry_result)
-            .collect();
-        let next = if results.len() == limit as usize {
-            Some(EntryResultContinuation::Offset(
-                offset
-                    .checked_add(limit)
-                    .ok_or_else(|| invalid_entry_result_page("Receipt offset exceeds u32 range"))?,
-            ))
+            .map(decode_paged_entry_result)
+            .collect::<StorageResult<Vec<_>>>()?;
+        let next = if entries.len() == limit as usize {
+            entries
+                .last()
+                .and_then(|entry| entry.stored_identity.clone())
+                .map(EntryResultContinuation::Keyset)
         } else {
             None
         };
-        Ok(EntryResultPage {
-            entries: results
-                .into_iter()
-                .map(|result| PagedEntryResult {
-                    result,
-                    stored_identity: None,
-                })
-                .collect(),
-            next,
-        })
+        Ok(EntryResultPage { entries, next })
     }
 
     async fn get_entry_counts(
@@ -929,6 +1421,38 @@ impl BulkSubmitProvider for MongoBackend {
     ) -> StorageResult<EntryCountSummary> {
         self.count_outcomes(tenant, submission_id, Some(manifest_id))
             .await
+    }
+
+    async fn mark_entries_unindexed(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        entries: &[UnindexedEntry],
+    ) -> StorageResult<u64> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        let results = self.entry_results().await?;
+        let mut affected = 0u64;
+        for entry in entries {
+            let mut filter = manifest_filter(tenant, submission_id, manifest_id);
+            filter.insert("resource_type", &entry.resource_type);
+            filter.insert("resource_id", &entry.resource_id);
+            let operation_outcome = json_string(&entry.operation_outcome)?;
+            let update = doc! {
+                "$set": {
+                    "outcome": BulkEntryOutcome::ProcessingError.to_string(),
+                    "operation_outcome": operation_outcome,
+                }
+            };
+            let result = results
+                .update_many(filter, update)
+                .await
+                .map_err(|e| internal_error(format!("mark entry unindexed: {e}")))?;
+            affected += result.modified_count;
+        }
+        Ok(affected)
     }
 }
 
@@ -947,12 +1471,20 @@ impl StreamingBulkSubmitProvider for MongoBackend {
         let mut line_number = 0u64;
         let mut batch = Vec::new();
 
+        // An ingest cancelled before it read anything persists nothing.
+        if options.is_cancelled() {
+            return Ok(result.aborted(CANCELLED_ABORT_REASON));
+        }
+
         loop {
             let mut line = String::new();
             let bytes_read = reader.read_line(&mut line).await.map_err(|e| {
-                StorageError::BulkSubmit(BulkSubmitError::ParseError {
-                    line: line_number,
-                    message: format!("failed to read line: {e}"),
+                // #1127: surface the reader's own message (e.g. the fetcher's
+                // give-up text) unprefixed so it reaches the manifest's error
+                // artifact intact.
+                StorageError::BulkSubmit(BulkSubmitError::InputStream {
+                    message: e.to_string(),
+                    source: Some(Box::new(e)),
                 })
             })?;
             if bytes_read == 0 {
@@ -1013,6 +1545,13 @@ impl StreamingBulkSubmitProvider for MongoBackend {
                     && result.counts.error_count() >= options.max_errors as u64
                 {
                     return Ok(result.aborted("max errors exceeded"));
+                }
+
+                // Abort is cooperative: a claimed manifest checks between
+                // batches, so an aborted submission stops here with its partial
+                // counts intact instead of running to the end (#968).
+                if options.is_cancelled() {
+                    return Ok(result.aborted(CANCELLED_ABORT_REASON));
                 }
             }
         }
@@ -1275,8 +1814,21 @@ impl SubmitWorkerStorage for MongoBackend {
     }
 
     async fn mark_manifest_processing(&self, lease: &ManifestLease) -> Result<(), LeaseError> {
-        self.fenced_update(
+        // Promotion only: an abort landing in the window between the claim and
+        // this call already moved the manifest to `failed`, and re-marking it
+        // `processing` would strand it there with nobody able to claim it
+        // again (#968).
+        let mut filter = fenced_filter(lease);
+        filter.insert(
+            "status",
+            doc! { "$in": [
+                ManifestStatus::Pending.to_string(),
+                ManifestStatus::Processing.to_string(),
+            ]},
+        );
+        self.fenced_update_filtered(
             lease,
+            filter,
             doc! { "$set": { "status": ManifestStatus::Processing.to_string() } },
         )
         .await
@@ -1410,7 +1962,9 @@ impl SubmitWorkerStorage for MongoBackend {
     }
 
     async fn finish_manifest(&self, lease: &ManifestLease) -> Result<(), LeaseError> {
-        self.fenced_update(
+        // Guarded on `processing` so a worker finishing just after an abort
+        // cannot rewrite the abort's `failed` verdict back to `completed` (#968).
+        self.fenced_update_while_processing(
             lease,
             doc! { "$set": {
                 "status": ManifestStatus::Completed.to_string(),
@@ -1426,7 +1980,8 @@ impl SubmitWorkerStorage for MongoBackend {
         lease: &ManifestLease,
         error_message: &str,
     ) -> Result<(), LeaseError> {
-        self.fenced_update(
+        // Same `processing` guard as `finish_manifest` (#968).
+        self.fenced_update_while_processing(
             lease,
             doc! { "$set": {
                 "status": ManifestStatus::Failed.to_string(),
@@ -1695,8 +2250,7 @@ impl SubmitWorkerStorage for MongoBackend {
             .map_err(|e| internal_error(format!("count active submissions: {e}")))?;
         // (submitter, submission_id) → has a non-terminal manifest. Presence in
         // the map at all means the submission has manifests.
-        let mut manifests: std::collections::HashMap<(String, String), bool> =
-            std::collections::HashMap::new();
+        let mut manifests: HashMap<(String, String), bool> = HashMap::new();
         for m in &collect(cursor).await? {
             let (Some(submitter), Some(submission_id)) =
                 (opt_str(m, "submitter"), opt_str(m, "submission_id"))
@@ -1817,4 +2371,203 @@ async fn collect(mut cursor: mongodb::Cursor<Document>) -> StorageResult<Vec<Doc
         );
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bson_count_reads_every_numeric_width() {
+        let group = doc! {
+            "small": 7_i32,
+            "large": 5_000_000_000_i64,
+            "mixed": 12.0_f64,
+            "negative": -3_i64,
+            "text": "9",
+        };
+        assert_eq!(bson_count(&group, "small"), 7);
+        assert_eq!(bson_count(&group, "large"), 5_000_000_000);
+        assert_eq!(bson_count(&group, "mixed"), 12);
+        assert_eq!(bson_count(&group, "negative"), 0);
+        assert_eq!(bson_count(&group, "text"), 0);
+        assert_eq!(bson_count(&group, "absent"), 0);
+    }
+
+    #[test]
+    fn submission_summary_reports_the_manifest_counters() {
+        let now = Utc::now();
+        let document = doc! {
+            "status": "complete",
+            "created_at": to_bson_time(now),
+            "updated_at": to_bson_time(now),
+            "metadata": "{\"source\":\"test\"}",
+        };
+        let group = doc! {
+            "manifests": 2_i32,
+            "total": 10_i32,
+            "processed": 6_i64,
+            "failed": 3_i32,
+            "skipped": 1_i32,
+        };
+        let totals = ManifestTotals::from_group(&group);
+        let summary =
+            submission_summary(&document, SubmissionId::new("sub", "s1"), &totals).unwrap();
+
+        assert_eq!(summary.status, SubmissionStatus::Complete);
+        assert_eq!(summary.manifest_count, 2);
+        assert_eq!(summary.total_entries, 10);
+        assert_eq!(summary.success_count, 6);
+        assert_eq!(summary.error_count, 3);
+        assert_eq!(summary.skipped_count, 1);
+        assert_eq!(summary.id, SubmissionId::new("sub", "s1"));
+    }
+
+    fn batch(outcomes: &[(u64, BulkEntryOutcome)]) -> Vec<BulkEntryResult> {
+        outcomes
+            .iter()
+            .map(|(line, outcome)| {
+                let mut result = BulkEntryResult::success(*line, "Patient", "p", true);
+                result.outcome = *outcome;
+                result
+            })
+            .collect()
+    }
+
+    #[test]
+    fn batch_tally_without_progress_charges_every_entry() {
+        let results = batch(&[
+            (1, BulkEntryOutcome::Success),
+            (2, BulkEntryOutcome::ValidationError),
+            (3, BulkEntryOutcome::Skipped),
+            (4, BulkEntryOutcome::ProcessingError),
+        ]);
+        let tally = BatchTally::beyond(&results, None);
+        assert_eq!(
+            tally,
+            BatchTally {
+                entries: 4,
+                succeeded: 1,
+                failed: 2,
+                skipped: 1,
+                last_line: 4,
+            }
+        );
+        assert_eq!(
+            tally.counters(),
+            doc! {
+                "total_entries": 4_i64,
+                "processed_entries": 1_i64,
+                "failed_entries": 2_i64,
+                "skipped_entries": 1_i64,
+                "last_processed_line": 4_i64,
+            }
+        );
+    }
+
+    #[test]
+    fn batch_tally_charges_only_lines_beyond_the_recorded_progress() {
+        let results = batch(&[
+            (3, BulkEntryOutcome::Success),
+            (4, BulkEntryOutcome::Success),
+            (5, BulkEntryOutcome::ValidationError),
+            (6, BulkEntryOutcome::Skipped),
+        ]);
+        let tally = BatchTally::beyond(&results, Some(4));
+        assert_eq!(
+            tally,
+            BatchTally {
+                entries: 2,
+                succeeded: 0,
+                failed: 1,
+                skipped: 1,
+                last_line: 6,
+            }
+        );
+
+        // A full re-walk of an already-charged file adds nothing and keeps
+        // the recorded line.
+        let rewalk = BatchTally::beyond(&results, Some(10));
+        assert_eq!(rewalk.entries, 0);
+        assert_eq!(rewalk.last_line, 10);
+    }
+
+    #[test]
+    fn recorded_max_line_finds_the_file_entry() {
+        let manifest = doc! {
+            FILE_PROGRESS_FIELD: [
+                { "file_url": "https://x.test/a.ndjson", "max_line": 7_i64 },
+                { "file_url": "https://x.test/b.ndjson", "max_line": 3_i32 },
+            ],
+        };
+        assert_eq!(
+            recorded_max_line(&manifest, "https://x.test/a.ndjson"),
+            Some(7)
+        );
+        assert_eq!(
+            recorded_max_line(&manifest, "https://x.test/b.ndjson"),
+            Some(3)
+        );
+        assert_eq!(
+            recorded_max_line(&manifest, "https://x.test/c.ndjson"),
+            None
+        );
+        assert_eq!(recorded_max_line(&doc! {}, "https://x.test/a.ndjson"), None);
+    }
+
+    #[test]
+    fn file_charge_guards_on_the_progress_that_was_read() {
+        let tenant = tenant_from_id("t1");
+        let id = SubmissionId::new("sub", "s1");
+        let url = "https://x.test/a.ndjson";
+        let tally = BatchTally {
+            entries: 2,
+            succeeded: 2,
+            last_line: 9,
+            ..BatchTally::default()
+        };
+
+        let (filter, update) = file_charge(manifest_filter(&tenant, &id, "m1"), url, None, &tally);
+        assert_eq!(filter.get_str("tenant_id").unwrap(), "t1");
+        assert_eq!(filter.get_str("manifest_id").unwrap(), "m1");
+        assert_eq!(
+            filter.get_document("file_progress.file_url").unwrap(),
+            &doc! { "$ne": url }
+        );
+        assert_eq!(
+            update.get_document("$push").unwrap(),
+            &doc! { "file_progress": { "file_url": url, "max_line": 9_i64 } }
+        );
+        assert_eq!(update.get_document("$inc").unwrap(), &tally.counters());
+
+        let (filter, update) =
+            file_charge(manifest_filter(&tenant, &id, "m1"), url, Some(7), &tally);
+        assert_eq!(filter.get_str("tenant_id").unwrap(), "t1");
+        assert_eq!(
+            filter.get_document("file_progress").unwrap(),
+            &doc! { "$elemMatch": { "file_url": url, "max_line": 7_i64 } }
+        );
+        assert_eq!(
+            update.get_document("$set").unwrap(),
+            &doc! { "file_progress.$.max_line": 9_i64 }
+        );
+        assert_eq!(update.get_document("$inc").unwrap(), &tally.counters());
+    }
+
+    #[test]
+    fn a_submission_without_manifests_reports_zero_counts() {
+        let summary = submission_summary(
+            &doc! { "status": "in-progress" },
+            SubmissionId::new("sub", "empty"),
+            &ManifestTotals::default(),
+        )
+        .unwrap();
+        assert_eq!(summary.status, SubmissionStatus::InProgress);
+        assert_eq!(summary.manifest_count, 0);
+        assert_eq!(summary.total_entries, 0);
+        assert_eq!(
+            summary.success_count + summary.error_count + summary.skipped_count,
+            0
+        );
+    }
 }

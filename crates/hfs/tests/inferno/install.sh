@@ -8,6 +8,8 @@
 #   HFS_PORT - Port where HFS is running (default: 8080)
 #   HFS_HOST - Host where HFS is running (default: localhost)
 #   HFS_URL  - Full URL to HFS (overrides HFS_HOST and HFS_PORT)
+#   INFERNO_DATA_DIR - Directory of fixture *.json files to load, in glob
+#                      order (default: this script's directory)
 #
 # Examples:
 #   ./install.sh                           # Uses localhost:8080
@@ -18,6 +20,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DATA_DIR="${INFERNO_DATA_DIR:-$SCRIPT_DIR}"
 
 # Determine HFS URL
 if [ -n "$1" ]; then
@@ -65,7 +68,7 @@ FAILED=0
 SUCCESS=0
 SKIPPED=0
 
-for FILE in "$SCRIPT_DIR"/*.json; do
+for FILE in "$DATA_DIR"/*.json; do
     FILENAME=$(basename "$FILE")
     echo "Processing $FILENAME..."
 
@@ -149,7 +152,7 @@ echo ""
 echo "Verifying fixture-addressed resources are retrievable..."
 MISSING=0
 CHECKED=0
-for FILE in "$SCRIPT_DIR"/*.json; do
+for FILE in "$DATA_DIR"/*.json; do
     [ "$(jq -r '.type // empty' "$FILE")" = "transaction" ] || continue
     while IFS= read -r URL; do
         [ -n "$URL" ] || continue

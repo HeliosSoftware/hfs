@@ -48,6 +48,10 @@
           </denominator>
         </strengthRatio>
       </ingredient>
+      <instance>
+        <lotNumber value="12345"/>
+        <expirationDate value="2019-10-31"/>
+      </instance>
     </Medication>
   </contained>
   <identifier>

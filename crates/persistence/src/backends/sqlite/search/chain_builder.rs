@@ -12,7 +12,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use crate::error::{BackendError, StorageResult};
-use crate::search::SearchParameterRegistry;
+use crate::search::{IMPLICIT_TOKEN_SYSTEM, SearchParameterRegistry};
 use crate::types::{ChainConfig, ReverseChainedParameter, SearchParamType, SearchValue};
 
 use super::query_builder::{SqlFragment, SqlParam};
@@ -364,7 +364,7 @@ impl ChainQueryBuilder {
         let param_num = self.param_offset + 1;
 
         // Build terminal condition
-        let (terminal_sql, terminal_param) =
+        let (terminal_sql, terminal_params) =
             self.build_terminal_condition(chain, value, param_num)?;
 
         // Get the last link to know the terminal resource type
@@ -427,7 +427,7 @@ impl ChainQueryBuilder {
         // Final wrap to select matching base resource IDs
         let final_sql = format!("r.id IN ({})", current_sql);
 
-        Ok(SqlFragment::with_params(final_sql, vec![terminal_param]))
+        Ok(SqlFragment::with_params(final_sql, terminal_params))
     }
 
     /// Builds the terminal condition for a chain query.
@@ -436,10 +436,12 @@ impl ChainQueryBuilder {
         chain: &ParsedChain,
         value: &SearchValue,
         param_num: usize,
-    ) -> StorageResult<(String, SqlParam)> {
+    ) -> StorageResult<(String, Vec<SqlParam>)> {
         let alias_num = chain.links.len();
         let alias = format!("si{}", alias_num);
 
+        // Number and quantity bind zero, one or several parameters; every other
+        // type binds exactly one.
         let (condition, param) = match chain.terminal_type {
             SearchParamType::String => {
                 let escaped = value.value.replace('%', "\\%").replace('_', "\\_");
@@ -448,54 +450,19 @@ impl ChainQueryBuilder {
                     SqlParam::String(format!("%{}%", escaped)),
                 )
             }
-            SearchParamType::Token => {
-                // Handle system|code format
-                if let Some((system, code)) = value.value.split_once('|') {
-                    if system.is_empty() {
-                        (
-                            format!(
-                                "({}.value_token_system IS NULL OR {}.value_token_system = '') \
-                                 AND {}.value_token_code = ?{}",
-                                alias, alias, alias, param_num
-                            ),
-                            SqlParam::String(code.to_string()),
-                        )
-                    } else {
-                        (
-                            format!(
-                                "{}.value_token_system = '{}' AND {}.value_token_code = ?{}",
-                                alias,
-                                system.replace('\'', "''"),
-                                alias,
-                                param_num
-                            ),
-                            SqlParam::String(code.to_string()),
-                        )
-                    }
-                } else {
-                    (
-                        format!("{}.value_token_code = ?{}", alias, param_num),
-                        SqlParam::String(value.value.clone()),
-                    )
-                }
-            }
+            SearchParamType::Token => build_token_condition(&alias, value, param_num),
             SearchParamType::Reference => (
                 format!("{}.value_reference LIKE ?{}", alias, param_num),
                 SqlParam::String(format!("%{}%", value.value)),
             ),
             SearchParamType::Date => {
-                // For date, use range comparison based on prefix
-                let date_col = format!("{}.value_date", alias);
-                build_date_condition(&date_col, value, param_num)
+                return Ok(build_date_condition(&alias, value, param_num));
             }
             SearchParamType::Number => {
-                let num_col = format!("{}.value_number", alias);
-                build_number_condition(&num_col, value, param_num)
+                return Ok(build_number_condition(&alias, value, param_num));
             }
             SearchParamType::Quantity => {
-                // Quantity comparison on value_quantity_value
-                let qty_col = format!("{}.value_quantity_value", alias);
-                build_number_condition(&qty_col, value, param_num)
+                return Ok(build_quantity_condition(&alias, value, param_num));
             }
             SearchParamType::Uri => (
                 format!("{}.value_uri = ?{}", alias, param_num),
@@ -507,7 +474,7 @@ impl ChainQueryBuilder {
             ),
         };
 
-        Ok((condition, param))
+        Ok((condition, vec![param]))
     }
 
     /// Builds SQL for a reverse chain (_has) query.
@@ -578,7 +545,7 @@ impl ChainQueryBuilder {
             })?;
 
             // Build the search condition for the terminal parameter
-            let (search_condition, search_param) = self.build_reverse_terminal_condition(
+            let (search_condition, search_params) = self.build_reverse_terminal_condition(
                 &rc.source_type,
                 &rc.search_param,
                 value,
@@ -608,7 +575,7 @@ impl ChainQueryBuilder {
                 search_condition = search_condition,
             );
 
-            Ok((sql, vec![search_param]))
+            Ok((sql, search_params))
         } else {
             // Nested case: recurse into inner _has
             let inner = rc.nested.as_ref().ok_or_else(|| BackendError::Internal {
@@ -655,7 +622,7 @@ impl ChainQueryBuilder {
         value: &SearchValue,
         depth: usize,
         param_num: usize,
-    ) -> StorageResult<(String, SqlParam)> {
+    ) -> StorageResult<(String, Vec<SqlParam>)> {
         // Determine the parameter type from the registry. Falls back to the
         // shared value-shape heuristic for unregistered custom params.
         let param_type = {
@@ -678,51 +645,19 @@ impl ChainQueryBuilder {
                     SqlParam::String(format!("%{}%", escaped)),
                 )
             }
-            SearchParamType::Token => {
-                if let Some((system, code)) = value.value.split_once('|') {
-                    if system.is_empty() {
-                        (
-                            format!(
-                                "({}.value_token_system IS NULL OR {}.value_token_system = '') \
-                                 AND {}.value_token_code = ?{}",
-                                alias, alias, alias, param_num
-                            ),
-                            SqlParam::String(code.to_string()),
-                        )
-                    } else {
-                        (
-                            format!(
-                                "{}.value_token_system = '{}' AND {}.value_token_code = ?{}",
-                                alias,
-                                system.replace('\'', "''"),
-                                alias,
-                                param_num
-                            ),
-                            SqlParam::String(code.to_string()),
-                        )
-                    }
-                } else {
-                    (
-                        format!("{}.value_token_code = ?{}", alias, param_num),
-                        SqlParam::String(value.value.clone()),
-                    )
-                }
-            }
+            SearchParamType::Token => build_token_condition(&alias, value, param_num),
             SearchParamType::Reference => (
                 format!("{}.value_reference LIKE ?{}", alias, param_num),
                 SqlParam::String(format!("%{}%", value.value)),
             ),
             SearchParamType::Date => {
-                let date_col = format!("{}.value_date", alias);
-                build_date_condition(&date_col, value, param_num)
+                return Ok(build_date_condition(&alias, value, param_num));
             }
             SearchParamType::Number => {
-                let num_col = format!("{}.value_number", alias);
-                build_number_condition(&num_col, value, param_num)
+                return Ok(build_number_condition(&alias, value, param_num));
             }
             SearchParamType::Quantity => {
-                let qty_col = format!("{}.value_quantity_value", alias);
-                build_number_condition(&qty_col, value, param_num)
+                return Ok(build_quantity_condition(&alias, value, param_num));
             }
             SearchParamType::Uri => (
                 format!("{}.value_uri = ?{}", alias, param_num),
@@ -734,56 +669,139 @@ impl ChainQueryBuilder {
             ),
         };
 
-        Ok((condition, param))
+        Ok((condition, vec![param]))
     }
 }
 
-/// Builds a date comparison condition.
-fn build_date_condition(column: &str, value: &SearchValue, param_num: usize) -> (String, SqlParam) {
-    let (sql, bound) = super::parameter_handlers::date::date_condition(
-        column,
+/// The terminal `date` comparison, against the range `{alias}.value_date` to
+/// `{alias}.value_date_end` (#1391) — the comparison the unchained date search
+/// makes.
+///
+/// Binds one parameter per bound (up to three), numbered `?N` from
+/// `param_num` with no gaps, or none for a value that is not a date — which
+/// the search gate rejects before a chain is ever built — whose condition then
+/// matches nothing.
+fn build_date_condition(
+    alias: &str,
+    value: &SearchValue,
+    param_num: usize,
+) -> (String, Vec<SqlParam>) {
+    let (sql, binds) = super::parameter_handlers::date::date_range_condition_or_nothing(
+        &format!("{alias}.value_date"),
+        &format!("{alias}.value_date_end"),
         value.prefix,
         &value.value,
         param_num,
     );
-    (sql, SqlParam::String(bound))
+    (sql, binds.into_iter().map(SqlParam::String).collect())
 }
 
-/// Builds a number comparison condition.
+/// The terminal `token` comparison, against `{alias}.value_token_*`.
+///
+/// Mirrors [`TokenHandler`](super::parameter_handlers::TokenHandler), the
+/// unchained `token` search's handler, for each `value` form:
+///
+/// - `code` matches the code in any system;
+/// - `|code` matches the code with no system (or the implicit-system marker a
+///   `code` element is indexed with);
+/// - `system|` matches every code in `system` — and, like the unchained
+///   handler, not the implicit-system marker (#1389: this form used to require
+///   an empty code, so it matched nothing);
+/// - `system|code` matches the code in `system` or in the implicit system
+///   (#1379).
+///
+/// Every form binds exactly one parameter, `?param_num`: `system|code` inlines
+/// its system as an escaped literal so the code can take the bind.
+fn build_token_condition(alias: &str, value: &SearchValue, param_num: usize) -> (String, SqlParam) {
+    let Some((system, code)) = value.value.split_once('|') else {
+        return (
+            format!("{}.value_token_code = ?{}", alias, param_num),
+            SqlParam::String(value.value.clone()),
+        );
+    };
+    if system.is_empty() {
+        (
+            format!(
+                "({}.value_token_system IS NULL OR {}.value_token_system IN ('', '{}')) \
+                 AND {}.value_token_code = ?{}",
+                alias, alias, IMPLICIT_TOKEN_SYSTEM, alias, param_num
+            ),
+            SqlParam::String(code.to_string()),
+        )
+    } else if code.is_empty() {
+        (
+            format!("{}.value_token_system = ?{}", alias, param_num),
+            SqlParam::String(system.to_string()),
+        )
+    } else {
+        (
+            format!(
+                "{}.value_token_system IN ('{}', '{}') AND {}.value_token_code = ?{}",
+                alias,
+                system.replace('\'', "''"),
+                IMPLICIT_TOKEN_SYSTEM,
+                alias,
+                param_num
+            ),
+            SqlParam::String(code.to_string()),
+        )
+    }
+}
+
+/// The terminal `number` comparison, against `{alias}.value_number`.
+///
+/// Delegates to [`NumberHandler`](super::parameter_handlers::NumberHandler),
+/// the unchained `number` search's handler, so a chained number means what the
+/// unchained one does: the implicit-precision range for `eq`/`ne` (`100` is
+/// `[99.5, 100.5)`), the exact value for the comparators, for `ap` a bound
+/// `BETWEEN` whose margin is taken from the magnitude (so a negative value has
+/// its bounds in order), and `1 = 0` for a value that is not a number.
+///
+/// This used to be its own operator table. Its `ap` arm wrote both bounds into
+/// the SQL text and still returned a bind, so rusqlite refused the statement
+/// with `Wrong number of parameters passed to query. Got 3, needed 2`; for a
+/// negative value the inlined bounds were also reversed. It read an unparseable
+/// number as `0` (#1306).
+///
+/// Binds zero, one or two parameters, numbered `?N` from `param_num` with no
+/// gaps. The terminal condition is the only part of a chain that binds
+/// anything (links use `?1` and literals), so the caller only has to return
+/// these params in order.
 fn build_number_condition(
-    column: &str,
+    alias: &str,
     value: &SearchValue,
     param_num: usize,
-) -> (String, SqlParam) {
-    use crate::types::SearchPrefix;
+) -> (String, Vec<SqlParam>) {
+    let fragment = super::parameter_handlers::NumberHandler::build_sql_for(
+        &format!("{alias}.value_number"),
+        value,
+        param_num - 1,
+    );
+    (format!("({})", fragment.sql), fragment.params)
+}
 
-    // Try to parse as a number
-    let num_value = value.value.parse::<f64>().unwrap_or(0.0);
-
-    let (op, val) = match value.prefix {
-        SearchPrefix::Eq => ("=", num_value),
-        SearchPrefix::Ne => ("!=", num_value),
-        SearchPrefix::Gt => (">", num_value),
-        SearchPrefix::Lt => ("<", num_value),
-        SearchPrefix::Ge => (">=", num_value),
-        SearchPrefix::Le => ("<=", num_value),
-        SearchPrefix::Sa => (">", num_value),
-        SearchPrefix::Eb => ("<", num_value),
-        SearchPrefix::Ap => {
-            // Approximately equal: within 10% for numbers
-            let lower = num_value * 0.9;
-            let upper = num_value * 1.1;
-            return (
-                format!("{} BETWEEN {} AND {}", column, lower, upper),
-                SqlParam::Float(num_value),
-            );
-        }
-    };
-
-    (
-        format!("{} {} ?{}", column, op, param_num),
-        SqlParam::Float(val),
-    )
+/// The terminal `quantity` comparison, against `{alias}.value_quantity_*`.
+///
+/// Delegates to [`QuantityHandler`](super::parameter_handlers::QuantityHandler),
+/// the unchained `quantity` search's handler: `number`, `number|code` and
+/// `number|system|code` are all read, the unit and system are compared as
+/// stored, and a convertible UCUM unit also matches its equivalents through the
+/// canonical columns.
+///
+/// This used to share [`build_number_condition`]'s operator table and its
+/// defects (#1306), and parsed the whole value as the number, so any value
+/// carrying a unit was read as `0`.
+fn build_quantity_condition(
+    alias: &str,
+    value: &SearchValue,
+    param_num: usize,
+) -> (String, Vec<SqlParam>) {
+    let fragment = super::parameter_handlers::QuantityHandler::build_sql_for(
+        &format!("{alias}."),
+        value,
+        param_num - 1,
+    );
+    (format!("({})", fragment.sql), fragment.params)
 }
 
 #[cfg(test)]
@@ -837,11 +855,20 @@ mod tests {
         )
         .with_base(vec!["Observation"]);
 
+        let patient_identifier = SearchParameterDefinition::new(
+            "http://hl7.org/fhir/SearchParameter/Patient-identifier",
+            "identifier",
+            SearchParamType::Token,
+            "Patient.identifier",
+        )
+        .with_base(vec!["Patient"]);
+
         registry.register(patient_subject).unwrap();
         registry.register(patient_org).unwrap();
         registry.register(org_name).unwrap();
         registry.register(patient_name).unwrap();
         registry.register(obs_code).unwrap();
+        registry.register(patient_identifier).unwrap();
 
         Arc::new(RwLock::new(registry))
     }
@@ -945,6 +972,91 @@ mod tests {
         assert!(fragment.sql.contains("Patient/%"));
     }
 
+    /// #1379: the chain terminal is a separate copy of the token match, and
+    /// has to accept the implicit-system marker of a `code` element the same
+    /// way `TokenHandler` does — for `system|code` and for `|code`.
+    #[test]
+    fn a_chained_system_qualified_token_accepts_the_implicit_system() {
+        let registry = create_test_registry();
+        let builder = ChainQueryBuilder::new("tenant1", "Patient", registry);
+        for (value, expected) in [
+            (
+                "http://loinc.org|1234-5",
+                format!("value_token_system IN ('http://loinc.org', '{IMPLICIT_TOKEN_SYSTEM}')"),
+            ),
+            (
+                "|1234-5",
+                format!("value_token_system IN ('', '{IMPLICIT_TOKEN_SYSTEM}')"),
+            ),
+        ] {
+            let rc = ReverseChainedParameter::terminal(
+                "Observation",
+                "subject",
+                "code",
+                SearchValue::eq(value),
+            );
+            let fragment = builder.build_reverse_chain_sql(&rc).unwrap();
+            assert!(fragment.sql.contains(&expected), "{}", fragment.sql);
+        }
+    }
+
+    /// #1389: `system|` means "any code in this system", as in `TokenHandler`.
+    /// Both terminals used to read it as `system|code` with an empty code and
+    /// bind `value_token_code = ''`, so the chain matched nothing.
+    fn assert_system_only_token(fragment: &SqlFragment) {
+        assert!(
+            fragment.sql.contains("value_token_system = ?"),
+            "{}",
+            fragment.sql
+        );
+        assert!(
+            !fragment.sql.contains("value_token_code"),
+            "{}",
+            fragment.sql
+        );
+        assert!(
+            !fragment.sql.contains(IMPLICIT_TOKEN_SYSTEM),
+            "{}",
+            fragment.sql
+        );
+        assert!(
+            matches!(
+                fragment.params.as_slice(),
+                [SqlParam::String(system)] if system == "http://loinc.org"
+            ),
+            "{:?}",
+            fragment.params
+        );
+    }
+
+    #[test]
+    fn a_chained_system_only_token_matches_any_code_in_the_system() {
+        let registry = create_test_registry();
+        let builder = ChainQueryBuilder::new("tenant1", "Observation", registry);
+
+        let chain = builder.parse_chain("subject.identifier").unwrap();
+        assert_eq!(chain.terminal_type, SearchParamType::Token);
+        let fragment = builder
+            .build_forward_chain_sql(&chain, &SearchValue::eq("http://loinc.org|"))
+            .unwrap();
+        assert_system_only_token(&fragment);
+    }
+
+    #[test]
+    fn a_reverse_chained_system_only_token_matches_any_code_in_the_system() {
+        let registry = create_test_registry();
+        let builder = ChainQueryBuilder::new("tenant1", "Patient", registry);
+
+        let rc = ReverseChainedParameter::terminal(
+            "Observation",
+            "subject",
+            "code",
+            SearchValue::eq("http://loinc.org|"),
+        );
+        let fragment = builder.build_reverse_chain_sql(&rc).unwrap();
+        assert_system_only_token(&fragment);
+    }
+
     #[test]
     fn test_reverse_chain_depth() {
         let inner = ReverseChainedParameter::terminal(
@@ -965,26 +1077,506 @@ mod date_condition_tests {
     use super::*;
     use crate::types::SearchPrefix;
 
-    /// #456: chained date terminals use the precision-aware normalized
-    /// comparison, not the raw text `=` this used to emit.
+    fn strings(params: &[SqlParam]) -> Vec<&str> {
+        params
+            .iter()
+            .map(|param| match param {
+                SqlParam::String(s) => s.as_str(),
+                other => panic!("expected a string param, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// #456, #1391: a chained date terminal compares the stored range the
+    /// way the unchained date search does, not the raw text `=` it once
+    /// emitted.
     #[test]
-    fn chained_dates_are_precision_aware() {
+    fn chained_dates_compare_the_stored_range() {
         let value = SearchValue::new(SearchPrefix::Eq, "1995-10-02");
-        let (sql, param) = build_date_condition("t2.value_date", &value, 7);
-        assert_eq!(
-            sql,
-            "(datetime(t2.value_date) >= datetime(?7) AND datetime(t2.value_date) < datetime(?7, '+1 day'))"
+        let (sql, params) = build_date_condition("t2", &value, 7);
+        assert!(
+            // The implied `end > start bound` comes first, so the end index
+            // can be sought (#1391).
+            sql.starts_with(
+                "(t2.value_date_end > ?7 AND strftime('%Y-%m-%d %H:%M:%f', CASE WHEN instr(t2.value_date, '.')"
+            ),
+            "{sql}"
         );
-        match param {
-            SqlParam::String(s) => assert_eq!(s, "1995-10-02T00:00:00"),
-            _ => panic!("expected string param"),
-        }
+        assert!(
+            sql.ends_with(") >= ?7 AND t2.value_date_end <= ?8)"),
+            "{sql}"
+        );
+        assert_eq!(
+            strings(&params),
+            ["1995-10-02 00:00:00.000", "1995-10-03 00:00:00.000"]
+        );
+    }
+
+    /// `ge` is two alternatives over three bounds, numbered without gaps.
+    #[test]
+    fn chained_ge_binds_every_bound_in_order() {
+        let value = SearchValue::new(SearchPrefix::Ge, "2016-01-23T13:07:42-04:00");
+        let (sql, params) = build_date_condition("t2", &value, 3);
+        assert!(sql.contains("t2.value_date_end > ?3) OR ("), "{sql}");
+        assert!(sql.contains(">= ?4 AND t2.value_date_end <= ?5))"), "{sql}");
+        assert_eq!(
+            strings(&params),
+            [
+                "2016-01-23 17:07:43.000",
+                "2016-01-23 17:07:42.000",
+                "2016-01-23 17:07:43.000"
+            ]
+        );
     }
 
     #[test]
-    fn chained_full_precision_is_equality() {
-        let value = SearchValue::new(SearchPrefix::Eq, "2016-01-23T13:07:42-04:00");
-        let (sql, _) = build_date_condition("t2.value_date", &value, 3);
-        assert_eq!(sql, "datetime(t2.value_date) = datetime(?3)");
+    fn a_chained_value_that_is_not_a_date_matches_nothing() {
+        let value = SearchValue::new(SearchPrefix::Eq, "2024-02-30");
+        let (sql, params) = build_date_condition("t2", &value, 3);
+        assert_eq!(sql, "1 = 0");
+        assert!(params.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod numeric_condition_tests {
+    use super::*;
+
+    /// The `?N` numbers a fragment references, sorted and deduplicated.
+    fn placeholders(sql: &str) -> Vec<usize> {
+        let mut found = Vec::new();
+        let mut rest = sql;
+        while let Some(at) = rest.find('?') {
+            rest = &rest[at + 1..];
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            found.push(digits.parse().expect("every placeholder is numbered"));
+        }
+        found.sort_unstable();
+        found.dedup();
+        found
+    }
+
+    fn floats(params: &[SqlParam]) -> Vec<f64> {
+        params
+            .iter()
+            .filter_map(|p| match p {
+                SqlParam::Float(f) => Some(*f),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn assert_floats(got: &[f64], want: &[f64], context: &str) {
+        assert_eq!(got.len(), want.len(), "{context}: {got:?}");
+        for (g, w) in got.iter().zip(want) {
+            assert!((g - w).abs() < 1e-9, "{context}: {got:?} != {want:?}");
+        }
+    }
+
+    /// #1306: every prefix of a chained number binds what it references, with
+    /// placeholders numbered from `param_num` without gaps. `ap` used to inline
+    /// its bounds and still return a bind.
+    #[test]
+    fn a_chained_number_binds_every_bound_with_gap_free_placeholders() {
+        let cases: &[(&str, &str, &[f64])] = &[
+            (
+                "100",
+                "(si1.value_number >= ?3 AND si1.value_number < ?4)",
+                &[99.5, 100.5],
+            ),
+            (
+                "ne100",
+                "((si1.value_number < ?3 OR si1.value_number >= ?4))",
+                &[99.5, 100.5],
+            ),
+            ("gt100", "(si1.value_number > ?3)", &[100.0]),
+            ("ge100", "(si1.value_number >= ?3)", &[100.0]),
+            ("lt100", "(si1.value_number < ?3)", &[100.0]),
+            ("le100", "(si1.value_number <= ?3)", &[100.0]),
+            ("sa100", "(si1.value_number > ?3)", &[100.0]),
+            ("eb100", "(si1.value_number < ?3)", &[100.0]),
+            (
+                "ap100",
+                "(si1.value_number BETWEEN ?3 AND ?4)",
+                &[90.0, 110.0],
+            ),
+            // Negative: the lower bound is still the smaller one.
+            (
+                "ap-100",
+                "(si1.value_number BETWEEN ?3 AND ?4)",
+                &[-110.0, -90.0],
+            ),
+        ];
+        for (value, predicate, binds) in cases {
+            let (sql, params) = build_number_condition("si1", &SearchValue::parse(value), 3);
+            assert_eq!(&sql, predicate, "{value}");
+            assert_floats(&floats(&params), binds, value);
+            assert_eq!(params.len(), binds.len(), "{value}: {params:?}");
+            let expected: Vec<usize> = (3..3 + binds.len()).collect();
+            assert_eq!(placeholders(&sql), expected, "{value}: {sql}");
+        }
+    }
+
+    /// #1306: a chained quantity reads `number|system|code` as the unchained
+    /// search does, against aliased columns, still without placeholder gaps.
+    #[test]
+    fn a_chained_quantity_qualifies_every_column_and_binds_every_placeholder() {
+        let (sql, params) = build_quantity_condition("si2", &SearchValue::parse("ap-5.4"), 3);
+        assert_eq!(sql, "(si2.value_quantity_value BETWEEN ?3 AND ?4)");
+        assert_floats(&floats(&params), &[-5.94, -4.86], "ap-5.4");
+
+        for value in [
+            "5.4|http://unitsofmeasure.org|mg",
+            "ap5.4||mg",
+            "ne5.4|mg",
+            "gt5.4|http://unitsofmeasure.org|mg",
+            "5.4||not-a-ucum-unit",
+        ] {
+            let (sql, params) = build_quantity_condition("si2", &SearchValue::parse(value), 3);
+            let expected: Vec<usize> = (3..3 + params.len()).collect();
+            assert_eq!(placeholders(&sql), expected, "{value}: {sql}");
+            assert_eq!(
+                sql.matches("value_quantity_").count(),
+                sql.matches("si2.value_quantity_").count(),
+                "{value}: {sql}"
+            );
+        }
+    }
+
+    /// #1306: a value that is not a number matches nothing and binds nothing,
+    /// under `ne` too. It used to be compared as `0`.
+    #[test]
+    fn a_chained_non_number_matches_nothing_and_binds_nothing() {
+        for value in ["abc", "apabc", "neabc", "gt", "", "abc||mg", "|mg"] {
+            for build in [build_number_condition, build_quantity_condition] {
+                let (sql, params) = build("si1", &SearchValue::parse(value), 3);
+                assert_eq!(sql, "(1 = 0)", "{value}");
+                assert!(params.is_empty(), "{value}: {params:?}");
+            }
+        }
+    }
+}
+
+/// Chained number and quantity terminals through the `ChainedSearchProvider`
+/// trait API (#1306), the only way this builder is reached. They live here
+/// rather than beside the other trait-API tests in `search_impl.rs` because the
+/// defect and its fix are this file's.
+#[cfg(test)]
+mod numeric_terminal_tests {
+    use crate::backends::sqlite::SqliteBackend;
+    use crate::core::{ChainedSearchProvider, ResourceStorage, SearchProvider};
+    use crate::tenant::{TenantContext, TenantId, TenantPermissions};
+    use crate::types::{
+        ReverseChainedParameter, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+    };
+    use helios_fhir::FhirVersion;
+    use serde_json::json;
+
+    fn tenant() -> TenantContext {
+        TenantContext::new(
+            TenantId::new("chain-numeric"),
+            TenantPermissions::full_access(),
+        )
+    }
+
+    /// Seeds the fixture through the real write path, on a backend that loads
+    /// the full R4 search-parameter set (without the data dir only five
+    /// embedded params exist and nothing numeric is indexed).
+    ///
+    /// Number terminal, `MolecularSequence.referenceSeq.windowStart`, reached
+    /// by `Observation?has-member:MolecularSequence.window-start`:
+    /// `on-neg` → -100, `on-zero` → 0, `on-100` → 100, `on-105` → 105,
+    /// `on-200` → 200. The zero row is what an unparseable number used to
+    /// match, because it was read as `0`.
+    ///
+    /// Quantity terminal, `Observation.valueQuantity`, reached by
+    /// `DiagnosticReport?result:Observation.value-quantity` and by
+    /// `Patient?_has:Observation:subject:value-quantity`:
+    /// `dr-neg`/`pq-neg` → -5.4 mg, `dr-a`/`pq-a` → 5.4 mg,
+    /// `dr-b`/`pq-b` → 5.9 mg, `dr-c`/`pq-c` → 6.5 mg,
+    /// `dr-g`/`pq-g` → 0.0054 g (the same amount as 5.4 mg).
+    ///
+    /// Number terminal for the reverse direction,
+    /// `Patient?_has:ChargeItem:subject:factor-override`: `pq-a` → 2,
+    /// `pq-neg` → -2, `pq-c` → 0.
+    ///
+    /// Asserts that the *unchained* number and quantity searches find the
+    /// seeded rows, so no chained assertion can pass vacuously.
+    async fn seeded_backend() -> SqliteBackend {
+        let data_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("data");
+        let mut config = crate::backends::sqlite::backend::SqliteBackendConfig::default();
+        config.data_dir = Some(data_dir);
+        let backend = SqliteBackend::with_config(":memory:", config).unwrap();
+        backend.init_schema().unwrap();
+        let tenant = tenant();
+
+        let mut resources = Vec::new();
+        for (suffix, window_start) in [
+            ("neg", -100),
+            ("zero", 0),
+            ("100", 100),
+            ("105", 105),
+            ("200", 200),
+        ] {
+            resources.push((
+                "MolecularSequence",
+                json!({
+                    "resourceType": "MolecularSequence",
+                    "id": format!("ms-{suffix}"),
+                    "coordinateSystem": 0,
+                    "referenceSeq": {"windowStart": window_start, "windowEnd": 1000},
+                }),
+            ));
+            resources.push((
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": format!("on-{suffix}"),
+                    "status": "final",
+                    "code": {"text": "x"},
+                    "hasMember": [{"reference": format!("MolecularSequence/ms-{suffix}")}],
+                }),
+            ));
+        }
+        for (suffix, amount, unit) in [
+            ("neg", -5.4, "mg"),
+            ("a", 5.4, "mg"),
+            ("b", 5.9, "mg"),
+            ("c", 6.5, "mg"),
+            ("g", 0.0054, "g"),
+        ] {
+            resources.push((
+                "Patient",
+                json!({"resourceType": "Patient", "id": format!("pq-{suffix}")}),
+            ));
+            resources.push((
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": format!("oq-{suffix}"),
+                    "status": "final",
+                    "code": {"text": "x"},
+                    "subject": {"reference": format!("Patient/pq-{suffix}")},
+                    "valueQuantity": {
+                        "value": amount,
+                        "unit": unit,
+                        "system": "http://unitsofmeasure.org",
+                        "code": unit,
+                    },
+                }),
+            ));
+            resources.push((
+                "DiagnosticReport",
+                json!({
+                    "resourceType": "DiagnosticReport",
+                    "id": format!("dr-{suffix}"),
+                    "status": "final",
+                    "code": {"text": "x"},
+                    "result": [{"reference": format!("Observation/oq-{suffix}")}],
+                }),
+            ));
+        }
+        for (patient, factor) in [("pq-a", 2.0), ("pq-neg", -2.0), ("pq-c", 0.0)] {
+            resources.push((
+                "ChargeItem",
+                json!({
+                    "resourceType": "ChargeItem",
+                    "id": format!("ci-{patient}"),
+                    "status": "billable",
+                    "code": {"text": "x"},
+                    "subject": {"reference": format!("Patient/{patient}")},
+                    "factorOverride": factor,
+                }),
+            ));
+        }
+        for (resource_type, resource) in resources {
+            backend
+                .create(&tenant, resource_type, resource, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+
+        for (resource_type, name, param_type, value) in [
+            (
+                "MolecularSequence",
+                "window-start",
+                SearchParamType::Number,
+                "ap100",
+            ),
+            (
+                "Observation",
+                "value-quantity",
+                SearchParamType::Quantity,
+                "ap5.4",
+            ),
+        ] {
+            let query = SearchQuery::new(resource_type).with_parameter(SearchParameter {
+                name: name.to_string(),
+                param_type,
+                modifier: None,
+                values: vec![SearchValue::parse(value)],
+                chain: vec![],
+                components: vec![],
+            });
+            let found = backend.search(&tenant, &query).await.unwrap();
+            assert_eq!(
+                found.resources.items.len(),
+                2,
+                "fixture: {name} must be indexed or the chained tests are vacuous"
+            );
+        }
+        backend
+    }
+
+    /// Compares one case, recording rather than panicking so a run reports
+    /// every failing prefix at once.
+    fn check(
+        failures: &mut Vec<String>,
+        label: &str,
+        value: &str,
+        result: Result<Vec<String>, impl std::fmt::Display>,
+        expected: &[&str],
+    ) {
+        match result {
+            Err(e) => failures.push(format!("{label}={value}: {e}")),
+            Ok(mut ids) => {
+                ids.sort();
+                ids.dedup();
+                if ids != expected {
+                    failures.push(format!("{label}={value}: got {ids:?}, want {expected:?}"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_chain_number_terminal() {
+        let backend = seeded_backend().await;
+        let cases: &[(&str, &[&str])] = &[
+            ("ap100", &["on-100", "on-105"]),
+            // A negative value: the window is [-110, -90], not [-90, -110].
+            ("ap-100", &["on-neg"]),
+            ("ap0", &["on-zero"]),
+            ("100", &["on-100"]),
+            ("100.0", &["on-100"]),
+            ("ne100", &["on-105", "on-200", "on-neg", "on-zero"]),
+            ("gt100", &["on-105", "on-200"]),
+            ("ge100", &["on-100", "on-105", "on-200"]),
+            ("lt100", &["on-neg", "on-zero"]),
+            ("le100", &["on-100", "on-neg", "on-zero"]),
+            ("lt0", &["on-neg"]),
+            // Not a number: must match nothing. It used to be read as 0.
+            ("abc", &[]),
+            ("apabc", &[]),
+            ("neabc", &[]),
+            ("gtabc", &[]),
+        ];
+        let mut failures = Vec::new();
+        for (value, expected) in cases {
+            let result = backend
+                .resolve_chain(
+                    &tenant(),
+                    "Observation",
+                    "has-member:MolecularSequence.window-start",
+                    value,
+                )
+                .await;
+            check(&mut failures, "window-start", value, result, expected);
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    #[tokio::test]
+    async fn resolve_chain_quantity_terminal() {
+        let backend = seeded_backend().await;
+        let cases: &[(&str, &[&str])] = &[
+            // No unit: the stored number alone is compared.
+            ("ap5.4", &["dr-a", "dr-b"]),
+            ("ap-5.4", &["dr-neg"]),
+            ("5.4", &["dr-a"]),
+            ("ne5.4", &["dr-b", "dr-c", "dr-g", "dr-neg"]),
+            ("gt5.4", &["dr-b", "dr-c"]),
+            ("ge5.4", &["dr-a", "dr-b", "dr-c"]),
+            ("lt0", &["dr-neg"]),
+            ("sa5.4", &["dr-b", "dr-c"]),
+            ("eb5.4", &["dr-g", "dr-neg"]),
+            ("le5.4", &["dr-a", "dr-g", "dr-neg"]),
+            // With a unit, as the unchained search reads it: the stored unit,
+            // or a UCUM equivalent (0.0054 g is 5.4 mg).
+            ("5.4|http://unitsofmeasure.org|mg", &["dr-a", "dr-g"]),
+            ("5.4||mg", &["dr-a", "dr-g"]),
+            (
+                "ap5.4|http://unitsofmeasure.org|mg",
+                &["dr-a", "dr-b", "dr-g"],
+            ),
+            ("ap-5.4||mg", &["dr-neg"]),
+            ("gt5.4||mg", &["dr-b", "dr-c"]),
+            ("5.4||kg", &[]),
+            // Not a number: must match nothing. It used to be read as 0.
+            ("abc", &[]),
+            ("apabc", &[]),
+            ("neabc", &[]),
+            ("abc||mg", &[]),
+        ];
+        let mut failures = Vec::new();
+        for (value, expected) in cases {
+            let result = backend
+                .resolve_chain(
+                    &tenant(),
+                    "DiagnosticReport",
+                    "result:Observation.value-quantity",
+                    value,
+                )
+                .await;
+            check(&mut failures, "value-quantity", value, result, expected);
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    #[tokio::test]
+    async fn resolve_reverse_chain_numeric_terminal() {
+        let backend = seeded_backend().await;
+        let cases: &[(&str, &str, &str, &[&str])] = &[
+            ("Observation", "value-quantity", "ap5.4", &["pq-a", "pq-b"]),
+            ("Observation", "value-quantity", "ap-5.4", &["pq-neg"]),
+            (
+                "Observation",
+                "value-quantity",
+                "5.4||mg",
+                &["pq-a", "pq-g"],
+            ),
+            ("Observation", "value-quantity", "lt0", &["pq-neg"]),
+            ("Observation", "value-quantity", "apabc", &[]),
+            ("ChargeItem", "factor-override", "ap2", &["pq-a"]),
+            ("ChargeItem", "factor-override", "ap-2", &["pq-neg"]),
+            ("ChargeItem", "factor-override", "2", &["pq-a"]),
+            ("ChargeItem", "factor-override", "ne2", &["pq-c", "pq-neg"]),
+            ("ChargeItem", "factor-override", "lt0", &["pq-neg"]),
+            ("ChargeItem", "factor-override", "abc", &[]),
+            ("ChargeItem", "factor-override", "apabc", &[]),
+        ];
+        let mut failures = Vec::new();
+        for (source, param, value, expected) in cases {
+            let rc = ReverseChainedParameter::terminal(
+                *source,
+                "subject",
+                *param,
+                SearchValue::parse(value),
+            );
+            let result = backend
+                .resolve_reverse_chain(&tenant(), "Patient", &rc)
+                .await;
+            check(
+                &mut failures,
+                &format!("_has {param}"),
+                value,
+                result,
+                expected,
+            );
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
     }
 }

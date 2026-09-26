@@ -36,15 +36,16 @@ All kick-offs require `Prefer: respond-async`. The default response is `202 Acce
 | `HFS_BULK_EXPORT_WORKER_CONCURRENCY` | `2` | In-process worker pool size |
 | `HFS_BULK_EXPORT_DISABLE_LOCAL_WORKER` | `false` | Disable in-pod workers for separate exporter deployments |
 | `HFS_BULK_EXPORT_MAX_CONCURRENT_PER_TENANT` | `4` | Per-tenant active job cap; kick-off returns `429` if exceeded |
+| `HFS_BULK_EXPORT_MAX_ATTEMPTS` | `3` | Claims allowed per job; a job reclaimed past this is failed as abandoned |
 | `HFS_BULK_EXPORT_BATCH_SIZE` | `1000` | Resources per `fetch_export_batch` |
 | `HFS_BULK_EXPORT_LEASE_DURATION` | `60` | Initial lease length in seconds; must exceed heartbeat interval |
-| `HFS_BULK_EXPORT_HEARTBEAT_INTERVAL` | `20` | Worker heartbeat cadence in seconds |
+| `HFS_BULK_EXPORT_HEARTBEAT_INTERVAL` | `20` | Lease-keeper renewal cadence in seconds; a background task renews the lease at this cadence while a job runs; must be below the lease duration |
 | `HFS_BULK_EXPORT_CLEANUP_INTERVAL` | `300` | Cleanup scan interval in seconds |
 | `HFS_BULK_EXPORT_SINCE_NEWLY_ADDED` | `include` | Group export `_since` toggle: include or exclude |
 
 Job-state storage reuses the same backend and connection pool that holds FHIR resources. SQLite deployments share `./data/hfs.db`. PostgreSQL deployments share `HFS_DATABASE_URL`. There is no separate job-store configuration.
 
-Bulk export is currently available on `sqlite`, `postgres`, `sqlite-elasticsearch`, and `postgres-elasticsearch`. Other backends return `501` until job-state implementations exist.
+Bulk export is currently available on `sqlite`, `postgres`, `sqlite-elasticsearch`, `postgres-elasticsearch`, `mongodb`, and `s3-elasticsearch` — the last two through a SQLite sidecar job store. The composite `mongo-elasticsearch` and standalone `s3` return `501` until job-state implementations exist there.
 
 ## Single-instance Recipe
 
@@ -77,10 +78,13 @@ The full local stack is in `docker/bulk-export/docker-compose.yml`: HFS, Postgre
 
 ## Behavior Notes
 
-- `_typeFilter` is parsed and applied.
+- `_typeFilter` is validated against the search parameter registry at kick-off (unknown parameters or invalid values → `400`, regardless of `Prefer: handling`) and applied by the worker per batch.
 - Unsupported result-control params inside `_typeFilter` are rejected with `400` regardless of `Prefer: handling`: `_sort`, `_include`, `_revinclude`, `_count`, `_elements`.
 - `_elements` is implemented: subset to listed paths plus `id`, `resourceType`, and `meta`, with a `SUBSETTED` `meta.tag` added.
 - Unsupported parameters `includeAssociatedData`, `organizeOutputBy`, and `allowPartialManifests` return `400` when `Prefer: handling=strict` is set. Without strict handling, or with lenient handling, they are ignored and a warning is logged.
 - Group export `_since` late membership uses `include` by default, returning pre-`_since` resources for patients added after `_since`.
 - `exclude` is reserved for a follow-up that requires group-membership-history tracking.
 - Group export flattens nested `Group/` members iteratively with a visited-set cycle guard.
+- `DELETE /export-status/{job_id}` is the whole teardown, and the UI's **Cancel** sends exactly that request; the UI's later **Delete** gets `404` and only drops the card. The handler cancels an active job, deletes its outputs, deletes the job row, then deletes the outputs again. Cancellation is cooperative and nothing waits for the worker, so the second sweep reclaims a part a still-running worker finalized in between; a worker that writes after the row is gone finds the job missing on its way out and deletes the outputs itself (#1272). `BulkExportStorage::delete_export` only removes rows — outputs are always the caller's job.
+- Status poll `202`: `X-Progress` is the percentage of resource types fully written; the body is a `Parameters` with `typesTotal`, `typesDone` and `currentType` (the type in flight), like `$sql-export`.
+- Transient storage failures on any export route answer `503` with `Retry-After: 5` and an `OperationOutcome` whose issue code is `transient`, not `500`. The usual cause on SQLite is a foreground write losing the race with a background search-index rebuild: the single writer lock is held elsewhere, the connection exhausts its `busy_timeout` (default 30 s) and the driver reports `database is locked`. Kick-off is the visible case because it is the first write of a job. A `503` here means retry shortly, not that the export is broken.

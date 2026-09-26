@@ -27,6 +27,11 @@
 //! multi-node deployment, poll the node you kicked off against. (Persisting job
 //! state across the cluster is tracked separately.)
 //!
+//! Terminal status is available for up to 24 hours, subject to a limit of the
+//! most recent 1024 statuses whose tasks have exited. Expiration is swept once
+//! per minute. Evicted statuses return 404; tasks still executing (including
+//! cancellation in progress) are protected from eviction.
+//!
 //! # Composite deployments
 //!
 //! The reindex driver writes to *every* search index — the primary's own index
@@ -60,6 +65,25 @@ fn reindex_unavailable() -> RestError {
         feature: "$reindex is not available: this storage backend has no search index to rebuild"
             .to_string(),
     }
+}
+
+/// Upper bound on `batchSize`. `HFS_REINDEX_BATCH_BYTES` caps a page's memory
+/// footprint, but only after a storage backend has already sized its page
+/// buffer to `batchSize` rows — SQLite's `fetch_resources_page_capped` does
+/// `Vec::with_capacity(limit as usize)` before a single row is read, so a
+/// `batchSize` anywhere near `u32::MAX` aborts the process with an allocation
+/// failure however small `batch_bytes` is. `10_000` rows is 100x the request
+/// default and far more than the byte cap alone would ever let through.
+const MAX_REINDEX_PAGE_SIZE: u32 = 10_000;
+
+/// `batchSize` as a page size: at least 1, saturating instead of wrapping
+/// (`4294967296 as u32` is 0, which reindexed nothing, #1499), and clamped to
+/// [`MAX_REINDEX_PAGE_SIZE`] so an oversized value cannot force a storage
+/// backend into a multi-gigabyte page preallocation.
+fn batch_size_param(size: u64) -> u32 {
+    u32::try_from(size)
+        .unwrap_or(u32::MAX)
+        .clamp(1, MAX_REINDEX_PAGE_SIZE)
 }
 
 /// Enforces the `system/reindex` operation scope. Auth disabled → allowed.
@@ -124,7 +148,7 @@ where
                         .get("valueInteger")
                         .and_then(serde_json::Value::as_u64)
                     {
-                        request.batch_size = size.max(1) as u32;
+                        request.batch_size = batch_size_param(size);
                     }
                 }
                 _ => {}
@@ -291,5 +315,22 @@ mod tests {
     #[test]
     fn test_no_principal_allows_reindex() {
         assert!(check_reindex_scope(None).is_ok());
+    }
+
+    #[test]
+    fn batch_size_param_clamps_and_saturates() {
+        assert_eq!(batch_size_param(0), 1);
+        assert_eq!(batch_size_param(1), 1);
+        assert_eq!(batch_size_param(1000), 1000);
+        assert_eq!(
+            batch_size_param(MAX_REINDEX_PAGE_SIZE as u64),
+            MAX_REINDEX_PAGE_SIZE
+        );
+        assert_eq!(
+            batch_size_param(MAX_REINDEX_PAGE_SIZE as u64 + 1),
+            MAX_REINDEX_PAGE_SIZE
+        );
+        assert_eq!(batch_size_param(4_294_967_296), MAX_REINDEX_PAGE_SIZE);
+        assert_eq!(batch_size_param(u64::MAX), MAX_REINDEX_PAGE_SIZE);
     }
 }

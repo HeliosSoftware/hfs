@@ -913,18 +913,29 @@ button.menu__option {
   box-shadow: var(--surface-shadow);
 }
 
+/* Sign out is a POST form (#1449, #738): a `<button>` styled as the row the
+   anchor used to draw, so the resets below keep it looking identical. */
+.user-menu__out-form {
+  display: block;
+  margin: 0;
+}
+
 .user-menu__out {
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 8px;
+  width: calc(100% - 4px);
   margin: 4px 2px 2px;
   padding: 8px 0;
   border: 1px solid var(--surface-border);
   border-radius: 10px;
+  background: none;
+  font: inherit;
   font-weight: 500;
   color: var(--text);
   text-decoration: none;
+  cursor: pointer;
 }
 
 .user-menu__out:hover {
@@ -1630,6 +1641,34 @@ select.field__input {
   margin-top: 6px;
 }
 
+/* A radio option inside a `fieldset.field` (#1108): the control and its
+   label text share the first row, and the hint sits on the second row
+   indented under the text — not under the radio. The 16px control plus the
+   10px gap match `.choice-card`, so the two radio treatments read alike. */
+.field--choice {
+  display: grid;
+  grid-template-columns: 16px 1fr;
+  column-gap: 10px;
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+.field--choice > input[type="radio"] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.field__choice-label {
+  color: var(--text);
+}
+
+.field--choice > .field__hint {
+  grid-column: 2;
+  margin-top: 2px;
+}
+
 .addbox__actions {
   margin-top: 4px;
   display: flex;
@@ -1651,8 +1690,8 @@ select.field__input {
 .spinner,
 .btn[aria-busy="true"]::after {
   /* Explicit border-box (#786): the `*` reset does not match pseudo-elements,
-     and content-box would render the ::after ring at 18px — off center against
-     the -7px offsets below. */
+     and content-box would render the ::after ring at 18px instead of the
+     14px glyph the standalone .spinner draws. */
   box-sizing: border-box;
   width: 14px;
   height: 14px;
@@ -1669,26 +1708,40 @@ select.field__input {
   .btn[aria-busy="true"]::after { animation: none; }
 }
 
-/* The busy button (#679), driven by busy.js: the label yields its space to
-   the ring — width stays put, the accessible name stays in the tree. Under
-   reduced motion the ring remains as a static glyph (the animation stops
-   above); a merely-dimmed label would read as disabled, not working. */
+/* The busy button (#679), driven by busy.js: the label stays and the ring
+   joins it as a trailing flex item, spaced by .btn's own gap (#1253). A
+   blanked label left an empty pill that read as "the action vanished", not
+   "working". Under reduced motion the ring remains as a static glyph (the
+   animation stops above). */
 .btn[aria-busy="true"] {
-  position: relative;
-  color: transparent;
   cursor: progress;
 }
 
 .btn[aria-busy="true"]::after {
   content: "";
-  position: absolute;
-  top: calc(50% - 7px);
-  left: calc(50% - 7px);
+  flex: none;
+}
+
+/* A button busy.js can mark busy carries .btn--busy-slot, so the ring's
+   room (14px ring + 6px gap) is there before the click and the button never
+   changes width (#1253 review). At rest the room is split into two empty
+   4px boxes, one each side (4 + 6 gap on both sides = 20), which keeps the
+   label centered; busy drops the leading box and the trailing one becomes
+   the ring. Without the class a busy button still works, it just grows. */
+.btn--busy-slot::before,
+.btn--busy-slot::after {
+  content: "";
+  flex: none;
+  width: 4px;
+}
+
+.btn--busy-slot[aria-busy="true"]::before {
+  display: none;
 }
 
 /* The ring must not inherit accent-on-accent on the filled button — the
-   track all but vanishes in dark theme. Explicit white, not currentColor:
-   the button's color is transparent while busy. */
+   track all but vanishes in dark theme. Explicit white, not currentColor,
+   so the ring does not follow the label's color. */
 .btn--primary[aria-busy="true"]::after {
   border-color: rgb(255 255 255 / 45%);
   border-top-color: #ffffff;
@@ -2198,6 +2251,14 @@ select.field__input {
   margin: 0;
   font-size: 13px;
   color: var(--muted);
+}
+
+/* #1184: give the rebuild notice a small gap above it so it reads as its own
+   element, not a continuation of the lede. Scoped to `.page-head` so the shared
+   `.notice` rule (used flush inside cards) is untouched, and so the dashboard's
+   in-chart notice keeps its own spacing. */
+.page-head [data-rebuild-notice] {
+  margin-top: 12px;
 }
 
 .back-link,
@@ -2981,6 +3042,12 @@ details.json-fold[open] > summary .icon {
   font-variant-numeric: tabular-nums;
 }
 
+/* An estimated rail count ("≈1234"): its title explains the estimate, so
+   the cursor advertises the tooltip. */
+.count--approximate {
+  cursor: help;
+}
+
 /* Appended to <body> and positioned from the focused/hovered truncated-name
    item so the full label is not clipped by rail or grid overflow. One shared
    tooltip serves rails, cloneNode()-based Recent items, and Bulk Export. */
@@ -3191,6 +3258,114 @@ details.json-fold[open] > summary .icon {
   overflow-wrap: anywhere;
 }
 
+/* Result id chip (#1106): long ids never wrap past one line — the label
+   shows an 8-character prefix and the full id stays the link's accessible
+   name (see .visually-hidden usage in saved-queries.js). */
+.query-results__table .col-id {
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+.query-results__table .result-id {
+  display: inline-flex;
+  flex-direction: row;
+  align-items: center;
+  height: 20px;
+  padding: 0 7px;
+  border-radius: 6px;
+  background: var(--muted-soft);
+  color: var(--muted-text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  white-space: nowrap;
+  text-decoration: none;
+}
+
+.query-results__table .result-id:hover {
+  color: var(--text-strong);
+}
+
+.query-results__table .result-id:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Visible id text inside the chip (#1106): the rest of an abbreviated id
+   lives in a sibling .visually-hidden node, so this span carries the id's
+   own no-wrap contract rather than relying on the chip around it. */
+.query-results__table .result-id__text {
+  white-space: nowrap;
+  overflow-wrap: normal;
+}
+
+/* Copy-id button and its "Copied" confirmation pill (#1106), clipboard-gated
+   so a browser without the Clipboard API never renders either. */
+.result-id-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.result-id__copy {
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+tr:hover .result-id__copy,
+.result-id__copy:hover,
+.result-id__copy:focus-visible {
+  border-color: var(--surface-border);
+  background: var(--surface);
+  color: var(--text);
+}
+
+.result-id__copy:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.result-id__copied {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 20px;
+  padding: 0 7px;
+  border-radius: 999px;
+  background: var(--ok-soft);
+  color: var(--ok);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+/* Single-line result cells (#1106): every data cell clips at the same width
+   as `.data-table .col-name` so rows stay a uniform height regardless of
+   content length; the full value surfaces in the shared tooltip
+   (resource-filter.js) on hover and, for the id, on keyboard focus. */
+.query-results__table td {
+  vertical-align: middle;
+}
+
+.query-results__table .result-cell {
+  display: block;
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.query-results__table .result-cell.url {
+  overflow-wrap: normal;
+}
+
 .table-foot {
   display: flex;
   flex-wrap: wrap;
@@ -3275,6 +3450,12 @@ details.json-fold[open] > summary .icon {
 }
 
 .tag--draft {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+/* Unsaved-changes pill (#1240), same tokens as .tag--draft. */
+.tag--unsaved {
   background: var(--warn-soft);
   color: var(--warn);
 }
@@ -4280,6 +4461,14 @@ details.json-fold[open] > summary .icon {
   padding: 16px 20px 4px;
 }
 
+/* The heading reuses .query-group__type, whose bottom margin spaces the
+   stacked query groups it was written for. Here the row is centred with
+   align-items, which centres each child's margin box — so that margin lifted
+   the heading ~2px above the count beside it (#994). */
+.query-results__head .query-group__type {
+  margin-bottom: 0;
+}
+
 .query-results__meta {
   flex: 1;
   font-size: 12px;
@@ -5167,6 +5356,169 @@ details.card > summary.card-head::-webkit-details-marker {
   border: 1px solid var(--surface-border);
   border-radius: 8px;
   outline: none;
+}
+
+/* ---- picker panel (#1239): header with a close control, an inline "added"
+   status wired by editor-add.js, and an Elements/Extensions accordion so the
+   form around the panel stays in view. Everything here hangs off
+   .editor-add--picker; the SQL library cards keep sharing the bare
+   .editor-add markup and rules above, untouched. ---- */
+
+.editor-add--picker .editor-add__panel {
+  max-width: 560px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.editor-add--picker .editor-add__filter {
+  margin-bottom: 0;
+}
+
+.editor-add__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.editor-add__title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+/* Not `.icon-button` (#1239): that class is a hard 30x30/9px contract
+   (`design-system.spec.ts`'s "canonical button scale" check) shared by
+   every other icon-only control in the crate, and this close control needs
+   to sit smaller, inline with the picker's title. Same recipe as the
+   CodeMirror lint panel's own 24x24 close button below (`#821`) instead of
+   a one-off. */
+.editor-add__close {
+  display: inline-grid;
+  place-items: center;
+  margin-left: auto;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  font-size: 18px;
+  line-height: 1;
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  border-radius: 9px;
+  cursor: pointer;
+}
+
+.editor-add__close:hover {
+  color: var(--text);
+  background: var(--accent-soft);
+}
+
+.editor-add__added {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 6px 8px;
+  font-size: 12px;
+  color: var(--ok);
+  background: var(--ok-soft);
+  border: 1px solid var(--ok);
+  border-radius: 8px;
+}
+
+.editor-add__added strong {
+  font-weight: 600;
+}
+
+.editor-add__undo {
+  margin-left: auto;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  color: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.editor-add__group {
+  border: 1px solid var(--surface-border);
+  border-radius: 8px;
+}
+
+.editor-add__group-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  background: var(--input-bg);
+  border-radius: 8px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.editor-add__group-head::-webkit-details-marker {
+  display: none;
+}
+
+.editor-add__group-head::before {
+  content: "▸";
+  display: inline-block;
+  color: var(--muted);
+  transition: transform 0.1s ease;
+}
+
+.editor-add__group[open] > .editor-add__group-head::before {
+  transform: rotate(90deg);
+}
+
+.editor-add__count {
+  margin-left: auto;
+  font-weight: 400;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.editor-add--picker .editor-add__list {
+  max-height: 200px;
+  padding: 4px;
+}
+
+.editor-add--picker .editor-add__ext {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  margin-top: 0;
+  padding: 4px;
+  border-top: 0;
+}
+
+.editor-add__ext-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--surface-border);
+}
+
+.editor-add__ext-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.editor-add__ext-label .editor-add__ext-url {
+  flex: 1;
 }
 
 /* ---- source view & validity rail ---- */
@@ -6357,6 +6709,11 @@ details.card > summary.card-head::-webkit-details-marker {
 
 .bulk-export-form:has(input[name="scope"][value="patient"]:checked) .combobox--scope-patient {
   display: block;
+}
+
+.bulk-export-form .combobox--scope-patient + .field__hint--error {
+  margin-top: -8px;
+  margin-bottom: 14px;
 }
 
 .typegrid {

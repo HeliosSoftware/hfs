@@ -57,6 +57,14 @@ pub fn core_terminology(version: FhirVersion) -> Arc<CoreTerminology> {
             static TX: OnceLock<Arc<CoreTerminology>> = OnceLock::new();
             Arc::clone(TX.get_or_init(|| Arc::new(CoreTerminology::from_gz(R6_TX))))
         }
+        // Feature unification can add FhirVersion variants beyond the packs
+        // this crate was built with: `helios-audit`'s R5/R6 features enable
+        // `helios-fhir/R4B` without enabling this crate's `R4B` (#1367).
+        #[allow(unreachable_patterns)]
+        other => panic!(
+            "no terminology pack embedded for FHIR version {other:?} — enable the matching \
+             helios-fhir-validator feature"
+        ),
     }
 }
 

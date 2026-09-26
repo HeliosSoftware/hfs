@@ -110,7 +110,7 @@ verbatim and not misread as the `ap` prefix (regression-tested in the REST extra
 | `_content` (full content) | backend FTS | ✓ | ✓ | ✗ | ✓ |
 | `_filter` | backend | ✓ | ✗ | ✗ | ✗ |
 | `_has` (reverse chaining) | REST + backend | ✓ | ✓ | ✗ | ✗ |
-| `_type` (system search) | REST | ✓ | ✓ | ✓ | ✓ |
+| `_type` (system search) | — (REST refuses system-level search with `501`, #1338) | ✗ | ✗ | ✗ | ✗ |
 | `_list` | passthrough param | ○ | ○ | ○ | ○ |
 | `_query` | — | ✗ | ✗ | ✗ | ✗ |
 | `_contained` / `_containedType` | stripped by REST | ✗ | ✗ | ✗ | ✗ |
@@ -130,30 +130,34 @@ effectively a no-op.
 | `:iterate` on include | ✓¹ | ✓¹ | parsed | ✓ (inline) |
 | `_include=Type:*` wildcard | ✓ | ✓ | ✓ | ✓ |
 
-SQLite and PostgreSQL resolve chains natively, via nested `search_index` subqueries with
-configurable depth limits (✓). For all other backends (◐), the REST layer resolves chained and
-reverse-chained parameters before the backend search runs: `search::resolve_chains` issues one
-plain `search()` per chain hop against the same backend and folds the result into an `_id`
-filter — application-side joins. So chained and `_has` queries work end-to-end over HTTP on every
-searchable backend, including Elasticsearch and MongoDB; the per-backend distinction is whether the
-join is pushed into the backend (SQLite/PG) or performed by the REST layer.
+The REST layer resolves chained and reverse-chained parameters before backend search:
+`search::resolve_chains` issues one plain `search()` per chain hop and folds the result into an
+`_id` filter. SQLite and PostgreSQL also have native chain query builders for direct backend
+use. When the resolved `_id` set is large, SQLite binds one JSON array and expands it with
+`json_each`; PostgreSQL binds one `text[]` and tests membership with `ANY` or `ALL`.
 
 **Nested `_has`** (`_has:Observation:subject:_has:Provenance:target:agent=X`) is resolved
 recursively by `resolve_reverse_chain`: the inner chain selects the qualifying source resources by
 id, then the outer level collects their references to the base type. A reverse-depth cap
 (`ChainConfig::max_reverse_depth`, default 4) is enforced.
 
-**Include resolution (`_include`/`_revinclude`).** Elasticsearch and MongoDB populate `included`
-inside their own `search()`. SQLite and Postgres do not — so the REST handler resolves includes via
-the backend-agnostic `core::resolve_includes_iterative` whenever the backend left `included` empty.
-References are extracted through the search-parameter registry's FHIRPath expression (so a parameter
-whose name differs from its JSON field — e.g. Patient `organization` → `managingOrganization` —
-resolves correctly), and the referenced/referencing resources are fetched with `search()`.
+**Include resolution (`_include`/`_revinclude`).** Every `IncludeProvider` implementation (SQLite,
+Postgres, Elasticsearch, MongoDB, Composite) delegates to the single backend-agnostic
+`core::resolve_includes_iterative`. SQLite, Postgres and Elasticsearch leave `included` empty in
+their own `search()` and let the REST handler run that resolver as the `Full` pass. MongoDB is the
+only backend that calls it inline, from within its own `search()`, but only for hop 1 — bounded by
+the `HFS_MONGODB_MAX_INCLUDED_RESOURCES` directive (a truncated result is flagged with an
+`OperationOutcome` marker, see note ¹) — so the REST handler still finishes any `:iterate` hops
+afterward. References are extracted through the search-parameter registry's FHIRPath expression (so
+a parameter whose name differs from its JSON field — e.g. Patient `organization` →
+`managingOrganization` — resolves correctly), and the referenced/referencing resources are fetched
+with `search()`.
 
 ¹ `:iterate` transitively follows includes of already-included resources (depth-capped, deduped) via
-  `resolve_includes_iterative`. Both spellings are accepted: `_include=Obs:subject:iterate` and the
-  spec's `_include:iterate=Obs:subject`. `_include=Type:*` expands at query-build time to one
-  directive per reference search parameter of `Type`.
+  `resolve_includes_iterative` for the `Full` pass, or `resolve_includes_iterate_continuation` for
+  the `Continuation` pass that picks up after MongoDB's inline hop 1. Both spellings are accepted:
+  `_include=Obs:subject:iterate` and the spec's `_include:iterate=Obs:subject`. `_include=Type:*`
+  expands at query-build time to one directive per reference search parameter of `Type`.
 
 ## 6. Result control (paging, sort, total, summary, elements)
 
@@ -262,7 +266,7 @@ handler now calls `search::resolve_chains` first: a backend-agnostic resolver th
 chain as application-side joins (one plain `search()` per hop, results folded into an `_id`
 filter), then runs the rewritten query. This works for any `SearchProvider`, so chained and `_has`
 queries are functional end-to-end on SQLite, PostgreSQL, MongoDB, and Elasticsearch. SQLite and PG
-additionally resolve chains natively in-backend.
+also expose native chain builders for direct backend use.
 
 SQLite is the most complete backend and serves as the reference for the others; PostgreSQL is now
 at near-parity (only `:text-advanced` remains).

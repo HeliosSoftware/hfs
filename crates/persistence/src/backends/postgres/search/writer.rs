@@ -156,16 +156,16 @@ use chrono::{DateTime, Utc};
 
 use crate::backends::postgres::cached::execute_cached;
 use crate::backends::postgres::schema::IndexLayout;
-use crate::error::{BackendError, StorageResult};
+use crate::backends::postgres::storage::internal_postgres_error;
+use crate::error::StorageResult;
 use crate::search::{converters::IndexValue, extractor::ExtractedValue};
 use crate::types::strip_reference_version;
 
-fn internal_error(message: String) -> crate::error::StorageError {
-    crate::error::StorageError::Backend(BackendError::Internal {
-        backend_name: "postgres".to_string(),
-        message,
-        source: None,
-    })
+fn postgres_error_message(error: &tokio_postgres::Error) -> String {
+    error.as_db_error().map_or_else(
+        || error.to_string(),
+        |db_error| db_error.message().to_string(),
+    )
 }
 
 /// Parses an extracted date value into the UTC timestamp stored in `value_date`.
@@ -180,12 +180,73 @@ fn internal_error(message: String) -> crate::error::StorageError {
 /// A missing index row makes the parameter behave as absent for that resource —
 /// still a gap, but a silent under-match is recoverable and a silent *wrong*
 /// match is not.
+///
+/// The value is read with the search side's own [`FhirDateValue`] first, so
+/// whatever that grammar accepts is indexed at exactly the first instant of the
+/// range a search for the same text covers. That is what indexes a stored
+/// `…T09:20` — minutes without seconds, which RFC 3339 does not allow and which
+/// used to be skipped here although `date=…T09:20` is a valid search (#1315) —
+/// and what puts a `:60` leap second on the next second, where the search side
+/// looks for it.
+///
+/// Only the text as stored counts: the search-side repairs (trimming, and a
+/// space read as a form-decoded `+`, #1296) do not apply to a resource, where
+/// a space is simply not part of a date. Anything the strict grammar does not
+/// take verbatim falls through to the lenient reading below, which is
+/// unchanged.
+///
+/// [`FhirDateValue`]: crate::search::FhirDateValue
 fn parse_index_date(value: &str) -> Option<DateTime<Utc>> {
+    if let Ok(parsed) = crate::search::FhirDateValue::parse(value) {
+        if parsed.canonical() == value {
+            return Some(parsed.start);
+        }
+    }
+    parse_index_date_lenient(value)
+}
+
+/// The reading [`parse_index_date`] falls back to: complete the value with
+/// [`normalize_date_for_pg`] and take whatever chrono makes of it. Wider than
+/// the FHIR grammar on purpose — it is what keeps an out-of-grammar value
+/// (`+14:30`, an instant past the year 9999) indexed rather than dropped.
+fn parse_index_date_lenient(value: &str) -> Option<DateTime<Utc>> {
     let normalized = normalize_date_for_pg(value);
     DateTime::parse_from_rfc3339(&normalized)
         .map(|dt| dt.with_timezone(&Utc))
         .or_else(|_| normalized.parse::<DateTime<Utc>>())
         .ok()
+}
+
+/// The `[value_date, value_date_end)` range an extracted date is stored as
+/// (#1391).
+///
+/// A point value covers one unit of its own precision; a `Period` runs to the
+/// end of its `end`, or to [`open_end`](crate::search::open_end) when it has
+/// none. Both bounds are always set, so `value_date_end` is `NULL` only on a
+/// row no v43 writer or backfill has touched.
+///
+/// The start is read as [`parse_index_date`] reads it: the shared grammar
+/// first, then the lenient reading for values it does not take verbatim. For
+/// those the end is derived from the declared precision. `None` — the row is
+/// skipped — when either bound cannot be read: indexing a `Period` whose `end`
+/// is garbage as open-ended would over-match every later search.
+fn index_date_range(value: &IndexValue) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    use crate::search::{StorageResolution, indexed_end, indexed_range};
+
+    let IndexValue::Date {
+        value: raw,
+        precision,
+        end,
+    } = value
+    else {
+        return None;
+    };
+    if let Some(range) = indexed_range(value, StorageResolution::Micros) {
+        return Some(range);
+    }
+    let start = parse_index_date(raw)?;
+    let end = indexed_end(start, *precision, end, StorageResolution::Micros)?;
+    Some((start, end))
 }
 
 /// One `search_index` row, flattened to every column any write path can set.
@@ -214,6 +275,7 @@ pub(crate) struct IndexRow {
     value_token_system_2: Option<String>,
     value_token_code_2: Option<String>,
     value_date: Option<DateTime<Utc>>,
+    value_date_end: Option<DateTime<Utc>>,
     value_date_precision: Option<String>,
     value_number: Option<f64>,
     value_number_2: Option<f64>,
@@ -262,9 +324,9 @@ macro_rules! column {
 /// below never has to NULL-pad.
 fn insert_plan(rows: &[&IndexRow]) -> InsertPlan {
     let mut plan = InsertPlan {
-        columns: Vec::with_capacity(28),
-        casts: Vec::with_capacity(28),
-        params: Vec::with_capacity(28),
+        columns: Vec::with_capacity(29),
+        casts: Vec::with_capacity(29),
+        params: Vec::with_capacity(29),
     };
     let p = &mut plan;
 
@@ -305,6 +367,13 @@ fn insert_plan(rows: &[&IndexRow]) -> InsertPlan {
         .clone());
     column!(p, rows, "value_date", "timestamptz[]", |r: &&IndexRow| r
         .value_date);
+    column!(
+        p,
+        rows,
+        "value_date_end",
+        "timestamptz[]",
+        |r: &&IndexRow| r.value_date_end
+    );
     column!(
         p,
         rows,
@@ -399,7 +468,7 @@ fn insert_plan(rows: &[&IndexRow]) -> InsertPlan {
 /// crud run, and never once re-used, because the text changed with the row
 /// count and `execute(&str)` prepares a throwaway statement each call.
 ///
-/// Now there is a single text with 31 parameters — three scalars and 28 arrays —
+/// Now there is a single text with 32 parameters — three scalars and 29 arrays —
 /// whatever the row count, so it is prepared once per connection and every
 /// execution after the fifth runs on a cached generic plan.
 ///
@@ -486,7 +555,7 @@ const CLEAR_SQL: &str = "DELETE FROM search_index \
 /// So this form promotes those two to arrays and keeps only `tenant_id` scalar,
 /// which a transaction genuinely does hold constant (a `PostgresTransaction`
 /// carries exactly one `TenantContext`). Everything else — the column list, the
-/// bind order, the parameter *numbers* of the 28 value arrays — is shared with
+/// bind order, the parameter *numbers* of the 29 value arrays — is shared with
 /// [`INSERT_SQL`] by construction, because both are built from the same
 /// [`insert_plan`].
 static INSERT_SQL_MULTI: LazyLock<String> = LazyLock::new(|| {
@@ -509,7 +578,7 @@ static INSERT_SQL_MULTI: LazyLock<String> = LazyLock::new(|| {
 /// Rows per statement.
 ///
 /// With the `unnest` form this is no longer a bind-parameter limit — 128 rows
-/// cost the same 31 parameters as one row does — so it exists only to bound the
+/// cost the same 32 parameters as one row does — so it exists only to bound the
 /// array a single statement has to marshal. It is well above the 24.2 index rows
 /// an average resource produces; what it changes is the tail. `Provenance.target`
 /// alone writes 1,626 rows for one resource, which the old 128-row cap split
@@ -533,8 +602,9 @@ const MULTI_BATCH_ROWS: usize = 4096;
 /// value column; `sort_expression` maps both to the bare columns rather than
 /// the correlated `search_index` subquery it uses for indexed parameters;
 /// `build_missing_condition` selects from `resources`; `primary_keyset_key`
-/// pages on `last_updated`; and `build_contained_condition` excludes
-/// `_`-prefixed parameters outright. `ChainQueryBuilder` was the one path that
+/// pages on `last_updated`; and `build_contained` answers `_id` from the
+/// `contained_local_id` column and refuses `_lastUpdated` (#1373).
+/// `ChainQueryBuilder` was the one path that
 /// still read the rows, for a chained or reverse-chained terminal such as
 /// `Observation?subject:Patient._id=p1`, and it now reads `resources` too.
 ///
@@ -590,9 +660,11 @@ impl IndexRow {
                 row.value_identifier_type_system = identifier_type_system.clone();
                 row.value_identifier_type_code = identifier_type_code.clone();
             }
-            IndexValue::Date { value, precision } => {
+            IndexValue::Date {
+                value, precision, ..
+            } => {
                 row.value_date_precision = Some(precision.to_string());
-                let Some(timestamp) = parse_index_date(value) else {
+                let Some((start, end)) = index_date_range(&extracted.value) else {
                     tracing::warn!(
                         param_name = %extracted.param_name,
                         resource_type = %resource_type,
@@ -602,7 +674,8 @@ impl IndexRow {
                     );
                     return None;
                 };
-                row.value_date = Some(timestamp);
+                row.value_date = Some(start);
+                row.value_date_end = Some(end);
             }
             IndexValue::Number(n) => {
                 row.value_number = Some(*n);
@@ -683,6 +756,13 @@ impl IndexRow {
         row: &super::composite_rows::CompositeRow,
         last_updated: Option<DateTime<Utc>>,
     ) -> Self {
+        // A composite date component is compared as a point (`value_date`
+        // only), but its row still carries the end of its own precision so
+        // `value_date_end` is set wherever `value_date` is.
+        let date_range = row
+            .value_date
+            .as_deref()
+            .and_then(|value| index_date_range(&IndexValue::date(value)));
         IndexRow {
             last_updated,
             param_name: row.param_name.clone(),
@@ -692,7 +772,8 @@ impl IndexRow {
             value_token_system_2: row.value_token_system_2.clone(),
             value_token_code_2: row.value_token_code_2.clone(),
             value_string: row.value_string.clone(),
-            value_date: row.value_date.as_deref().and_then(parse_index_date),
+            value_date: date_range.map(|(start, _)| start),
+            value_date_end: date_range.map(|(_, end)| end),
             value_number: row.value_number,
             value_number_2: row.value_number_2,
             value_quantity_value: row.value_quantity_value,
@@ -710,7 +791,7 @@ impl IndexRow {
 ///
 /// Every column the table has, in borrowed form: the three that identify the
 /// resource (bound once per statement, so they are passed in rather than read
-/// off the row) plus all 28 of [`IndexRow`]'s. Two rows with equal keys are the
+/// off the row) plus all 29 of [`IndexRow`]'s. Two rows with equal keys are the
 /// same tuple, byte for byte, and Postgres would store both.
 ///
 /// `f64` is not `Eq`/`Hash`, so the five float columns are keyed on their IEEE
@@ -734,6 +815,7 @@ struct RowKey<'a> {
     value_token_system_2: Option<&'a String>,
     value_token_code_2: Option<&'a String>,
     value_date: Option<&'a DateTime<Utc>>,
+    value_date_end: Option<&'a DateTime<Utc>>,
     value_date_precision: Option<&'a String>,
     value_number: Option<u64>,
     value_number_2: Option<u64>,
@@ -775,6 +857,7 @@ impl IndexRow {
             value_token_system_2,
             value_token_code_2,
             value_date,
+            value_date_end,
             value_date_precision,
             value_number,
             value_number_2,
@@ -808,6 +891,7 @@ impl IndexRow {
             value_token_system_2: value_token_system_2.as_ref(),
             value_token_code_2: value_token_code_2.as_ref(),
             value_date: value_date.as_ref(),
+            value_date_end: value_date_end.as_ref(),
             value_date_precision: value_date_precision.as_ref(),
             value_number: value_number.map(f64::to_bits),
             value_number_2: value_number_2.map(f64::to_bits),
@@ -911,7 +995,7 @@ fn dedup_rows<'a>(
 
 /// The hasher [`dedup_rows`] uses, in place of the standard library's SipHash.
 ///
-/// A [`RowKey`] is 28 fields — most of them `Option<&String>` — so hashing one
+/// A [`RowKey`] is 29 fields — most of them `Option<&String>` — so hashing one
 /// feeds a few hundred bytes through the hasher, once per index row. SipHash is
 /// a keyed MAC chosen for resistance to collision attacks on hash maps whose
 /// keys an attacker controls; nothing here is a durable map, the keys live for
@@ -1000,6 +1084,11 @@ impl PostgresSearchIndexWriter {
     /// a grouped aggregate over one row per component.
     ///
     /// Returns the number of rows written.
+    /// This low-level API accepts arbitrary extracted values and a raw client.
+    /// Callers must provide their own transaction, tenant/resource advisory
+    /// locks, current-row freshness check, and atomic replacement of stale
+    /// search and FTS rows. Supported CRUD and reindex paths use guarded
+    /// internal writers instead.
     pub async fn write_values(
         client: &deadpool_postgres::Client,
         tenant_id: &str,
@@ -1048,10 +1137,23 @@ impl PostgresSearchIndexWriter {
     /// Flattens the values extracted from one `contained[]` entry into rows.
     ///
     /// [`Self::drop_resources_backed`] applies here too, and did not before.
-    /// `build_contained` (`search/query_builder.rs`) skips every parameter whose
-    /// name `starts_with('_')` outright, so a contained `_id` or `_lastUpdated`
-    /// row has no reader at all — not "answered from `resources`" as on the
-    /// plain path, but genuinely unreachable.
+    /// `build_contained` (`search/query_builder.rs`) reads neither row: since
+    /// #1373 it answers `_id` from the `contained_local_id` column every
+    /// contained row carries and refuses `_lastUpdated` (a contained resource
+    /// has none of its own), so a contained `_id` or `_lastUpdated` row has no
+    /// reader at all — not "answered from `resources`" as on the plain path,
+    /// but genuinely unreachable. (The other `_`-parameters — `_tag`,
+    /// `_profile`, `_security`, `_source`, `_language` — are read, and kept.)
+    ///
+    /// The one `_id` row that IS written is the presence row of a contained
+    /// resource that yields no other indexed value (#1407). `build_contained`
+    /// finds contained resources by grouping their rows, so with no row at all
+    /// such a resource was invisible to every `_contained` search — the
+    /// no-criteria form, `_id`, and `:not` included — on this backend only
+    /// (SQLite, MongoDB and Elasticsearch keep the `_id` value). Any row makes
+    /// the entity visible, so the `_id` row is kept exactly when it would
+    /// otherwise have none; every resource with another indexed value still
+    /// saves it.
     ///
     /// The `_id` row is worse than merely unread: it is a byte-for-byte
     /// restatement of a column the same row already carries. On the benchmark's
@@ -1081,10 +1183,20 @@ impl PostgresSearchIndexWriter {
         contained: (&str, &str),
         values: &[ExtractedValue],
     ) -> Vec<IndexRow> {
-        values
+        let rows: Vec<IndexRow> = values
             .iter()
             .filter(|value| !answered_from_resources(&value.param_name))
             .filter_map(|value| IndexRow::from_contained(value, container, contained))
+            .collect();
+        if !rows.is_empty() {
+            return rows;
+        }
+        // Nothing but `_id` / `_lastUpdated`: keep `_id` as the presence row.
+        values
+            .iter()
+            .filter(|value| value.param_name == "_id")
+            .filter_map(|value| IndexRow::from_contained(value, container, contained))
+            .take(1)
             .collect()
     }
 
@@ -1126,13 +1238,16 @@ impl PostgresSearchIndexWriter {
     /// of one write, so they are bound once per statement instead of once per
     /// row — 3 fewer values on the wire for each of the ~39.5M index rows an
     /// import writes.
-    pub(crate) async fn insert_rows(
-        client: &deadpool_postgres::Client,
+    pub(crate) async fn insert_rows<C>(
+        client: &C,
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
         rows: &[IndexRow],
-    ) -> StorageResult<()> {
+    ) -> StorageResult<()>
+    where
+        C: deadpool_postgres::GenericClient + ?Sized,
+    {
         Self::write_rows(client, tenant_id, resource_type, resource_id, rows, false).await
     }
 
@@ -1142,24 +1257,30 @@ impl PostgresSearchIndexWriter {
     /// rather than being one of its own. Only the *first* chunk carries it: a
     /// resource whose rows exceed [`BATCH_ROWS`] must not have chunk 2 delete
     /// what chunk 1 just wrote.
-    pub(crate) async fn replace_rows(
-        client: &deadpool_postgres::Client,
+    pub(crate) async fn replace_rows<C>(
+        client: &C,
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
         rows: &[IndexRow],
-    ) -> StorageResult<()> {
+    ) -> StorageResult<()>
+    where
+        C: deadpool_postgres::GenericClient + ?Sized,
+    {
         Self::write_rows(client, tenant_id, resource_type, resource_id, rows, true).await
     }
 
-    async fn write_rows(
-        client: &deadpool_postgres::Client,
+    async fn write_rows<C>(
+        client: &C,
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
         rows: &[IndexRow],
         clear_first: bool,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<()>
+    where
+        C: deadpool_postgres::GenericClient + ?Sized,
+    {
         if clear_first && rows.is_empty() {
             // Nothing to fold the `DELETE` into, and it still has to happen.
             execute_cached(
@@ -1168,7 +1289,10 @@ impl PostgresSearchIndexWriter {
                 &[&tenant_id, &resource_type, &resource_id],
             )
             .await
-            .map_err(|e| internal_error(format!("Failed to clear search index rows: {}", e)))?;
+            .map_err(|e| {
+                let message = format!("Failed to clear search index rows: {e}");
+                internal_postgres_error(message, e)
+            })?;
             return Ok(());
         }
 
@@ -1200,7 +1324,11 @@ impl PostgresSearchIndexWriter {
             execute_cached(client, sql, &param_refs)
                 .await
                 .map_err(|e| {
-                    internal_error(format!("Failed to insert search index rows: {}", e))
+                    let message = format!(
+                        "Failed to insert search index rows: {}",
+                        postgres_error_message(&e)
+                    );
+                    internal_postgres_error(message, e)
                 })?;
         }
 
@@ -1220,11 +1348,14 @@ impl PostgresSearchIndexWriter {
     /// Chunked at [`MULTI_BATCH_ROWS`] so one caller's flush is normally one
     /// statement, and a single pathological resource (`Provenance.target` writes
     /// 1,626 rows) cannot make the arrays unbounded.
-    pub(crate) async fn insert_rows_multi(
-        client: &deadpool_postgres::Client,
+    pub(crate) async fn insert_rows_multi<C>(
+        client: &C,
         tenant_id: &str,
         batches: &[(&str, &str, &[IndexRow])],
-    ) -> StorageResult<()> {
+    ) -> StorageResult<()>
+    where
+        C: deadpool_postgres::GenericClient + ?Sized,
+    {
         let total: usize = batches.iter().map(|(_, _, rows)| rows.len()).sum();
         if total == 0 {
             return Ok(());
@@ -1263,7 +1394,11 @@ impl PostgresSearchIndexWriter {
             execute_cached(client, INSERT_SQL_MULTI.as_str(), &param_refs)
                 .await
                 .map_err(|e| {
-                    internal_error(format!("Failed to insert search index rows: {}", e))
+                    let message = format!(
+                        "Failed to insert search index rows: {}",
+                        postgres_error_message(&e)
+                    );
+                    internal_postgres_error(message, e)
                 })?;
         }
 
@@ -1274,6 +1409,8 @@ impl PostgresSearchIndexWriter {
     ///
     /// Shares [`IndexRow`] with the batched path so both agree on which column
     /// each `IndexValue` variant populates.
+    /// Like [`Self::write_values`], this raw-client API requires the caller to
+    /// enforce transaction, lock, and current-row freshness obligations.
     pub async fn write_entry(
         client: &deadpool_postgres::Client,
         tenant_id: &str,
@@ -1301,7 +1438,7 @@ impl PostgresSearchIndexWriter {
 /// - "2024-01-15" -> "2024-01-15T00:00:00+00:00"
 /// - "2024-01-15T10:30:00" -> "2024-01-15T10:30:00+00:00"
 /// - "2024-01-15T10:30:00-07:00" -> unchanged (already zoned)
-fn normalize_date_for_pg(value: &str) -> String {
+pub(super) fn normalize_date_for_pg(value: &str) -> String {
     if let Some((_, time_part)) = value.split_once('T') {
         // Already has a time component — append UTC only if it carries no zone.
         //
@@ -1339,6 +1476,143 @@ fn normalize_date_for_pg(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A search value and the stored value it should match must never be zoned
+    /// differently (#1288). The query side used to guarantee that by calling
+    /// [`normalize_date_for_pg`] itself; it now reads search values with the
+    /// shared `FhirDateValue`, and so does [`parse_index_date`] (#1315): for
+    /// every value the search grammar accepts, the instant indexed is the
+    /// start of the range searched.
+    ///
+    /// That includes what a resource cannot validly carry but real data does —
+    /// `hh:mm` without seconds — and a `:60` leap second, which the search
+    /// side reads as the next second.
+    #[test]
+    fn search_and_index_agree_on_every_valid_value() {
+        for value in [
+            "2013",
+            "2013-04",
+            "2013-12",
+            "2013-04-05",
+            "2024-02-29",
+            "2013-04-05T09:20:00",
+            "2013-04-05T09:20:00Z",
+            "2013-04-05T09:20:00-04:00",
+            "2013-04-05T18:50:00+05:30",
+            "2013-04-05T09:20:00-00:00",
+            "2013-04-05T23:20:00+14:00",
+            "2013-04-05T09:20:00.5Z",
+            "2013-04-05T23:30:00.123-04:00",
+            "2021-11-10T16:48:57.246958-08:00",
+            // Minutes without seconds (#1315).
+            "2013-04-05T09:20",
+            "2013-04-05T09:20Z",
+            "2013-04-05T09:20-04:00",
+            "2013-04-05T18:50+05:30",
+            "2013-04-05T09:20-00:00",
+            "2013-04-05T23:59-14:00",
+            // A leap second is the first instant of the next second.
+            "2016-12-31T23:59:60Z",
+            "2013-04-05T09:20:60",
+            "2016-12-31T18:59:60-05:00",
+            "2016-12-31T23:59:60.5Z",
+            // Nine fraction digits, and digits past the ninth.
+            "2013-04-05T09:20:00.123456789Z",
+            "2013-04-05T09:20:00.1234567891Z",
+            "2013-04-05T09:20:00.12345678912345-04:00",
+            // The edges of the supported years.
+            "0001",
+            "0001-01-01T00:00:00Z",
+            "0001-01-01T14:00:00+14:00",
+            "9999",
+            "9999-12-31",
+            "9999-12-31T23:59",
+            "9999-12-31T23:59:59Z",
+            "9999-12-31T09:59:59-14:00",
+        ] {
+            let searched = crate::search::FhirDateValue::parse(value)
+                .unwrap_or_else(|e| panic!("{value} is a valid search value: {e}"));
+            assert_eq!(parse_index_date(value), Some(searched.start), "{value}");
+        }
+    }
+
+    /// #1315 itself: minutes without seconds are not RFC 3339, so the lenient
+    /// reading — all there was — dropped the value and the row was skipped.
+    #[test]
+    fn minute_precision_values_are_indexed() {
+        for (value, expected) in [
+            ("2013-04-05T09:20", "2013-04-05T09:20:00+00:00"),
+            ("2013-04-05T09:20Z", "2013-04-05T09:20:00+00:00"),
+            ("2013-04-05T09:20-04:00", "2013-04-05T13:20:00+00:00"),
+            ("2013-04-05T18:50+05:30", "2013-04-05T13:20:00+00:00"),
+        ] {
+            assert_eq!(parse_index_date_lenient(value), None, "{value} before");
+            assert_eq!(
+                parse_index_date(value).map(|t| t.to_rfc3339()),
+                Some(expected.to_string()),
+                "{value}"
+            );
+        }
+    }
+
+    /// The only value both readings accept and disagree on. Chrono keeps a
+    /// leap second as `:59` plus a second of nanoseconds, which sorts *before*
+    /// the next second; the search side looks for it *at* the next second.
+    #[test]
+    fn leap_second_is_indexed_where_the_search_side_looks_for_it() {
+        let lenient = parse_index_date_lenient("2016-12-31T23:59:60Z").expect("chrono reads it");
+        assert_eq!(lenient.timestamp(), 1_483_228_799, "lenient: still :59");
+        let indexed = parse_index_date("2016-12-31T23:59:60Z").expect("indexed");
+        assert_eq!(indexed.to_rfc3339(), "2017-01-01T00:00:00+00:00");
+    }
+
+    /// The search side trims a value and reads a space in the zone-sign
+    /// position as a form-decoded `+` (#1296). Neither applies to a stored
+    /// value: there a space is not part of a date, and the value is skipped as
+    /// it always was rather than indexed at a zone nobody wrote.
+    #[test]
+    fn search_side_repairs_do_not_apply_to_stored_values() {
+        for value in [
+            "2013-04-05T18:50:00 05:30",
+            "2013-04-05T18:50 05:30",
+            " 2013-04-05T09:20",
+            "2013-04-05T09:20 ",
+            " 2013-04-05 ",
+        ] {
+            assert!(
+                crate::search::FhirDateValue::parse(value).is_ok(),
+                "{value:?} is accepted as a search value"
+            );
+            assert_eq!(parse_index_date(value), None, "{value:?}");
+        }
+    }
+
+    /// What the strict grammar rejects still goes through the lenient reading,
+    /// exactly as before: the strict pass only ever adds index rows.
+    #[test]
+    fn values_outside_the_grammar_keep_the_lenient_reading() {
+        for value in [
+            // Offset beyond ±14:00.
+            "2013-04-05T09:20:00+14:30",
+            // Valid text whose UTC instant is past the year 9999.
+            "9999-12-31T23:59:59-01:00",
+            // Its range would have no width left inside the supported years.
+            "9999-12-31T23:59:59.999999999Z",
+            // Lower-case designators.
+            "2013-04-05t09:20:00z",
+        ] {
+            assert!(
+                crate::search::FhirDateValue::parse(value).is_err(),
+                "{value} is outside the search grammar"
+            );
+            assert!(parse_index_date_lenient(value).is_some(), "{value}");
+            assert_eq!(
+                parse_index_date(value),
+                parse_index_date_lenient(value),
+                "{value}"
+            );
+        }
+    }
 
     /// The two statements are built from one [`insert_plan`], and
     /// [`PostgresSearchIndexWriter::insert_rows`] and
@@ -1475,6 +1749,7 @@ mod tests {
                 r.value_token_code_2 = Some("c".into())
             }),
             ("value_date", |r| r.value_date = Some(Utc::now())),
+            ("value_date_end", |r| r.value_date_end = Some(Utc::now())),
             ("value_date_precision", |r| {
                 r.value_date_precision = Some("day".into())
             }),
@@ -1930,6 +2205,33 @@ mod tests {
         assert_eq!(names, vec!["family"], "contained rows: {names:?}");
     }
 
+    /// A contained resource with nothing indexed but its id keeps the `_id` row:
+    /// it is the only row that makes the resource visible to `build_contained`,
+    /// which finds contained resources by grouping their rows (#1407).
+    #[test]
+    fn an_id_only_contained_resource_keeps_its_id_row_as_a_presence_row() {
+        let mut id_value = extracted(IndexValue::Token {
+            system: None,
+            code: "bare".to_string(),
+            display: None,
+            identifier_type_system: None,
+            identifier_type_code: None,
+        });
+        id_value.param_name = "_id".to_string();
+
+        let rows = PostgresSearchIndexWriter::build_contained_rows(
+            ("DiagnosticReport", "dr1"),
+            ("Location", "bare"),
+            &[id_value],
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].param_name, "_id");
+        assert!(rows[0].is_contained);
+        assert_eq!(rows[0].contained_type.as_deref(), Some("Location"));
+        assert_eq!(rows[0].contained_local_id.as_deref(), Some("bare"));
+    }
+
     /// The re-index `DELETE` is folded into the insert, so the two texts have to
     /// agree about parameter numbering: a caller binds one list and picks the
     /// text. If the fold ever stopped being a pure prefix, the bind order would
@@ -1967,6 +2269,7 @@ mod tests {
         let bad = || IndexValue::Date {
             value: "not-a-date".to_string(),
             precision: DatePrecision::Day,
+            end: crate::search::DateEnd::Precision,
         };
         assert!(
             IndexRow::from_extracted(&extracted(bad()), "Observation", "abc", Some(Utc::now()))
@@ -1974,6 +2277,65 @@ mod tests {
         );
         assert!(
             IndexRow::from_contained(&extracted(bad()), ("Observation", "abc"), ("Patient", "p1"))
+                .is_none()
+        );
+    }
+    /// One row per date value carrying both bounds (#1391): a point ends one
+    /// unit of its precision on, a `Period` at the end of its `end`, an open
+    /// end at the supported limit, and a `Period` whose `end` cannot be read
+    /// is not indexed at all.
+    #[test]
+    fn a_date_row_carries_its_range() {
+        use crate::search::{StorageResolution, open_end, open_start};
+        let at = |s: &str| {
+            DateTime::parse_from_rfc3339(s)
+                .expect("fixture instant")
+                .with_timezone(&Utc)
+        };
+        let range = |value: IndexValue| {
+            let row = row_of(value);
+            (
+                row.value_date.expect("start"),
+                row.value_date_end.expect("end"),
+            )
+        };
+
+        assert_eq!(
+            range(IndexValue::date("2020-06")),
+            (at("2020-06-01T00:00:00Z"), at("2020-07-01T00:00:00Z"))
+        );
+        assert_eq!(
+            range(IndexValue::date("2020-06-15T10:00:00.123456+02:00")),
+            (
+                at("2020-06-15T08:00:00.123456Z"),
+                at("2020-06-15T08:00:00.123457Z")
+            )
+        );
+        assert_eq!(
+            range(IndexValue::date_range(Some("2020-01-15"), Some("2020-06")).unwrap()),
+            (at("2020-01-15T00:00:00Z"), at("2020-07-01T00:00:00Z"))
+        );
+        assert_eq!(
+            range(IndexValue::date_range(Some("2020-01-15"), None).unwrap()),
+            (
+                at("2020-01-15T00:00:00Z"),
+                open_end(StorageResolution::Micros)
+            )
+        );
+        assert_eq!(
+            range(IndexValue::date_range(None, Some("2020")).unwrap()),
+            (open_start(), at("2021-01-01T00:00:00Z"))
+        );
+        // Outside the shared grammar but read leniently, as before: the end
+        // follows the declared precision.
+        assert_eq!(
+            range(IndexValue::date("2013-04-05T09:20:00+14:30")),
+            (at("2013-04-04T18:50:00Z"), at("2013-04-04T18:50:01Z"))
+        );
+
+        let bad_end = IndexValue::date_range(Some("2020-01-15"), Some("2020-02-30")).unwrap();
+        assert!(
+            IndexRow::from_extracted(&extracted(bad_end), "Encounter", "e1", Some(Utc::now()))
                 .is_none()
         );
     }

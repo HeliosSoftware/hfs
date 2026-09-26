@@ -275,13 +275,20 @@ impl S3Keyspace {
     ///
     /// `file_url` names the manifest output file the line came from; see
     /// [`submit_file_segment`] for why it is part of the key.
-    pub fn submit_raw_line_key(
+    /// Key for the raw NDJSON archive of one ingest batch (chunk) of a file.
+    ///
+    /// One object holds every line of the batch, keyed by the batch's first
+    /// line number so successive chunks of the same file (each a separate
+    /// `process_entries` call) never collide (#1429). `file_url` names the
+    /// manifest output file the lines came from; see [`submit_file_segment`]
+    /// for why it is part of the key (two files' line-1 batches must differ).
+    pub fn submit_raw_batch_key(
         &self,
         submitter: &str,
         submission_id: &str,
         manifest_id: &str,
         file_url: Option<&str>,
-        line: u64,
+        first_line: u64,
     ) -> String {
         self.join(&[
             "bulk",
@@ -291,14 +298,17 @@ impl S3Keyspace {
             "raw",
             manifest_id,
             &submit_file_segment(file_url),
-            &format!("line-{}.ndjson", line),
+            &format!("batch-{}.ndjson", first_line),
         ])
     }
 
-    /// Key for the processing result of a single NDJSON line.
+    /// Key for the processing result of a single NDJSON line — the legacy
+    /// per-line receipt shape, which the ingest no longer writes (#1429) but
+    /// the readers still accept; kept so the tests can plant one.
     ///
     /// `file_url` names the manifest output file the line came from; see
     /// [`submit_file_segment`] for why it is part of the key.
+    #[cfg(test)]
     pub fn submit_result_line_key(
         &self,
         submitter: &str,
@@ -319,6 +329,34 @@ impl S3Keyspace {
         ])
     }
 
+    /// Key for one ingest batch's coalesced receipts — every entry result the
+    /// batch produced, in a single object rather than one per line (#1429).
+    ///
+    /// Sits under the same `results/<manifest>/` prefix that
+    /// [`Self::submit_result_line_key`] writes and that `load_entry_results`
+    /// sweeps, nested by file and keyed by the batch's first line exactly like
+    /// the raw archive and the change log, so batches of one file never
+    /// collide and two files' batches stay apart (#457).
+    pub fn submit_result_batch_key(
+        &self,
+        submitter: &str,
+        submission_id: &str,
+        manifest_id: &str,
+        file_url: Option<&str>,
+        first_line: u64,
+    ) -> String {
+        self.join(&[
+            "bulk",
+            "submit",
+            submitter,
+            submission_id,
+            "results",
+            manifest_id,
+            &submit_file_segment(file_url),
+            &format!("batch-{}.json", first_line),
+        ])
+    }
+
     /// Key for a recorded change (create or update) within a submission.
     pub fn submit_change_key(
         &self,
@@ -333,6 +371,34 @@ impl S3Keyspace {
             submission_id,
             "changes",
             &format!("{}.json", change_id),
+        ])
+    }
+
+    /// Key for one ingest batch's coalesced change log — every change the batch
+    /// recorded, in a single object rather than one per resource (#1429).
+    ///
+    /// Sits under the same `changes/` prefix that [`Self::submit_change_key`]
+    /// writes and that `load_changes` lists, but nested by manifest and file so
+    /// batches never collide: like the raw archive and the entry receipts, the
+    /// key is discriminated by `file_url` (line numbers restart per file, see
+    /// [`submit_file_segment`]) and keyed by the batch's first line.
+    pub fn submit_change_batch_key(
+        &self,
+        submitter: &str,
+        submission_id: &str,
+        manifest_id: &str,
+        file_url: Option<&str>,
+        first_line: u64,
+    ) -> String {
+        self.join(&[
+            "bulk",
+            "submit",
+            submitter,
+            submission_id,
+            "changes",
+            manifest_id,
+            &submit_file_segment(file_url),
+            &format!("batch-{}.json", first_line),
         ])
     }
 
@@ -499,6 +565,18 @@ impl S3Keyspace {
     /// so listing this prefix can never return one.
     pub fn user_settings_prefix(&self) -> String {
         self.join(&["_system.user-settings/"])
+    }
+
+    /// Object key for one web UI login session or pending login (#1481):
+    /// `kind` is `session` or `pending`, `id` the opaque random id (URL-safe
+    /// base64, so path-safe and fixed-length by construction).
+    pub fn login_session_key(&self, kind: &str, id: &str) -> String {
+        self.join(&["_system.login-sessions", kind, &format!("{id}.json")])
+    }
+
+    /// Prefix covering every login object of one `kind`, for the sweep.
+    pub fn login_sessions_prefix(&self, kind: &str) -> String {
+        self.join(&["_system.login-sessions", &format!("{kind}/")])
     }
 
     /// Joins `parts` with `/`, prepending the base prefix when set.

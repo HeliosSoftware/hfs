@@ -14,6 +14,8 @@
 //! - [`capabilities`] - Get server capabilities (CapabilityStatement)
 //! - [`versions`] - Get supported FHIR versions ($versions operation)
 //! - [`health`] - Health check endpoint
+//! - `dashboard_counts` - The dashboard counters' post-commit write observer
+//! - `write_event` - Reporting committed writes to the post-commit write observer
 
 pub mod admin_tenants;
 pub mod batch;
@@ -23,9 +25,12 @@ pub mod bulk_submit;
 pub mod bulk_submit_jwks;
 pub mod capabilities;
 pub mod compartment;
+mod conditional_support;
 pub mod console_metrics;
 pub mod create;
+pub mod dashboard_counts;
 pub mod delete;
+pub mod everything;
 pub mod health;
 pub mod history;
 pub mod nl_search;
@@ -37,14 +42,13 @@ pub mod search;
 pub mod smart_discovery;
 pub mod sof;
 #[cfg(feature = "subscriptions")]
-pub mod subscription_event;
-#[cfg(feature = "subscriptions")]
 pub mod subscriptions;
 pub mod update;
 pub mod user_settings;
 pub mod validate;
 pub mod versions;
 pub mod vread;
+pub(crate) mod write_event;
 #[cfg(feature = "subscriptions")]
 pub mod ws;
 
@@ -77,19 +81,20 @@ pub use capabilities::capabilities_handler;
 pub use compartment::compartment_search_handler;
 pub use create::create_handler;
 pub use delete::{conditional_delete_handler, delete_handler};
+pub use everything::{patient_everything_instance_handler, patient_everything_type_handler};
 pub use health::health_handler;
 pub use history::{
     delete_instance_history_handler, delete_version_handler, history_instance_handler,
     history_system_handler, history_type_handler,
 };
 pub use nl_search::nl_search_handler;
-pub use patch::patch_handler;
+pub use patch::{conditional_patch_handler, patch_handler};
 pub use purge::{purge_instance_handler, purge_type_handler};
 pub use read::{head_read_handler, read_handler};
 pub use reindex::{
     reindex_cancel_handler, reindex_status_handler, reindex_system_handler, reindex_type_handler,
 };
-pub use search::{search_get_handler, search_post_handler};
+pub use search::{search_get_handler, search_post_handler, search_system_not_supported_handler};
 pub use update::{conditional_update_handler, update_handler};
 pub use user_settings::{get_user_settings, patch_user_settings, put_user_settings};
 pub use validate::{

@@ -528,11 +528,15 @@ fn replace_only_body() -> Value {
 }
 
 fn status_body() -> Value {
+    status_body_for("it-1")
+}
+
+fn status_body_for(submission_id: &str) -> Value {
     json!({
         "resourceType": "Parameters",
         "parameter": [
             {"name": "submitter", "valueIdentifier": {"system": "http://ehr", "value": "ehr-1"}},
-            {"name": "submissionId", "valueString": "it-1"}
+            {"name": "submissionId", "valueString": submission_id}
         ]
     })
 }
@@ -551,6 +555,107 @@ fn kickoff_body_with_status(submission_id: &str, code: &str) -> Value {
                 "system": "http://hl7.org/fhir/event-status", "code": code}}
         ]
     })
+}
+
+/// A status-only kick-off: identity plus `submissionStatus`, no manifest —
+/// the shape the Import page's Abort / Mark completed buttons send.
+fn status_only_body(submission_id: &str, code: &str) -> Value {
+    json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "submitter", "valueIdentifier": {"system": "http://ehr", "value": "ehr-1"}},
+            {"name": "submissionId", "valueString": submission_id},
+            {"name": "submissionStatus", "valueCoding": {
+                "system": "http://hl7.org/fhir/event-status", "code": code}}
+        ]
+    })
+}
+
+/// #998: a status-only kick-off that restates the terminal status a submission
+/// already has answers `200` again. The provider whose first close-out timed
+/// out client-side — while the server still committed it — can only send it
+/// again, and a `409` there reads as the transition having been refused. Only
+/// the exact restatement is idempotent: the other terminal status, or any
+/// kick-off carrying a manifest, is still a conflict.
+#[tokio::test]
+async fn test_restating_a_terminal_status_is_idempotent() {
+    let (server, backend, ..) = create_submit_server().await;
+    let tenant = helios_persistence::tenant::TenantContext::new(
+        helios_persistence::tenant::TenantId::new("test-tenant"),
+        helios_persistence::tenant::TenantPermissions::full_access(),
+    );
+
+    // completed, then completed again.
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&kickoff_body_with_status("again-1", "completed"))
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
+    let repeated = server
+        .post("/$bulk-submit")
+        .json(&status_only_body("again-1", "completed"))
+        .await;
+    assert_eq!(
+        repeated.status_code(),
+        StatusCode::OK,
+        "the same close-out twice is one close-out: {}",
+        repeated.text()
+    );
+    let completed_id = helios_persistence::core::SubmissionId::new("http://ehr|ehr-1", "again-1");
+    assert_eq!(
+        backend
+            .get_submission_status(&tenant, &completed_id)
+            .await
+            .unwrap(),
+        Some(helios_persistence::core::SubmissionStatus::Complete)
+    );
+    // ...but not stopped after completed,
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&status_only_body("again-1", "stopped"))
+            .await
+            .status_code(),
+        StatusCode::CONFLICT
+    );
+    // ...nor a restatement that also carries a manifest.
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&kickoff_body_with_status("again-1", "completed"))
+            .await
+            .status_code(),
+        StatusCode::CONFLICT
+    );
+
+    // stopped, then stopped again — the abort is not re-run.
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&kickoff_body_with_status("again-2", "stopped"))
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&status_only_body("again-2", "stopped"))
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&status_only_body("again-2", "completed"))
+            .await
+            .status_code(),
+        StatusCode::CONFLICT
+    );
 }
 
 /// `submissionStatus=completed` SHALL make the submission terminal.
@@ -589,7 +694,9 @@ async fn test_completed_status_finalizes_submission() {
         summary.status
     );
 
-    // And being terminal, it must reject further kick-offs.
+    // And being terminal, it must reject further kick-offs — this one carries
+    // a manifest, so it is a further submission, not a restated close-out
+    // (`test_restating_a_terminal_status_is_idempotent`).
     assert_eq!(
         server
             .post("/$bulk-submit")
@@ -745,6 +852,79 @@ async fn test_kickoff_returns_200() {
     let (server, ..) = create_submit_server().await;
     let resp = server.post("/$bulk-submit").json(&kickoff_body()).await;
     assert_eq!(resp.status_code(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_status_kickoff_returns_404_for_missing_submission() {
+    let (server, ..) = create_submit_server().await;
+
+    let response = server
+        .post("/$bulk-submit-status")
+        .json(&status_body())
+        .await;
+
+    assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_poll_reports_an_aborted_submission() {
+    let (server, ..) = create_submit_server().await;
+    let submission_id = "poll-aborted";
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&kickoff_body_with_status(submission_id, "stopped"))
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
+
+    let status = server
+        .post("/$bulk-submit-status")
+        .json(&status_body_for(submission_id))
+        .await;
+    assert_eq!(status.status_code(), StatusCode::ACCEPTED);
+    let poll_path = status
+        .headers()
+        .get("content-location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .trim_start_matches("http://localhost:8080");
+
+    assert_eq!(server.get(poll_path).await.status_code(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_status_getter_internal_error_maps_to_500() {
+    let (server, _backend, _output, db_path, _tmp) =
+        create_file_submit_server(BulkSubmitConfig::default()).await;
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&kickoff_body())
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
+
+    rusqlite::Connection::open(db_path)
+        .unwrap()
+        .execute(
+            "UPDATE bulk_submissions SET status = 'invalid-status'
+             WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3",
+            rusqlite::params!["test-tenant", "http://ehr|ehr-1", "it-1"],
+        )
+        .unwrap();
+
+    assert_eq!(
+        server
+            .post("/$bulk-submit-status")
+            .json(&status_body())
+            .await
+            .status_code(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
 }
 
 #[tokio::test]
@@ -1586,6 +1766,7 @@ async fn test_in_progress_poll_advertises_the_configured_retry_after() {
         mock_fetcher(),
         BulkSubmitConfig {
             retry_after_secs: 7,
+            pre_ingest_retry_after_secs: 7,
             ..BulkSubmitConfig::default()
         },
     )
@@ -1599,6 +1780,93 @@ async fn test_in_progress_poll_advertises_the_configured_retry_after() {
         resp.headers().get("retry-after").expect("Retry-After"),
         "7",
         "the in-progress poll must advertise HFS_BULK_SUBMIT_RETRY_AFTER"
+    );
+}
+
+/// The pre-ingest phases (#953) each last seconds, while the ingest cadence
+/// is two minutes by default. A poller that honours the long cadence from the
+/// first `202` sleeps straight through queued -> reading -> sizing ->
+/// downloading and the phase reports never reach a screen — HFS's own Import
+/// page showed the queued text for its whole first window. So the short
+/// cadence is advertised until the first counted byte or entry, and the long
+/// one after.
+#[tokio::test]
+async fn test_poll_advertises_the_short_cadence_until_ingest_starts() {
+    let (server, backend, _fetcher, _output, _tmp) = create_submit_server_with(
+        mock_fetcher(),
+        BulkSubmitConfig {
+            retry_after_secs: 90,
+            pre_ingest_retry_after_secs: 8,
+            ..BulkSubmitConfig::default()
+        },
+    )
+    .await;
+    let poll_path = start_and_get_poll_path(&server).await;
+
+    // Queued: nothing claimed.
+    let resp = server.get(&poll_path).await;
+    assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
+    assert_eq!(
+        resp.headers().get("retry-after").expect("Retry-After"),
+        "8",
+        "a queued submission must advertise the pre-ingest cadence"
+    );
+
+    // Claimed and in a named phase: still pre-ingest.
+    let lease = backend
+        .claim_next_manifest(&WorkerId::new("cadence-worker"), Duration::from_secs(60))
+        .await
+        .expect("claim")
+        .expect("a manifest to claim");
+    backend
+        .update_manifest_phase(&lease, ManifestPhase::Sizing, 3, 12)
+        .await
+        .expect("phase update");
+    let resp = server.get(&poll_path).await;
+    assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
+    assert_eq!(
+        resp.headers().get("retry-after").expect("Retry-After"),
+        "8",
+        "a sizing submission must advertise the pre-ingest cadence"
+    );
+
+    // First bytes counted: ingest cadence.
+    backend
+        .update_manifest_bytes(&lease, 350, 1_000)
+        .await
+        .expect("bytes update");
+    let resp = server.get(&poll_path).await;
+    assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
+    assert_eq!(
+        resp.headers().get("retry-after").expect("Retry-After"),
+        "90",
+        "once bytes are counted the poll must advertise HFS_BULK_SUBMIT_RETRY_AFTER"
+    );
+}
+
+/// The advertised pre-ingest cadence must never be one the rate limiter
+/// would punish: a client doing exactly what the header says has to stay
+/// inside `POLL_RATE_LIMIT` per `POLL_RATE_WINDOW`.
+#[tokio::test]
+async fn test_pre_ingest_cadence_is_clamped_to_the_poll_rate_limit() {
+    let (server, ..) = create_submit_server_with(
+        mock_fetcher(),
+        BulkSubmitConfig {
+            pre_ingest_retry_after_secs: 1,
+            poll_rate_limit: 4,
+            poll_rate_window_secs: 60,
+            ..BulkSubmitConfig::default()
+        },
+    )
+    .await;
+    let poll_path = start_and_get_poll_path(&server).await;
+
+    let resp = server.get(&poll_path).await;
+    assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
+    assert_eq!(
+        resp.headers().get("retry-after").expect("Retry-After"),
+        "15",
+        "4 polls per 60s means one poll every 15s at most"
     );
 }
 
@@ -1695,7 +1963,7 @@ async fn test_poll_percentage_tracks_ingested_bytes() {
         .unwrap()
         .to_string();
     assert!(
-        progress.contains("Processing 35% of bytes"),
+        progress.contains("Processing 35%"),
         "the percentage must follow ingested bytes, got: {progress}"
     );
 }
@@ -1739,7 +2007,7 @@ async fn test_poll_progress_header_is_ascii_readable_with_a_resource_count() {
         .to_str()
         .unwrap_or_else(|e| panic!("X-Progress must be ASCII a client can read: {e}"));
     assert_eq!(
-        progress, "Processing 35% of bytes - 1,234 resources written",
+        progress, "Processing 35% - 1,234 Resources written",
         "the poll must report both the byte percentage and the resource count"
     );
 }
@@ -1779,7 +2047,7 @@ async fn test_poll_reports_a_stalled_ingestion() {
         .unwrap()
         .to_string();
     assert!(
-        progress.contains("stalled"),
+        progress.contains("Stalled"),
         "a dead worker pool must be visible to the poller, got: {progress}"
     );
 }
@@ -1805,20 +2073,45 @@ async fn poll_progress(server: &TestServer, poll_path: &str) -> String {
 }
 
 /// A submission whose manifests are all still `pending` is queued, not slow:
-/// no worker has claimed anything, so there is no percentage to report.
+/// no worker has claimed anything, so there is no percentage to report. With
+/// the in-process pool running an idle worker claims within seconds, so the
+/// text says "queued", not "waiting" — nothing scarce is being waited on.
 #[tokio::test]
-async fn test_poll_reports_waiting_for_a_worker_before_any_claim() {
+async fn test_poll_reports_queued_before_any_claim() {
     let (server, ..) = create_submit_server_with(mock_fetcher(), BulkSubmitConfig::default()).await;
     let poll_path = start_and_get_poll_path(&server).await;
 
     let progress = poll_progress(&server, &poll_path).await;
     assert_eq!(
-        progress, "waiting for a worker",
+        progress, "Queued - starting shortly",
         "an unclaimed submission must say it is queued, got: {progress}"
     );
     assert!(
-        !progress.starts_with("processing "),
+        !progress.to_ascii_lowercase().starts_with("processing "),
         "an indeterminate phase must not look like a determinate percentage (#827)"
+    );
+}
+
+/// With the in-process worker pool disabled nothing in this process will ever
+/// claim the manifest, so "starting shortly" would be a promise HFS cannot
+/// keep. The operator needs to hear that an external worker is the missing
+/// piece.
+#[tokio::test]
+async fn test_poll_reports_the_external_worker_wait_when_the_local_pool_is_off() {
+    let (server, ..) = create_submit_server_with(
+        mock_fetcher(),
+        BulkSubmitConfig {
+            disable_local_worker: true,
+            ..BulkSubmitConfig::default()
+        },
+    )
+    .await;
+    let poll_path = start_and_get_poll_path(&server).await;
+
+    let progress = poll_progress(&server, &poll_path).await;
+    assert_eq!(
+        progress, "Queued - waiting for an external worker",
+        "an unclaimed submission with no local workers must name the dependency, got: {progress}"
     );
 }
 
@@ -1842,7 +2135,7 @@ async fn test_poll_reports_the_manifest_read_phase() {
 
     let progress = poll_progress(&server, &poll_path).await;
     assert_eq!(
-        progress, "reading manifest",
+        progress, "Reading manifest",
         "the manifest fetch must be visible to the poller, got: {progress}"
     );
     assert!(
@@ -1871,7 +2164,7 @@ async fn test_poll_reports_the_sizing_phase_with_file_counts() {
 
     let progress = poll_progress(&server, &poll_path).await;
     assert_eq!(
-        progress, "sizing 37 of 412 files",
+        progress, "Sizing 37 of 412 files",
         "pre-sizing must report its file counts, got: {progress}"
     );
     assert!(
@@ -1900,12 +2193,59 @@ async fn test_poll_reports_the_downloading_phase_with_file_counts() {
 
     let progress = poll_progress(&server, &poll_path).await;
     assert_eq!(
-        progress, "downloading file 1 of 412",
+        progress, "Downloading file 1 of 412",
         "the file being fetched must be visible to the poller, got: {progress}"
     );
     assert!(
         !progress.starts_with("processing "),
         "an indeterminate phase must not look like a determinate percentage (#827)"
+    );
+}
+
+/// #1218: once every output file has been pulled, the poll says so — and
+/// keeps saying so beside the counters, which otherwise outrank every phase.
+/// That is what tells "still downloading" apart from the manifest's wind-down.
+#[tokio::test]
+async fn test_poll_reports_all_files_downloaded_beside_the_counters() {
+    let (server, backend, _fetcher, _output, _tmp) =
+        create_submit_server_with(mock_fetcher(), BulkSubmitConfig::default()).await;
+    let poll_path = start_and_get_poll_path(&server).await;
+
+    let lease = backend
+        .claim_next_manifest(&WorkerId::new("downloaded-worker"), Duration::from_secs(60))
+        .await
+        .expect("claim")
+        .expect("a manifest to claim");
+    backend
+        .update_manifest_bytes(&lease, 350, 1_000)
+        .await
+        .expect("bytes update");
+    backend
+        .add_manifest_progress(&lease, 1_234, 0, 1_234)
+        .await
+        .expect("progress update");
+
+    // Files still being pulled: the counters alone speak.
+    backend
+        .update_manifest_phase(&lease, ManifestPhase::Downloading, 24, 24)
+        .await
+        .expect("phase update");
+    let progress = poll_progress(&server, &poll_path).await;
+    assert_eq!(progress, "Processing 35% - 1,234 Resources written");
+
+    // Fan-out drained: the counters keep the lead, the completion trails.
+    backend
+        .update_manifest_phase(&lease, ManifestPhase::Downloaded, 24, 24)
+        .await
+        .expect("phase update");
+    let progress = poll_progress(&server, &poll_path).await;
+    assert_eq!(
+        progress, "Processing 35% - 1,234 Resources written - Downloaded 24 of 24 files",
+        "the poller must be told every file is in, got: {progress}"
+    );
+    assert!(
+        progress.is_ascii(),
+        "X-Progress is a header value: {progress}"
     );
 }
 
@@ -1929,7 +2269,7 @@ async fn test_poll_falls_back_when_the_phase_has_no_file_total() {
 
     let progress = poll_progress(&server, &poll_path).await;
     assert_eq!(
-        progress, "Processing 0% of bytes",
+        progress, "Processing 0%",
         "an unknown file total must not render as 'of 0', got: {progress}"
     );
 }
@@ -1962,7 +2302,7 @@ async fn test_moving_bytes_outrank_a_stale_phase() {
 
     let progress = poll_progress(&server, &poll_path).await;
     assert!(
-        progress.contains("Processing 35% of bytes"),
+        progress.contains("Processing 35%"),
         "a real percentage must take over from the pre-ingest phase, got: {progress}"
     );
 }
@@ -2014,7 +2354,7 @@ async fn test_progress_header_stays_ascii_in_every_branch() {
         "X-Progress must be US-ASCII; a conservative client discards it otherwise. Got: {text}"
     );
     assert!(
-        text.contains("609,191 resources written"),
+        text.contains("609,191 Resources written"),
         "the count branch must still be the one under test, got: {text}"
     );
 }

@@ -501,17 +501,23 @@ test("a patient-only server rejection starts reactive field validation", async (
   page,
   bulkExport,
 }) => {
+  const exportName = "Patient-only rejection";
   await bulkExport.goto();
-  await bulkExport.nameInput.fill("Patient-only rejection");
+  await bulkExport.nameInput.fill(exportName);
   await bulkExport.scopeRadio("patient").check();
   await bulkExport.sincePreset.selectOption("custom");
   await bulkExport.sinceCustom.fill("2026-08-01T00:00:00Z");
-  await bulkExport.form.evaluate((form) => {
+  // Inject the malformed value as a combobox chip (`data-combobox-selected-input`)
+  // rather than a bare form field: T2's inline validation now blocks an empty
+  // Patients selection before submit, so the client must see a selection here
+  // for this test to reach the server-side format rejection it exercises.
+  await bulkExport.patientCombobox.evaluate((fieldset) => {
     const patient = document.createElement("input");
     patient.type = "hidden";
     patient.name = "patient";
     patient.value = "Patient/not/valid";
-    form.append(patient);
+    patient.setAttribute("data-combobox-selected-input", "");
+    fieldset.append(patient);
   });
 
   const submitted = page.waitForResponse(
@@ -524,6 +530,13 @@ test("a patient-only server rejection starts reactive field validation", async (
 
   await expect(bulkExport.form).toHaveAttribute("data-validation-started", "true");
   await expect(page.locator(".notice")).toContainText("valid logical Patient IDs");
+  // The attribute only arms the reactive validation; the deferred
+  // bulk-export.js is what acts on it, and everything asserted above is server
+  // markup that is already there while the scripts are still loading. Wait for
+  // the enhancement itself: the server renders the static page title in the
+  // heading, and the name reaches it in the same synchronous pass that binds
+  // the input listeners the edits below depend on.
+  await expect(bulkExport.nameHeading).toHaveText(exportName);
   await expect(bulkExport.nameError).toBeHidden();
   await expect(bulkExport.sinceCustomError).toBeHidden();
 
@@ -607,6 +620,163 @@ test("server rejects an impossible Custom date without creating an export", asyn
   await expect(page.locator(".job-card").filter({ hasText: exportName })).toHaveCount(0);
 });
 
+// #1271: Until used to accept any text, so a typo created a job that only
+// failed at kick-off. It now validates inline, independent of the Since preset.
+test("Start Export rejects a malformed Until inline without submitting", async ({
+  page,
+  bulkExport,
+}) => {
+  await bulkExport.goto();
+  let submissions = 0;
+  page.on("request", (request) => {
+    if (request.url().endsWith("/ui/bulk-export") && request.method() === "POST") {
+      submissions += 1;
+    }
+  });
+
+  await expect(bulkExport.until).toHaveAttribute("data-pattern", /\[1-9\]000\)-/);
+  await expect(bulkExport.until).not.toHaveAttribute("pattern", /.+/);
+  await expect(bulkExport.until).toHaveAttribute("aria-describedby", "bulk-export-until-hint");
+  await bulkExport.nameInput.fill("Until typo must not start");
+  await expect(bulkExport.sincePreset).toHaveValue("");
+  await bulkExport.until.fill("026-09-17T10:38:49Z");
+  await bulkExport.until.press("Tab");
+  await expect(bulkExport.untilError).toBeHidden();
+  await expect(bulkExport.until).not.toHaveAttribute("aria-invalid", /.+/);
+
+  await bulkExport.startButton.click();
+
+  await expect(bulkExport.until).toBeFocused();
+  await expect(bulkExport.until).toHaveAttribute("aria-invalid", "true");
+  await expect(bulkExport.until).toHaveAttribute(
+    "aria-describedby",
+    "bulk-export-until-hint bulk-export-until-error",
+  );
+  await expect(bulkExport.untilError).toBeVisible();
+  await expect(bulkExport.untilError).toHaveText(
+    "Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z.",
+  );
+  await expect(bulkExport.nameError).toBeHidden();
+  await expect(bulkExport.sinceCustomError).toBeHidden();
+  expect(submissions).toBe(0);
+
+  await bulkExport.until.fill("2026-09-17T10:38:49Z");
+  await expect(bulkExport.untilError).toBeHidden();
+  await expect(bulkExport.until).not.toHaveAttribute("aria-invalid", /.+/);
+  await expect(bulkExport.until).toHaveAttribute("aria-describedby", "bulk-export-until-hint");
+
+  for (const instant of ["2026-02-31T00:00:00Z", "2026-08-01T24:00:00Z", "not-an-instant"]) {
+    await bulkExport.until.fill(instant);
+    await expect(bulkExport.untilError).toBeVisible();
+  }
+
+  await bulkExport.until.fill("   ");
+  await expect(bulkExport.untilError).toBeHidden();
+
+  await page.route("**/ui/bulk-export", (route) =>
+    route.request().method() === "POST"
+      ? route.fulfill({ status: 204 })
+      : route.continue(),
+  );
+  const submitted = page.waitForRequest(
+    (request) => request.url().endsWith("/ui/bulk-export") && request.method() === "POST",
+  );
+  await bulkExport.startButton.click();
+  await submitted;
+  expect(submissions).toBe(1);
+});
+
+test("server rejects a malformed Until without creating an export", async ({
+  page,
+  bulkExport,
+}) => {
+  const exportName = "Browser malformed Until must not start";
+  await bulkExport.goto();
+  await bulkExport.nameInput.fill(exportName);
+  await bulkExport.allResources.uncheck();
+  await bulkExport.typeCheckbox("Patient").check();
+  await bulkExport.until.fill("026-09-17T10:38:49Z");
+
+  const submitted = page.waitForResponse(
+    (response) =>
+      response.url().endsWith("/ui/bulk-export") &&
+      response.request().method() === "POST",
+  );
+  // Bypass the enhanced submit handler, as a no-JavaScript client would.
+  await bulkExport.form.evaluate((form) => (form as HTMLFormElement).submit());
+  expect((await submitted).status()).toBe(400);
+
+  await expect(page).toHaveURL(/\/ui\/bulk-export$/);
+  await expect(bulkExport.nameInput).toHaveValue(exportName);
+  await expect(bulkExport.typeCheckbox("Patient")).toBeChecked();
+  await expect(bulkExport.until).toHaveValue("026-09-17T10:38:49Z");
+  await expect(bulkExport.until).toHaveAttribute("aria-invalid", "true");
+  await expect(bulkExport.until).toHaveAttribute(
+    "aria-describedby",
+    "bulk-export-until-hint bulk-export-until-error",
+  );
+  await expect(bulkExport.untilError).toBeVisible();
+  await expect(bulkExport.untilError).toHaveText(
+    "Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z.",
+  );
+  await expect(bulkExport.until).toBeFocused();
+  await expect(bulkExport.sinceCustomError).toBeHidden();
+
+  await bulkExport.until.fill("2026-09-17T10:38:49Z");
+  await expect(bulkExport.untilError).toBeHidden();
+  await expect(bulkExport.until).not.toHaveAttribute("aria-invalid", /.+/);
+
+  const { violations } = await new AxeBuilder({ page }).analyze();
+  expect(violations, axeSummary(violations)).toEqual([]);
+
+  await page.goto("/ui/bulk-export");
+  await expect(page.locator(".job-card").filter({ hasText: exportName })).toHaveCount(0);
+});
+
+test("Until earlier than Since is rejected inline and revalidates when Since changes", async ({
+  page,
+  bulkExport,
+}) => {
+  await bulkExport.goto();
+  let submissions = 0;
+  page.on("request", (request) => {
+    if (request.url().endsWith("/ui/bulk-export") && request.method() === "POST") {
+      submissions += 1;
+    }
+  });
+
+  await bulkExport.nameInput.fill("Until before Since must not start");
+  await bulkExport.sincePreset.selectOption("custom");
+  await bulkExport.sinceCustom.fill("2026-09-17T10:38:49Z");
+  await bulkExport.until.fill("2026-01-01T00:00:00Z");
+  await bulkExport.startButton.click();
+
+  await expect(bulkExport.until).toBeFocused();
+  await expect(bulkExport.until).toHaveAttribute("aria-invalid", "true");
+  await expect(bulkExport.untilError).toHaveText("Until must not be earlier than Since.");
+  await expect(bulkExport.sinceCustomError).toBeHidden();
+  expect(submissions).toBe(0);
+
+  // Moving Since back clears the error without touching Until.
+  await bulkExport.sinceCustom.fill("2025-12-01T00:00:00Z");
+  await expect(bulkExport.untilError).toBeHidden();
+  await expect(bulkExport.until).not.toHaveAttribute("aria-invalid", /.+/);
+
+  // A preset resolves to a recent instant, so an old Until is rejected again.
+  await bulkExport.sincePreset.selectOption("day");
+  await expect(bulkExport.untilError).toHaveText("Until must not be earlier than Since.");
+
+  // A malformed Until still reports the format message, not the order one.
+  await bulkExport.until.fill("026-09-17T10:38:49Z");
+  await expect(bulkExport.untilError).toHaveText(
+    "Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z.",
+  );
+
+  await bulkExport.sincePreset.selectOption("");
+  await bulkExport.until.fill("2026-01-01T00:00:00Z");
+  await expect(bulkExport.untilError).toBeHidden();
+});
+
 test("Patient combobox supports keyboard selection, dedupe, removal, and scope serialization", async ({
   page,
   bulkExport,
@@ -676,6 +846,75 @@ test("Patient combobox supports keyboard selection, dedupe, removal, and scope s
   await bulkExport.patientCombobox.getByRole("button", { name: "Remove Ana Rivera" }).click();
   await expect(bulkExport.selectedPatients).toHaveCount(0);
   await expect(bulkExport.patientSearch).toBeFocused();
+});
+
+test("Start Export with the Patients scope and no selected patient is blocked inline", async ({
+  page,
+  bulkExport,
+}) => {
+  await page.route("**/ui/lookup/patient-options*", (route) =>
+    route.fulfill({ status: 200, contentType: "text/html", body: patientOptions }),
+  );
+  await bulkExport.goto();
+  let submissions = 0;
+  page.on("request", (request) => {
+    if (request.url().endsWith("/ui/bulk-export") && request.method() === "POST") {
+      submissions += 1;
+    }
+  });
+
+  await bulkExport.nameInput.fill("Patients scope without a selection");
+  await bulkExport.scopeRadio("patient").check();
+  await bulkExport.patientSearch.fill("an");
+  await expect(bulkExport.patientListbox).toBeVisible();
+
+  await bulkExport.startButton.click();
+
+  expect(submissions).toBe(0);
+  await expect(bulkExport.patientsError).toBeVisible();
+  await expect(bulkExport.patientsError).toHaveText(
+    "Select at least one patient. To export every patient, choose the Everything scope.",
+  );
+  await expect(bulkExport.patientSearch).toHaveAttribute("aria-invalid", "true");
+  const describedBy = await bulkExport.patientSearch.getAttribute("aria-describedby");
+  expect(describedBy).toContain("bulk-export-patients-error");
+  expect(describedBy).toContain("bulk-export-patients-hint");
+  await expect(bulkExport.patientSearch).toBeFocused();
+  await expect(bulkExport.nameError).toBeHidden();
+
+  await bulkExport.patientSearch.press("ArrowDown");
+  await bulkExport.patientSearch.press("Enter");
+  await expect(bulkExport.patientsError).toBeHidden();
+  await expect(bulkExport.patientSearch).not.toHaveAttribute("aria-invalid", /.+/);
+
+  await bulkExport.patientCombobox.getByRole("button", { name: "Remove Ana Rivera" }).click();
+  await expect(bulkExport.patientsError).toBeVisible();
+
+  await bulkExport.scopeRadio("system").check();
+  await expect(bulkExport.patientsError).toBeHidden();
+
+  await bulkExport.scopeRadio("patient").check();
+  await expect(bulkExport.patientsError).toBeVisible();
+
+  await bulkExport.patientSearch.fill("an");
+  await expect(bulkExport.patientListbox).toBeVisible();
+  await bulkExport.patientSearch.press("ArrowDown");
+  await bulkExport.patientSearch.press("Enter");
+  await expect(bulkExport.patientsError).toBeHidden();
+
+  await page.route("**/ui/bulk-export", (route) =>
+    route.request().method() === "POST"
+      ? route.fulfill({ status: 204 })
+      : route.continue(),
+  );
+  const submitted = page.waitForRequest(
+    (request) => request.url().endsWith("/ui/bulk-export") && request.method() === "POST",
+  );
+  await bulkExport.startButton.click();
+  const request = await submitted;
+  const params = new URLSearchParams(request.postData() ?? "");
+  expect(params.get("scope")).toBe("patient");
+  expect(params.getAll("patient").length).toBeGreaterThan(0);
 });
 
 test("Patient combobox finds and selects a patient by exact identifier", async ({
@@ -1074,6 +1313,9 @@ test("a persisted pageshow clears the restored Start Export busy state", async (
 }) => {
   await bulkExport.goto();
   await bulkExport.nameInput.fill("Busy state export");
+  const restingWidth = await bulkExport.startButton.evaluate(
+    (button) => button.getBoundingClientRect().width,
+  );
   await bulkExport.form.evaluate((form) => {
     HTMLFormElement.prototype.submit = function () {};
     form.dispatchEvent(new SubmitEvent("submit", { bubbles: true, cancelable: true }));
@@ -1081,6 +1323,12 @@ test("a persisted pageshow clears the restored Start Export busy state", async (
 
   await expect(bulkExport.startButton).toHaveAttribute("aria-busy", "true");
   await expect(bulkExport.startButton).toBeDisabled();
+  // The ring's room is reserved at rest (.btn--busy-slot, #1253 review): the
+  // label stays and Start Export keeps its width while busy.
+  await expect(bulkExport.startButton).toHaveText("Start Export");
+  expect(
+    await bulkExport.startButton.evaluate((button) => button.getBoundingClientRect().width),
+  ).toBe(restingWidth);
   await page.evaluate(() => {
     window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
   });

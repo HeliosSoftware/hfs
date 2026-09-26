@@ -11,7 +11,8 @@ use serde_json::Value;
 
 use crate::core::{Transaction, TransactionOptions, TransactionProvider};
 use crate::error::{
-    BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult, TransactionError,
+    BackendError, ConcurrencyError, QueryErrorExt, ResourceError, StorageError, StorageResult,
+    TransactionError,
 };
 use crate::search::SearchParameterExtractor;
 use crate::tenant::{Operation, TenantContext};
@@ -19,6 +20,8 @@ use crate::types::StoredResource;
 
 use super::PostgresBackend;
 use super::cached::{execute_cached, query_cached, query_opt_cached};
+use super::cleanup::GuardedClient;
+use super::lock_protocol::{acquire_exclusive_write_gate, acquire_shared_write_locks};
 use super::search::writer::{IndexRow, PostgresSearchIndexWriter};
 
 fn internal_error(message: String) -> StorageError {
@@ -39,6 +42,7 @@ fn serialization_error(message: String) -> StorageError {
 /// Wraps a deadpool_postgres Client that has an active transaction.
 /// The transaction is automatically rolled back on drop if not committed.
 pub struct PostgresTransaction {
+    backend: PostgresBackend,
     /// The client with active transaction.
     /// Option so we can take it during commit/rollback.
     client: Option<Client>,
@@ -72,6 +76,11 @@ pub struct PostgresTransaction {
     /// Set when a flush discovers that a buffered create conflicted with an
     /// existing row. See [`PostgresTransaction::flush`].
     conflict: Option<DeferredConflict>,
+    /// Complete logical keys declared before BEGIN for a shared-gate batch.
+    planned_keys: Option<HashSet<(String, String)>>,
+    /// An unexpected key or post-mutation error cannot be committed.
+    poisoned: bool,
+    search_snapshot_dirty: bool,
 }
 
 /// A create whose `resources`/`resource_history`/`search_index` rows are built
@@ -127,13 +136,11 @@ impl std::fmt::Debug for PostgresTransaction {
 impl PostgresTransaction {
     /// Create a new transaction.
     async fn new(
+        backend: &PostgresBackend,
         client: Client,
         tenant: TenantContext,
-        search_extractor: Arc<SearchParameterExtractor>,
-        search_offloaded: bool,
-        defer_search_indexing: bool,
-        fhir_version: FhirVersion,
-        index_layout: super::schema::IndexLayout,
+        planned_keys: Option<Vec<(String, String)>>,
+        options: TransactionOptions,
     ) -> StorageResult<Self> {
         // Start the transaction.
         //
@@ -146,25 +153,53 @@ impl PostgresTransaction {
         // `Client::transaction()` uses for exactly these three keywords. Every
         // bundle pays this twice (BEGIN and COMMIT), plus once more on the
         // rollback paths.
-        client.batch_execute("BEGIN").await.map_err(|e| {
+        let mut guarded = GuardedClient::new(client, backend.cleanup_tracker.clone(), None);
+        guarded.batch_execute("BEGIN").await.map_err(|e| {
             StorageError::Transaction(TransactionError::RolledBack {
                 reason: format!("Failed to begin transaction: {}", e),
             })
         })?;
 
+        let tenant_id = tenant.tenant_id().as_str();
+        let lock_result = match planned_keys.as_ref() {
+            Some(keys) => acquire_shared_write_locks(&*guarded, tenant_id, keys).await,
+            None => acquire_exclusive_write_gate(&*guarded, tenant_id).await,
+        };
+        if let Err(error) = lock_result {
+            if guarded.batch_execute("ROLLBACK").await.is_ok() {
+                guarded.mark_settled();
+            }
+            return Err(error);
+        }
+        let extractor = match backend.authoritative_extractor(&*guarded, tenant_id).await {
+            Ok(extractor) => extractor,
+            Err(error) => {
+                if guarded.batch_execute("ROLLBACK").await.is_ok() {
+                    guarded.mark_settled();
+                }
+                return Err(error);
+            }
+        };
+
         Ok(Self {
-            client: Some(client),
+            backend: backend.clone(),
+            client: Some(guarded.hand_off()),
             active: true,
             tenant,
-            search_extractor,
-            search_offloaded,
-            defer_search_indexing,
-            fhir_version,
-            index_layout,
+            search_extractor: Arc::new(extractor),
+            search_offloaded: backend.is_search_offloaded(),
+            defer_search_indexing: options.defer_search_indexing,
+            fhir_version: options
+                .fhir_version
+                .unwrap_or(backend.config().fhir_version),
+            index_layout: backend.index_layout(),
             pending: Vec::new(),
             pending_index_rows: 0,
             creates_seen: 0,
             conflict: None,
+            planned_keys: planned_keys.map(|keys| keys.into_iter().collect()),
+            poisoned: false,
+            search_snapshot_dirty: false,
         })
     }
 
@@ -193,10 +228,15 @@ impl PostgresTransaction {
     pub(crate) async fn savepoint(&mut self, name: &str) -> StorageResult<()> {
         self.ensure_usable()?;
         self.flush().await?;
-        self.client()?
+        let result = self
+            .client()?
             .batch_execute(&format!("SAVEPOINT {name}"))
             .await
-            .map_err(|e| internal_error(format!("savepoint: {e}")))
+            .map_err(|e| internal_error(format!("savepoint: {e}")));
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
     }
 
     /// Releases a savepoint, sending the creates buffered since it was opened
@@ -204,10 +244,15 @@ impl PostgresTransaction {
     /// where the caller can roll it back, and not at commit.
     pub(crate) async fn release_savepoint(&mut self, name: &str) -> StorageResult<()> {
         self.flush().await?;
-        self.client()?
+        let result = self
+            .client()?
             .batch_execute(&format!("RELEASE SAVEPOINT {name}"))
             .await
-            .map_err(|e| internal_error(format!("release savepoint: {e}")))
+            .map_err(|e| internal_error(format!("release savepoint: {e}")));
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
     }
 
     /// Rolls back to a savepoint, dropping the creates buffered since it was
@@ -220,11 +265,19 @@ impl PostgresTransaction {
     pub(crate) async fn rollback_to_savepoint(&mut self, name: &str) -> StorageResult<()> {
         self.pending.clear();
         self.pending_index_rows = 0;
-        self.conflict = None;
-        self.client()?
+        let result = self
+            .client()?
             .batch_execute(&format!("ROLLBACK TO SAVEPOINT {name}"))
             .await
-            .map_err(|e| internal_error(format!("rollback to savepoint: {e}")))
+            .map_err(|e| internal_error(format!("rollback to savepoint: {e}")));
+        if let Err(error) = result {
+            self.poisoned = true;
+            return Err(error);
+        }
+        self.conflict = None;
+        self.poisoned = false;
+        self.search_snapshot_dirty = true;
+        Ok(())
     }
 
     /// Index a resource for search within the transaction.
@@ -243,20 +296,24 @@ impl PostgresTransaction {
 
         let client = self.client()?;
 
-        if mode == super::storage::IndexWrite::Replace {
-            execute_cached(
+        // Fast-load clears both representations; the later rebuild owns them.
+        if self.defer_search_indexing {
+            if mode == super::storage::IndexWrite::Replace {
+                execute_cached(
                     client,
                     "DELETE FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
                     &[&tenant_id, &resource_type, &resource_id],
                 )
                 .await
-                .map_err(|e| internal_error(format!("Failed to clear search index: {}", e)))?;
-        }
-
-        // Extract values using the registry-driven extractor
-        // Fast-load (#903): stale rows are gone (Replace delete above); the
-        // rebuild is deferred to the post-ingest reindex.
-        if self.defer_search_indexing {
+                .map_err(|e| internal_error(format!("Failed to clear search index: {e}")))?;
+                execute_cached(
+                    client,
+                    "DELETE FROM resource_fts WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
+                    &[&tenant_id, &resource_type, &resource_id],
+                )
+                .await
+                .map_err(|e| internal_error(format!("Failed to clear FTS index: {e}")))?;
+            }
             return Ok(());
         }
 
@@ -265,18 +322,45 @@ impl PostgresTransaction {
             .extract(resource, resource_type)
             .map_err(|e| internal_error(format!("Search parameter extraction failed: {}", e)))?;
 
-        // Write the extracted values, folding composites into the denormalized
-        // one-row-per-instance layout (#279).
-        PostgresSearchIndexWriter::write_values(
-            client,
-            tenant_id,
+        let mut rows = PostgresSearchIndexWriter::build_rows(
             resource_type,
             resource_id,
             last_updated,
             self.index_layout,
             values,
-        )
-        .await?;
+        );
+        for contained in self.search_extractor.extract_contained(resource) {
+            rows.extend(PostgresSearchIndexWriter::build_contained_rows(
+                (resource_type, resource_id),
+                (&contained.contained_type, &contained.local_id),
+                &contained.values,
+            ));
+        }
+        match mode {
+            super::storage::IndexWrite::Fresh => {
+                PostgresSearchIndexWriter::insert_rows(
+                    client,
+                    tenant_id,
+                    resource_type,
+                    resource_id,
+                    &rows,
+                )
+                .await?;
+            }
+            super::storage::IndexWrite::Replace => {
+                PostgresSearchIndexWriter::replace_rows(
+                    client,
+                    tenant_id,
+                    resource_type,
+                    resource_id,
+                    &rows,
+                )
+                .await?;
+            }
+        }
+        self.backend
+            .index_fts_content_guarded(client, tenant_id, resource_type, resource_id, resource)
+            .await?;
 
         tracing::debug!(
             "Indexed resource {}/{} within transaction",
@@ -285,6 +369,19 @@ impl PostgresTransaction {
         );
 
         Ok(())
+    }
+}
+
+impl PostgresBackend {
+    /// Begins a bulk-submit batch whose complete resource keys are known.
+    pub(super) async fn begin_planned_transaction(
+        &self,
+        tenant: &TenantContext,
+        options: TransactionOptions,
+        keys: Vec<(String, String)>,
+    ) -> StorageResult<PostgresTransaction> {
+        let client = self.get_client().await?;
+        PostgresTransaction::new(self, client, tenant.clone(), Some(keys), options).await
     }
 }
 
@@ -380,7 +477,13 @@ impl PostgresTransaction {
         let conflict = {
             let client = self.client()?;
             let tenant_id = self.tenant.tenant_id().as_str();
-            flush_pending(client, tenant_id, &pending).await?
+            match flush_pending(client, tenant_id, &pending).await {
+                Ok(conflict) => conflict,
+                Err(error) => {
+                    self.poisoned = true;
+                    return Err(error);
+                }
+            }
         };
 
         if let Some(conflict) = conflict {
@@ -395,15 +498,72 @@ impl PostgresTransaction {
             }));
         }
 
+        if !self.search_offloaded && !self.defer_search_indexing {
+            let client = self.client()?;
+            let tenant_id = self.tenant.tenant_id().as_str();
+            for created in &pending {
+                if let Err(error) = self
+                    .backend
+                    .index_fts_content_guarded(
+                        client,
+                        tenant_id,
+                        &created.resource_type,
+                        &created.id,
+                        &created.data,
+                    )
+                    .await
+                {
+                    self.poisoned = true;
+                    return Err(error);
+                }
+            }
+        }
+
         Ok(())
     }
 
     /// Refuses to keep using a transaction that has already lost an entry.
     fn ensure_usable(&self) -> StorageResult<()> {
-        if !self.active || self.conflict.is_some() {
+        if !self.active || self.conflict.is_some() || self.poisoned {
             return Err(StorageError::Transaction(
                 TransactionError::InvalidTransaction,
             ));
+        }
+        Ok(())
+    }
+
+    fn ensure_planned_key(&mut self, resource_type: &str, id: &str) -> StorageResult<()> {
+        if let Some(keys) = &self.planned_keys {
+            if resource_type == "SearchParameter"
+                || !keys.contains(&(resource_type.to_string(), id.to_string()))
+            {
+                self.poisoned = true;
+                return Err(StorageError::Transaction(TransactionError::RolledBack {
+                    reason: format!(
+                        "resource {resource_type}/{id} was not in the transaction lock plan"
+                    ),
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    async fn refresh_search_snapshot_if_dirty(&mut self) -> StorageResult<()> {
+        if self.search_snapshot_dirty {
+            self.flush().await?;
+            let extractor = match self
+                .backend
+                .authoritative_extractor(self.client()?, self.tenant.tenant_id().as_str())
+                .await
+            {
+                Ok(extractor) => extractor,
+                Err(error) => {
+                    self.poisoned = true;
+                    return Err(error);
+                }
+            };
+            self.search_extractor = Arc::new(extractor);
+            self.search_snapshot_dirty = false;
         }
         Ok(())
     }
@@ -513,9 +673,11 @@ impl Transaction for PostgresTransaction {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .unwrap_or_else(crate::types::new_resource_id);
+        self.ensure_planned_key(resource_type, &id)?;
+        self.refresh_search_snapshot_if_dirty().await?;
 
         // Build the resource with id and resourceType
-        let mut data = resource.clone();
+        let mut data = resource;
         if let Some(obj) = data.as_object_mut() {
             obj.insert("id".to_string(), Value::String(id.clone()));
             obj.insert(
@@ -541,13 +703,21 @@ impl Transaction for PostgresTransaction {
                 .map_err(|e| {
                     internal_error(format!("Search parameter extraction failed: {}", e))
                 })?;
-            PostgresSearchIndexWriter::build_rows(
+            let mut rows = PostgresSearchIndexWriter::build_rows(
                 resource_type,
                 &id,
                 now,
                 self.index_layout,
                 values,
-            )
+            );
+            for contained in self.search_extractor.extract_contained(&data) {
+                rows.extend(PostgresSearchIndexWriter::build_contained_rows(
+                    (resource_type, &id),
+                    (&contained.contained_type, &contained.local_id),
+                    &contained.values,
+                ));
+            }
+            rows
         };
 
         let ordinal = self.creates_seen;
@@ -563,6 +733,9 @@ impl Transaction for PostgresTransaction {
             fhir_version: fhir_version_str.to_string(),
             index_rows,
         });
+        if resource_type == "SearchParameter" {
+            self.search_snapshot_dirty = true;
+        }
 
         if self.pending.len() >= MAX_PENDING_RESOURCES
             || self.pending_index_rows >= MAX_PENDING_INDEX_ROWS
@@ -589,6 +762,7 @@ impl Transaction for PostgresTransaction {
         id: &str,
     ) -> StorageResult<Option<StoredResource>> {
         self.ensure_usable()?;
+        self.ensure_planned_key(resource_type, id)?;
 
         // Buffered creates must be visible to everything that is not another
         // create. This is what keeps `read`/`update`/`delete` — and therefore a
@@ -650,6 +824,7 @@ impl Transaction for PostgresTransaction {
             .check_permission(Operation::Update, current.resource_type())?;
 
         self.ensure_usable()?;
+        self.ensure_planned_key(current.resource_type(), current.id())?;
 
         // Buffered creates must be visible to everything that is not another
         // create. This is what keeps `read`/`update`/`delete` — and therefore a
@@ -657,49 +832,23 @@ impl Transaction for PostgresTransaction {
         // what they saw before: the batch is a wire-level optimisation, never a
         // change of visibility inside the transaction.
         self.flush().await?;
+        self.refresh_search_snapshot_if_dirty().await?;
+        self.poisoned = true;
 
         let client = self.client()?;
-        let tenant_id = self.tenant.tenant_id().as_str();
+        let tenant_id = self.tenant.tenant_id().as_str().to_string();
         let resource_type = current.resource_type();
         let id = current.id();
 
-        // Verify current version still matches (optimistic locking)
-        let row = query_opt_cached(
-            client,
-            "SELECT version_id FROM resources
-                 WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = FALSE",
-            &[&tenant_id, &resource_type, &id],
-        )
-        .await
-        .map_err(|e| internal_error(format!("Failed to get current version: {}", e)))?;
-
-        let db_version = match row {
-            Some(row) => row.get::<_, String>(0),
-            None => {
-                return Err(StorageError::Resource(ResourceError::NotFound {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                }));
-            }
-        };
-
-        if db_version != current.version_id() {
-            return Err(StorageError::Concurrency(
-                ConcurrencyError::VersionConflict {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                    expected_version: current.version_id().to_string(),
-                    actual_version: db_version,
-                },
-            ));
-        }
-
-        // Calculate new version
-        let new_version: u64 = db_version.parse().unwrap_or(0) + 1;
+        // The expected version is `current`'s, and the UPDATE below only matches a
+        // row that still carries it — so the new version follows from what the
+        // caller already read, with no round trip to ask what is stored.
+        let expected_version = current.version_id().to_string();
+        let new_version: u64 = current.version_id().parse().unwrap_or(0) + 1;
         let new_version_str = new_version.to_string();
 
         // Build the resource with id and resourceType
-        let mut data = resource.clone();
+        let mut data = resource;
         if let Some(obj) = data.as_object_mut() {
             obj.insert("id".to_string(), Value::String(id.to_string()));
             obj.insert(
@@ -711,13 +860,20 @@ impl Transaction for PostgresTransaction {
         let now = Utc::now();
         let fhir_version = current.fhir_version();
         let fhir_version_str = fhir_version.as_mime_param();
-        let is_deleted = false;
-
-        // Update the resource
-        execute_cached(
+        // Version check, update and history row in one statement. Folding the
+        // expected version into the `WHERE` makes the check and write atomic:
+        // a concurrent writer cannot bump the version between two statements
+        // and have this update overwrite it while reporting success.
+        let updated = execute_cached(
             client,
-            "UPDATE resources SET version_id = $1, data = $2, last_updated = $3
-                 WHERE tenant_id = $4 AND resource_type = $5 AND id = $6",
+            "WITH upd AS (
+                 UPDATE resources SET version_id = $1, data = $2, last_updated = $3
+                 WHERE tenant_id = $4 AND resource_type = $5 AND id = $6
+                   AND is_deleted = FALSE AND version_id = $7
+                 RETURNING tenant_id, resource_type, id, version_id, data, last_updated, is_deleted
+             )
+             INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
+             SELECT tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, $8 FROM upd",
             &[
                 &new_version_str,
                 &data,
@@ -725,31 +881,63 @@ impl Transaction for PostgresTransaction {
                 &tenant_id,
                 &resource_type,
                 &id,
+                &expected_version,
+                &fhir_version_str,
             ],
         )
         .await
-        .map_err(|e| internal_error(format!("Failed to update resource: {}", e)))?;
+        .or_query_error("Failed to update resource")?;
 
-        // Insert into history
-        execute_cached(
+        if updated == 0 {
+            // The statement matched nothing because the row is missing,
+            // soft-deleted, or has a different version. Only the last case is
+            // a concurrency conflict; the lookup is needed only on this error
+            // path to distinguish it from the two not-found cases.
+            let actual = query_opt_cached(
                 client,
-                "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-                &[&tenant_id, &resource_type, &id, &new_version_str, &data, &now, &is_deleted, &fhir_version_str],
+                "SELECT version_id FROM resources
+                 WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = FALSE",
+                &[&tenant_id, &resource_type, &id],
             )
             .await
-            .map_err(|e| internal_error(format!("Failed to insert history: {}", e)))?;
+            .or_query_error("Failed to get current version")?;
+
+            return match actual {
+                Some(row) => Err(StorageError::Concurrency(
+                    ConcurrencyError::VersionConflict {
+                        resource_type: resource_type.to_string(),
+                        id: id.to_string(),
+                        expected_version,
+                        actual_version: row.get::<_, String>(0),
+                    },
+                )),
+                None => Err(StorageError::Resource(ResourceError::NotFound {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                })),
+            };
+        }
 
         // Re-index the resource for search
-        self.index_resource(
-            tenant_id,
-            resource_type,
-            id,
-            now,
-            super::storage::IndexWrite::Replace,
-            &data,
-        )
-        .await?;
+        if resource_type == "SearchParameter" {
+            self.search_snapshot_dirty = true;
+            self.refresh_search_snapshot_if_dirty().await?;
+        }
+        if let Err(error) = self
+            .index_resource(
+                &tenant_id,
+                resource_type,
+                id,
+                now,
+                super::storage::IndexWrite::Replace,
+                &data,
+            )
+            .await
+        {
+            self.poisoned = true;
+            return Err(error);
+        }
+        self.poisoned = false;
 
         Ok(StoredResource::from_storage(
             resource_type,
@@ -769,6 +957,7 @@ impl Transaction for PostgresTransaction {
             .check_permission(Operation::Delete, resource_type)?;
 
         self.ensure_usable()?;
+        self.ensure_planned_key(resource_type, id)?;
 
         // Buffered creates must be visible to everything that is not another
         // create. This is what keeps `read`/`update`/`delete` — and therefore a
@@ -776,6 +965,7 @@ impl Transaction for PostgresTransaction {
         // what they saw before: the batch is a wire-level optimisation, never a
         // change of visibility inside the transaction.
         self.flush().await?;
+        self.poisoned = true;
 
         let client = self.client()?;
         let tenant_id = self.tenant.tenant_id().as_str();
@@ -830,6 +1020,27 @@ impl Transaction for PostgresTransaction {
             .await
             .map_err(|e| internal_error(format!("Failed to insert deletion history: {}", e)))?;
 
+        if !self.search_offloaded {
+            execute_cached(
+                client,
+                "DELETE FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
+                &[&tenant_id, &resource_type, &id],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to delete search index: {e}")))?;
+            execute_cached(
+                client,
+                "DELETE FROM resource_fts WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
+                &[&tenant_id, &resource_type, &id],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to delete FTS index: {e}")))?;
+        }
+        if resource_type == "SearchParameter" {
+            self.search_snapshot_dirty = true;
+        }
+        self.poisoned = false;
+
         Ok(())
     }
 
@@ -843,14 +1054,15 @@ impl Transaction for PostgresTransaction {
         // A transaction that lost an entry to a conflict cannot be committed:
         // see `flush`. Roll it back here rather than leaving it to `Drop`, so
         // the caller gets a definite answer.
-        if self.conflict.is_some() {
-            if let Some(client) = self.client.as_ref() {
-                let _ = client.batch_execute("ROLLBACK").await;
-            }
-            self.active = false;
+        if self.conflict.is_some() || self.poisoned {
+            let rolled_back = match self.client.as_ref() {
+                Some(client) => client.batch_execute("ROLLBACK").await.is_ok(),
+                None => false,
+            };
+            self.active = !rolled_back;
             self.pending.clear();
             return Err(StorageError::Transaction(TransactionError::RolledBack {
-                reason: "a bundle entry conflicted with an existing resource".to_string(),
+                reason: "a bundle entry conflicted or violated its lock plan".to_string(),
             }));
         }
 
@@ -904,18 +1116,6 @@ impl Transaction for PostgresTransaction {
 
 impl Drop for PostgresTransaction {
     fn drop(&mut self) {
-        // If the transaction wasn't explicitly committed or rolled back, we must
-        // still ROLLBACK before the connection is returned to the pool. deadpool's
-        // default recycling does NOT reset session state, so a connection handed
-        // back with an open transaction poisons the pool: the next checkout fails
-        // with "there is already a transaction in progress", cascading across every
-        // subsequent request that reuses it. (The previous code assumed recycling
-        // auto-rolls-back, which is false — this was the cause of the import-suite
-        // failure cascade under concurrent load.)
-        //
-        // Drop can't be async, so move the client into a spawned task that issues
-        // the ROLLBACK and only then drops it — the connection returns to the pool
-        // clean, and only after the rollback completes.
         if !self.active {
             return;
         }
@@ -924,25 +1124,7 @@ impl Drop for PostgresTransaction {
         let Some(client) = self.client.take() else {
             return;
         };
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                tracing::warn!(
-                    "PostgreSQL transaction dropped without explicit commit/rollback; rolling back before pool return"
-                );
-                handle.spawn(async move {
-                    // Ignore the result: the connection drops (returns to the pool)
-                    // when this task ends regardless, and a failed rollback here
-                    // just means a broken connection deadpool will discard anyway.
-                    let _ = client.batch_execute("ROLLBACK").await;
-                });
-            }
-            Err(_) => {
-                // No async runtime (e.g. a synchronous test drop): can't roll back.
-                tracing::warn!(
-                    "PostgreSQL transaction dropped without explicit commit/rollback and no runtime available to roll back; connection may re-enter the pool with an open transaction"
-                );
-            }
-        }
+        self.backend.cleanup_tracker.settle_on_drop(client, None);
     }
 }
 
@@ -956,16 +1138,164 @@ impl TransactionProvider for PostgresBackend {
         options: TransactionOptions,
     ) -> StorageResult<Self::Transaction> {
         let client = self.get_client().await?;
-        PostgresTransaction::new(
-            client,
-            tenant.clone(),
-            std::sync::Arc::new(self.tenant_extractor(tenant.tenant_id().as_str())),
-            self.is_search_offloaded(),
-            options.defer_search_indexing,
-            options.fhir_version.unwrap_or(self.config().fhir_version),
-            self.index_layout(),
-        )
+        PostgresTransaction::new(self, client, tenant.clone(), None, options).await
+    }
+}
+
+#[cfg(test)]
+mod reindex_groups_tests {
+    use super::*;
+    use crate::backends::postgres::PostgresConfig;
+    use crate::tenant::{TenantId, TenantPermissions};
+    use serde_json::json;
+    use testcontainers::ImageExt;
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::postgres::Postgres;
+    use tokio::sync::OnceCell;
+
+    struct SharedPg {
+        host: String,
+        port: u16,
+        _container: testcontainers::ContainerAsync<Postgres>,
+    }
+
+    static SHARED_PG: OnceCell<SharedPg> = OnceCell::const_new();
+
+    async fn backend() -> PostgresBackend {
+        let pg = SHARED_PG
+            .get_or_init(|| async {
+                let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
+                let container = super::super::schema::container_cleanup::with_cleanup_label(
+                    Postgres::default()
+                        .with_tag("16-alpine")
+                        .with_label("github.run_id", &run_id),
+                )
+                .start()
+                .await
+                .expect("start PostgreSQL 16 testcontainer");
+                SharedPg {
+                    host: container.get_host().await.expect("host").to_string(),
+                    port: container.get_host_port_ipv4(5432).await.expect("port"),
+                    _container: container,
+                }
+            })
+            .await;
+        let backend = PostgresBackend::new(PostgresConfig {
+            host: pg.host.clone(),
+            port: pg.port,
+            dbname: "postgres".into(),
+            user: "postgres".into(),
+            password: Some("postgres".into()),
+            max_connections: 2,
+            ..Default::default()
+        })
         .await
+        .expect("backend");
+        backend.init_schema().await.expect("schema");
+        backend
+    }
+
+    #[tokio::test]
+    async fn unexpected_key_poison_prevents_commit() {
+        let backend = backend().await;
+        let tenant = TenantContext::new(
+            TenantId::new("planned-poison"),
+            TenantPermissions::full_access(),
+        );
+        let mut transaction = backend
+            .begin_planned_transaction(
+                &tenant,
+                TransactionOptions::default(),
+                vec![("Patient".into(), "allowed".into())],
+            )
+            .await
+            .expect("begin planned transaction");
+        transaction
+            .create("Patient", json!({"resourceType":"Patient","id":"allowed"}))
+            .await
+            .expect("planned create");
+        let error = transaction
+            .create(
+                "Patient",
+                json!({"resourceType":"Patient","id":"unexpected"}),
+            )
+            .await
+            .expect_err("unplanned key rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("not in the transaction lock plan")
+        );
+        assert!(Box::new(transaction).commit().await.is_err());
+        let client = backend.get_client().await.expect("observer");
+        let count: i64 = client
+            .query_one(
+                "SELECT count(*) FROM resources WHERE tenant_id = $1 AND resource_type = 'Patient'",
+                &[&tenant.tenant_id().as_str()],
+            )
+            .await
+            .expect("count durable resources")
+            .get(0);
+        assert_eq!(
+            count, 0,
+            "poisoned transaction must roll back earlier writes"
+        );
+    }
+
+    #[tokio::test]
+    async fn savepoint_rollback_clears_unexpected_key_poison() {
+        let backend = backend().await;
+        let tenant = TenantContext::new(
+            TenantId::new("planned-savepoint"),
+            TenantPermissions::full_access(),
+        );
+        let mut transaction = backend
+            .begin_planned_transaction(
+                &tenant,
+                TransactionOptions::default(),
+                vec![("Patient".into(), "allowed".into())],
+            )
+            .await
+            .expect("begin planned transaction");
+        transaction
+            .create("Patient", json!({"resourceType":"Patient","id":"allowed"}))
+            .await
+            .expect("planned create");
+        transaction
+            .savepoint("reindex_test_entry")
+            .await
+            .expect("savepoint");
+        assert!(
+            transaction
+                .create(
+                    "Patient",
+                    json!({"resourceType":"Patient","id":"unexpected"})
+                )
+                .await
+                .is_err()
+        );
+        transaction
+            .rollback_to_savepoint("reindex_test_entry")
+            .await
+            .expect("entry rollback");
+        transaction
+            .release_savepoint("reindex_test_entry")
+            .await
+            .expect("release entry savepoint");
+        Box::new(transaction)
+            .commit()
+            .await
+            .expect("commit planned work");
+        let client = backend.get_client().await.expect("observer");
+        let count: i64 = client
+            .query_one(
+                "SELECT count(*) FROM resources WHERE tenant_id = $1 AND resource_type = 'Patient' AND id = 'allowed'",
+                &[&tenant.tenant_id().as_str()],
+            )
+            .await
+            .expect("count durable planned resource")
+            .get(0);
+        assert_eq!(count, 1);
     }
 }
 

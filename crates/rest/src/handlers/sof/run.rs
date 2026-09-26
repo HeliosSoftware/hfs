@@ -71,7 +71,7 @@ use helios_sof::fhir_format::{
 use helios_sof::{
     ContentType, ExtractedRunParams, RunOptions, create_bundle_from_resources_for_version,
     extract_run_params_from_json, filter_resources_by_patient_and_group, filter_resources_by_since,
-    lint::{Severity, lint_operation_outcome, lint_view_definition},
+    lint::{DiagnosticCode, Severity, lint_operation_outcome, lint_view_definition},
     parse_view_definition_for_version, process_view_definition, run_view_definition_with_options,
     split_csv_refs,
 };
@@ -718,6 +718,34 @@ fn lint_inline_view_definition(view_json: &Value) -> Result<(), RestError> {
         })
     } else {
         Ok(())
+    }
+}
+
+/// Write-path guard for stored ViewDefinitions (#1014): a `resource`
+/// that names no FHIR resource type can never run, so a create or update
+/// carrying one is rejected with `422` and the linter's own
+/// `OperationOutcome` (issue code `code-invalid`, coding
+/// `unknown-resource-type`) regardless of `HFS_VALIDATION_MODE`. Every
+/// other lint finding is deliberately *not* a write error: the editor's
+/// "save it anyway" flow (#821) stores drafts on purpose. A no-op for
+/// any other resource type.
+pub(crate) fn reject_unknown_view_definition_resource(
+    resource_type: &str,
+    resource: &Value,
+) -> Result<(), RestError> {
+    if resource_type != "ViewDefinition" {
+        return Ok(());
+    }
+    let diagnostics: Vec<_> = lint_view_definition(resource)
+        .into_iter()
+        .filter(|diagnostic| diagnostic.code == DiagnosticCode::UnknownResourceType)
+        .collect();
+    if diagnostics.is_empty() {
+        Ok(())
+    } else {
+        Err(RestError::ValidationFailed {
+            outcome: lint_operation_outcome(&diagnostics),
+        })
     }
 }
 

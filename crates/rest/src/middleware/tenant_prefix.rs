@@ -42,6 +42,11 @@ const RESERVED_SYSTEM_PATHS: &[&str] = &[
     // middleware would rewrite the path to `/smart-configuration` — a 404 for
     // SMART discovery under `url_path`/`both` routing.
     ".well-known",
+    // System-level search (`[base]/_search`). `_search` parses as a tenant id,
+    // so under `url_path`/`both` routing an unprefixed `POST /_search` was
+    // rewritten to `POST /` — the batch endpoint — for a tenant named
+    // `_search`, and a Bundle sent there was committed into it (#1338).
+    "_search",
 ];
 
 /// Checks if a path segment is a reserved path (not a tenant identifier).

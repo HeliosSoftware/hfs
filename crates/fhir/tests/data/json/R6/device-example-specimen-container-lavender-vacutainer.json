@@ -7,6 +7,10 @@
       "value": "345675"
     }
   ],
+  "biologicalSourceEvent": {
+    "system": "http://terminology.hl7.org/NamingSystem/ib",
+    "value": "A999908123456"
+  },
   "name": [
     {
       "value": "Lavender Tube",

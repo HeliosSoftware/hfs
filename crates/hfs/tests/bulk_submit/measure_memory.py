@@ -1,0 +1,3708 @@
+#!/usr/bin/env python3
+"""Bulk-submit benchmark controller for issues #995 and #1086.
+
+Drives the release ``hfs`` binary natively on macOS against a dedicated
+PostgreSQL container the caller owns, and records **external** observations
+only: HFS RSS from ``ps`` every 0.5 s, host memory pressure/swap/compressor
+vitals every 5 s, PostgreSQL state through ``docker exec <container> psql``,
+and HTTP phase markers with the raw responses behind them. The optional
+``--postgres-reindex-evidence`` profile also captures the opt-in HFS phase
+summary, PostgreSQL activity deltas, and representative cursor plans required
+by the bounded #1086 protocol. See ``MEMORY_MEASUREMENT.md`` beside this file
+for #995 and ``docs/postgres-reindex-benchmark.md`` for #1086.
+
+A successful attempt requires the deferred reindex to be positively verified:
+a supported deferred-reindex start log line with ``job_id=...``, ``$reindex-status``
+reporting ``completed`` with ``errorCount == 0`` and ``processed == total``,
+and a SQL coverage probe of zero unindexed Patients.  Anything less marks the
+attempt unverified, keeps its raw timings labelled incomplete, and stops the
+run instead of continuing to the next job.
+
+Safety: starts one HFS process in its own process group plus an in-process
+loopback provider (or reads from a caller-owned ``--provider-url`` server), and
+stops exactly those.  The PostgreSQL container is inspected and queried, never
+stopped or reconfigured.  Credentials are never logged or written to the
+output directory.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import functools
+import hashlib
+import http.server
+import json
+import os
+import re
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Iterable, Optional
+
+SCHEMA_VERSION = 2
+ISSUE_1086_DEFAULT_RESOURCES = 2000
+ISSUE_1086_MAX_RESOURCES = 10_000
+GROUPED_CREATE_DEFAULT_RESOURCES = 10_000
+GROUPED_CREATE_CONTENT_LIMIT_BYTES = 8 * 1024 * 1024
+GROUPED_CREATE_OVERSIZED_RESOURCES = 203
+TENANT = "default"
+FAMILY = "Pilot995"
+MRN_SYSTEM = "http://helios.example/mrn"
+REINDEX_START_MARKERS = (
+    "deferred reindex generation started",
+    "deferred-index rebuild started",
+)
+SUBMITTER_SYSTEM = "http://helios.example/bench"
+SUBMITTER_VALUE = "mem995"
+FIXTURE_FILE_COUNT = 4
+
+EXIT_OK, EXIT_ABORTED, EXIT_CONFIG, EXIT_VALIDATION, EXIT_PREFLIGHT = 0, 2, 3, 4, 5
+
+# Resource-constrained by design: this is not a default-server measurement.
+HFS_ENV_BASE = {
+    # hfs logs its database URL at info; persistence info still supplies the
+    # registry and deferred-reindex markers used by this controller.
+    "RUST_LOG": "info,hfs=warn",
+    "HFS_STORAGE_BACKEND": "postgres",
+    "HFS_DEFAULT_TENANT": TENANT,
+    "HFS_DEFAULT_FHIR_VERSION": "R4",
+    "HFS_BULK_SUBMIT_ENABLED": "true",
+    "HFS_BULK_SUBMIT_WORKER_CONCURRENCY": "1",
+    "HFS_BULK_SUBMIT_MAX_CONCURRENT_PER_TENANT": "1",
+    # Poll rate limit defaults to 10 hits / 60 s, which would quantise the
+    # terminal marker to 6 s; it throttles nothing on the ingest path.
+    "HFS_BULK_SUBMIT_POLL_RATE_LIMIT": "1000000",
+    "HFS_PG_MAX_CONNECTIONS": "4",
+    "HFS_PG_STATEMENT_TIMEOUT_MS": "300000",
+    "HFS_MAX_PAGE_SIZE": "1000",
+    "HFS_REQUEST_TIMEOUT": "300",
+    "HFS_AUTH_ENABLED": "false",
+    "HFS_AUDIT_BACKEND": "none",
+}
+
+
+def effective_hfs_env(
+    args: argparse.Namespace, base_url: str, output_dir: Path
+) -> dict[str, str]:
+    """Build the measured HFS environment, with caller overrides applied last."""
+    env = dict(HFS_ENV_BASE)
+    env["HFS_BASE_URL"] = base_url
+    env["HFS_SERVER_HOST"] = args.host
+    env["HFS_SERVER_PORT"] = str(args.hfs_port)
+    env["HFS_LOG_LEVEL"] = args.hfs_log_level
+    env["HFS_BULK_SUBMIT_FILE_CONCURRENCY"] = str(args.file_concurrency)
+    env["HFS_BULK_SUBMIT_DEFER_INDEXING"] = (
+        "true" if args.defer_indexing else "false"
+    )
+    env["HFS_BULK_SUBMIT_OUTPUT_BACKEND"] = "local-fs"
+    env["HFS_BULK_SUBMIT_OUTPUT_DIR"] = str(output_dir / "artifacts")
+    if args.batch_size is not None:
+        env["HFS_BULK_SUBMIT_BATCH_SIZE"] = str(args.batch_size)
+    if args.postgres_reindex_evidence:
+        env["HFS_PERF_PHASES"] = "1"
+        # EnvFilter target directives match prefixes. Without the more-specific
+        # override, `hfs=warn` also suppresses the `hfs_perf` INFO summary.
+        env["RUST_LOG"] = "info,hfs=warn,hfs_perf=info"
+    for item in args.hfs_env:
+        key, _, value = item.partition("=")
+        env[key.strip()] = value
+    return env
+
+
+# --------------------------------------------------------------------------
+# utilities
+# --------------------------------------------------------------------------
+
+
+def iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def reindex_start_marker(line: str) -> Optional[str]:
+    return next((marker for marker in REINDEX_START_MARKERS if marker in line), None)
+
+
+def parse_reindex_start_log_timestamp(line: str) -> Optional[datetime]:
+    """Parse the RFC3339 prefix from a deferred-reindex start log line."""
+    if reindex_start_marker(line) is None:
+        return None
+    match = re.match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\s", line)
+    if not match:
+        return None
+    try:
+        return datetime.fromisoformat(match.group(1)[:-1] + "+00:00")
+    except ValueError:
+        return None
+
+
+def mono() -> float:
+    return time.monotonic()
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def redact_db_url(url: str) -> str:
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except Exception:
+        return "<unparsable database url>"
+    if not parts.hostname:
+        return "<redacted database url>"
+    user = parts.username or ""
+    auth = f"{urllib.parse.quote(user)}:REDACTED@" if user else ""
+    port = f":{parts.port}" if parts.port else ""
+    return f"{parts.scheme}://{auth}{parts.hostname}{port}{parts.path}"
+
+
+def db_url_parts(url: str) -> dict[str, Optional[str]]:
+    parts = urllib.parse.urlsplit(url)
+    user = urllib.parse.unquote(parts.username) if parts.username else "postgres"
+    return {
+        "user": user,
+        "db": (parts.path or "").lstrip("/") or user,
+        "host": parts.hostname,
+        "port": parts.port,
+    }
+
+
+def run_capture(
+    cmd: Iterable[str], timeout: float = 60.0, cwd: Optional[Path] = None
+) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        list(cmd), capture_output=True, text=True, timeout=timeout, check=False, cwd=cwd
+    )
+
+
+def source_fingerprint(repo_root: Path) -> dict[str, Any]:
+    """Hash HEAD, every tracked change, and every untracked file."""
+
+    def git(*args: str) -> str:
+        result = run_capture(["git", *args], timeout=60, cwd=repo_root)
+        if result.returncode != 0:
+            raise ConfigError(
+                f"git {' '.join(args)} failed in {repo_root}: {result.stderr.strip()[:300]}"
+            )
+        return result.stdout
+
+    head = git("rev-parse", "HEAD").strip()
+    branch = git("rev-parse", "--abbrev-ref", "HEAD").strip()
+    tracked_diff = git("diff", "--binary", "HEAD", "--", ".").encode("utf-8")
+    untracked_paths = sorted(
+        path for path in git("ls-files", "--others", "--exclude-standard", "-z").split("\0") if path
+    )
+    untracked: list[dict[str, Any]] = []
+    digest = hashlib.sha256()
+    digest.update(b"hfs-source-fingerprint-v1\0")
+    digest.update(head.encode("ascii"))
+    digest.update(b"\0tracked-diff\0")
+    digest.update(tracked_diff)
+    for relative in untracked_paths:
+        path = repo_root / relative
+        content = os.readlink(path).encode("utf-8") if path.is_symlink() else path.read_bytes()
+        encoded_path = relative.encode("utf-8")
+        digest.update(b"\0untracked\0")
+        digest.update(len(encoded_path).to_bytes(8, "big"))
+        digest.update(encoded_path)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+        untracked.append(
+            {
+                "path": relative,
+                "bytes": len(content),
+                "sha256": hashlib.sha256(content).hexdigest(),
+            }
+        )
+    return {
+        "head": head,
+        "branch": branch,
+        "dirty": bool(tracked_diff or untracked),
+        "tracked_diff_bytes": len(tracked_diff),
+        "tracked_diff_sha256": hashlib.sha256(tracked_diff).hexdigest(),
+        "untracked": untracked,
+        "fingerprint_sha256": digest.hexdigest(),
+    }
+
+
+def pgrep_count(name: str) -> int:
+    try:
+        proc = run_capture(["pgrep", "-x", name], timeout=10)
+    except Exception:
+        return 0
+    return len([line for line in proc.stdout.splitlines() if line.strip().isdigit()])
+
+
+def port_is_free(host: str, port: int) -> bool:
+    """connect() first: a bind-only probe misreports an active listener."""
+    probe = socket.socket()
+    probe.settimeout(0.35)
+    try:
+        probe.connect((host, port))
+    except OSError:
+        pass
+    else:
+        return False
+    finally:
+        probe.close()
+    holder = socket.socket()
+    try:
+        holder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        holder.bind((host, port))
+    except OSError:
+        return False
+    finally:
+        holder.close()
+    return True
+
+
+def pick_free_port(preferred: int, host: str = "127.0.0.1", span: int = 400) -> int:
+    if preferred and port_is_free(host, preferred):
+        return preferred
+    start = preferred or 19000
+    for candidate in range(start, start + span):
+        if port_is_free(host, candidate):
+            return candidate
+    raise RuntimeError(f"no free loopback port in {start}..{start + span}")
+
+
+def ps_sample(pid: int) -> Optional[dict[str, float]]:
+    try:
+        proc = run_capture(["ps", "-o", "rss=,vsz=,pcpu=", "-p", str(pid)], timeout=15)
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    fields = proc.stdout.split()
+    if len(fields) < 3:
+        return None
+    try:
+        return {
+            "rss_kib": float(fields[0]),
+            "vsz_kib": float(fields[1]),
+            "cpu_percent": float(fields[2]),
+        }
+    except ValueError:
+        return None
+
+
+def parse_vm_stat(text: str) -> dict[str, Any]:
+    page_size = 16384
+    match = re.search(r"page size of (\d+) bytes", text)
+    if match:
+        page_size = int(match.group(1))
+    pages: dict[str, int] = {}
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        key, _, rest = line.partition(":")
+        value = rest.strip().rstrip(".")
+        if value.isdigit():
+            pages[key.strip().strip('"')] = int(value)
+
+    def mib(name: str) -> Optional[float]:
+        value = pages.get(name)
+        return None if value is None else value * page_size / 1024 / 1024
+
+    free_spec = pages.get("Pages free", 0) + pages.get("Pages speculative", 0)
+    swapouts = pages.get("Swapouts")
+    return {
+        "page_size": page_size,
+        "free_pages": pages.get("Pages free"),
+        "speculative_pages": pages.get("Pages speculative"),
+        "free_spec_mib": free_spec * page_size / 1024 / 1024,
+        "active_mib": mib("Pages active"),
+        "inactive_mib": mib("Pages inactive"),
+        "wired_mib": mib("Pages wired down"),
+        "compressor_mib": mib("Pages occupied by compressor"),
+        "compressed_pages": pages.get("Pages stored in compressor"),
+        "swapouts_pages": swapouts,
+        "swapout_bytes": None if swapouts is None else swapouts * page_size,
+        "swapins_pages": pages.get("Swapins"),
+    }
+
+
+def parse_swapusage(text: str) -> dict[str, Optional[float]]:
+    def mib(label: str) -> Optional[float]:
+        match = re.search(rf"{label}\s*=\s*([0-9.]+)([MG])", text)
+        if not match:
+            return None
+        value = float(match.group(1))
+        return value * 1024 if match.group(2) == "G" else value
+
+    return {
+        "swap_total_mib": mib("total"),
+        "swap_used_mib": mib("used"),
+        "swap_free_mib": mib("free"),
+    }
+
+
+def host_vitals() -> dict[str, Any]:
+    sample: dict[str, Any] = {"wall": iso_now(), "mono": mono()}
+    sample.update(zip(("load1", "load5", "load15"), os.getloadavg()))
+    try:
+        sample.update(parse_vm_stat(run_capture(["vm_stat"], timeout=20).stdout))
+    except Exception as exc:
+        sample["vm_stat_error"] = str(exc)
+    try:
+        sample.update(parse_swapusage(run_capture(["sysctl", "-n", "vm.swapusage"], timeout=20).stdout))
+    except Exception as exc:
+        sample["swapusage_error"] = str(exc)
+    try:
+        level = run_capture(["sysctl", "-n", "kern.memorystatus_vm_pressure_level"], timeout=10).stdout.strip()
+        sample["pressure_level"] = int(level) if level.isdigit() else None
+    except Exception:
+        sample["pressure_level"] = None
+    return sample
+
+
+def _round(value: Any, digits: int = 1) -> Optional[float]:
+    return None if value is None else round(float(value), digits)
+
+
+def _mib(value: Any) -> Optional[float]:
+    return None if value in (None, 0) else round(int(value) / 1024 / 1024, 1)
+
+
+def _median(values: list[float]) -> Optional[float]:
+    if not values:
+        return None
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return _round(ordered[middle])
+    return _round((ordered[middle - 1] + ordered[middle]) / 2)
+
+
+def _json_array_length(path: Path) -> Optional[int]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if isinstance(payload, list):
+        return len(payload)
+    if isinstance(payload, dict) and isinstance(payload.get("entry"), list):
+        return len(payload["entry"])
+    return None
+
+
+def numeric_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    """Subtract numeric PostgreSQL counters while retaining unsupported fields."""
+    delta: dict[str, Any] = {}
+    for key in sorted(set(before) | set(after)):
+        old, new = before.get(key), after.get(key)
+        if isinstance(old, (int, float)) and isinstance(new, (int, float)):
+            delta[key] = new - old
+        else:
+            delta[key] = None
+    return delta
+
+
+def statement_counter_delta(
+    before: dict[str, Any], after: dict[str, Any]
+) -> dict[str, Any]:
+    """Subtract scoped pg_stat_statements call counters."""
+    result: dict[str, Any] = {}
+    for kind in ("resource_insert", "savepoint"):
+        old = before.get(kind) or {}
+        new = after.get(kind) or {}
+        old_calls, new_calls = old.get("calls"), new.get("calls")
+        calls = (
+            new_calls - old_calls
+            if isinstance(old_calls, int) and isinstance(new_calls, int)
+            else None
+        )
+        result[kind] = {
+            "calls": calls,
+            "matching_queryids": new.get("matching_queryids") if calls else 0,
+        }
+    return result
+
+
+def statement_counter_intervals(
+    before_kickoff: dict[str, Any],
+    polling_observed_terminal: dict[str, Any],
+    verified_search_ready: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "before": before_kickoff,
+        "polling_observed_terminal": polling_observed_terminal,
+        "after": verified_search_ready,
+        "interval_deltas": {
+            "kickoff_to_terminal": statement_counter_delta(
+                before_kickoff, polling_observed_terminal
+            ),
+            "observed_terminal_to_search_ready": statement_counter_delta(
+                polling_observed_terminal, verified_search_ready
+            ),
+            "kickoff_to_search_ready": statement_counter_delta(
+                before_kickoff, verified_search_ready
+            ),
+        },
+    }
+
+
+def postgres_activity_intervals(
+    before_kickoff: dict[str, Any],
+    polling_observed_terminal: dict[str, Any],
+    verified_search_ready: dict[str, Any],
+) -> dict[str, Any]:
+    """Build honestly labelled deltas around the observable reindex boundaries."""
+    whole_delta = numeric_delta(before_kickoff, verified_search_ready)
+    return {
+        # Keep the original before/after/delta fields for existing consumers.
+        "before": before_kickoff,
+        "polling_observed_terminal": polling_observed_terminal,
+        "after": verified_search_ready,
+        "delta": whole_delta,
+        "interval_deltas": {
+            "kickoff_to_terminal": numeric_delta(
+                before_kickoff, polling_observed_terminal
+            ),
+            "observed_terminal_to_search_ready": numeric_delta(
+                polling_observed_terminal, verified_search_ready
+            ),
+            "kickoff_to_search_ready": whole_delta,
+        },
+        "attribution": {
+            "terminal_boundary": (
+                "Observed after terminal-manifest polling and validation; it may include a small "
+                "amount of reindex work that started before the snapshot."
+            ),
+            "search_ready_boundary": (
+                "Observed after status and SQL readiness probes; interval deltas include those "
+                "measurement queries and are not exact DB-only reindex attribution."
+            ),
+            "counter_scope": (
+                "Database and WAL counters can include other sessions; use a dedicated PostgreSQL "
+                "container with one benchmark job at a time."
+            ),
+        },
+    }
+
+
+def postgres_reindex_comparability_reasons(
+    attempt: dict[str, Any],
+    preflight: dict[str, Any],
+    fixture: dict[str, Any],
+    hfs_samples: int,
+    postgres_samples: int,
+    require_phase_summary: bool,
+) -> list[str]:
+    """Return missing #1086 evidence without changing functional validation."""
+    reasons: list[str] = []
+    git = preflight.get("git") or {}
+    postgres = preflight.get("postgres") or {}
+    reindex = attempt.get("reindex") or {}
+    work = attempt.get("postgres_work") or {}
+    plans = attempt.get("cursor_plans") or []
+    intervals = work.get("interval_deltas") or {}
+    if not (preflight.get("binary") or {}).get("sha256"):
+        reasons.append("missing binary fingerprint")
+    if not (preflight.get("controller") or {}).get("sha256"):
+        reasons.append("missing controller fingerprint")
+    if not preflight.get("host"):
+        reasons.append("missing host metadata")
+    if not git.get("fingerprint_sha256"):
+        reasons.append("missing full source fingerprint")
+    if not git.get("fingerprint_verified"):
+        reasons.append("source fingerprint was not bound to the expected value")
+    if not postgres.get("image_id"):
+        reasons.append("missing immutable PostgreSQL image ID")
+    if not (postgres.get("server") or {}).get("version"):
+        reasons.append("missing PostgreSQL server version")
+    if not fixture.get("corpus_sha256"):
+        reasons.append("missing corpus fingerprint")
+    if not all(
+        isinstance(work.get(key), dict)
+        for key in ("before", "polling_observed_terminal", "after", "delta")
+    ):
+        reasons.append("missing PostgreSQL activity boundary snapshots")
+    if not all(
+        key in intervals
+        for key in (
+            "kickoff_to_terminal",
+            "observed_terminal_to_search_ready",
+            "kickoff_to_search_ready",
+        )
+    ):
+        reasons.append("missing PostgreSQL activity interval deltas")
+    if reindex.get("start_log_to_completion_observed_interval_s") is None:
+        reasons.append("missing reindex start-log to completion-observation interval")
+    if len(plans) != 3 or {plan.get("label") for plan in plans} != {
+        "early",
+        "middle",
+        "late",
+    } or not all(plan.get("ok") and plan.get("plan") is not None for plan in plans):
+        reasons.append("expected three parsed cursor plans")
+    if require_phase_summary and not reindex.get("phase_summary_available"):
+        reasons.append("required correlated phase summary is missing")
+    if hfs_samples < 1:
+        reasons.append("missing HFS memory sample between kickoff and search readiness")
+    if postgres_samples < 1:
+        reasons.append("missing PostgreSQL memory sample between kickoff and search readiness")
+    return reasons
+
+
+def postgres_grouped_create_comparability_reasons(
+    attempt: dict[str, Any],
+    preflight: dict[str, Any],
+    fixture: dict[str, Any],
+    hfs_samples: int,
+    postgres_samples: int,
+    expected_resource_inserts: int,
+    expected_savepoints: int,
+) -> list[str]:
+    """Return missing or contradictory #1455 benchmark evidence."""
+    reasons: list[str] = []
+    git = preflight.get("git") or {}
+    postgres = preflight.get("postgres") or {}
+    tracking = preflight.get("pg_stat_statements") or {}
+    work = attempt.get("postgres_work") or {}
+    sql = attempt.get("grouped_create_sql") or {}
+    intervals = work.get("interval_deltas") or {}
+    if not (preflight.get("binary") or {}).get("sha256"):
+        reasons.append("missing binary fingerprint")
+    if not (preflight.get("controller") or {}).get("sha256"):
+        reasons.append("missing controller fingerprint")
+    if not git.get("fingerprint_sha256"):
+        reasons.append("missing full source fingerprint")
+    if not git.get("fingerprint_verified"):
+        reasons.append("source fingerprint was not bound to the expected value")
+    if not postgres.get("image_id"):
+        reasons.append("missing immutable PostgreSQL image ID")
+    if not (postgres.get("server") or {}).get("version"):
+        reasons.append("missing PostgreSQL server version")
+    if not fixture.get("corpus_sha256"):
+        reasons.append("missing corpus fingerprint")
+    if not tracking.get("available"):
+        reasons.append("pg_stat_statements is unavailable")
+    if not tracking.get("track_utility"):
+        reasons.append("pg_stat_statements.track_utility is off")
+    if not tracking.get("savepoint_pilot_observed"):
+        reasons.append("SAVEPOINT bulk_entry utility pilot was not observed")
+    if not all(
+        key in intervals
+        for key in (
+            "kickoff_to_terminal",
+            "observed_terminal_to_search_ready",
+            "kickoff_to_search_ready",
+        )
+    ):
+        reasons.append("missing PostgreSQL activity interval deltas")
+    terminal = (sql.get("interval_deltas") or {}).get("kickoff_to_terminal") or {}
+    ready = (sql.get("interval_deltas") or {}).get("kickoff_to_search_ready") or {}
+    for label, snapshot in (("terminal", terminal), ("search-ready", ready)):
+        inserts = (snapshot.get("resource_insert") or {}).get("calls")
+        savepoints = (snapshot.get("savepoint") or {}).get("calls")
+        if inserts != expected_resource_inserts:
+            reasons.append(
+                f"{label} resource INSERT calls {inserts!r} != expected {expected_resource_inserts}"
+            )
+        if savepoints != expected_savepoints:
+            reasons.append(
+                f"{label} SAVEPOINT bulk_entry calls {savepoints!r} != expected {expected_savepoints}"
+            )
+        for kind in ("resource_insert", "savepoint"):
+            matches = (snapshot.get(kind) or {}).get("matching_queryids")
+            calls = (snapshot.get(kind) or {}).get("calls")
+            expected_matches = 1 if calls else 0
+            if matches != expected_matches:
+                reasons.append(
+                    f"{label} {kind} counter is ambiguous: {matches!r} matching queryids"
+                )
+    if hfs_samples < 1:
+        reasons.append("missing HFS memory sample between kickoff and search readiness")
+    if postgres_samples < 1:
+        reasons.append("missing PostgreSQL memory sample between kickoff and search readiness")
+    return reasons
+
+
+# --------------------------------------------------------------------------
+# writers
+# --------------------------------------------------------------------------
+
+
+class CsvWriter:
+    def __init__(self, path: Path, columns: list[str]):
+        self.columns = columns
+        self._lock = threading.Lock()
+        self._handle = open(path, "w", encoding="utf-8", newline="")
+        self._writer = csv.DictWriter(self._handle, fieldnames=columns, extrasaction="ignore")
+        self._writer.writeheader()
+        self._handle.flush()
+
+    def write(self, row: dict[str, Any]) -> None:
+        with self._lock:
+            self._writer.writerow({key: ("" if row.get(key) is None else row.get(key)) for key in self.columns})
+            self._handle.flush()
+
+    def close(self) -> None:
+        with self._lock:
+            self._handle.close()
+
+
+class JsonlWriter:
+    def __init__(self, path: Path):
+        self._lock = threading.Lock()
+        self._handle = open(path, "w", encoding="utf-8", buffering=1)
+
+    def write(self, record: dict[str, Any]) -> None:
+        with self._lock:
+            self._handle.write(json.dumps(record, default=str) + "\n")
+
+    def close(self) -> None:
+        with self._lock:
+            self._handle.close()
+
+
+def write_json_atomic(path: Path, payload: Any) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+class RunLog:
+    def __init__(self, path: Path, echo: bool = True):
+        self._lock = threading.Lock()
+        self._handle = open(path, "a", encoding="utf-8", buffering=1)
+        self.echo = echo
+
+    def line(self, event: str, **fields: Any) -> None:
+        record = {"wall": iso_now(), "mono": round(mono(), 3), "event": event}
+        record.update(fields)
+        with self._lock:
+            self._handle.write(json.dumps(record, default=str) + "\n")
+            self._handle.flush()
+            if self.echo:
+                detail = " ".join(f"{key}={value}" for key, value in fields.items())
+                print(f"[{record['wall']}] {event}{' ' + detail if detail else ''}", flush=True)
+
+    def close(self) -> None:
+        with self._lock:
+            self._handle.close()
+
+
+class Aborted(Exception):
+    """The measurement cannot produce a verified result; stop the run."""
+
+    def __init__(self, reason: str, detail: Optional[dict[str, Any]] = None):
+        super().__init__(reason)
+        self.reason = reason
+        self.detail = detail or {}
+
+
+class ConfigError(Exception):
+    pass
+
+
+class PgError(Exception):
+    pass
+
+
+# --------------------------------------------------------------------------
+# HFS log follower
+# --------------------------------------------------------------------------
+
+
+class LogFollower:
+    """Incremental reader over the HFS log file written by our own process."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.offset = 0
+        self._pending = b""
+
+    def seek_end(self) -> int:
+        try:
+            self.offset = self.path.stat().st_size
+        except OSError:
+            self.offset = 0
+        return self.offset
+
+    def read_new(self) -> list[str]:
+        try:
+            with open(self.path, "rb") as handle:
+                handle.seek(self.offset)
+                chunk = handle.read()
+                self.offset = handle.tell()
+        except OSError:
+            return []
+        if not chunk:
+            return []
+        data = self._pending + chunk
+        lines = data.split(b"\n")
+        self._pending = lines.pop()
+        return [line.decode("utf-8", errors="replace") for line in lines]
+
+    def tail(self, max_bytes: int = 6000) -> str:
+        try:
+            size = self.path.stat().st_size
+            with open(self.path, "rb") as handle:
+                handle.seek(max(0, size - max_bytes))
+                return handle.read().decode("utf-8", errors="replace")
+        except OSError:
+            return ""
+
+
+# --------------------------------------------------------------------------
+# PostgreSQL through the dedicated container (read-only probes)
+# --------------------------------------------------------------------------
+
+
+class PgClient:
+    TABLES = (
+        "resources",
+        "resource_history",
+        "search_index",
+        "resource_fts",
+        "bulk_submissions",
+        "bulk_manifests",
+        "bulk_entry_results",
+        "bulk_submission_changes",
+        "bulk_submit_files",
+    )
+    UNIT = "\x1f"
+
+    def __init__(self, container: str, user: str, database: str):
+        self.container = container
+        self.user = user
+        self.database = database
+
+    def psql(self, sql: str, timeout: float = 120.0) -> dict[str, Any]:
+        cmd = [
+            "docker", "exec", "-e", f"PGOPTIONS=-c statement_timeout={max(1, int((timeout - 5) * 1000))}", self.container, "psql",
+            "-U", self.user, "-d", self.database,
+            "-X", "-q", "-A", "-t", "-F", self.UNIT, "-v", "ON_ERROR_STOP=1", "-c", sql,
+        ]
+        try:
+            proc = run_capture(cmd, timeout=timeout)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc), "rows": [], "stderr": ""}
+        return {
+            "ok": proc.returncode == 0,
+            "error": None if proc.returncode == 0 else (proc.stderr.strip() or "psql failed"),
+            "rows": [line.split(self.UNIT) for line in proc.stdout.splitlines() if line.strip()],
+            "stderr": proc.stderr.strip(),
+        }
+
+    def require(self, sql: str) -> list[list[str]]:
+        result = self.psql(sql)
+        if not result["ok"]:
+            raise PgError(result["error"] or "psql probe failed")
+        return result["rows"]
+
+    def wait_ready(self, attempts: int = 15, interval: float = 2.0) -> bool:
+        for _ in range(attempts):
+            if self.psql("SELECT 1", timeout=30)["ok"]:
+                return True
+            time.sleep(interval)
+        return False
+
+    def stream_rows(self, sql: str, timeout: float = 1800.0):
+        """Stream rows instead of buffering the whole result set in one blob.
+
+        JSONB text output never contains a newline, so a line is a row.
+        """
+        cmd = [
+            "docker", "exec", "-e", f"PGOPTIONS=-c statement_timeout={max(1, int((timeout - 5) * 1000))}", self.container, "psql",
+            "-U", self.user, "-d", self.database,
+            "-X", "-q", "-A", "-t", "-F", self.UNIT, "-v", "ON_ERROR_STOP=1", "-c", sql,
+        ]
+        # Spool to disk so timeout covers the query and pipe consumption, while
+        # the controller never holds the entire result set in memory.
+        with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as output:
+            process = subprocess.run(cmd, stdout=output, stderr=subprocess.PIPE,
+                                     text=True, timeout=timeout, check=False)
+            if process.returncode != 0:
+                raise PgError(process.stderr.strip() or "psql stream failed")
+            output.seek(0)
+            for line in output:
+                line = line.rstrip("\n")
+                if line:
+                    yield line.split(self.UNIT)
+
+    def existing_tables(self) -> set[str]:
+        listing = ", ".join(f"'{name}'" for name in self.TABLES)
+        sql = (
+            "SELECT table_name FROM information_schema.tables "
+            f"WHERE table_schema = 'public' AND table_name IN ({listing});"
+        )
+        return {row[0] for row in self.require(sql) if row}
+
+    def counts(self) -> dict[str, Any]:
+        """Counts and coverage.  Only tables that exist are named in SQL."""
+        tables = self.existing_tables()
+        parts: list[str] = []
+        for table in self.TABLES:
+            if table in tables:
+                parts.append(f"SELECT '{table}', count(*)::text FROM {table} WHERE tenant_id = '{TENANT}'")
+        if "resources" in tables:
+            parts.append(
+                f"SELECT 'resources_patient', count(*)::text FROM resources "
+                f"WHERE tenant_id = '{TENANT}' AND resource_type = 'Patient'"
+            )
+            parts.append(
+                f"SELECT 'version:' || version_id, count(*)::text FROM resources "
+                f"WHERE tenant_id = '{TENANT}' AND resource_type = 'Patient' GROUP BY 1"
+            )
+        if "resource_history" in tables:
+            parts.append(
+                f"SELECT 'history:' || version_id, count(*)::text FROM resource_history "
+                f"WHERE tenant_id = '{TENANT}' AND resource_type = 'Patient' GROUP BY 1"
+            )
+        if "resources" in tables and "search_index" in tables:
+            # The #903 verdict: a Patient with no index rows is unsearchable.
+            parts.append(
+                "SELECT 'unindexed_patients', count(*)::text FROM ("
+                f"SELECT id FROM resources WHERE tenant_id = '{TENANT}' "
+                "AND resource_type = 'Patient' AND is_deleted = FALSE EXCEPT "
+                f"SELECT resource_id FROM search_index WHERE tenant_id = '{TENANT}' "
+                "AND resource_type = 'Patient') missing"
+            )
+            parts.append(
+                f"SELECT 'search_index_patient', count(*)::text FROM search_index "
+                f"WHERE tenant_id = '{TENANT}' AND resource_type = 'Patient'"
+            )
+            parts.append(
+                "SELECT 'family_exact_patients', count(DISTINCT resource_id)::text "
+                f"FROM search_index WHERE tenant_id = '{TENANT}' "
+                "AND resource_type = 'Patient' AND param_name = 'family' "
+                f"AND value_string = '{FAMILY}'"
+            )
+            parts.append(
+                "SELECT 'active_true_patients', count(DISTINCT resource_id)::text "
+                f"FROM search_index WHERE tenant_id = '{TENANT}' "
+                "AND resource_type = 'Patient' AND param_name = 'active' "
+                "AND value_token_system IS NULL AND value_token_code = 'true'"
+            )
+        if "resources" in tables and "resource_fts" in tables:
+            # Match the production `_content` predicate exactly, while the
+            # resources join keeps tenant, type, and deletion semantics explicit.
+            parts.append(
+                "SELECT 'fts_content_pilot995_patients', "
+                "count(DISTINCT fts.resource_id)::text "
+                "FROM resource_fts fts INNER JOIN resources r "
+                "ON r.tenant_id = fts.tenant_id "
+                "AND r.resource_type = fts.resource_type "
+                "AND r.id = fts.resource_id "
+                f"WHERE r.tenant_id = '{TENANT}' AND r.resource_type = 'Patient' "
+                "AND r.is_deleted = FALSE "
+                f"AND fts.content_tsvector @@ plainto_tsquery('english', '{FAMILY}')"
+            )
+        rows = self.require("\nUNION ALL\n".join(parts) + ";") if parts else []
+        flat: dict[str, Any] = {}
+        version_spread: dict[str, int] = {}
+        history_spread: dict[str, int] = {}
+        for row in rows:
+            if len(row) < 2:
+                continue
+            key, value = row[0], row[1]
+            try:
+                number = int(value)
+            except ValueError:
+                continue
+            if key.startswith("version:"):
+                version_spread[key.split(":", 1)[1]] = number
+            elif key.startswith("history:"):
+                history_spread[key.split(":", 1)[1]] = number
+            else:
+                flat[key] = number
+        return {"counts": flat, "version_spread": version_spread, "history_spread": history_spread}
+
+    def server_info(self) -> dict[str, Any]:
+        rows = self.require(
+            "SELECT current_setting('server_version'), current_setting('server_version_num'), "
+            "pg_size_pretty(pg_database_size(current_database()));"
+        )
+        return {
+            "version": rows[0][0],
+            "version_num": rows[0][1],
+            "database_size": rows[0][2],
+        }
+
+    def activity_snapshot(self) -> dict[str, Any]:
+        names = [
+            "xact_commit", "xact_rollback", "blks_read", "blks_hit",
+            "tup_returned", "tup_fetched", "tup_inserted", "tup_updated",
+            "tup_deleted", "temp_files", "temp_bytes", "wal_bytes",
+        ]
+        rows = self.require(
+            "SELECT xact_commit::text, xact_rollback::text, blks_read::text, blks_hit::text, "
+            "tup_returned::text, tup_fetched::text, tup_inserted::text, tup_updated::text, "
+            "tup_deleted::text, temp_files::text, temp_bytes::text, "
+            "pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0')::text "
+            "FROM pg_stat_database WHERE datname = current_database();"
+        )
+        if not rows:
+            raise PgError("pg_stat_database returned no row for current database")
+        values: dict[str, Any] = {}
+        for name, raw in zip(names, rows[0]):
+            try:
+                values[name] = int(raw)
+            except ValueError:
+                values[name] = float(raw)
+        return values
+
+    def statement_tracking_info(self) -> dict[str, Any]:
+        result = self.psql(
+            "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements')::text, "
+            "coalesce(current_setting('pg_stat_statements.track_utility', true), '')::text;"
+        )
+        if not result["ok"] or not result["rows"]:
+            return {
+                "available": False,
+                "track_utility": False,
+                "error": result.get("error") or "pg_stat_statements probe returned no row",
+            }
+        installed, utility = result["rows"][0][:2]
+        true_values = {"true", "t", "on", "1"}
+        return {
+            "available": installed.strip().lower() in true_values,
+            "track_utility": utility.strip().lower() in true_values,
+            "setting": utility,
+            "database": self.database,
+            "user": self.user,
+        }
+
+    def statement_snapshot(self) -> dict[str, Any]:
+        rows = self.require(
+            "WITH classified AS ("
+            " SELECT queryid, calls, CASE"
+            "   WHEN btrim(query) = 'SAVEPOINT bulk_entry' THEN 'savepoint'"
+            "   WHEN position('WITH input (resource_type, id, version_id, data, last_updated, fhir_version) AS' in query) > 0"
+            "    AND position('INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)' in query) > 0"
+            "   THEN 'resource_insert' ELSE NULL END AS kind"
+            " FROM pg_stat_statements"
+            " WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())"
+            "   AND userid = (SELECT usesysid FROM pg_user WHERE usename = current_user)"
+            ")"
+            " SELECT kind, count(DISTINCT queryid)::text, coalesce(sum(calls), 0)::bigint::text"
+            " FROM classified WHERE kind IS NOT NULL GROUP BY kind ORDER BY kind;"
+        )
+        snapshot = {
+            "database": self.database,
+            "user": self.user,
+            "resource_insert": {"matching_queryids": 0, "calls": 0},
+            "savepoint": {"matching_queryids": 0, "calls": 0},
+        }
+        for row in rows:
+            if len(row) != 3 or row[0] not in snapshot:
+                continue
+            snapshot[row[0]] = {
+                "matching_queryids": int(row[1]),
+                "calls": int(row[2]),
+            }
+        return snapshot
+
+    def statement_tracking_pilot(self) -> dict[str, Any]:
+        before = self.statement_snapshot()
+        self.require(
+            "BEGIN; SAVEPOINT bulk_entry; RELEASE SAVEPOINT bulk_entry; ROLLBACK;"
+        )
+        after = self.statement_snapshot()
+        delta = statement_counter_delta(before, after)
+        return {
+            "before": before,
+            "after": after,
+            "delta": delta,
+            "observed": (delta.get("savepoint") or {}).get("calls") == 1,
+        }
+
+    def reindex_cursor_plans(self, total: int, analyze: bool = False) -> list[dict[str, Any]]:
+        offsets = [("early", None), ("middle", max(0, total // 2 - 1)), ("late", max(0, total - 101))]
+        plans: list[dict[str, Any]] = []
+        prefix = (
+            "EXPLAIN (ANALYZE, BUFFERS, WAL, SETTINGS, FORMAT JSON)"
+            if analyze
+            else "EXPLAIN (SETTINGS, FORMAT JSON)"
+        )
+        for label, offset in offsets:
+            cursor = None
+            predicate = ""
+            if offset is not None:
+                rows = self.require(
+                    "SELECT last_updated::text, id FROM resources "
+                    f"WHERE tenant_id = '{TENANT}' AND resource_type = 'Patient' "
+                    f"AND is_deleted = FALSE ORDER BY last_updated, id OFFSET {offset} LIMIT 1;"
+                )
+                if not rows:
+                    plans.append({"label": label, "error": "cursor row not found"})
+                    continue
+                cursor = {"last_updated": rows[0][0], "id": rows[0][1]}
+                timestamp = cursor["last_updated"].replace("'", "''")
+                resource_id = cursor["id"].replace("'", "''")
+                predicate = (
+                    f" AND (last_updated > '{timestamp}'::timestamptz OR "
+                    f"(last_updated = '{timestamp}'::timestamptz AND id > '{resource_id}'))"
+                )
+            sql = (
+                f"{prefix} SELECT id, version_id, data, last_updated, fhir_version FROM resources "
+                f"WHERE tenant_id = '{TENANT}' AND resource_type = 'Patient' "
+                f"AND is_deleted = FALSE{predicate} ORDER BY last_updated ASC, id ASC LIMIT 100;"
+            )
+            result = self.psql(sql, timeout=300)
+            raw = "\n".join(row[0] for row in result["rows"] if row)
+            try:
+                plan = json.loads(raw) if result["ok"] else None
+            except json.JSONDecodeError:
+                plan = None
+            plans.append({
+                "label": label,
+                "cursor": cursor,
+                "analyze": analyze,
+                "ok": result["ok"] and plan is not None,
+                "plan": plan,
+                "raw": None if plan is not None else raw,
+                "error": result["error"],
+            })
+        return plans
+
+    def detail(self, resource_ids: list[str], submission_id: str) -> dict[str, Any]:
+        """Versions, history and receipt bookkeeping.  Never SELECT * on changes."""
+        tables = self.existing_tables()
+        ids = ", ".join("'" + rid.replace("'", "") + "'" for rid in resource_ids)
+        sid = submission_id.replace("'", "")
+        queries: dict[str, str] = {
+            "resources": (
+                f"SELECT id, version_id, is_deleted, last_updated, fhir_version, data::text FROM resources "
+                f"WHERE tenant_id = '{TENANT}' AND resource_type = 'Patient' AND id IN ({ids}) ORDER BY id;"
+            ),
+            "history": (
+                f"SELECT id, version_id, last_updated FROM resource_history "
+                f"WHERE tenant_id = '{TENANT}' AND resource_type = 'Patient' AND id IN ({ids}) "
+                "ORDER BY id, last_updated, version_id;"
+            ),
+        }
+        if "bulk_submissions" in tables:
+            queries["submission"] = (
+                f"SELECT submission_id, status, created_at, updated_at, completed_at FROM bulk_submissions "
+                f"WHERE tenant_id = '{TENANT}' AND submission_id = '{sid}';"
+            )
+        if "bulk_manifests" in tables:
+            queries["manifests"] = (
+                f"SELECT manifest_id, status, total_entries, processed_entries, failed_entries FROM bulk_manifests "
+                f"WHERE tenant_id = '{TENANT}' AND submission_id = '{sid}' ORDER BY added_at;"
+            )
+        if "bulk_entry_results" in tables:
+            queries["entry_results"] = (
+                f"SELECT outcome, coalesce(created::text, 'null'), count(*) FROM bulk_entry_results "
+                f"WHERE tenant_id = '{TENANT}' AND submission_id = '{sid}' GROUP BY 1, 2 ORDER BY 1, 2;"
+            )
+        if "bulk_submission_changes" in tables:
+            queries["changes"] = (
+                f"SELECT change_type, coalesce(previous_version, 'null'), new_version, count(*) "
+                f"FROM bulk_submission_changes WHERE tenant_id = '{TENANT}' AND submission_id = '{sid}' "
+                "GROUP BY 1, 2, 3 ORDER BY 1, 2, 3;"
+            )
+        if "bulk_submit_files" in tables:
+            queries["files"] = (
+                f"SELECT file_type, count(*) FROM bulk_submit_files "
+                f"WHERE tenant_id = '{TENANT}' AND submission_id = '{sid}' GROUP BY 1 ORDER BY 1;"
+            )
+        data: dict[str, list[list[str]]] = {}
+        for name, sql in queries.items():
+            data[name] = self.require(sql)
+        return {"tables": sorted(tables), "data": data}
+
+
+# --------------------------------------------------------------------------
+# loopback fixture provider
+# --------------------------------------------------------------------------
+
+
+class FixtureProvider:
+    """Serve the NDJSON corpus over loopback HTTP/1.1 (HTTP/1.0 truncated large bodies, #1126)."""
+
+    def __init__(self, root: Path, preferred_port: int, log: RunLog, log_path: Path):
+        self.root = root
+        self.preferred_port = preferred_port
+        self.log = log
+        self.httpd: Optional[http.server.ThreadingHTTPServer] = None
+        self.port = 0
+        self._lock = threading.Lock()
+        self._handle = open(log_path, "a", encoding="utf-8", buffering=1)
+
+    def _factory(self) -> Callable[..., http.server.SimpleHTTPRequestHandler]:
+        provider = self
+
+        class Handler(http.server.SimpleHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"  # HTTP/1.0 truncated large bodies (#1126)
+            timeout = 300  # reap idle keep-alive connections
+
+            def log_message(self, fmt: str, *args: Any) -> None:
+                provider._record(f"{self.address_string()} {fmt % args}")
+
+            def log_error(self, fmt: str, *args: Any) -> None:
+                provider._record(f"error {self.address_string()} {fmt % args}")
+
+        return functools.partial(Handler, directory=str(self.root))
+
+    def _record(self, message: str) -> None:
+        with self._lock:
+            self._handle.write(json.dumps({"wall": iso_now(), "message": message}) + "\n")
+
+    def start(self) -> str:
+        base = self.preferred_port or 19200
+        for candidate in range(base, base + 60):
+            if not port_is_free("127.0.0.1", candidate):
+                continue
+            try:
+                self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", candidate), self._factory())
+            except OSError:
+                continue
+            self.port = candidate
+            break
+        if self.httpd is None:
+            raise ConfigError("could not bind a loopback provider port")
+        self.httpd.daemon_threads = True
+        threading.Thread(target=self.httpd.serve_forever, name="provider", daemon=True).start()
+        url = f"http://127.0.0.1:{self.port}"
+        self.log.line("provider_started", base=url, root=str(self.root))
+        return url
+
+    def stop(self) -> None:
+        if self.httpd is not None:
+            try:
+                self.httpd.shutdown()
+                self.httpd.server_close()
+            except Exception:
+                pass
+        with self._lock:
+            self._handle.close()
+
+
+# --------------------------------------------------------------------------
+# HFS process
+# --------------------------------------------------------------------------
+
+
+class HfsProcess:
+    def __init__(self, argv: list[str], env: dict[str, str], cwd: Path, log_path: Path):
+        self.argv = argv
+        self.env = env
+        self.cwd = cwd
+        self.log_path = log_path
+        self.popen: Optional[subprocess.Popen] = None
+        self.pid: Optional[int] = None
+        self._handle = None
+
+    def start(self) -> int:
+        self._handle = open(self.log_path, "wb", buffering=0)
+        self.popen = subprocess.Popen(
+            self.argv, cwd=str(self.cwd), env=self.env,
+            stdout=self._handle, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        self.pid = self.popen.pid
+        return self.pid
+
+    def alive(self) -> bool:
+        return self.popen is not None and self.popen.poll() is None
+
+    def stop(self, grace_seconds: float = 10.0) -> dict[str, Any]:
+        """Terminate exactly this process group; never anything else."""
+        result: dict[str, Any] = {"pid": self.pid, "sigkill": False, "exit_code": None}
+        if self.popen is not None and self.popen.poll() is None and self.pid:
+            for signum, wait in ((signal.SIGTERM, grace_seconds), (signal.SIGKILL, 5.0)):
+                try:
+                    os.killpg(os.getpgid(self.pid), signum)
+                except (ProcessLookupError, PermissionError):
+                    break
+                result["sigkill"] = signum == signal.SIGKILL
+                try:
+                    self.popen.wait(timeout=wait)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+        if self.popen is not None:
+            result["exit_code"] = self.popen.poll()
+        if self._handle is not None:
+            self._handle.close()
+            self._handle = None
+        return result
+
+
+def http_request(
+    method: str, url: str, body: Optional[bytes] = None, timeout: float = 60.0
+) -> dict[str, Any]:
+    request = urllib.request.Request(url, data=body, method=method)
+    request.add_header("Accept", "application/fhir+json, application/json")
+    if body is not None:
+        request.add_header("Content-Type", "application/fhir+json")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return {
+                "status": response.status,
+                "headers": {key.lower(): value for key, value in response.headers.items()},
+                "body": response.read(),
+                "error": None,
+            }
+    except urllib.error.HTTPError as exc:
+        payload = b""
+        try:
+            payload = exc.read()
+        except Exception:
+            pass
+        return {
+            "status": exc.code,
+            "headers": {key.lower(): value for key, value in (exc.headers or {}).items()},
+            "body": payload,
+            "error": f"HTTP {exc.code}",
+        }
+    except Exception as exc:
+        return {"status": 0, "headers": {}, "body": b"", "error": str(exc)}
+
+
+def http_json(method: str, url: str, payload: Any = None, timeout: float = 60.0) -> dict[str, Any]:
+    body = json.dumps(payload).encode("utf-8") if payload is not None else None
+    result = http_request(method, url, body=body, timeout=timeout)
+    parsed = None
+    if result["body"]:
+        try:
+            parsed = json.loads(result["body"].decode("utf-8", errors="replace"))
+        except json.JSONDecodeError:
+            parsed = None
+    result["json"] = parsed
+    return result
+
+
+def parameters_map(payload: Any) -> dict[str, Any]:
+    values: dict[str, Any] = {}
+    for parameter in (payload or {}).get("parameter", []):
+        for key, value in parameter.items():
+            if key != "name":
+                values[parameter.get("name")] = value
+    return values
+
+
+# --------------------------------------------------------------------------
+# sampling thread
+# --------------------------------------------------------------------------
+
+
+class Sampler(threading.Thread):
+    def __init__(self, ctl: "Controller"):
+        super().__init__(name="sampler", daemon=True)
+        self.ctl = ctl
+        self._stop_event = threading.Event()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def run(self) -> None:
+        next_host = 0.0
+        docker_thread = None
+        if self.ctl.args.docker_stats_interval > 0:
+            docker_thread = threading.Thread(target=self.sample_database, daemon=True)
+            docker_thread.start()
+        while not self._stop_event.is_set():
+            now = mono()
+            try:
+                self.ctl.sample_rss()
+                if now >= next_host:
+                    self.ctl.sample_host()
+                    next_host = now + self.ctl.args.host_interval
+                self.ctl.check_deadline()
+            except Exception as exc:
+                self.ctl.log.line("sampler_error", error=str(exc))
+            self._stop_event.wait(self.ctl.args.sample_interval)
+        if docker_thread is not None:
+            docker_thread.join(timeout=7)
+
+    def sample_database(self) -> None:
+        # Docker's stats call can take seconds. It must not block HFS RSS or
+        # the host-pressure watchdog.
+        while not self._stop_event.is_set():
+            try:
+                self.ctl.sample_docker_stats()
+            except Exception as exc:
+                self.ctl.log.line("database_sampler_error", error=str(exc))
+            self._stop_event.wait(self.ctl.args.docker_stats_interval)
+
+
+# --------------------------------------------------------------------------
+# controller
+# --------------------------------------------------------------------------
+
+
+RSS_COLUMNS = [
+    "wall_iso", "mono_s", "rel_s", "phase", "job", "pid",
+    "rss_kib", "rss_mib", "vsz_kib", "cpu_percent",
+]
+HOST_COLUMNS = [
+    "wall_iso", "mono_s", "rel_s", "phase", "job", "page_size", "free_pages",
+    "speculative_pages", "free_spec_mib", "active_mib", "inactive_mib", "wired_mib",
+    "compressor_mib", "compressed_pages", "swap_total_mib", "swap_used_mib",
+    "swap_free_mib", "pressure_level", "swapouts_pages_cum", "swapout_bytes_cum",
+    "swapout_bytes_since_start", "swapins_pages_cum", "load1", "load5", "load15",
+]
+PHASE_COLUMNS = [
+    "phase", "job", "wall_iso", "mono_s", "rel_s", "rss_mib", "host_free_spec_mib",
+    "host_swap_free_mib", "host_compressor_mib", "pressure_level",
+    "swapout_bytes_since_start", "uptime_seconds", "extra_json",
+]
+DOCKER_COLUMNS = [
+    "wall_iso", "mono_s", "rel_s", "phase", "job", "container", "mem_usage_mib",
+    "mem_limit_mib", "mem_percent", "cpu_percent", "pids", "block_io", "net_io",
+]
+
+
+class Controller:
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
+        self.t0 = mono()
+        self.run_id = os.urandom(3).hex()
+        self.repo_root = (
+            Path(args.repo_root).expanduser().resolve()
+            if args.repo_root
+            else Path(__file__).resolve().parents[4]
+        )
+        self.out = Path(args.output_dir).expanduser().resolve()
+        self.binary = Path(args.binary).expanduser().resolve()
+        parts = db_url_parts(args.database_url)
+        self.pg = PgClient(
+            args.pg_container,
+            args.pg_user or str(parts["user"]),
+            args.pg_db or str(parts["db"]),
+        )
+
+        self.log: Optional[RunLog] = None
+        self.provider: Optional[FixtureProvider] = None
+        self.hfs: Optional[HfsProcess] = None
+        self.follower: Optional[LogFollower] = None
+        self.sampler: Optional[Sampler] = None
+        self.provider_base: Optional[str] = None
+        self.csv_rss: Optional[CsvWriter] = None
+        self.csv_host: Optional[CsvWriter] = None
+        self.csv_phase: Optional[CsvWriter] = None
+        self.csv_docker: Optional[CsvWriter] = None
+        self.jsonl_phase: Optional[JsonlWriter] = None
+        self.jsonl_pg: Optional[JsonlWriter] = None
+        self.jsonl_stops: Optional[JsonlWriter] = None
+
+        self.lock = threading.Lock()
+        self.phases: list[dict[str, Any]] = []
+        self.stops: list[dict[str, Any]] = []
+        self.checks: list[dict[str, Any]] = []
+        self.attempts: list[dict[str, Any]] = []
+        self.rss_rows: list[dict[str, Any]] = []
+        self.docker_rows: list[dict[str, Any]] = []
+        self.preflight_info: dict[str, Any] = {}
+        self.fixture_info: dict[str, Any] = {}
+        self.current_attempt: Optional[dict[str, Any]] = None
+        self.current_phase = "preflight"
+        self.current_job = 0
+        self.last_host: Optional[dict[str, Any]] = None
+        self.swapout_baseline_bytes: Optional[int] = None
+        self.rss_baseline_mib: Optional[float] = None
+        self.pressure_streak = 0
+        self.swap_growth_streak = 0
+        self.abort: Optional[dict[str, Any]] = None
+        self.signal_number: Optional[int] = None
+        self.deadline_mono = self.t0 + args.deadline
+
+    # -- paths / fixtures -------------------------------------------------
+
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.args.host}:{self.args.hfs_port}"
+
+    @property
+    def hfs_dir(self) -> Path:
+        return self.out / "hfs"
+
+    @property
+    def jobs_dir(self) -> Path:
+        return self.out / "jobs"
+
+    @property
+    def fixtures_dir(self) -> Path:
+        return self.out / "fixtures"
+
+    def patient_id(self, file_index: int, offset: int) -> str:
+        return f"p995-{file_index}-{offset}"
+
+    def patient_resource(self, file_index: int, offset: int) -> dict[str, Any]:
+        resource = {
+            "resourceType": "Patient",
+            "id": self.patient_id(file_index, offset),
+            "identifier": [
+                {
+                    "system": MRN_SYSTEM,
+                    "value": f"MRN-{file_index}-{offset}",
+                    "use": "official",
+                }
+            ],
+            "active": offset % 2 == 0,
+            "name": [{"family": FAMILY, "given": [f"File{file_index}", f"Index{offset}"]}],
+            "telecom": [
+                {"system": "phone", "value": f"555-{file_index:03d}-{offset:04d}", "use": "home"}
+            ],
+            "gender": "female" if offset % 2 == 0 else "male",
+            "birthDate": ["1970-01-01", "1975-05-05", "1980-09-09", "1985-12-12"][offset % 4],
+            "address": [
+                {
+                    "use": "home",
+                    "line": [f"{offset} Memory Way"],
+                    "city": "Springfield",
+                    "state": "IL",
+                    "postalCode": "62701",
+                }
+            ],
+        }
+        if (
+            self.args.fixture_mode == "oversized"
+            and file_index == 0
+            and offset == self.oversized_offset()
+        ):
+            resource["photo"] = [
+                {"contentType": "application/octet-stream", "data": ""}
+            ]
+            compact = json.dumps(
+                resource, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")
+            padding = GROUPED_CREATE_CONTENT_LIMIT_BYTES + 1 - len(compact)
+            if padding < 1:
+                raise ConfigError("oversized fixture base unexpectedly exceeds 8 MiB")
+            resource["photo"][0]["data"] = "A" * padding
+        return resource
+
+    def fixture_file_count(self) -> int:
+        return 1 if self.args.postgres_grouped_create_evidence else FIXTURE_FILE_COUNT
+
+    def oversized_offset(self) -> int:
+        if self.args.resources >= GROUPED_CREATE_OVERSIZED_RESOURCES:
+            return 100
+        return self.args.resources // 2
+
+    def file_offsets(self) -> list[list[int]]:
+        """Local offsets per file, so ids read `p995-<file>-<offset>`."""
+        total = self.args.resources
+        file_count = self.fixture_file_count()
+        per_file = total // file_count
+        layout = [list(range(per_file)) for _ in range(file_count)]
+        remainder = total - per_file * file_count
+        if remainder:
+            layout[-1].extend(range(per_file, per_file + remainder))
+        return layout
+
+    def expected_ids(self, file_index: int) -> list[str]:
+        return [self.patient_id(file_index, offset) for offset in self.file_offsets()[file_index]]
+
+    def expected_total(self) -> int:
+        return self.args.resources
+
+    def expected_active(self) -> int:
+        return sum(1 for offsets in self.file_offsets() for offset in offsets if offset % 2 == 0)
+
+    def ensure_fixtures(self, job: int) -> str:
+        if not self.fixture_info:
+            files = []
+            for file_index, offsets in enumerate(self.file_offsets()):
+                path = self.fixtures_dir / f"patients-{file_index}.ndjson"
+                with open(path, "w", encoding="utf-8") as handle:
+                    for offset in offsets:
+                        handle.write(json.dumps(self.patient_resource(file_index, offset)) + "\n")
+                files.append(
+                    {
+                        "name": path.name,
+                        "count": len(offsets),
+                        "bytes": path.stat().st_size,
+                        "sha256": sha256_file(path),
+                        "ids": [self.patient_id(file_index, offset) for offset in offsets],
+                    }
+                )
+            self.fixture_info = {
+                "family": FAMILY,
+                "mrn_system": MRN_SYSTEM,
+                "mode": self.args.fixture_mode,
+                "file_count": self.fixture_file_count(),
+                "files": files,
+                "total": sum(entry["count"] for entry in files),
+                "total_bytes": sum(entry["bytes"] for entry in files),
+                "corpus_sha256": hashlib.sha256(
+                    "".join(entry["sha256"] for entry in files).encode("ascii")
+                ).hexdigest(),
+                "scheme": (
+                    "one-file deterministic all-new Patients"
+                    if self.args.postgres_grouped_create_evidence
+                    else "identical resources re-submitted with stable ids (reimports)"
+                ),
+            }
+            if self.args.fixture_mode == "oversized":
+                oversized = self.patient_resource(0, self.oversized_offset())
+                self.fixture_info["oversized"] = {
+                    "id": oversized["id"],
+                    "offset": self.oversized_offset(),
+                    "compact_bytes": len(
+                        json.dumps(
+                            oversized, separators=(",", ":"), ensure_ascii=False
+                        ).encode("utf-8")
+                    ),
+                    "content_limit_bytes": GROUPED_CREATE_CONTENT_LIMIT_BYTES,
+                }
+        manifest_path = self.fixtures_dir / f"manifest-{job:02d}.json"
+        manifest = {
+            "transactionTime": "2024-01-01T00:00:00Z",
+            "request": f"{self.provider_base}/{manifest_path.name}",
+            "requiresAccessToken": False,
+            "output": [
+                {
+                    "type": "Patient",
+                    "url": f"{self.provider_base}/{entry['name']}",
+                    "count": entry["count"],
+                }
+                for entry in self.fixture_info["files"]
+            ],
+            "error": [],
+            "deleted": [],
+        }
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        return f"{self.provider_base}/{manifest_path.name}"
+
+    def start_provider(self) -> None:
+        """Point ``provider_base`` at an external server, or start the built-in one."""
+        if not self.args.provider_url:
+            self.provider = FixtureProvider(
+                self.fixtures_dir, self.args.provider_port, self.log, self.out / "provider.log"
+            )
+            self.provider_base = self.provider.start()
+            return
+        self.provider_base = self.args.provider_url
+        self.log.line(
+            "provider_external", base=self.provider_base, root=str(self.fixtures_dir)
+        )
+        self.verify_external_provider()
+
+    def verify_external_provider(self) -> None:
+        """Fail fast unless ``--provider-url`` serves this run's fixtures directory."""
+        probe = self.fixtures_dir / ".provider-probe"
+        token = os.urandom(16).hex()
+        probe.write_text(token, encoding="ascii")
+        url = f"{self.provider_base}/{probe.name}"
+        try:
+            with urllib.request.urlopen(url, timeout=30) as response:
+                served = response.read().decode("ascii", "replace").strip()
+        except (urllib.error.URLError, OSError) as exc:
+            raise ConfigError(
+                f"--provider-url {self.provider_base} did not serve {probe.name}: {exc}; "
+                f"the server must be rooted at {self.fixtures_dir}"
+            ) from exc
+        finally:
+            probe.unlink(missing_ok=True)
+        if served != token:
+            raise ConfigError(
+                f"--provider-url {self.provider_base} served unexpected bytes for "
+                f"{probe.name}; the server must be rooted at {self.fixtures_dir}"
+            )
+        self.log.line("provider_probe_ok", base=self.provider_base)
+
+    # -- outputs ----------------------------------------------------------
+
+    def prepare_outputs(self) -> None:
+        if self.out.exists():
+            raise ConfigError(f"output dir already exists: {self.out} (must be a new path)")
+        self.out.mkdir(parents=True)
+        for directory in (self.hfs_dir, self.jobs_dir, self.fixtures_dir):
+            directory.mkdir(parents=True, exist_ok=True)
+        self.log = RunLog(self.out / "controller.log", echo=not self.args.quiet)
+        self.csv_rss = CsvWriter(self.out / "rss.csv", RSS_COLUMNS)
+        self.csv_host = CsvWriter(self.out / "host.csv", HOST_COLUMNS)
+        self.csv_phase = CsvWriter(self.out / "phases.csv", PHASE_COLUMNS)
+        self.csv_docker = CsvWriter(self.out / "docker_stats.csv", DOCKER_COLUMNS)
+        self.jsonl_phase = JsonlWriter(self.out / "phases.jsonl")
+        self.jsonl_pg = JsonlWriter(self.out / "pg_probes.jsonl")
+        self.jsonl_stops = JsonlWriter(self.out / "stops.jsonl")
+        self.log.line(
+            "run_start",
+            output_dir=str(self.out),
+            database=redact_db_url(self.args.database_url),
+            pg_container=self.args.pg_container,
+        )
+
+    def write_json(self, relative: str, payload: Any) -> None:
+        path = self.out / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(path, payload)
+
+    # -- phases / sampling ------------------------------------------------
+
+    def metrics_uptime(self) -> Optional[float]:
+        if not (self.hfs and self.hfs.alive()):
+            return None
+        result = http_request("GET", f"{self.base_url}/metrics", timeout=15)
+        if result["status"] != 200:
+            return None
+        match = re.search(r"uptime_seconds\s+([0-9.]+)", result["body"].decode("utf-8", "replace"))
+        return float(match.group(1)) if match else None
+
+    def phase(self, name: str, job: int, extra: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+        pid = self.hfs.pid if self.hfs else None
+        sample = ps_sample(pid) if pid else None
+        host = self.last_host or {}
+        swapout_growth = None
+        if host.get("swapout_bytes") is not None and self.swapout_baseline_bytes is not None:
+            swapout_growth = int(host["swapout_bytes"]) - self.swapout_baseline_bytes
+        record = {
+            "phase": name,
+            "job": job,
+            "wall_iso": iso_now(),
+            "mono_s": round(mono(), 3),
+            "rel_s": round(mono() - self.t0, 3),
+            "rss_mib": round(sample["rss_kib"] / 1024, 1) if sample else None,
+            "host_free_spec_mib": _round(host.get("free_spec_mib")),
+            "host_swap_free_mib": _round(host.get("swap_free_mib")),
+            "host_compressor_mib": _round(host.get("compressor_mib")),
+            "pressure_level": host.get("pressure_level"),
+            "swapout_bytes_since_start": swapout_growth,
+            "uptime_seconds": self.metrics_uptime(),
+            "extra": extra or {},
+        }
+        with self.lock:
+            self.phases.append(record)
+            self.current_phase = name
+            self.current_job = job
+        if self.csv_phase:
+            self.csv_phase.write(
+                {
+                    **{key: record[key] for key in PHASE_COLUMNS if key != "extra_json"},
+                    "extra_json": json.dumps(record["extra"], default=str),
+                }
+            )
+        if self.jsonl_phase:
+            self.jsonl_phase.write(record)
+        if self.log:
+            self.log.line(
+                "phase", phase=name, job=job, rss_mib=record["rss_mib"],
+                swap_free_mib=record["host_swap_free_mib"], pressure=record["pressure_level"],
+            )
+        return record
+
+    def sample_rss(self) -> None:
+        pid = self.hfs.pid if self.hfs else None
+        if not pid:
+            return
+        sample = ps_sample(pid)
+        if sample is None:
+            return
+        rss_mib = sample["rss_kib"] / 1024
+        row = {
+            "wall_iso": iso_now(),
+            "mono_s": round(mono(), 3),
+            "rel_s": round(mono() - self.t0, 3),
+            "phase": self.current_phase,
+            "job": self.current_job,
+            "pid": pid,
+            "rss_kib": int(sample["rss_kib"]),
+            "rss_mib": round(rss_mib, 3),
+            "vsz_kib": int(sample["vsz_kib"]),
+            "cpu_percent": sample["cpu_percent"],
+        }
+        with self.lock:
+            self.rss_rows.append(row)
+        if self.csv_rss:
+            self.csv_rss.write(row)
+        if rss_mib > self.args.operational_max_rss_mib:
+            self.request_stop(
+                {
+                    "rule": "rss_operational_max",
+                    "observed_mib": round(rss_mib, 1),
+                    "threshold_mib": self.args.operational_max_rss_mib,
+                }
+            )
+
+    def sample_host(self) -> None:
+        vitals = host_vitals()
+        self.last_host = vitals
+        if self.swapout_baseline_bytes is None and vitals.get("swapout_bytes") is not None:
+            self.swapout_baseline_bytes = int(vitals["swapout_bytes"])
+        growth = None
+        if vitals.get("swapout_bytes") is not None and self.swapout_baseline_bytes is not None:
+            growth = int(vitals["swapout_bytes"]) - self.swapout_baseline_bytes
+        row = {
+            "wall_iso": vitals["wall"],
+            "mono_s": round(vitals["mono"], 3),
+            "rel_s": round(vitals["mono"] - self.t0, 3),
+            "phase": self.current_phase,
+            "job": self.current_job,
+            "page_size": vitals.get("page_size"),
+            "free_pages": vitals.get("free_pages"),
+            "speculative_pages": vitals.get("speculative_pages"),
+            "free_spec_mib": _round(vitals.get("free_spec_mib")),
+            "active_mib": _round(vitals.get("active_mib")),
+            "inactive_mib": _round(vitals.get("inactive_mib")),
+            "wired_mib": _round(vitals.get("wired_mib")),
+            "compressor_mib": _round(vitals.get("compressor_mib")),
+            "compressed_pages": vitals.get("compressed_pages"),
+            "swap_total_mib": _round(vitals.get("swap_total_mib")),
+            "swap_used_mib": _round(vitals.get("swap_used_mib")),
+            "swap_free_mib": _round(vitals.get("swap_free_mib")),
+            "pressure_level": vitals.get("pressure_level"),
+            "swapouts_pages_cum": vitals.get("swapouts_pages"),
+            "swapout_bytes_cum": vitals.get("swapout_bytes"),
+            "swapout_bytes_since_start": growth,
+            "swapins_pages_cum": vitals.get("swapins_pages"),
+            "load1": vitals.get("load1"),
+            "load5": vitals.get("load5"),
+            "load15": vitals.get("load15"),
+        }
+        if self.csv_host:
+            self.csv_host.write(row)
+        pressure = vitals.get("pressure_level")
+        if pressure is not None:
+            self.pressure_streak = self.pressure_streak + 1 if pressure != 1 else 0
+            if self.pressure_streak >= self.args.pressure_samples:
+                self.request_stop(
+                    {
+                        "rule": "memory_pressure_sustained",
+                        "observed": pressure,
+                        "threshold_samples": self.args.pressure_samples,
+                        "sample": row,
+                    }
+                )
+                return
+        if growth is not None:
+            self.swap_growth_streak = (
+                self.swap_growth_streak + 1
+                if growth / 1024 / 1024 > self.args.swap_growth_mib
+                else 0
+            )
+            if self.swap_growth_streak >= self.args.swap_growth_samples:
+                self.request_stop(
+                    {
+                        "rule": "swapout_growth",
+                        "observed_mib": round(growth / 1024 / 1024, 1),
+                        "threshold_mib": self.args.swap_growth_mib,
+                        "sample": row,
+                    }
+                )
+
+    def sample_docker_stats(self) -> None:
+        result = run_capture(
+            ["docker", "stats", "--no-stream", "--format", "{{json .}}", self.args.pg_container],
+            timeout=5,
+        )
+        row = {
+            "wall_iso": iso_now(),
+            "mono_s": round(mono(), 3),
+            "rel_s": round(mono() - self.t0, 3),
+            "phase": self.current_phase,
+            "job": self.current_job,
+            "container": self.args.pg_container,
+        }
+        for line in result.stdout.splitlines():
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            usage, _, limit = (payload.get("MemUsage") or "").partition("/")
+            row.update(
+                {
+                    "mem_usage_mib": _usage_mib(usage),
+                    "mem_limit_mib": _usage_mib(limit),
+                    "mem_percent": payload.get("MemPerc"),
+                    "cpu_percent": payload.get("CPUPerc"),
+                    "pids": payload.get("PIDs"),
+                    "block_io": payload.get("BlockIO"),
+                    "net_io": payload.get("NetIO"),
+                }
+            )
+        if self.csv_docker:
+            self.csv_docker.write(row)
+        self.docker_rows.append(row)
+
+    def check_deadline(self) -> None:
+        if self.args.deadline > 0 and mono() > self.deadline_mono:
+            self.request_stop(
+                {
+                    "rule": "deadline",
+                    "observed_s": round(mono() - self.t0, 1),
+                    "threshold_s": self.args.deadline,
+                }
+            )
+
+    def request_stop(self, event: dict[str, Any]) -> None:
+        with self.lock:
+            if self.abort is not None:
+                return
+            record = {
+                **event,
+                "wall_iso": iso_now(),
+                "mono_s": round(mono(), 3),
+                "rel_s": round(mono() - self.t0, 3),
+                "last_60s": self.rss_rows[-120:],
+            }
+            self.stops.append(record)
+            self.abort = {"reason": f"watchdog:{event['rule']}", "detail": record}
+        if self.jsonl_stops:
+            self.jsonl_stops.write(record)
+        if self.log:
+            self.log.line("stop_requested", rule=event["rule"], detail=json.dumps(event, default=str))
+        if self.hfs is not None:
+            stopped = self.hfs.stop(grace_seconds=5.0)
+            if self.log:
+                self.log.line("hfs_stopped_by_watchdog", **stopped)
+
+    def raise_if_aborted(self) -> None:
+        with self.lock:
+            abort = self.abort
+        if abort is not None:
+            raise Aborted(abort["reason"], abort.get("detail", {}))
+        if self.signal_number is not None:
+            raise Aborted(f"signal:{self.signal_number}")
+
+    # -- preflight --------------------------------------------------------
+
+    def preflight(self) -> dict[str, Any]:
+        if not self.binary.is_file():
+            raise ConfigError(f"binary not found: {self.binary}")
+        if not os.access(self.binary, os.X_OK):
+            raise ConfigError(f"binary is not executable: {self.binary}")
+        r4 = self.repo_root / "data" / "search-parameters-r4.json"
+        if not r4.is_file():
+            raise ConfigError(
+                f"missing {r4}: HFS would fall back to the embedded parameter set "
+                "(pass --repo-root if the checkout is elsewhere)"
+            )
+        info: dict[str, Any] = {
+            "binary": {
+                "path": str(self.binary),
+                "sha256": sha256_file(self.binary),
+                "size_bytes": self.binary.stat().st_size,
+                "mtime": datetime.fromtimestamp(self.binary.stat().st_mtime, timezone.utc)
+                .isoformat(timespec="seconds")
+                .replace("+00:00", "Z"),
+            },
+            "controller": {
+                "path": str(Path(__file__).resolve()),
+                "sha256": sha256_file(Path(__file__).resolve()),
+                "python": sys.version,
+            },
+            "git": {},
+            "host": {},
+            "search_parameters_file": {
+                "path": str(r4),
+                "sha256": sha256_file(r4),
+                "bytes": r4.stat().st_size,
+                "entries": _json_array_length(r4),
+            },
+            "foreign_processes": {
+                "hfs": pgrep_count("hfs"),
+                "rustc": pgrep_count("rustc"),
+                "cargo": pgrep_count("cargo"),
+            },
+        }
+        info["git"] = source_fingerprint(self.repo_root)
+        info["git"]["expected_fingerprint"] = self.args.expected_source_fingerprint
+        info["git"]["fingerprint_verified"] = bool(
+            self.args.expected_source_fingerprint
+            and info["git"]["fingerprint_sha256"]
+            == self.args.expected_source_fingerprint
+        )
+        try:
+            info["host"] = {
+                "macos": run_capture(["sw_vers", "-productVersion"], timeout=20).stdout.strip(),
+                "build": run_capture(["sw_vers", "-buildVersion"], timeout=20).stdout.strip(),
+                "cpu": run_capture(["sysctl", "-n", "machdep.cpu.brand_string"], timeout=20).stdout.strip(),
+                "ncpu": run_capture(["sysctl", "-n", "hw.ncpu"], timeout=20).stdout.strip(),
+                "memsize_bytes": run_capture(["sysctl", "-n", "hw.memsize"], timeout=20).stdout.strip(),
+            }
+        except Exception as exc:
+            info["host"] = {"error": str(exc)}
+        info["postgres"] = self._docker_inspect()
+        info["postgres"]["psql_ready"] = self.pg.wait_ready()
+        if not info["postgres"]["psql_ready"]:
+            raise ConfigError(
+                f"psql is not usable inside container {self.args.pg_container!r}; "
+                "the deferred-reindex verdict requires SQL coverage probes"
+            )
+        info["postgres"]["server"] = self.pg.server_info()
+        if self.args.postgres_grouped_create_evidence:
+            tracking = self.pg.statement_tracking_info()
+            if tracking.get("available") and tracking.get("track_utility"):
+                try:
+                    pilot = self.pg.statement_tracking_pilot()
+                    tracking["savepoint_pilot"] = pilot
+                    tracking["savepoint_pilot_observed"] = pilot["observed"]
+                except Exception as error:
+                    tracking["savepoint_pilot_observed"] = False
+                    tracking["pilot_error"] = str(error)
+            else:
+                tracking["savepoint_pilot_observed"] = False
+            info["pg_stat_statements"] = tracking
+        info["db_before"] = self.pg.counts()
+
+        samples = []
+        for index in range(self.args.preflight_samples):
+            vitals = host_vitals()
+            samples.append(
+                {
+                    "wall_iso": vitals["wall"],
+                    "free_spec_mib": _round(vitals.get("free_spec_mib")),
+                    "swap_free_mib": _round(vitals.get("swap_free_mib")),
+                    "compressor_mib": _round(vitals.get("compressor_mib")),
+                    "pressure_level": vitals.get("pressure_level"),
+                }
+            )
+            if self.swapout_baseline_bytes is None and vitals.get("swapout_bytes") is not None:
+                self.swapout_baseline_bytes = int(vitals["swapout_bytes"])
+            if index + 1 < self.args.preflight_samples:
+                time.sleep(self.args.preflight_interval)
+        info["preflight_samples"] = samples
+        info["preflight_medians"] = {
+            key: _median([s[key] for s in samples if s.get(key) is not None])
+            for key in ("free_spec_mib", "swap_free_mib", "compressor_mib")
+        }
+
+        blocked: list[str] = []
+        expected_fingerprint = self.args.expected_source_fingerprint
+        if (
+            expected_fingerprint
+            and info["git"]["fingerprint_sha256"] != expected_fingerprint
+        ):
+            blocked.append(
+                "source fingerprint mismatch: "
+                f"expected {expected_fingerprint}, got {info['git']['fingerprint_sha256']}"
+            )
+        counts = info["db_before"]["counts"]
+        stale = {
+            key: counts[key]
+            for key in ("resources", "resource_history", "bulk_submissions", "bulk_manifests")
+            if isinstance(counts.get(key), int) and counts[key] > 0
+        }
+        if stale and not self.args.allow_nonempty_db:
+            blocked.append("database is not fresh: " + ", ".join(f"{k}={v}" for k, v in stale.items()))
+        if self.args.postgres_grouped_create_evidence:
+            tracking = info.get("pg_stat_statements") or {}
+            if not tracking.get("available"):
+                blocked.append("pg_stat_statements extension is unavailable")
+            if not tracking.get("track_utility"):
+                blocked.append("pg_stat_statements.track_utility must be on")
+            if not tracking.get("savepoint_pilot_observed"):
+                blocked.append("pg_stat_statements did not observe the SAVEPOINT bulk_entry pilot")
+        if info["foreign_processes"]["hfs"]:
+            blocked.append(f"another hfs process is running ({info['foreign_processes']['hfs']})")
+        if info["foreign_processes"]["rustc"]:
+            blocked.append(f"a rustc build is active ({info['foreign_processes']['rustc']} processes)")
+        if info["foreign_processes"]["cargo"]:
+            blocked.append(f"a cargo build is active ({info['foreign_processes']['cargo']} processes)")
+        recent = [s["pressure_level"] for s in samples[-3:]]
+        if recent and all(level is not None and level != 1 for level in recent):
+            blocked.append(f"memory pressure is not normal: {recent}")
+        info["blocked"] = bool(blocked)
+        info["block_reasons"] = blocked
+        self.preflight_info = info
+        for reason in blocked:
+            self.log.line("preflight_blocked", reason=reason)
+        if not blocked:
+            self.log.line(
+                "preflight_ok",
+                swap_free_mib=info["preflight_medians"]["swap_free_mib"],
+                free_spec_mib=info["preflight_medians"]["free_spec_mib"],
+                compressor_mib=info["preflight_medians"]["compressor_mib"],
+            )
+        return info
+
+    def _docker_inspect(self) -> dict[str, Any]:
+        result = run_capture(
+            ["docker", "inspect", "--format", "{{json .}}", self.args.pg_container], timeout=60
+        )
+        if result.returncode != 0:
+            raise ConfigError(
+                f"docker inspect {self.args.pg_container!r} failed: {result.stderr.strip()[:200]}"
+            )
+        payload = json.loads(result.stdout.strip().splitlines()[0])
+        host_config = payload.get("HostConfig") or {}
+        state = payload.get("State") or {}
+        return {
+            "container": self.args.pg_container,
+            "id": payload.get("Id"),
+            "image": (payload.get("Config") or {}).get("Image"),
+            "image_id": payload.get("Image"),
+            "running": state.get("Running"),
+            "started_at": state.get("StartedAt"),
+            "memory_limit_mib": _mib(host_config.get("Memory")),
+            "memory_swap_mib": _mib(host_config.get("MemorySwap")),
+            "nano_cpus": host_config.get("NanoCpus"),
+            "user": self.pg.user,
+            "database": self.pg.database,
+        }
+
+    # -- HFS lifecycle ----------------------------------------------------
+
+    def effective_env(self) -> dict[str, str]:
+        return effective_hfs_env(self.args, self.base_url, self.out)
+
+    def start_hfs(self, job: int) -> None:
+        # An unrelated shell's HFS settings must not change this experiment.
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith("HFS_") and key != "HELIOS_OBS_MODE"}
+        overrides = self.effective_env()
+        env.update(overrides)
+        # Credentials travel in the environment, never in argv.
+        env["HFS_DATABASE_URL"] = self.args.database_url
+        argv = [
+            str(self.binary),
+            "--host", self.args.host,
+            "--port", str(self.args.hfs_port),
+            "--log-level", self.args.hfs_log_level,
+        ]
+        log_path = self.hfs_dir / f"job{job:02d}.log"
+        self.hfs = HfsProcess(argv, env, self.repo_root, log_path)
+        pid = self.hfs.start()
+        self.follower = LogFollower(log_path)
+        self.phase(
+            "server_start",
+            job,
+            {
+                "pid": pid,
+                "argv": argv,
+                "log": str(log_path),
+                "env": {
+                    key: (redact_db_url(value) if key == "HFS_DATABASE_URL" else value)
+                    for key, value in overrides.items()
+                },
+            },
+        )
+        deadline = mono() + self.args.startup_timeout
+        while True:
+            self.raise_if_aborted()
+            if not self.hfs.alive():
+                raise Aborted("hfs_exited_during_startup", {"log_tail": self.follower.tail()})
+            if http_request("GET", f"{self.base_url}/health", timeout=15)["status"] == 200:
+                break
+            if mono() > deadline:
+                raise Aborted("hfs_startup_timeout", {"log_tail": self.follower.tail()})
+            time.sleep(1.0)
+        sample = ps_sample(pid)
+        self.rss_baseline_mib = round(sample["rss_kib"] / 1024, 1) if sample else None
+        counts = self.pg.counts()
+        self.phase(
+            "startup_complete",
+            job,
+            {
+                "rss_baseline_mib": self.rss_baseline_mib,
+                "db_counts": counts["counts"],
+                "search_parameter_file_entries": self.preflight_info["search_parameters_file"]["entries"],
+                "search_parameter_log_lines": [
+                    line
+                    for line in self.follower.read_new()
+                    if "SearchParameter" in line
+                ][:5],
+            },
+        )
+
+    def stop_hfs(self, job: int, reason: str) -> None:
+        if self.hfs is None:
+            return
+        sample = ps_sample(self.hfs.pid) if self.hfs.pid else None
+        self.phase(
+            "server_stop",
+            job,
+            {"reason": reason, "rss_mib": round(sample["rss_kib"] / 1024, 1) if sample else None},
+        )
+        stopped = self.hfs.stop()
+        if self.log:
+            self.log.line("hfs_stopped", job=job, reason=reason, **stopped)
+        self.hfs = None
+        self.follower = None
+
+    # -- submit -----------------------------------------------------------
+
+    def search_count(self, query: str) -> Optional[int]:
+        """Parameterised searches go through the index; the bare one does not."""
+        suffix = f"?{query}&_summary=count&_count=1" if query else "?_summary=count&_count=1"
+        result = http_json(
+            "GET",
+            f"{self.base_url}/Patient{suffix}",
+            timeout=self.args.request_timeout,
+        )
+        with (self.out / "search-checks.jsonl").open("a") as evidence:
+            evidence.write(json.dumps({"wall_iso": iso_now(), "query": query,
+                "status": result["status"], "error": result["error"],
+                "json": result["json"]}) + "\n")
+        if result["status"] != 200 or not isinstance(result["json"], dict):
+            return None
+        total = result["json"].get("total")
+        return int(total) if isinstance(total, (int, float)) else None
+
+    def kickoff(self, submission_id: str, manifest_url: str) -> dict[str, Any]:
+        payload = {
+            "resourceType": "Parameters",
+            "parameter": [
+                {
+                    "name": "submitter",
+                    "valueIdentifier": {"system": SUBMITTER_SYSTEM, "value": SUBMITTER_VALUE},
+                },
+                {"name": "submissionId", "valueString": submission_id},
+                {"name": "manifestUrl", "valueUrl": manifest_url},
+                {"name": "fhirBaseUrl", "valueUrl": f"{self.provider_base}/fhir"},
+                {
+                    "name": "submissionStatus",
+                    "valueCoding": {
+                        "system": "http://hl7.org/fhir/event-status",
+                        "code": "completed",
+                    },
+                },
+            ],
+        }
+        return http_json(
+            "POST", f"{self.base_url}/$bulk-submit", payload=payload, timeout=self.args.request_timeout
+        )
+
+    def poll_terminal(
+        self, job: int, submission_id: str, kickoff_mono: float
+    ) -> dict[str, Any]:
+        status_payload = {
+            "resourceType": "Parameters",
+            "parameter": [
+                {
+                    "name": "submitter",
+                    "valueIdentifier": {"system": SUBMITTER_SYSTEM, "value": SUBMITTER_VALUE},
+                },
+                {"name": "submissionId", "valueString": submission_id},
+            ],
+        }
+        opened = http_json(
+            "POST", f"{self.base_url}/$bulk-submit-status", payload=status_payload, timeout=60
+        )
+        poll_url = opened["headers"].get("content-location")
+        if opened["status"] != 202 or not poll_url:
+            raise Aborted(
+                "submit_status_kickoff_failed",
+                {"status": opened["status"], "error": opened["error"]},
+            )
+        interval = max(0.25, self.args.endpoint_poll_interval)
+        deadline = mono() + self.args.terminal_timeout
+        polls: list[dict[str, Any]] = []
+        while True:
+            self.raise_if_aborted()
+            if mono() > deadline:
+                raise Aborted("submit_terminal_timeout", {"polls": polls[-20:]})
+            result = http_json("GET", poll_url, timeout=60)
+            polls.append(
+                {
+                    "elapsed_s": round(mono() - kickoff_mono, 3),
+                    "status": result["status"],
+                    "x_progress": result["headers"].get("x-progress"),
+                    "retry_after": result["headers"].get("retry-after"),
+                }
+            )
+            if result["status"] == 200:
+                manifest = result["json"] if isinstance(result["json"], dict) else {}
+                pages = [manifest]
+                guard = 0
+                while guard < 50:
+                    guard += 1
+                    nexts = [
+                        link
+                        for link in manifest.get("link", [])
+                        if link.get("relation") == "next" and link.get("url")
+                    ]
+                    if not nexts:
+                        break
+                    page = http_json("GET", nexts[0]["url"], timeout=60)
+                    if page["status"] != 200 or not isinstance(page["json"], dict):
+                        raise Aborted("submit_manifest_page_failed", {"url": nexts[0]["url"]})
+                    manifest = page["json"]
+                    pages.append(manifest)
+                return {
+                    "poll_url": poll_url,
+                    "polls": polls,
+                    "pages": len(pages),
+                    "manifest": pages[0],
+                    "output": [entry for page in pages for entry in page.get("output", [])],
+                    "outcome": [entry for page in pages for entry in page.get("outcome", [])],
+                    "deleted": [entry for page in pages for entry in page.get("deleted", [])],
+                    "terminal_s": round(mono() - kickoff_mono, 3),
+                    "job": job,
+                }
+            if result["status"] == 404:
+                raise Aborted("submit_poll_404", {"poll_url": poll_url, "polls": polls[-5:]})
+            if result["status"] == 429:
+                time.sleep(float(result["headers"].get("retry-after") or 6))
+            else:
+                time.sleep(interval)
+
+    def receipt_check(self, job: int, output: list[dict[str, Any]]) -> dict[str, Any]:
+        """Download every receipt artifact and require the exact aggregate id set.
+
+        The worker writes one receipt per resource *type*, not per input file, so
+        the four Patient files come back as a single combined artifact.  The
+        verdict is therefore on the union of all output entries.
+        """
+        expected = {
+            self.patient_id(file_index, offset)
+            for file_index, offsets in enumerate(self.file_offsets())
+            for offset in offsets
+        }
+        summaries = []
+        ids: list[str] = []
+        for entry in output:
+            url = entry.get("url")
+            fetched = http_request("GET", url, timeout=300) if url else {"status": 0, "body": b""}
+            lines = [line for line in fetched["body"].decode("utf-8", "replace").splitlines() if line.strip()]
+            unparsable = 0
+            bad_reference = 0
+            for line in lines:
+                try:
+                    reference = str(json.loads(line).get("reference", ""))
+                except json.JSONDecodeError:
+                    unparsable += 1
+                    continue
+                if reference.startswith("Patient/"):
+                    ids.append(reference.split("/", 1)[1])
+                else:
+                    bad_reference += 1
+            declared_count = entry.get("count")
+            declared_size = entry.get("fileSize")
+            summaries.append(
+                {
+                    "url": url,
+                    "type": entry.get("type"),
+                    "status": fetched["status"],
+                    "lines": len(lines),
+                    "bytes": len(fetched["body"]),
+                    "sha256": hashlib.sha256(fetched["body"]).hexdigest(),
+                    "declared_count": declared_count,
+                    "declared_file_size": declared_size,
+                    "declared_count_ok": declared_count is None or int(declared_count) == len(lines),
+                    "declared_file_size_ok": declared_size is None or int(declared_size) == len(fetched["body"]),
+                    "unparsable_lines": unparsable,
+                    "bad_reference_lines": bad_reference,
+                }
+            )
+        seen_ids: set[str] = set()
+        duplicate_ids: set[str] = set()
+        for identifier in ids:
+            if identifier in seen_ids:
+                duplicate_ids.add(identifier)
+            seen_ids.add(identifier)
+        duplicates = sorted(duplicate_ids)
+        result = {
+            "ok": (
+                len(summaries) >= 1
+                and all(item["status"] == 200 for item in summaries)
+                and all(item["unparsable_lines"] == 0 for item in summaries)
+                and all(item["bad_reference_lines"] == 0 for item in summaries)
+                and all(item["declared_count_ok"] for item in summaries)
+                and all(item["declared_file_size_ok"] for item in summaries)
+                and not duplicates
+                and len(ids) == self.expected_total()
+                and set(ids) == expected
+            ),
+            "output_entries": len(summaries),
+            "references": len(ids),
+            "unique_references": len(set(ids)),
+            "duplicates": duplicates[:5],
+            "expected_references": len(expected),
+            "artifacts": summaries,
+        }
+        self.write_json(f"jobs/job{job:02d}/receipts.json", result)
+        if not result["ok"]:
+            raise Aborted("receipt_mismatch", result)
+        return result
+
+    # -- reindex verification ---------------------------------------------
+
+    def verify_reindex(
+        self, job: int, submission_id: str, log_offset: int, kickoff_mono: float
+    ) -> dict[str, Any]:
+        """Positive verification or the attempt is unverified and the run stops."""
+        total = self.expected_total()
+        evidence: dict[str, Any] = {
+            "defer_indexing": bool(self.args.defer_indexing),
+            "log_offset_at_kickoff": log_offset,
+        }
+        if self.args.defer_indexing:
+            deadline = mono() + self.args.reindex_timeout
+            job_id = None
+            start_log_timestamp = None
+            start_log_marker = None
+            lines: list[str] = []
+            while job_id is None:
+                self.raise_if_aborted()
+                if mono() > deadline:
+                    raise Aborted(
+                        "reindex_job_id_not_found",
+                        {"log_tail": self.follower.tail(), "evidence": evidence},
+                    )
+                lines.extend(self.follower.read_new())
+                hooks = [
+                    line
+                    for line in lines
+                    if "bulk fast-load: rebuilding deferred search indexes" in line
+                    and submission_id in line
+                ]
+                started = [
+                    line
+                    for line in lines
+                    if reindex_start_marker(line) is not None
+                ]
+                ids = {
+                    match.group(1)
+                    for line in started
+                    for match in [re.search(r'job_id="?([0-9a-fA-F-]{36})"?', line)]
+                    if match
+                }
+                if ids:
+                    evidence["hook_lines"] = hooks[-3:]
+                    evidence["start_lines"] = started[-3:]
+                    if len(ids) > 1 or len(hooks) != 1:
+                        raise Aborted(
+                            "reindex_correlation_ambiguous",
+                            {"job_ids": sorted(ids), "hook_lines": hooks[-3:]},
+                        )
+                    job_id = ids.pop()
+                    correlated_start_lines = [
+                        line for line in started if job_id in line
+                    ]
+                    correlated_start_line = correlated_start_lines[-1]
+                    start_log_timestamp = parse_reindex_start_log_timestamp(
+                        correlated_start_line
+                    )
+                    start_log_marker = reindex_start_marker(correlated_start_line)
+                time.sleep(min(1.0, self.args.endpoint_poll_interval))
+            evidence["job_id"] = job_id
+            evidence["job_id_source"] = (
+                f"hfs log line containing {start_log_marker!r} after kickoff"
+            )
+            evidence["start_log_marker"] = start_log_marker
+            evidence["start_log_timestamp"] = (
+                start_log_timestamp.isoformat().replace("+00:00", "Z")
+                if start_log_timestamp
+                else None
+            )
+            evidence["status_poll_resolution_s"] = self.args.endpoint_poll_interval
+            status_deadline = mono() + self.args.reindex_timeout
+            status_polls: list[dict[str, Any]] = []
+            while True:
+                self.raise_if_aborted()
+                result = http_json("GET", f"{self.base_url}/$reindex-status/{job_id}", timeout=60)
+                params = parameters_map(result["json"]) if result["status"] == 200 else {}
+                status_polls.append(
+                    {"status": result["status"], "reindex": params.get("status"), "at_s": round(mono() - kickoff_mono, 3)}
+                )
+                if params.get("status") in ("completed", "failed", "cancelled"):
+                    completion_observed_wall = datetime.now(timezone.utc)
+                    break
+                if mono() > status_deadline:
+                    raise Aborted(
+                        "reindex_timeout",
+                        {"polls": status_polls[-10:], "evidence": evidence},
+                    )
+                time.sleep(max(0.05, self.args.endpoint_poll_interval))
+            evidence["status_polls"] = status_polls[-10:]
+            evidence["status"] = params.get("status")
+            evidence["total"] = params.get("total")
+            evidence["processed"] = params.get("processed")
+            evidence["entries_created"] = params.get("entriesCreated")
+            evidence["error_count"] = params.get("errorCount")
+            evidence["completion_observed_wall"] = completion_observed_wall.isoformat(
+                timespec="milliseconds"
+            ).replace("+00:00", "Z")
+            upper_bound = (
+                (completion_observed_wall - start_log_timestamp).total_seconds()
+                if start_log_timestamp
+                else None
+            )
+            evidence["start_log_to_completion_observed_interval_s"] = (
+                round(upper_bound, 3)
+                if upper_bound is not None and upper_bound >= 0
+                else None
+            )
+            if (
+                params.get("status") != "completed"
+                or params.get("errorCount") != 0
+                or params.get("processed") != params.get("total")
+                or params.get("total") != total
+            ):
+                raise Aborted("reindex_not_completed_cleanly", {"evidence": evidence})
+        else:
+            evidence["job_id_source"] = "not applicable: HFS_BULK_SUBMIT_DEFER_INDEXING=false"
+
+        counts = self.pg.counts()
+        evidence["db_counts"] = counts["counts"]
+        unindexed = counts["counts"].get("unindexed_patients")
+        family_exact = counts["counts"].get("family_exact_patients")
+        fts_content = counts["counts"].get("fts_content_pilot995_patients")
+        evidence["family_exact_patients"] = family_exact
+        evidence["fts_content_pilot995_patients"] = fts_content
+        evidence["unindexed_patients"] = unindexed
+        if unindexed != 0:
+            raise Aborted("reindex_coverage_incomplete", {"evidence": evidence})
+        if family_exact != total:
+            raise Aborted("family_index_count_mismatch", {"evidence": evidence})
+        if fts_content != total:
+            raise Aborted("fts_content_count_mismatch", {"evidence": evidence})
+        ready_mono = mono()
+        evidence["reindex_s"] = round(ready_mono - kickoff_mono, 3)
+        evidence["search_ready_observed_mono"] = ready_mono
+        if (
+            self.args.postgres_reindex_evidence
+            or self.args.postgres_grouped_create_evidence
+        ):
+            try:
+                evidence["postgres_activity_at_search_ready"] = self.pg.activity_snapshot()
+            except Exception as error:
+                evidence["postgres_activity_at_search_ready"] = None
+                evidence["postgres_activity_at_search_ready_error"] = str(error)
+        if self.args.defer_indexing:
+            # Search readiness and its database snapshot are already fixed.
+            # Waiting for buffered log output must not inflate either metric.
+            summary_wait_started = mono()
+            summary_deadline = summary_wait_started + 5.0
+            summary_lines: list[str] = []
+            while mono() <= summary_deadline:
+                lines.extend(self.follower.read_new())
+                summary_lines = [
+                    line
+                    for line in lines
+                    if "reindex phase summary" in line and job_id in line
+                ][-3:]
+                if summary_lines:
+                    break
+                time.sleep(0.05)
+            evidence["phase_summary_wait_limit_s"] = 5.0
+            evidence["phase_summary_wait_elapsed_s"] = round(
+                mono() - summary_wait_started, 3
+            )
+            evidence["phase_summary_required"] = bool(self.args.require_phase_summary)
+            evidence["phase_summary_lines"] = summary_lines
+            evidence["phase_summary_available"] = bool(evidence["phase_summary_lines"])
+        evidence["verified"] = True
+        self.jsonl_pg.write({"phase": "reindex_verified", "job": job, **evidence})
+        return evidence
+
+    # -- idle / validation ------------------------------------------------
+
+    def idle(self, job: int) -> float:
+        self.phase("idle_start", job, {"idle_seconds": self.args.idle_seconds})
+        end = mono() + self.args.idle_seconds
+        while mono() < end:
+            self.raise_if_aborted()
+            time.sleep(min(0.5, max(0.05, end - mono())))
+        return self.phase("idle_end", job)["mono_s"]
+
+    def validate_job(self, job: int, submission_id: str, output: list[dict[str, Any]]) -> dict[str, Any]:
+        """Exactness checks after the idle window; labelled as validation.
+
+        The receipt artifact is written per resource *type*, so the four Patient
+        files come back as one combined artifact and the verdict is on the union
+        of all output entries.
+        """
+        self.phase("validation_start", job, {"label": "post_idle_validation"})
+        started = mono()
+        total = self.expected_total()
+        layout = self.file_offsets()
+        all_points = [
+            (file_index, offset)
+            for file_index, offsets in enumerate(layout)
+            for offset in offsets
+        ]
+        sample_points = [
+            all_points[0],
+            all_points[len(all_points) // 2],
+            all_points[-1],
+        ]
+        sampled = [self.patient_id(file_index, offset) for file_index, offset in sample_points]
+        expected = {
+            self.patient_id(file_index, offset): self.patient_resource(file_index, offset)
+            for file_index, offsets in enumerate(layout)
+            for offset in offsets
+        }
+        receipts = self.receipt_check(job, output)
+        detail = self.pg.detail(sampled, submission_id)
+        counts = self.pg.counts()
+        checks: list[dict[str, Any]] = []
+
+        def add(name: str, kind: str, ok: bool, expected: Any, actual: Any, note: str = "") -> None:
+            check = {
+                "job": job,
+                "name": name,
+                "kind": kind,
+                "ok": bool(ok),
+                "expected": expected,
+                "actual": actual,
+                "note": note,
+            }
+            checks.append(check)
+            self.checks.append(check)
+
+        # Exact current content, id set, version and history - streamed from SQL.
+        content_mismatches: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        version_distribution: Counter = Counter()
+        content_rows = 0
+        for row in self.pg.stream_rows(
+            "SELECT id, version_id, is_deleted, data::text FROM resources "
+            f"WHERE tenant_id = '{TENANT}' AND resource_type = 'Patient' ORDER BY id"
+        ):
+            if len(row) < 4:
+                continue
+            content_rows += 1
+            resource_id, version_id, is_deleted, body = row[0], row[1], row[2], row[3]
+            seen_ids.add(resource_id)
+            version_distribution[version_id] += 1
+            wanted = expected.get(resource_id)
+            if wanted is None:
+                content_mismatches.append({"id": resource_id, "reason": "unexpected id"})
+                continue
+            if is_deleted == "t":
+                content_mismatches.append({"id": resource_id, "reason": "is_deleted"})
+                continue
+            try:
+                stored = json.loads(body)
+            except json.JSONDecodeError:
+                content_mismatches.append({"id": resource_id, "reason": "unparsable jsonb"})
+                continue
+            # `data` holds the submitted body only: server meta is merged on read.
+            diffs = [key for key, value in wanted.items() if stored.get(key) != value]
+            if set(stored) != set(wanted):
+                diffs.append("keys:" + ",".join(sorted(set(stored) ^ set(wanted))[:5]))
+            if diffs:
+                content_mismatches.append({"id": resource_id, "reason": "content", "diff": diffs[:5]})
+
+        add("pg_content_all", "hard", not content_mismatches and content_rows == total,
+            f"{total} stored bodies identical to the fixture",
+            {"rows": content_rows, "mismatches": len(content_mismatches),
+             "examples": content_mismatches[:5]})
+        add("pg_id_set", "hard", seen_ids == set(expected), f"{total} ids", {
+            "rows": len(seen_ids),
+            "missing": len(set(expected) - seen_ids),
+            "unexpected": len(seen_ids - set(expected)),
+        })
+        add("pg_version_distribution", "hard", dict(version_distribution) == {str(job): total},
+            {str(job): total}, dict(version_distribution))
+
+        history_counts: Counter = Counter()
+        history_keys: Counter = Counter()
+        for row in self.pg.stream_rows(
+            "SELECT id, version_id FROM resource_history "
+            f"WHERE tenant_id = '{TENANT}' AND resource_type = 'Patient' ORDER BY id, version_id"
+        ):
+            if len(row) >= 2:
+                history_keys[(row[0], row[1])] += 1
+                history_counts[row[0]] += 1
+        expected_versions = {str(version) for version in range(1, job + 1)}
+        bad_history: dict[str, Any] = {}
+        for (resource_id, version_id), count in history_keys.items():
+            if version_id not in expected_versions or count != 1:
+                bad_history[resource_id] = f"{version_id}x{count}"
+        for resource_id in expected:
+            if history_counts.get(resource_id) != job:
+                bad_history.setdefault(resource_id, f"versions={history_counts.get(resource_id)}")
+        add("pg_history_exact", "hard", not bad_history and len(history_counts) == total,
+            {str(version): total for version in range(1, job + 1)},
+            {"ids": len(history_counts), "bad_ids": len(bad_history),
+             "examples": dict(list(bad_history.items())[:5])})
+
+        add("pg_patient_resources", "hard", counts["counts"].get("resources_patient") == total,
+            total, counts["counts"].get("resources_patient"))
+        add("pg_unindexed_patients", "hard", counts["counts"].get("unindexed_patients") == 0,
+            0, counts["counts"].get("unindexed_patients"))
+        add("pg_family_exact_patients", "hard",
+            counts["counts"].get("family_exact_patients") == total,
+            total, counts["counts"].get("family_exact_patients"))
+        add("pg_active_true_patients", "hard",
+            counts["counts"].get("active_true_patients") == self.expected_active(),
+            self.expected_active(), counts["counts"].get("active_true_patients"))
+        add("pg_fts_content_pilot995_patients", "hard",
+            counts["counts"].get("fts_content_pilot995_patients") == total,
+            total, counts["counts"].get("fts_content_pilot995_patients"))
+
+        # Keep one bounded end-to-end search API check. `_id` uses the direct
+        # resources-backed route and avoids an unbounded structured COUNT query.
+        add("http_storage_total", "hard", self.search_count("") == total, total, self.search_count(""))
+        middle_file, middle_offset = sample_points[1]
+        middle_id = self.patient_id(middle_file, middle_offset)
+        id_total = self.search_count(
+            "_id=" + urllib.parse.quote(middle_id, safe="")
+        )
+        add("http_id_search", "hard", id_total == 1, 1, id_total)
+        # Supplemental: three sampled resources over HTTP, including meta version.
+        for resource_id in sampled:
+            response = http_json("GET", f"{self.base_url}/Patient/{resource_id}")
+            stored = response["json"] if isinstance(response["json"], dict) else {}
+            wanted = self._expected_for_id(resource_id)
+            matches = bool(wanted) and all(stored.get(key) == value for key, value in wanted.items())
+            version = str((stored.get("meta") or {}).get("versionId", ""))
+            add(f"http_sample_{resource_id}", "hard",
+                response["status"] == 200 and matches and version == str(job),
+                {"content": "matches fixture", "version": job},
+                {"status": response["status"], "version": version})
+
+        entry_results = detail["data"].get("entry_results", [])
+        receipt_ok = (
+            len(entry_results) == 1
+            and entry_results[0][0] == "success"
+            and int(entry_results[0][2]) == total
+            and entry_results[0][1] == ("true" if job == 1 else "false")
+        )
+        add("pg_entry_results", "hard", receipt_ok,
+            {"outcome": "success", "created": job == 1, "count": total}, entry_results)
+        changes = detail["data"].get("changes", [])
+        if job == 1:
+            changes_ok = len(changes) == 1 and changes[0][0] == "create" and int(changes[0][3]) == total
+            expected_changes = {"change_type": "create", "count": total}
+        else:
+            changes_ok = (
+                len(changes) == 1
+                and changes[0][0] == "update"
+                and changes[0][1] == str(job - 1)
+                and changes[0][2] == str(job)
+                and int(changes[0][3]) == total
+            )
+            expected_changes = {
+                "change_type": "update",
+                "previous_version": job - 1,
+                "new_version": job,
+                "count": total,
+            }
+        add("pg_submission_changes", "hard", changes_ok, expected_changes, changes)
+        manifests = detail["data"].get("manifests", [])
+        add("pg_manifests_terminal", "hard",
+            bool(manifests) and all(row[1] == "completed" for row in manifests),
+            "every manifest completed", manifests)
+
+        result = {
+            "job": job,
+            "submission_id": submission_id,
+            "label": "post_idle_validation",
+            "duration_s": round(mono() - started, 3),
+            "checks": checks,
+            "receipts": receipts,
+            "pg_detail": detail,
+            "pg_counts": counts,
+            "sampled_ids": sampled,
+            "version_distribution": dict(version_distribution),
+            "history_ids": len(history_counts),
+        }
+        self.write_json(f"jobs/job{job:02d}/validation.json", result)
+        self.phase(
+            "validation_end",
+            job,
+            {
+                "checks": len(checks),
+                "failed_hard": len([c for c in checks if c["kind"] == "hard" and not c["ok"]]),
+                "failed_soft": len([c for c in checks if c["kind"] == "soft" and not c["ok"]]),
+                "duration_s": result["duration_s"],
+            },
+        )
+        return result
+
+    def _expected_for_id(self, resource_id: str) -> dict[str, Any]:
+        match = re.fullmatch(r"p995-(\d+)-(\d+)", resource_id)
+        if not match:
+            return {}
+        file_index, offset = int(match.group(1)), int(match.group(2))
+        return self.patient_resource(file_index, offset)
+
+    # -- job / run orchestration ------------------------------------------
+
+    def run_job(self, job: int) -> None:
+        submission_id = f"{SUBMITTER_VALUE}-{self.run_id}-j{job}"
+        total = self.expected_total()
+        attempt: dict[str, Any] = {
+            "ordinal": job,
+            "submission_id": submission_id,
+            "mode": self.args.mode,
+            "defer_indexing": bool(self.args.defer_indexing),
+            "status": "running",
+            "timings": {"label": "incomplete", "comparable": False},
+            "throughput_resources_per_s": None,
+            "throughput_to_publication_resources_per_s": None,
+            "throughput_to_verified_search_ready_resources_per_s": None,
+        }
+        self.current_attempt = attempt
+        self.attempts.append(attempt)
+        if self.args.mode == "restart" or self.hfs is None:
+            self.start_hfs(job)
+        manifest_url = self.ensure_fixtures(job)
+        baseline = self.phase(
+            "prekickoff_baseline",
+            job,
+            {
+                "submission_id": submission_id,
+                "validation_effects": job > 1,
+                "manifest": str(Path(manifest_url).name),
+            },
+        )
+        if (
+            self.args.postgres_reindex_evidence
+            or self.args.postgres_grouped_create_evidence
+        ):
+            attempt["postgres_work"] = {
+                "before_kickoff": None,
+                "measurement_errors": [],
+            }
+            try:
+                attempt["postgres_work"]["before_kickoff"] = self.pg.activity_snapshot()
+            except Exception as error:
+                attempt["postgres_work"]["measurement_errors"].append(
+                    {"boundary": "before_kickoff", "error": str(error)}
+                )
+        if self.args.postgres_grouped_create_evidence:
+            attempt["grouped_create_sql"] = {
+                "before_kickoff": None,
+                "measurement_errors": [],
+            }
+            try:
+                attempt["grouped_create_sql"]["before_kickoff"] = (
+                    self.pg.statement_snapshot()
+                )
+            except Exception as error:
+                attempt["grouped_create_sql"]["measurement_errors"].append(
+                    {"boundary": "before_kickoff", "error": str(error)}
+                )
+        log_offset = self.follower.seek_end()
+        self.phase("kickoff", job, {"submission_id": submission_id})
+        kickoff_mono = mono()
+        kickoff = self.kickoff(submission_id, manifest_url)
+        self.write_json(
+            f"jobs/job{job:02d}/kickoff.json",
+            {"submission_id": submission_id, "status": kickoff["status"], "body": kickoff["json"]},
+        )
+        if kickoff["status"] != 200:
+            raise Aborted(
+                "kickoff_failed",
+                {"status": kickoff["status"], "body": kickoff["json"], "error": kickoff["error"]},
+            )
+        self.phase("kickoff_accepted", job, {"submission_id": submission_id, "status": kickoff["status"]})
+        terminal = self.poll_terminal(job, submission_id, kickoff_mono)
+        attempt["timings"]["kickoff_to_terminal_s"] = terminal["terminal_s"]
+        declared = sum(int(entry.get("count") or 0) for entry in terminal["output"])
+        self.phase(
+            "submit_terminal",
+            job,
+            {
+                "submission_id": submission_id,
+                "terminal_s": terminal["terminal_s"],
+                "pages": terminal["pages"],
+                "declared_count": declared,
+                "outcome_entries": len(terminal["outcome"]),
+                "deleted_entries": len(terminal["deleted"]),
+            },
+        )
+        self.write_json(
+            f"jobs/job{job:02d}/submit-terminal.json",
+            {
+                "submission_id": submission_id,
+                "terminal_s": terminal["terminal_s"],
+                "polls": terminal["polls"],
+                "output": terminal["output"],
+                "outcome": terminal["outcome"],
+                "deleted": terminal["deleted"],
+            },
+        )
+        if declared != self.expected_total():
+            raise Aborted("manifest_count_mismatch", {"declared": declared, "expected": self.expected_total()})
+        if terminal["outcome"]:
+            raise Aborted("manifest_reports_outcome_entries", {"outcome": terminal["outcome"][:3]})
+        if terminal["deleted"]:
+            raise Aborted("manifest_reports_deleted_entries", {"deleted": terminal["deleted"][:3]})
+        attempt["manifest"] = {
+            "pages": terminal["pages"],
+            "declared_count": declared,
+            "output_entries": len(terminal["output"]),
+            "outcome_entries": len(terminal["outcome"]),
+            "deleted_entries": len(terminal["deleted"]),
+            "transaction_time": (terminal["manifest"] or {}).get("transactionTime"),
+            "requires_access_token": (terminal["manifest"] or {}).get("requiresAccessToken"),
+        }
+        if (
+            self.args.postgres_reindex_evidence
+            or self.args.postgres_grouped_create_evidence
+        ):
+            # This is the earliest safe boundary after the polled terminal
+            # manifest and its hard invariants have been validated.
+            try:
+                attempt["postgres_work"]["polling_observed_terminal"] = (
+                    self.pg.activity_snapshot()
+                )
+            except Exception as error:
+                attempt["postgres_work"]["polling_observed_terminal"] = None
+                attempt["postgres_work"]["measurement_errors"].append(
+                    {"boundary": "polling_observed_terminal", "error": str(error)}
+                )
+        if self.args.postgres_grouped_create_evidence:
+            try:
+                attempt["grouped_create_sql"]["polling_observed_terminal"] = (
+                    self.pg.statement_snapshot()
+                )
+            except Exception as error:
+                attempt["grouped_create_sql"]["polling_observed_terminal"] = None
+                attempt["grouped_create_sql"]["measurement_errors"].append(
+                    {"boundary": "polling_observed_terminal", "error": str(error)}
+                )
+        reindex = self.verify_reindex(job, submission_id, log_offset, kickoff_mono)
+        self.phase("reindex_terminal", job, {
+            "job_id": reindex.get("job_id"), "verified": reindex["verified"],
+            "deferred": bool(self.args.defer_indexing),
+        })
+        attempt["reindex"] = reindex
+        attempt["timings"]["kickoff_to_reindex_s"] = reindex["reindex_s"]
+        attempt["timings"]["terminal_to_reindex_s"] = round(
+            reindex["reindex_s"] - terminal["terminal_s"], 3
+        )
+        attempt["timings"]["observed_terminal_to_search_ready_s"] = attempt[
+            "timings"
+        ]["terminal_to_reindex_s"]
+        attempt["timings"]["kickoff_to_verified_search_ready_s"] = reindex[
+            "reindex_s"
+        ]
+        if self.args.postgres_grouped_create_evidence:
+            try:
+                attempt["grouped_create_sql"]["verified_search_ready"] = (
+                    self.pg.statement_snapshot()
+                )
+            except Exception as error:
+                attempt["grouped_create_sql"]["verified_search_ready"] = None
+                attempt["grouped_create_sql"]["measurement_errors"].append(
+                    {"boundary": "verified_search_ready", "error": str(error)}
+                )
+        if (
+            self.args.postgres_reindex_evidence
+            or self.args.postgres_grouped_create_evidence
+        ):
+            work = attempt["postgres_work"]
+            ready_snapshot = reindex.get("postgres_activity_at_search_ready")
+            if ready_snapshot is None:
+                work["measurement_errors"].append(
+                    {
+                        "boundary": "verified_search_ready",
+                        "error": reindex.get("postgres_activity_at_search_ready_error")
+                        or "snapshot unavailable",
+                    }
+                )
+            if all(
+                isinstance(snapshot, dict)
+                for snapshot in (
+                    work.get("before_kickoff"),
+                    work.get("polling_observed_terminal"),
+                    ready_snapshot,
+                )
+            ):
+                completed_work = postgres_activity_intervals(
+                    work["before_kickoff"],
+                    work["polling_observed_terminal"],
+                    ready_snapshot,
+                )
+                completed_work["measurement_errors"] = work["measurement_errors"]
+                attempt["postgres_work"] = completed_work
+            else:
+                attempt["postgres_work"] = {
+                    "before": work.get("before_kickoff"),
+                    "polling_observed_terminal": work.get(
+                        "polling_observed_terminal"
+                    ),
+                    "after": ready_snapshot,
+                    "delta": None,
+                    "interval_deltas": {},
+                    "measurement_errors": work["measurement_errors"],
+                }
+            if self.args.postgres_reindex_evidence:
+                try:
+                    attempt["cursor_plans"] = self.pg.reindex_cursor_plans(
+                        total, analyze=self.args.explain_analyze
+                    )
+                except Exception as error:
+                    attempt["cursor_plans"] = []
+                    attempt["cursor_plan_error"] = str(error)
+                self.write_json(
+                    f"jobs/job{job:02d}/postgres-reindex-evidence.json",
+                    {
+                        "postgres_work": attempt["postgres_work"],
+                        "cursor_plans": attempt["cursor_plans"],
+                        "phase_summary_lines": reindex.get("phase_summary_lines", []),
+                    },
+                )
+        if self.args.postgres_grouped_create_evidence:
+            sql = attempt["grouped_create_sql"]
+            if all(
+                isinstance(snapshot, dict)
+                for snapshot in (
+                    sql.get("before_kickoff"),
+                    sql.get("polling_observed_terminal"),
+                    sql.get("verified_search_ready"),
+                )
+            ):
+                completed_sql = statement_counter_intervals(
+                    sql["before_kickoff"],
+                    sql["polling_observed_terminal"],
+                    sql["verified_search_ready"],
+                )
+                completed_sql["measurement_errors"] = sql["measurement_errors"]
+                attempt["grouped_create_sql"] = completed_sql
+            else:
+                attempt["grouped_create_sql"] = {
+                    "before": sql.get("before_kickoff"),
+                    "polling_observed_terminal": sql.get(
+                        "polling_observed_terminal"
+                    ),
+                    "after": sql.get("verified_search_ready"),
+                    "interval_deltas": {},
+                    "measurement_errors": sql["measurement_errors"],
+                }
+        self.write_json(f"jobs/job{job:02d}/reindex.json", reindex)
+        idle_end = self.idle(job)
+        validation = self.validate_job(job, submission_id, terminal["output"])
+        attempt["validation"] = {
+            "duration_s": validation["duration_s"],
+            "failed_hard": [c["name"] for c in validation["checks"] if c["kind"] == "hard" and not c["ok"]],
+            "failed_soft": [c["name"] for c in validation["checks"] if c["kind"] == "soft" and not c["ok"]],
+            "version_distribution": validation["version_distribution"],
+            "history_ids": validation["history_ids"],
+            "index_coverage": {
+                "unindexed_patients": validation["pg_counts"]["counts"].get(
+                    "unindexed_patients"
+                ),
+                "family_exact_patients": validation["pg_counts"]["counts"].get(
+                    "family_exact_patients"
+                ),
+                "active_true_patients": validation["pg_counts"]["counts"].get(
+                    "active_true_patients"
+                ),
+                "expected_active_true_patients": self.expected_active(),
+                "fts_content_pilot995_patients": validation["pg_counts"]["counts"].get(
+                    "fts_content_pilot995_patients"
+                ),
+                "expected_fts_content_pilot995_patients": self.expected_total(),
+            },
+        }
+        attempt["receipts"] = {
+            "ok": validation["receipts"]["ok"],
+            "output_entries": validation["receipts"]["output_entries"],
+            "references": validation["receipts"]["references"],
+            "checked_after": "idle_end (validation phase)",
+        }
+        attempt["rss"] = self.rss_stats(job, kickoff_mono, idle_end, baseline["rss_mib"])
+        if self.args.mode == "restart":
+            self.stop_hfs(job, "job_complete")
+        # A failed validation stops the run: the next job would build on an
+        # unverified database state.
+        if attempt["validation"]["failed_hard"]:
+            attempt["status"] = "failed"
+            self.write_summary()
+            raise Aborted(
+                "hard_validation_failed",
+                {"job": job, "checks": attempt["validation"]["failed_hard"]},
+            )
+        ready_mono = reindex["search_ready_observed_mono"]
+        hfs_memory_values = [
+            row["rss_mib"]
+            for row in self.rss_rows
+            if row.get("job") == job
+            and kickoff_mono <= row["mono_s"] <= ready_mono
+            and row.get("rss_mib") is not None
+        ]
+        postgres_memory_values = [
+            row["mem_usage_mib"]
+            for row in self.docker_rows
+            if row.get("job") == job
+            and kickoff_mono <= row["mono_s"] <= ready_mono
+            and row.get("mem_usage_mib") is not None
+        ]
+        hfs_samples = len(hfs_memory_values)
+        postgres_samples = len(postgres_memory_values)
+        attempt["evidence_sample_counts"] = {
+            "hfs_memory_kickoff_to_search_ready": hfs_samples,
+            "postgres_memory_kickoff_to_search_ready": postgres_samples,
+        }
+        attempt["hfs_memory_kickoff_to_search_ready"] = {
+            "samples": hfs_samples,
+            "peak_mib": max(hfs_memory_values) if hfs_memory_values else None,
+        }
+        attempt["postgres_memory_kickoff_to_search_ready"] = {
+            "samples": postgres_samples,
+            "peak_mib": max(postgres_memory_values) if postgres_memory_values else None,
+        }
+        if self.args.postgres_grouped_create_evidence:
+            comparison_reasons = postgres_grouped_create_comparability_reasons(
+                attempt,
+                self.preflight_info,
+                self.fixture_info,
+                hfs_samples,
+                postgres_samples,
+                self.args.expected_resource_inserts,
+                self.args.expected_bulk_entry_savepoints,
+            )
+        elif self.args.postgres_reindex_evidence:
+            comparison_reasons = postgres_reindex_comparability_reasons(
+                attempt,
+                self.preflight_info,
+                self.fixture_info,
+                hfs_samples,
+                postgres_samples,
+                self.args.require_phase_summary,
+            )
+        else:
+            comparison_reasons = []
+        attempt["timings"].update(
+            {
+                "label": "complete",
+                "comparable": not comparison_reasons,
+                "comparison_reasons": comparison_reasons,
+                "verified": True,
+            }
+        )
+        attempt["status"] = "verified"
+        publication_throughput = round(total / max(terminal["terminal_s"], 0.001), 3)
+        readiness_throughput = round(total / max(reindex["reindex_s"], 0.001), 3)
+        attempt["throughput_to_publication_resources_per_s"] = publication_throughput
+        attempt["throughput_to_verified_search_ready_resources_per_s"] = readiness_throughput
+        # Compatibility alias: this historically meant terminal publication.
+        attempt["throughput_resources_per_s"] = publication_throughput
+        if self.args.postgres_reindex_evidence:
+            self.write_json(
+                f"jobs/job{job:02d}/postgres-reindex-evidence.json",
+                {
+                    "postgres_work": attempt["postgres_work"],
+                    "cursor_plans": attempt["cursor_plans"],
+                    "phase_summary_lines": reindex.get("phase_summary_lines", []),
+                    "memory": {
+                        "hfs": attempt["hfs_memory_kickoff_to_search_ready"],
+                        "postgres": attempt[
+                            "postgres_memory_kickoff_to_search_ready"
+                        ],
+                    },
+                    "comparability": {
+                        "comparable": not comparison_reasons,
+                        "reasons": comparison_reasons,
+                    },
+                },
+            )
+        if self.args.postgres_grouped_create_evidence:
+            self.write_json(
+                f"jobs/job{job:02d}/postgres-grouped-create-evidence.json",
+                {
+                    "batch_size": self.args.batch_size,
+                    "fixture_mode": self.args.fixture_mode,
+                    "expected": {
+                        "resource_insert_calls": self.args.expected_resource_inserts,
+                        "bulk_entry_savepoint_calls": self.args.expected_bulk_entry_savepoints,
+                    },
+                    "postgres_work": attempt["postgres_work"],
+                    "statement_counts": attempt["grouped_create_sql"],
+                    "memory": {
+                        "hfs": attempt["hfs_memory_kickoff_to_search_ready"],
+                        "postgres": attempt[
+                            "postgres_memory_kickoff_to_search_ready"
+                        ],
+                    },
+                    "comparability": {
+                        "comparable": not comparison_reasons,
+                        "reasons": comparison_reasons,
+                    },
+                },
+            )
+        self.write_summary()
+
+    def rss_stats(self, job: int, start: float, end: float, baseline: Optional[float]) -> dict[str, Any]:
+        """Measured window is kickoff..idle_end; startup and validation are separate."""
+        rows = [row for row in self.rss_rows if row.get("job") == job]
+
+        def block(values: list[float], base: Optional[float] = None) -> dict[str, Any]:
+            if not values:
+                return {"samples": 0}
+            return {
+                "samples": len(values),
+                "first_mib": values[0],
+                "peak_mib": max(values),
+                "last_mib": values[-1],
+                "delta_peak_mib": None if base is None else round(max(values) - base, 1),
+            }
+
+        measured = [row["rss_mib"] for row in rows if start <= row["mono_s"] <= end]
+        return {
+            "measured_window": {
+                **block(measured, baseline),
+                "baseline_mib": baseline,
+                "window": "kickoff..idle_end",
+            },
+            "startup_window": block([row["rss_mib"] for row in rows if row["mono_s"] < start]),
+            "validation_window": block([row["rss_mib"] for row in rows if row["mono_s"] > end]),
+        }
+
+    def mark_attempt_incomplete(self, reason: str) -> None:
+        attempt = self.current_attempt
+        if not attempt or attempt.get("status") not in ("running",):
+            return
+        attempt["status"] = "unverified" if "reindex" in reason else "failed"
+        attempt["failure_reason"] = reason
+        attempt["timings"].update({"label": "incomplete", "comparable": False, "verified": False})
+        attempt["throughput_resources_per_s"] = None
+        attempt["throughput_to_publication_resources_per_s"] = None
+        attempt["throughput_to_verified_search_ready_resources_per_s"] = None
+        attempt["rss"] = self.rss_stats(attempt["ordinal"], 0.0, float("inf"), None)
+
+    def hard_failures(self) -> list[dict[str, Any]]:
+        return [check for check in self.checks if check["kind"] == "hard" and not check["ok"]]
+
+    def write_summary(self) -> None:
+        write_json_atomic(
+            self.out / "summary.json",
+            {
+                "schema_version": SCHEMA_VERSION,
+                "updated": iso_now(),
+                "attempts": self.attempts,
+                "phases": len(self.phases),
+                "stops": self.stops,
+                "hard_failures": [c["name"] for c in self.hard_failures()],
+            },
+        )
+
+    def cleanup(self) -> None:
+        if self.sampler is not None:
+            self.sampler.stop()
+            self.sampler.join(timeout=60)
+            self.sampler = None
+        if self.hfs is not None:
+            stopped = self.hfs.stop()
+            if self.log:
+                self.log.line("hfs_stopped", reason="cleanup", **stopped)
+            self.hfs = None
+        if self.provider is not None:
+            self.provider.stop()
+            self.provider = None
+        for writer in (
+            self.csv_rss, self.csv_host, self.csv_phase, self.csv_docker,
+            self.jsonl_phase, self.jsonl_pg, self.jsonl_stops,
+        ):
+            if writer is not None:
+                writer.close()
+        self.csv_rss = self.csv_host = self.csv_phase = self.csv_docker = None
+        self.jsonl_phase = self.jsonl_pg = self.jsonl_stops = None
+
+    def finish(self, status: str, exit_code: int, reason: Optional[str]) -> None:
+        payload = {
+            "schema_version": SCHEMA_VERSION,
+            "status": status,
+            "exit_code": exit_code,
+            "reason": reason,
+            "controller": {"path": str(Path(__file__).resolve()), "python": sys.version},
+            "config": {
+                "binary": str(self.binary),
+                "output_dir": str(self.out),
+                "repo_root": str(self.repo_root),
+                "resources": self.args.resources,
+                "jobs": self.args.jobs,
+                "mode": self.args.mode,
+                "batch_size": self.args.batch_size,
+                "fixture_mode": self.args.fixture_mode,
+                "defer_indexing": bool(self.args.defer_indexing),
+                "postgres_reindex_evidence": bool(self.args.postgres_reindex_evidence),
+                "postgres_grouped_create_evidence": bool(
+                    self.args.postgres_grouped_create_evidence
+                ),
+                "expected_resource_inserts": self.args.expected_resource_inserts,
+                "expected_bulk_entry_savepoints": (
+                    self.args.expected_bulk_entry_savepoints
+                ),
+                "explain_analyze": bool(self.args.explain_analyze),
+                "require_phase_summary": bool(self.args.require_phase_summary),
+                "expected_source_fingerprint": self.args.expected_source_fingerprint,
+                "idle_seconds": self.args.idle_seconds,
+                "file_concurrency": self.args.file_concurrency,
+                # Which server delivered the corpus (#1126).
+                "corpus_provider": (
+                    {"kind": "external", "url": self.args.provider_url}
+                    if self.args.provider_url
+                    else {"kind": "builtin", "base": self.provider_base}
+                ),
+                "pg_container": self.args.pg_container,
+                "database_url": redact_db_url(self.args.database_url),
+                "hfs_env": {
+                    key: (redact_db_url(value) if key == "HFS_DATABASE_URL" else value)
+                    for key, value in self.effective_env().items()
+                },
+                "watchdog": {
+                    "operational_max_rss_mib": self.args.operational_max_rss_mib,
+                    "pressure_samples": self.args.pressure_samples,
+                    "swap_growth_mib": self.args.swap_growth_mib,
+                    "swap_growth_samples": self.args.swap_growth_samples,
+                    "deadline_s": self.args.deadline,
+                },
+                "timers": {
+                    "request_timeout_s": self.args.request_timeout,
+                    "startup_timeout_s": self.args.startup_timeout,
+                    "terminal_timeout_s": self.args.terminal_timeout,
+                    "reindex_timeout_s": self.args.reindex_timeout,
+                    "endpoint_poll_interval_s": self.args.endpoint_poll_interval,
+                    "sample_interval_s": self.args.sample_interval,
+                    "host_interval_s": self.args.host_interval,
+                    "docker_stats_interval_s": self.args.docker_stats_interval,
+                },
+            },
+            "preflight": self.preflight_info,
+            "fixture": {
+                key: value
+                for key, value in self.fixture_info.items()
+                if key != "files"
+            }
+            | {"files": [
+                {key: value for key, value in entry.items() if key != "ids"}
+                for entry in self.fixture_info.get("files", [])
+            ]},
+            "phases": self.phases,
+            "attempts": self.attempts,
+            "checks": self.checks,
+            "stops": self.stops,
+        }
+        write_json_atomic(self.out / "run.json", payload)
+        self.write_summary()
+        if self.log:
+            self.log.line("run_end", status=status, exit_code=exit_code, reason=reason)
+            self.log.close()
+
+    # -- top level --------------------------------------------------------
+
+    def install_signal_handlers(self) -> None:
+        def handler(signum: int, _frame: Any) -> None:
+            self.signal_number = signum
+            with self.lock:
+                if self.abort is None:
+                    self.abort = {"reason": f"signal:{signum}", "detail": {}}
+            if self.hfs is not None:
+                self.hfs.stop(grace_seconds=5.0)
+            if self.log:
+                self.log.line("signal_received", signal=signum)
+
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            try:
+                signal.signal(signum, handler)
+            except (ValueError, OSError):
+                pass
+
+    def run(self) -> int:
+        try:
+            self.prepare_outputs()
+        except ConfigError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return EXIT_CONFIG
+        self.install_signal_handlers()
+        status, exit_code, reason = "ok", EXIT_OK, None
+        try:
+            info = self.preflight()
+            if info["blocked"]:
+                raise Aborted("preflight_blocked", {"reasons": info["block_reasons"]})
+            fixture_plan = {
+                "files": [
+                    {"name": f"patients-{index}.ndjson", "count": len(offsets)}
+                    for index, offsets in enumerate(self.file_offsets())
+                ],
+                "total": self.expected_total(),
+                "mode": self.args.fixture_mode,
+            }
+            self.log.line("fixture_plan", plan=json.dumps(fixture_plan))
+            self.start_provider()
+            self.sampler = Sampler(self)
+            self.sampler.start()
+            for job in range(1, self.args.jobs + 1):
+                self.run_job(job)
+        except Aborted as exc:
+            reason = exc.reason
+            self.mark_attempt_incomplete(exc.reason)
+            if exc.reason == "preflight_blocked":
+                status, exit_code = "preflight_blocked", EXIT_PREFLIGHT
+            elif exc.reason == "hard_validation_failed":
+                status, exit_code = "aborted", EXIT_VALIDATION
+            elif self.signal_number is not None:
+                status, exit_code = "interrupted", 128 + self.signal_number
+            else:
+                status, exit_code = "aborted", EXIT_ABORTED
+            if self.log:
+                self.log.line("run_aborted", reason=reason, detail=json.dumps(exc.detail, default=str))
+        except ConfigError as exc:
+            status, exit_code, reason = "config_error", EXIT_CONFIG, str(exc)
+            print(f"ERROR: {exc}", file=sys.stderr)
+        except KeyboardInterrupt:
+            status, exit_code, reason = "interrupted", 130, "keyboard interrupt"
+        except Exception as exc:
+            status, exit_code, reason = "failed", EXIT_CONFIG, f"{type(exc).__name__}: {exc}"
+            if self.log:
+                self.log.line("run_failed", error=reason)
+        finally:
+            self.phase("series_end", self.current_job, {"status": status, "reason": reason})
+            self.cleanup()
+        if status == "ok" and self.args.strict_validation and self.hard_failures():
+            failures = [check["name"] for check in self.hard_failures()]
+            status, exit_code = "validation_failed", EXIT_VALIDATION
+            reason = f"hard validation checks failed: {', '.join(failures)}"
+        self.finish(status, exit_code, reason)
+        verified = [attempt for attempt in self.attempts if attempt.get("status") == "verified"]
+        print(
+            f"\n{status}: {len(verified)}/{len(self.attempts)} attempt(s) verified; "
+            f"artifacts in {self.out}"
+        )
+        return exit_code
+
+
+def _usage_mib(value: str) -> Optional[float]:
+    match = re.match(r"\s*([0-9.]+)\s*([kKmMgG]?i?B)", value or "")
+    if not match:
+        return None
+    number = float(match.group(1))
+    unit = match.group(2).lower()
+    if unit.startswith("b"):
+        return round(number / 1024 / 1024, 1)
+    if unit.startswith("k"):
+        return round(number / 1024, 1)
+    if unit.startswith("g"):
+        return round(number * 1024, 1)
+    return round(number, 1)
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+
+def parse_bool(value: str) -> bool:
+    normalised = str(value).strip().lower()
+    if normalised in ("1", "true", "yes", "on"):
+        return True
+    if normalised in ("0", "false", "no", "off"):
+        return False
+    raise argparse.ArgumentTypeError(f"expected true or false, got {value!r}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Drive $bulk-submit imports of a deterministic Patient corpus against a "
+            "dedicated PostgreSQL container and record external RSS/pressure/DB evidence."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--binary", required=True, help="release hfs binary (R4+postgres)")
+    parser.add_argument("--output-dir", required=True, help="new, nonexistent output directory")
+    parser.add_argument(
+        "--resources",
+        type=int,
+        help=(
+            "Patients per submission (1000 normally, 2000 for #1086, "
+            "10000 for #1455 normal, 203 for #1455 oversized)"
+        ),
+    )
+    parser.add_argument("--jobs", type=int, default=1, help="submissions in this run")
+    parser.add_argument("--mode", choices=("consecutive", "restart"), default="consecutive")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        help=(
+            "set HFS_BULK_SUBMIT_BATCH_SIZE explicitly; omitted preserves the "
+            "server default outside an opt-in evidence profile"
+        ),
+    )
+    parser.add_argument(
+        "--fixture-mode", choices=("normal", "oversized"), default="normal"
+    )
+    parser.add_argument(
+        "--defer-indexing", type=parse_bool, default=True,
+        help="HFS_BULK_SUBMIT_DEFER_INDEXING for the measured server",
+    )
+    parser.add_argument("--idle-seconds", type=float, default=60.0)
+    parser.add_argument("--file-concurrency", type=int, default=1)
+    parser.add_argument("--pg-container", required=True, help="dedicated PostgreSQL container")
+    parser.add_argument("--database-url", required=True, help="host-reachable PostgreSQL URL")
+    parser.add_argument("--pg-user", help="psql -U (default: from the URL)")
+    parser.add_argument("--pg-db", help="psql -d (default: from the URL)")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--hfs-port", type=int, default=0, help="0 picks a free loopback port")
+    parser.add_argument("--provider-port", type=int, default=0, help="0 starts at 19200")
+    parser.add_argument(
+        "--provider-url",
+        help=(
+            "serve the fixtures from an external HTTP/1.1 static server instead of the "
+            "built-in one; it must be rooted at <output-dir>/fixtures"
+        ),
+    )
+    parser.add_argument("--hfs-log-level", default="info")
+    parser.add_argument("--sample-interval", type=float, default=0.5, help="HFS RSS cadence, seconds")
+    parser.add_argument("--host-interval", type=float, default=5.0, help="host vitals cadence, seconds")
+    parser.add_argument(
+        "--docker-stats-interval",
+        type=float,
+        help="0 disables; defaults to 1s for #1086 evidence and 60s otherwise",
+    )
+    parser.add_argument(
+        "--endpoint-poll-interval",
+        type=float,
+        help="defaults to 0.25s for #1086 evidence and 1s otherwise",
+    )
+    parser.add_argument("--request-timeout", type=float, default=60.0)
+    parser.add_argument("--startup-timeout", type=float, default=180.0)
+    parser.add_argument("--terminal-timeout", type=float, default=3600.0)
+    parser.add_argument("--reindex-timeout", type=float, default=900.0)
+    parser.add_argument("--deadline", type=float, default=10800.0, help="whole-run watchdog, seconds")
+    parser.add_argument("--preflight-samples", type=int, default=5)
+    parser.add_argument("--preflight-interval", type=float, default=5.0, help="settle between preflight samples")
+    parser.add_argument("--operational-max-rss-mib", type=float, default=1536.0)
+    parser.add_argument("--pressure-samples", type=int, default=6, help="consecutive non-normal pressure samples")
+    parser.add_argument("--swap-growth-mib", type=float, default=256.0)
+    parser.add_argument("--swap-growth-samples", type=int, default=3)
+    parser.add_argument("--allow-nonempty-db", action="store_true", help="skip the fresh-database gate")
+    parser.add_argument("--strict-validation", dest="strict_validation", action="store_true", default=True)
+    parser.add_argument("--no-strict-validation", dest="strict_validation", action="store_false")
+    parser.add_argument("--repo-root", help="checkout root containing data/ (default: derived)")
+    parser.add_argument(
+        "--expected-source-fingerprint",
+        help="reject a run if repo-root no longer matches this full source fingerprint",
+    )
+    parser.add_argument("--hfs-env", action="append", default=[], metavar="KEY=VALUE")
+    parser.add_argument(
+        "--postgres-reindex-evidence",
+        action="store_true",
+        help="capture the bounded #1086 phase, PostgreSQL delta, and cursor-plan evidence",
+    )
+    parser.add_argument(
+        "--postgres-grouped-create-evidence",
+        action="store_true",
+        help=(
+            "capture #1455 one-file grouped-create SQL, WAL, RSS, fixture, and "
+            "search-readiness evidence"
+        ),
+    )
+    parser.add_argument("--expected-resource-inserts", type=int)
+    parser.add_argument("--expected-bulk-entry-savepoints", type=int)
+    parser.add_argument(
+        "--explain-analyze",
+        action="store_true",
+        help="execute the bounded SELECT cursor probes while collecting EXPLAIN plans",
+    )
+    parser.add_argument(
+        "--require-phase-summary",
+        action="store_true",
+        help="make missing correlated phase output a #1086 comparability failure",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="print the plan and exit")
+    parser.add_argument("--quiet", action="store_true", help="do not echo controller events to stdout")
+    return parser
+
+
+def dry_run_plan(args: argparse.Namespace) -> dict[str, Any]:
+    repo_root = (
+        Path(args.repo_root).expanduser().resolve()
+        if args.repo_root
+        else Path(__file__).resolve().parents[4]
+    )
+    file_count = 1 if args.postgres_grouped_create_evidence else FIXTURE_FILE_COUNT
+    per_file = args.resources // file_count
+    layout = [per_file] * file_count
+    for _ in range(per_file * file_count, args.resources):
+        layout[-1] += 1
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    base_url = f"http://{args.host}:{args.hfs_port}"
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "dry_run": True,
+        "binary": str(Path(args.binary).expanduser().resolve()),
+        "output_dir": str(output_dir),
+        "repo_root": str(repo_root),
+        "source": source_fingerprint(repo_root),
+        "expected_source_fingerprint": args.expected_source_fingerprint,
+        "search_parameters_file": str(repo_root / "data" / "search-parameters-r4.json"),
+        "fixture": {
+            "files": [
+                {"name": f"patients-{index}.ndjson", "count": count, "ids": f"p995-{index}-0..{count - 1}"}
+                for index, count in enumerate(layout)
+            ],
+            "total": args.resources,
+            "expected_active_true": sum((count + 1) // 2 for count in layout),
+            "expected_fts_content_pilot995": args.resources,
+            "mode": args.fixture_mode,
+            "file_count": file_count,
+            "family": FAMILY,
+            "mrn_system": MRN_SYSTEM,
+        }
+        | (
+            {
+                "oversized": {
+                    "offset": 100 if args.resources >= GROUPED_CREATE_OVERSIZED_RESOURCES else args.resources // 2,
+                    "compact_bytes": GROUPED_CREATE_CONTENT_LIMIT_BYTES + 1,
+                    "content_limit_bytes": GROUPED_CREATE_CONTENT_LIMIT_BYTES,
+                }
+            }
+            if args.fixture_mode == "oversized"
+            else {}
+        ),
+        "jobs": args.jobs,
+        "mode": args.mode,
+        "batch_size": args.batch_size,
+        "corpus_provider": (
+            {"kind": "external", "url": args.provider_url}
+            if args.provider_url
+            else {"kind": "builtin", "preferred_port": args.provider_port or 19200}
+        ),
+        "defer_indexing": bool(args.defer_indexing),
+        "postgres_reindex_evidence": bool(args.postgres_reindex_evidence),
+        "postgres_grouped_create_evidence": bool(
+            args.postgres_grouped_create_evidence
+        ),
+        "expected_statement_counts": {
+            "resource_insert_calls": args.expected_resource_inserts,
+            "bulk_entry_savepoint_calls": args.expected_bulk_entry_savepoints,
+        },
+        "explain_analyze": bool(args.explain_analyze),
+        "require_phase_summary": bool(args.require_phase_summary),
+        "hfs_env": effective_hfs_env(args, base_url, output_dir),
+        "database": redact_db_url(args.database_url),
+        "pg_container": args.pg_container,
+        "sampling": {
+            "docker_stats_interval_s": args.docker_stats_interval,
+            "endpoint_poll_interval_s": args.endpoint_poll_interval,
+        },
+        "timeouts": {
+            "request_s": args.request_timeout,
+            "startup_s": args.startup_timeout,
+            "terminal_s": args.terminal_timeout,
+            "reindex_s": args.reindex_timeout,
+        },
+        "watchdog": {
+            "operational_max_rss_mib": args.operational_max_rss_mib,
+            "pressure_samples": args.pressure_samples,
+            "swap_growth_mib": args.swap_growth_mib,
+            "swap_growth_samples": args.swap_growth_samples,
+            "deadline_s": args.deadline,
+        },
+        "verification": [
+            "submit terminal 200 for every manifest page, outcome/deleted empty, declared counts match",
+            "receipt artifact download: exact aggregate Patient id set (one receipt per resource type)",
+            "deferred reindex job id from the hfs log line, $reindex-status completed with errorCount=0 and processed=total",
+            "SQL coverage: zero unindexed Patients plus exact family, active=true, and FTS content Patient counts",
+            "bounded HTTP search API coverage: _id resolves the deterministic middle Patient",
+            "post-idle: version/history spread, content, entry_results receipts, submission changes",
+            "#1086 profile: PostgreSQL work interval deltas, early/middle/late cursor plans, opt-in phase summary",
+            "#1455 profile: one-file fixture, pg_stat_statements INSERT/savepoint oracles, WAL and RSS intervals",
+        ],
+    }
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.resources is None:
+        if args.postgres_grouped_create_evidence:
+            args.resources = (
+                GROUPED_CREATE_OVERSIZED_RESOURCES
+                if args.fixture_mode == "oversized"
+                else GROUPED_CREATE_DEFAULT_RESOURCES
+            )
+        else:
+            args.resources = (
+                ISSUE_1086_DEFAULT_RESOURCES if args.postgres_reindex_evidence else 1000
+            )
+    if args.docker_stats_interval is None:
+        args.docker_stats_interval = (
+            1.0
+            if args.postgres_reindex_evidence
+            or args.postgres_grouped_create_evidence
+            else 60.0
+        )
+    if args.endpoint_poll_interval is None:
+        args.endpoint_poll_interval = (
+            0.25
+            if args.postgres_reindex_evidence
+            or args.postgres_grouped_create_evidence
+            else 1.0
+        )
+    minimum_resources = 3 if args.postgres_grouped_create_evidence else FIXTURE_FILE_COUNT
+    if args.resources < minimum_resources:
+        parser.error(f"--resources must be >= {minimum_resources}")
+    if args.postgres_reindex_evidence and args.resources > ISSUE_1086_MAX_RESOURCES:
+        parser.error(
+            f"--resources must be <= {ISSUE_1086_MAX_RESOURCES} "
+            "with --postgres-reindex-evidence"
+        )
+    if args.postgres_reindex_evidence and not args.defer_indexing:
+        parser.error("--postgres-reindex-evidence requires --defer-indexing=true")
+    if args.postgres_reindex_evidence and args.postgres_grouped_create_evidence:
+        parser.error("the #1086 and #1455 evidence profiles are mutually exclusive")
+    if args.fixture_mode == "oversized" and not args.postgres_grouped_create_evidence:
+        parser.error("--fixture-mode=oversized requires --postgres-grouped-create-evidence")
+    if args.postgres_grouped_create_evidence:
+        if not args.defer_indexing:
+            parser.error("--postgres-grouped-create-evidence requires --defer-indexing=true")
+        if args.jobs != 1:
+            parser.error("--postgres-grouped-create-evidence requires --jobs=1")
+        if args.file_concurrency != 1:
+            parser.error("--postgres-grouped-create-evidence requires --file-concurrency=1")
+        if args.batch_size is None:
+            parser.error("--postgres-grouped-create-evidence requires --batch-size")
+        if args.expected_resource_inserts is None:
+            parser.error(
+                "--postgres-grouped-create-evidence requires --expected-resource-inserts"
+            )
+        if args.expected_bulk_entry_savepoints is None:
+            parser.error(
+                "--postgres-grouped-create-evidence requires --expected-bulk-entry-savepoints"
+            )
+    if args.require_phase_summary and not args.postgres_reindex_evidence:
+        parser.error("--require-phase-summary requires --postgres-reindex-evidence")
+    if args.expected_source_fingerprint and not re.fullmatch(
+        r"[0-9a-f]{64}", args.expected_source_fingerprint
+    ):
+        parser.error("--expected-source-fingerprint must be 64 lowercase hexadecimal characters")
+    if args.provider_url:
+        if args.provider_port:
+            parser.error("--provider-url and --provider-port are mutually exclusive")
+        parsed_provider = urllib.parse.urlparse(args.provider_url)
+        if parsed_provider.scheme not in ("http", "https") or not parsed_provider.netloc:
+            parser.error("--provider-url must be an absolute http:// or https:// URL")
+        args.provider_url = args.provider_url.rstrip("/")
+    if args.jobs < 1:
+        parser.error("--jobs must be >= 1")
+    if args.batch_size is not None and args.batch_size < 1:
+        parser.error("--batch-size must be >= 1")
+    if args.expected_resource_inserts is not None and args.expected_resource_inserts < 0:
+        parser.error("--expected-resource-inserts must be >= 0")
+    if (
+        args.expected_bulk_entry_savepoints is not None
+        and args.expected_bulk_entry_savepoints < 0
+    ):
+        parser.error("--expected-bulk-entry-savepoints must be >= 0")
+    if args.file_concurrency < 1:
+        parser.error("--file-concurrency must be >= 1")
+    if args.sample_interval <= 0 or args.host_interval <= 0:
+        parser.error("--sample-interval and --host-interval must be > 0")
+    if args.pressure_samples < 1 or args.swap_growth_samples < 1:
+        parser.error("--pressure-samples and --swap-growth-samples must be >= 1")
+    if args.dry_run:
+        plan = dry_run_plan(args)
+        if (
+            args.expected_source_fingerprint
+            and plan["source"]["fingerprint_sha256"]
+            != args.expected_source_fingerprint
+        ):
+            parser.error(
+                "current source does not match --expected-source-fingerprint"
+            )
+        print(json.dumps(plan, indent=2))
+        return EXIT_OK
+    try:
+        args.hfs_port = args.hfs_port or pick_free_port(18810, args.host)
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return EXIT_CONFIG
+    return Controller(args).run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -33,7 +33,7 @@ async fn get_compartment_definition_returns_seeded_resources() {
     let backend = Arc::new(backend);
 
     // Seed the default tenant, then serve.
-    seed_spec_compartment_definitions(&*backend, FhirVersion::R4, &data_dir(), "default")
+    seed_spec_compartment_definitions(&*backend, FhirVersion::R4, &data_dir(), "default", None)
         .await
         .expect("seed compartment definitions");
 

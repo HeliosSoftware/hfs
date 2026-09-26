@@ -330,23 +330,23 @@
       </table>
     </div>
   </text>
-  <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm">
-    <valueInteger value="5"/>
-  </extension>
   <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status">
     <valueCode value="normative"/>
+  </extension>
+  <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-normative-version">
+    <valueCode value="6.0.0-snapshot1"/>
   </extension>
   <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-wg">
     <valueCode value="vocab"/>
   </extension>
   <url value="http://hl7.org/fhir/OperationDefinition/CodeSystem-validate-code"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-snapshot1"/>
   <name value="ValidateCode"/>
   <title value="Code System based Validation"/>
   <status value="active"/>
   <kind value="operation"/>
   <experimental value="false"/>
-  <date value="2026-07-17T03:44:13+00:00"/>
+  <date value="2026-09-14T16:43:45+00:00"/>
   <publisher value="HL7 International / Terminology Infrastructure"/>
   <contact>
     <telecom>

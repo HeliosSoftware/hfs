@@ -77,10 +77,14 @@ mod bulk_export;
 mod bulk_provider;
 mod bulk_submit;
 pub(crate) mod cached;
+mod cleanup;
+mod lock_protocol;
+mod login_sessions;
 pub(crate) mod schema;
 pub mod search;
 mod search_impl;
 mod storage;
+mod sync_failures;
 mod transaction;
 mod user_settings;
 

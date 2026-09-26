@@ -54,6 +54,19 @@
 {# The summary card's STATUS cell rides along out-of-band, so the page-level
    status never goes stale while the card polls (#765 follow-up). #}
 <div id="submission-status" hx-swap-oob="true">{{ status_label }}</div>
+{# And so does the failed-status-change banner (#968): an Abort whose kick-off
+   the recipient never accepted leaves the submission running, and the only
+   durable signal used to be a log line. Out-of-band rather than inside the
+   card above, because this fragment is re-fetched every 5s with
+   hx-swap="outerHTML" — a banner beside the card would be duplicated by the
+   next swap, and one inside it would vanish whenever the card renders its
+   empty (not polling, not finished) form. The detail page renders the same
+   host, filled, so a hard reload shows it too. #}
+{% if !status_error.is_empty() %}
+<div id="submission-error" class="alert" role="alert" hx-swap-oob="true">{{ status_error }}</div>
+{% else %}
+<div id="submission-error" hx-swap-oob="true"></div>
+{% endif %}
 {# So does the Submission Log, whose lines this same poll just recorded
    (#955) — one response keeps both regions current. #}
 {% include "partials/bulk_import_log.html" %}

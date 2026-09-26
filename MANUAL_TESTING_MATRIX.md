@@ -9,8 +9,9 @@ builds it: all FHIR versions, all databases, all features (`--all-features`).
 
 From T2 onward every step is performed **by hand in the web UI** (`/ui`). The tester
 does not call the FHIR API with `curl` or any other client; the only command-line
-work is downloading and unpacking the test data, serving it over HTTP, and running
-the tiny webhook receiver that the subscription test needs.
+work is downloading and unpacking the test data, serving it over HTTP (optional for
+the T3 corpus, which is also hosted unpacked in S3 — see 7.1), and running the tiny
+webhook receiver that the subscription test needs.
 
 Legend for result cells: `☐` not run · `✅` pass · `❌` fail (link the issue) ·
 `N/A` not supported on this backend (expected, see [Expected support](#expected-support-by-backend)).
@@ -28,10 +29,10 @@ issue and replace the `☐` cells.
 | `sqlite-es` (SQLite + Elasticsearch) | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ |
 | `postgres` | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ |
 | `pg-es` (PostgreSQL + Elasticsearch) | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ |
-| `mongodb` | ☐ | ☐ | ☐ | ☐ | ☐ (4.10, 4.11 N/A) | N/A (501) | ☐ | ☐ | ☐ | ☐ |
+| `mongodb` | ☐ | ☐ | ☐ | ☐ | ☐ (4.13 N/A) | ☐ | ☐ | ☐ | ☐ | ☐ |
 | `mongo-es` (MongoDB + Elasticsearch) | ☐ | ☐ | ☐ | ☐ | ☐ | N/A (501) | ☐ | ☐ | ☐ | ☐ |
 | `s3` (MinIO) | ☐ | ☐ | ☐ (batch only) | ☐ | N/A (no search) | N/A (501) | ☐ | ☐ | ☐ | ☐ |
-| `s3-es` (MinIO + Elasticsearch) | ☐ | ☐ | ☐ (batch only) | ☐ | ☐ | N/A (501) | ☐ | ☐ | ☐ | ☐ |
+| `s3-es` (MinIO + Elasticsearch) | ☐ | ☐ | ☐ (batch only) | ☐ | ☐ | ☐ (5.8: 0 Patient) | ☐ | ☐ | ☐ | ☐ |
 
 Tester: ______  Commit: ______  Date: ______  OS/arch: ______
 
@@ -45,9 +46,9 @@ that is a failure.
 |---|---|---|---|---|---|---|---|---|
 | CRUD, history | yes | yes | yes | yes | yes | yes | yes | yes |
 | Search | yes | yes (ES) | yes | yes (ES) | yes | yes (ES) | **no** | yes (ES) |
-| Chained and `_has` search | yes | yes | yes | yes | **no** | yes | no | yes |
-| Transaction Bundles | yes | yes | yes | yes | yes | yes | **no** (batch only) | **no** (batch only) |
-| Bulk Data `$export` (job store) | yes | yes | yes | yes | no (501) | no (501) | no (501) | no (501) |
+| Chained and `_has` search | yes | yes | yes | yes | yes | yes | no | yes |
+| Transaction Bundles | yes | yes | yes | yes | yes (replica set) | yes (replica set) | **no** (batch only) | **no** (batch only) |
+| Bulk Data `$export` (job store) | yes | yes | yes | yes | yes | no (501) | no (501) | yes (SQLite sidecar) |
 | `$bulk-submit` ingestion (Import page) | yes | yes | yes | yes | yes | yes | yes¹ | yes¹ |
 | `$sql-run` / `$sql-export` runner | in-DB | in-DB (primary) | in-DB | in-DB (primary) | in-DB (aggregation) | in-DB (primary) | in-process scan | in-process scan |
 | Subscriptions engine | yes | yes | yes | yes | yes | yes | yes | yes |
@@ -69,9 +70,11 @@ part of T4.
 | Rust 1.90+ (edition 2024), `cargo` | build |
 | Python 3 with dev headers, `maturin` not required | `--workspace` includes `pysof` (PyO3 cdylib); the build needs a Python interpreter on `PATH` |
 | Docker | Postgres, Elasticsearch, MongoDB, MinIO |
-| `curl`, `jq` | T1 smoke check only; `jq` optionally trims the import manifest in T3 |
-| `tar`, `python3` | unpack the corpora; `python3 -m http.server` serves the corpus to the Import page and runs the webhook receiver in T8 |
-| ~45 GB free disk | corpus (3.6 GB tar.gz, 35 GB extracted) plus SQLite/Postgres data |
+| `curl`, `jq` | T1 smoke check; T3 corpus and count checks (7.1, 7.5); `jq` optionally trims the import manifest in T3 |
+| `tar`, `python3` | unpack the corpora; `python3` runs the webhook receiver in T8 (not the corpus server, see 7.1) |
+| HTTP/1.1 keep-alive static server | serves the corpus to the Import page in T3 (7.1); `nginx:alpine` in Docker works |
+| ~45 GB free disk | corpus (3.6 GB tar.gz, 35 GB extracted) plus SQLite/Postgres data; the corpus share is not needed when T3 uses the hosted manifest (7.1) |
+| ≥ 16 GB RAM on `*-es` rows | 8 GB Elasticsearch heap (section 4) |
 | A modern browser with JavaScript on | every step from T2 on runs in `/ui`; the Batch / Transaction page needs JavaScript |
 
 Shell conventions used below:
@@ -90,6 +93,7 @@ Test data used from T2 on:
 | Archive | Contents | Used in |
 |---|---|---|
 | <https://hfs-manual-test.s3.us-east-1.amazonaws.com/fhir2.tar.gz> (3.6 GB) | Synthea R4 corpus as NDJSON: 24 files, 18,955,865 resources for 11,704 Massachusetts patients, plus a Bulk Data `manifest.json` | T3 |
+| <https://hfs-manual-test.s3.us-east-1.amazonaws.com/manifest.json> | The same corpus, already unpacked in the S3 bucket: a Bulk Data manifest whose 24 `output` URLs point at the NDJSON files in the bucket. Use it directly as the T3 **Manifest URL** instead of downloading, unpacking, and serving `fhir2.tar.gz` (see 7.1) | T3 (alternative) |
 | <https://hfs-manual-test.s3.us-east-1.amazonaws.com/fhir-batch-import.tar.gz> (187 KB) | Three Synthea Bundles: `hospitalInformation…json` (batch, 9 entries), `practitionerInformation…json` (batch, 8 entries), `Nicky270_Ann985_Larkin917_…json` (transaction, 662 entries) | T2 |
 
 One patient from the corpus is used as the anchor for T4–T8. Its id is stable
@@ -108,13 +112,12 @@ because the bulk import preserves resource ids:
 ## 3. T0 — Build (the full CI build)
 
 `ci.yml` tests with `cargo test --workspace --all-features` and releases with
-`cargo build --workspace --all-features --release`. Use the release form so the
-import and export timings are representative.
+`cargo build --workspace --all-features`.
 
 ```bash
 cd /path/to/hfs
 git status --short | grep -v 'crates/fhir/tests/data' # working tree should be clean apart from R6 fixture churn
-cargo build --workspace --all-features --release 2>&1 | tee "$WORK/build.log"
+cargo build --workspace --all-features 2>&1 | tee "$WORK/build.log"
 ./target/release/hfs --help | head -5
 ```
 
@@ -124,7 +127,7 @@ downloaded on first build; the build also rewrites the checked-in R6 fixture fil
 under `crates/fhir/tests/data` — do not commit those.
 
 If Python is unavailable on the machine, build the default members instead and note
-the deviation in the results: `cargo build --all-features --release` (skips `pysof`).
+the deviation in the results: `cargo build --all-features` (skips `pysof`).
 
 Pass criteria: build exits 0; `hfs --help` prints usage.
 
@@ -133,7 +136,8 @@ Pass criteria: build exits 0; `hfs --help` prints usage.
 ## 4. Backend infrastructure
 
 Start only what the row under test needs. Ports below are the ones the start
-commands in section 5 assume. These match the images CI uses.
+commands in section 5 assume. These match the images CI uses, except the
+Elasticsearch heap, which is sized for T3.
 
 ```bash
 # PostgreSQL 16 (postgres, pg-es)
@@ -141,20 +145,26 @@ docker run -d --name hfs-pg -p 5432:5432 \
   -e POSTGRES_USER=helios -e POSTGRES_PASSWORD=helios -e POSTGRES_DB=helios postgres:16
 
 # Elasticsearch 8.15.0 (any *-es composite)
+# T3: 8 GB heap and a named volume (survives `docker rm -fv`)
+docker volume create hfs-es-data
 docker run -d --name hfs-es -p 9200:9200 \
   -e discovery.type=single-node -e xpack.security.enabled=false \
-  -e "ES_JAVA_OPTS=-Xms1g -Xmx1g" elasticsearch:8.15.0
+  -e "ES_JAVA_OPTS=-Xms8g -Xmx8g" \
+  -v hfs-es-data:/usr/share/elasticsearch/data \
+  elasticsearch:8.15.0
 
-# MongoDB 7.0 (mongodb, mongo-es)
-docker run -d --name hfs-mongo -p 27017:27017 mongo:7.0
+# MongoDB 7.0 (mongodb, mongo-es) — a single-node replica set: transaction Bundles
+# need multi-document transactions, which a standalone mongod cannot run (T2 6.3).
+docker run -d --name hfs-mongo -p 27017:27017 mongo:7.0 --replSet rs0 --bind_ip_all
+docker exec hfs-mongo mongosh --quiet --eval 'rs.initiate({_id:"rs0",members:[{_id:0,host:"localhost:27017"}]})'
 
 # MinIO (s3, s3-es, and the S3 output-backend variants of T5/T7)
 docker run -d --name hfs-minio -p 9000:9000 -p 9001:9001 \
   -e MINIO_ROOT_USER=hfs-minio -e MINIO_ROOT_PASSWORD=hfs-minio-secret \
-  minio/minio:latest server /data --console-address ":9001"
+  quay.io/minio/minio:latest server /data --console-address ":9001"
 # create the buckets once MinIO is up (console at http://localhost:9001)
 docker run --rm --network host -e MC_HOST_local=http://hfs-minio:hfs-minio-secret@localhost:9000 \
-  minio/mc mb --ignore-existing local/hfs local/hfs-export local/hfs-sql-export
+  quay.io/minio/mc mb --ignore-existing local/hfs local/hfs-export local/hfs-sql-export
 ```
 
 Readiness checks:
@@ -163,12 +173,58 @@ Readiness checks:
 docker exec hfs-pg pg_isready -U helios
 curl -s localhost:9200/_cluster/health | jq .status
 docker exec hfs-mongo mongosh --quiet --eval 'db.runCommand({ping:1}).ok'
+docker exec hfs-mongo mongosh --quiet --eval 'rs.status().ok'    # 1
 curl -sf localhost:9000/minio/health/live && echo minio ok
 ```
 
+On a host with less than 16 GB of RAM use `-Xms4g -Xmx4g` and record the deviation.
+
 Reset between backend rows: `docker rm -fv hfs-pg hfs-es hfs-mongo hfs-minio` and
 recreate. For SQLite delete `data/hfs.db*` and `data/bulk_export.db*`; on every
-backend also delete `data/submit` (bulk-import status artifacts).
+backend also delete `data/submit` (bulk-import status artifacts). `hfs-es-data` survives
+`docker rm -fv`; for a clean index also run `docker volume rm hfs-es-data`.
+
+### 4.1 Elasticsearch preparation for `*-es` rows
+
+Do this before T3.
+
+**1. Give the run its own index prefix** in the shell that starts HFS (keep it
+exported for 7.5 and §14), so a retried T3 starts clean:
+
+```bash
+export ES_PREFIX=hfs_$(date +%Y%m%d_%H%M)          # e.g. hfs_20260916_1042
+export HFS_ELASTICSEARCH_INDEX_PREFIX=$ES_PREFIX   # default "hfs"
+```
+
+**2. Check the shard budget** before starting.
+
+```bash
+curl -s "localhost:9200/_cat/health?v"                       # green or yellow, never red
+curl -s "localhost:9200/_cat/shards" | wc -l                 # must be well under 1000
+curl -s "localhost:9200/_cat/indices?v&h=index,health,docs.count,store.size"
+```
+
+The shard count must stay well under 1,000 (a T3 run adds about 52). If the cluster
+is full, HFS never becomes ready and the log only shows `Sync attempt failed,
+retrying`. That is not an HFS defect: run step 3. Yellow is normal on a single node;
+only red is a failure.
+
+**3. Clean up at the end of the row.**
+
+```bash
+names=$(curl -s "localhost:9200/_cat/indices/${ES_PREFIX}_*?h=index" | tr -d ' ' | paste -sd, -)
+echo "$names"
+curl -sf -X DELETE "localhost:9200/$names"     # wildcard deletes are rejected, hence the names
+curl -s localhost:9200/_cat/shards | wc -l     # back down
+```
+
+If a run hits the shard limit mid-import, raise it for the session, finish, clean up
+and record that you did:
+
+```bash
+curl -sf -X PUT localhost:9200/_cluster/settings -H 'Content-Type: application/json' \
+  -d '{"persistent":{"cluster.max_shards_per_node":3000}}'
+```
 
 ---
 
@@ -185,13 +241,50 @@ export HFS_REQUEST_TIMEOUT=600            # large bundles on composite backends
 export HFS_SUBSCRIPTIONS_ENABLED=true
 export HFS_BULK_EXPORT_OUTPUT_DIR=$WORK/bulk-exports  # T5 local-fs output
 export HFS_EXPORT_DIR=$WORK/sql-exports               # T7 fs sink
-# composites: make searches read-your-write so T3 counts and T4 are deterministic
+# composites: read-your-write for T2 and T4; the rebuild skips the refresh wait
 export HFS_COMPOSITE_SYNC_MODE=synchronous HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for
+export HFS_ELASTICSEARCH_REINDEX_REFRESH=false
 ```
 
 `HFS_BASE_URL` matters more than usual in this pass: the Import page makes HFS
 submit `$bulk-submit` *to itself* at that URL, so it must be reachable from the HFS
 process.
+
+**If you move `HFS_SERVER_PORT` off 8080, move `HFS_BASE_URL` with it.** They are
+independent settings with independent defaults, and the Import page always uses
+`HFS_BASE_URL` as the Data Recipient — it is not typed per submission (#689/#686).
+Change only the port and every submission fails minutes later with a transport
+error, `POST http://localhost:8080/$bulk-submit failed: error sending request for
+url`, because nothing is listening there. HFS does warn about the mismatch at
+startup (`HFS_BASE_URL '…' advertises a different port from listener …`), but it is
+a `warn!`, not a fatal, and it is easy to miss in the startup log. The rest of this
+document writes `http://localhost:8080`; substitute your own base URL throughout.
+
+### One environment for the whole pass
+
+Use these settings for the whole pass; do not restart HFS between T3 and T4:
+
+| Setting | Value | Why |
+|---|---|---|
+| `HFS_COMPOSITE_SYNC_MODE` | `synchronous` | T2 and T4 see their own writes |
+| `HFS_ELASTICSEARCH_WRITE_REFRESH` | `wait_for` | same, for the Elasticsearch leg |
+| `HFS_ELASTICSEARCH_REINDEX_REFRESH` | `false` | the rebuild does not wait for refreshes |
+
+Without `REINDEX_REFRESH=false` the search rebuild in 7.4 is several times slower.
+
+Leave `HFS_BULK_SUBMIT_DEFER_INDEXING` at its default (`true`) on rows without
+Elasticsearch: the import stores first and the search index is rebuilt afterwards
+(7.4). On `*-es` rows set `HFS_BULK_SUBMIT_DEFER_INDEXING=false` with
+`HFS_BULK_SUBMIT_INDEX_QUEUE=64`, `HFS_BULK_SUBMIT_INDEX_CONCURRENCY=8` and
+`HFS_BULK_SUBMIT_INDEX_COALESCE=4`, the settings of the #937 reference run (§14).
+Record the mode in the matrix cell, because it changes what 7.4 and §14 measure.
+
+### Cost of the status page during T3
+
+Keep the submission detail page open (7.3), but expect it to slow down. Its status
+card polls every 5 s, and each poll gets slower as the import grows; on SQLite, gaps
+of minutes between updates are expected, not a hang. The dashboard is safe to leave
+open (#1081).
 
 ### Per-backend environment
 
@@ -201,7 +294,7 @@ process.
 | `sqlite-es` | `HFS_STORAGE_BACKEND=sqlite-es HFS_ELASTICSEARCH_NODES=http://localhost:9200` |
 | `postgres` | `HFS_STORAGE_BACKEND=postgres HFS_DATABASE_URL=postgresql://helios:helios@localhost:5432/helios` |
 | `pg-es` | as `postgres` plus `HFS_STORAGE_BACKEND=pg-es HFS_ELASTICSEARCH_NODES=http://localhost:9200` |
-| `mongodb` | `HFS_STORAGE_BACKEND=mongodb HFS_MONGODB_URI=mongodb://localhost:27017 HFS_MONGODB_DATABASE=helios` |
+| `mongodb` | `HFS_STORAGE_BACKEND=mongodb HFS_MONGODB_URI=mongodb://localhost:27017/?replicaSet=rs0&directConnection=true HFS_MONGODB_DATABASE=helios` |
 | `mongo-es` | as `mongodb` plus `HFS_STORAGE_BACKEND=mongo-es HFS_ELASTICSEARCH_NODES=http://localhost:9200` |
 | `s3` | `HFS_STORAGE_BACKEND=s3 HFS_S3_BUCKET=hfs HFS_S3_ENDPOINT=http://localhost:9000 HFS_S3_FORCE_PATH_STYLE=true HFS_S3_REGION=us-east-1 AWS_ACCESS_KEY_ID=hfs-minio AWS_SECRET_ACCESS_KEY=hfs-minio-secret` |
 | `s3-es` | as `s3` plus `HFS_STORAGE_BACKEND=s3-es HFS_ELASTICSEARCH_NODES=http://localhost:9200` |
@@ -222,7 +315,9 @@ open $HFS/ui   # dashboard renders; sidebar shows the backend and FHIR version
 
 Pass criteria: `/health` is 200; CapabilityStatement `fhirVersion` is `4.0.1`;
 the startup log names the expected backend (and Elasticsearch index prefix for
-composites); `/ui` loads with zero resources.
+composites); `/ui` loads; the clinical rail is at 0 while the dashboard reads
+about 1.4k stored resources (the 1,374 SearchParameter and 5 CompartmentDefinition
+resources seeded at startup).
 
 Also check version switching works on a multi-version build: `curl -sf
 "$HFS/metadata?_format=json" -H 'Accept: application/fhir+json; fhirVersion=5.0'
@@ -334,13 +429,44 @@ references; 6.4 gives the exact messages. On `s3`/`s3-es` run 6.2 and 6.4 only.
 
 ## 7. T3 — Import the Synthea corpus from the Import page
 
+For issue #1086 development measurements, use the bounded 2,000-resource
+[PostgreSQL reindex benchmark](docs/postgres-reindex-benchmark.md). That protocol
+does not replace this full-corpus release-matrix test or change its pass criteria.
+
+For issue #1087 coordination measurements, use the focused
+[deferred reindex coordination benchmark](docs/deferred-reindex-coordination-benchmark.md).
+It submits combined, consecutive, overlapping, and burst manifests against a
+dedicated PostgreSQL instance. The controller records physical reindex jobs,
+summed job totals, processed resources, created index entries, observed overlap,
+and indexed-search readiness. Run the controller separately because its
+concurrent API traffic does not fit this UI-only release pass.
+
+Deferred automatic reindex coordination is common to every backend that wires a
+`ReindexOperation`, but the #1087 performance protocol supports claims about
+PostgreSQL only. The guarantee is process-local. Explicit `$reindex` jobs and
+jobs started on another HFS process can overlap the automatic work.
+
 The corpus is a Bulk Data export of 11,704 Synthea patients (18,955,865 resources in
 24 NDJSON files) plus a `manifest.json` that references those files at
 `http://localhost:8000/…`. HFS ingests it with the Bulk Data `$bulk-submit`
 operation, driven from the **Import** page, which makes HFS fetch the manifest and
-every file from a small HTTP server you run on port 8000.
+every file from a static HTTP server you run on port 8000 — or, alternatively,
+straight from the S3 bucket, where the archive has already been unpacked.
+
+Before starting, confirm HFS runs with the section 5 environment and, on `*-es` rows,
+that 4.1 is done.
 
 ### 7.1 Download, unpack, and serve the corpus
+
+**Alternative: use the hosted manifest and skip the download and the server.** The
+manifest at <https://hfs-manual-test.s3.us-east-1.amazonaws.com/manifest.json> is
+publicly readable and its `output` URLs point at the bucket. Record the per-type
+counts (below, hosted form), then go to 7.2 and enter that URL as the **Manifest
+URL**. Counts in 7.5 and T4 are unchanged. HFS needs outbound internet and pulls
+~35 GB; note the source in the matrix cell. There is no local server log to watch in
+7.3.
+
+Otherwise, host the corpus locally:
 
 ```bash
 mkdir -p "$WORK/corpus" && cd "$WORK/corpus"
@@ -348,11 +474,63 @@ mkdir -p "$WORK/corpus" && cd "$WORK/corpus"
 tar -xzf fhir2.tar.gz                    # extracts a directory containing the 24 *.ndjson files and manifest.json
 cd fhir2 2>/dev/null || cd "$(dirname "$(find . -name manifest.json | head -1)")"
 ls | wc -l                               # 26 files (24 NDJSON, manifest.json, parameters.json)
-python3 -m http.server 8000 --bind 127.0.0.1 > "$WORK/corpus-http.log" 2>&1 &
-curl -sf http://localhost:8000/manifest.json | head -c 400   # the manifest is being served
+export CORPUS=$PWD
 ```
 
-Leave the HTTP server running until the import has finished.
+#### Serve it with an HTTP/1.1 keep-alive server, not `python3 -m http.server`
+
+```bash
+chmod -R a+rX "$CORPUS"                  # the container's worker must be able to read the files
+docker run -d --name hfs-corpus -p 8000:80 -v "$CORPUS":/usr/share/nginx/html:ro nginx:alpine
+```
+
+Any static server works (e.g. `caddy file-server --root "$CORPUS" --listen :8000`);
+on SELinux add `,z` to the mount. Stop it with `docker rm -f hfs-corpus` after T3 and
+its search rebuild, not before.
+
+`python3 -m http.server` truncates large files on this corpus (#1126), which fails T3
+after hours of ingest. Run the byte check below before the import.
+
+#### Check the server answers HTTP/1.1 and serves whole files
+
+```bash
+curl -s -o /dev/null -D - http://localhost:8000/manifest.json | head -3   # HTTP/1.1 200, no "Connection: close"
+curl -sf http://localhost:8000/manifest.json | head -c 400                # the manifest is being served
+```
+
+```bash
+jq -r '.output[].url' manifest.json | sed 's|.*/||' | sort -u |
+while read -r f; do
+  want=$(wc -c < "$f")
+  got=$(curl -s -o /dev/null -w '%{size_download}' "http://localhost:8000/$f")
+  if [ "$want" = "$got" ]; then echo "ok    $f $want"; else echo "TRUNC $f want=$want got=$got"; fi
+done | tee "$WORK/corpus-served-bytes.txt"
+grep -c '^ok' "$WORK/corpus-served-bytes.txt"     # must equal the number of NDJSON files
+grep '^TRUNC' "$WORK/corpus-served-bytes.txt"     # must print nothing
+```
+
+This reads the whole corpus once (a few minutes on NVMe). **A single `TRUNC` line
+means stop: fix the server and start T3 over.** Keep the file with the results.
+
+#### Record the per-type counts the run will be judged against
+
+```bash
+jq -r '.output[] | [.type, (.url | split("/") | last)] | @tsv' manifest.json |
+while IFS=$'\t' read -r type file; do printf '%s\t%s\n' "$type" "$(wc -l < "$file")"; done |
+sort > "$WORK/corpus-counts.tsv"
+cat "$WORK/corpus-counts.tsv"
+```
+
+These are the expected counts for 7.5. With the hosted manifest, use its `count` per
+output instead:
+
+```bash
+curl -sf https://hfs-manual-test.s3.us-east-1.amazonaws.com/manifest.json |
+  jq -r '.output[] | [.type, .count] | @tsv' | sort > "$WORK/corpus-counts.tsv"
+```
+
+Leave the HTTP server running until the import **and its search rebuild** have
+finished (7.4).
 
 **Optional reduced import.** The full corpus is ~35 GB of NDJSON; on a slow machine
 or a composite backend it can take hours. The later steps only need the file types
@@ -365,8 +543,22 @@ jq '.output |= map(select(.type | IN("Patient","Encounter","Condition","Observat
    manifest.json > manifest-core.json          # 11,197,644 resources; Observation (7.5 GB) is the bulk of it
 ```
 
+No trimmed manifest is hosted in the bucket. To combine the reduced import with the
+hosted files, run the same `jq` filter over the hosted manifest and serve only the
+resulting small file locally — its `output` URLs still point at S3:
+
+```bash
+mkdir -p "$WORK/corpus" && cd "$WORK/corpus"
+curl -sf https://hfs-manual-test.s3.us-east-1.amazonaws.com/manifest.json \
+  | jq '.output |= map(select(.type | IN("Patient","Encounter","Condition","Observation","Procedure",
+                                         "Organization","Practitioner","PractitionerRole","Location")))' \
+  > manifest-core.json
+docker run -d --name hfs-corpus -p 8000:80 -v "$PWD":/usr/share/nginx/html:ro nginx:alpine
+```
+
 Whichever manifest is used, the counts in T4 for `Patient`, `Encounter`,
-`Condition`, and `Observation` are unchanged.
+`Condition`, and `Observation` are unchanged. Regenerate `corpus-counts.tsv` from the
+manifest you actually serve.
 
 ### 7.2 Create the submission in the UI
 
@@ -378,7 +570,9 @@ Whichever manifest is used, the counts in T4 for `Patient`, `Encounter`,
 3. Fill in:
    - **Submission name**: `synthea-<backend>` (e.g. `synthea-sqlite`).
    - **Manifest URL**: `http://localhost:8000/manifest.json`
-     (or `http://localhost:8000/manifest-core.json` for the reduced import).
+     (or `http://localhost:8000/manifest-core.json` for the reduced import, or
+     `https://hfs-manual-test.s3.us-east-1.amazonaws.com/manifest.json` for the
+     hosted corpus — see 7.1).
    - **Authentication**: leave **None** selected.
    - Leave **Advanced options** collapsed (defaults: submitter
      `urn:helios:hfs:bulk-submit`, format `application/fhir+ndjson`).
@@ -391,7 +585,9 @@ Whichever manifest is used, the counts in T4 for `Patient`, `Encounter`,
 On the detail page verify:
 
 - The summary card shows **Manifest URL** = the URL you typed, **Data Recipient** =
-  `http://localhost:8080`, a **Submission ID**, **Submitter**
+  your `HFS_BASE_URL` (`http://localhost:8080` unless you moved it — if this shows a
+  port nothing is listening on, stop here and fix `HFS_BASE_URL`; see T1), a
+  **Submission ID**, **Submitter**
   `urn:helios:hfs:bulk-submit | <submission id>`, **Status** = **In Progress**,
   **Authentication** = `none`.
 - The **Submission Log** (newest first) contains
@@ -400,26 +596,77 @@ On the detail page verify:
 - The status card shows **Processing** with a progress bar, and refreshes on its own
   every 5 s. Its text is the recipient's progress report (or *"Waiting for the
   recipient's first status report…"* right after kick-off).
-- In the HTTP server log (`$WORK/corpus-http.log`) the NDJSON files are being
-  requested one after another.
+- In the corpus server's log (`docker logs hfs-corpus`) the NDJSON files are being
+  requested one after another. (Not applicable with the hosted manifest: the files
+  come from S3, so the log line quotes the S3 manifest URL and there is no local
+  request log.)
 
 Wait for the status card to change to **Result** → *"Processing finished at …"*,
 **Output files** = 24 (or 9 for the reduced manifest) and **Error files** = 0, the
 summary **Status** = **Completed**, and the log to end with
 `Status: got 200 OK — processing finished cleanly (24 outputs); submission completed.`
-Record the elapsed time in the matrix.
+Record that instant as the end of the ingest time (§14). Do not run the counts yet:
+the search index is rebuilt in 7.4.
 
 If the status becomes **Failed**, the **Error files** count is non-zero, or the log
-shows `POST http://localhost:8080/$bulk-submit → …` with an error, record the log text
-and file an issue.
+shows `POST <your HFS_BASE_URL>/$bulk-submit → …` with an error, record the log text
+and file an issue. One cause is not a bug: `error sending request for url` is a
+transport failure, meaning the Data Recipient points at a port with nothing behind
+it — re-check `HFS_BASE_URL` against `HFS_SERVER_PORT` before filing.
 
-### 7.4 Verify the data landed and is searchable
+### 7.4 Wait for the deferred search rebuild
+
+With `HFS_BULK_SUBMIT_DEFER_INDEXING=true` (rows without Elasticsearch, section 5) the
+submission reports **Completed** once the resources are stored, and a separate job
+builds the search index afterwards. In the #1126 campaign it reported Completed with
+the index about 9 % built. Every count check belongs after this step.
+
+On `*-es` rows (`DEFER_INDEXING=false`, section 5) the batches were indexed during
+ingest and the log says `bulk-submit indexed every resource during ingest; no deferred
+reindex needed`; this step then only confirms there is nothing to wait for. Record
+which mode ran. The rest describes the default.
+
+1. **Watch the rebuild banner on `/ui`**: *"Search index rebuilding — N % (P of T
+   resources). Searches may miss stored resources until it finishes."*
+2. **The banner is also a result** (#1125): it stays up if the rebuild left resources
+   unindexed, and disappears on a clean `completed`, but also when the rebuild was
+   cancelled or never ran, and once the job is evicted (24 h or 1,024 jobs). An absent
+   banner alone proves nothing; go to step 3.
+3. **Confirm with `$reindex-status`.** The job id is in the banner and in the
+   `deferred reindex generation started` log line.
+
+   ```bash
+   curl -sf "$HFS/\$reindex-status/<job id>" |
+     jq -r '.parameter[] | "\(.name)=\(.valueString // .valueInteger // .valueCode // .valueDecimal // "")"'
+   ```
+
+   `status` is `queued`, `inprogress`, `completed`, `failed` or `cancelled`. **Pass
+   needs `completed` with `errorCount` 0.** Failing resources come back as `error`
+   parts (`resourceType`, `resourceId`, `message`, `retryable`), capped at 100.
+4. **Confirm the log** (`$WORK/hfs-<backend>.log`) carries `deferred reindex
+   generation completed` and none of these, each of which means the search index is
+   incomplete:
+
+   - `deferred reindex generation failed; retrying once`
+   - `deferred reindex failed twice; run $reindex manually …`
+   - `deferred reindex completed, but resources were rejected permanently …`
+   - `deferred reindex coordinator closed…; run $reindex manually`
+
+5. **Record the rebuild's elapsed time** separately from the ingest time (§14).
+
+A rebuild that ends `failed`, or `completed` with a non-zero `errorCount`, fails T3
+for this row; keep the `$reindex-status` output. Running `POST $HFS/$reindex` by hand
+to move on is allowed; record that it was needed. Since #1156 the expected result is a
+clean `completed`, so a shortfall is a regression to report.
+
+### 7.5 Verify the data landed and is searchable
 
 1. Open `$HFS/ui` (the dashboard). The stat cards and the resources-over-time chart
    must reflect the import; the **Patient** card reads 11,705 (the corpus plus the
    patient from T2).
 2. Click **Resources** in the sidebar. The **Resource Types** rail shows a live count
-   next to every type; compare against the manifest plus what T2 created:
+   next to every type. Compare **every type in `$WORK/corpus-counts.tsv`** plus what
+   T2 created, not only this table (it omits types such as `Provenance`):
 
    | Type | Expected count |
    |---|---|
@@ -431,17 +678,35 @@ and file an issue.
    | Organization / Practitioner / PractitionerRole | 1,140 each |
    | Location | 1,142 |
 
+   **A short type is a T3 failure.** Record which type and by how much.
+
 3. In the **QUERY** box type `GET /Patient?_id=7d24f7a0-6f2e-ce3b-5568-db7b14695583`
    and press **Run**. One row: Cari853 Esperanza675 Parker433, female, 2015-12-29.
    Click the id link; the **Edit Resource** modal opens with the JSON. Close it.
 4. Type `GET /Observation?_summary=count` and **Run**: the results header reads
    **7,699,987 results** and the table says *No results.* (a count-only Bundle has no
    entries; that is correct).
-5. On composites, confirm the Elasticsearch document counts match
-   (`curl localhost:9200/_cat/indices/hfs*` — an infrastructure check, not an HFS API
-   call).
+5. On composites, confirm the Elasticsearch counts per type. Use `_count`, not
+   `_cat/indices`, whose `docs.count` includes hidden nested documents (#991). This
+   is an infrastructure check, not an HFS API call:
 
-### 7.5 Optional: back to Batch / Transaction
+   ```bash
+   while IFS=$'\t' read -r type _; do
+     idx="${ES_PREFIX}_default_$(echo "$type" | tr 'A-Z' 'a-z')"
+     n=$(curl -s -H 'Content-Type: application/json' "localhost:9200/$idx/_count" -d '{
+           "query": {"bool": {
+             "filter":   [{"term": {"is_deleted": false}}],
+             "must_not": [{"term": {"is_contained": true}}]}}}' | jq -r '.count // "no index"')
+     printf '%s\t%s\n' "$type" "$n"
+   done < "$WORK/corpus-counts.tsv" | tee "$WORK/es-counts.tsv"
+   ```
+
+   The filter is the one HFS's own searches use (`query_builder.rs`); top-level
+   documents omit `is_contained`, so `must_not: true` is used, not `false`. Compare
+   `es-counts.tsv` with `corpus-counts.tsv` plus what T2 created; a shortfall in any
+   type is a failure.
+
+### 7.6 Optional: back to Batch / Transaction
 
 The corpus contains its own copy of every organisation and practitioner that T2
 created, each with the same identifier. Upload `Nicky270_Ann985_Larkin917_….json`
@@ -450,21 +715,27 @@ once more on **Batch / Transaction** and **Execute**: it must now be rejected wi
 more than one resource"*, and `GET /Patient?given=Nicky270&family=Larkin917` on
 **Resources** is still **1 result**. Click **Cancel**.
 
-Pass criteria: the submission finishes **Completed** with 0 error files; the rail
-counts match the table; the anchor patient is found by id; the dashboard reflects
-the import; the optional duplicate-reference upload is rejected without side effects.
+Pass criteria: the byte check in 7.1 reported no truncation (locally served corpus);
+the submission finishes **Completed** with 0 error files; the search rebuild reaches
+`completed` with `errorCount` 0; per-type counts match `corpus-counts.tsv` plus what
+T2 created, on the rail and (composites) in Elasticsearch; the anchor patient is
+found by id; the dashboard reflects the import; the optional duplicate-reference
+upload is rejected without side effects; ingest time, searchable time and final
+database size are recorded (§14). No restart is needed before T4.
 
 ---
 
 ## 8. T4 — One manual search per FHIR search type
 
-All searches are typed into the **QUERY** box on **Resources** (`/ui/resources`).
-The box accepts a raw FHIR search (`GET /Patient?name=Parker433&_count=5`) and
-**Run** (or Enter) executes it and renders the Bundle in the **Results** card. The
-results header shows **N results** taken from `Bundle.total` and, when the Bundle
-carries `_include`/`_revinclude` entries, **· M included**. The **Open in New Tab**
-link is the exact path that ran — hover it to confirm the URL the UI built, or click
-it to see the raw Bundle.
+All searches are typed into the **QUERY** box on **Resources** (`/ui/resources`). The
+box accepts a raw FHIR search (`GET /Patient?name=Parker433&_count=5`) and **Run**
+(or Enter) executes it and renders the Bundle in the **Results** card. The results
+header shows **N results** taken from `Bundle.total` (the page adds `_total=accurate`
+to the request it sends, so the count is the match count, not the page size; a query
+that opts out with `_total=none` reads **N+ results** while more pages remain) and,
+when the Bundle carries `_include`/`_revinclude` entries, **· M included**. The
+**Open in New Tab** link is the exact path that ran — hover it to confirm the URL the
+UI built, or click it to see the raw Bundle.
 
 Expected counts assume the full corpus plus the T2 transaction (11,705 patients).
 `PID` is the anchor patient `7d24f7a0-6f2e-ce3b-5568-db7b14695583`.
@@ -497,7 +768,7 @@ issues a `PUT` and the ids are known in advance.
 
 | # | Search type | Type into the QUERY box | Expected in the Results card |
 |---|---|---|---|
-| 4.1 | **string** | `GET /Patient?family=Parker433` then `GET /Patient?family:exact=Parker433` then `GET /Patient?family:contains=arker43` then `GET /Patient?name=cari853` | **30 results** for the first two; the `:contains` form ≥ 30; the lower-case `name=cari853` form finds the anchor patient (≥ 8 results — `name` also matches given names, case-insensitively) |
+| 4.1 | **string** | `GET /Patient?family=Parker433` then `GET /Patient?family:exact=Parker433` then `GET /Patient?family:contains=arker43` then `GET /Patient?name=cari853` | **30 results** for the first two; the `:contains` form ≥ 30; the lower-case `name=cari853` form finds the anchor patient (**3 results** — given names match too; `name=Cari853`, `given=Cari853` and `name:exact=Cari853` return the same 3) |
 | 4.2 | **token** | `GET /Patient?gender=female` · `GET /Patient?gender:not=female` · `GET /Patient?identifier=http://hl7.org/fhir/sid/us-ssn\|999-33-3920` · `GET /Observation?code=http://loinc.org\|8302-2` · `GET /Observation?code=8302-2` | **5,814** · **5,891** (the two add up to 11,705) · **1 result** = the anchor patient · > 175,000 results, identical for the `system\|code` and code-only forms |
 | 4.3 | **date** | `GET /Patient?birthdate=ge1980-01-01&birthdate=lt1990-01-01` · `GET /Encounter?patient=PID&date=ge2016` · `GET /Patient?_lastUpdated=ge<today, YYYY-MM-DD>` | **1,268 results** · between 1 and 24 results, every `period.start` in 2016 or later · **11,705** |
 | 4.4 | **number** | `GET /RiskAssessment?probability=gt0.5` · `GET /RiskAssessment?probability=lt0.5` · `GET /RiskAssessment?probability=ap0.8` | **1 result** (`manual-risk`) · **0 results** · **1 result** |
@@ -506,10 +777,10 @@ issues a `PUT` and the ids are known in advance.
 | 4.7 | **uri** | `GET /ValueSet?url=http://example.org/fhir/ValueSet/manual-test` · `GET /ValueSet?url:below=http://example.org/fhir` | **1 result** · ≥ 1 |
 | 4.8 | **composite** | `GET /Observation?code-value-quantity=http://loinc.org\|8302-2$gt150` | > 0; equals the first count in 4.5; every row is a Body Height with value > 150 |
 | 4.9 | **special** (`_id`) | `GET /Patient?_id=PID` · `GET /Patient?_id=PID,<LPID from T2>` | **1** · **2** |
-| 4.10 | **chained** | `GET /Observation?subject.identifier=http://hl7.org/fhir/sid/us-ssn\|999-33-3920` · `GET /Observation?subject:Patient.family=Parker433&_count=5` | **165 results** (same as 4.6) · > 165, every row's `subject.display` ends in Parker433. **N/A on `mongodb`** (forward chains unsupported; expect a clear error, not a 500) |
-| 4.11 | **reverse chained** | `GET /Patient?_has:Observation:patient:code=http://loinc.org\|8302-2&_count=5` | > 0; pick a row, then `GET /Observation?patient=<that id>&code=8302-2` is > 0. **N/A on `mongodb`** |
+| 4.10 | **chained** | `GET /Observation?subject.identifier=http://hl7.org/fhir/sid/us-ssn\|999-33-3920` · `GET /Observation?subject:Patient.family=Parker433&_count=5` | **165 results** (same as 4.6) · > 165, every row's `subject.display` ends in Parker433. |
+| 4.11 | **reverse chained** | `GET /Patient?_has:Observation:patient:code=http://loinc.org\|8302-2&_count=5` | > 0; pick a row, then `GET /Observation?patient=<that id>&code=8302-2` is > 0. |
 | 4.12 | **_revinclude / _sort / paging** | `GET /Patient?_id=PID&_revinclude=Condition:patient` · `GET /Observation?patient=PID&_sort=-date&_count=5` · `GET /Patient?_count=20&_total=accurate` | **1 result · 15 included** · **165 results**, 5 rows, `effective` dates descending (also try the **Sort** dropdown: *Most recent*/*Oldest* re-run with `_sort` swapped) · **11,705 results**, 20 rows, **Next** appears; click it — the total stays 11,705 and **Previous** appears |
-| 4.13 | **_content** (full text) | `GET /Patient?_content=Everett` | ≥ 83 results (83 patients live in Everett); on composites check the log to confirm Elasticsearch served it |
+| 4.13 | **_content** (full text) | `GET /Patient?_content=Everett` | ≥ 83 results (83 patients live in Everett); on composites check the log to confirm Elasticsearch served it. **N/A on `mongodb`** (standalone MongoDB has no full-text search; the server answers 501 `full-text search not available`) |
 | 4.14 | **visual builder + saved query** | On **Saved Queries** (`/ui/queries`, type the URL) click **Patient** in the rail, then **+ Add condition**: parameter `family`, modifier **is**, value `Parker433`; **+ Add condition**: parameter `birthdate`, comparator **ge**, value `2010-01-01`; **+ _count** → key `_sort`, value `birthdate`. | The QUERY box reads `GET /Patient?family=Parker433&birthdate=ge2010-01-01&_sort=birthdate`; **Run** shows the Parker433 children (≥ 1, birth dates ascending). Enter **Name** `Parker kids`, click **Save**; it appears under **Patient** in the saved list; **Run** there re-runs it and its meta shows `1×`; the **Recent** dropdown lists it under **Saved**. |
 
 ### 8.3 Searches over the data loaded by Batch / Transaction (T2)
@@ -521,14 +792,14 @@ shows up twice, while the patient and everything under it exist only once.
 
 | # | Search type | Type into the QUERY box | Expected in the Results card |
 |---|---|---|---|
-| 4.15 | **token / string** on the patient | `GET /Patient?identifier=http://hl7.org/fhir/sid/us-ssn\|999-19-2626` · `GET /Patient?address-city=Millis` · `GET /Patient?family=Larkin917&given=Nicky270&gender=female` | **1 result** = `LPID` (this SSN exists only in the batch archive) · **13 results** (12 corpus + `LPID`) · ≥ 1, `LPID` among them |
+| 4.15 | **token / string** on the patient | `GET /Patient?identifier=http://hl7.org/fhir/sid/us-ssn\|999-19-2626` · `GET /Patient?address-city=Millis` · `GET /Patient?address-city:exact=Millis` · `GET /Patient?family=Larkin917&given=Nicky270&gender=female` | **1 result** = `LPID` (this SSN exists only in the batch archive) · **19 results** (string search is a prefix match: 13 in Millis plus 6 in Millis-Clicquot) · **13 results** (the selective exact form) · ≥ 1, `LPID` among them |
 | 4.16 | **date** (`_lastUpdated`) separates the two import paths | `GET /Patient?_lastUpdated=lt<T3 start>` · `GET /Patient?_lastUpdated=ge<T3 start>` where `<T3 start>` is the instant noted in 7.2 in UTC, e.g. `2026-09-04T14:00:00Z` | **1 result** = `LPID` (created in T2, before the import) · **11,704** |
 | 4.17 | **token + date** on Encounters | `GET /Encounter?patient=LPID&class=EMER` · `GET /Encounter?patient=LPID&class=IMP` · `GET /Encounter?patient=LPID&date=ge2020` · `GET /Encounter?patient=LPID&type=http://snomed.info/sct\|424619006` | **5** · **1** · **38** · **17** (prenatal visits) |
 | 4.18 | **reference + `_include`** through references the transaction resolved | `GET /Encounter?patient=LPID&_include=Encounter:service-provider` · `GET /Encounter?patient=LPID&_include=Encounter:participant` | **49 results · 4 included** (the four batch Organizations) · **49 results · 4 included** (the four batch Practitioners). In the raw Bundle (**Open in New Tab**) every `serviceProvider.reference` is a literal `Organization/<id>` |
-| 4.19 | **chained** through the batch reference data | `GET /Encounter?patient=LPID&service-provider.name=ENCOMPASS` · `GET /Encounter?patient=LPID&participant.identifier=http://hl7.org/fhir/sid/us-npi\|9999989798` | **38** · **38** (38 of the 49 encounters are at ENCOMPASS HEALTH BRAINTREE with Dr. Nickolas58 Schumm995). **N/A on `mongodb`** |
-| 4.20 | **batch reference data**, duplicated by the corpus | `GET /Organization?name=TIMOTHY DANIELS HOUSE` · `GET /Organization?address-city=HOLLISTON` · `GET /Practitioner?identifier=http://hl7.org/fhir/sid/us-npi\|9999888693` · `GET /Practitioner?family=Torphy630&given=Laine739&gender=female` · `GET /Location?name=A&A HEALTHCARE LLC` | **2 results** each (one created by the T2 batch with a server-assigned id, one imported by T3 with the Synthea id) |
+| 4.19 | **chained** through the batch reference data | `GET /Encounter?patient=LPID&service-provider.name=ENCOMPASS` · `GET /Encounter?patient=LPID&participant.identifier=http://hl7.org/fhir/sid/us-npi\|9999989798` | **38** · **38** (38 of the 49 encounters are at ENCOMPASS HEALTH BRAINTREE with Dr. Nickolas58 Schumm995). |
+| 4.20 | **batch reference data**, duplicated by the corpus | `GET /Organization?name=TIMOTHY DANIELS HOUSE` · `GET /Organization?address-city=HOLLISTON` · `GET /Practitioner?identifier=http://hl7.org/fhir/sid/us-npi\|9999888693` · `GET /Practitioner?family=Torphy630&given=Laine739&gender=female` · `GET /Location?name=A%26A%20HEALTHCARE%20LLC` | **2 results** each (one created by the T2 batch with a server-assigned id, one imported by T3 with the Synthea id) |
 | 4.21 | **clinical data** under the patient | `GET /Condition?patient=LPID&clinical-status=active` · `GET /Condition?patient=LPID&code=http://snomed.info/sct\|72892002` · `GET /Observation?patient=LPID&code=29463-7&value-quantity=gt60` · `GET /Observation?patient=LPID&code-value-quantity=http://loinc.org\|8302-2$gt160` · `GET /Immunization?patient=LPID&vaccine-code=http://hl7.org/fhir/sid/cvx\|140` · `GET /MedicationRequest?patient=LPID&status=stopped` · `GET /MedicationRequest?patient=LPID&code=http://www.nlm.nih.gov/research/umls/rxnorm\|757594` | **6** · **3** (Normal pregnancy) · **2** (60.2 kg and 64.5 kg) · **3** (all 164.1 cm) · **3** (seasonal influenza) · **9** · **4** (Jolivette 28 Day Pack) |
-| 4.22 | **`_revinclude` / `_has` / `_sort`** | `GET /Patient?_id=LPID&_revinclude=Immunization:patient` · `GET /Patient?_has:Condition:patient:code=http://snomed.info/sct\|706893006&_count=50` · `GET /Observation?patient=LPID&code=29463-7&_sort=date` | **1 result · 8 included** · `LPID` is among the rows · **4 results** whose values read 55.4, 58.5, 60.2, 64.5 from top to bottom (open each row). **`_has` is N/A on `mongodb`** |
+| 4.22 | **`_revinclude` / `_has` / `_sort`** | `GET /Patient?_id=LPID&_revinclude=Immunization:patient` · `GET /Patient?_has:Condition:patient:code=http://snomed.info/sct\|706893006&_count=50` · `GET /Observation?patient=LPID&code=29463-7&_sort=date` | **1 result · 8 included** · `LPID` is among the rows · **4 results** whose values read 55.4, 58.5, 60.2, 64.5 from top to bottom (open each row). |
 
 ### 8.4 Searches over the data loaded by the bulk import (T3)
 
@@ -542,8 +813,8 @@ These target the anchor patient (`PID`) and corpus-only reference data, beyond w
 | 4.25 | **references the bulk import left unresolved** | `GET /Encounter?patient=PID&_include=Encounter:service-provider`, then open one row | **24 results** with **no** *included* count. In the JSON, `serviceProvider.reference` is still the string `Organization?identifier=https://github.com/synthetichealth/synthea\|…`: the bulk import stores resources verbatim and does not rewrite conditional references, unlike the transaction in 4.18. Expected — record it, not a failure |
 | 4.26 | **clinical data** under the patient | `GET /Condition?patient=PID&clinical-status=active` · `GET /Condition?patient=PID&code=http://snomed.info/sct\|65363002` · `GET /Immunization?patient=PID` · `GET /MedicationRequest?patient=PID` · `GET /Procedure?patient=PID` | **1** · **2** (Otitis media) · **25** · **7** · **18** |
 | 4.27 | **quantity + `_sort`** (growth chart) | `GET /Observation?patient=PID&code=8302-2&_sort=date&_count=20` · `GET /Observation?patient=PID&code=8302-2&value-quantity=gt120` · `GET /Observation?patient=PID&code=8302-2&value-quantity=gt100\|\|cm` | **15 results**, oldest first; opening the first and last rows shows 72 cm (2016-09-07) and 145.3 cm (2026-01-06) · **4** · **8** |
-| 4.28 | **corpus-only reference data** | `GET /Organization?identifier=https://github.com/synthetichealth/synthea\|e2a8b444-9b8f-36ff-84c4-05ee98589482` · `GET /Organization?name=WHITLEY WELLNESS` · `GET /Location?address-city=Fitchburg` · `GET /Location?name=Fitchburg Outpatient Clinic` | **1** each (WHITLEY WELLNESS LLC, Charlestown, is the anchor's usual provider and is not in the batch archive) |
-| 4.29 | **`_has` / `_revinclude`** across the corpus | `GET /Patient?_has:Condition:patient:code=http://snomed.info/sct\|65363002&_id=PID` · `GET /Patient?_id=PID&_revinclude=Immunization:patient` · `GET /Patient?_id=PID&_revinclude=Encounter:patient&_revinclude=Procedure:patient` | **1** · **1 result · 25 included** · **1 result · 42 included** (24 + 18). **`_has` is N/A on `mongodb`** |
+| 4.28 | **corpus-only reference data** | `GET /Organization?identifier=https://github.com/synthetichealth/synthea\|e2a8b444-9b8f-36ff-84c4-05ee98589482` · `GET /Organization?name=WHITLEY WELLNESS` · `GET /Location?address-city=Fitchburg` · `GET /Location?name=Fitchburg Outpatient Clinic` | **1** each for the first two (WHITLEY WELLNESS LLC, Charlestown, is the anchor's usual provider and is not in the batch archive) · **8** for `address-city=Fitchburg` (the corpus holds eight Locations in Fitchburg) · **1** for `name=Fitchburg Outpatient Clinic`, the selective query |
+| 4.29 | **`_has` / `_revinclude`** across the corpus | `GET /Patient?_has:Condition:patient:code=http://snomed.info/sct\|65363002&_id=PID` · `GET /Patient?_id=PID&_revinclude=Immunization:patient` · `GET /Patient?_id=PID&_revinclude=Encounter:patient&_revinclude=Procedure:patient` | **1** · **1 result · 25 included** · **1 result · 42 included** (24 + 18). |
 
 Pass criteria: every row in 8.2–8.4 produces the expected count or shape; no row
 reports an error except the documented N/A rows on `mongodb`; the **Open in New Tab** URL matches
@@ -578,7 +849,7 @@ files**, *finished in …*, and one download pill per resource type.
 
 | # | Name | Form | Expect on the card |
 |---|---|---|---|
-| 5.1 | `everything-small` | scope **Everything**; untick **All Resources** and tick only `Organization`, `Practitioner`, `Location` | **Complete · 3 files**; pills `Organization`, `Practitioner`, `Location`. Download `Organization`: 1,140 lines (1,136 corpus + 4 from T2); each line is one JSON object |
+| 5.1 | `everything-small` | scope **Everything**; untick **All Resources** and tick only `Organization`, `Practitioner`, `Location` | **Complete · 6 files** (output is chunked at 1,000 resources per file: `Location-0` with 1,000 plus `Location-1` with 137, and likewise for the other two types); pills `Organization`, `Practitioner`, `Location`. Download `Organization-0` and `Organization-1`: 1,000 + 140 lines = 1,140 total (1,136 corpus + 4 from T2); each line is one JSON object |
 | 5.2 | `one-patient` | scope **Patients**; in **Patients** search `Parker433` and pick Cari853 Esperanza675 Parker433 (or paste `PID`); types `Patient`, `Condition`, `Observation` | **Complete · 3 files**; `Patient` file has 1 line, `Condition` 15, `Observation` 165 |
 | 5.3 | `group-active-conditions` | scope **Group**, **Group ID** `manual-group`; types `Patient`, `Condition`; **Type filter** `Condition?clinical-status=active`; **FHIR elements** empty; **Since** *All time* | **Complete · 2 files**; `Patient` has 1 line; every line of `Condition` has `clinicalStatus` = `active` and belongs to `PID` (fewer than the 15 of 5.2) |
 | 5.4 | `elements-subset` | scope **Everything**; type `Patient` only; **FHIR elements** `id,gender` | **Complete · 1 file**; each Patient line has only `id`, `gender`, `meta` and the `meta.tag` `SUBSETTED` |
@@ -586,7 +857,7 @@ files**, *finished in …*, and one download pill per resource type.
 | 5.6 | negative | leave **Name** empty and **Start Export** | the form re-renders with *"Enter a name for this export."* |
 
 Then on `everything-small` click **Download All Resources**: the browser saves a ZIP
-holding the three NDJSON files. On `cancel-me` click **Delete** → the warning
+holding the six NDJSON files. On `cancel-me` click **Delete** → the warning
 *"Delete cancel-me and its output files from the server? This cannot be undone."* →
 **Delete export**; the card disappears.
 
@@ -606,7 +877,7 @@ are entered in UTC, e.g. `2026-09-04T14:00:00Z`.
 | 5.8 | `until-import` | type `Patient`; **Since** *All time*; **Until** `<T3 start>` | window line **Until <instant>**; `Patient` has **1** line: Nicky270 Ann985 Larkin917 |
 | 5.9 | `since-until` | type `Patient`; **Since** *Custom* `<T3 start>`, **Until** `<T3 end>` | window line `since → until`; `Patient` has **11,704** lines |
 | 5.10 | `since-fixtures` | types `Patient`, `RiskAssessment`, `ValueSet`, `Group`; **Since** *Custom* `<T3 end>` | `RiskAssessment`, `ValueSet`, `Group` pills with **1** line each (`manual-risk`, `manual-test-vs`, `manual-group`); no `Patient` pill, or an empty `Patient` file |
-| 5.11 | `last-day` | type `Organization`; **Since** *Last day* | window line shows an instant about 24 h ago; **1,140** lines when T2 and T3 ran within the last day (otherwise only the T2 copies, 4 lines) |
+| 5.11 | `last-day` | type `Organization`; **Since** *Last day* | window line shows an instant about 24 h ago; **0** lines with a well-formed empty `output: []` unless T2 and T3 ran within the last day, in which case **1,140** |
 | 5.12 | negative | **Since** *Custom*, **Custom instant** `yesterday` | the form re-renders with *"Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z."* under the field; switch the preset back to *All time* and the same text no longer blocks the submit (the field is disabled) |
 
 ### 9.4 Failure and Retry
@@ -624,10 +895,16 @@ HFS_BULK_EXPORT_REQUIRES_ACCESS_TOKEN=false` plus the MinIO credentials from sec
 
 Pass criteria: 5.1–5.4 and 5.7–5.11 complete with the stated files and line counts;
 5.5 cancels; 5.6 and 5.12 are rejected; 5.13 fails, retries, and deletes as
-described; the ZIP download works. On `mongodb`, `mongo-es`, `s3`, `s3-es` the
+described; the ZIP download works. On `mongo-es` and standalone `s3` the
 card appears immediately as **Failed** with
 `kick-off answered 501: bulk export not supported by this backend` — record N/A, and
 check that **Delete** removes the failed card.
+
+On `s3-es` `$export` runs (a SQLite sidecar job store at
+`$HFS_BULK_EXPORT_OUTPUT_DIR/bulk_export.db`), so 5.1–5.13 apply as written, with
+one caveat: on the S3-family rows the T2 **transaction** Bundle is refused, so the
+patient it would have created is absent. Step 5.8's *until-import* export therefore
+returns **0 Patient lines**, not the Larkin patient.
 
 ---
 
@@ -801,7 +1078,7 @@ kind is exported in every format.
 | # | Name | Subjects | Format | Expect |
 |---|---|---|---|---|
 | 7.m | `vd-csv` | `patient_demographics` | **CSV**, header on | header `id,gender,birth_date,family,city` plus **11,705** data lines; `PID`'s line reads `…,female,2015-12-29,Parker433,Everett` |
-| 7.n | `vd-parquet` | `patient_demographics` | **Parquet** | schema `id, gender, birth_date, family, city`; **11,705** rows; `birth_date` is a date column, not a string |
+| 7.n | `vd-parquet` | `patient_demographics` | **Parquet** | schema `id, gender, birth_date, family, city`; **11,705** rows; `birth_date` is a **string** column, which is correct — the SQL on FHIR 3.0.0-ballot default mapping (see #569) renders FHIR `date`, `dateTime` and `time` as `CHARACTER VARYING` |
 | 7.o | `query-ndjson` | `tall_female_patients`, `min_height` = `150` | **NDJSON** | one JSON object per line with `id`, `city`, `height`; line count equals the data-line count of 7.b |
 | 7.p | `query-parquet` | `tall_female_patients`, `min_height` = `150` | **Parquet** | schema `id, city, height` with `height` numeric; row count equals 7.o |
 | 7.q | `view-ndjson` | `female_patients` | **NDJSON** | **5,814** lines, each with `id`, `birth_date`, `city` and no `gender` key |
@@ -985,11 +1262,20 @@ Verify:
 3. Upload `encounters.json` once more on **Batch / Transaction**, reload the page:
    **Delivered in 24 h** and **Sent** advance by 3; the sparkline gains a point in the
    current half-hour bucket.
-4. Failure path: kill the receiver, upload `encounters.json`, wait ~30 s, reload. The
-   chip becomes **Error** (after 3 consecutive failures), the row is highlighted, the
-   **Failing** card reads 1, and **Fail streak** counts the failures. Try the **Sort**
-   menu (**Status** / **Most sent** / **Fail streak**). Restart the receiver; after the
-   retries land, reload: the chip is **Active** again and the streak is `0`.
+4. Failure path: kill the receiver, upload `encounters.json`, reload. The **Error**
+   chip counts *exhausted deliveries*, not connection failures, so the streak appears
+   only after the retry window (about **five minutes**, right after `Max retries
+   exhausted` in the log; at 30 s the dashboard still reads `Active · Failing 0 ·
+   streak 0` while the log already holds `Connection failed` lines). Once the streak
+   appears: the chip is **Error**, the row is highlighted, the **Failing** card reads
+   1, and **Fail streak** counts the failures. Try the **Sort** menu (**Status** /
+   **Most sent** / **Fail streak**). Recovery: inside the retry window, restarting the
+   receiver is enough — the queued retries land and reloading shows **Active** again
+   with streak `0`. After the retry window, the subscription is `status=error`, and
+   recovery is a **reactivation** (`PUT` the Subscription with `status: requested` →
+   new handshake → `active`), not a wait — restarting the receiver alone no longer
+   recovers it. **Sent** restarts at 1 because the counter is
+   `events-since-subscription-start`.
 5. Restart HFS: the engine rehydrates (`HFS_SUBSCRIPTION_REHYDRATE=true`) and the row
    returns as **Active** without re-creating anything. Check the log for
    `Failed to persist subscription status transition` — it must not appear.
@@ -1015,19 +1301,45 @@ For each backend row, attach to the release issue:
   card + log), the T2 **Per-Action Outcomes** stage for the transaction, the **SQL
   Exports** list with a completed card, `/ui` after import, and `/ui/subscriptions`
   after T9 step 3.
-- The T3 elapsed time and the T7 7.a *finished in* time.
+- **The T3 ingest time**: from the submission's creation instant (7.2) to
+  *Processing finished at …* (7.3).
+- **The T3 searchable time**: from the same start to the rebuild reaching `completed`
+  (7.4), plus the rebuild's own elapsed time and its `$reindex-status` summary.
+- Reference (#937, `sqlite-es`): 18,955,865 resources in 4 h 36 m 47 s from creation
+  to Completed, searchable at that point, with the section 5 `*-es` settings.
+- **The final database size** and the resource count it holds:
+
+  ```bash
+  du -sh data/hfs.db* data/submit 2>/dev/null                                    # sqlite
+  docker exec hfs-pg psql -U helios -d helios -tAc \
+    "SELECT pg_size_pretty(pg_database_size('helios'))"                          # postgres
+  docker exec hfs-mongo mongosh --quiet \
+    --eval 'db.getSiblingDB("helios").stats().storageSize'                       # mongodb
+  curl -s "localhost:9200/_cat/indices/${ES_PREFIX}_*?h=index,store.size"        # elasticsearch
+  ```
+
+- `$WORK/corpus-served-bytes.txt` (the corpus byte check), `$WORK/corpus-counts.tsv`
+  and, on composites, `$WORK/es-counts.tsv`.
+- The T7 7.a *finished in* time.
 - One downloaded sample from T5 (5.1) and each format from T7.
 - For any `❌`: the page, what was entered, the exact on-screen message, and the log
   excerpt, filed as an issue and linked from the matrix cell.
 
 ## 15. Known expectations and gotchas
 
-- **Bulk export on MongoDB/S3** returns `501`: the Export page shows a **Failed** card
-  reading `kick-off answered 501: bulk export not supported by this backend`. Expected.
+- **Bulk export on `mongo-es` and standalone `s3`** returns `501`: the Export page shows a
+  **Failed** card reading `kick-off answered 501: bulk export not supported by this backend`.
+  Expected — those rows have no bulk-export job store. Standalone `mongodb` and `s3-es`
+  both support `$export` via a SQLite sidecar job store
+  (`$HFS_BULK_EXPORT_OUTPUT_DIR/bulk_export.db`). (Whether standalone `s3` and `mongo-es`
+  gain the sidecar too is unverified as of #1167 — re-check when running those rows.)
 - **S3 standalone has no search**: the Resources page cannot run queries on the `s3`
   row (T4 is N/A); `s3-es` searches through Elasticsearch.
 - **Transaction Bundles on S3** are refused by design; batch Bundles work.
-- **MongoDB** does not support chained or `_has` searches (T4 rows 4.10, 4.11).
+- **Transaction Bundles on a standalone `mongod`** answer `501` with diagnostics
+  `Isolation level 'transaction bundles for mongodb require replica-set or sharded
+  topology' is not supported`; `batch` Bundles are unaffected — this is why §4 starts
+  MongoDB as a single-node replica set.
 - **`near`** is not implemented on any backend and is deliberately absent from T4.
 - **`$reindex` on `s3` standalone** returns `501` (no search index). Expected.
 - **Elasticsearch composites** are eventually consistent unless
@@ -1035,13 +1347,14 @@ For each backend row, attach to the release issue:
   are set, as they are in section 5. Without them T3 counts and T4 may lag.
 - **Import page = HFS submitting to itself**: the Data Recipient is `HFS_BASE_URL`,
   and the manifest and files are fetched by the HFS process, so `localhost:8000` must
-  be reachable from it. Re-submitting the same manifest URL for the same submission
-  is refused with `409 … already submitted`.
+  be reachable from it — or, with the hosted manifest (7.1),
+  `hfs-manual-test.s3.us-east-1.amazonaws.com` over outbound HTTPS. Re-submitting
+  the same manifest URL for the same submission is refused with `409 … already submitted`.
 - **Batch / Transaction page needs JavaScript** and is file-upload only (no paste);
   the body limit is `HFS_MAX_BODY_SIZE` (10 MiB by default).
 - **T2 order matters**: the patient transaction fails until the two reference-data
   batches have run, and after the T3 import its conditional references match two
-  Organizations, so it is rejected again (7.5).
+  Organizations, so it is rejected again (7.6).
 - **SQL pages have no Run button**: results follow the editor text with a 500 ms
   delay, capped at 50 rows; the SQL Query preview cannot bind `:parameters` — values
   are supplied on the SQL Export page only.

@@ -12,13 +12,13 @@
       <a name="hcbase"> </a>
       <h2 id="title"/>
       <ul>
-        <li>Implementation Guide Version: 6.0.0-ballot4 </li>
-        <li>FHIR Version: 6.0.0-ballot4 </li>
+        <li>Implementation Guide Version: 6.0.0-snapshot1 </li>
+        <li>FHIR Version: 6.0.0-snapshot1 </li>
         <li>Supported Formats: 
           <code>xml</code>, 
           <code>json</code>
         </li>
-        <li>Published on: 2026-07-17T03:44:13Z </li>
+        <li>Published on: 2026-09-14T16:43:45Z </li>
         <li>Published by: HL7 International / FHIR Infrastructure </li>
       </ul>
       <blockquote class="impl-note">
@@ -1429,7 +1429,7 @@
               <td class="text-center">y</td>
               <td class="text-center">y</td>
               <td class="text-center">y</td>
-              <td>date, identifier, controller, period, data, manager, purpose, subject, verified-date, grantee, source-reference, verified, actor, security-label, patient, action, category, status</td>
+              <td>date, identifier, controller, period, data, manager, purpose, subject, participant-role, verified-date, composite-actor-role, grantee, source-reference, verified, regulatory-basis, actor, security-label, patient, action, category, status</td>
               <td>
                 <code>Consent.controller</code>, 
                 <code>Consent.data</code>, 
@@ -1802,7 +1802,7 @@
               <td class="text-center">y</td>
               <td class="text-center">y</td>
               <td class="text-center">y</td>
-              <td>insurance, performer-code, requester, identifier, product, performer, location-code, event-date, subject, encounter, authored-on, intent, group-identifier, based-on, patient, device, prior-request, status</td>
+              <td>insurance, performer-code, requester, identifier, product, performer, location-code, event-date, subject, encounter, authored-on, intent, group-identifier, based-on, patient, category, device, prior-request, status</td>
               <td>
                 <code>DeviceRequest.insurance</code>, 
                 <code>DeviceRequest.requester</code>, 
@@ -5035,7 +5035,7 @@
               <td class="text-center">y</td>
               <td class="text-center">y</td>
               <td class="text-center">y</td>
-              <td>prescriber, identifier, product, patient, datewritten, encounter, intent, status</td>
+              <td>prescriber, identifier, product, patient, datewritten, encounter, category, intent, status</td>
               <td>
                 <code>VisionPrescription.prescriber</code>, 
                 <code>VisionPrescription.patient</code>, 
@@ -15014,7 +15014,7 @@
                       </td>
                       <td>
                         <div>
-                          <p>Time frame for this rule</p>
+                          <p>Time frame for the consent</p>
 
                         </div>
                       </td>
@@ -15092,6 +15092,23 @@
                         <b>SHALL</b>
                       </td>
                       <td>
+                        <a href="consent-search.html#Consent-participant-role">participant-role</a>
+                      </td>
+                      <td>
+                        <code>token</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>Role of the participant in the consent provision</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
                         <a href="consent-search.html#Consent-verified-date">verified-date</a>
                       </td>
                       <td>
@@ -15100,6 +15117,23 @@
                       <td>
                         <div>
                           <p>When consent verified</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
+                        <a href="consent-search.html#Consent-composite-actor-role">composite-actor-role</a>
+                      </td>
+                      <td>
+                        <code>composite</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>Composite of actor and role</p>
 
                         </div>
                       </td>
@@ -15151,6 +15185,23 @@
                       <td>
                         <div>
                           <p>Has been verified</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
+                        <a href="consent-search.html#Consent-regulatory-basis">regulatory-basis</a>
+                      </td>
+                      <td>
+                        <code>token</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>Regulatory basis for the consent statement</p>
 
                         </div>
                       </td>
@@ -17484,7 +17535,7 @@
                       </td>
                       <td>
                         <div>
-                          <p>Search for products that match this code</p>
+                          <p>The device participating in the association.</p>
 
                         </div>
                       </td>
@@ -18414,6 +18465,23 @@
                       <td>
                         <div>
                           <p>Individual the service is ordered for</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
+                        <a href="devicerequest-search.html#DeviceRequest-category">category</a>
+                      </td>
+                      <td>
+                        <code>token</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>Classification of the device request</p>
 
                         </div>
                       </td>
@@ -48238,6 +48306,23 @@
                         <b>SHALL</b>
                       </td>
                       <td>
+                        <a href="visionprescription-search.html#VisionPrescription-category">category</a>
+                      </td>
+                      <td>
+                        <code>token</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>Classification of the vision prescription</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
                         <a href="visionprescription-search.html#VisionPrescription-intent">intent</a>
                       </td>
                       <td>
@@ -48281,11 +48366,11 @@
     <valueCode value="fhir"/>
   </extension>
   <url value="http://hl7.org/fhir/CapabilityStatement/base"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-snapshot1"/>
   <name value="Base FHIR Capability Statement (Full)"/>
   <status value="draft"/>
   <experimental value="false"/>
-  <date value="2026-07-17T03:44:13+00:00"/>
+  <date value="2026-09-14T16:43:45+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -48298,7 +48383,7 @@
   <software>
     <name value="Insert your software name here..."/>
   </software>
-  <fhirVersion value="6.0.0-ballot4"/>
+  <fhirVersion value="6.0.0-snapshot1"/>
   <format value="xml"/>
   <format value="json"/>
   <rest>
@@ -52274,7 +52359,7 @@
         <name value="period"/>
         <definition value="http://hl7.org/fhir/SearchParameter/Consent-period"/>
         <type value="date"/>
-        <documentation value="Time frame for this rule"/>
+        <documentation value="Time frame for the consent"/>
       </searchParam>
       <searchParam>
         <name value="data"/>
@@ -52301,10 +52386,22 @@
         <documentation value="Who the consent applies to"/>
       </searchParam>
       <searchParam>
+        <name value="participant-role"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/Consent-participant-role"/>
+        <type value="token"/>
+        <documentation value="Role of the participant in the consent provision"/>
+      </searchParam>
+      <searchParam>
         <name value="verified-date"/>
         <definition value="http://hl7.org/fhir/SearchParameter/Consent-verified-date"/>
         <type value="date"/>
         <documentation value="When consent verified"/>
+      </searchParam>
+      <searchParam>
+        <name value="composite-actor-role"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/Consent-composite-actor-role"/>
+        <type value="composite"/>
+        <documentation value="Composite of actor and role"/>
       </searchParam>
       <searchParam>
         <name value="grantee"/>
@@ -52323,6 +52420,12 @@
         <definition value="http://hl7.org/fhir/SearchParameter/Consent-verified"/>
         <type value="token"/>
         <documentation value="Has been verified"/>
+      </searchParam>
+      <searchParam>
+        <name value="regulatory-basis"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/Consent-regulatory-basis"/>
+        <type value="token"/>
+        <documentation value="Regulatory basis for the consent statement"/>
       </searchParam>
       <searchParam>
         <name value="actor"/>
@@ -53320,7 +53423,7 @@
         <name value="device"/>
         <definition value="http://hl7.org/fhir/SearchParameter/DeviceAssociation-device"/>
         <type value="reference"/>
-        <documentation value="Search for products that match this code"/>
+        <documentation value="The device participating in the association."/>
       </searchParam>
       <searchParam>
         <name value="status"/>
@@ -53697,6 +53800,12 @@
         <definition value="http://hl7.org/fhir/SearchParameter/clinical-patient"/>
         <type value="reference"/>
         <documentation value="Individual the service is ordered for"/>
+      </searchParam>
+      <searchParam>
+        <name value="category"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/DeviceRequest-category"/>
+        <type value="token"/>
+        <documentation value="Classification of the device request"/>
       </searchParam>
       <searchParam>
         <name value="device"/>
@@ -66187,6 +66296,12 @@
         <definition value="http://hl7.org/fhir/SearchParameter/clinical-encounter"/>
         <type value="reference"/>
         <documentation value="Return prescriptions with this encounter identifier"/>
+      </searchParam>
+      <searchParam>
+        <name value="category"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/VisionPrescription-category"/>
+        <type value="token"/>
+        <documentation value="Classification of the vision prescription"/>
       </searchParam>
       <searchParam>
         <name value="intent"/>

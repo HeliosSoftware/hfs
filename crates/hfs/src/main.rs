@@ -41,7 +41,7 @@ use tracing::{info, warn};
 use helios_persistence::backends::local_fs::LocalFsOutputStore;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 use helios_persistence::core::{BulkExportJobStore, DefaultExportWorker};
-use helios_persistence::core::{BulkProviderStore, SettingsStore};
+use helios_persistence::core::{BulkProviderStore, SettingsStore, WriteObserver};
 #[cfg(any(
     feature = "sqlite",
     feature = "postgres",
@@ -82,7 +82,7 @@ use helios_persistence::search::ReindexOperation;
 use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
 
 #[cfg(feature = "mongodb")]
-use helios_persistence::backends::mongodb::{MongoBackend, MongoBackendConfig};
+use helios_persistence::backends::mongodb::{IndexBuildMode, MongoBackend, MongoBackendConfig};
 fn is_database_audit_dedicated(config: &AuditConfig, backend_kind: BackendKind) -> bool {
     match backend_kind {
         BackendKind::Sqlite | BackendKind::Postgres => config.database_url.is_some(),
@@ -148,6 +148,90 @@ fn composite_sync_mode_from_env() -> helios_persistence::composite::SyncMode {
     }
 }
 
+/// Forwards composite secondary sync failures to the Prometheus exporter
+/// (#1334): `composite_secondary_sync_failures_total{backend,operation}` and
+/// the `composite_secondary_sync_needs_reindex` gauge.
+#[cfg(feature = "elasticsearch")]
+struct CompositeSyncMetrics;
+
+#[cfg(feature = "elasticsearch")]
+impl helios_persistence::composite::SecondarySyncObserver for CompositeSyncMetrics {
+    fn sync_failed(
+        &self,
+        backend_id: &str,
+        operation: helios_persistence::composite::SyncOperation,
+    ) {
+        helios_observability::composite_metrics::record_secondary_sync_failure(
+            backend_id,
+            operation.as_str(),
+        );
+    }
+
+    fn needs_reindex(&self, outstanding: u64) {
+        helios_observability::composite_metrics::set_secondary_sync_needs_reindex(outstanding);
+    }
+}
+
+/// Reads a non-negative integer setting, falling back on anything else.
+#[cfg(feature = "elasticsearch")]
+fn env_u64(var: &str, default_value: u64) -> u64 {
+    match std::env::var(var) {
+        Ok(v) => v.trim().parse().unwrap_or_else(|_| {
+            tracing::warn!(variable = var, value = %v, default_value, "Not a number; using the default");
+            default_value
+        }),
+        Err(_) => default_value,
+    }
+}
+
+/// Periodically drains the composite's "needs reindex" records (#1334): each
+/// pass re-syncs the primary's current state of up to
+/// `HFS_COMPOSITE_SYNC_REPAIR_BATCH` (default 100) recorded resources to the
+/// secondary that missed them. Runs every
+/// `HFS_COMPOSITE_SYNC_REPAIR_INTERVAL` seconds (default 60; `0` disables),
+/// starting right away so records left by an earlier run are picked up.
+///
+/// A primary without a ledger (S3) has nothing to drain, so no task is
+/// spawned for it.
+#[cfg(feature = "elasticsearch")]
+fn spawn_secondary_sync_repair(
+    composite: Arc<helios_persistence::composite::CompositeStorage>,
+    has_ledger: bool,
+) {
+    if !has_ledger {
+        info!(
+            "This primary keeps no needs-reindex ledger: failed secondary syncs are counted and logged only; repair them with $reindex"
+        );
+        return;
+    }
+    let interval = env_u64("HFS_COMPOSITE_SYNC_REPAIR_INTERVAL", 60);
+    if interval == 0 {
+        info!(
+            "HFS_COMPOSITE_SYNC_REPAIR_INTERVAL=0: periodic repair of failed secondary syncs is off"
+        );
+        return;
+    }
+    let batch = env_u64("HFS_COMPOSITE_SYNC_REPAIR_BATCH", 100).max(1) as usize;
+    let interval = std::time::Duration::from_secs(interval);
+    tokio::spawn(async move {
+        loop {
+            match composite.repair_secondary_sync_failures(batch).await {
+                Ok(report) if report.examined > 0 => info!(
+                    examined = report.examined,
+                    repaired = report.repaired,
+                    still_failing = report.still_failing,
+                    dropped = report.dropped,
+                    remaining = report.remaining,
+                    "Secondary sync repair pass finished"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("Repair of failed secondary syncs could not run: {e}"),
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
+}
+
 #[cfg(feature = "elasticsearch")]
 fn es_write_refresh_from_config(
     config: &ServerConfig,
@@ -158,8 +242,56 @@ fn es_write_refresh_from_config(
         .map_err(|e: String| anyhow::anyhow!("{} (from HFS_ELASTICSEARCH_WRITE_REFRESH)", e))
 }
 
+/// The refresh policy `$reindex` and the deferred rebuild use, or `None` to
+/// follow `HFS_ELASTICSEARCH_WRITE_REFRESH` (unset or blank).
+#[cfg(feature = "elasticsearch")]
+fn es_reindex_refresh_from_config(
+    config: &ServerConfig,
+) -> anyhow::Result<Option<helios_persistence::backends::elasticsearch::WriteRefreshPolicy>> {
+    match config
+        .elasticsearch_reindex_refresh
+        .as_deref()
+        .map(str::trim)
+    {
+        None | Some("") => Ok(None),
+        Some(value) => value
+            .parse()
+            .map(Some)
+            .map_err(|e: String| anyhow::anyhow!("{} (from HFS_ELASTICSEARCH_REINDEX_REFRESH)", e)),
+    }
+}
+
+/// The indexes `$reindex` rebuilds on `sqlite-elasticsearch`.
+///
+/// Elasticsearch always, because it serves every search here. The SQLite
+/// primary only when it still indexes locally: once search is offloaded no
+/// query reads its `search_index`/FTS tables (the composite routes the whole
+/// query to Elasticsearch, #1012), so rebuilding them is a second FHIRPath
+/// extraction, a write transaction on the ingest file, and rows that pile up on
+/// every rerun because the matching delete is a no-op (#1125).
+#[cfg(all(feature = "sqlite", feature = "elasticsearch"))]
+fn sqlite_es_reindex_targets(
+    sqlite: &Arc<SqliteBackend>,
+    es: &Arc<helios_persistence::backends::elasticsearch::ElasticsearchBackend>,
+) -> (
+    Vec<Arc<dyn helios_persistence::search::ReindexTarget>>,
+    &'static [&'static str],
+) {
+    if sqlite.is_search_offloaded() {
+        (vec![es.clone()], &["elasticsearch"])
+    } else {
+        (
+            vec![sqlite.clone(), es.clone()],
+            &["sqlite", "elasticsearch"],
+        )
+    }
+}
+
 #[cfg(feature = "mongodb")]
-fn build_mongodb_config(config: &ServerConfig, search_offloaded: bool) -> MongoBackendConfig {
+fn build_mongodb_config(
+    config: &ServerConfig,
+    search_offloaded: bool,
+) -> anyhow::Result<MongoBackendConfig> {
     build_mongodb_config_with_env(config, search_offloaded, |name| std::env::var(name).ok())
 }
 
@@ -168,7 +300,7 @@ fn build_mongodb_config_with_env<F>(
     config: &ServerConfig,
     search_offloaded: bool,
     env: F,
-) -> MongoBackendConfig
+) -> anyhow::Result<MongoBackendConfig>
 where
     F: Fn(&str) -> Option<String>,
 {
@@ -194,8 +326,24 @@ where
     let server_selection_timeout_ms = env("HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(15_000);
+    // Bounds `_include`/`_revinclude` resolution per directive (#1061), so a
+    // wide reverse-reference set can't grow a searchset Bundle without limit.
+    let max_included_resources = env("HFS_MONGODB_MAX_INCLUDED_RESOURCES")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1000)
+        .max(1);
+    // The only way to reach `off` (the escape hatch that stops the builder
+    // touching the collection at all) or `inline`, so an invalid value must
+    // fail startup rather than silently fall back to `background` — same
+    // "bail with the invalid value" shape as HFS_BULK_EXPORT_OUTPUT_BACKEND.
+    let index_build = match env("HFS_MONGODB_INDEX_BUILD") {
+        Some(raw) => raw
+            .parse::<IndexBuildMode>()
+            .map_err(|message| anyhow::anyhow!(message))?,
+        None => IndexBuildMode::default(),
+    };
 
-    MongoBackendConfig {
+    Ok(MongoBackendConfig {
         connection_string,
         database_name,
         max_connections,
@@ -204,7 +352,11 @@ where
         fhir_version: config.default_fhir_version,
         data_dir: config.data_dir.clone(),
         search_offloaded,
-    }
+        max_included_resources,
+        index_build,
+        app_name: MongoBackendConfig::default().app_name,
+        reindex_catch_up_margin_ms: MongoBackendConfig::default().reindex_catch_up_margin_ms,
+    })
 }
 
 #[cfg(feature = "sqlite")]
@@ -413,6 +565,12 @@ async fn create_audit_mongodb_storage(
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(15_000);
+        let index_build = match std::env::var("HFS_MONGODB_INDEX_BUILD") {
+            Ok(raw) => raw
+                .parse::<IndexBuildMode>()
+                .map_err(|message| anyhow::anyhow!(message))?,
+            Err(_) => IndexBuildMode::default(),
+        };
 
         let config = MongoBackendConfig {
             connection_string,
@@ -423,10 +581,14 @@ async fn create_audit_mongodb_storage(
             fhir_version: server_config.default_fhir_version,
             data_dir: server_config.data_dir.clone(),
             search_offloaded: false,
+            index_build,
+            // Audit storage doesn't resolve _include/_revinclude; the default
+            // (and any future new field) is fine here.
+            ..Default::default()
         };
         MongoBackend::new(config)?
     } else {
-        MongoBackend::new(build_mongodb_config(server_config, false))?
+        MongoBackend::new(build_mongodb_config(server_config, false)?)?
     };
 
     backend.init_schema().await?;
@@ -579,7 +741,7 @@ async fn start_mongodb(
     auth_state: Option<Arc<AuthMiddlewareState>>,
     audit_state: Option<Arc<AuditMiddlewareState>>,
 ) -> anyhow::Result<()> {
-    let backend_config = build_mongodb_config(&config, false);
+    let backend_config = build_mongodb_config(&config, false)?;
     info!(
         url = %backend_config.connection_string,
         database = %backend_config.database_name,
@@ -589,7 +751,9 @@ async fn start_mongodb(
 
     backend.init_schema().await?;
     let backend = Arc::new(backend);
-    seed_conformance_resources(&*backend, &config).await;
+    attach_login_sessions(auth_state.as_ref(), backend.clone());
+    let observability = helios_rest::WriteObservability::new();
+    seed_conformance_resources(&*backend, &config, Some(observability.observers.as_ref())).await;
     spawn_mongodb_search_param_refresh(backend.clone(), &config);
     let serve_audit_state = audit_state.clone();
 
@@ -616,15 +780,22 @@ async fn start_mongodb(
         backend.clone(),
         backend.tenant_registries().clone(),
         audit_state.as_ref(),
+        observability.clone(),
     );
     // Bulk submit needs no sidecar: MongoDB hosts the submission, manifest,
     // lease, and artifact state itself, in the same store the ingestion engine
     // writes resources to.
-    let reindex_hook = ops.reindex.clone().map(|op| {
-        Arc::new(helios_persistence::search::ReindexOnFinish::new(op))
-            as Arc<dyn helios_persistence::core::DeferredReindexHook>
-    });
-    let submit_bundle = build_bulk_submit(&config, backend.clone(), reindex_hook).await?;
+    let reindex_hook = ops
+        .reindex
+        .clone()
+        .map(|op| automatic_reindex_hook_with_ledger(op, &config, None));
+    let submit_bundle = build_bulk_submit(
+        &config,
+        backend.clone(),
+        reindex_hook,
+        observability.observers.clone(),
+    )
+    .await?;
     let app = create_app_with_auth_bulk_settings_and_ops(
         backend.clone(),
         config.clone(),
@@ -645,6 +816,7 @@ async fn start_mongodb(
         Some(backend),
         ui_settings,
         ui_bulk_provider,
+        Some(observability.observers.clone() as Arc<dyn WriteObserver>),
     )
     .await
 }
@@ -704,8 +876,16 @@ async fn serve(
     ui_tenants: Option<Arc<dyn ResourceStorage>>,
     ui_settings: Option<Arc<dyn SettingsStore>>,
     ui_bulk_provider: Option<Arc<dyn BulkProviderStore>>,
+    write_observer: Option<Arc<dyn WriteObserver>>,
 ) -> anyhow::Result<()> {
-    let app = attach_ui(app, config, ui_tenants, ui_settings, ui_bulk_provider);
+    let app = attach_ui(
+        app,
+        config,
+        ui_tenants,
+        ui_settings,
+        ui_bulk_provider,
+        write_observer,
+    );
 
     let addr = config.socket_addr();
     info!(address = %addr, "Server listening");
@@ -761,17 +941,31 @@ fn attach_ui(
     ui_tenants: Option<Arc<dyn ResourceStorage>>,
     ui_settings: Option<Arc<dyn SettingsStore>>,
     ui_bulk_provider: Option<Arc<dyn BulkProviderStore>>,
+    write_observer: Option<Arc<dyn WriteObserver>>,
 ) -> axum::Router {
     #[cfg(feature = "ui")]
     {
         if config.ui_enabled {
-            return mount_ui(app, config, ui_tenants, ui_settings, ui_bulk_provider);
+            return mount_ui(
+                app,
+                config,
+                ui_tenants,
+                ui_settings,
+                ui_bulk_provider,
+                write_observer,
+            );
         }
         info!("Web UI is DISABLED (HFS_UI_ENABLED=false)");
     }
     #[cfg(not(feature = "ui"))]
     {
-        let _ = (config, &ui_tenants, &ui_settings, &ui_bulk_provider);
+        let _ = (
+            config,
+            &ui_tenants,
+            &ui_settings,
+            &ui_bulk_provider,
+            &write_observer,
+        );
     }
     ui_absent_routes(app)
 }
@@ -814,6 +1008,7 @@ fn mount_ui(
     ui_tenants: Option<Arc<dyn ResourceStorage>>,
     ui_settings: Option<Arc<dyn SettingsStore>>,
     ui_bulk_provider: Option<Arc<dyn BulkProviderStore>>,
+    write_observer: Option<Arc<dyn WriteObserver>>,
 ) -> axum::Router {
     // The UI reads SearchParameter/CompartmentDefinition from the server's
     // own FHIR API over HTTP. It calls itself on the loopback address, with
@@ -839,6 +1034,12 @@ fn mount_ui(
             .storage_backend_mode()
             .expect("storage backend was validated before server startup"),
     );
+    // The Home dashboard's refresh cadences are process-wide, like its
+    // provider: installed here, right before the UI is mounted (#1078).
+    helios_ui::set_dashboard_refresh(helios_ui::DashboardRefresh {
+        moving_secs: u32::try_from(config.dashboard_refresh_secs).unwrap_or(u32::MAX),
+        settled_secs: u32::try_from(config.dashboard_idle_refresh_secs).unwrap_or(u32::MAX),
+    });
     helios_ui::mount_with_body_limit_and_tenant_routing(
         app,
         env!("CARGO_PKG_VERSION"),
@@ -860,6 +1061,7 @@ fn mount_ui(
         config.multitenancy.routing_mode.supports_url_path(),
         ui_bulk_provider,
         patient_name_search,
+        write_observer,
     )
 }
 
@@ -887,6 +1089,7 @@ fn patient_name_search_support(mode: StorageBackendMode) -> helios_ui::PatientNa
 async fn init_auth_with_audit(
     audit_sink: Arc<dyn AuditSink>,
     tenant_url_routing: bool,
+    public_base_url: &str,
 ) -> anyhow::Result<(AuthConfig, Option<Arc<AuthMiddlewareState>>)> {
     let auth_config = AuthConfig::from_env();
 
@@ -939,6 +1142,17 @@ async fn init_auth_with_audit(
 
     let audit_config = AuditConfig::from_env();
 
+    // The web UI's browser login (#1449) shares one session store between the
+    // REST auth layer (which turns the session cookie into a bearer) and the
+    // UI (which establishes sessions). Built here, before either is mounted.
+    let sessions = init_login_sessions(&auth_config, public_base_url).await?;
+    #[cfg(feature = "ui")]
+    if let Some(sessions) = &sessions {
+        helios_ui::set_interactive_login(helios_ui::LoginRuntime {
+            sessions: Arc::clone(sessions),
+        });
+    }
+
     let auth_state = Arc::new(AuthMiddlewareState {
         provider: Arc::new(provider),
         config: Arc::new(auth_config.clone()),
@@ -946,9 +1160,104 @@ async fn init_auth_with_audit(
         audit_source_observer: audit_config.source_observer.clone(),
         audit_exclusion_filter: ExclusionFilter::new(audit_config.exclusions.clone()),
         tenant_url_routing,
+        sessions,
     });
 
     Ok((auth_config, Some(auth_state)))
+}
+
+/// Builds the interactive-login session store when the web UI's IdP client is
+/// configured (`HFS_UI_LOGIN_CLIENT_ID`), resolving the authorize/token/
+/// end-session endpoints from explicit `HFS_SMART_*` settings or, failing
+/// those, from the issuer's OpenID Connect discovery document. `None` when no
+/// client is configured — auth stays bearer-only and the UI has no login.
+async fn init_login_sessions(
+    auth_config: &AuthConfig,
+    public_base_url: &str,
+) -> anyhow::Result<Option<Arc<helios_auth::SessionStore>>> {
+    let Some(client_id) = auth_config.web_client_id.clone() else {
+        return Ok(None);
+    };
+    let issuer = auth_config
+        .expected_issuer
+        .as_deref()
+        .expect("validate() guarantees an issuer when auth is enabled");
+    let (authorization_endpoint, token_endpoint, end_session_endpoint) =
+        helios_auth::discover_endpoints(
+            issuer,
+            auth_config.smart_authorize_endpoint.clone(),
+            auth_config.smart_token_endpoint.clone(),
+            auth_config.smart_end_session_endpoint.clone(),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("interactive login could not be configured: {e}"))?;
+    let redirect_uri = auth_config
+        .web_redirect_uri
+        .clone()
+        .unwrap_or_else(|| format!("{}/ui/callback", public_base_url.trim_end_matches('/')));
+    info!(
+        client_id = %client_id,
+        redirect_uri = %redirect_uri,
+        authorization_endpoint = %authorization_endpoint,
+        end_session = ?end_session_endpoint,
+        cookie_secure = auth_config.web_cookie_secure,
+        "Interactive browser login ENABLED"
+    );
+    if !auth_config.web_cookie_secure {
+        warn!(
+            "HFS_UI_LOGIN_COOKIE_SECURE=false: the session cookie is sent over plain HTTP. \
+             Only for local development."
+        );
+    }
+    Ok(Some(Arc::new(helios_auth::SessionStore::new(
+        helios_auth::LoginConfig {
+            client_id,
+            client_secret: auth_config.web_client_secret.clone(),
+            redirect_uri,
+            scopes: auth_config.web_scopes.clone(),
+            authorization_endpoint,
+            token_endpoint,
+            end_session_endpoint,
+            cookie_secure: auth_config.web_cookie_secure,
+        },
+    ))))
+}
+
+/// Gives the web UI's login sessions a home in the primary store (#1481), so
+/// a session established on one node resolves on every other and outlives a
+/// restart. Called from a backend's `start_*` once its Arc exists: the store
+/// itself is built with the auth state, before any backend is. Nothing to
+/// attach when interactive login is off.
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "s3"
+))]
+fn attach_login_sessions(
+    auth_state: Option<&Arc<AuthMiddlewareState>>,
+    persistence: Arc<dyn helios_auth::SessionPersistence>,
+) {
+    if let Some(sessions) = auth_state.and_then(|state| state.sessions.as_ref()) {
+        sessions.attach_persistence(persistence);
+    }
+}
+
+/// A deployment with nowhere tenant-independent to keep them (S3
+/// bucket-per-tenant with no system bucket — the same case that leaves
+/// `/_user/settings` unwired) keeps login sessions in process: fine on one
+/// node, but a cluster needs sticky sessions and a restart signs everyone
+/// out. Said once at startup so an operator knows which mode they are in.
+/// This binary only ever builds `PrefixPerTenant` from its environment, so
+/// the branch is reached through the library's configuration alone (#1514).
+#[cfg(feature = "s3")]
+fn warn_login_sessions_in_process(auth_state: Option<&Arc<AuthMiddlewareState>>) {
+    if auth_state.is_some_and(|state| state.sessions.is_some()) {
+        warn!(
+            "web login sessions are held in process on this storage backend: a session is \
+             not shared across nodes and does not survive a restart"
+        );
+    }
 }
 
 /// Initializes the audit subsystem from environment configuration.
@@ -1080,6 +1389,7 @@ async fn main() -> anyhow::Result<()> {
     let (auth_config, auth_state) = init_auth_with_audit(
         audit_sink,
         config.multitenancy.routing_mode.supports_url_path(),
+        &config.base_url,
     )
     .await?;
 
@@ -1159,8 +1469,11 @@ async fn main() -> anyhow::Result<()> {
     feature = "mongodb",
     feature = "elasticsearch"
 ))]
-async fn seed_conformance_resources<S>(backend: &S, config: &ServerConfig)
-where
+async fn seed_conformance_resources<S>(
+    backend: &S,
+    config: &ServerConfig,
+    observer: Option<&dyn WriteObserver>,
+) where
     S: helios_persistence::core::ResourceStorage,
 {
     if !config.seed_conformance {
@@ -1178,6 +1491,7 @@ where
             config.default_fhir_version,
             &data_dir,
             &tenant_id,
+            observer,
         )
         .await;
     }
@@ -1337,6 +1651,88 @@ fn spawn_s3_search_param_refresh(
     });
 }
 
+/// Registers the shared base SearchParameters — embedded fallback, the FHIR
+/// spec file, and every custom file in `data_dir` (e.g. the SQL-on-FHIR
+/// `ViewDefinition` params in `sql-on-fhir-search-parameters.json`) — into
+/// `registry`.
+///
+/// This is the same three-tier load the SQLite, PostgreSQL, and MongoDB
+/// backends perform when they build their own registries. A primary with no
+/// `data_dir` of its own (S3) needs a starter to do it instead; skipping the
+/// custom tier left Elasticsearch unaware of params such as `ViewDefinition`
+/// `name`, so `name:contains` was silently dropped from searches (#1070).
+#[cfg(all(feature = "s3", feature = "elasticsearch"))]
+fn populate_base_search_registry(
+    registry: &mut helios_persistence::search::SearchParameterRegistry,
+    fhir_version: helios_fhir::FhirVersion,
+    data_dir: &std::path::Path,
+) {
+    use helios_persistence::search::SearchParameterLoader;
+
+    let loader = SearchParameterLoader::new(fhir_version);
+    let mut fallback_count = 0;
+    let mut spec_count = 0;
+    let mut custom_count = 0;
+    let mut custom_files: Vec<String> = Vec::new();
+
+    match loader.load_embedded() {
+        Ok(params) => {
+            for p in params {
+                if registry.register(p).is_ok() {
+                    fallback_count += 1;
+                }
+            }
+        }
+        Err(e) => warn!("Failed to load embedded SearchParameters: {e}"),
+    }
+
+    let spec_path = data_dir.join(loader.spec_filename());
+    match loader.load_from_spec_file(data_dir) {
+        Ok(params) => {
+            for p in params {
+                if registry.register(p).is_ok() {
+                    spec_count += 1;
+                }
+            }
+        }
+        Err(e) => warn!(
+            "Could not load spec SearchParameters from {}: {e}. Using minimal fallback.",
+            spec_path.display()
+        ),
+    }
+
+    match loader.load_custom_from_directory_with_files(data_dir) {
+        Ok((params, files)) => {
+            for p in params {
+                if registry.register(p).is_ok() {
+                    custom_count += 1;
+                }
+            }
+            custom_files = files;
+        }
+        Err(e) => warn!(
+            "Error loading custom SearchParameters from {}: {e}",
+            data_dir.display()
+        ),
+    }
+
+    let custom_info = if custom_files.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", custom_files.join(", "))
+    };
+    info!(
+        "SearchParameter registry initialized: {} total ({} spec from {}, {} fallback, {} custom{}) covering {} resource types",
+        registry.len(),
+        spec_count,
+        spec_path.display(),
+        fallback_count,
+        custom_count,
+        custom_info,
+        registry.resource_types().len()
+    );
+}
+
 /// Starts the server with SQLite-only backend.
 #[cfg(feature = "sqlite")]
 async fn start_sqlite(
@@ -1347,7 +1743,9 @@ async fn start_sqlite(
 ) -> anyhow::Result<()> {
     let serve_audit_state = audit_state.clone();
     let backend = Arc::new(create_sqlite_backend(&config)?);
-    seed_conformance_resources(&*backend, &config).await;
+    attach_login_sessions(auth_state.as_ref(), backend.clone());
+    let observability = helios_rest::WriteObservability::new();
+    seed_conformance_resources(&*backend, &config, Some(observability.observers.as_ref())).await;
     spawn_sqlite_search_param_refresh(backend.clone(), &config);
     // Second handle to the same backend for the web UI's tenant-maintenance
     // read/write path (the FHIR app keeps its own). Cheap: the SQLite backend
@@ -1364,12 +1762,19 @@ async fn start_sqlite(
         backend.clone(),
         backend.tenant_registries().clone(),
         audit_state.as_ref(),
+        observability.clone(),
     );
-    let reindex_hook = ops.reindex.clone().map(|op| {
-        Arc::new(helios_persistence::search::ReindexOnFinish::new(op))
-            as Arc<dyn helios_persistence::core::DeferredReindexHook>
-    });
-    let submit_bundle = build_bulk_submit(&config, backend.clone(), reindex_hook).await?;
+    let reindex_hook = ops
+        .reindex
+        .clone()
+        .map(|op| automatic_reindex_hook_with_ledger(op, &config, Some(backend.clone())));
+    let submit_bundle = build_bulk_submit(
+        &config,
+        backend.clone(),
+        reindex_hook,
+        observability.observers.clone(),
+    )
+    .await?;
     let app = create_app_with_auth_bulk_settings_and_ops(
         backend,
         config.clone(),
@@ -1388,6 +1793,7 @@ async fn start_sqlite(
         ui_tenants,
         ui_settings,
         ui_bulk_provider,
+        Some(observability.observers.clone() as Arc<dyn WriteObserver>),
     )
     .await
 }
@@ -1492,7 +1898,19 @@ where
                         .map(|d| format!("{}/exports", d.display()))
                 })
                 .unwrap_or_else(|| "./data/exports".to_string());
-            Arc::new(LocalFsOutputStore::new(output_dir, config.base_url.clone()))
+            // The served file endpoint enforces a token only when auth is on, so
+            // the manifest's requiresAccessToken must follow the auth state under
+            // `auto`; an explicit true/false override still wins (#1269). `false`
+            // is rejected for local-fs by config validation (no pre-signing).
+            let requires_token = match cfg.requires_access_token.as_str() {
+                "true" => true,
+                "false" => false,
+                _ => AuthConfig::from_env().enabled,
+            };
+            Arc::new(
+                LocalFsOutputStore::new(output_dir, config.base_url.clone())
+                    .with_access_token_required(requires_token),
+            )
         }
         "s3" => {
             #[cfg(feature = "s3")]
@@ -1568,6 +1986,62 @@ fn wire_reindex(
     Arc::new(op)
 }
 
+/// Builds the deferred bulk-submit hook using the existing submit-worker
+/// concurrency as the per-process automatic reindex limit, plus where to clear
+/// the persisted "this manifest still owes a rebuild" marker when a generation
+/// finishes (#1125). Without a ledger (`None`) nothing is recorded and a
+/// restart cannot resume, as before.
+///
+/// Split into this function and [`automatic_reindex_hook_with_ledger`] so a
+/// test can read the concrete `ReindexOnFinish`'s `batch_bytes()` (#1499)
+/// without downcasting the trait object every other caller uses.
+///
+/// Gated exactly like [`wire_reindex`], which produces the `op` every caller
+/// passes in: any build with a reindex target. Keep the two in step rather
+/// than naming individual backends here — a narrower gate breaks the builds
+/// that leave that backend out (#1291).
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "elasticsearch"
+))]
+fn build_automatic_reindex_hook(
+    op: Arc<ReindexOperation>,
+    config: &ServerConfig,
+    ledger: Option<Arc<dyn helios_persistence::search::DeferredReindexLedger>>,
+) -> helios_persistence::search::ReindexOnFinish {
+    let hook = helios_persistence::search::ReindexOnFinish::with_max_concurrency(
+        op,
+        config.bulk_submit.worker_concurrency as usize,
+    )
+    .with_batch_size(config.reindex_batch_size)
+    .with_batch_bytes(config.reindex_batch_bytes)
+    .with_bulk_index_rebuild(config.bulk_submit.bulk_index_rebuild);
+    match ledger {
+        Some(ledger) => hook.with_ledger(ledger),
+        None => hook,
+    }
+}
+
+/// Builds [`build_automatic_reindex_hook`]'s hook and erases it behind
+/// `Arc<dyn DeferredReindexHook>`, the shape every wiring site outside tests
+/// needs. See that function's doc comment for what it configures and why the
+/// two are split (#1499).
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "elasticsearch"
+))]
+fn automatic_reindex_hook_with_ledger(
+    op: Arc<ReindexOperation>,
+    config: &ServerConfig,
+    ledger: Option<Arc<dyn helios_persistence::search::DeferredReindexLedger>>,
+) -> Arc<dyn helios_persistence::core::DeferredReindexHook> {
+    Arc::new(build_automatic_reindex_hook(op, config, ledger))
+}
+
 /// Ops bundle for a backend that indexes itself — the standalone deployments
 /// (SQLite, PostgreSQL, MongoDB), where resources and search index share a home.
 #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
@@ -1575,6 +2049,7 @@ fn standalone_ops<B>(
     backend: Arc<B>,
     registries: Arc<helios_persistence::search::TenantSearchRegistries>,
     audit_state: Option<&Arc<AuditMiddlewareState>>,
+    observability: helios_rest::WriteObservability,
 ) -> OperationsBundle
 where
     B: PurgableStorage + helios_persistence::search::ReindexableStorage + 'static,
@@ -1585,6 +2060,7 @@ where
             ReindexOperation::new(backend, registries),
             audit_state,
         )),
+        observability: Some(observability),
     }
 }
 
@@ -1608,6 +2084,7 @@ fn composite_ops(
     targets: Vec<Arc<dyn helios_persistence::search::ReindexTarget>>,
     registries: Arc<helios_persistence::search::TenantSearchRegistries>,
     audit_state: Option<&Arc<AuditMiddlewareState>>,
+    observability: helios_rest::WriteObservability,
 ) -> OperationsBundle {
     OperationsBundle {
         purge: Some(composite as Arc<dyn PurgableStorage>),
@@ -1615,6 +2092,7 @@ fn composite_ops(
             ReindexOperation::with_parts(source, targets, registries),
             audit_state,
         )),
+        observability: Some(observability),
     }
 }
 
@@ -1633,6 +2111,8 @@ fn spawn_export_workers<Dp>(
         return;
     }
     let lease = std::time::Duration::from_secs(cfg.lease_duration_secs);
+    let heartbeat = std::time::Duration::from_secs(cfg.heartbeat_interval_secs);
+    let max_attempts = cfg.max_attempts;
     for i in 0..cfg.worker_concurrency {
         let jobs = jobs.clone();
         let data = data.clone();
@@ -1641,9 +2121,10 @@ fn spawn_export_workers<Dp>(
         let exclude_newly_added = cfg.since_newly_added.eq_ignore_ascii_case("exclude");
         tokio::spawn(async move {
             let worker = DefaultExportWorker::new(jobs.clone(), data, output, worker_id.clone())
-                .with_exclude_since_newly_added(exclude_newly_added);
+                .with_exclude_since_newly_added(exclude_newly_added)
+                .with_heartbeat_interval(heartbeat);
             loop {
-                match jobs.claim_next(&worker_id, lease).await {
+                match jobs.claim_next(&worker_id, lease, max_attempts).await {
                     Ok(Some(claimed)) => {
                         if let Err(e) = worker.run_job(claimed).await {
                             tracing::error!("export worker job failed: {e}");
@@ -1691,6 +2172,94 @@ fn spawn_export_workers<Dp>(
     );
 }
 
+/// Picks the `$bulk-submit` job store for a primary + Elasticsearch composite.
+///
+/// The raw primary never feeds Elasticsearch, so by default the store is
+/// wrapped in [`CompositeSubmitJobs`], which syncs each finished manifest's
+/// resources into the secondary index (#882). Under bulk fast-load the worker
+/// fires a per-type reindex after each manifest that rebuilds Elasticsearch
+/// too, so the wrapper's per-resource sync would only duplicate that work (#903)
+/// and is switched off with `with_ingest_sync(false)`. The wrapper itself stays
+/// in the chain: it is what mirrors a rolled-back change onto Elasticsearch
+/// (a rolled-back create becomes a delete) and forwards the #1125 rebuild
+/// ledger to the primary. Handing the worker the raw primary instead left
+/// rolled-back resources searchable in Elasticsearch after they were gone from
+/// the primary (#1161). Aborting a submission rolls nothing back on any
+/// primary, so abort leaves Elasticsearch alone. Fast-load without a reindex
+/// hook keeps the per-resource sync, otherwise the data never reaches
+/// Elasticsearch.
+///
+/// With `HFS_BULK_SUBMIT_DEFER_INDEXING=false` (#1127, #1242) the wrapper is
+/// itself wrapped in [`IndexingSubmitJobs`]: every committed batch is handed to
+/// an [`IngestIndexSink`] writing into `search_targets` (the Elasticsearch
+/// secondary, not the primary's own offloaded index), and the manifest's sync
+/// drains that sink instead of re-reading the manifest. The deferred reindex
+/// then rebuilds only the types the sink rejected. `source` is the primary the
+/// sink reads resources back from for engines that do not hand them over. On
+/// this ES-composite path `false` always means the sink; the operator no longer
+/// names the mechanism (the old `HFS_BULK_SUBMIT_INDEX_DURING_INGEST` is gone).
+///
+/// [`CompositeSubmitJobs`]: helios_persistence::composite::CompositeSubmitJobs
+/// [`IndexingSubmitJobs`]: helios_persistence::composite::IndexingSubmitJobs
+/// [`IngestIndexSink`]: helios_persistence::composite::IngestIndexSink
+#[cfg(all(
+    feature = "elasticsearch",
+    any(
+        feature = "sqlite",
+        feature = "postgres",
+        feature = "mongodb",
+        feature = "s3"
+    )
+))]
+fn composite_submit_jobs(
+    primary: Arc<dyn BulkSubmitJobStore>,
+    source: Arc<dyn ResourceStorage>,
+    composite: Arc<helios_persistence::composite::CompositeStorage>,
+    search_targets: Vec<Arc<dyn helios_persistence::search::ReindexTarget>>,
+    cfg: &helios_rest::config::BulkSubmitConfig,
+    has_reindex_hook: bool,
+) -> Arc<dyn BulkSubmitJobStore> {
+    use helios_persistence::composite::{
+        CompositeSubmitJobs, IndexingSubmitJobs, IngestIndexSink, IngestIndexSinkConfig,
+    };
+
+    if !cfg.defer_indexing {
+        // Search is offloaded to Elasticsearch here (this fn is the ES-composite
+        // path), so "index as the manifest ingests" means the batch-by-batch
+        // sink (#1127, #1242).
+        let sink_config = IngestIndexSinkConfig {
+            queue: cfg.index_queue as usize,
+            concurrency: cfg.index_concurrency as usize,
+            coalesce: cfg.index_coalesce as usize,
+            max_wait: std::time::Duration::from_secs(cfg.index_max_wait_secs),
+        };
+        info!(
+            queue = sink_config.queue,
+            concurrency = sink_config.concurrency,
+            coalesce = sink_config.coalesce,
+            max_wait_secs = cfg.index_max_wait_secs,
+            "Bulk submit indexes into Elasticsearch during ingest (DEFER_INDEXING=false); \
+             the deferred reindex runs only for types the search index rejected"
+        );
+        let sink = Arc::new(IngestIndexSink::new(source, search_targets, sink_config));
+        let inner: Arc<dyn BulkSubmitJobStore> =
+            Arc::new(CompositeSubmitJobs::new(primary, composite));
+        Arc::new(IndexingSubmitJobs::new(inner, sink))
+    } else if has_reindex_hook {
+        info!(
+            "Bulk submit defers indexing (DEFER_INDEXING=true); Elasticsearch is rebuilt \
+             per type after each manifest, and rollbacks are mirrored to it"
+        );
+        Arc::new(CompositeSubmitJobs::new(primary, composite).with_ingest_sync(false))
+    } else {
+        info!(
+            "Bulk submit syncs each finished manifest into Elasticsearch (no reindex hook); \
+             set DEFER_INDEXING=false to index batch by batch instead"
+        );
+        Arc::new(CompositeSubmitJobs::new(primary, composite))
+    }
+}
+
 /// Builds the bulk-submit subsystem (input fetcher + output store + file auth +
 /// worker pool) from a caller-supplied job store. Returns `None` when bulk submit
 /// is disabled. The job store is the same backend instance that holds the FHIR
@@ -1705,36 +2274,35 @@ fn spawn_export_workers<Dp>(
     feature = "mongodb",
     feature = "s3"
 ))]
-/// Picks the `$bulk-submit` job store for a primary + Elasticsearch composite.
-///
-/// The raw primary never feeds Elasticsearch, so by default the store is
-/// wrapped in [`CompositeSubmitJobs`], which syncs each finished manifest's
-/// resources into the secondary index (#882). Under bulk fast-load the worker
-/// fires a per-type reindex after each manifest that rebuilds Elasticsearch
-/// too, so the wrapper's per-resource sync would only duplicate that work; the
-/// raw primary is used instead. Fast-load without a reindex hook still needs
-/// the wrapper, otherwise the data never reaches Elasticsearch.
-///
-/// [`CompositeSubmitJobs`]: helios_persistence::composite::CompositeSubmitJobs
-fn composite_submit_jobs(
-    primary: Arc<dyn BulkSubmitJobStore>,
-    composite: Arc<helios_persistence::composite::CompositeStorage>,
-    defer_indexing: bool,
-    has_reindex_hook: bool,
-) -> Arc<dyn BulkSubmitJobStore> {
-    if defer_indexing && has_reindex_hook {
-        primary
-    } else {
-        Arc::new(helios_persistence::composite::CompositeSubmitJobs::new(
-            primary, composite,
-        ))
-    }
+fn use_independent_submit_files(
+    mode: Option<StorageBackendMode>,
+    effective_file_concurrency: u32,
+) -> bool {
+    matches!(mode, Some(StorageBackendMode::Postgres)) && effective_file_concurrency > 1
 }
 
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "s3"
+))]
+struct SubmitFileScheduling {
+    concurrency: u32,
+    independent_tasks: bool,
+}
+
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "s3"
+))]
 async fn build_bulk_submit(
     config: &ServerConfig,
     jobs: Arc<dyn BulkSubmitJobStore>,
     reindex_hook: Option<Arc<dyn helios_persistence::core::DeferredReindexHook>>,
+    write_observer: Arc<dyn WriteObserver>,
 ) -> anyhow::Result<Option<helios_rest::BulkSubmitBundle>> {
     let cfg = config.bulk_submit.clone();
     info!(
@@ -1836,6 +2404,7 @@ async fn build_bulk_submit(
             token_provider,
             cfg.outbound_scope.clone(),
         )
+        .with_read_timeout(std::time::Duration::from_secs(cfg.fetch_read_timeout_secs))
         .with_decryption_keys(decryption_keys),
     );
 
@@ -1843,11 +2412,15 @@ async fn build_bulk_submit(
     // lock until they outlast `busy_timeout` and abort the manifest (#942).
     // Ignore the configured value there, and warn about it, rather than letting
     // it fail the import.
-    let backend_kind = config
-        .storage_backend_mode()
-        .map(|mode| mode.primary_backend_kind())
+    let backend_mode = config.storage_backend_mode().ok();
+    let backend_kind = backend_mode
+        .map(StorageBackendMode::primary_backend_kind)
         .unwrap_or(BackendKind::Sqlite);
     let file_concurrency = cfg.effective_file_concurrency(backend_kind);
+    let file_scheduling = SubmitFileScheduling {
+        concurrency: file_concurrency,
+        independent_tasks: use_independent_submit_files(backend_mode, file_concurrency),
+    };
     if file_concurrency < cfg.file_concurrency.max(1) {
         warn!(
             configured = cfg.file_concurrency,
@@ -1864,8 +2437,9 @@ async fn build_bulk_submit(
         fetcher.clone(),
         output.clone(),
         &cfg,
-        file_concurrency,
+        file_scheduling,
         reindex_hook,
+        write_observer,
     );
 
     Ok(Some(helios_rest::BulkSubmitBundle {
@@ -1888,8 +2462,9 @@ fn spawn_submit_workers(
     fetcher: Arc<dyn SubmitInputFetcher>,
     output: Arc<dyn ExportOutputStore>,
     cfg: &helios_rest::config::BulkSubmitConfig,
-    file_concurrency: u32,
+    file_scheduling: SubmitFileScheduling,
     reindex_hook: Option<Arc<dyn helios_persistence::core::DeferredReindexHook>>,
+    write_observer: Arc<dyn WriteObserver>,
 ) {
     if cfg.disable_local_worker {
         info!("Bulk submit in-process worker pool is disabled");
@@ -1900,23 +2475,74 @@ fn spawn_submit_workers(
     if defer_indexing {
         info!("Bulk submit fast-load: search indexing deferred to post-manifest reindex");
     }
-    let file_concurrency = file_concurrency.max(1) as usize;
-    if file_concurrency > 1 {
-        info!(
-            file_concurrency,
-            "Bulk submit fan-out: ingesting a manifest's output files concurrently"
-        );
+    let batch_size = cfg.batch_size;
+    let skip_unchanged = cfg.skip_unchanged;
+    if skip_unchanged {
+        info!("Bulk submit skips resources whose content is identical to the stored version");
     }
+    // #1125: manifests whose rebuild was still outstanding when the server
+    // stopped. The marker is on the manifest row, so it survived; re-firing
+    // the same hook the live path uses keeps one code path.
+    if defer_indexing && let Some(hook) = reindex_hook.clone() {
+        let jobs = jobs.clone();
+        tokio::spawn(async move {
+            match jobs.list_manifests_awaiting_reindex(256).await {
+                Ok(pending) if !pending.is_empty() => {
+                    info!(
+                        manifests = pending.len(),
+                        "resuming search-index rebuilds left outstanding by an earlier run"
+                    );
+                    for manifest in pending {
+                        if manifest.resource_types.is_empty() {
+                            continue;
+                        }
+                        hook.reindex_types_with_context(
+                            &manifest.tenant,
+                            manifest.resource_types,
+                            helios_persistence::core::DeferredReindexContext {
+                                submission_id: Some(manifest.submission.to_string()),
+                                manifest_id: Some(manifest.manifest_id),
+                            },
+                        )
+                        .await;
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "could not look for search-index rebuilds left outstanding by an earlier run"
+                ),
+            }
+        });
+    }
+    let file_concurrency = file_scheduling.concurrency.max(1) as usize;
+    let scheduling = if file_scheduling.independent_tasks {
+        "independent-tasks"
+    } else {
+        "inline"
+    };
+    info!(
+        file_concurrency,
+        scheduling, "Bulk submit file scheduling selected"
+    );
     for i in 0..cfg.worker_concurrency {
         let jobs = jobs.clone();
         let fetcher = fetcher.clone();
         let output = output.clone();
         let reindex_hook = reindex_hook.clone();
+        let write_observer = write_observer.clone();
         let worker_id = WorkerId::new(format!("hfs-submit-worker-{i}"));
         tokio::spawn(async move {
-            let worker = DefaultSubmitWorker::new(jobs.clone(), fetcher, output, worker_id.clone())
-                .with_deferred_indexing(defer_indexing, reindex_hook.clone())
-                .with_file_concurrency(file_concurrency);
+            let mut worker =
+                DefaultSubmitWorker::new(jobs.clone(), fetcher, output, worker_id.clone())
+                    .with_deferred_indexing(defer_indexing, reindex_hook.clone())
+                    .with_write_observer(Some(write_observer))
+                    .with_file_concurrency(file_concurrency)
+                    .with_batch_size(batch_size)
+                    .with_skip_unchanged(skip_unchanged);
+            if file_scheduling.independent_tasks {
+                worker = worker.with_independent_file_tasks();
+            }
             loop {
                 match jobs.claim_next_manifest(&worker_id, lease).await {
                     Ok(Some(claimed)) => {
@@ -2003,6 +2629,7 @@ async fn start_sqlite_elasticsearch(
     let mut sqlite = create_sqlite_backend(&config)?;
     sqlite.set_search_offloaded(true);
     let sqlite = Arc::new(sqlite);
+    attach_login_sessions(auth_state.as_ref(), sqlite.clone());
     info!("SQLite search indexing disabled (offloaded to Elasticsearch)");
     // Refresh reads from the primary; the ES backend shares its registry Arc.
     // Seeding waits for the composite below, so the writes also index into ES.
@@ -2040,6 +2667,11 @@ async fn start_sqlite_elasticsearch(
         fhir_version: config.default_fhir_version,
         refresh_interval: config.elasticsearch_refresh_interval.clone(),
         write_refresh: es_write_refresh_from_config(&config)?,
+        nested_objects_limit: config.elasticsearch_nested_objects_limit,
+        request_timeout_ms: config.elasticsearch_request_timeout_ms,
+        bulk_max_bytes: config.elasticsearch_bulk_max_bytes,
+        bulk_concurrency: config.elasticsearch_bulk_concurrency,
+        reindex_refresh: es_reindex_refresh_from_config(&config)?,
         ..Default::default()
     };
 
@@ -2060,6 +2692,7 @@ async fn start_sqlite_elasticsearch(
         .primary("sqlite", BackendKind::Sqlite)
         .search_backend("es", BackendKind::Elasticsearch)
         .sync_mode(composite_sync_mode_from_env())
+        .fhir_version(config.default_fhir_version)
         .build()?;
 
     // Build backends map for CompositeStorage
@@ -2088,6 +2721,10 @@ async fn start_sqlite_elasticsearch(
     let composite = CompositeStorage::new(composite_config, backends)?
         .with_search_providers(search_providers)
         .with_full_primary(sqlite.clone())
+        // A failed Elasticsearch sync is counted, logged, and recorded in the
+        // primary as "needs reindex" (#1334).
+        .with_sync_observer(Arc::new(CompositeSyncMetrics))
+        .with_sync_failure_ledger(sqlite.clone())
         // `$purge` must reach the Elasticsearch secondary too — purging only
         // the SQLite primary would leave the resource in the search index,
         // still searchable and still holding its content.
@@ -2101,11 +2738,13 @@ async fn start_sqlite_elasticsearch(
 
     let serve_audit_state = audit_state.clone();
     let composite = Arc::new(composite);
+    spawn_secondary_sync_repair(composite.clone(), true);
 
     // Seed through the composite: the primary's own indexing is offloaded, so
     // seeding it directly would leave the conformance resources unsearchable
     // (empty /SearchParameter and /CompartmentDefinition, and empty UI viewers).
-    seed_conformance_resources(&*composite, &config).await;
+    let observability = helios_rest::WriteObservability::new();
+    seed_conformance_resources(&*composite, &config, Some(observability.observers.as_ref())).await;
 
     // The per-user settings store lives on the SQLite primary (Elasticsearch is
     // search-only), so it is wired from the underlying `sqlite` backend even
@@ -2114,34 +2753,48 @@ async fn start_sqlite_elasticsearch(
     let ui_settings = settings_store.clone();
     let ui_bulk_provider: Option<Arc<dyn BulkProviderStore>> = Some(sqlite.clone());
 
-    let export_bundle = build_bulk_export(&config, sqlite.clone(), sqlite.clone()).await?;
-    // Reindex reads from the SQLite primary and rebuilds BOTH indexes: SQLite's
-    // own search_index table and the Elasticsearch index that actually serves
-    // search here.
+    // The worker searches through `composite` (not the bare `sqlite` primary)
+    // so a `_typeFilter` runs against Elasticsearch, the index that actually
+    // serves search in this deployment.
+    let export_bundle = build_bulk_export(&config, composite.clone(), sqlite.clone()).await?;
+    // Reindex reads from the SQLite primary and writes only the indexes a query
+    // can read: Elasticsearch, plus SQLite's own index while it is not offloaded.
+    let (reindex_targets, reindex_target_names) = sqlite_es_reindex_targets(&sqlite, &es);
+    info!(targets = ?reindex_target_names, "Reindex writes to search targets");
     let ops = composite_ops(
         composite.clone(),
         sqlite.clone(),
-        vec![sqlite.clone(), es.clone()],
+        reindex_targets,
         sqlite.tenant_registries().clone(),
         audit_state.as_ref(),
+        observability.clone(),
     );
-    let reindex_hook = ops.reindex.clone().map(|op| {
-        Arc::new(helios_persistence::search::ReindexOnFinish::new(op))
-            as Arc<dyn helios_persistence::core::DeferredReindexHook>
-    });
+    let reindex_hook = ops
+        .reindex
+        .clone()
+        .map(|op| automatic_reindex_hook_with_ledger(op, &config, Some(sqlite.clone())));
     // Bulk ingestion runs on the SQLite primary's engine, but wrapped so that
     // finished manifests sync their resources into Elasticsearch — the raw
     // primary skips local indexing when search is offloaded, and without the
     // wrapper bulk-loaded data is invisible to every search (#882). In
     // fast-load mode the post-manifest reindex already rebuilds Elasticsearch,
-    // so the per-resource sync is skipped rather than done twice (#903).
+    // so the wrapper skips its per-resource sync rather than doing it twice
+    // (#903), but stays in the chain to mirror rollbacks (#1161).
     let submit_jobs = composite_submit_jobs(
         sqlite.clone(),
+        sqlite.clone(),
         composite.clone(),
-        config.bulk_submit.defer_indexing,
+        vec![es.clone()],
+        &config.bulk_submit,
         reindex_hook.is_some(),
     );
-    let submit_bundle = build_bulk_submit(&config, submit_jobs, reindex_hook).await?;
+    let submit_bundle = build_bulk_submit(
+        &config,
+        submit_jobs,
+        reindex_hook,
+        observability.observers.clone(),
+    )
+    .await?;
     let app = create_app_with_auth_bulk_settings_and_ops(
         composite.clone(),
         config.clone(),
@@ -2162,6 +2815,7 @@ async fn start_sqlite_elasticsearch(
         Some(composite),
         ui_settings,
         ui_bulk_provider,
+        Some(observability.observers.clone() as Arc<dyn WriteObserver>),
     )
     .await
 }
@@ -2180,6 +2834,24 @@ async fn start_sqlite_elasticsearch(
     )
 }
 
+/// Selects reindex width only for the exact standalone PostgreSQL mode.
+#[cfg(feature = "postgres")]
+fn postgres_reindex_selection(
+    config: &ServerConfig,
+    pool_max_connections: usize,
+) -> (Option<StorageBackendMode>, usize, usize) {
+    let mode = config.storage_backend_mode().ok();
+    let n = config
+        .bulk_submit
+        .effective_file_concurrency(BackendKind::Postgres) as usize;
+    let width = if mode == Some(StorageBackendMode::Postgres) {
+        n.min(pool_max_connections.max(1))
+    } else {
+        1
+    };
+    (mode, n, width)
+}
+
 /// Starts the server with PostgreSQL backend.
 #[cfg(feature = "postgres")]
 async fn start_postgres(
@@ -2189,10 +2861,22 @@ async fn start_postgres(
     audit_state: Option<Arc<AuditMiddlewareState>>,
 ) -> anyhow::Result<()> {
     let backend = create_postgres_backend(&config).await?;
+    let (exact_mode, requested, width) =
+        postgres_reindex_selection(&config, backend.config().max_connections);
+    let backend = backend.with_reindex_concurrency(width);
+    info!(
+        storage_mode = ?exact_mode,
+        file_concurrency = requested,
+        reindex_width = width,
+        concurrent_reindex = width > 1,
+        "Selected PostgreSQL reindex scheduling"
+    );
 
     backend.init_schema().await?;
     let backend = Arc::new(backend);
-    seed_conformance_resources(&*backend, &config).await;
+    attach_login_sessions(auth_state.as_ref(), backend.clone());
+    let observability = helios_rest::WriteObservability::new();
+    seed_conformance_resources(&*backend, &config, Some(observability.observers.as_ref())).await;
     spawn_postgres_search_param_refresh(backend.clone(), &config);
 
     let serve_audit_state = audit_state.clone();
@@ -2206,12 +2890,19 @@ async fn start_postgres(
         backend.clone(),
         backend.tenant_registries().clone(),
         audit_state.as_ref(),
+        observability.clone(),
     );
-    let reindex_hook = ops.reindex.clone().map(|op| {
-        Arc::new(helios_persistence::search::ReindexOnFinish::new(op))
-            as Arc<dyn helios_persistence::core::DeferredReindexHook>
-    });
-    let submit_bundle = build_bulk_submit(&config, backend.clone(), reindex_hook).await?;
+    let reindex_hook = ops
+        .reindex
+        .clone()
+        .map(|op| automatic_reindex_hook_with_ledger(op, &config, None));
+    let submit_bundle = build_bulk_submit(
+        &config,
+        backend.clone(),
+        reindex_hook,
+        observability.observers.clone(),
+    )
+    .await?;
     let app = create_app_with_auth_bulk_settings_and_ops(
         backend.clone(),
         config.clone(),
@@ -2232,6 +2923,7 @@ async fn start_postgres(
         Some(backend),
         ui_settings,
         ui_bulk_provider,
+        Some(observability.observers.clone() as Arc<dyn WriteObserver>),
     )
     .await
 }
@@ -2276,6 +2968,7 @@ async fn start_postgres_elasticsearch(
     let mut backend = backend;
     backend.set_search_offloaded(true);
     let pg = Arc::new(backend);
+    attach_login_sessions(auth_state.as_ref(), pg.clone());
     info!("PostgreSQL search indexing disabled (offloaded to Elasticsearch)");
     // Refresh reads from the primary; the ES backend shares its registry Arc.
     // Seeding waits for the composite below, so the writes also index into ES.
@@ -2313,6 +3006,11 @@ async fn start_postgres_elasticsearch(
         fhir_version: config.default_fhir_version,
         refresh_interval: config.elasticsearch_refresh_interval.clone(),
         write_refresh: es_write_refresh_from_config(&config)?,
+        nested_objects_limit: config.elasticsearch_nested_objects_limit,
+        request_timeout_ms: config.elasticsearch_request_timeout_ms,
+        bulk_max_bytes: config.elasticsearch_bulk_max_bytes,
+        bulk_concurrency: config.elasticsearch_bulk_concurrency,
+        reindex_refresh: es_reindex_refresh_from_config(&config)?,
         ..Default::default()
     };
 
@@ -2333,6 +3031,7 @@ async fn start_postgres_elasticsearch(
         .primary("postgres", BackendKind::Postgres)
         .search_backend("es", BackendKind::Elasticsearch)
         .sync_mode(composite_sync_mode_from_env())
+        .fhir_version(config.default_fhir_version)
         .build()?;
 
     // Build backends map for CompositeStorage
@@ -2361,6 +3060,10 @@ async fn start_postgres_elasticsearch(
     let composite = CompositeStorage::new(composite_config, backends)?
         .with_search_providers(search_providers)
         .with_full_primary(pg.clone())
+        // A failed Elasticsearch sync is counted, logged, and recorded in the
+        // primary as "needs reindex" (#1334).
+        .with_sync_observer(Arc::new(CompositeSyncMetrics))
+        .with_sync_failure_ledger(pg.clone())
         // See `start_sqlite_elasticsearch`: `$purge` must reach the search
         // secondary, not just the primary.
         .with_purgable_backends(
@@ -2373,10 +3076,12 @@ async fn start_postgres_elasticsearch(
 
     let serve_audit_state = audit_state.clone();
     let composite = Arc::new(composite);
+    spawn_secondary_sync_repair(composite.clone(), true);
 
     // Seed through the composite: the primary's own indexing is offloaded, so
     // seeding it directly would leave the conformance resources unsearchable.
-    seed_conformance_resources(&*composite, &config).await;
+    let observability = helios_rest::WriteObservability::new();
+    seed_conformance_resources(&*composite, &config, Some(observability.observers.as_ref())).await;
 
     // The per-user settings store lives on the PostgreSQL primary (Elasticsearch
     // is search-only), so it is wired from the underlying `pg` backend even
@@ -2385,28 +3090,41 @@ async fn start_postgres_elasticsearch(
     let ui_settings = settings_store.clone();
     let ui_bulk_provider: Option<Arc<dyn BulkProviderStore>> = Some(pg.clone());
 
-    let export_bundle = build_bulk_export(&config, pg.clone(), pg.clone()).await?;
+    // The worker searches through `composite` (not the bare `pg` primary) so a
+    // `_typeFilter` runs against Elasticsearch, the index that actually serves
+    // search in this deployment.
+    let export_bundle = build_bulk_export(&config, composite.clone(), pg.clone()).await?;
     let ops = composite_ops(
         composite.clone(),
         pg.clone(),
         vec![pg.clone(), es.clone()],
         pg.tenant_registries().clone(),
         audit_state.as_ref(),
+        observability.clone(),
     );
-    let reindex_hook = ops.reindex.clone().map(|op| {
-        Arc::new(helios_persistence::search::ReindexOnFinish::new(op))
-            as Arc<dyn helios_persistence::core::DeferredReindexHook>
-    });
+    let reindex_hook = ops
+        .reindex
+        .clone()
+        .map(|op| automatic_reindex_hook_with_ledger(op, &config, None));
     // Wrapped like sqlite-es: finished manifests sync their ingested
     // resources into Elasticsearch, which the raw primary never does (#882),
-    // unless fast-load's post-manifest reindex covers it (#903).
+    // unless fast-load's post-manifest reindex covers it (#903); rollbacks are
+    // mirrored to Elasticsearch either way (#1161).
     let submit_jobs = composite_submit_jobs(
         pg.clone(),
+        pg.clone(),
         composite.clone(),
-        config.bulk_submit.defer_indexing,
+        vec![es.clone()],
+        &config.bulk_submit,
         reindex_hook.is_some(),
     );
-    let submit_bundle = build_bulk_submit(&config, submit_jobs, reindex_hook).await?;
+    let submit_bundle = build_bulk_submit(
+        &config,
+        submit_jobs,
+        reindex_hook,
+        observability.observers.clone(),
+    )
+    .await?;
     let app = create_app_with_auth_bulk_settings_and_ops(
         composite.clone(),
         config.clone(),
@@ -2427,6 +3145,7 @@ async fn start_postgres_elasticsearch(
         Some(composite),
         ui_settings,
         ui_bulk_provider,
+        Some(observability.observers.clone() as Arc<dyn WriteObserver>),
     )
     .await
 }
@@ -2463,7 +3182,7 @@ async fn start_mongodb_elasticsearch(
     use helios_persistence::core::BackendKind;
 
     // Create MongoDB backend
-    let backend_config = build_mongodb_config(&config, true);
+    let backend_config = build_mongodb_config(&config, true)?;
     info!(
         url = %backend_config.connection_string,
         database = %backend_config.database_name,
@@ -2475,6 +3194,7 @@ async fn start_mongodb_elasticsearch(
 
     // Offload search to Elasticsearch
     let mongo = Arc::new(backend);
+    attach_login_sessions(auth_state.as_ref(), mongo.clone());
     info!("MongoDB search indexing disabled (offloaded to Elasticsearch)");
     // Refresh reads from the primary; the ES backend shares its registry Arc.
     // Seeding waits for the composite below, so the writes also index into ES.
@@ -2512,6 +3232,11 @@ async fn start_mongodb_elasticsearch(
         fhir_version: config.default_fhir_version,
         refresh_interval: config.elasticsearch_refresh_interval.clone(),
         write_refresh: es_write_refresh_from_config(&config)?,
+        nested_objects_limit: config.elasticsearch_nested_objects_limit,
+        request_timeout_ms: config.elasticsearch_request_timeout_ms,
+        bulk_max_bytes: config.elasticsearch_bulk_max_bytes,
+        bulk_concurrency: config.elasticsearch_bulk_concurrency,
+        reindex_refresh: es_reindex_refresh_from_config(&config)?,
         ..Default::default()
     };
 
@@ -2532,6 +3257,7 @@ async fn start_mongodb_elasticsearch(
         .primary("mongodb", BackendKind::MongoDB)
         .search_backend("es", BackendKind::Elasticsearch)
         .sync_mode(composite_sync_mode_from_env())
+        .fhir_version(config.default_fhir_version)
         .build()?;
 
     // Build backends map for CompositeStorage
@@ -2560,6 +3286,10 @@ async fn start_mongodb_elasticsearch(
     let composite = CompositeStorage::new(composite_config, backends)?
         .with_search_providers(search_providers)
         .with_full_primary(mongo.clone())
+        // A failed Elasticsearch sync is counted, logged, and recorded in the
+        // primary as "needs reindex" (#1334).
+        .with_sync_observer(Arc::new(CompositeSyncMetrics))
+        .with_sync_failure_ledger(mongo.clone())
         // See `start_sqlite_elasticsearch`: `$purge` must reach the search
         // secondary, not just the primary.
         .with_purgable_backends(
@@ -2572,10 +3302,12 @@ async fn start_mongodb_elasticsearch(
 
     let serve_audit_state = audit_state.clone();
     let composite = Arc::new(composite);
+    spawn_secondary_sync_repair(composite.clone(), true);
 
     // Seed through the composite: the primary's own indexing is offloaded, so
     // seeding it directly would leave the conformance resources unsearchable.
-    seed_conformance_resources(&*composite, &config).await;
+    let observability = helios_rest::WriteObservability::new();
+    seed_conformance_resources(&*composite, &config, Some(observability.observers.as_ref())).await;
 
     // The per-user settings store lives on the MongoDB primary (Elasticsearch is
     // search-only), so it is wired from the underlying `mongo` backend even
@@ -2589,7 +3321,10 @@ async fn start_mongodb_elasticsearch(
         #[cfg(feature = "sqlite")]
         {
             let jobs = build_embedded_job_store(&config)?;
-            build_bulk_export(&config, mongo.clone(), jobs).await?
+            // The worker searches through `composite` (not the bare `mongo`
+            // primary) so a `_typeFilter` runs against Elasticsearch, the
+            // index that actually serves search in this deployment.
+            build_bulk_export(&config, composite.clone(), jobs).await?
         }
         #[cfg(not(feature = "sqlite"))]
         {
@@ -2602,15 +3337,37 @@ async fn start_mongodb_elasticsearch(
         vec![mongo.clone(), es.clone()],
         mongo.tenant_registries().clone(),
         audit_state.as_ref(),
+        observability.clone(),
     );
+    let reindex_hook = ops
+        .reindex
+        .clone()
+        .map(|op| automatic_reindex_hook_with_ledger(op, &config, None));
     // Bulk submit runs against the MongoDB primary, which hosts its own job
-    // state. Ingestion deliberately goes to `mongo` rather than the composite:
-    // the composite's search half is fed by the primary's own indexing hooks.
-    let reindex_hook = ops.reindex.clone().map(|op| {
-        Arc::new(helios_persistence::search::ReindexOnFinish::new(op))
-            as Arc<dyn helios_persistence::core::DeferredReindexHook>
-    });
-    let submit_bundle = build_bulk_submit(&config, mongo.clone(), reindex_hook).await?;
+    // state, but wrapped like sqlite-es and pg-es so finished manifests sync
+    // their resources into Elasticsearch (#882). The comment this replaces said
+    // the composite's search half was "fed by the primary's own indexing
+    // hooks" — on this backend those hooks are exactly what is turned off
+    // (`search_offloaded`, logged above as "MongoDB search indexing disabled"),
+    // so nothing indexed the bulk-loaded data anywhere and 99.9 % of an import
+    // was readable by id and invisible to every search (#1021). Under fast-load
+    // the wrapper skips its per-resource sync but still mirrors rollbacks
+    // (#903, #1161).
+    let submit_jobs = composite_submit_jobs(
+        mongo.clone(),
+        mongo.clone(),
+        composite.clone(),
+        vec![es.clone()],
+        &config.bulk_submit,
+        reindex_hook.is_some(),
+    );
+    let submit_bundle = build_bulk_submit(
+        &config,
+        submit_jobs,
+        reindex_hook,
+        observability.observers.clone(),
+    )
+    .await?;
     let app = create_app_with_auth_bulk_settings_and_ops(
         composite.clone(),
         config.clone(),
@@ -2631,6 +3388,7 @@ async fn start_mongodb_elasticsearch(
         Some(composite),
         ui_settings,
         ui_bulk_provider,
+        Some(observability.observers.clone() as Arc<dyn WriteObserver>),
     )
     .await
 }
@@ -2703,7 +3461,15 @@ async fn start_s3(
     })?;
 
     let backend = Arc::new(backend);
+    if backend.supports_user_settings() {
+        attach_login_sessions(auth_state.as_ref(), backend.clone());
+    } else {
+        warn_login_sessions_in_process(auth_state.as_ref());
+    }
     let serve_audit_state = audit_state.clone();
+    // Standalone S3 seeds no conformance resources, but its REST writes, bulk
+    // submit, and UI purges still report to the one write observer (#1078).
+    let observability = helios_rest::WriteObservability::new();
 
     // Second handle to the same backend (S3Backend clones share the client)
     // for the web UI's tenant-maintenance read/write path.
@@ -2738,6 +3504,7 @@ async fn start_s3(
     let ops = OperationsBundle {
         purge: Some(backend.clone() as Arc<dyn PurgableStorage>),
         reindex: None,
+        observability: Some(observability.clone()),
     };
 
     // Bulk submit *is* wired: S3 keeps the submission, manifest, lease, and
@@ -2752,9 +3519,14 @@ async fn start_s3(
             &config,
             backend.clone(),
             ops.reindex.clone().map(|op| {
-                Arc::new(helios_persistence::search::ReindexOnFinish::new(op))
-                    as Arc<dyn helios_persistence::core::DeferredReindexHook>
+                Arc::new(
+                    helios_persistence::search::ReindexOnFinish::new(op)
+                        .with_batch_size(config.reindex_batch_size)
+                        .with_batch_bytes(config.reindex_batch_bytes)
+                        .with_bulk_index_rebuild(config.bulk_submit.bulk_index_rebuild),
+                ) as Arc<dyn helios_persistence::core::DeferredReindexHook>
             }),
+            observability.observers.clone(),
         )
         .await?
     } else {
@@ -2783,6 +3555,7 @@ async fn start_s3(
         ui_tenants,
         ui_settings,
         ui_bulk_provider,
+        Some(observability.observers.clone() as Arc<dyn WriteObserver>),
     )
     .await
 }
@@ -2862,6 +3635,11 @@ async fn start_s3_elasticsearch(
             e
         )
     })?);
+    if s3.supports_user_settings() {
+        attach_login_sessions(auth_state.as_ref(), s3.clone());
+    } else {
+        warn_login_sessions_in_process(auth_state.as_ref());
+    }
     // Refresh reads from the primary; the ES backend shares its registry Arc
     // (wired below, once it's populated). Seeding waits for the composite
     // further down, so the writes also index into ES.
@@ -2893,6 +3671,11 @@ async fn start_s3_elasticsearch(
         fhir_version: config.default_fhir_version,
         refresh_interval: config.elasticsearch_refresh_interval.clone(),
         write_refresh: es_write_refresh_from_config(&config)?,
+        nested_objects_limit: config.elasticsearch_nested_objects_limit,
+        request_timeout_ms: config.elasticsearch_request_timeout_ms,
+        bulk_max_bytes: config.elasticsearch_bulk_max_bytes,
+        bulk_concurrency: config.elasticsearch_bulk_concurrency,
+        reindex_refresh: es_reindex_refresh_from_config(&config)?,
         ..Default::default()
     };
 
@@ -2903,32 +3686,26 @@ async fn start_s3_elasticsearch(
     );
 
     // Populate S3's own per-tenant registry container with the shared base
-    // (embedded + spec) — S3 has no `data_dir`/FHIR version of its own to load
-    // these from, so a composite starter does it once here, the same params
-    // `build_search_registry` used to load into a standalone container. Unlike
+    // (embedded + spec + custom, e.g. the SQL-on-FHIR `ViewDefinition` params) —
+    // S3 has no `data_dir`/FHIR version of its own to load these from, so a
+    // composite starter does it once here, the same three tiers the SQLite,
+    // PostgreSQL, and MongoDB primaries load into theirs. Omitting the custom
+    // tier left ES blind to `ViewDefinition?name:contains=…` (#1070). Unlike
     // before, this container is *S3's real registries* (`s3.tenant_registries()`),
     // not a throwaway one: S3's own create/update/delete hooks now keep each
     // tenant's stored SearchParameter overlay on it current (#787), so sharing
     // it with Elasticsearch below gives ES the same live overlay every other
     // composite's search backend already gets from its primary.
     {
-        use helios_persistence::search::SearchParameterLoader;
-        let loader = SearchParameterLoader::new(config.default_fhir_version);
-        let mut base = s3.tenant_registries().base().write();
-        if let Ok(params) = loader.load_embedded() {
-            for p in params {
-                let _ = base.register(p);
-            }
-        }
         let data_dir = config
             .data_dir
             .clone()
             .unwrap_or_else(|| std::path::PathBuf::from("./data"));
-        if let Ok(params) = loader.load_from_spec_file(&data_dir) {
-            for p in params {
-                let _ = base.register(p);
-            }
-        }
+        populate_base_search_registry(
+            &mut s3.tenant_registries().base().write(),
+            config.default_fhir_version,
+            &data_dir,
+        );
     }
     let es = Arc::new(ElasticsearchBackend::with_shared_registry(
         es_config,
@@ -2940,6 +3717,7 @@ async fn start_s3_elasticsearch(
         .primary("s3", BackendKind::S3)
         .search_backend("es", BackendKind::Elasticsearch)
         .sync_mode(composite_sync_mode_from_env())
+        .fhir_version(config.default_fhir_version)
         .build()?;
 
     let mut backends = HashMap::new();
@@ -2965,6 +3743,9 @@ async fn start_s3_elasticsearch(
     let composite = CompositeStorage::new(composite_config, backends)?
         .with_search_providers(search_providers)
         .with_full_primary(s3.clone())
+        // S3 keeps no needs-reindex ledger: a failed Elasticsearch sync is
+        // counted and logged, and repaired by `$reindex` (#1334).
+        .with_sync_observer(Arc::new(CompositeSyncMetrics))
         // See `start_sqlite_elasticsearch`: `$purge` must reach the search
         // secondary, not just the primary.
         .with_purgable_backends(
@@ -2977,10 +3758,12 @@ async fn start_s3_elasticsearch(
 
     let serve_audit_state = audit_state.clone();
     let composite = Arc::new(composite);
+    spawn_secondary_sync_repair(composite.clone(), false);
 
     // Seed through the composite so the conformance resources land in the S3
     // primary and get indexed into Elasticsearch — the only search index here.
-    seed_conformance_resources(&*composite, &config).await;
+    let observability = helios_rest::WriteObservability::new();
+    seed_conformance_resources(&*composite, &config, Some(observability.observers.as_ref())).await;
 
     // The per-user settings store lives on the S3 primary (Elasticsearch is
     // search-only), so it is wired from the underlying `s3` backend even though
@@ -3007,6 +3790,7 @@ async fn start_s3_elasticsearch(
         vec![es.clone()],
         es.tenant_registries().clone(),
         audit_state.as_ref(),
+        observability.clone(),
     );
 
     // S3 primary; embedded SQLite sidecar for bulk-export job state. A single
@@ -3016,7 +3800,10 @@ async fn start_s3_elasticsearch(
         #[cfg(feature = "sqlite")]
         {
             let jobs = build_embedded_job_store(&config)?;
-            build_bulk_export(&config, s3.clone(), jobs).await?
+            // The worker searches through `composite` (not the bare `s3`
+            // primary) so a `_typeFilter` runs against Elasticsearch, the
+            // only search index in this deployment.
+            build_bulk_export(&config, composite.clone(), jobs).await?
         }
         #[cfg(not(feature = "sqlite"))]
         {
@@ -3024,16 +3811,32 @@ async fn start_s3_elasticsearch(
         }
     };
     // Bulk submit needs no sidecar here either: the S3 primary hosts its own
-    // job state. Ingestion goes to `s3` rather than the composite because the
-    // composite's Elasticsearch half is fed by the primary's indexing hooks.
+    // job state. It is wrapped like every other composite (#882): S3 maintains
+    // no search index of its own — Elasticsearch is the only one in this
+    // deployment, as the `ops` comment above says — so the primary has no
+    // indexing hooks for the composite's search half to be "fed by", which is
+    // what the comment this replaces claimed. Without the wrapper a completed
+    // `$bulk-submit` here leaves its resources searchable nowhere (#1021).
+    // Under fast-load the wrapper skips its per-resource sync but still mirrors
+    // rollbacks (#903, #1161).
+    let reindex_hook = ops
+        .reindex
+        .clone()
+        .map(|op| automatic_reindex_hook_with_ledger(op, &config, None));
     let bulk_submit = if s3.supports_bulk_submit_worker() {
+        let submit_jobs = composite_submit_jobs(
+            s3.clone(),
+            s3.clone(),
+            composite.clone(),
+            vec![es.clone()],
+            &config.bulk_submit,
+            reindex_hook.is_some(),
+        );
         build_bulk_submit(
             &config,
-            s3.clone(),
-            ops.reindex.clone().map(|op| {
-                Arc::new(helios_persistence::search::ReindexOnFinish::new(op))
-                    as Arc<dyn helios_persistence::core::DeferredReindexHook>
-            }),
+            submit_jobs,
+            reindex_hook,
+            observability.observers.clone(),
         )
         .await?
     } else {
@@ -3064,6 +3867,7 @@ async fn start_s3_elasticsearch(
         Some(composite),
         ui_settings,
         ui_bulk_provider,
+        Some(observability.observers.clone() as Arc<dyn WriteObserver>),
     )
     .await
 }
@@ -3095,6 +3899,106 @@ mod tests {
     use super::*;
     use helios_audit::AuditConfig;
     use helios_rest::ServerConfig;
+
+    // ── Elasticsearch rebuild wiring (#1125) ──────────────────────
+
+    #[cfg(feature = "elasticsearch")]
+    #[test]
+    fn test_es_reindex_refresh_follows_write_refresh_when_unset() {
+        use helios_persistence::backends::elasticsearch::WriteRefreshPolicy;
+
+        for unset in [None, Some(String::new()), Some("  ".to_string())] {
+            let config = ServerConfig {
+                elasticsearch_reindex_refresh: unset,
+                ..Default::default()
+            };
+            assert_eq!(es_reindex_refresh_from_config(&config).unwrap(), None);
+        }
+        let config = ServerConfig {
+            elasticsearch_write_refresh: "wait_for".to_string(),
+            elasticsearch_reindex_refresh: Some("false".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            es_write_refresh_from_config(&config).unwrap(),
+            WriteRefreshPolicy::WaitFor
+        );
+        assert_eq!(
+            es_reindex_refresh_from_config(&config).unwrap(),
+            Some(WriteRefreshPolicy::False)
+        );
+        let config = ServerConfig {
+            elasticsearch_reindex_refresh: Some("sometimes".to_string()),
+            ..Default::default()
+        };
+        let error = es_reindex_refresh_from_config(&config).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("HFS_ELASTICSEARCH_REINDEX_REFRESH"),
+            "{error}"
+        );
+    }
+
+    #[cfg(all(feature = "sqlite", feature = "elasticsearch"))]
+    #[test]
+    fn test_sqlite_es_reindex_skips_an_offloaded_primary() {
+        use helios_persistence::backends::elasticsearch::{
+            ElasticsearchBackend, ElasticsearchConfig,
+        };
+
+        // Never contacted: building the client does not connect.
+        let es = Arc::new(
+            ElasticsearchBackend::new(ElasticsearchConfig {
+                nodes: vec!["http://127.0.0.1:1".to_string()],
+                ..Default::default()
+            })
+            .expect("ES backend builds without a cluster"),
+        );
+        let config = ServerConfig {
+            database_url: Some(":memory:".to_string()),
+            ..Default::default()
+        };
+
+        let mut offloaded = create_sqlite_backend(&config).unwrap();
+        offloaded.set_search_offloaded(true);
+        let (targets, names) = sqlite_es_reindex_targets(&Arc::new(offloaded), &es);
+        assert_eq!(names, &["elasticsearch"]);
+        assert_eq!(targets.len(), 1);
+
+        let local = Arc::new(create_sqlite_backend(&config).unwrap());
+        let (targets, names) = sqlite_es_reindex_targets(&local, &es);
+        assert_eq!(names, &["sqlite", "elasticsearch"]);
+        assert_eq!(targets.len(), 2);
+    }
+
+    // ── Automatic reindex hook wiring (#1499) ──────────────────────
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn test_automatic_reindex_hook_gets_the_server_default_batch_bytes_when_unset() {
+        use clap::Parser;
+
+        let config = ServerConfig::try_parse_from(["rest-server"]).unwrap();
+        assert_eq!(
+            config.reindex_batch_bytes,
+            32 * 1024 * 1024,
+            "HFS_REINDEX_BATCH_BYTES server default (#1499)"
+        );
+
+        let backend = Arc::new(
+            create_sqlite_backend(&ServerConfig {
+                database_url: Some(":memory:".to_string()),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let registries = backend.tenant_registries().clone();
+        let op = Arc::new(ReindexOperation::new(backend, registries));
+
+        let hook = build_automatic_reindex_hook(op, &config, None);
+        assert_eq!(hook.batch_bytes(), 32 * 1024 * 1024);
+    }
 
     // ── create_sqlite_backend() ───────────────────────────────────
 
@@ -3172,7 +4076,8 @@ mod tests {
             "HFS_MONGODB_CONNECT_TIMEOUT_MS" => Some("7500".to_string()),
             "HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS" => Some("2500".to_string()),
             _ => None,
-        });
+        })
+        .expect("valid config");
 
         assert_eq!(
             mongo_config.connection_string,
@@ -3185,6 +4090,7 @@ mod tests {
         assert_eq!(mongo_config.fhir_version, FhirVersion::R4);
         assert_eq!(mongo_config.data_dir, Some(data_dir));
         assert!(!mongo_config.search_offloaded);
+        assert_eq!(mongo_config.index_build, IndexBuildMode::Background);
     }
 
     #[cfg(feature = "mongodb")]
@@ -3199,11 +4105,39 @@ mod tests {
             "HFS_DATABASE_URL" => Some("postgres://localhost/hfs".to_string()),
             "HFS_MONGODB_DATABASE" => Some("mongo_db".to_string()),
             _ => None,
-        });
+        })
+        .expect("valid config");
 
         assert_eq!(mongo_config.connection_string, "mongodb://localhost:27017");
         assert_eq!(mongo_config.database_name, "mongo_db");
         assert!(mongo_config.search_offloaded);
+    }
+
+    #[cfg(feature = "mongodb")]
+    #[test]
+    fn test_build_mongodb_config_reads_index_build_and_rejects_invalid_values() {
+        let config = ServerConfig::default();
+
+        let mongo_config = build_mongodb_config_with_env(&config, false, |name| match name {
+            "HFS_MONGODB_INDEX_BUILD" => Some("off".to_string()),
+            _ => None,
+        })
+        .expect("valid config");
+        assert_eq!(mongo_config.index_build, IndexBuildMode::Off);
+
+        let mongo_config = build_mongodb_config_with_env(&config, false, |name| match name {
+            "HFS_MONGODB_INDEX_BUILD" => Some("inline".to_string()),
+            _ => None,
+        })
+        .expect("valid config");
+        assert_eq!(mongo_config.index_build, IndexBuildMode::Inline);
+
+        let err = build_mongodb_config_with_env(&config, false, |name| match name {
+            "HFS_MONGODB_INDEX_BUILD" => Some("nonsense".to_string()),
+            _ => None,
+        })
+        .expect_err("invalid mode must fail startup");
+        assert!(format!("{err}").contains("HFS_MONGODB_INDEX_BUILD"));
     }
 
     #[cfg(feature = "mongodb")]
@@ -3215,7 +4149,8 @@ mod tests {
             "HFS_MONGODB_URI" => Some("mongodb://mongo-specific:27017".to_string()),
             "HFS_DATABASE_URL" => Some("mongodb://database-url:27017".to_string()),
             _ => None,
-        });
+        })
+        .expect("valid config");
 
         assert_eq!(
             mongo_config.connection_string,
@@ -3282,6 +4217,93 @@ mod tests {
             StorageBackendMode::S3Elasticsearch.primary_backend_kind(),
             BackendKind::S3
         );
+    }
+
+    #[test]
+    fn bulk_submit_file_scheduling_selection() {
+        let modes = [
+            Some(StorageBackendMode::Sqlite),
+            Some(StorageBackendMode::SqliteElasticsearch),
+            Some(StorageBackendMode::Postgres),
+            Some(StorageBackendMode::PostgresElasticsearch),
+            Some(StorageBackendMode::MongoDB),
+            Some(StorageBackendMode::MongoDBElasticsearch),
+            Some(StorageBackendMode::S3),
+            Some(StorageBackendMode::S3Elasticsearch),
+            None,
+        ];
+
+        for mode in modes {
+            for effective in [0, 1, 2, 8] {
+                let expected = matches!(mode, Some(StorageBackendMode::Postgres)) && effective > 1;
+                assert_eq!(
+                    use_independent_submit_files(mode, effective),
+                    expected,
+                    "mode={mode:?} effective={effective}"
+                );
+            }
+
+            for configured in [0, 1, 2, 8] {
+                let cfg = helios_rest::config::BulkSubmitConfig {
+                    file_concurrency: configured,
+                    ..Default::default()
+                };
+                let backend = mode
+                    .map(StorageBackendMode::primary_backend_kind)
+                    .unwrap_or(BackendKind::Sqlite);
+                let effective = cfg.effective_file_concurrency(backend);
+                let expected = matches!(mode, Some(StorageBackendMode::Postgres)) && effective > 1;
+                assert_eq!(
+                    use_independent_submit_files(mode, effective),
+                    expected,
+                    "mode={mode:?} configured={configured} effective={effective}"
+                );
+            }
+        }
+
+        assert!(!use_independent_submit_files(None, 8));
+        assert!(!use_independent_submit_files(
+            Some(StorageBackendMode::PostgresElasticsearch),
+            8,
+        ));
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn test_postgres_reindex_groups_selection() {
+        let mut config = ServerConfig::default();
+        config.bulk_submit.file_concurrency = 4;
+        for mode in [
+            StorageBackendMode::Sqlite,
+            StorageBackendMode::SqliteElasticsearch,
+            StorageBackendMode::Postgres,
+            StorageBackendMode::PostgresElasticsearch,
+            StorageBackendMode::MongoDB,
+            StorageBackendMode::MongoDBElasticsearch,
+            StorageBackendMode::S3,
+            StorageBackendMode::S3Elasticsearch,
+        ] {
+            config.storage_backend = mode.to_string();
+            let (_, n, width) = postgres_reindex_selection(&config, 8);
+            assert_eq!(n, 4);
+            assert_eq!(
+                width,
+                if mode == StorageBackendMode::Postgres {
+                    4
+                } else {
+                    1
+                }
+            );
+        }
+        config.storage_backend = "postgres".to_string();
+        assert_eq!(postgres_reindex_selection(&config, 1).2, 1);
+        assert_eq!(postgres_reindex_selection(&config, 2).2, 2);
+        config.bulk_submit.file_concurrency = 0;
+        assert_eq!(postgres_reindex_selection(&config, 8).2, 1);
+        config.storage_backend.clear();
+        assert_eq!(postgres_reindex_selection(&config, 8).2, 1);
+        config.storage_backend = "invalid".to_string();
+        assert_eq!(postgres_reindex_selection(&config, 8).2, 1);
     }
 
     #[cfg(feature = "ui")]
@@ -3388,7 +4410,7 @@ mod tests {
         let config = ServerConfig::default();
         assert!(config.ui_enabled, "the UI must default to on");
 
-        let response = attach_ui(axum::Router::new(), &config, None, None, None)
+        let response = attach_ui(axum::Router::new(), &config, None, None, None, None)
             .oneshot(
                 axum::http::Request::get("/ui")
                     .body(axum::body::Body::empty())
@@ -3423,7 +4445,7 @@ mod tests {
         let mut config = ServerConfig::default();
         config.ui_enabled = false;
 
-        let response = attach_ui(axum::Router::new(), &config, None, None, None)
+        let response = attach_ui(axum::Router::new(), &config, None, None, None, None)
             .oneshot(
                 axum::http::Request::get("/ui")
                     .body(axum::body::Body::empty())
@@ -3437,5 +4459,148 @@ mod tests {
         let outcome: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(outcome["resourceType"], "OperationOutcome");
         assert_eq!(outcome["issue"][0]["code"], "not-found");
+    }
+
+    // ── Deferred bulk-submit job store (#1161) ──────────────────
+
+    #[cfg(all(feature = "elasticsearch", feature = "sqlite"))]
+    mod composite_submit_jobs_1161 {
+        use super::*;
+        use helios_fhir::FhirVersion;
+        use helios_persistence::composite::{
+            CompositeConfig, CompositeStorage, DynStorage, SyncMode,
+        };
+        use helios_persistence::core::{SubmissionChange, SubmissionId};
+        use helios_persistence::{StorageResult, StoredResource, TenantId, TenantPermissions};
+        use parking_lot::Mutex;
+        use serde_json::Value;
+
+        /// A search secondary that only records deletes; nothing else is
+        /// reached by a rollback.
+        struct DeleteSpy {
+            deletes: Arc<Mutex<Vec<String>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl ResourceStorage for DeleteSpy {
+            fn backend_name(&self) -> &'static str {
+                "delete-spy"
+            }
+
+            async fn create(
+                &self,
+                _tenant: &TenantContext,
+                _resource_type: &str,
+                _resource: Value,
+                _fhir_version: FhirVersion,
+            ) -> StorageResult<StoredResource> {
+                unimplemented!("a rollback never creates on the secondary")
+            }
+
+            async fn create_or_update(
+                &self,
+                _tenant: &TenantContext,
+                _resource_type: &str,
+                _id: &str,
+                _resource: Value,
+                _fhir_version: FhirVersion,
+            ) -> StorageResult<(StoredResource, bool)> {
+                unimplemented!("a rollback of a create never upserts")
+            }
+
+            async fn read(
+                &self,
+                _tenant: &TenantContext,
+                _resource_type: &str,
+                _id: &str,
+            ) -> StorageResult<Option<StoredResource>> {
+                Ok(None)
+            }
+
+            async fn update(
+                &self,
+                _tenant: &TenantContext,
+                _current: &StoredResource,
+                _resource: Value,
+            ) -> StorageResult<StoredResource> {
+                unimplemented!("a rollback of a create never updates")
+            }
+
+            async fn delete(
+                &self,
+                _tenant: &TenantContext,
+                resource_type: &str,
+                id: &str,
+            ) -> StorageResult<()> {
+                self.deletes
+                    .lock()
+                    .push(format!("delete {resource_type}/{id}"));
+                Ok(())
+            }
+
+            async fn count(
+                &self,
+                _tenant: &TenantContext,
+                _resource_type: Option<&str>,
+            ) -> StorageResult<u64> {
+                Ok(0)
+            }
+        }
+
+        /// #1161: the job store `composite_submit_jobs` hands the worker under
+        /// deferred indexing must mirror a rolled-back create to the search
+        /// backend. Returning the raw primary there left the document in
+        /// Elasticsearch after the primary had dropped it.
+        #[tokio::test]
+        async fn deferred_submit_jobs_mirror_rollbacks_to_the_search_backend() {
+            let sqlite = Arc::new(SqliteBackend::in_memory().unwrap());
+            sqlite.init_schema().unwrap();
+            let deletes = Arc::new(Mutex::new(Vec::new()));
+
+            let config = CompositeConfig::builder()
+                .primary("sqlite", BackendKind::Sqlite)
+                .search_backend("es", BackendKind::Elasticsearch)
+                // Synchronous, so the delete lands before the assertion.
+                .sync_mode(SyncMode::Synchronous)
+                .build()
+                .unwrap();
+            let mut backends = std::collections::HashMap::new();
+            backends.insert("sqlite".to_string(), sqlite.clone() as DynStorage);
+            backends.insert(
+                "es".to_string(),
+                Arc::new(DeleteSpy {
+                    deletes: deletes.clone(),
+                }) as DynStorage,
+            );
+            let composite = Arc::new(CompositeStorage::new(config, backends).unwrap());
+
+            let cfg = helios_rest::config::BulkSubmitConfig {
+                defer_indexing: true,
+                ..Default::default()
+            };
+            let jobs = composite_submit_jobs(
+                sqlite.clone(),
+                sqlite.clone(),
+                composite,
+                Vec::new(),
+                &cfg,
+                true,
+            );
+
+            // No ingest needed: SQLite treats a create that is already gone
+            // as reverted, which is all the wrapper needs to mirror it.
+            let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+            let change = SubmissionChange::create("m1", "Patient", "p-1161", "1");
+            let sub = SubmissionId::generate("t1161");
+            assert!(jobs.rollback_change(&tenant, &sub, &change).await.unwrap());
+
+            assert_eq!(
+                deletes.lock().clone(),
+                vec!["delete Patient/p-1161".to_string()],
+                "the deferred-path job store must mirror rollbacks to the search backend \
+                 (#1161); nothing recorded means composite_submit_jobs handed the worker \
+                 the raw primary"
+            );
+        }
     }
 }

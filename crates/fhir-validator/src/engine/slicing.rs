@@ -150,8 +150,8 @@ pub(super) fn validate_slices(
         } else if rules == "openAtEnd"
             && let Some(last_matched) = mark.item_matches.iter().rposition(|m| !m.is_empty())
         {
-            for index in 0..last_matched {
-                if mark.item_matches[index].is_empty() {
+            for (index, matches) in mark.item_matches.iter().enumerate().take(last_matched) {
+                if matches.is_empty() {
                     ctx.path.push_index(index);
                     ctx.error(ErrorKind::SliceUnmatched, errors::msg_slice_open_at_end());
                     ctx.path.pop();

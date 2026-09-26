@@ -39,12 +39,23 @@
 //! spec-defined parameters/features that the server explicitly refuses;
 //! [`RestError::NotImplemented`] (501 + `not-supported`) signals work that
 //! has not yet been wired up.
+//!
+//! Three variants share `400` and differ only in how precisely they classify
+//! the fault, using the `issue-type` hierarchy rather than three shades of the
+//! same code: [`RestError::MissingElement`] (`required`) for an absent
+//! mandatory element, [`RestError::InvalidElementValue`] (`value`) for one
+//! that is present but unusable, and [`RestError::BadRequest`] (`invalid`,
+//! their common parent) for everything else. Prefer a child where the
+//! distinction is real — `OperationOutcome.issue.code` is bound `required` to
+//! `issue-type` and its ElementDefinition asks for the most applicable code.
 
 use axum::{
     Json,
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use helios_fhir::FhirVersion;
+use helios_persistence::core::PatchError;
 use helios_persistence::error::{
     BackendError, ConcurrencyError, ResourceError, SearchError, StorageError, TenantError,
     TransactionError, ValidationError,
@@ -120,6 +131,45 @@ pub enum RestError {
         message: String,
     },
 
+    /// A mandatory element is absent (HTTP 400 + `required`).
+    ///
+    /// Split from [`RestError::BadRequest`] so the outcome can carry
+    /// `required` — "A required element is missing." — rather than its is-a
+    /// parent `invalid`. Nothing in this crate could say `required` before:
+    /// every handler reported an absent element as `BadRequest`, and the
+    /// Bundle arms were the first place the distinction mattered enough to
+    /// notice (#504).
+    ///
+    /// Use it only where the StructureDefinition gives `min=1` or a named
+    /// invariant makes the element mandatory — `Bundle.entry.request`
+    /// (`bdl-3` in R4/R4B, transitively `bdl-3c` in R5/R6),
+    /// `Bundle.entry.request.method` (1..1) and `Bundle.entry.request.url`
+    /// (1..1). It is deliberately **not** used for an absent
+    /// `Bundle.entry.resource`: that element is 0..1 and only R5/R6's
+    /// `bdl-3c` requires it for POST/PUT/PATCH, so claiming `required` there
+    /// would assert a rule R4 and R4B do not have.
+    MissingElement {
+        /// Message naming the absent element and the entry it belongs to.
+        message: String,
+    },
+
+    /// An element is present but its value cannot be used (HTTP 400 + `value`).
+    ///
+    /// Split from [`RestError::BadRequest`] for the same reason as
+    /// [`RestError::MissingElement`], one level down the other branch:
+    /// `value` — "An element or header value is invalid." — is a child of
+    /// `invalid`, and `OperationOutcome.issue.code`'s ElementDefinition
+    /// requires the most applicable code rather than an ancestor that happens
+    /// to be true.
+    ///
+    /// The distinction against `MissingElement` is absent-versus-unusable, and
+    /// it is the one a client acts on differently: a missing element is added,
+    /// an invalid value is corrected.
+    InvalidElementValue {
+        /// Message naming the element and why its value cannot be used.
+        message: String,
+    },
+
     /// Unsupported media type (HTTP 415).
     UnsupportedMediaType {
         /// The unsupported content type.
@@ -145,6 +195,15 @@ pub enum RestError {
     /// lint on an inline `$sql-run` subject (`helios_sof::lint`, #821).
     ValidationFailed {
         /// The OperationOutcome to return as the response body.
+        outcome: serde_json::Value,
+    },
+
+    /// A Bundle PATCH failed inside an atomic transaction. The backend has
+    /// rolled back and retained the entry's exact status and OperationOutcome.
+    BundlePatchFailed {
+        /// The HTTP status of the failed PATCH entry.
+        status: StatusCode,
+        /// The complete FHIR outcome, including validator issue locations.
         outcome: serde_json::Value,
     },
 
@@ -230,6 +289,20 @@ pub enum RestError {
         feature: String,
     },
 
+    /// The request path names a resource type this server does not serve
+    /// for the request's effective FHIR version (HTTP 404 + `not-supported`).
+    ///
+    /// Covers a misspelling (`Patinet`), wrong case (`observation`), and a
+    /// type from another FHIR version (`ActorDefinition` under R4). Per
+    /// `http.html`, "resource type not supported" is a `404 Not Found` for
+    /// every interaction, read and write alike (#989).
+    UnknownResourceType {
+        /// The type segment as it appeared in the request URL.
+        resource_type: String,
+        /// The FHIR version the request was resolved against.
+        version: FhirVersion,
+    },
+
     /// Internal server error (HTTP 500).
     InternalError {
         /// Error message.
@@ -300,6 +373,12 @@ impl fmt::Display for RestError {
             RestError::BadRequest { message } => {
                 write!(f, "Bad request: {}", message)
             }
+            RestError::MissingElement { message } => {
+                write!(f, "Missing element: {}", message)
+            }
+            RestError::InvalidElementValue { message } => {
+                write!(f, "Invalid element value: {}", message)
+            }
             RestError::UnsupportedMediaType { content_type } => {
                 write!(f, "Unsupported media type: {}", content_type)
             }
@@ -311,6 +390,9 @@ impl fmt::Display for RestError {
             }
             RestError::ValidationFailed { .. } => {
                 write!(f, "Resource validation failed")
+            }
+            RestError::BundlePatchFailed { status, .. } => {
+                write!(f, "Bundle PATCH failed with status {status}")
             }
             RestError::Unauthorized { message } => {
                 write!(f, "Unauthorized: {}", message)
@@ -341,6 +423,16 @@ impl fmt::Display for RestError {
             }
             RestError::NotSupported { feature } => {
                 write!(f, "Not supported: {}", feature)
+            }
+            RestError::UnknownResourceType {
+                resource_type,
+                version,
+            } => {
+                write!(
+                    f,
+                    "Unknown resource type: {} (FHIR {})",
+                    resource_type, version
+                )
             }
             RestError::InternalError { message } => {
                 write!(f, "Internal error: {}", message)
@@ -419,6 +511,16 @@ impl RestError {
             RestError::BadRequest { message } => {
                 (StatusCode::BAD_REQUEST, "invalid", message.clone())
             }
+            // `required` and `value` are both children of `invalid` in the
+            // `issue-type` hierarchy (verified identical in R4/R4B/R5/R6 at
+            // `crates/fhir-gen/resources/*/valuesets.json`), so these two
+            // refine `BadRequest` rather than contradicting it.
+            RestError::MissingElement { message } => {
+                (StatusCode::BAD_REQUEST, "required", message.clone())
+            }
+            RestError::InvalidElementValue { message } => {
+                (StatusCode::BAD_REQUEST, "value", message.clone())
+            }
             RestError::UnsupportedMediaType { content_type } => (
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 "not-supported",
@@ -432,11 +534,19 @@ impl RestError {
                 "processing",
                 message.clone(),
             ),
+            // Unreachable from either renderer since #504: both go through
+            // [`Self::client_outcome`], which intercepts `ValidationFailed`
+            // above this table and surfaces the validator's own multi-issue
+            // outcome. Kept so the match stays exhaustive, and because a
+            // caller wanting only a summary line is still entitled to one.
             RestError::ValidationFailed { .. } => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "processing",
                 "Resource validation failed".to_string(),
             ),
+            RestError::BundlePatchFailed { status, .. } => {
+                (*status, "processing", "Bundle PATCH failed".to_string())
+            }
             RestError::Unauthorized { message } => {
                 (StatusCode::UNAUTHORIZED, "login", message.clone())
             }
@@ -492,6 +602,19 @@ impl RestError {
             RestError::NotSupported { feature } => {
                 (StatusCode::BAD_REQUEST, "not-supported", feature.clone())
             }
+            RestError::UnknownResourceType {
+                resource_type,
+                version,
+            } => (
+                StatusCode::NOT_FOUND,
+                "not-supported",
+                format!(
+                    "'{}' is not a resource type this server supports for FHIR {}. \
+                     Resource type names are case-sensitive; see the CapabilityStatement \
+                     at [base]/metadata for the supported types.",
+                    resource_type, version
+                ),
+            ),
             RestError::InternalError { message } => {
                 // Log the full underlying detail server-side so operators keep it,
                 // but never leak backend/driver/SQL detail (table and column names,
@@ -519,21 +642,50 @@ impl RestError {
             ),
         }
     }
+
+    /// The client-facing `(status, OperationOutcome)` for this error.
+    ///
+    /// **This is the only place a [`RestError`] becomes an OperationOutcome.**
+    /// [`IntoResponse`] renders the pair as an HTTP response body and
+    /// `handlers::batch` renders it as a `Bundle.entry.response.outcome`;
+    /// neither builds its own. That is the point. Before #504 the batch
+    /// handler had a second renderer that hardcoded `"code": "processing"`,
+    /// so the identical failure carried `forbidden` at `GET [base]/Patient/1`
+    /// and `processing` for the same read inside a Bundle entry — and
+    /// [`Self::client_response`]'s promise one doc comment above, that it is
+    /// "shared by `IntoResponse` and the batch/transaction handler so both
+    /// sanitize identically", was not true.
+    ///
+    /// `ValidationFailed` is surfaced verbatim rather than collapsed, because
+    /// it already carries a fully-formed multi-issue outcome from the
+    /// write-path validator — per-issue `code`, `severity` and `expression`.
+    /// The interception has to happen **here** rather than at any call site:
+    /// [`Self::client_response`]'s own `ValidationFailed` arm returns
+    /// `(422, "processing", "Resource validation failed")`, so a caller that
+    /// reached the code table first would re-flatten it. `MultiIssue` is the
+    /// same shape for the request-level `400`: the outcome is the payload.
+    pub(crate) fn client_outcome(&self) -> (StatusCode, serde_json::Value) {
+        if let RestError::ValidationFailed { outcome } = self {
+            return (StatusCode::UNPROCESSABLE_ENTITY, outcome.clone());
+        }
+        if let RestError::BundlePatchFailed { status, outcome } = self {
+            return (*status, outcome.clone());
+        }
+        if let RestError::MultiIssue { outcome } = self {
+            return (StatusCode::BAD_REQUEST, outcome.clone());
+        }
+        let (status, code, details) = self.client_response();
+        (status, create_operation_outcome("error", code, &details))
+    }
 }
 
 impl IntoResponse for RestError {
     fn into_response(self) -> Response {
-        // ValidationFailed carries a fully-formed OperationOutcome (potentially
-        // many issues from the write-path validator); surface it verbatim
-        // rather than collapsing it to the generic single-issue shape.
-        if let RestError::ValidationFailed { outcome } = &self {
-            return (StatusCode::UNPROCESSABLE_ENTITY, Json(outcome.clone())).into_response();
-        }
-        if let RestError::MultiIssue { outcome } = &self {
-            return (StatusCode::BAD_REQUEST, Json(outcome.clone())).into_response();
-        }
-        let (status, code, details) = self.client_response();
-        let operation_outcome = create_operation_outcome("error", code, &details);
+        // Both the HTTP body and a Bundle entry's `response.outcome` are
+        // rendered by `client_outcome`, so the two cannot describe the same
+        // failure differently (#504). It also carries the `ValidationFailed`
+        // pass-through that used to live here.
+        let (status, operation_outcome) = self.client_outcome();
 
         // Unauthorized additionally carries a Bearer challenge in the
         // WWW-Authenticate header.
@@ -592,7 +744,11 @@ impl IntoResponse for RestError {
 /// * `severity` - The issue severity (fatal, error, warning, information)
 /// * `code` - The FHIR issue code
 /// * `details` - Human-readable details
-fn create_operation_outcome(severity: &str, code: &str, details: &str) -> serde_json::Value {
+pub(crate) fn create_operation_outcome(
+    severity: &str,
+    code: &str,
+    details: &str,
+) -> serde_json::Value {
     serde_json::json!({
         "resourceType": "OperationOutcome",
         "issue": [{
@@ -684,7 +840,12 @@ impl From<StorageError> for RestError {
                     | B::MaxErrorsExceeded { .. } => {
                         RestError::UnprocessableEntity { message: msg }
                     }
-                    B::RollbackFailed { .. } => RestError::InternalError { message: msg },
+                    // #1127: a submitted file's body broke mid-stream. That is
+                    // a server-side ingest failure, not a bad submission, so
+                    // it classifies with the other internal failures.
+                    B::RollbackFailed { .. } | B::InputStream { .. } => {
+                        RestError::InternalError { message: msg }
+                    }
                 }
             }
         }
@@ -812,6 +973,29 @@ impl From<ValidationError> for RestError {
             ValidationError::InvalidReference { reference, message } => RestError::BadRequest {
                 message: format!("The reference '{}' is invalid: {}.", reference, message),
             },
+            ValidationError::Patch(e) => e.into(),
+        }
+    }
+}
+
+/// One mapping for both patch endpoints: `PATCH [type]/[id]` applies the patch
+/// in the handler, `PATCH [type]?criteria` inside the storage layer, and both
+/// get their [`PatchError`] from the same applier.
+impl From<PatchError> for RestError {
+    fn from(err: PatchError) -> Self {
+        match err {
+            PatchError::UnsupportedFormat { format } => RestError::NotImplemented {
+                feature: format.to_string(),
+            },
+            // The document is well-formed, but its precondition is false.
+            PatchError::TestFailed { .. } => RestError::UnprocessableEntity {
+                message: err.to_string(),
+            },
+            PatchError::MalformedDocument { .. }
+            | PatchError::OperationFailed { .. }
+            | PatchError::ImmutableElement { .. } => RestError::BadRequest {
+                message: err.to_string(),
+            },
         }
     }
 }
@@ -819,6 +1003,19 @@ impl From<ValidationError> for RestError {
 impl From<SearchError> for RestError {
     fn from(err: SearchError) -> Self {
         match err {
+            // Named after the parameter, like the extractor's own value errors.
+            SearchError::InvalidDateValue { param, reason, .. } => RestError::InvalidParameter {
+                param,
+                message: reason,
+            },
+            SearchError::InvalidNumberValue { param, reason, .. } => RestError::InvalidParameter {
+                param,
+                message: reason,
+            },
+            SearchError::EmptyValue { param } => RestError::InvalidParameter {
+                param,
+                message: helios_persistence::search::EMPTY_VALUE_REASON.to_string(),
+            },
             SearchError::UnsupportedParameterType { .. }
             | SearchError::UnsupportedModifier { .. }
             | SearchError::InvalidComposite { .. }
@@ -829,7 +1026,8 @@ impl From<SearchError> for RestError {
             SearchError::ChainedSearchNotSupported { .. }
             | SearchError::ReverseChainNotSupported
             | SearchError::IncludeNotSupported { .. }
-            | SearchError::TextSearchNotAvailable => RestError::NotImplemented {
+            | SearchError::TextSearchNotAvailable
+            | SearchError::TerminologyRequired { .. } => RestError::NotImplemented {
                 feature: err.to_string(),
             },
             SearchError::TooManyResults { count, max } => RestError::UnprocessableEntity {
@@ -847,6 +1045,12 @@ impl From<TransactionError> for RestError {
             }
             TransactionError::BundleError { index, message } => RestError::BadRequest {
                 message: format!("Bundle entry {}: {}", index, message),
+            },
+            TransactionError::PatchEntry {
+                status, outcome, ..
+            } => RestError::BundlePatchFailed {
+                status: StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                outcome,
             },
             // A transaction that ran out of time is the same condition as a
             // cancelled statement, one level up: the backend is healthy and
@@ -1235,6 +1439,28 @@ mod tests {
         assert_eq!(status_of(err), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
+    #[test]
+    fn test_bulk_submit_input_stream_maps_to_500() {
+        use helios_persistence::error::BulkSubmitError;
+        let err = StorageError::BulkSubmit(BulkSubmitError::InputStream {
+            message: "reading file http://host/p.ndjson?[redacted]: connection reset by peer \
+                      (gave up after 512 bytes and 3 retries)"
+                .to_string(),
+            source: None,
+        });
+        // #1127: the reader's message reaches the response body unprefixed.
+        let rest = RestError::from(err);
+        assert!(
+            rest.to_string().contains("gave up after 512 bytes"),
+            "unexpected message: {rest}"
+        );
+        assert!(!rest.to_string().contains("parse error at line"));
+        assert_eq!(
+            rest.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
     // ── ServiceUnavailable (503) — over-capacity / pool exhaustion ─
 
     #[test]
@@ -1358,6 +1584,11 @@ mod tests {
                 backend_name: "sqlite".to_string(),
                 message: "poisoned mutex".to_string(),
                 source: None,
+            },
+            BackendError::Internal {
+                backend_name: "postgres".to_string(),
+                message: "sensitive detail".to_string(),
+                source: Some(Box::new(std::io::Error::other("sensitive cause"))),
             },
             BackendError::QueryError {
                 message: "relation \"resources\" does not exist".to_string(),

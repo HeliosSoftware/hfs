@@ -34,28 +34,28 @@
         <tr>
           <td>entered-in-error</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>error</td>
         </tr>
         <tr>
           <td>current</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>active</td>
         </tr>
         <tr>
           <td>superseded</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>inactive</td>
         </tr>
         <tr>
           <td>unknown</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>unknown</td>
         </tr>
@@ -63,12 +63,12 @@
     </div>
   </text>
   <url value="http://hl7.org/fhir/ConceptMap/sc-document-reference-status"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-snapshot1"/>
   <name value="DocumentReferenceStatusCanonicalMap"/>
   <title value="Canonical Mapping for &quot;DocumentReferenceStatus&quot;"/>
   <status value="draft"/>
   <experimental value="false"/>
-  <date value="2026-07-17T03:44:13+00:00"/>
+  <date value="2026-09-14T16:43:45+00:00"/>
   <publisher value="HL7 International / Orders and Observations"/>
   <contact>
     <telecom>

@@ -14,9 +14,11 @@ use crate::core::bulk_export::{
 use crate::core::bulk_export_output::{ExportPartKey, FinalizedPart};
 use crate::core::bulk_export_worker::{
     ExportClaimStrategy, ExportJobLease, ExportWorkerStorage, LeaseError, WorkerId, WorkerJobView,
+    abandoned_export_message, export_lease_expiry,
 };
 use crate::error::{BackendError, BulkExportError, StorageError, StorageResult};
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
+use crate::types::StoredResource;
 
 use super::PostgresBackend;
 
@@ -142,7 +144,7 @@ impl BulkExportStorage for PostgresBackend {
 
         let rows = client
             .query(
-                "SELECT status, level, group_id, transaction_time, started_at, completed_at, error_message, current_type
+                "SELECT status, level, group_id, transaction_time, started_at, completed_at, error_message, current_type, types_done, types_total
                  FROM bulk_export_jobs
                  WHERE id = $1 AND tenant_id = $2",
                 &[&job_id.as_str(), &tenant_id],
@@ -165,6 +167,8 @@ impl BulkExportStorage for PostgresBackend {
         let completed_at: Option<chrono::DateTime<Utc>> = row.get(5);
         let error_message: Option<String> = row.get(6);
         let current_type: Option<String> = row.get(7);
+        let types_done: i32 = row.get(8);
+        let types_total: i32 = row.get(9);
 
         let status: ExportStatus = status_str
             .parse()
@@ -215,6 +219,8 @@ impl BulkExportStorage for PostgresBackend {
             completed_at,
             type_progress,
             current_type,
+            types_done: types_done as u32,
+            types_total: types_total as u32,
             error_message,
         })
     }
@@ -584,76 +590,167 @@ impl ExportClaimStrategy for PostgresBackend {
         &self,
         worker_id: &WorkerId,
         lease_duration: StdDuration,
+        max_attempts: u32,
     ) -> StorageResult<Option<ExportJobLease>> {
         let mut client = self.get_client().await?;
         let now = Utc::now();
-        let lease_expiry = now
-            + chrono::Duration::from_std(lease_duration)
-                .unwrap_or_else(|_| chrono::Duration::seconds(60));
+        let lease_expiry = export_lease_expiry(now, lease_duration);
 
         let txn = client
             .transaction()
             .await
             .map_err(|e| internal_error(format!("Failed to begin claim txn: {}", e)))?;
 
-        let rows = txn
-            .query(
-                "SELECT id, tenant_id, fencing_token FROM bulk_export_jobs
-                 WHERE status = 'accepted'
-                    OR (status = 'in-progress' AND (lease_expiry IS NULL OR lease_expiry < $1))
-                 ORDER BY created_at
-                 LIMIT 1
-                 FOR UPDATE SKIP LOCKED",
-                &[&now],
+        // Each turn either claims a job or retires one whose attempts are
+        // spent. Retiring moves the job out of the eligible set — visible to
+        // the next select, which runs in this same transaction — so the scan
+        // makes progress on every turn and a caller is never left empty-handed
+        // while another job is still claimable (#1041).
+        loop {
+            let rows = txn
+                .query(
+                    "SELECT id, tenant_id, status, fencing_token, attempts FROM bulk_export_jobs
+                     WHERE status = 'accepted'
+                        OR (status = 'in-progress' AND (lease_expiry IS NULL OR lease_expiry < $1))
+                     ORDER BY created_at
+                     LIMIT 1
+                     FOR UPDATE SKIP LOCKED",
+                    &[&now],
+                )
+                .await
+                .map_err(|e| internal_error(format!("Failed to select claimable job: {}", e)))?;
+
+            let Some(row) = rows.first() else {
+                txn.commit()
+                    .await
+                    .map_err(|e| internal_error(format!("Failed to commit claim txn: {}", e)))?;
+                return Ok(None);
+            };
+            let job_id: String = row.get(0);
+            let tenant_id: String = row.get(1);
+            let status: String = row.get(2);
+            let fencing_token: i64 = row.get(3);
+            let attempts: i32 = row.get(4);
+            let new_token = fencing_token + 1;
+            let attempt = attempts + 1;
+
+            if i64::from(attempt) > i64::from(max_attempts) {
+                // Every worker that held this job lost its lease before
+                // finishing. Hand it to no one else: fail it terminally so the
+                // status poll ends in an error the client can act on, and so
+                // the job stops occupying one of the tenant's export slots.
+                let attempts_made = u32::try_from(attempts).unwrap_or(u32::MAX);
+                txn.execute(
+                    "UPDATE bulk_export_jobs
+                     SET status = 'error', error_message = $1, completed_at = $2,
+                         current_type = NULL, worker_id = NULL, lease_expiry = NULL
+                     WHERE id = $3",
+                    &[
+                        &abandoned_export_message(attempts_made),
+                        &now,
+                        &job_id.as_str(),
+                    ],
+                )
+                .await
+                .map_err(|e| internal_error(format!("Failed to abandon export job: {}", e)))?;
+                tracing::warn!(
+                    job_id = %job_id,
+                    attempts = attempts_made,
+                    "export job abandoned: its lease expired on every attempt"
+                );
+                // No wipe: the job is terminal, and the output TTL sweep
+                // reclaims its rows and its artifacts together.
+                continue;
+            }
+
+            // A re-claimed job restarts from scratch. The worker resumes
+            // *within* a type from `cursor_state` but always restarts
+            // `part_index` at 0, so keeping the previous attempt's rows would
+            // let the resumed run overwrite parts 0..n of the half-finished
+            // type — silently dropping every resource the dead worker had
+            // already written, with the job still ending `complete` (#1041).
+            // Types that did finish would also be exported twice, inflating
+            // `exported_count`. A job still `accepted` never wrote anything.
+            //
+            // Only the rows go. The artifacts stay: unlinking them would pull
+            // the `.tmp` file out from under a zombie worker, whose
+            // `finalize_part` would then fail its rename with a plain
+            // `StorageError` instead of `LeaseLost` — and that makes the
+            // worker loop emit a spurious `failed` audit event for a job now
+            // running under someone else's lease. The periodic TTL cleanup
+            // drops the job's whole output prefix anyway.
+            //
+            // The DELETEs ride in the claim transaction, so the token bump and
+            // the wipe become visible together.
+            if status == "in-progress" {
+                txn.execute(
+                    "DELETE FROM bulk_export_progress WHERE job_id = $1",
+                    &[&job_id.as_str()],
+                )
+                .await
+                .map_err(|e| {
+                    internal_error(format!("Failed to clear reclaimed progress: {}", e))
+                })?;
+                txn.execute(
+                    "DELETE FROM bulk_export_files WHERE job_id = $1",
+                    &[&job_id.as_str()],
+                )
+                .await
+                .map_err(|e| {
+                    internal_error(format!("Failed to clear reclaimed file rows: {}", e))
+                })?;
+                tracing::info!(
+                    job_id = %job_id,
+                    attempt,
+                    "reclaimed export job: discarding the previous attempt's progress"
+                );
+            }
+
+            txn.execute(
+                "UPDATE bulk_export_jobs
+                 SET status = 'in-progress', worker_id = $1, lease_expiry = $2,
+                     heartbeat_at = $3, fencing_token = $4, attempts = $5,
+                     started_at = COALESCE(started_at, $3)
+                 WHERE id = $6",
+                &[
+                    &worker_id.as_str(),
+                    &lease_expiry,
+                    &now,
+                    &new_token,
+                    &attempt,
+                    &job_id.as_str(),
+                ],
             )
             .await
-            .map_err(|e| internal_error(format!("Failed to select claimable job: {}", e)))?;
+            .map_err(|e| internal_error(format!("Failed to claim export job: {}", e)))?;
 
-        let Some(row) = rows.first() else {
             txn.commit()
                 .await
                 .map_err(|e| internal_error(format!("Failed to commit claim txn: {}", e)))?;
-            return Ok(None);
-        };
-        let job_id: String = row.get(0);
-        let tenant_id: String = row.get(1);
-        let fencing_token: i64 = row.get(2);
-        let new_token = fencing_token + 1;
 
-        txn.execute(
-            "UPDATE bulk_export_jobs
-             SET status = 'in-progress', worker_id = $1, lease_expiry = $2,
-                 heartbeat_at = $3, fencing_token = $4,
-                 started_at = COALESCE(started_at, $3)
-             WHERE id = $5",
-            &[
-                &worker_id.as_str(),
-                &lease_expiry,
-                &now,
-                &new_token,
-                &job_id.as_str(),
-            ],
-        )
-        .await
-        .map_err(|e| internal_error(format!("Failed to claim export job: {}", e)))?;
-
-        txn.commit()
-            .await
-            .map_err(|e| internal_error(format!("Failed to commit claim txn: {}", e)))?;
-
-        Ok(Some(ExportJobLease {
-            job_id: ExportJobId::from_string(job_id),
-            tenant: TenantContext::new(TenantId::new(tenant_id), TenantPermissions::full_access()),
-            worker_id: worker_id.clone(),
-            lease_expiry,
-            fencing_token: new_token as u64,
-        }))
+            return Ok(Some(ExportJobLease {
+                job_id: ExportJobId::from_string(job_id),
+                tenant: TenantContext::new(
+                    TenantId::new(tenant_id),
+                    TenantPermissions::full_access(),
+                ),
+                worker_id: worker_id.clone(),
+                lease_expiry,
+                fencing_token: new_token as u64,
+                lease_duration,
+            }));
+        }
     }
 
     async fn heartbeat(&self, lease: &ExportJobLease) -> Result<DateTime<Utc>, LeaseError> {
         let client = self.get_client().await.map_err(LeaseError::Storage)?;
         let now = Utc::now();
-        let new_expiry = now + chrono::Duration::seconds(60);
+        // Renew by the duration the job was claimed under, not by a constant
+        // this backend picked. A hardcoded 60s here made
+        // `HFS_BULK_EXPORT_LEASE_DURATION` inert: the first heartbeat shrank
+        // every lease back to a minute, so a slow batch still outlived its
+        // lease and the job got reclaimed in a loop (#1152, #1041).
+        let new_expiry = export_lease_expiry(now, lease.lease_duration);
         let affected = client
             .execute(
                 "UPDATE bulk_export_jobs
@@ -860,6 +957,45 @@ impl ExportWorkerStorage for PostgresBackend {
         }
     }
 
+    async fn set_export_current_type(
+        &self,
+        tenant: &TenantContext,
+        job_id: &ExportJobId,
+        worker_id: &WorkerId,
+        fencing_token: u64,
+        current_type: Option<&str>,
+        types_done: u32,
+        types_total: u32,
+    ) -> Result<(), LeaseError> {
+        let client = self.get_client().await.map_err(LeaseError::Storage)?;
+        let affected = client
+            .execute(
+                "UPDATE bulk_export_jobs
+                 SET current_type = $1, types_done = $2, types_total = $3
+                 WHERE id = $4 AND tenant_id = $5 AND worker_id = $6 AND fencing_token = $7",
+                &[
+                    &current_type,
+                    &(types_done as i32),
+                    &(types_total as i32),
+                    &job_id.as_str(),
+                    &tenant.tenant_id().as_str(),
+                    &worker_id.as_str(),
+                    &(fencing_token as i64),
+                ],
+            )
+            .await
+            .map_err(|e| {
+                LeaseError::Storage(internal_error(format!("set_export_current_type: {e}")))
+            })?;
+        if affected == 0 {
+            Err(LeaseError::LeaseLost {
+                job_id: job_id.clone(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
     async fn record_export_file(
         &self,
         tenant: &TenantContext,
@@ -923,7 +1059,7 @@ impl ExportWorkerStorage for PostgresBackend {
         let affected = client
             .execute(
                 "UPDATE bulk_export_jobs
-                 SET status = 'complete', completed_at = $1
+                 SET status = 'complete', completed_at = $1, current_type = NULL
                  WHERE id = $2 AND tenant_id = $3 AND worker_id = $4 AND fencing_token = $5",
                 &[
                     &now,
@@ -957,7 +1093,7 @@ impl ExportWorkerStorage for PostgresBackend {
         let affected = client
             .execute(
                 "UPDATE bulk_export_jobs
-                 SET status = 'error', error_message = $1, completed_at = $2
+                 SET status = 'error', error_message = $1, completed_at = $2, current_type = NULL
                  WHERE id = $3 AND tenant_id = $4 AND worker_id = $5 AND fencing_token = $6",
                 &[
                     &error_message,
@@ -1068,7 +1204,7 @@ impl ExportDataProvider for PostgresBackend {
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
 
-        let mut sql = "SELECT id, data, last_updated FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE".to_string();
+        let mut sql = "SELECT id, data, last_updated, version_id FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE".to_string();
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
             Box::new(tenant_id.to_string()),
             Box::new(resource_type.to_string()),
@@ -1119,6 +1255,9 @@ impl ExportDataProvider for PostgresBackend {
             let id: String = row.get(0);
             let resource: Value = row.get(1);
             let last_updated: chrono::DateTime<Utc> = row.get(2);
+            let version_id: String = row.get(3);
+            // The blob carries no server meta; merge it from the row (#1273).
+            let resource = StoredResource::merge_meta(resource, &version_id, last_updated);
 
             let line = serde_json::to_string(&resource)
                 .map_err(|e| internal_error(format!("Failed to serialize resource: {}", e)))?;
@@ -1210,7 +1349,7 @@ impl PatientExportProvider for PostgresBackend {
 
         if resource_type == "Patient" {
             // For Patient resources, just filter by the IDs using ANY($3::text[])
-            let mut sql = "SELECT id, data, last_updated FROM resources
+            let mut sql = "SELECT id, data, last_updated, version_id FROM resources
                  WHERE tenant_id = $1 AND resource_type = $2 AND id = ANY($3::text[]) AND is_deleted = FALSE".to_string();
 
             let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
@@ -1267,6 +1406,9 @@ impl PatientExportProvider for PostgresBackend {
                 let id: String = row.get(0);
                 let resource: Value = row.get(1);
                 let last_updated: chrono::DateTime<Utc> = row.get(2);
+                let version_id: String = row.get(3);
+                // The blob carries no server meta; merge it from the row (#1273).
+                let resource = StoredResource::merge_meta(resource, &version_id, last_updated);
 
                 let line = serde_json::to_string(&resource)
                     .map_err(|e| internal_error(format!("Failed to serialize: {}", e)))?;
@@ -1292,7 +1434,7 @@ impl PatientExportProvider for PostgresBackend {
             .map(|id| format!("Patient/{}", id))
             .collect();
 
-        let mut sql = "SELECT id, data, last_updated FROM resources
+        let mut sql = "SELECT id, data, last_updated, version_id FROM resources
              WHERE tenant_id = $1
                 AND resource_type = $2
                 AND is_deleted = FALSE
@@ -1351,6 +1493,9 @@ impl PatientExportProvider for PostgresBackend {
             let id: String = row.get(0);
             let resource: Value = row.get(1);
             let last_updated: chrono::DateTime<Utc> = row.get(2);
+            let version_id: String = row.get(3);
+            // The blob carries no server meta; merge it from the row (#1273).
+            let resource = StoredResource::merge_meta(resource, &version_id, last_updated);
 
             let line = serde_json::to_string(&resource)
                 .map_err(|e| internal_error(format!("Failed to serialize: {}", e)))?;
@@ -1385,7 +1530,9 @@ impl GroupExportProvider for PostgresBackend {
             .map_err(|e| internal_error(format!("Failed to fetch group: {}", e)))?;
 
         if rows.is_empty() {
-            return Ok(Vec::new());
+            return Err(StorageError::BulkExport(BulkExportError::GroupNotFound {
+                group_id: group_id.to_string(),
+            }));
         }
 
         let data: Value = rows[0].get(0);

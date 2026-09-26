@@ -6,7 +6,8 @@
 //! explicit `?lang=` override (persisted in the `hfs_lang` cookie by the
 //! language switcher) → cookie → `Accept-Language` (RFC 4647 Lookup) → `en`.
 //!
-//! Catalogs live in `locales/<locale>/main.ftl` at the workspace root and are
+//! Catalogs live in `locales/<locale>/main.ftl` at the workspace root (reached
+//! through this crate's `locales` symlink so `cargo publish` packages them) and are
 //! embedded at compile time — no runtime file or CDN dependency, matching the
 //! asset stance of this crate. `en` is the source locale and the final
 //! fallback: a key missing from a translation renders its English string,
@@ -24,6 +25,22 @@ use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use unic_langid::{LanguageIdentifier, langid};
 
+#[cfg(not(helios_workspace_locales))]
+fluent_templates::static_loader! {
+    static LOCALES = {
+        locales: "locales",
+        fallback_language: "en",
+        // The UI renders whole localized sentences into an LTR document; the
+        // Unicode bidi isolation marks Fluent adds around placeables by
+        // default would only show up as garbage in tests and diffs.
+        customise: |bundle| bundle.set_use_isolating(false),
+    };
+}
+
+// Same loader against the workspace-root catalogs, for checkouts where the
+// `locales` symlink did not materialize as a directory (Windows without
+// `core.symlinks`, #1257). `build.rs` sets the cfg.
+#[cfg(helios_workspace_locales)]
 fluent_templates::static_loader! {
     static LOCALES = {
         locales: "../../locales",
@@ -240,6 +257,34 @@ impl I18n {
             .unwrap_or_else(|| key.to_owned())
     }
 
+    /// Three named placeables — the shape a message needs when one value
+    /// selects the plural form and another carries its localized rendering
+    /// (`{ $errors -> [one] … *[other] { $count } … }`, #1125).
+    ///
+    /// Three `(name, value)` pairs are six parameters by construction, like
+    /// [`Self::t_arg2`] above; they are not an argument list that wants
+    /// grouping into a struct.
+    #[allow(clippy::too_many_arguments)]
+    pub fn t_arg3(
+        &self,
+        key: &str,
+        name1: &str,
+        value1: impl Into<FluentValue<'static>>,
+        name2: &str,
+        value2: impl Into<FluentValue<'static>>,
+        name3: &str,
+        value3: impl Into<FluentValue<'static>>,
+    ) -> String {
+        let args: HashMap<Cow<'static, str>, FluentValue<'static>> = HashMap::from([
+            (Cow::Owned(name1.to_owned()), value1.into()),
+            (Cow::Owned(name2.to_owned()), value2.into()),
+            (Cow::Owned(name3.to_owned()), value3.into()),
+        ]);
+        LOCALES
+            .try_lookup_with_args(self.locale, key, &args)
+            .unwrap_or_else(|| key.to_owned())
+    }
+
     /// Look up a message with an arbitrary, named-at-runtime set of string
     /// placeables — `t_arg`/`t_arg2` above cover the fixed 1- and 2-argument
     /// call sites everywhere else in this crate, but the ViewDefinition lint
@@ -450,6 +495,7 @@ mod tests {
             DiagnosticCode::SelectWithoutOutput,
             DiagnosticCode::FhirPathSyntax,
             DiagnosticCode::UndeclaredConstant,
+            DiagnosticCode::UnknownResourceType,
         ];
         // A stand-in value for every placeable any `vd-lint-*` message might
         // interpolate — `t_args`, not the argument-free `t`, since most of

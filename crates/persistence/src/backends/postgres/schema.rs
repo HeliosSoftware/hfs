@@ -1,19 +1,24 @@
 //! PostgreSQL schema definitions and migrations.
 
+use std::time::Duration;
+
 use deadpool_postgres::GenericClient;
 use serde_json::Value;
 
+use super::search::REFERENCE_TARGET_ID_EXPR;
 use crate::core::bulk_submit_legacy::{
     LegacyFile, LegacyManifest, LegacyPublicationAction, classify_legacy_publications,
 };
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 37;
+pub const SCHEMA_VERSION: i32 = 44;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
 const MIGRATION_LOCK_KEY: i64 = 0x4846_5300_4d49_4752; // "HFS\0MIGR"
+const MIGRATION_LOCK_RETRY_DELAY: Duration = Duration::from_millis(100);
+const POST_MIGRATION_ANALYZE_TIMEOUT: &str = "30s";
 
 /// Initialize the database schema.
 ///
@@ -27,12 +32,12 @@ const MIGRATION_LOCK_KEY: i64 = 0x4846_5300_4d49_4752; // "HFS\0MIGR"
 /// still building.
 ///
 /// The lock is session-scoped, so it is released even if the process is killed
-/// mid-migration.
+/// mid-migration. Lock acquisition uses non-blocking probes with an async pause
+/// between attempts. A deployment-wide `statement_timeout` therefore cannot
+/// abort startup merely because another instance is still migrating, and
+/// cancellation while waiting cannot strand a newly acquired session lock.
 pub async fn initialize_schema(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
-    client
-        .execute("SELECT pg_advisory_lock($1)", &[&MIGRATION_LOCK_KEY])
-        .await
-        .map_err(|e| pg_error(format!("Failed to acquire migration lock: {}", e)))?;
+    acquire_migration_lock(client).await?;
 
     let result = run_migrations(client).await;
 
@@ -45,6 +50,21 @@ pub async fn initialize_schema(client: &mut deadpool_postgres::Client) -> Storag
     }
 
     result
+}
+
+async fn acquire_migration_lock(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    loop {
+        let acquired: bool = client
+            .query_one("SELECT pg_try_advisory_lock($1)", &[&MIGRATION_LOCK_KEY])
+            .await
+            .map_err(|e| pg_error(format!("Failed to acquire migration lock: {e}")))?
+            .get(0);
+        if acquired {
+            return Ok(());
+        }
+
+        tokio::time::sleep(MIGRATION_LOCK_RETRY_DELAY).await;
+    }
 }
 
 async fn run_migrations(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
@@ -369,6 +389,30 @@ async fn migrate_schema(
                 // The helper commits the v37 marker inside its transaction, so
                 // the common loop must not stamp the same version again.
                 migrate_v36_to_v37(client).await?;
+                version += 1;
+                continue;
+            }
+            37 => migrate_v37_to_v38(client).await?,
+            38 => migrate_v38_to_v39(client).await?,
+            39 => migrate_v39_to_v40(client).await?,
+            40 => migrate_v40_to_v41(client).await?,
+            41 => {
+                // The helper writes the v42 marker inside its own transaction,
+                // like v37, so the common loop must not stamp it again.
+                migrate_v41_to_v42(client).await?;
+                version += 1;
+                continue;
+            }
+            42 => {
+                // Same as v42: the helper commits its own marker.
+                migrate_v42_to_v43(client).await?;
+                version += 1;
+                continue;
+            }
+            43 => {
+                // The helper writes the v44 marker inside its own transaction,
+                // like v43, so the common loop must not stamp it again.
+                migrate_v43_to_v44(client).await?;
                 version += 1;
                 continue;
             }
@@ -3623,6 +3667,393 @@ async fn mark_manifest_publication(
     Ok(())
 }
 
+/// v37 -> v38: types_done/types_total on bulk_export_jobs (#961).
+///
+/// The `current_type` column existed since v6 but nothing wrote it, so a
+/// status poll could never name the resource type an export was currently
+/// writing. `types_done`/`types_total` accompany it so the poll can also show
+/// how far through the type list the worker is — both are `0` on a job the
+/// worker has not yet started.
+async fn migrate_v37_to_v38(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    let stmts = [
+        "ALTER TABLE bulk_export_jobs ADD COLUMN IF NOT EXISTS types_done INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE bulk_export_jobs ADD COLUMN IF NOT EXISTS types_total INTEGER NOT NULL DEFAULT 0",
+    ];
+
+    for sql in stmts {
+        client
+            .execute(sql, &[])
+            .await
+            .map_err(|e| pg_error(format!("Migration v37->v38 failed: {}", e)))?;
+    }
+
+    Ok(())
+}
+
+/// v38 -> v39: bulk-submit progress that a re-walk cannot inflate (#1127).
+///
+/// `bulk_manifest_file_progress` keeps, per input file of a manifest, the
+/// highest line whose entry has already been charged to the manifest's
+/// counters. A worker that re-reads a file — after a lost lease, a reclaim or
+/// a whole-file retry — re-ingests those lines but no longer adds them to
+/// `total_entries` a second time, so the counters describe the manifest
+/// rather than the sum over passes, and they still never move backwards
+/// (#969). `skipped_entries` gives the submission summary a skip count without
+/// scanning `bulk_entry_results`.
+async fn migrate_v38_to_v39(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    let stmts = [
+        "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS skipped_entries INTEGER NOT NULL DEFAULT 0",
+        "CREATE TABLE IF NOT EXISTS bulk_manifest_file_progress (
+            tenant_id TEXT NOT NULL,
+            submitter TEXT NOT NULL,
+            submission_id TEXT NOT NULL,
+            manifest_id TEXT NOT NULL,
+            file_url TEXT NOT NULL,
+            max_line BIGINT NOT NULL DEFAULT 0,
+            total_entries BIGINT NOT NULL DEFAULT 0,
+            processed_entries BIGINT NOT NULL DEFAULT 0,
+            failed_entries BIGINT NOT NULL DEFAULT 0,
+            skipped_entries BIGINT NOT NULL DEFAULT 0,
+            PRIMARY KEY (tenant_id, submitter, submission_id, manifest_id, file_url),
+            FOREIGN KEY (tenant_id, submitter, submission_id, manifest_id)
+                REFERENCES bulk_manifests(tenant_id, submitter, submission_id, manifest_id)
+                ON DELETE CASCADE
+        )",
+    ];
+
+    for sql in stmts {
+        client
+            .execute(sql, &[])
+            .await
+            .map_err(|e| pg_error(format!("Migration v38->v39 failed: {}", e)))?;
+    }
+
+    Ok(())
+}
+
+/// v39 -> v40: `attempts` on `bulk_export_jobs` (#1041).
+///
+/// Counts how many times the job has been claimed by a worker. A job whose
+/// lease expires mid-run is reclaimable, so without a count of past claims a
+/// job that keeps dying the same way is handed to worker after worker forever,
+/// never reaching a terminal state and never giving its tenant's concurrency
+/// slot back. `claim_next` bumps the column on every claim and retires the job
+/// once the count would exceed the configured cap.
+async fn migrate_v39_to_v40(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .execute(
+            "ALTER TABLE bulk_export_jobs ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Migration v39->v40 failed: {}", e)))?;
+
+    Ok(())
+}
+
+/// v40 -> v41: `secondary_sync_failures` (#1334).
+///
+/// The durable "needs reindex" ledger for a composite whose secondary refused
+/// a change this primary had already committed. One row per (tenant, resource,
+/// secondary), so a repeat failure folds into the existing row instead of
+/// growing the table; `last_failed_at` orders the repair queue.
+async fn migrate_v40_to_v41(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS secondary_sync_failures (
+                tenant_id TEXT NOT NULL,
+                resource_type TEXT NOT NULL,
+                resource_id TEXT NOT NULL,
+                backend_id TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                first_failed_at TIMESTAMPTZ NOT NULL,
+                last_failed_at TIMESTAMPTZ NOT NULL,
+                last_error TEXT NOT NULL,
+                attempts BIGINT NOT NULL DEFAULT 0,
+                PRIMARY KEY (tenant_id, resource_type, resource_id, backend_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_secondary_sync_failures_queue
+                ON secondary_sync_failures (last_failed_at);",
+        )
+        .await
+        .map_err(|e| pg_error(format!("Migration v40->v41 failed: {}", e)))?;
+
+    Ok(())
+}
+
+/// v41 -> v42: indexable bare-id reference lookup (#1414).
+///
+/// A bare logical id (`Observation?patient=<id>`) matched as
+/// `value_reference = $n OR value_reference LIKE '%/<id>'`. The leading-wildcard
+/// LIKE is not sargable in any operator class and poisons the OR, so the
+/// planner scans the whole `(tenant_id, resource_type, param_name)` slice.
+/// Storing the match differently needs no new column and no backfill: the
+/// target id is already in every row as the last `/`-delimited segment of
+/// `value_reference` (the version-agnostic base since v33), so an expression
+/// index on [`REFERENCE_TARGET_ID_EXPR`] turns the bare-id predicate into one
+/// equality seek while `Type/id` keeps using `idx_search_reference_pattern`.
+///
+/// ## Lock / cost / recovery
+///
+/// Plain (non-concurrent) `CREATE INDEX` runs inside the migration transaction.
+/// It takes a `SHARE` lock on `search_index`, which permits reads but blocks
+/// inserts, updates, and deletes until the build commits. The advisory lock
+/// serializes schema migration across HFS instances; it does not stop other
+/// instances from writing application data. Operators must therefore budget a
+/// write pause for the build.
+///
+/// Build time and temporary and durable disk use scale with the number of
+/// reference rows. The partial predicate keeps non-reference rows out of the
+/// btree, and no column or backfill is needed. After migration, inserts of
+/// reference rows add one btree entry. Updates and reindexing, which delete and
+/// insert search rows, also maintain the index. `CONCURRENTLY` is unusable here
+/// because it cannot run in this transaction. A mid-build death can also leave
+/// an invalid index that a later `IF NOT EXISTS` would skip; see the v15 and v19
+/// notes.
+///
+/// The v42 marker is written in the same transaction as the index. A failure
+/// before commit rolls both changes back, so the next startup retries the whole
+/// migration. A failure in the best-effort `ANALYZE` below only warns and does
+/// not revert v42.
+///
+/// `SET LOCAL statement_timeout = 0` guards the migration transaction against a
+/// deployment-wide statement timeout that would otherwise kill a minutes-long
+/// index build on a production-sized `search_index`. The post-commit `ANALYZE`
+/// has a separate bounded timeout because startup must not wait on it forever.
+async fn migrate_v41_to_v42(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|e| pg_error(format!("begin v42 migration: {e}")))?;
+    tx.execute("SET LOCAL statement_timeout = 0", &[])
+        .await
+        .map_err(|e| pg_error(format!("disable statement timeout for v42 migration: {e}")))?;
+    let create_index = format!(
+        "CREATE INDEX idx_search_reference_target_id \
+         ON search_index (tenant_id, resource_type, param_name, ({expr})) \
+         WHERE value_reference IS NOT NULL",
+        expr = REFERENCE_TARGET_ID_EXPR,
+    );
+    tx.execute(create_index.as_str(), &[])
+        .await
+        .map_err(|e| pg_error(format!("Migration v41->v42 failed: {e}")))?;
+    set_schema_version(&tx, 42).await?;
+    tx.commit()
+        .await
+        .map_err(|e| pg_error(format!("commit v42 migration: {e}")))?;
+
+    // Best-effort statistics so the planner prices the new index from the
+    // start. A separate transaction: v42 is already committed, and an ANALYZE
+    // failure must not revert it.
+    if let Err(e) = analyze_search_index_with_timeout(client, POST_MIGRATION_ANALYZE_TIMEOUT).await
+    {
+        tracing::warn!(
+            "Migration v41->v42: optional ANALYZE failed ({e}); plans may use default estimates until autovacuum runs"
+        );
+    }
+
+    Ok(())
+}
+
+/// The instant `value_date_end` stores for an open-ended `Period` and clamps
+/// every other end to: [`open_end`](crate::search::open_end) at microsecond
+/// resolution, the last instant the shared date layer supports.
+const OPEN_END_SQL: &str = "TIMESTAMPTZ '9999-12-31 23:59:59.999999+00'";
+
+/// v42 -> v43: store every date as a range `[value_date, value_date_end)`
+/// (#1391).
+///
+/// A `Period` used to be indexed as two unrelated rows, one per bound, and each
+/// search prefix was decided per row: `date=2020` matched a period that only
+/// started or ended in 2020, `sa2020` matched on the end alone, and an
+/// open-ended period was a single instant. The writer now stores one row per
+/// date value carrying both bounds — a point covers one unit of its own
+/// precision, a `Period` runs to the end of its `end`, and an open end is
+/// stored as the supported limit ([`OPEN_END_SQL`], or year 1 for a missing
+/// start) rather than `NULL`, so `NULL` keeps meaning "no row".
+///
+/// ## Backfill
+///
+/// Every existing date row gets the end of its own precision, computed in UTC
+/// so the session `TimeZone` cannot move a month or day boundary. That is
+/// exact for every point value. It is **not** a repair of `Period`s: those rows
+/// were written as two points and stay two points until the resource is
+/// re-extracted — run `$reindex` after upgrading to index them as ranges. A
+/// fraction-of-a-second value was recorded as `millisecond` whatever its
+/// length, so its backfilled end is one millisecond on. Rows without a
+/// precision (composite components, which are compared as points on
+/// `value_date` alone) get one microsecond.
+///
+/// ## Indexes
+///
+/// - `idx_search_date` and `idx_search_date_recent` carry `value_date_end` in
+///   their payload, so the end filter of `eq`/`eb`/`ne` stays index-only on the
+///   value-first seek and on the fast path's recent-first scan.
+/// - `idx_search_date_end` is new, keyed on the end: `gt` is `value_date_end >
+///   x` with no bound on the start, and without it a sparse or empty `gt` (the
+///   benchmark's `date=gt2070-01-01`) would walk the whole parameter slice
+///   instead of seeking — see `open_range_needs_empty_guard` in `search_impl.rs`
+///   for why that matters. It is partial on `value_date_end IS NOT NULL`, not
+///   on `value_date`: the emitted `gt` predicate is `value_date_end > $n` and
+///   nothing else, which implies the former and not the latter, and PostgreSQL
+///   only uses a partial index whose predicate the query implies. Keyed on
+///   `value_date`, the index was never chosen (`idx_scan = 0`) and `gt` fell
+///   back to a sequential scan of the whole table (measured: 600k date rows,
+///   sparse `gt`, 40 ms -> 0.1 ms with the fix).
+/// - A multivariate statistic on the end mirrors v16's on `value_date`.
+///
+/// ## Lock / cost / recovery
+///
+/// As v42: one transaction with `statement_timeout = 0`, the marker written
+/// inside it, so a failure rolls everything back and the next startup retries.
+/// The `UPDATE` rewrites every date row, and the three index builds take a
+/// `SHARE` lock that blocks writes; budget a write pause proportional to the
+/// number of date rows. The best-effort `ANALYZE` runs after commit.
+async fn migrate_v42_to_v43(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|e| pg_error(format!("begin v43 migration: {e}")))?;
+    tx.execute("SET LOCAL statement_timeout = 0", &[])
+        .await
+        .map_err(|e| pg_error(format!("disable statement timeout for v43 migration: {e}")))?;
+
+    let utc_plus = |interval: &str| {
+        format!("(value_date AT TIME ZONE 'UTC' + INTERVAL '{interval}') AT TIME ZONE 'UTC'")
+    };
+    let backfill = format!(
+        "UPDATE search_index SET value_date_end = LEAST(
+             CASE value_date_precision
+                 WHEN 'year' THEN {year}
+                 WHEN 'month' THEN {month}
+                 WHEN 'day' THEN {day}
+                 WHEN 'hour' THEN {hour}
+                 WHEN 'minute' THEN {minute}
+                 WHEN 'second' THEN {second}
+                 WHEN 'millisecond' THEN {millisecond}
+                 ELSE value_date + INTERVAL '1 microsecond'
+             END,
+             {open_end})
+         WHERE value_date IS NOT NULL AND value_date_end IS NULL",
+        year = utc_plus("1 year"),
+        month = utc_plus("1 month"),
+        day = utc_plus("1 day"),
+        hour = utc_plus("1 hour"),
+        minute = utc_plus("1 minute"),
+        second = utc_plus("1 second"),
+        millisecond = utc_plus("1 millisecond"),
+        open_end = OPEN_END_SQL,
+    );
+    let statements = [
+        "ALTER TABLE search_index ADD COLUMN IF NOT EXISTS value_date_end TIMESTAMPTZ".to_string(),
+        backfill,
+        "DROP INDEX IF EXISTS idx_search_date".to_string(),
+        "CREATE INDEX idx_search_date
+         ON search_index (tenant_id, resource_type, param_name, value_date)
+         INCLUDE (resource_id, last_updated, value_date_end)
+         WHERE value_date IS NOT NULL"
+            .to_string(),
+        "DROP INDEX IF EXISTS idx_search_date_recent".to_string(),
+        "CREATE INDEX idx_search_date_recent
+         ON search_index (tenant_id, resource_type, param_name, last_updated DESC, resource_id ASC)
+         INCLUDE (value_date, value_date_end)
+         WHERE value_date IS NOT NULL"
+            .to_string(),
+        "DROP INDEX IF EXISTS idx_search_date_end".to_string(),
+        "CREATE INDEX idx_search_date_end
+         ON search_index (tenant_id, resource_type, param_name, value_date_end)
+         INCLUDE (resource_id, last_updated)
+         WHERE value_date_end IS NOT NULL"
+            .to_string(),
+        "CREATE STATISTICS IF NOT EXISTS stx_search_type_param_date_end (mcv, dependencies)
+         ON resource_type, param_name, value_date_end FROM search_index"
+            .to_string(),
+    ];
+    for sql in &statements {
+        tx.execute(sql.as_str(), &[])
+            .await
+            .map_err(|e| pg_error(format!("Migration v42->v43 failed: {e}")))?;
+    }
+    set_schema_version(&tx, 43).await?;
+    tx.commit()
+        .await
+        .map_err(|e| pg_error(format!("commit v43 migration: {e}")))?;
+
+    if let Err(e) = analyze_search_index_with_timeout(client, POST_MIGRATION_ANALYZE_TIMEOUT).await
+    {
+        tracing::warn!(
+            "Migration v42->v43: optional ANALYZE failed ({e}); plans may use default estimates until autovacuum runs"
+        );
+    }
+
+    Ok(())
+}
+
+/// Best-effort `ANALYZE search_index` after a migration's index build.
+async fn analyze_search_index_with_timeout(
+    client: &mut deadpool_postgres::Client,
+    timeout: &str,
+) -> StorageResult<()> {
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|e| pg_error(format!("begin post-migration analyze: {e}")))?;
+    tx.query_one(
+        "SELECT set_config('statement_timeout', $1, true)",
+        &[&timeout],
+    )
+    .await
+    .map_err(|e| pg_error(format!("set timeout for post-migration analyze: {e}")))?;
+    tx.execute("ANALYZE search_index", &[])
+        .await
+        .map_err(|e| pg_error(format!("analyze search_index after migration: {e}")))?;
+    tx.commit()
+        .await
+        .map_err(|e| pg_error(format!("commit post-migration analyze: {e}")))
+}
+
+/// v43 -> v44: add `login_sessions`, the web UI's interactive login sessions
+/// and the logins still pending at the identity provider (#1481). One JSONB
+/// document per opaque id with a monotonic `version` for conditional writes,
+/// so a session established on one node resolves on every other and outlives
+/// a restart. `kind` keeps sessions and pending logins apart; `expires_at`
+/// drives the sweep. Independent of the FHIR `resources` table, like
+/// `user_settings`.
+///
+/// Runs in its own transaction with `SET LOCAL statement_timeout = 0` and
+/// writes the v44 marker inside it, like v43: a deployment-wide statement
+/// timeout must not be able to cut a migration's DDL short, the setting
+/// reverts at commit, and a failure rolls the table and the marker back
+/// together so the next startup retries the whole step.
+async fn migrate_v43_to_v44(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|e| pg_error(format!("begin v44 migration: {e}")))?;
+    tx.execute("SET LOCAL statement_timeout = 0", &[])
+        .await
+        .map_err(|e| pg_error(format!("disable statement timeout for v44 migration: {e}")))?;
+    tx.batch_execute(
+        "CREATE TABLE IF NOT EXISTS login_sessions (
+            id         TEXT PRIMARY KEY,
+            kind       TEXT NOT NULL,
+            data       JSONB NOT NULL,
+            version    BIGINT NOT NULL DEFAULT 1,
+            expires_at TIMESTAMPTZ NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_login_sessions_expires
+            ON login_sessions (expires_at);",
+    )
+    .await
+    .map_err(|e| pg_error(format!("Migration v43->v44 failed: {e}")))?;
+    set_schema_version(&tx, 44).await?;
+    tx.commit()
+        .await
+        .map_err(|e| pg_error(format!("commit v44 migration: {e}")))?;
+    Ok(())
+}
+
 /// v23 -> v24: drop `fk_search_resource`.
 ///
 /// `search_index` carried a composite FK to `resources` with `ON DELETE
@@ -4237,8 +4668,16 @@ fn pg_error(message: String) -> crate::error::StorageError {
     })
 }
 
+/// Process-exit removal of the shared PostgreSQL testcontainer below. Declared
+/// at file level: a `#[path]` inside an inline module resolves through a
+/// virtual `schema/<module>/` directory that does not exist, which Linux
+/// rejects while Windows normalises it away.
 #[cfg(test)]
-mod postgres_integration_v37_migration {
+#[path = "../../../tests/common/container_cleanup.rs"]
+pub(super) mod container_cleanup;
+
+#[cfg(test)]
+mod postgres_integration_migrations {
     use super::*;
     use chrono::Utc;
     use testcontainers::ImageExt;
@@ -4257,7 +4696,8 @@ mod postgres_integration_v37_migration {
     struct SharedPg {
         host: String,
         port: u16,
-        /// Kept alive for the test binary; CI cleanup uses the run label.
+        /// Kept alive for the test binary; the `container_cleanup` exit hook
+        /// removes it at process exit.
         _container: testcontainers::ContainerAsync<Postgres>,
     }
 
@@ -4268,12 +4708,16 @@ mod postgres_integration_v37_migration {
         SHARED_PG
             .get_or_init(|| async {
                 let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
-                let container = Postgres::default()
-                    .with_tag("16-alpine")
-                    .with_label("github.run_id", &run_id)
-                    .start()
-                    .await
-                    .expect("start PostgreSQL container");
+                // `SHARED_PG` is a static and never dropped; the cleanup label
+                // lets the exit hook remove the container.
+                let container = super::container_cleanup::with_cleanup_label(
+                    Postgres::default()
+                        .with_tag("16-alpine")
+                        .with_label("github.run_id", &run_id),
+                )
+                .start()
+                .await
+                .expect("start PostgreSQL container");
                 let host = container
                     .get_host()
                     .await
@@ -4320,6 +4764,109 @@ mod postgres_integration_v37_migration {
         })
         .await
         .expect("connect migration test backend")
+    }
+
+    async fn create_v41_database(pg: &SharedPg, name: &str) -> PostgresBackend {
+        let backend = create_database(pg, name).await;
+        let mut client = backend.get_client().await.unwrap();
+        initialize_schema(&mut client)
+            .await
+            .expect("initialize current schema fixture");
+        client
+            .execute("DROP INDEX idx_search_reference_target_id", &[])
+            .await
+            .expect("remove the v42 index from the fixture");
+        set_schema_version(&client, 41)
+            .await
+            .expect("mark fixture as v41");
+        assert_eq!(get_schema_version(&client).await.unwrap(), 41);
+        backend
+    }
+
+    /// A database at v42: the current schema with v43's column, indexes and
+    /// statistic taken back out and the two date indexes in their v42 form.
+    async fn create_v42_database(pg: &SharedPg, name: &str) -> PostgresBackend {
+        let backend = create_database(pg, name).await;
+        let mut client = backend.get_client().await.unwrap();
+        initialize_schema(&mut client)
+            .await
+            .expect("initialize current schema fixture");
+        client
+            .batch_execute(
+                "DROP STATISTICS stx_search_type_param_date_end;
+                 DROP INDEX idx_search_date_end;
+                 DROP INDEX idx_search_date;
+                 DROP INDEX idx_search_date_recent;
+                 ALTER TABLE search_index DROP COLUMN value_date_end;
+                 CREATE INDEX idx_search_date
+                 ON search_index (tenant_id, resource_type, param_name, value_date)
+                 INCLUDE (resource_id, last_updated)
+                 WHERE value_date IS NOT NULL;
+                 CREATE INDEX idx_search_date_recent
+                 ON search_index (tenant_id, resource_type, param_name, last_updated DESC, resource_id ASC)
+                 INCLUDE (value_date)
+                 WHERE value_date IS NOT NULL;",
+            )
+            .await
+            .expect("take v43 back out of the fixture");
+        set_schema_version(&client, 42)
+            .await
+            .expect("mark fixture as v42");
+        backend
+    }
+
+    async fn index_definition(client: &deadpool_postgres::Client, name: &str) -> Option<String> {
+        client
+            .query_opt(
+                "SELECT indexdef FROM pg_indexes
+                 WHERE schemaname = current_schema() AND indexname = $1",
+                &[&name],
+            )
+            .await
+            .expect("read index definition")
+            .map(|row| row.get(0))
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct ReferenceTargetIndex {
+        oid: i64,
+        valid: bool,
+        expression: String,
+        predicate: String,
+    }
+
+    async fn reference_target_index(
+        client: &deadpool_postgres::Client,
+    ) -> Option<ReferenceTargetIndex> {
+        client
+            .query_opt(
+                "SELECT i.indexrelid::oid::bigint,
+                        i.indisvalid,
+                        pg_get_expr(i.indexprs, i.indrelid, true),
+                        pg_get_expr(i.indpred, i.indrelid, true)
+                 FROM pg_index i
+                 JOIN pg_class c ON c.oid = i.indexrelid
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = current_schema()
+                   AND c.relname = 'idx_search_reference_target_id'",
+                &[],
+            )
+            .await
+            .expect("inspect reference target index")
+            .map(|row| ReferenceTargetIndex {
+                oid: row.get(0),
+                valid: row.get(1),
+                expression: row.get(2),
+                predicate: row.get(3),
+            })
+    }
+
+    async fn statement_timeout(client: &deadpool_postgres::Client) -> String {
+        client
+            .query_one("SELECT current_setting('statement_timeout')", &[])
+            .await
+            .expect("read statement_timeout")
+            .get(0)
     }
 
     async fn migrate_through_v36(client: &deadpool_postgres::Client) -> StorageResult<()> {
@@ -4822,7 +5369,9 @@ mod postgres_integration_v37_migration {
             .get(0);
         assert_eq!(malformed, "{broken");
 
-        assert_eq!(get_schema_version(&client).await.unwrap(), 37);
+        // `initialize_schema` runs every migration after v37 as well, so the
+        // database lands on the current version, not on v37 itself.
+        assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
         assert_eq!(index_count(&client).await, 2);
         assert_eq!(
             column_type(&client, "bulk_manifests", "published_token").await,
@@ -4847,6 +5396,15 @@ mod postgres_integration_v37_migration {
         assert_eq!(
             column_type(&client, "bulk_submit_files", "publication_excluded_reason").await,
             Some("text".to_string())
+        );
+        // v39 (#1127): re-walk-proof per-file progress and a skip counter.
+        assert_eq!(
+            column_type(&client, "bulk_manifests", "skipped_entries").await,
+            Some("integer".to_string())
+        );
+        assert_eq!(
+            column_type(&client, "bulk_manifest_file_progress", "max_line").await,
+            Some("bigint".to_string())
         );
         assert_eq!(
             classification(&client, completed).await,
@@ -5035,7 +5593,7 @@ mod postgres_integration_v37_migration {
         initialize_schema(&mut migration_client)
             .await
             .expect("retry v37");
-        assert_eq!(get_schema_version(&client).await.unwrap(), 37);
+        assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
         assert_eq!(
             classification(&client, output).await,
             (Some("manifest-rollback".to_string()), None)
@@ -5142,5 +5700,556 @@ mod postgres_integration_v37_migration {
         );
         assert_eq!(classification(&client, output).await, first_classification);
         assert_eq!(index_count(&client).await, 2);
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_v41_to_v42_builds_valid_idempotent_index() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let pg = shared_pg().await;
+        let backend = create_v41_database(
+            pg,
+            &format!("hfs_v42_test_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+        let mut client = backend.get_client().await.unwrap();
+
+        let server_version: i32 = client
+            .query_one("SHOW server_version_num", &[])
+            .await
+            .expect("read PostgreSQL version")
+            .get::<_, String>(0)
+            .parse()
+            .expect("numeric PostgreSQL version");
+        assert!(
+            (160_000..170_000).contains(&server_version),
+            "migration tests require PostgreSQL 16, got {server_version}"
+        );
+        client
+            .execute(
+                "INSERT INTO search_index
+                 (tenant_id, resource_type, resource_id, param_name, value_reference)
+                 VALUES ('tenant-a', 'Observation', 'preexisting-observation',
+                         'subject', 'Patient/preexisting-id')",
+                &[],
+            )
+            .await
+            .expect("seed a pre-v42 reference row");
+        client
+            .batch_execute(
+                "SET statement_timeout = '50ms';
+                 CREATE FUNCTION delay_v42_create_index() RETURNS event_trigger
+                 LANGUAGE plpgsql AS $$
+                 BEGIN
+                     PERFORM pg_sleep(0.2);
+                 END
+                 $$;
+                 CREATE EVENT TRIGGER delay_v42_create_index
+                 ON ddl_command_start WHEN TAG IN ('CREATE INDEX')
+                 EXECUTE FUNCTION delay_v42_create_index();",
+            )
+            .await
+            .expect("install delayed v42 CREATE INDEX injection");
+        assert_eq!(statement_timeout(&client).await, "50ms");
+
+        let migration_started = tokio::time::Instant::now();
+        initialize_schema(&mut client)
+            .await
+            .expect("migrate v41 to v42");
+        let migration_elapsed = migration_started.elapsed();
+        assert!(
+            migration_elapsed >= Duration::from_millis(150),
+            "CREATE INDEX injection did not outlast the session timeout: {migration_elapsed:?}"
+        );
+        client
+            .batch_execute(
+                "DROP EVENT TRIGGER delay_v42_create_index;
+                 DROP FUNCTION delay_v42_create_index();",
+            )
+            .await
+            .expect("remove delayed v42 CREATE INDEX injection");
+        assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
+        assert_eq!(statement_timeout(&client).await, "50ms");
+        let preexisting_matches: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM search_index
+                 WHERE tenant_id = 'tenant-a'
+                   AND resource_type = 'Observation'
+                   AND param_name = 'subject'
+                   AND split_part(value_reference, '/', -1) = 'preexisting-id'",
+                &[],
+            )
+            .await
+            .expect("find the preexisting row through the indexed expression")
+            .get(0);
+        assert_eq!(preexisting_matches, 1);
+
+        let first = reference_target_index(&client)
+            .await
+            .expect("v42 index must exist");
+        assert!(first.valid, "v42 index must be valid: {first:?}");
+        assert!(
+            first.expression.contains("split_part(value_reference")
+                && first.expression.contains("'/'::text")
+                && first.expression.contains("-1"),
+            "unexpected v42 index expression: {}",
+            first.expression
+        );
+        assert!(
+            first.predicate.contains("value_reference IS NOT NULL"),
+            "unexpected v42 partial predicate: {}",
+            first.predicate
+        );
+
+        initialize_schema(&mut client)
+            .await
+            .expect("reinitialize current schema");
+        assert_eq!(
+            reference_target_index(&client).await,
+            Some(first),
+            "reinitialization must preserve the same valid index"
+        );
+        assert_eq!(statement_timeout(&client).await, "50ms");
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_v41_to_v42_lock_wait_ignores_statement_timeout() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let pg = shared_pg().await;
+        let backend = create_v41_database(
+            pg,
+            &format!("hfs_v42_test_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+        let lock_holder = backend.get_client().await.unwrap();
+        let mut migration_client = backend.get_client().await.unwrap();
+        lock_holder
+            .execute("SELECT pg_advisory_lock($1)", &[&MIGRATION_LOCK_KEY])
+            .await
+            .expect("hold migration lock");
+        migration_client
+            .execute("SET statement_timeout = '50ms'", &[])
+            .await
+            .expect("set short migration timeout");
+
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            lock_holder
+                .query_one("SELECT pg_advisory_unlock($1)", &[&MIGRATION_LOCK_KEY])
+                .await
+                .expect("release held migration lock")
+                .get::<_, bool>(0)
+        });
+        let migration_started = tokio::time::Instant::now();
+        initialize_schema(&mut migration_client)
+            .await
+            .expect("wait for lock and migrate v41 to v42");
+        let migration_elapsed = migration_started.elapsed();
+        assert!(release.await.expect("join lock release task"));
+
+        assert!(
+            migration_elapsed >= Duration::from_millis(200),
+            "migration did not wait beyond its session timeout: {migration_elapsed:?}"
+        );
+        assert_eq!(statement_timeout(&migration_client).await, "50ms");
+        assert_eq!(
+            get_schema_version(&migration_client).await.unwrap(),
+            SCHEMA_VERSION
+        );
+        assert!(
+            reference_target_index(&migration_client)
+                .await
+                .is_some_and(|index| index.valid),
+            "migration after the lock wait must build a valid index"
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_v41_to_v42_analyze_timeout_is_bounded_and_local() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let pg = shared_pg().await;
+        let backend = create_v41_database(
+            pg,
+            &format!("hfs_v42_test_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+        let mut migration_client = backend.get_client().await.unwrap();
+        initialize_schema(&mut migration_client)
+            .await
+            .expect("migrate fixture to v42");
+        let committed_index = reference_target_index(&migration_client)
+            .await
+            .expect("v42 index must be committed before analyze timeout test");
+        drop(migration_client);
+
+        let mut lock_client = backend.get_client().await.unwrap();
+        let mut analyze_client = backend.get_client().await.unwrap();
+        analyze_client
+            .execute("SET statement_timeout = '900ms'", &[])
+            .await
+            .expect("set analyze session timeout");
+        let lock_tx = lock_client
+            .transaction()
+            .await
+            .expect("begin incompatible lock transaction");
+        lock_tx
+            .execute("LOCK TABLE search_index IN ACCESS EXCLUSIVE MODE", &[])
+            .await
+            .expect("block ANALYZE on search_index");
+
+        let analyze_started = tokio::time::Instant::now();
+        let error = analyze_search_index_with_timeout(&mut analyze_client, "50ms")
+            .await
+            .expect_err("blocked ANALYZE must hit its explicit timeout");
+        let analyze_elapsed = analyze_started.elapsed();
+        assert!(
+            analyze_elapsed >= Duration::from_millis(40),
+            "ANALYZE failed before its configured timeout: {analyze_elapsed:?}"
+        );
+        assert!(
+            analyze_elapsed < Duration::from_secs(2),
+            "ANALYZE timeout did not bound startup delay: {analyze_elapsed:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("analyze search_index after migration"),
+            "unexpected ANALYZE error: {error}"
+        );
+        lock_tx
+            .rollback()
+            .await
+            .expect("release incompatible table lock");
+
+        assert_eq!(statement_timeout(&analyze_client).await, "900ms");
+        assert_eq!(
+            get_schema_version(&analyze_client).await.unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            reference_target_index(&analyze_client).await,
+            Some(committed_index),
+            "a best-effort ANALYZE timeout must not alter the committed v42 index"
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_v41_to_v42_rolls_back_index_failure_and_retries() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let pg = shared_pg().await;
+        let backend = create_v41_database(
+            pg,
+            &format!("hfs_v42_test_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+        let mut client = backend.get_client().await.unwrap();
+        client
+            .batch_execute(
+                "SET statement_timeout = '900ms';
+                 CREATE FUNCTION fail_v42_create_index() RETURNS event_trigger
+                 LANGUAGE plpgsql AS $$
+                 BEGIN
+                     RAISE EXCEPTION 'injected v42 CREATE INDEX failure';
+                 END
+                 $$;
+                 CREATE EVENT TRIGGER fail_v42_create_index
+                 ON ddl_command_start WHEN TAG IN ('CREATE INDEX')
+                 EXECUTE FUNCTION fail_v42_create_index();",
+            )
+            .await
+            .expect("install v42 CREATE INDEX failure injection");
+
+        let error = initialize_schema(&mut client)
+            .await
+            .expect_err("injected CREATE INDEX failure must abort v42");
+        assert!(
+            error.to_string().contains("Migration v41->v42 failed"),
+            "unexpected migration error: {error}"
+        );
+        assert_eq!(get_schema_version(&client).await.unwrap(), 41);
+        assert!(
+            reference_target_index(&client).await.is_none(),
+            "a failed transactional build must leave no valid index"
+        );
+        assert_eq!(
+            statement_timeout(&client).await,
+            "900ms",
+            "rollback must restore the session timeout"
+        );
+
+        client
+            .batch_execute(
+                "DROP EVENT TRIGGER fail_v42_create_index;
+                 DROP FUNCTION fail_v42_create_index();",
+            )
+            .await
+            .expect("remove v42 CREATE INDEX failure injection");
+        initialize_schema(&mut client)
+            .await
+            .expect("retry v41 to v42");
+        assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
+        assert!(
+            reference_target_index(&client)
+                .await
+                .is_some_and(|index| index.valid),
+            "the retry must build a valid index"
+        );
+        assert_eq!(statement_timeout(&client).await, "900ms");
+    }
+
+    /// #1391: a sparse `gt` on a date parameter seeks on `idx_search_date_end`.
+    /// The predicate is the one the query builder really emits (`value_date_end
+    /// > $n`, nothing on `value_date`), so this fails if the index's own
+    /// predicate stops being implied by it — PostgreSQL then ignores the index
+    /// and scans the whole table.
+    #[tokio::test]
+    async fn postgres_integration_sparse_gt_seeks_on_the_end_index() {
+        use crate::backends::postgres::search::query_builder::{SqlParam, date_range_predicate};
+        use crate::types::SearchPrefix;
+
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let pg = shared_pg().await;
+        let backend = create_database(
+            pg,
+            &format!("hfs_gt_index_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+        let mut client = backend.get_client().await.unwrap();
+        initialize_schema(&mut client)
+            .await
+            .expect("create the current schema");
+
+        // Enough rows, over several parameters, for the planner to prefer a
+        // seek over a scan for a predicate that matches almost nothing.
+        client
+            .batch_execute(
+                "INSERT INTO search_index
+                   (tenant_id, resource_type, resource_id, param_name, value_date,
+                    value_date_precision, value_date_end, last_updated)
+                 SELECT 'tenant-a', 'Encounter', 'd-' || g, 'date', d, 'day',
+                        d + interval '1 day', now() - (g || ' seconds')::interval
+                   FROM (SELECT g, timestamptz '1950-01-01' + (g % 29000) * interval '1 day' AS d
+                           FROM generate_series(1, 60000) g) s;
+                 INSERT INTO search_index
+                   (tenant_id, resource_type, resource_id, param_name, value_token_code, last_updated)
+                 SELECT 'tenant-a', 'Encounter', 'd-' || g, 'status', 'finished',
+                        now() - (g || ' seconds')::interval
+                   FROM generate_series(1, 60000) g;
+                 ANALYZE search_index;",
+            )
+            .await
+            .expect("seed date and token rows");
+
+        let mut next = 0;
+        let (predicate, params) = date_range_predicate(
+            "value_date",
+            "value_date_end",
+            SearchPrefix::Gt,
+            "2031",
+            &mut next,
+        );
+        let [SqlParam::Timestamp(bound)] = params.as_slice() else {
+            panic!("gt binds one instant, got {params:?}");
+        };
+        let sql = format!(
+            "EXPLAIN (FORMAT JSON)
+             SELECT DISTINCT resource_id, last_updated FROM search_index
+              WHERE tenant_id = 'tenant-a' AND resource_type = 'Encounter'
+                AND param_name = 'date' AND {predicate}
+              ORDER BY last_updated DESC, resource_id ASC LIMIT 21"
+        );
+        let plan: serde_json::Value = client
+            .query_one(sql.as_str(), &[bound])
+            .await
+            .expect("explain the gt query")
+            .get(0);
+        let plan = plan.to_string();
+        assert!(
+            plan.contains("idx_search_date_end"),
+            "a sparse gt must seek on the end index: {plan}"
+        );
+        assert!(
+            !plan.contains("Seq Scan"),
+            "a sparse gt must not scan the table: {plan}"
+        );
+    }
+
+    /// v43 backfills the end of every existing date row from its own
+    /// precision, in UTC whatever the session zone, clamps at the supported
+    /// limit, leaves non-date rows alone, and puts the end on the date indexes.
+    #[tokio::test]
+    async fn postgres_integration_v42_to_v43_backfills_date_range_ends() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let pg = shared_pg().await;
+        let backend = create_v42_database(
+            pg,
+            &format!("hfs_v43_test_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+        let mut client = backend.get_client().await.unwrap();
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .expect("fixture instant")
+                .with_timezone(&Utc)
+        };
+
+        // (id, precision, value_date, expected value_date_end). The day row
+        // is the US spring-forward date: with the session zone below, local
+        // arithmetic would make that day 23 hours long.
+        let rows: &[(&str, Option<&str>, &str, &str)] = &[
+            (
+                "year",
+                Some("year"),
+                "2020-01-01T00:00:00Z",
+                "2021-01-01T00:00:00Z",
+            ),
+            (
+                "month",
+                Some("month"),
+                "2020-02-01T00:00:00Z",
+                "2020-03-01T00:00:00Z",
+            ),
+            (
+                "day",
+                Some("day"),
+                "2020-03-08T00:00:00Z",
+                "2020-03-09T00:00:00Z",
+            ),
+            (
+                "hour",
+                Some("hour"),
+                "2020-03-08T05:00:00Z",
+                "2020-03-08T06:00:00Z",
+            ),
+            (
+                "minute",
+                Some("minute"),
+                "2020-03-08T05:30:00Z",
+                "2020-03-08T05:31:00Z",
+            ),
+            (
+                "second",
+                Some("second"),
+                "2020-03-08T05:30:10Z",
+                "2020-03-08T05:30:11Z",
+            ),
+            (
+                "millisecond",
+                Some("millisecond"),
+                "2020-03-08T05:30:10.123Z",
+                "2020-03-08T05:30:10.124Z",
+            ),
+            (
+                "composite",
+                None,
+                "2020-03-08T05:30:10Z",
+                "2020-03-08T05:30:10.000001Z",
+            ),
+            (
+                "last-year",
+                Some("year"),
+                "9999-01-01T00:00:00Z",
+                "9999-12-31T23:59:59.999999Z",
+            ),
+        ];
+        for (id, precision, value, _) in rows {
+            client
+                .execute(
+                    "INSERT INTO search_index
+                     (tenant_id, resource_type, resource_id, param_name, value_date, value_date_precision)
+                     VALUES ('tenant-a', 'Encounter', $1, 'date', $2, $3)",
+                    &[id, &at(value), precision],
+                )
+                .await
+                .expect("seed a pre-v43 date row");
+        }
+        client
+            .execute(
+                "INSERT INTO search_index
+                 (tenant_id, resource_type, resource_id, param_name, value_token_code)
+                 VALUES ('tenant-a', 'Encounter', 'token', 'status', 'finished')",
+                &[],
+            )
+            .await
+            .expect("seed a pre-v43 token row");
+        client
+            .execute("SET TimeZone = 'America/New_York'", &[])
+            .await
+            .expect("set a zone with DST");
+
+        initialize_schema(&mut client)
+            .await
+            .expect("migrate v42 to v43");
+        assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            column_type(&client, "search_index", "value_date_end")
+                .await
+                .as_deref(),
+            Some("timestamp with time zone")
+        );
+
+        for (id, _, _, expected) in rows {
+            let end: Option<chrono::DateTime<Utc>> = client
+                .query_one(
+                    "SELECT value_date_end FROM search_index WHERE resource_id = $1",
+                    &[id],
+                )
+                .await
+                .expect("read backfilled end")
+                .get(0);
+            assert_eq!(end, Some(at(expected)), "{id}");
+        }
+        let token_end: Option<chrono::DateTime<Utc>> = client
+            .query_one(
+                "SELECT value_date_end FROM search_index WHERE resource_id = 'token'",
+                &[],
+            )
+            .await
+            .expect("read the token row")
+            .get(0);
+        assert_eq!(token_end, None, "a non-date row has no range");
+
+        for (name, include) in [
+            (
+                "idx_search_date",
+                "INCLUDE (resource_id, last_updated, value_date_end)",
+            ),
+            (
+                "idx_search_date_recent",
+                "INCLUDE (value_date, value_date_end)",
+            ),
+            ("idx_search_date_end", "INCLUDE (resource_id, last_updated)"),
+        ] {
+            let definition = index_definition(&client, name)
+                .await
+                .unwrap_or_else(|| panic!("{name} must exist after v43"));
+            assert!(definition.contains(include), "{name}: {definition}");
+            // The end index is partial on the end itself: see the v43 docs.
+            let predicate = if name == "idx_search_date_end" {
+                "WHERE (value_date_end IS NOT NULL)"
+            } else {
+                "WHERE (value_date IS NOT NULL)"
+            };
+            assert!(definition.contains(predicate), "{name}: {definition}");
+        }
+        assert!(
+            index_definition(&client, "idx_search_date_end")
+                .await
+                .is_some_and(|d| d.contains("param_name, value_date_end)")),
+            "idx_search_date_end is keyed on the end"
+        );
+
+        // Idempotent: a restart at v43 migrates nothing and keeps the ends.
+        initialize_schema(&mut client)
+            .await
+            .expect("reinitialize current schema");
+        let backfilled: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM search_index WHERE value_date_end IS NOT NULL",
+                &[],
+            )
+            .await
+            .expect("count backfilled rows")
+            .get(0);
+        assert_eq!(backfilled, rows.len() as i64);
     }
 }

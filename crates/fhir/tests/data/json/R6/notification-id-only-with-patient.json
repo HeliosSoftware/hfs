@@ -11,7 +11,7 @@
         "id": "dae6bdbc-71ab-4043-b11e-59b52bda60ad",
         "text": {
           "status": "generated",
-          "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: SubscriptionStatus dae6bdbc-71ab-4043-b11e-59b52bda60ad\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"dae6bdbc-71ab-4043-b11e-59b52bda60ad\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcdae6bdbc-71ab-4043-b11e-59b52bda60ad\"\u003e \u003c/a\u003e\u003cp\u003e\u003cb\u003estatus\u003c/b\u003e: Active\u003c/p\u003e\u003cp\u003e\u003cb\u003etype\u003c/b\u003e: Event Notification\u003c/p\u003e\u003cp\u003e\u003cb\u003eeventsSinceSubscriptionStart\u003c/b\u003e: 2\u003c/p\u003e\u003cblockquote\u003e\u003cp\u003e\u003cb\u003enotificationEvent\u003c/b\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003eeventNumber\u003c/b\u003e: 2\u003c/p\u003e\u003cp\u003e\u003cb\u003efocus\u003c/b\u003e: \u003ca href\u003d\"broken-link.html\"\u003ehttp://example.org/FHIR/R5/Encounter/2\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003eadditionalContext\u003c/b\u003e: \u003ca href\u003d\"broken-link.html\"\u003ehttp://example.org/FHIR/R5/Patient/ABC\u003c/a\u003e\u003c/p\u003e\u003cblockquote\u003e\u003cp\u003e\u003cb\u003erelatedQuery\u003c/b\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003equeryType\u003c/b\u003e: [not stated]: \u003c/p\u003e\u003cp\u003e\u003cb\u003equery\u003c/b\u003e: Patient?_id\u003dABC\u0026amp;_include:iterate\u003dPatient:link\u003c/p\u003e\u003c/blockquote\u003e\u003cblockquote\u003e\u003cp\u003e\u003cb\u003erelatedQuery\u003c/b\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003equeryType\u003c/b\u003e: [not stated]: \u003c/p\u003e\u003cp\u003e\u003cb\u003equery\u003c/b\u003e: Patient/ABC$current-providers\u003c/p\u003e\u003c/blockquote\u003e\u003c/blockquote\u003e\u003cp\u003e\u003cb\u003esubscription\u003c/b\u003e: \u003ca href\u003d\"broken-link.html\"\u003ehttp://example.org/FHIR/R5/Subscription/123\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003etopic\u003c/b\u003e: \u003ca href\u003d\"broken-link.html\"\u003ehttp://example.org/FHIR/R5/SubscriptionTopic/admission\u003c/a\u003e\u003c/p\u003e\u003c/div\u003e"
+          "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: SubscriptionStatus dae6bdbc-71ab-4043-b11e-59b52bda60ad\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"dae6bdbc-71ab-4043-b11e-59b52bda60ad\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcdae6bdbc-71ab-4043-b11e-59b52bda60ad\"\u003e \u003c/a\u003e\u003cp\u003e\u003cb\u003estatus\u003c/b\u003e: Active\u003c/p\u003e\u003cp\u003e\u003cb\u003etype\u003c/b\u003e: Event Notification\u003c/p\u003e\u003cp\u003e\u003cb\u003eeventsSinceSubscriptionStart\u003c/b\u003e: 2\u003c/p\u003e\u003cblockquote\u003e\u003cp\u003e\u003cb\u003enotificationEvent\u003c/b\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003eeventNumber\u003c/b\u003e: 2\u003c/p\u003e\u003cp\u003e\u003cb\u003efocus\u003c/b\u003e: \u003ca href\u003d\"broken-link.html\"\u003ehttp://example.org/FHIR/R5/Encounter/2\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003eadditionalContext\u003c/b\u003e: \u003ca href\u003d\"broken-link.html\"\u003ehttp://example.org/FHIR/R5/Patient/ABC\u003c/a\u003e\u003c/p\u003e\u003cblockquote\u003e\u003cp\u003e\u003cb\u003erelatedQuery\u003c/b\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003equeryType\u003c/b\u003e: CodeSystem-patient-queries: current-patient (current-patient)\u003c/p\u003e\u003cp\u003e\u003cb\u003equery\u003c/b\u003e: Patient?_id\u003dABC\u0026amp;_include:iterate\u003dPatient:link\u003c/p\u003e\u003c/blockquote\u003e\u003cblockquote\u003e\u003cp\u003e\u003cb\u003erelatedQuery\u003c/b\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003equeryType\u003c/b\u003e: CodeSystem-patient-queries: current-providers (current-providers)\u003c/p\u003e\u003cp\u003e\u003cb\u003equery\u003c/b\u003e: Patient/ABC$current-providers\u003c/p\u003e\u003c/blockquote\u003e\u003c/blockquote\u003e\u003cp\u003e\u003cb\u003esubscription\u003c/b\u003e: \u003ca href\u003d\"broken-link.html\"\u003ehttp://example.org/FHIR/R5/Subscription/123\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003etopic\u003c/b\u003e: \u003ca href\u003d\"broken-link.html\"\u003ehttp://example.org/FHIR/R5/SubscriptionTopic/admission\u003c/a\u003e\u003c/p\u003e\u003c/div\u003e"
         },
         "status": "active",
         "type": "event-notification",
@@ -29,9 +29,17 @@
             ],
             "relatedQuery": [
               {
+                "queryType": {
+                  "system": "http://example.org/fhir/CodeSystem-patient-queries",
+                  "code": "current-patient"
+                },
                 "query": "Patient?_id\u003dABC\u0026_include:iterate\u003dPatient:link"
               },
               {
+                "queryType": {
+                  "system": "http://example.org/fhir/CodeSystem-patient-queries",
+                  "code": "current-providers"
+                },
                 "query": "Patient/ABC$current-providers"
               }
             ]

@@ -279,6 +279,88 @@ test("Save with a valid document never confirms", async ({ page }) => {
   expect(dialogFired).toBe(false);
 });
 
+/** #1014: `status: "bogus"` is not a `publication-status` code — a finding
+ * only the generic FHIR validator (via the guided form's chip) reports, the
+ * linter has no rule for `status` at all. The Save guard must still confirm,
+ * taking the chip's own count since the last completed lint pass alone would
+ * say zero. */
+test("saving with a validator-only error confirms even though the linter has none", async ({
+  page,
+}) => {
+  await page.goto("/ui/sql/view-definitions?vd=new");
+  const ed = new VdEditor(page);
+  const stamp = Date.now().toString(36);
+  await ed.setDoc(`{
+  "resourceType": "ViewDefinition",
+  "name": "e2e_lint_validator_only_${stamp}",
+  "status": "bogus",
+  "resource": "Patient",
+  "select": [{ "column": [{ "name": "id", "path": "getResourceKey()" }] }]
+}`);
+  await expect(page.locator(".cm-lintRange-error")).toHaveCount(0);
+  const chip = page.locator("#vd-editor-grid .editor-validity");
+  await expect(chip).toHaveText(/1 issue/);
+  // The Save guard reads `data-error-count` off this same chip
+  // (`chipErrorCount`, vd-editor.js) — wait for the attribute itself, not
+  // just the text it renders alongside, since the two settle from the same
+  // re-render but a race on the text alone was enough to flake the confirm
+  // before the guard was fixed (adenda, iter 1).
+  await expect(chip).toHaveAttribute("data-error-count", "1");
+
+  const save = page.locator("#vd-editor-form button[name='action'][value='save']");
+  let message = "";
+  page.once("dialog", (dialog) => {
+    message = dialog.message();
+    dialog.dismiss();
+  });
+  await save.click();
+  expect(message).toBe("This view definition still has 1 error. Save it anyway?");
+  await expect(page).toHaveURL(/vd=new/);
+  await expect(page).not.toHaveURL(/saved=1/);
+});
+
+/** #1014 (T1/T2): `resource: "Nope"` is now both underlined by the linter
+ * (`.cm-lintRange-error`) and counted by the chip (the generic validator's
+ * required-binding check on `ViewDefinition.resource`) — confirming on save
+ * still submits, and the server (T2's write-path guard) rejects it with
+ * 422, so the page never reaches `saved=1`. */
+test("an unknown resource type is marked, confirmed on save and rejected by the server", async ({
+  page,
+}) => {
+  await page.goto("/ui/sql/view-definitions?vd=new");
+  const ed = new VdEditor(page);
+  const stamp = Date.now().toString(36);
+  await ed.setDoc(`{
+  "resourceType": "ViewDefinition",
+  "name": "e2e_lint_unknown_resource_${stamp}",
+  "status": "active",
+  "resource": "Nope",
+  "select": [{ "column": [{ "name": "id", "path": "getResourceKey()" }] }]
+}`);
+  await expect(page.locator(".cm-lintRange-error")).toHaveCount(1);
+  await expect(page.locator("#vd-editor-grid .editor-validity")).toHaveText(/1 issue/);
+
+  const save = page.locator("#vd-editor-form button[name='action'][value='save']");
+  let message = "";
+  page.once("dialog", (dialog) => {
+    message = dialog.message();
+    dialog.accept();
+  });
+  await save.click();
+  // Scoped away from `#run-notice`: the textarea's own `hx-trigger="input
+  // changed delay:500ms"` (sql-view-definitions.html) fires a `$sql-run`
+  // preview 500ms after `setDoc`'s typing settles, which also 422s on
+  // `resource: "Nope"` and swaps its own `.notice--warn` into `#run-notice`
+  // (`sql_run_results.html`) — mentioning "Nope" too, so filtering by text
+  // alone still resolves both. The save-error notice this test cares about
+  // (sql-view-definitions.html's own `save_error` paragraph) is the only
+  // `.notice--warn` outside that region (adenda, iter 1).
+  const saveNotice = page.locator(".notice--warn:not(#run-notice *)");
+  await expect(saveNotice).toContainText(/Nope|unknown-resource-type|code-invalid/);
+  expect(message).toBe("This view definition still has 1 error. Save it anyway?");
+  await expect(page).not.toHaveURL(/saved=1/);
+});
+
 test("Duplicate never confirms, even with lint errors present", async ({ page, request }) => {
   // Duplicate only renders for an already-stored view (`{% if !is_new %}`,
   // sql-view-definitions.html) — a fresh `?vd=new` document has nothing to

@@ -37,6 +37,18 @@
   var subject = document.getElementById("editor-subject");
   var messages = root.dataset;
 
+  /* Unsaved-changes tracking (#1240): opt in lazily, once the document is in
+   * scope, so `read` never runs before the fragment it reads exists. */
+  var unsaved = null;
+  function trackUnsaved() {
+    if (unsaved || !window.HfsUnsaved) return;
+    unsaved = window.HfsUnsaved.track({
+      root: root,
+      read: readWithPending,
+      cue: root.querySelector(".editor__actions"),
+    });
+  }
+
   var resourceType = messages.type;
   var resourceId = messages.id;
 
@@ -68,6 +80,7 @@
         body.innerHTML = html;
         applyView();
         restoreUiState(state);
+        if (unsaved) unsaved.check();
       });
   }
 
@@ -91,25 +104,8 @@
         end: active.selectionEnd,
       };
     }
-    body.querySelectorAll("details.editor-add[open]").forEach(function (box) {
-      var row = box.closest("[data-path]");
-      var filter = box.querySelector(".editor-add__filter");
-      state.pickers.push({
-        path: row ? row.dataset.path : "",
-        filter: filter ? filter.value : "",
-        focusFilter: filter === document.activeElement,
-      });
-    });
+    state.pickers = window.HfsEditorAdd.capturePickers(body);
     return state;
-  }
-
-  function rowByPath(path) {
-    if (!path) return body;
-    var rows = body.querySelectorAll("[data-path]");
-    for (var i = 0; i < rows.length; i++) {
-      if (rows[i].dataset.path === path) return rows[i];
-    }
-    return null;
   }
 
   function inputByPath(path) {
@@ -134,24 +130,14 @@
         if (toggle) toggle.classList.add("editor-json__act--on");
       }
     }
-    state.pickers.forEach(function (saved) {
-      var row = rowByPath(saved.path);
-      if (!row) return;
-      var box = row.querySelector("details.editor-add");
-      if (!box) return;
-      box.setAttribute("open", "");
-      var filter = box.querySelector(".editor-add__filter");
-      if (filter && saved.filter) {
-        filter.value = saved.filter;
-        filter.dispatchEvent(new Event("input", { bubbles: true }));
-      }
-      if (saved.focusFilter && filter) filter.focus();
-    });
-
-    // The server names the node the mutation created; the caret goes there.
-    // Otherwise it returns to the field that was focused before the swap.
+    // The server names the node the mutation created; the picker that
+    // created it clears its filter and shows the added signal, #1239.
     var formEl = body.querySelector("#editor-form");
     var createdPath = formEl && formEl.dataset ? formEl.dataset.focus : null;
+    window.HfsEditorAdd.restorePickers(body, state.pickers, createdPath);
+
+    // The caret goes to the node the mutation created. Otherwise it
+    // returns to the field that was focused before the swap.
     var target = createdPath ? inputByPath(createdPath) : null;
     if (target) {
       target.focus();
@@ -184,6 +170,40 @@
     return field ? field.value : "{}";
   }
 
+  /* Pending edits (#1240): a guided-form `[data-set]` control only round-trips
+   * through `send("set", …)` on blur (below), so #editor-doc alone lags a
+   * keystroke behind what is actually on screen. One "path=value" line per
+   * control whose value has moved from what it loaded with — a `select`'s
+   * loaded state is its `defaultSelected` option, every other control's is
+   * `defaultValue`. */
+  function pendingEdits(container) {
+    var lines = "";
+    var fields = container.querySelectorAll("[data-set]");
+    for (var i = 0; i < fields.length; i++) {
+      var el = fields[i];
+      var path = el.dataset.set;
+      if (!path) continue;
+      if (el.tagName === "SELECT") {
+        var selected = el.options[el.selectedIndex];
+        if (selected && !selected.defaultSelected) lines += path + "=" + el.value + "\n";
+      } else if ("defaultValue" in el) {
+        if (el.value !== el.defaultValue) lines += path + "=" + el.value + "\n";
+      }
+    }
+    return lines;
+  }
+
+  /* The unsaved-changes tracker's own `read` (#1240): the document plus any
+   * pending edit. With one pending, the whole string no longer parses as
+   * JSON, so it always differs from the last clean baseline — a pending edit
+   * is dirty by definition — until it either commits (the next render
+   * replaces #editor-doc and clears it) or is retyped back to its loaded
+   * value. */
+  function readWithPending() {
+    var pending = pendingEdits(body);
+    return currentDocument() + (pending ? "\n--pending--\n" + pending : "");
+  }
+
   /* ---- loading --------------------------------------------------------- */
 
   function load() {
@@ -195,7 +215,12 @@
       seed.set("op", "");
       return fetch("/ui/editor/render", { method: "POST", body: seed })
         .then(function (r) { return r.text(); })
-        .then(function (html) { body.innerHTML = html; applyView(); });
+        .then(function (html) {
+          body.innerHTML = html;
+          applyView();
+          trackUnsaved();
+          if (unsaved) unsaved.reset();
+        });
     }
     return fetch("/" + resourceType + "/" + resourceId, {
       headers: fhirHeaders(),
@@ -213,7 +238,10 @@
             ? " · " + new Date(resource.meta.lastUpdated).toLocaleString()
             : "");
         loadVersions();
-        return renderDocument(resource);
+        return renderDocument(resource).then(function () {
+          trackUnsaved();
+          if (unsaved) unsaved.reset();
+        });
       })
       .catch(function () {
         say(messages.msgLoadError, "error");
@@ -227,7 +255,11 @@
     form.set("op", "");
     return fetch("/ui/editor/render", { method: "POST", body: form })
       .then(function (r) { return r.text(); })
-      .then(function (html) { body.innerHTML = html; applyView(); });
+      .then(function (html) {
+        body.innerHTML = html;
+        applyView();
+        if (unsaved) unsaved.check();
+      });
   }
 
   /* ---- version history panel ------------------------------------------- */
@@ -339,8 +371,7 @@
 
     var extension = event.target.closest("[data-extension]");
     if (extension) {
-      var panel = extension.closest(".editor-add__ext");
-      var url = extension.dataset.url || (panel ? panel.querySelector(".editor-add__ext-url").value.trim() : "");
+      var url = window.HfsEditorAdd.extensionUrl(extension);
       send("extension", { path: extension.dataset.extension, url: url });
       return;
     }
@@ -423,17 +454,8 @@
     }, 300);
   });
 
-  /* Typeahead over the "add" list -- the only thing here that is purely
-   * cosmetic, and the only thing that would be silly to round-trip. */
-  root.addEventListener("input", function (event) {
-    var filter = event.target.closest(".editor-add__filter");
-    if (!filter) return;
-    var needle = filter.value.trim().toLowerCase();
-    var panel = filter.closest(".editor-add__panel");
-    panel.querySelectorAll("[data-add-name]").forEach(function (item) {
-      item.hidden = needle && item.dataset.addName.toLowerCase().indexOf(needle) === -1;
-    });
-  });
+  /* The add-picker's own typeahead over the "add" list (#1239). */
+  window.HfsEditorAdd.attach(root);
 
   /* ---- saving ---------------------------------------------------------- */
 
@@ -536,6 +558,7 @@
             return;
           }
           say(messages.msgSaved, "ok");
+          if (unsaved) unsaved.reset();
           if (result.payload && result.payload.id && !parsed.id) {
             resourceId = result.payload.id;
           }
@@ -553,7 +576,10 @@
 
     fetch("/" + resourceType + "/" + parsed.id, { method: "DELETE", headers: fhirHeaders() })
       .then(function (response) {
-        if (response.ok) window.location.href = "/ui/queries";
+        if (response.ok) {
+          if (window.HfsUnsaved) window.HfsUnsaved.suspend();
+          window.location.href = "/ui/queries";
+        }
       })
       .catch(function (error) {
         say(String(error), "error");

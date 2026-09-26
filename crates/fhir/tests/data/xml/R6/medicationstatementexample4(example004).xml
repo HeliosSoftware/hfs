@@ -32,22 +32,42 @@
   </note>
   <dosage>
     <renderedInstruction value="One capsule three times daily by mouth."/>
-    <safety>
-      <doseLimit>
-        <valueQuantity>
-          <value value="3"/>
-          <unit value="capsules"/>
-          <system value="http://snomed.info/sct"/>
-          <code value="385055001"/>
-        </valueQuantity>
-        <scope value="period"/>
-        <period>
-          <value value="1"/>
-          <system value="http://unitsofmeasure.org"/>
-          <code value="d"/>
-        </period>
-      </doseLimit>
-    </safety>
+    <step>
+      <component>
+        <text value="one capsule three times daily"/>
+        <timing>
+          <repeat>
+            <frequency value="3"/>
+            <period value="1"/>
+            <periodUnit value="d"/>
+          </repeat>
+        </timing>
+        <asNeeded value="false"/>
+        <route>
+          <coding>
+            <system value="http://snomed.info/sct"/>
+            <code value="260548002"/>
+            <display value="Oral"/>
+          </coding>
+        </route>
+        <safety>
+          <doseLimit>
+            <valueQuantity>
+              <value value="3"/>
+              <unit value="capsules"/>
+              <system value="http://snomed.info/sct"/>
+              <code value="385055001"/>
+            </valueQuantity>
+            <scope value="period"/>
+            <period>
+              <value value="1"/>
+              <system value="http://unitsofmeasure.org"/>
+              <code value="d"/>
+            </period>
+          </doseLimit>
+        </safety>
+      </component>
+    </step>
   </dosage>
   <adherence>
     <code>

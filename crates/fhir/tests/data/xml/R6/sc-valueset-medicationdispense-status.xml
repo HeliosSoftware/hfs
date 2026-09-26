@@ -34,63 +34,63 @@
         <tr>
           <td>entered-in-error</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>error</td>
         </tr>
         <tr>
           <td>preparation</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>planned</td>
         </tr>
         <tr>
           <td>in-progress</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>active</td>
         </tr>
         <tr>
           <td>on-hold</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>suspended</td>
         </tr>
         <tr>
           <td>unfulfilled</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>failed</td>
         </tr>
         <tr>
           <td>completed</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>complete</td>
         </tr>
         <tr>
           <td>unknown</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>unknown</td>
         </tr>
         <tr>
           <td>cancelled</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>not-done</td>
         </tr>
         <tr>
           <td>declined</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>not-done</td>
         </tr>
@@ -98,7 +98,7 @@
     </div>
   </text>
   <url value="http://hl7.org/fhir/ConceptMap/sc-medicationdispense-status"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-snapshot1"/>
   <name value="MedicationDispenseStatusCodesCanonicalMap"/>
   <title value="Canonical Mapping for &quot;MedicationDispense Status Codes&quot;"/>
   <status value="draft"/>

@@ -15,10 +15,13 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use crate::error::{BackendError, StorageResult};
-use crate::search::SearchParameterRegistry;
+use crate::search::{IMPLICIT_TOKEN_SYSTEM, SearchParameterRegistry};
 use crate::types::{ChainConfig, ReverseChainedParameter, SearchParamType, SearchValue};
 
-use super::query_builder::{SqlFragment, SqlParam};
+use super::query_builder::{
+    SqlFragment, SqlParam, date_predicate, date_range_predicate, match_nothing, number_predicate,
+    quantity_predicate,
+};
 
 /// A single link in a forward chain.
 #[derive(Debug, Clone)]
@@ -375,10 +378,10 @@ impl ChainQueryBuilder {
     ) -> StorageResult<(String, Vec<SqlParam>)> {
         let alias = format!("si{}", chain.links.len());
 
-        if let Some((sql, bind)) =
+        if let Some(condition) =
             resources_backed_condition(&chain.terminal_param, &alias, value, param_num)
         {
-            return Ok((sql, vec![bind]));
+            return Ok(condition);
         }
 
         let (condition, params) = match chain.terminal_type {
@@ -394,12 +397,28 @@ impl ChainQueryBuilder {
                     if system.is_empty() {
                         (
                             format!(
-                                "({alias}.value_token_system IS NULL OR {alias}.value_token_system = '') \
+                                "({alias}.value_token_system IS NULL OR {alias}.value_token_system IN ('', '{implicit}')) \
                                  AND {alias}.value_token_code = ${pn}",
                                 alias = alias,
+                                implicit = IMPLICIT_TOKEN_SYSTEM,
                                 pn = param_num,
                             ),
                             vec![SqlParam::Text(code.to_string())],
+                        )
+                    } else if code.is_empty() {
+                        // `system|`: any code in that system, as the direct
+                        // token handler does. Without this branch the empty
+                        // code was bound as `value_token_code = ''` and the
+                        // terminal matched nothing. The `IS NOT NULL` conjunct
+                        // excludes no rows; it lets the planner use the
+                        // code-leading token index (see `token_value_predicate`).
+                        (
+                            format!(
+                                "({alias}.value_token_code IS NOT NULL AND {alias}.value_token_system = ${pn})",
+                                alias = alias,
+                                pn = param_num,
+                            ),
+                            vec![SqlParam::Text(system.to_string())],
                         )
                     } else {
                         // Both halves are bound. The system used to be
@@ -409,8 +428,9 @@ impl ChainQueryBuilder {
                         // distinct statement text per system either way.
                         (
                             format!(
-                                "{alias}.value_token_system = ${pn} AND {alias}.value_token_code = ${pn2}",
+                                "{alias}.value_token_system IN (${pn}, '{implicit}') AND {alias}.value_token_code = ${pn2}",
                                 alias = alias,
+                                implicit = IMPLICIT_TOKEN_SYSTEM,
                                 pn = param_num,
                                 pn2 = param_num + 1,
                             ),
@@ -432,20 +452,12 @@ impl ChainQueryBuilder {
                 vec![SqlParam::Text(format!("%{}%", value.value))],
             ),
             SearchParamType::Date => {
-                let date_col = format!("{}.value_date", alias);
-                let (sql, bind) = build_date_condition(&date_col, value, param_num);
-                (sql, vec![bind])
+                let start_col = format!("{}.value_date", alias);
+                let end_col = format!("{}.value_date_end", alias);
+                build_date_condition(&start_col, Some(&end_col), value, param_num)
             }
-            SearchParamType::Number => {
-                let num_col = format!("{}.value_number", alias);
-                let (sql, bind) = build_number_condition(&num_col, value, param_num);
-                (sql, vec![bind])
-            }
-            SearchParamType::Quantity => {
-                let qty_col = format!("{}.value_quantity_value", alias);
-                let (sql, bind) = build_number_condition(&qty_col, value, param_num);
-                (sql, vec![bind])
-            }
+            SearchParamType::Number => build_number_condition(&alias, value, param_num),
+            SearchParamType::Quantity => build_quantity_condition(&alias, value, param_num),
             SearchParamType::Uri => (
                 format!("{}.value_uri = ${}", alias, param_num),
                 vec![SqlParam::Text(value.value.clone())],
@@ -621,9 +633,8 @@ impl ChainQueryBuilder {
 
         let alias = format!("si{}", depth);
 
-        if let Some((sql, bind)) = resources_backed_condition(param_name, &alias, value, param_num)
-        {
-            return Ok((sql, vec![bind]));
+        if let Some(condition) = resources_backed_condition(param_name, &alias, value, param_num) {
+            return Ok(condition);
         }
 
         let (condition, params) = match param_type {
@@ -639,12 +650,28 @@ impl ChainQueryBuilder {
                     if system.is_empty() {
                         (
                             format!(
-                                "({alias}.value_token_system IS NULL OR {alias}.value_token_system = '') \
+                                "({alias}.value_token_system IS NULL OR {alias}.value_token_system IN ('', '{implicit}')) \
                                  AND {alias}.value_token_code = ${pn}",
                                 alias = alias,
+                                implicit = IMPLICIT_TOKEN_SYSTEM,
                                 pn = param_num,
                             ),
                             vec![SqlParam::Text(code.to_string())],
+                        )
+                    } else if code.is_empty() {
+                        // `system|`: any code in that system, as the direct
+                        // token handler does. Without this branch the empty
+                        // code was bound as `value_token_code = ''` and the
+                        // terminal matched nothing. The `IS NOT NULL` conjunct
+                        // excludes no rows; it lets the planner use the
+                        // code-leading token index (see `token_value_predicate`).
+                        (
+                            format!(
+                                "({alias}.value_token_code IS NOT NULL AND {alias}.value_token_system = ${pn})",
+                                alias = alias,
+                                pn = param_num,
+                            ),
+                            vec![SqlParam::Text(system.to_string())],
                         )
                     } else {
                         // Both halves are bound. The system used to be
@@ -654,8 +681,9 @@ impl ChainQueryBuilder {
                         // distinct statement text per system either way.
                         (
                             format!(
-                                "{alias}.value_token_system = ${pn} AND {alias}.value_token_code = ${pn2}",
+                                "{alias}.value_token_system IN (${pn}, '{implicit}') AND {alias}.value_token_code = ${pn2}",
                                 alias = alias,
+                                implicit = IMPLICIT_TOKEN_SYSTEM,
                                 pn = param_num,
                                 pn2 = param_num + 1,
                             ),
@@ -677,20 +705,12 @@ impl ChainQueryBuilder {
                 vec![SqlParam::Text(format!("%{}%", value.value))],
             ),
             SearchParamType::Date => {
-                let date_col = format!("{}.value_date", alias);
-                let (sql, bind) = build_date_condition(&date_col, value, param_num);
-                (sql, vec![bind])
+                let start_col = format!("{}.value_date", alias);
+                let end_col = format!("{}.value_date_end", alias);
+                build_date_condition(&start_col, Some(&end_col), value, param_num)
             }
-            SearchParamType::Number => {
-                let num_col = format!("{}.value_number", alias);
-                let (sql, bind) = build_number_condition(&num_col, value, param_num);
-                (sql, vec![bind])
-            }
-            SearchParamType::Quantity => {
-                let qty_col = format!("{}.value_quantity_value", alias);
-                let (sql, bind) = build_number_condition(&qty_col, value, param_num);
-                (sql, vec![bind])
-            }
+            SearchParamType::Number => build_number_condition(&alias, value, param_num),
+            SearchParamType::Quantity => build_quantity_condition(&alias, value, param_num),
             SearchParamType::Uri => (
                 format!("{}.value_uri = ${}", alias, param_num),
                 vec![SqlParam::Text(value.value.clone())],
@@ -743,14 +763,15 @@ fn resources_backed_condition(
     alias: &str,
     value: &SearchValue,
     param_num: usize,
-) -> Option<(String, SqlParam)> {
+) -> Option<(String, Vec<SqlParam>)> {
     match param_name {
         "_id" => Some((
             format!("{}.id = ${}", alias, param_num),
-            SqlParam::Text(value.value.clone()),
+            vec![SqlParam::Text(value.value.clone())],
         )),
         "_lastUpdated" => Some(build_date_condition(
             &format!("{}.last_updated", alias),
+            None,
             value,
             param_num,
         )),
@@ -758,64 +779,108 @@ fn resources_backed_condition(
     }
 }
 
-fn build_date_condition(column: &str, value: &SearchValue, param_num: usize) -> (String, SqlParam) {
-    use crate::types::SearchPrefix;
-
-    let (op, val) = match value.prefix {
-        SearchPrefix::Eq => ("=", &value.value),
-        SearchPrefix::Ne => ("!=", &value.value),
-        SearchPrefix::Gt => (">", &value.value),
-        SearchPrefix::Lt => ("<", &value.value),
-        SearchPrefix::Ge => (">=", &value.value),
-        SearchPrefix::Le => ("<=", &value.value),
-        SearchPrefix::Sa => (">", &value.value),
-        SearchPrefix::Eb => ("<", &value.value),
-        SearchPrefix::Ap => {
-            return (
-                format!("DATE({}) = DATE(${})", column, param_num),
-                SqlParam::Text(value.value.clone()),
-            );
-        }
-    };
-
-    (
-        format!("{} {} ${}", column, op, param_num),
-        SqlParam::Text(val.clone()),
-    )
-}
-
-fn build_number_condition(
+/// The terminal date comparison, against the indexed range
+/// `[value_date, value_date_end)` or the `last_updated` instant.
+///
+/// With an `end_column` it delegates to [`date_range_predicate`], the unchained
+/// `date` search's range semantics (#1391); without one to [`date_predicate`],
+/// the point comparison `_lastUpdated` uses. Either way a chained date means
+/// what the unchained one does: `TIMESTAMPTZ` binds, precision ranges (`eq2020-01-01` is the whole
+/// day), zone offsets honored, and a non-date matching nothing.
+///
+/// This used to be its own operator table binding the raw search string as
+/// `SqlParam::Text`. Both columns are `TIMESTAMPTZ`, and tokio-postgres will
+/// not serialize a `String` into one, so every chained date search failed with
+/// `error serializing parameter` before reaching the server (#1290).
+///
+/// Binds zero (not a date), one, or two parameters, numbered from `param_num`
+/// with no gaps. The terminal condition is the only part of a chain that binds
+/// anything — every link above it uses `$1` and literals — so the caller needs
+/// no further accounting than returning these params in order.
+fn build_date_condition(
     column: &str,
+    end_column: Option<&str>,
     value: &SearchValue,
     param_num: usize,
-) -> (String, SqlParam) {
-    use crate::types::SearchPrefix;
-
-    let num_value = value.value.parse::<f64>().unwrap_or(0.0);
-
-    let (op, val) = match value.prefix {
-        SearchPrefix::Eq => ("=", num_value),
-        SearchPrefix::Ne => ("!=", num_value),
-        SearchPrefix::Gt => (">", num_value),
-        SearchPrefix::Lt => ("<", num_value),
-        SearchPrefix::Ge => (">=", num_value),
-        SearchPrefix::Le => ("<=", num_value),
-        SearchPrefix::Sa => (">", num_value),
-        SearchPrefix::Eb => ("<", num_value),
-        SearchPrefix::Ap => {
-            let lower = num_value * 0.9;
-            let upper = num_value * 1.1;
-            return (
-                format!("{} BETWEEN {} AND {}", column, lower, upper),
-                SqlParam::Float(num_value),
-            );
+) -> (String, Vec<SqlParam>) {
+    // Both predicates pre-increment: they number their first bind `next + 1`.
+    let mut next = param_num - 1;
+    let (sql, params) = match end_column {
+        Some(end_column) => {
+            date_range_predicate(column, end_column, value.prefix, &value.value, &mut next)
         }
+        None => date_predicate(column, value.prefix, &value.value, &mut next),
     };
+    debug_assert_eq!(next, param_num - 1 + params.len());
+    // Parenthesized: the predicate may be `a AND b`, and it is spliced after
+    // an `AND` in the terminal subquery today but need not always be.
+    (format!("({sql})"), params)
+}
 
-    (
-        format!("{} {} ${}", column, op, param_num),
-        SqlParam::Float(val),
-    )
+/// The terminal `number` comparison, against `{alias}.value_number`.
+///
+/// Delegates to [`number_predicate`], the unchained `number` search's
+/// predicate, so a chained number means what the unchained one does: the
+/// implicit-precision range for `eq`/`ne` (`100` is `[99.5, 100.5)`), the exact
+/// value for the comparators, and for `ap` a bound `BETWEEN` whose margin is
+/// taken from the magnitude, so a negative value has its bounds in order.
+///
+/// This used to be its own operator table. Its `ap` arm wrote both bounds into
+/// the SQL text and still returned a bind, so the statement was given one more
+/// parameter than it had placeholders and failed with `expected 1 parameters
+/// but got 2`; for a negative value the inlined bounds were also reversed. It
+/// read an unparseable number as `0` (#1306).
+///
+/// Binds zero (not a number), one, or two parameters, numbered from
+/// `param_num` with no gaps; see [`build_date_condition`] on why the caller
+/// needs no further accounting.
+fn build_number_condition(
+    alias: &str,
+    value: &SearchValue,
+    param_num: usize,
+) -> (String, Vec<SqlParam>) {
+    // The shared predicates pre-increment: the first bind is `next + 1`.
+    let mut next = param_num - 1;
+    let column = format!("{alias}.value_number");
+    let built = number_predicate(&column, value.prefix, &value.value, &mut next);
+    finish_numeric_condition(built, next, param_num)
+}
+
+/// The terminal `quantity` comparison, against `{alias}.value_quantity_*`.
+///
+/// Delegates to [`quantity_predicate`], the unchained `quantity` search's
+/// predicate: `number`, `number|code` and `number|system|code` are all read,
+/// the unit and system are compared as stored, and a convertible UCUM unit
+/// also matches its equivalents through the canonical columns.
+///
+/// This used to share [`build_number_condition`]'s operator table and its
+/// defects (#1306), and parsed the whole value as the number, so any value
+/// carrying a unit was read as `0`.
+fn build_quantity_condition(
+    alias: &str,
+    value: &SearchValue,
+    param_num: usize,
+) -> (String, Vec<SqlParam>) {
+    let mut next = param_num - 1;
+    let table = format!("{alias}.");
+    let built = quantity_predicate(&table, value.prefix, &value.value, &mut next);
+    finish_numeric_condition(built, next, param_num)
+}
+
+/// A value that is not a number matches nothing, under every prefix, and binds
+/// nothing. Otherwise the predicate is parenthesized for splicing.
+fn finish_numeric_condition(
+    built: Option<(String, Vec<SqlParam>)>,
+    next: usize,
+    param_num: usize,
+) -> (String, Vec<SqlParam>) {
+    match built {
+        Some((sql, params)) => {
+            debug_assert_eq!(next, param_num - 1 + params.len());
+            (format!("({sql})"), params)
+        }
+        None => (format!("({})", match_nothing().sql), Vec::new()),
+    }
 }
 
 #[cfg(test)]
@@ -968,10 +1033,305 @@ mod tests {
             .unwrap();
 
         assert!(frag.sql.contains("FROM resources si1"), "{}", frag.sql);
+        // `gt` at day precision is "after the whole day": `>=` the day's end,
+        // bound as a timestamp (#1290), exactly as the unchained form does.
         assert!(
-            frag.sql.contains("si1.last_updated > $2"),
+            frag.sql.contains("(si1.last_updated >= $2)"),
             "the prefix must survive: {}",
             frag.sql
+        );
+        assert_eq!(frag.params.len(), 1);
+        assert!(matches!(
+            &frag.params[0],
+            SqlParam::Timestamp(ts) if ts.to_rfc3339() == "2024-01-02T00:00:00+00:00"
+        ));
+    }
+
+    fn obs_subject_patient_birthdate() -> Arc<RwLock<SearchParameterRegistry>> {
+        registry_with(vec![
+            SearchParameterDefinition::new(
+                "http://hl7.org/fhir/SearchParameter/Observation-subject",
+                "subject",
+                SearchParamType::Reference,
+                "Observation.subject",
+            )
+            .with_base(vec!["Observation"])
+            .with_targets(vec!["Patient"]),
+            SearchParameterDefinition::new(
+                "http://hl7.org/fhir/SearchParameter/individual-birthdate",
+                "birthdate",
+                SearchParamType::Date,
+                "Patient.birthDate",
+            )
+            .with_base(vec!["Patient"]),
+        ])
+    }
+
+    /// The `$N` placeholders a fragment uses, in order of first appearance.
+    fn placeholders(sql: &str) -> Vec<usize> {
+        let mut seen = Vec::new();
+        for (i, _) in sql.match_indices('$') {
+            let digits: String = sql[i + 1..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if let Ok(n) = digits.parse::<usize>() {
+                if !seen.contains(&n) {
+                    seen.push(n);
+                }
+            }
+        }
+        seen
+    }
+
+    /// A chained date terminal binds timestamps and carries precision-range
+    /// semantics; before #1290 it bound the raw string as text, which
+    /// tokio-postgres cannot serialize into `TIMESTAMPTZ`.
+    #[test]
+    fn a_chained_date_binds_timestamps_with_gap_free_placeholders() {
+        let builder = ChainQueryBuilder::new("t", "Observation", obs_subject_patient_birthdate())
+            .with_param_offset(1);
+        let parsed = builder.parse_chain("subject.birthdate").unwrap();
+        assert_eq!(parsed.terminal_type, SearchParamType::Date);
+
+        // (value, expected predicate, expected binds). The terminal row is a
+        // range `[value_date, value_date_end)` (#1391); `end <= b` also
+        // carries its implied `start < b`, sharing the bind.
+        let cases: &[(&str, &str, &[&str])] = &[
+            (
+                "2020-01-01",
+                "(si1.value_date >= $2 AND si1.value_date < $3 AND si1.value_date_end <= $3)",
+                &["2020-01-01T00:00:00+00:00", "2020-01-02T00:00:00+00:00"],
+            ),
+            (
+                "ne2020-01",
+                "((si1.value_date < $2 OR si1.value_date_end > $3))",
+                &["2020-01-01T00:00:00+00:00", "2020-02-01T00:00:00+00:00"],
+            ),
+            (
+                "ge1980-01-01",
+                "((si1.value_date_end > $2 OR (si1.value_date >= $3 AND si1.value_date < $4 \
+                 AND si1.value_date_end <= $4)))",
+                &[
+                    "1980-01-02T00:00:00+00:00",
+                    "1980-01-01T00:00:00+00:00",
+                    "1980-01-02T00:00:00+00:00",
+                ],
+            ),
+            (
+                "gt1980",
+                "(si1.value_date_end > $2)",
+                &["1981-01-01T00:00:00+00:00"],
+            ),
+            (
+                "le1980-01-01",
+                "((si1.value_date < $2 OR (si1.value_date >= $3 AND si1.value_date < $4 \
+                 AND si1.value_date_end <= $4)))",
+                &[
+                    "1980-01-01T00:00:00+00:00",
+                    "1980-01-01T00:00:00+00:00",
+                    "1980-01-02T00:00:00+00:00",
+                ],
+            ),
+            (
+                "lt1980-01-01",
+                "(si1.value_date < $2)",
+                &["1980-01-01T00:00:00+00:00"],
+            ),
+            (
+                "sa1980",
+                "(si1.value_date >= $2)",
+                &["1981-01-01T00:00:00+00:00"],
+            ),
+            (
+                "eb1980",
+                "(si1.value_date < $2 AND si1.value_date_end <= $2)",
+                &["1980-01-01T00:00:00+00:00"],
+            ),
+            // A value to the second is a range too (#1297): `gt` is past the
+            // end of that second, with the offset folded into the bind.
+            (
+                "gt2019-05-04T23:30:00-07:00",
+                "(si1.value_date_end > $2)",
+                &["2019-05-05T06:30:01+00:00"],
+            ),
+        ];
+        for (value, predicate, binds) in cases {
+            let frag = builder
+                .build_forward_chain_sql(&parsed, &SearchValue::parse(value))
+                .unwrap();
+            assert!(frag.sql.contains(predicate), "{value}: {}", frag.sql);
+            let got: Vec<String> = frag
+                .params
+                .iter()
+                .map(|p| match p {
+                    SqlParam::Timestamp(ts) => ts.to_rfc3339(),
+                    other => panic!("{value}: non-timestamp bind {other:?}"),
+                })
+                .collect();
+            assert_eq!(&got, binds, "{value}");
+            // `$1` is the tenant; the binds follow it with no gap.
+            let expected: Vec<usize> = (1..=1 + binds.len()).collect();
+            assert_eq!(placeholders(&frag.sql), expected, "{value}: {}", frag.sql);
+        }
+    }
+
+    /// A terminal value that is not a date matches nothing and binds nothing —
+    /// under `ne` too, which would otherwise widen the result (#1289).
+    #[test]
+    fn a_chained_non_date_matches_nothing_and_binds_nothing() {
+        let builder = ChainQueryBuilder::new("t", "Observation", obs_subject_patient_birthdate())
+            .with_param_offset(1);
+        let parsed = builder.parse_chain("subject.birthdate").unwrap();
+
+        for value in ["not-a-date", "nenot-a-date", "ge", ""] {
+            let frag = builder
+                .build_forward_chain_sql(&parsed, &SearchValue::parse(value))
+                .unwrap();
+            assert!(frag.sql.contains("AND (FALSE)"), "{value}: {}", frag.sql);
+            assert!(frag.params.is_empty(), "{value}: {:?}", frag.params);
+            assert_eq!(placeholders(&frag.sql), vec![1], "{value}: {}", frag.sql);
+        }
+    }
+
+    fn floats(params: &[SqlParam]) -> Vec<f64> {
+        params
+            .iter()
+            .filter_map(|p| match p {
+                SqlParam::Float(f) => Some(*f),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn assert_floats(got: &[f64], want: &[f64], context: &str) {
+        assert_eq!(got.len(), want.len(), "{context}: {got:?}");
+        for (g, w) in got.iter().zip(want) {
+            assert!((g - w).abs() < 1e-9, "{context}: {got:?} != {want:?}");
+        }
+    }
+
+    /// #1306: every prefix of a chained number binds what it references, with
+    /// placeholders numbered from `param_num` without gaps. `ap` used to inline
+    /// its bounds and still return a bind.
+    #[test]
+    fn a_chained_number_binds_every_bound_with_gap_free_placeholders() {
+        // (value, expected predicate, expected binds)
+        let cases: &[(&str, &str, &[f64])] = &[
+            (
+                "100",
+                "(si1.value_number >= $4 AND si1.value_number < $5)",
+                &[99.5, 100.5],
+            ),
+            (
+                "ne100",
+                "((si1.value_number < $4 OR si1.value_number >= $5))",
+                &[99.5, 100.5],
+            ),
+            ("gt100", "(si1.value_number > $4)", &[100.0]),
+            ("ge100", "(si1.value_number >= $4)", &[100.0]),
+            ("lt100", "(si1.value_number < $4)", &[100.0]),
+            ("le100", "(si1.value_number <= $4)", &[100.0]),
+            ("sa100", "(si1.value_number > $4)", &[100.0]),
+            ("eb100", "(si1.value_number < $4)", &[100.0]),
+            (
+                "ap100",
+                "(si1.value_number BETWEEN $4 AND $5)",
+                &[90.0, 110.0],
+            ),
+            // Negative: the lower bound is still the smaller one.
+            (
+                "ap-100",
+                "(si1.value_number BETWEEN $4 AND $5)",
+                &[-110.0, -90.0],
+            ),
+        ];
+        for (value, predicate, binds) in cases {
+            let (sql, params) = build_number_condition("si1", &SearchValue::parse(value), 4);
+            assert_eq!(&sql, predicate, "{value}");
+            assert_floats(&floats(&params), binds, value);
+            assert_eq!(params.len(), binds.len(), "{value}: {params:?}");
+            let expected: Vec<usize> = (4..4 + binds.len()).collect();
+            assert_eq!(placeholders(&sql), expected, "{value}: {sql}");
+        }
+    }
+
+    /// #1306: a chained quantity reads `number|system|code` as the unchained
+    /// search does, against aliased columns, still without placeholder gaps.
+    #[test]
+    fn a_chained_quantity_qualifies_every_column_and_binds_every_placeholder() {
+        let (sql, params) = build_quantity_condition("si2", &SearchValue::parse("ap-5.4"), 2);
+        assert_eq!(sql, "((si2.value_quantity_value BETWEEN $2 AND $3))");
+        assert_floats(&floats(&params), &[-5.94, -4.86], "ap-5.4");
+
+        for value in [
+            "5.4|http://unitsofmeasure.org|mg",
+            "ap5.4||mg",
+            "ne5.4|mg",
+            "gt5.4|http://unitsofmeasure.org|mg",
+            "5.4||not-a-ucum-unit",
+        ] {
+            let (sql, params) = build_quantity_condition("si2", &SearchValue::parse(value), 2);
+            let expected: Vec<usize> = (2..2 + params.len()).collect();
+            assert_eq!(placeholders(&sql), expected, "{value}: {sql}");
+            // Every column is qualified: the chain's subqueries alias
+            // `search_index` several times over.
+            assert_eq!(
+                sql.matches("value_quantity_").count(),
+                sql.matches("si2.value_quantity_").count(),
+                "{value}: {sql}"
+            );
+        }
+    }
+
+    /// #1306: a value that is not a number matches nothing and binds nothing,
+    /// under `ne` too. It used to be compared as `0`.
+    #[test]
+    fn a_chained_non_number_matches_nothing_and_binds_nothing() {
+        for value in ["abc", "apabc", "neabc", "gt", "", "abc||mg", "|mg"] {
+            for build in [build_number_condition, build_quantity_condition] {
+                let (sql, params) = build("si1", &SearchValue::parse(value), 2);
+                assert_eq!(sql, "(FALSE)", "{value}");
+                assert!(params.is_empty(), "{value}: {params:?}");
+            }
+        }
+    }
+
+    /// The reverse (`_has`) terminal takes the same path.
+    #[test]
+    fn a_reverse_chained_date_binds_timestamps() {
+        let registry = registry_with(vec![
+            SearchParameterDefinition::new(
+                "http://hl7.org/fhir/SearchParameter/clinical-date",
+                "date",
+                SearchParamType::Date,
+                "Observation.effective",
+            )
+            .with_base(vec!["Observation"]),
+        ]);
+        let builder = ChainQueryBuilder::new("t", "Patient", registry).with_param_offset(1);
+        let rc = ReverseChainedParameter::terminal(
+            "Observation",
+            "subject",
+            "date",
+            SearchValue::parse("2020-01-01"),
+        );
+        let frag = builder.build_reverse_chain_sql(&rc).unwrap();
+
+        assert!(
+            frag.sql.contains(
+                "(si2.value_date >= $2 AND si2.value_date < $3 AND si2.value_date_end <= $3)"
+            ),
+            "{}",
+            frag.sql
+        );
+        assert_eq!(placeholders(&frag.sql), vec![1, 2, 3], "{}", frag.sql);
+        assert!(
+            frag.params
+                .iter()
+                .all(|p| matches!(p, SqlParam::Timestamp(_))),
+            "{:?}",
+            frag.params
         );
     }
 
@@ -1027,7 +1387,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            frag.sql.contains("value_token_system = $2")
+            frag.sql.contains("value_token_system IN ($2, ")
                 && frag.sql.contains("value_token_code = $3"),
             "both halves bound: {}",
             frag.sql
@@ -1058,7 +1418,7 @@ mod tests {
         let frag = builder.build_reverse_chain_sql(&rc).unwrap();
 
         assert!(
-            frag.sql.contains("value_token_system = $2")
+            frag.sql.contains("value_token_system IN ($2, ")
                 && frag.sql.contains("value_token_code = $3"),
             "both halves bound: {}",
             frag.sql
@@ -1069,6 +1429,75 @@ mod tests {
             frag.sql
         );
         assert_eq!(frag.params.len(), 2);
+    }
+
+    /// `system|` (#1389) means "any code in this system". It used to fall into
+    /// the `system|code` branch with an empty code, binding
+    /// `value_token_code = ''` and matching nothing. It must bind only the
+    /// system, and must not accept the implicit system the way `system|code`
+    /// does.
+    #[test]
+    fn a_chained_system_only_token_matches_any_code_in_the_system() {
+        let registry = obs_subject_patient_org_code();
+        let builder = ChainQueryBuilder::new("t", "Observation", registry);
+        let parsed = builder.parse_chain("subject.identifier").unwrap();
+        let frag = builder
+            .build_forward_chain_sql(&parsed, &SearchValue::eq("http://ex.org/mrn|"))
+            .unwrap();
+
+        assert!(
+            frag.sql
+                .contains("(si1.value_token_code IS NOT NULL AND si1.value_token_system = $2)"),
+            "system-only predicate: {}",
+            frag.sql
+        );
+        assert!(
+            !frag.sql.contains("value_token_code = $"),
+            "no code equality: {}",
+            frag.sql
+        );
+        assert!(
+            !frag.sql.contains(IMPLICIT_TOKEN_SYSTEM),
+            "the implicit system is not accepted: {}",
+            frag.sql
+        );
+        assert_eq!(frag.params.len(), 1);
+        assert!(matches!(&frag.params[0], SqlParam::Text(v) if v == "http://ex.org/mrn"));
+    }
+
+    /// Same, on the reverse-chain terminal, which is a separate copy of the
+    /// same match.
+    #[test]
+    fn a_reverse_chained_system_only_token_matches_any_code_in_the_system() {
+        let registry = obs_subject_patient_org_code();
+        let builder = ChainQueryBuilder::new("t", "Patient", registry);
+        let rc = ReverseChainedParameter {
+            source_type: "Observation".to_string(),
+            reference_param: "subject".to_string(),
+            search_param: "code".to_string(),
+            value: Some(SearchValue::eq("http://loinc.org|")),
+            nested: None,
+        };
+        let frag = builder.build_reverse_chain_sql(&rc).unwrap();
+
+        assert!(
+            frag.sql.contains("value_token_code IS NOT NULL AND ")
+                && frag.sql.contains("value_token_system = $2)"),
+            "system-only predicate: {}",
+            frag.sql
+        );
+        assert!(
+            !frag.sql.contains("value_token_code = $"),
+            "no code equality: {}",
+            frag.sql
+        );
+        assert!(
+            !frag.sql.contains(IMPLICIT_TOKEN_SYSTEM),
+            "the implicit system is not accepted: {}",
+            frag.sql
+        );
+        assert_eq!(frag.params.len(), 1);
+        assert!(matches!(&frag.params[0], SqlParam::Text(v) if v == "http://loinc.org"));
     }
 
     #[test]

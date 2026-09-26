@@ -29,12 +29,7 @@
       "value": "00-09-1F-80-07-3A"
     }
   ],
-  "location": {
-    "reference": "Location/2"
-  },
-  "parent": {
-    "reference": "Device/345675"
-  },
+  "definition": "http://hl7.org/fhir/DeviceDefinition/example",
   "udiCarrier": [
     {
       "deviceIdentifier": "39183189818",
@@ -70,6 +65,20 @@
         }
       ],
       "text": "MDC_MOC_VMS_MDS_SIMP: Personal Health Device"
+    }
+  ],
+  "deviceVersion": [
+    {
+      "type": {
+        "coding": [
+          {
+            "system": "urn:iso:std:iso:11073:10101",
+            "code": "532352"
+          }
+        ],
+        "text": "MDC_REG_CERT_DATA_CONTINUA_VERSION: Continua version"
+      },
+      "value": "1.0"
     }
   ],
   "conformsTo": [
@@ -132,6 +141,12 @@
       "valueBoolean": true
     }
   ],
+  "location": {
+    "reference": "Location/2"
+  },
+  "parent": {
+    "reference": "Device/345675"
+  },
   "meta": {
     "tag": [
       {

@@ -10,15 +10,17 @@
 #}
 <fieldset class="field">
   <legend class="field__label">{{ i18n.t("bulk-import-auth") }}</legend>
-  <span class="field__hint">{{ i18n.t("bulk-import-auth-hint") }}</span>
-  <label class="field">
+  {# No legend-level hint (#1108): the legend and the per-option hints
+     already say everything it did. `field--choice` lays each radio out as
+     control + text, with the hint indented under the text. #}
+  <label class="field field--choice">
     <input type="radio" name="auth" value="none"{% if auth_value == "none" %} checked{% endif %}>
-    {{ i18n.t("bulk-import-auth-none") }}
+    <span class="field__choice-label">{{ i18n.t("bulk-import-auth-none") }}</span>
     <span class="field__hint">{{ i18n.t("bulk-import-auth-none-hint") }}</span>
   </label>
-  <label class="field">
+  <label class="field field--choice">
     <input type="radio" name="auth" value="backend-services"{% if auth_value == "backend-services" %} checked{% endif %}>
-    {{ i18n.t("bulk-import-auth-backend") }}
+    <span class="field__choice-label">{{ i18n.t("bulk-import-auth-backend") }}</span>
     <span class="field__hint">{{ i18n.t("bulk-import-auth-backend-hint") }}</span>
   </label>
   <label class="field">

@@ -57,7 +57,17 @@
   ],
   "conclusion": "CT brains: large tumor sphenoid/clivus.",
   "conclusionCode": [
-    null
+    {
+      "concept": {
+        "coding": [
+          {
+            "system": "http://snomed.info/sct",
+            "code": "188340000",
+            "display": "Malignant tumor of craniopharyngeal duct"
+          }
+        ]
+      }
+    }
   ],
   "meta": {
     "tag": [

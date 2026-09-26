@@ -71,10 +71,12 @@ mod backend;
 mod bulk_export;
 mod bulk_provider;
 mod bulk_submit;
+mod login_sessions;
 mod schema;
 pub mod search;
 mod search_impl;
 mod storage;
+mod sync_failures;
 mod transaction;
 mod user_settings;
 

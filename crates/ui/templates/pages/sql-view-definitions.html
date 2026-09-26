@@ -86,7 +86,7 @@
       <input type="search" name="filter" value="{{ filter }}"
              placeholder="{{ i18n.t("vd-filter") }}" aria-label="{{ i18n.t("vd-filter") }}">
     </form>
-    {% call recent::group("vd-rail-recent", "vd-rail-list", rail_page, max_recent, i18n.t("sp-rail-recent"), recent_entries) %}{% endcall %}
+    {% call recent::group("vd-rail-recent", "vd-rail-list", rail_page, max_recent, i18n.t("sp-rail-recent"), recent_entries, false) %}{% endcall %}
     <div class="filter-rail__divider" aria-hidden="true"></div>
     <div class="filter-rail__heading filter-rail__heading--group">{{ i18n.t("vd-rail-all-heading") }}</div>
     <div class="filter-rail__list" id="vd-rail-list">
@@ -126,7 +126,7 @@
         <button type="submit" class="btn" form="vd-editor-form" name="action" value="duplicate">
           <span class="icon">{% include "icons/copy.svg" %}</span> {{ i18n.t("vd-duplicate") }}
         </button>
-        <button type="button" class="btn btn--danger" data-crud-delete
+        <button type="button" class="btn btn--danger btn--busy-slot" data-crud-delete
                 data-type="ViewDefinition" data-id="{{ sel.id }}"
                 data-confirm="{{ i18n.t_arg("vd-delete-confirm", "name", sel.name.to_string()) }}"
                 data-failed="{{ i18n.t("vd-delete-failed") }}"
@@ -241,9 +241,12 @@
      window.HfsEditorForm, window.HfsEditorPair) at the top of its IIFE.
      editor-form.js and editor-pair.js are loaded here, not from base.html,
      the same as the other two: nothing outside this page drives the
-     guided-form pairing through them yet. Loaded only on this page. -->
+     guided-form pairing through them yet. editor-add.js (#1239) loads
+     right before editor-form.js, which reads window.HfsEditorAdd when it
+     mounts. Loaded only on this page. -->
 <script src="/ui/assets/vendor/codemirror.bundle.js" defer></script>
 <script src="/ui/assets/code-editor.js" defer></script>
+<script src="/ui/assets/editor-add.js" defer></script>
 <script src="/ui/assets/editor-form.js" defer></script>
 <script src="/ui/assets/editor-pair.js" defer></script>
 <script src="/ui/assets/vd-editor.js" defer></script>

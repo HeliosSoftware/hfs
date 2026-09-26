@@ -120,9 +120,50 @@ pub struct ElasticsearchConfig {
     #[serde(default = "default_max_result_window")]
     pub max_result_window: u32,
 
+    /// Maximum nested objects one document may contain, summed across every
+    /// `nested` search-parameter field (default: 50000).
+    ///
+    /// Elasticsearch's own default of 10000 rejects the whole document, so a
+    /// resource with more indexed values than that — a Synthea `Provenance`
+    /// whose `target` array alone holds 13,554 references — is stored but
+    /// never searchable (#1050). The setting is dynamic: new indices take it
+    /// from the index template, existing ones are raised in
+    /// [`Backend::initialize`].
+    #[serde(default = "default_nested_objects_limit")]
+    pub nested_objects_limit: u32,
+
     /// Request timeout in milliseconds (default: 30000).
     #[serde(default = "default_request_timeout_ms")]
     pub request_timeout_ms: u64,
+
+    /// Upper bound, in bytes, on the documents one `_bulk` request carries
+    /// (default: 10 MiB), on top of the fixed per-request operation count.
+    ///
+    /// Without it a page of large resources becomes one oversized request: 500
+    /// Synthea `Provenance` documents of ~108 KB each is a ~54 MB body, which
+    /// outlives the client's request timeout and fails every resource in it
+    /// (#1125). A single document larger than the cap is still sent, alone.
+    /// `0` disables the byte cap, leaving only the operation count.
+    #[serde(default = "default_bulk_max_bytes")]
+    pub bulk_max_bytes: usize,
+
+    /// How many `_bulk` requests of one page may be in flight at once
+    /// (default: 1, one request at a time).
+    ///
+    /// Requests of a page never touch the same document, so they can be sent
+    /// together; what stays sequential is the chain a request produces — its
+    /// halves after a `413` or a timeout, and its `429` resends. Raising this
+    /// shortens a rebuild on a cluster that is not the bottleneck (#1125).
+    #[serde(default = "default_bulk_concurrency")]
+    pub bulk_concurrency: usize,
+
+    /// Refresh behavior for `$reindex` and the deferred rebuild's `_bulk`
+    /// writes (default: `None`, which follows [`Self::write_refresh`]).
+    ///
+    /// Lets a rebuild skip the per-request refresh wait (`False`) while
+    /// ordinary writes keep read-after-write visibility (`WaitFor`).
+    #[serde(default)]
+    pub reindex_refresh: Option<WriteRefreshPolicy>,
 
     /// Optional authentication.
     #[serde(default)]
@@ -158,8 +199,27 @@ fn default_max_result_window() -> u32 {
     10000
 }
 
+fn default_nested_objects_limit() -> u32 {
+    50_000
+}
+
 fn default_request_timeout_ms() -> u64 {
     30000
+}
+
+/// Default for [`ElasticsearchConfig::bulk_max_bytes`]: 10 MiB.
+pub const DEFAULT_BULK_MAX_BYTES: usize = 10 * 1024 * 1024;
+
+fn default_bulk_max_bytes() -> usize {
+    DEFAULT_BULK_MAX_BYTES
+}
+
+/// Default for [`ElasticsearchConfig::bulk_concurrency`]: one request at a
+/// time, which is what every release before #1125 did.
+pub const DEFAULT_BULK_CONCURRENCY: usize = 1;
+
+fn default_bulk_concurrency() -> usize {
+    DEFAULT_BULK_CONCURRENCY
 }
 
 impl Default for ElasticsearchConfig {
@@ -172,7 +232,11 @@ impl Default for ElasticsearchConfig {
             refresh_interval: default_refresh_interval(),
             write_refresh: WriteRefreshPolicy::default(),
             max_result_window: default_max_result_window(),
+            nested_objects_limit: default_nested_objects_limit(),
             request_timeout_ms: default_request_timeout_ms(),
+            bulk_max_bytes: default_bulk_max_bytes(),
+            bulk_concurrency: default_bulk_concurrency(),
+            reindex_refresh: None,
             auth: None,
             disable_certificate_validation: false,
             fhir_version: FhirVersion::default_enabled(),
@@ -193,6 +257,10 @@ pub struct ElasticsearchBackend {
     /// Per-tenant search parameter registries (a shared base plus per-tenant
     /// overlays). Shared with the primary backend for consistency.
     registries: Arc<TenantSearchRegistries>,
+    /// Indices whose mapping this process has already reconciled with
+    /// `schema::SCHEMA_VERSION` (or found it cannot), so `ensure_index` checks
+    /// each index once per process rather than on every write (#1335).
+    schema_checked: parking_lot::Mutex<std::collections::HashSet<String>>,
 }
 
 impl Debug for ElasticsearchBackend {
@@ -283,6 +351,7 @@ impl ElasticsearchBackend {
             client,
             config,
             registries,
+            schema_checked: Default::default(),
         })
     }
 
@@ -302,6 +371,7 @@ impl ElasticsearchBackend {
             client,
             config,
             registries,
+            schema_checked: Default::default(),
         })
     }
 
@@ -355,6 +425,17 @@ impl ElasticsearchBackend {
         &self.client
     }
 
+    /// Whether this process has already reconciled `index`'s mapping.
+    pub(super) fn is_schema_checked(&self, index: &str) -> bool {
+        self.schema_checked.lock().contains(index)
+    }
+
+    /// Records that `index`'s mapping needs no further reconciling by this
+    /// process.
+    pub(super) fn mark_schema_checked(&self, index: &str) {
+        self.schema_checked.lock().insert(index.to_string());
+    }
+
     /// Returns the backend configuration.
     pub fn config(&self) -> &ElasticsearchConfig {
         &self.config
@@ -362,6 +443,35 @@ impl ElasticsearchBackend {
 
     pub(crate) fn write_refresh_param(&self) -> Option<elasticsearch::params::Refresh> {
         self.config.write_refresh.as_refresh_param()
+    }
+
+    /// The refresh policy a rebuild's `_bulk` writes use: the configured
+    /// [`ElasticsearchConfig::reindex_refresh`], or the ordinary write policy
+    /// when none is set.
+    pub(crate) fn reindex_refresh_param(&self) -> Option<elasticsearch::params::Refresh> {
+        self.config
+            .reindex_refresh
+            .unwrap_or(self.config.write_refresh)
+            .as_refresh_param()
+    }
+
+    /// The byte budget of one `_bulk` request, or `usize::MAX` when the cap
+    /// is disabled (`0`).
+    pub(crate) fn bulk_max_bytes(&self) -> usize {
+        match self.config.bulk_max_bytes {
+            0 => usize::MAX,
+            bytes => bytes,
+        }
+    }
+
+    /// The client's per-request timeout, as configured.
+    pub(crate) fn request_timeout_ms(&self) -> u64 {
+        self.config.request_timeout_ms
+    }
+
+    /// How many `_bulk` requests of one page may be in flight, never below 1.
+    pub(crate) fn bulk_concurrency(&self) -> usize {
+        self.config.bulk_concurrency.max(1)
     }
 
     /// Returns the per-tenant search parameter registries (shared base + tenant
@@ -540,7 +650,34 @@ impl Backend for ElasticsearchBackend {
                 backend_name: "elasticsearch".to_string(),
                 message: format!("Failed to create index template: {}", e),
                 source: None,
-            })
+            })?;
+
+        // The template only reaches indices created from now on. Indices that
+        // already exist keep Elasticsearch's 10000 nested-object limit until
+        // raised here (#1050). Not fatal: a missing `manage` privilege must not
+        // stop the server, and every resource under the old limit still
+        // indexes.
+        let limit = self.config().nested_objects_limit;
+        match super::schema::raise_nested_objects_limit(self).await {
+            Ok(0) => {}
+            Ok(raised) => tracing::info!(
+                indices = raised,
+                limit,
+                "raised the Elasticsearch nested-object limit on existing indices"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                limit,
+                "could not raise the Elasticsearch nested-object limit on existing indices; \
+                 resources with more nested values than an index's current limit stay unsearchable"
+            ),
+        }
+
+        // Likewise the template's *mapping* only reaches new indices. Bring
+        // existing ones up to `SCHEMA_VERSION` (#1335). Never fatal: each
+        // failure is logged with its index, which then keeps its old mapping.
+        super::schema::reconcile_index_mappings(self).await;
+        Ok(())
     }
 
     async fn migrate(&self) -> Result<(), BackendError> {
@@ -721,6 +858,46 @@ mod tests {
         assert_eq!(config.number_of_shards, 1);
         assert_eq!(config.number_of_replicas, 1);
         assert_eq!(config.nodes, vec!["http://localhost:9200"]);
+        assert_eq!(config.request_timeout_ms, 30_000);
+        assert_eq!(config.bulk_max_bytes, DEFAULT_BULK_MAX_BYTES);
+        assert_eq!(config.reindex_refresh, None);
+    }
+
+    /// A rebuild follows the ordinary write policy unless it is given its
+    /// own, and a byte cap of `0` means "no cap", not "nothing fits" (#1125).
+    #[test]
+    fn reindex_refresh_falls_back_to_write_refresh_and_zero_bytes_is_uncapped() {
+        let backend = |write_refresh, reindex_refresh, bulk_max_bytes| {
+            ElasticsearchBackend::new(ElasticsearchConfig {
+                write_refresh,
+                reindex_refresh,
+                bulk_max_bytes,
+                ..Default::default()
+            })
+            .expect("client construction is lazy")
+        };
+        let follows = backend(WriteRefreshPolicy::WaitFor, None, 0);
+        assert!(matches!(
+            follows.reindex_refresh_param(),
+            Some(elasticsearch::params::Refresh::WaitFor)
+        ));
+        assert!(matches!(
+            follows.write_refresh_param(),
+            Some(elasticsearch::params::Refresh::WaitFor)
+        ));
+        assert_eq!(follows.bulk_max_bytes(), usize::MAX);
+
+        let own = backend(
+            WriteRefreshPolicy::WaitFor,
+            Some(WriteRefreshPolicy::False),
+            4096,
+        );
+        assert!(own.reindex_refresh_param().is_none());
+        assert!(matches!(
+            own.write_refresh_param(),
+            Some(elasticsearch::params::Refresh::WaitFor)
+        ));
+        assert_eq!(own.bulk_max_bytes(), 4096);
     }
 
     /// The method-level view of the injective derivation. The exhaustive
