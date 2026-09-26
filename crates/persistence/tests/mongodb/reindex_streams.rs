@@ -7,11 +7,19 @@
 use super::*;
 
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use helios_persistence::search::{ReindexSource, ResourcePage, TypeWalkPlan, TypeWalkRequest};
+use async_trait::async_trait;
+use helios_persistence::error::StorageResult;
+use helios_persistence::search::{
+    ReindexOperation, ReindexRequest, ReindexSource, ReindexStatus, ReindexTarget, ResourcePage,
+    TypeWalkPlan, TypeWalkRequest,
+};
+use helios_persistence::types::StoredResource;
 
 use super::reindex_id_walk::{
-    backdate_fixture, capture_walk_logs, seed_walk_fixture, walk_log_lines,
+    backdate_fixture, capture_walk_logs, seed_walk_fixture, snapshot, wait_for_terminal,
+    walk_log_lines,
 };
 use super::reindex_pipeline::{create_backend_with_pool, log_field_value};
 
@@ -518,4 +526,440 @@ async fn mongodb_id_phase_done_cursor_runs_the_catch_up_from_its_floor() {
         walk_log_lines(&["mongodb reindex walk started", &needle]).is_empty(),
         "a catch-up cursor never restarts the walk"
     );
+}
+
+/// A mutation run from inside a source fetch.
+type Mutation = Box<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+
+/// Delegates every `ReindexSource` method to a real backend, and counts what
+/// the id ranges return: fetches whose cursor carries the backend's range tag
+/// `v2|r|`, ahead fetches included when they return a page. Keeps every plan
+/// it hands the driver, and can run a mutation once, right after the first
+/// fetch of one range returns and before the driver gets that page (#1403).
+struct RangeCountingSource {
+    inner: Arc<MongoBackend>,
+    range_fetches: AtomicU64,
+    range_resources: AtomicU64,
+    plans: std::sync::Mutex<Vec<TypeWalkPlan>>,
+    trigger: Option<(usize, Mutation)>,
+    fired: AtomicBool,
+}
+
+impl RangeCountingSource {
+    fn new(inner: Arc<MongoBackend>) -> Self {
+        Self {
+            inner,
+            range_fetches: AtomicU64::new(0),
+            range_resources: AtomicU64::new(0),
+            plans: std::sync::Mutex::new(Vec::new()),
+            trigger: None,
+            fired: AtomicBool::new(false),
+        }
+    }
+
+    /// Runs `mutation` once, after the first fetch of range `range` (the
+    /// cursor the plan handed out for it) returns.
+    fn with_trigger(mut self, range: usize, mutation: Mutation) -> Self {
+        self.trigger = Some((range, mutation));
+        self
+    }
+
+    fn count(&self, cursor: Option<&str>, page: &ResourcePage) {
+        if cursor.is_some_and(|c| c.starts_with("v2|r|")) {
+            self.range_fetches.fetch_add(1, Ordering::SeqCst);
+            self.range_resources
+                .fetch_add(page.resources.len() as u64, Ordering::SeqCst);
+        }
+    }
+
+    fn range_start(&self, range: usize) -> Option<String> {
+        match self.plans.lock().unwrap().last() {
+            Some(TypeWalkPlan::Ranges { ranges, .. }) => ranges.get(range).cloned(),
+            _ => None,
+        }
+    }
+}
+
+#[async_trait]
+impl ReindexSource for RangeCountingSource {
+    async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
+        self.inner.list_resource_types(tenant).await
+    }
+
+    async fn count_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+    ) -> StorageResult<u64> {
+        self.inner.count_resources(tenant, resource_type).await
+    }
+
+    async fn fetch_resources_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> StorageResult<ResourcePage> {
+        let page = self
+            .inner
+            .fetch_resources_page(tenant, resource_type, cursor, limit)
+            .await?;
+        self.count(cursor, &page);
+        Ok(page)
+    }
+
+    async fn fetch_resources_page_capped(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<ResourcePage> {
+        let page = self
+            .inner
+            .fetch_resources_page_capped(tenant, resource_type, cursor, limit, max_bytes)
+            .await?;
+        self.count(cursor, &page);
+        if let Some((range, mutation)) = &self.trigger
+            && cursor.is_some()
+            && cursor.map(str::to_string) == self.range_start(*range)
+            && !self.fired.swap(true, Ordering::SeqCst)
+        {
+            mutation().await;
+        }
+        Ok(page)
+    }
+
+    async fn fetch_resources_by_ids(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[String],
+    ) -> StorageResult<Vec<StoredResource>> {
+        self.inner
+            .fetch_resources_by_ids(tenant, resource_type, ids)
+            .await
+    }
+
+    fn may_prefetch_page(&self, cursor: &str) -> bool {
+        self.inner.may_prefetch_page(cursor)
+    }
+
+    async fn fetch_resources_page_ahead(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: &str,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<Option<ResourcePage>> {
+        let page = self
+            .inner
+            .fetch_resources_page_ahead(tenant, resource_type, cursor, limit, max_bytes)
+            .await?;
+        if let Some(page) = &page {
+            self.count(Some(cursor), page);
+        }
+        Ok(page)
+    }
+
+    async fn plan_type_walk(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        request: TypeWalkRequest,
+    ) -> StorageResult<TypeWalkPlan> {
+        let plan = self
+            .inner
+            .plan_type_walk(tenant, resource_type, request)
+            .await?;
+        self.plans.lock().unwrap().push(plan.clone());
+        Ok(plan)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mongodb_reindex_write_streams_match_single_stream() {
+    let Some(backend) = create_streams_backend("reindex_streams_match_single").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant_a = create_tenant("streams-match-a");
+    let tenant_b = create_tenant("streams-match-b");
+    let fixture_a = seed_walk_fixture(&backend, &tenant_a, 2_000, "extra").await;
+    backdate_fixture(&backend, &tenant_a, &fixture_a).await;
+    let fixture_b = seed_walk_fixture(&backend, &tenant_b, 200, "extra").await;
+    backdate_fixture(&backend, &tenant_b, &fixture_b).await;
+    let live_observations = fixture_a.live["Observation"].len() as u64;
+
+    let plan = backend
+        .plan_type_walk(
+            &tenant_a,
+            "Observation",
+            TypeWalkRequest {
+                streams: 4,
+                min_resources_per_stream: 500,
+                concurrent_runs: 1,
+            },
+        )
+        .await
+        .unwrap();
+    match &plan {
+        TypeWalkPlan::Ranges { ranges, catch_up } => {
+            assert_eq!(ranges.len(), 4, "{plan:?}");
+            assert!(ranges.iter().all(|c| c.starts_with("v2|r|")), "{ranges:?}");
+            assert!(catch_up.starts_with("v2|d|"), "{catch_up}");
+        }
+        TypeWalkPlan::Single => {
+            panic!("2,000 Observations at 500 per stream must plan four ranges")
+        }
+    }
+
+    let db = backend.get_database().await.unwrap();
+    let tenant_b_before = snapshot(&db, "streams-match-b", false).await;
+
+    let mut snapshots = Vec::new();
+    for (label, streams, batch_bytes) in [
+        ("one stream", 1, 0),
+        ("four streams", 4, 0),
+        ("four streams, 4 KiB pages", 4, 4096),
+    ] {
+        let source = Arc::new(RangeCountingSource::new(backend.clone()));
+        let op = ReindexOperation::with_parts(
+            source.clone(),
+            vec![backend.clone() as Arc<dyn ReindexTarget>],
+            backend.tenant_registries().clone(),
+        );
+        let job = op
+            .start(
+                tenant_a.clone(),
+                ReindexRequest::for_types(["Observation"])
+                    .with_batch_size(100)
+                    .with_batch_bytes(batch_bytes)
+                    .with_write_streams(streams)
+                    .with_min_resources_per_stream(500)
+                    .clear_existing(),
+                None,
+            )
+            .await
+            .unwrap();
+        let progress = wait_for_terminal(&op, &job).await;
+        assert_eq!(
+            progress.status,
+            ReindexStatus::Completed,
+            "{label}: {progress:?}"
+        );
+        assert!(progress.errors.is_empty(), "{label}: {:?}", progress.errors);
+        if streams > 1 {
+            assert_eq!(
+                source.range_resources.load(Ordering::SeqCst),
+                live_observations,
+                "{label}: the ranges must return every live Observation exactly once"
+            );
+            let plans = source.plans.lock().unwrap().clone();
+            assert!(
+                matches!(plans.as_slice(), [TypeWalkPlan::Ranges { ranges, .. }] if ranges.len() == 4),
+                "{label}: {plans:?}"
+            );
+        } else {
+            assert_eq!(
+                source.range_fetches.load(Ordering::SeqCst),
+                0,
+                "{label}: a single walk never uses a range cursor"
+            );
+        }
+        snapshots.push((label, snapshot(&db, "streams-match-a", false).await));
+    }
+
+    let (_, baseline) = &snapshots[0];
+    assert!(
+        !baseline.0.is_empty(),
+        "the single-stream rebuild must have written search_index rows"
+    );
+    for (label, rows) in &snapshots[1..] {
+        assert_eq!(
+            rows, baseline,
+            "{label}: rows differ from the single-stream rebuild"
+        );
+    }
+    assert_eq!(
+        snapshot(&db, "streams-match-b", false).await,
+        tenant_b_before,
+        "tenant B's rows must be untouched"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mongodb_streams_catch_up_indexes_a_resource_created_during_the_ranges() {
+    use helios_persistence::core::{BulkProcessingOptions, BulkSubmitProvider, NdjsonEntry};
+
+    let Some(backend) = create_streams_backend("reindex_streams_catch_up").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("streams-catch-up");
+    let fixture = seed_walk_fixture(&backend, &tenant, 800, "extra").await;
+    backdate_fixture(&backend, &tenant, &fixture).await;
+    let (submission, manifest) = super::bulk_submit::seed(&backend, &tenant).await;
+    let live_observations = fixture.live["Observation"].len() as u64;
+
+    let mutation_backend = backend.clone();
+    let mutation_tenant = tenant.clone();
+    let mutation: Mutation = Box::new(move || {
+        let backend = mutation_backend.clone();
+        let tenant = mutation_tenant.clone();
+        let submission = submission.clone();
+        let manifest = manifest.clone();
+        Box::pin(async move {
+            backend
+                .process_entries(
+                    &tenant,
+                    &submission,
+                    &manifest,
+                    vec![NdjsonEntry::new(
+                        1,
+                        "Observation",
+                        json!({
+                            "resourceType": "Observation",
+                            "id": "--created-mid-walk",
+                            "status": "final",
+                            "code": { "coding": [{ "system": "http://loinc.org", "code": "8867-4" }] },
+                        }),
+                    )],
+                    &BulkProcessingOptions::new().with_defer_indexing(true),
+                )
+                .await
+                .unwrap();
+            // A deferred create writes no search rows of its own, so rows
+            // found at the end can only come from the rebuild.
+            assert_eq!(
+                search_index_entry_count(&backend, &tenant, "Observation", "--created-mid-walk")
+                    .await,
+                0
+            );
+        }) as futures::future::BoxFuture<'static, ()>
+    });
+    let source = Arc::new(RangeCountingSource::new(backend.clone()).with_trigger(1, mutation));
+    let op = ReindexOperation::with_parts(
+        source.clone(),
+        vec![backend.clone() as Arc<dyn ReindexTarget>],
+        backend.tenant_registries().clone(),
+    );
+    let job = op
+        .start(
+            tenant.clone(),
+            ReindexRequest::for_types(["Observation"])
+                .with_batch_size(50)
+                .with_write_streams(4)
+                .with_min_resources_per_stream(100),
+            None,
+        )
+        .await
+        .unwrap();
+    let progress = wait_for_terminal(&op, &job).await;
+    assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+    assert!(
+        source.fired.load(Ordering::SeqCst),
+        "the create ran during range 1"
+    );
+    assert!(source.range_fetches.load(Ordering::SeqCst) > 0);
+    assert_eq!(
+        source.range_resources.load(Ordering::SeqCst),
+        live_observations,
+        "the ranges walk exactly the Observations stamped before the floor"
+    );
+    assert!(
+        search_index_entry_count(&backend, &tenant, "Observation", "--created-mid-walk").await > 0,
+        "the catch-up must index a resource created while the ranges ran"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mongodb_streams_log_id_phase_finished_after_every_range_page_is_written() {
+    let Some(backend) = create_streams_backend("reindex_streams_log_order").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("streams-log-order");
+    let fixture = seed_walk_fixture(&backend, &tenant, 400, "extra").await;
+    backdate_fixture(&backend, &tenant, &fixture).await;
+
+    capture_walk_logs();
+    let saw_transition_early = Arc::new(AtomicBool::new(false));
+    let probe = Arc::new(super::reindex_pipeline::PhaseLogProbeTarget {
+        backend: backend.clone(),
+        saw_transition_early: saw_transition_early.clone(),
+    });
+    let op = ReindexOperation::with_parts(
+        backend.clone(),
+        vec![probe as Arc<dyn ReindexTarget>],
+        backend.tenant_registries().clone(),
+    );
+    let job = op
+        .start(
+            tenant.clone(),
+            ReindexRequest::for_types(["Observation"])
+                .with_batch_size(50)
+                .with_write_streams(4)
+                .with_min_resources_per_stream(50),
+            None,
+        )
+        .await
+        .unwrap();
+    let progress = wait_for_terminal(&op, &job).await;
+    assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+    assert!(
+        !saw_transition_early.load(Ordering::SeqCst),
+        "id phase finished must never be logged while a range page is being written"
+    );
+
+    let needle = format!("tenant={}", tenant.tenant_id().as_str());
+    assert_eq!(
+        walk_log_lines(&["mongodb reindex walk started", &needle]).len(),
+        1,
+        "the plan fixes the floor once for the whole type"
+    );
+    assert_eq!(
+        walk_log_lines(&["mongodb reindex id phase finished", &needle]).len(),
+        1
+    );
+    let planned = walk_log_lines(&["mongodb reindex streams planned", &needle]);
+    assert_eq!(planned.len(), 1, "{planned:?}");
+    assert_eq!(
+        log_field_value(&planned[0], "requested"),
+        "4",
+        "{}",
+        planned[0]
+    );
+    assert_eq!(
+        log_field_value(&planned[0], "allowed"),
+        "4",
+        "{}",
+        planned[0]
+    );
+    assert_eq!(
+        log_field_value(&planned[0], "streams"),
+        "4",
+        "{}",
+        planned[0]
+    );
+    let ranges = walk_log_lines(&["mongodb reindex id range finished", &needle]);
+    assert_eq!(ranges.len(), 4, "{ranges:?}");
+    for line in &ranges {
+        assert_eq!(
+            field_names_after(line, "mongodb reindex id range finished"),
+            ["tenant", "resource_type", "floor", "lo", "hi"]
+        );
+    }
+    let open_lo = ranges
+        .iter()
+        .filter(|l| log_field_value(l, "lo") == "*")
+        .count();
+    let open_hi = ranges
+        .iter()
+        .filter(|l| log_field_value(l, "hi") == "*")
+        .count();
+    assert_eq!((open_lo, open_hi), (1, 1), "{ranges:?}");
 }

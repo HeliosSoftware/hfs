@@ -1826,9 +1826,9 @@ async fn mongodb_integration_reindex_run_parity_across_knobs() {
 /// write's own execution window could have raced. Checking only "present
 /// after" would also flag a page that runs after an earlier page already
 /// logged the transition, which is not a race at all (#1403).
-struct PhaseLogProbeTarget {
-    backend: Arc<MongoBackend>,
-    saw_transition_early: Arc<std::sync::atomic::AtomicBool>,
+pub(super) struct PhaseLogProbeTarget {
+    pub(super) backend: Arc<MongoBackend>,
+    pub(super) saw_transition_early: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[async_trait]
