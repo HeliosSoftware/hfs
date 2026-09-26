@@ -108,6 +108,8 @@ fn test_mongodb_config_defaults() {
     assert_eq!(config.server_selection_timeout_ms, 15_000);
     assert!(!config.search_offloaded);
     assert_eq!(config.fhir_version, FhirVersion::default());
+    // #1403: the `$reindex` walk's clock-skew and commit-lag allowance.
+    assert_eq!(config.reindex_catch_up_margin_ms, 120_000);
 }
 
 #[test]
@@ -1142,6 +1144,10 @@ async fn mongodb_conditional_patch() {
 /// Same `#[path]` arrangement.
 #[path = "search/versioned_write_race_suite.rs"]
 mod versioned_write_race_suite;
+
+/// #1403: the id-order `$reindex` walk and its catch-up rounds.
+#[path = "mongodb/reindex_id_walk.rs"]
+mod reindex_id_walk;
 
 /// #1405: of several writers holding the same version, one `update` writes and
 /// every loser is a `ConcurrencyError` — the server's `WriteConflict` used to
@@ -10806,7 +10812,13 @@ mod bulk_submit {
 
     /// Creates a submission with one fetchable manifest — the shape the REST
     /// kickoff handler produces.
-    async fn seed(backend: &MongoBackend, tenant: &TenantContext) -> (SubmissionId, String) {
+    ///
+    /// `pub(super)` so the sibling `#[path]`-included `reindex_id_walk.rs`
+    /// module can reach it as `super::bulk_submit::seed` (#1403 P11).
+    pub(super) async fn seed(
+        backend: &MongoBackend,
+        tenant: &TenantContext,
+    ) -> (SubmissionId, String) {
         let id = SubmissionId::generate("data-provider");
         backend.create_submission(tenant, &id, None).await.unwrap();
         let manifest = backend

@@ -355,6 +355,7 @@ where
         max_included_resources,
         index_build,
         app_name: MongoBackendConfig::default().app_name,
+        reindex_catch_up_margin_ms: MongoBackendConfig::default().reindex_catch_up_margin_ms,
     })
 }
 
