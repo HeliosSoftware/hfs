@@ -629,8 +629,14 @@ curl -X POST http://localhost:8080/ \
 It is a `code` with a required binding to `http://hl7.org/fhir/ValueSet/http-verb`,
 whose concepts are `caseSensitive: true` and uppercase in every supported FHIR
 version — so a lowercase `"post"` is invalid instance data and is refused with
-`400`, not silently accepted. `GET`, `POST`, `PUT` and `DELETE` dispatch; `PATCH`
-and `HEAD` are refused as described under Current Limitations.
+`400`, not silently accepted. `GET`, `POST`, `PUT`, `PATCH` and `DELETE` dispatch;
+`HEAD` is refused as described under Current Limitations.
+
+A `PATCH` entry's `resource` is a FHIRPath Patch `Parameters` resource in every
+version, or, from R5, a `Binary` carrying a JSON Patch
+(`contentType: application/json-patch+json`). A `Binary` patch in an R4/R4B
+bundle is `501 not-supported`. A Bundle has no encoding for JSON Merge Patch.
+The patched resource goes through the same write-path validation as a `PUT`.
 
 ### Per-entry outcomes
 
@@ -648,17 +654,17 @@ search entry and the same search at `GET [base]/[type]?…`.
 | `request.url` absent | 400 | `required` |
 | `request.url` names nothing | 400 | `value` |
 | `resource` absent on `POST`/`PUT` | 400 | `invalid` |
-| `PUT`/`DELETE` URL names no instance | 400 | `value` |
+| `PUT`/`PATCH`/`DELETE` URL names no instance | 400 | `value` |
 | criteria in a `POST` entry's URL | 400 | `value` |
 | URL criteria that decode to nothing | 400 | `value` |
-| `ifMatch` on a conditional entry | 400 | `invalid` |
+| `ifMatch` beside `ifNoneExist` | 400 | `invalid` |
 | insufficient scope | 403 | `forbidden` |
 | target not found | 404 | `not-found` |
 | search entry failed (`_query`, `:not-in`, …) | per class | `invalid`, `not-supported`, … |
 | `HEAD` | 405 | `not-supported` |
 | `ifMatch` precondition failed | 412 | `conflict` |
 | write validation failed | 422 | the validator's own issues |
-| `PATCH` | 501 | `not-supported` |
+| `Binary` JSON Patch in an R4/R4B bundle | 501 | `not-supported` |
 | storage error | per class | `deleted`, `conflict`, `multiple-matches`, `transient`, `timeout`, `exception`, … |
 
 An entry that fails enforce-mode write validation carries the validator's **full
@@ -671,8 +677,8 @@ and an unusable value does not apply.
 
 ### Conditional Operations in Bundles
 
-- `ifMatch` — **supported.** ETag for optimistic locking on `PUT` **and `DELETE`**
-  entries, in both `batch` and `transaction` bundles. Parsed as the comma-separated
+- `ifMatch` — **supported.** ETag for optimistic locking on `PUT`, `PATCH` **and
+  `DELETE`** entries, in both `batch` and `transaction` bundles. Parsed as the comma-separated
   list RFC 9110 §13.1.1 defines: satisfied when any supplied entity-tag matches.
 - `ifNoneMatch` — **parsed and ignored.** `parse_bundle_entry` populates
   `BundleEntry.if_none_match`; no handler or backend reads it.
@@ -690,34 +696,38 @@ and an unusable value does not apply.
   bundle fails at that entry rather than creating a duplicate.
 
 Conditional interactions expressed in the entry URL (`PUT [type]?[criteria]`,
-`DELETE [type]?[criteria]`):
+`DELETE [type]?[criteria]`, `PATCH [type]?[criteria]`):
 
 - In a `batch`, they are **resolved** with the status mapping the resource
   endpoints use. `PUT`: one match updates (`200`, `location` = `[type]/[id]`), no
   match creates (`201`), several matches `412`. `DELETE`: deleted or no match
   `204`, several matches `412` (`/metadata` elects `conditionalDelete: "single"`).
+  `PATCH`: one match is patched (`200`), no match `404`, several matches `412`.
   The criteria are percent-decoded like a request URL's query, with repeated
   parameters kept. A bundle carrying a conditional entry runs its entries
   serially, because the backends resolve criteria as read-then-write rather than
-  compare-and-swap. `ifMatch` on a conditional entry is `400`: it names a
-  version of an instance the server has yet to resolve. Criteria on a `POST` are
-  `400`; a conditional create is expressed through `ifNoneExist`.
+  compare-and-swap. `ifMatch` on a conditional entry is evaluated against the
+  resource the criteria resolve to (#1381): an unsatisfied tag is `412`, and so
+  is any `ifMatch` on a `PUT` or `DELETE` whose criteria matched nothing, so a
+  guarded `PUT` never falls through to a create. `ifMatch` beside `ifNoneExist`
+  is `400`. Criteria on a `POST` are `400`; a conditional create is expressed
+  through `ifNoneExist`.
 - In a `transaction`, any non-`GET` entry whose URL carries a query string still
   declines the whole bundle with `400 not-supported` before anything executes.
   Resolving URL criteria inside a transaction's atomic scope needs a search
   surface on the `Transaction` trait and the R4 §3.1.0.11.2 overlapping-identity
   pre-pass, and is tracked by #859.
 
-Note that `/metadata` advertises `conditionalCreate`, `conditionalUpdate` and
-`conditionalDelete` for every resource type regardless of backend; gating it per
-backend is #514.
+`/metadata` advertises `conditionalCreate`, `conditionalUpdate`,
+`conditionalDelete` and (from R5) `conditionalPatch` from what the storage
+backend really serves (`ConditionalStorage::supports_conditional`, #1384). A
+conditional `batch` entry for an interaction the backend does not serve is `501`.
 
 ### Current Limitations
 
 The following FHIR transaction features are not yet implemented:
 - **Conditional URL criteria in transactions** - `[type]?[criteria]` entries are declined whole in a `transaction` (resolved in a `batch`; #859)
-- **Conditional reference resolution** - References like `Patient?identifier=12345` are not resolved
-- **PATCH method** - PATCH operations in bundles return `501 not-supported`, in both `batch` (per entry) and `transaction` (whole bundle). Send the patch to the instance endpoint instead
+- **Conditional reference resolution in batches** - a `transaction` resolves references like `Patient?identifier=12345` in its resources (#459): one match rewrites the reference to `Type/id`, and zero or several fail the bundle. A `batch` leaves them as written
 - **HEAD entries** - refused with `405 not-supported`. `HEAD` is a legal `http-verb` code and is served on the instance-read route, but not inside a Bundle
 - **Prefer header** - `return=minimal` and `return=OperationOutcome` not honored
 - **Duplicate detection** - Same resource appearing twice in a transaction is not detected
