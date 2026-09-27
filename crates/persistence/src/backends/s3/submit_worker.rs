@@ -556,10 +556,13 @@ impl SubmitClaimStrategy for S3Backend {
             };
 
             // Eligible: never started, or held by a worker that stopped
-            // heartbeating. Anything terminal leaves the queue instead.
+            // heartbeating. A `processing` manifest with no lease stays put: a
+            // synchronous `process_entries` caller is ingesting it right now,
+            // having promoted it without taking a lease (#1530). Anything
+            // terminal leaves the queue instead.
             let eligible = match state.manifest.status {
                 ManifestStatus::Pending => true,
-                ManifestStatus::Processing => state.lease_expiry.is_none_or(|expiry| expiry < now),
+                ManifestStatus::Processing => state.lease_expiry.is_some_and(|expiry| expiry < now),
                 ManifestStatus::Completed | ManifestStatus::Failed | ManifestStatus::Replaced => {
                     self.dequeue_manifest(&tenant, &id, &manifest_id).await?;
                     false
