@@ -628,7 +628,7 @@ impl SubmitClaimStrategy for IndexingSubmitJobs {
         self.inner.heartbeat(lease).await
     }
 
-    async fn release(&self, lease: ManifestLease) -> StorageResult<()> {
+    async fn release(&self, lease: ManifestLease) -> StorageResult<bool> {
         self.inner.release(lease).await
     }
 }

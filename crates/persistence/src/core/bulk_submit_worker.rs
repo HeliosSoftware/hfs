@@ -268,8 +268,28 @@ pub trait SubmitClaimStrategy: Send + Sync {
     /// `LeaseError::LeaseLost` if the manifest was reclaimed.
     async fn heartbeat(&self, lease: &ManifestLease) -> Result<DateTime<Utc>, LeaseError>;
 
-    /// Releases a lease early (graceful shutdown). Best-effort.
-    async fn release(&self, lease: ManifestLease) -> StorageResult<()>;
+    /// Hands a lease back early, on graceful shutdown, so another worker can
+    /// claim the manifest at once instead of waiting out the lease (#1531).
+    ///
+    /// The manifest goes back to `pending`, fenced on `worker_id` +
+    /// `fencing_token` and on still being `processing`. A later claim then
+    /// finds it in the same state as a manifest whose lease lapsed, and that
+    /// path is already safe:
+    ///
+    /// - there is no attempt counter to refund;
+    /// - the next run walks every file again from the top, and entries
+    ///   already committed upsert idempotently. Each line is charged to the
+    ///   counters once however many runs walk it (#1127), and byte progress
+    ///   only moves forward (`MAX`);
+    /// - result artifacts are published only together with the terminal
+    ///   state, which a released run never reaches;
+    /// - the deferred-index marker (#1125) is only set by a run that
+    ///   finished.
+    ///
+    /// Returns whether the lease was released. `false` means this worker no
+    /// longer held it (reclaimed, or moved out of `processing` by an abort),
+    /// and nothing was written.
+    async fn release(&self, lease: ManifestLease) -> StorageResult<bool>;
 }
 
 /// Every bulk-submit storage is the ledger the deferred rebuild clears when it
@@ -695,6 +715,8 @@ pub struct DefaultSubmitWorker<Js: ?Sized, Fetcher: ?Sized, Os: ?Sized> {
     /// Leave content-identical resources untouched instead of writing a new
     /// version (`HFS_BULK_SUBMIT_SKIP_UNCHANGED`, #1127).
     skip_unchanged: bool,
+    /// Tripped on graceful shutdown; see [`Self::with_shutdown`].
+    shutdown: tokio_util::sync::CancellationToken,
 }
 
 /// Services captured by the opt-in executor for independent file tasks.
@@ -1240,6 +1262,26 @@ where
     }
 }
 
+/// Trips a run's [`CancelToken`] when the server starts shutting down, so the
+/// ingest stops at its next batch boundary (#1531). Dropping the bridge stops
+/// the task.
+struct ShutdownBridge(tokio::task::JoinHandle<()>);
+
+impl ShutdownBridge {
+    fn spawn(shutdown: tokio_util::sync::CancellationToken, cancel: CancelToken) -> Self {
+        Self(tokio::spawn(async move {
+            shutdown.cancelled().await;
+            cancel.cancel();
+        }))
+    }
+}
+
+impl Drop for ShutdownBridge {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Logs a claimed manifest winding down before its natural end.
 ///
 /// A cancelled manifest is deliberately left untouched: `abort_submission`
@@ -1299,7 +1341,22 @@ where
             owned_file_executor: None,
             batch_size: None,
             skip_unchanged: false,
+            shutdown: tokio_util::sync::CancellationToken::new(),
         }
+    }
+
+    /// Stops a running manifest when `shutdown` is cancelled, and hands its
+    /// lease back rather than letting it lapse (#1531).
+    ///
+    /// Shutdown uses the same cooperative stop as an abort (#968): the
+    /// ingest stops after its current batch commits, in-flight files finish
+    /// that batch, and no receipts or terminal state are written. Then
+    /// [`SubmitClaimStrategy::release`] returns the manifest to `pending`, so
+    /// another instance can claim it right away instead of waiting out the
+    /// lease. A manifest already publishing its result finishes instead.
+    pub fn with_shutdown(mut self, shutdown: tokio_util::sync::CancellationToken) -> Self {
+        self.shutdown = shutdown;
+        self
     }
 
     /// Sets how many entries each ingest transaction commits
@@ -1426,6 +1483,9 @@ where
             progress.clone(),
             cancel.clone(),
         );
+        // Shutdown stops the ingest at its next batch boundary, as an abort
+        // would. `wind_down` tells the two apart afterwards (#1531).
+        let _shutdown_bridge = ShutdownBridge::spawn(self.shutdown.clone(), cancel.clone());
 
         // 1. Fetch the remote Bulk Export Manifest.
         self.report_phase(&lease, ManifestPhase::ReadingManifest, 0, 0)
@@ -1672,7 +1732,7 @@ where
             {
                 IndependentCompletion::Completed => {}
                 IndependentCompletion::Cancelled => {
-                    log_wind_down(&lease, true);
+                    self.wind_down(&lease, keeper).await;
                     return Ok(());
                 }
                 IndependentCompletion::LeaseLost => {
@@ -1715,6 +1775,12 @@ where
                 return Ok(());
             }
         }
+        // A cancelled ingest winds its files down and still "completes"; stop
+        // before reporting the files downloaded.
+        if keeper.should_stop() {
+            self.wind_down(&lease, keeper).await;
+            return Ok(());
+        }
         // Every output file has been consumed to its end. The counters keep
         // outranking the phase at the status endpoint, so this is rendered as
         // a suffix on the progress line rather than in place of it (#1218).
@@ -1733,7 +1799,7 @@ where
         let mut deleted_refs = Vec::new();
         for (input_index, file) in manifest.deleted.iter().enumerate() {
             if keeper.should_stop() {
-                log_wind_down(&lease, keeper.cancelled());
+                self.wind_down(&lease, keeper).await;
                 return Ok(());
             }
             match self
@@ -1810,7 +1876,7 @@ where
         // receipt step below: a lost lease or an abort must not sync into a
         // manifest another worker (or the abort itself) already owns.
         if keeper.should_stop() {
-            log_wind_down(&lease, keeper.cancelled());
+            self.wind_down(&lease, keeper).await;
             return Ok(());
         }
         let sync = match self.jobs.sync_ingested(&lease).await {
@@ -1861,7 +1927,7 @@ where
         // the receipts would claim a manifest that never finished, and an
         // aborted manifest's outcome is already recorded by the abort (#968).
         if keeper.should_stop() {
-            log_wind_down(&lease, keeper.cancelled());
+            self.wind_down(&lease, keeper).await;
             return Ok(());
         }
         // Receipts spool to disk and replay part by part, so the lease has to
@@ -1930,6 +1996,49 @@ where
             self.reindex_deferred(&lease, &manifest.output, &sync).await;
         }
         Ok(())
+    }
+
+    /// Ends a run that stopped before its natural end.
+    ///
+    /// If the stop came from shutdown, and the lease is still held, the lease
+    /// is handed back so the manifest can be claimed again at once (#1531).
+    /// Otherwise this only logs: an aborted manifest already belongs to the
+    /// abort, and a lost lease to whoever reclaimed it.
+    async fn wind_down(&self, lease: &ManifestLease, keeper: LeaseKeeper) {
+        let cancelled = keeper.cancelled();
+        let lease_lost = keeper.control.lease_lost();
+        // Renewals stop before the lease is handed back: a heartbeat that
+        // lands after the release finds the lease gone and reports it stolen.
+        drop(keeper);
+        if !(cancelled && !lease_lost && self.shutdown.is_cancelled()) {
+            log_wind_down(lease, cancelled);
+            return;
+        }
+        // Fenced on the manifest still being `processing`: if an abort landed
+        // alongside the shutdown, the release is a no-op and the abort stands.
+        match self.jobs.release(lease.clone()).await {
+            Ok(true) => tracing::info!(
+                submission = %lease.submission_id,
+                manifest = %lease.manifest_id,
+                worker = %lease.worker_id,
+                "bulk-submit manifest stopped for shutdown; lease released and the \
+                 manifest re-queued, its files are walked again by the next claim"
+            ),
+            Ok(false) => tracing::info!(
+                submission = %lease.submission_id,
+                manifest = %lease.manifest_id,
+                worker = %lease.worker_id,
+                "bulk-submit manifest stopped for shutdown; its lease was no longer held"
+            ),
+            Err(e) => tracing::warn!(
+                submission = %lease.submission_id,
+                manifest = %lease.manifest_id,
+                worker = %lease.worker_id,
+                error = %e,
+                "bulk-submit manifest stopped for shutdown, but releasing its lease \
+                 failed; the manifest waits for the lease to expire"
+            ),
+        }
     }
 
     /// Reads back this manifest's entry results and writes `output` receipts
@@ -7601,6 +7710,130 @@ mod tests {
                 "the re-walked entry must add to the earlier run's total, not replace it"
             );
             assert_eq!(manifests[0].failed_entries, 7);
+        }
+    }
+
+    /// Starts the server's shutdown as the first input file is opened, so the
+    /// ingest is under way when the worker notices.
+    struct ShutdownOnOpen {
+        inner: Arc<MockFetcher>,
+        shutdown: tokio_util::sync::CancellationToken,
+    }
+
+    #[async_trait]
+    impl SubmitInputFetcher for ShutdownOnOpen {
+        async fn fetch_manifest(
+            &self,
+            url: &str,
+            headers: &[(String, String)],
+            oauth: &[String],
+            key: Option<&Value>,
+        ) -> StorageResult<RemoteManifest> {
+            self.inner.fetch_manifest(url, headers, oauth, key).await
+        }
+
+        async fn open_file_stream(
+            &self,
+            url: &str,
+            headers: &[(String, String)],
+            requires_token: bool,
+            oauth: &[String],
+            key: Option<&Value>,
+        ) -> StorageResult<(Box<dyn tokio::io::AsyncBufRead + Send + Unpin>, Option<u64>)> {
+            self.shutdown.cancel();
+            tokio::task::yield_now().await;
+            self.inner
+                .open_file_stream(url, headers, requires_token, oauth, key)
+                .await
+        }
+    }
+
+    /// A shutdown mid-ingest stops the manifest without publishing anything
+    /// and hands the lease back: the manifest is `pending` again, and the next
+    /// worker to claim it ingests every entry and completes it (#1531).
+    #[tokio::test]
+    async fn test_worker_releases_its_lease_on_shutdown() {
+        for independent in [false, true] {
+            let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+            backend.init_schema().unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            let output = Arc::new(LocalFsOutputStore::new(
+                tmp.path().to_path_buf(),
+                "http://x",
+            ));
+            let tenant = tenant();
+            let sub_id = seed(&backend, &tenant).await;
+            let ndjson: String = (0..50)
+                .map(|i| format!("{{\"resourceType\":\"Patient\",\"id\":\"p{i}\"}}\n"))
+                .collect();
+
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let fetcher = Arc::new(ShutdownOnOpen {
+                inner: patient_fetcher(&ndjson),
+                shutdown: shutdown.clone(),
+            });
+            let worker = with_test_file_scheduling(
+                DefaultSubmitWorker::new(
+                    backend.clone(),
+                    fetcher,
+                    Arc::clone(&output),
+                    WorkerId::new("w1"),
+                ),
+                independent,
+                2,
+            )
+            .with_batch_size(1)
+            .with_shutdown(shutdown);
+            let lease = backend
+                .claim_next_manifest(&WorkerId::new("w1"), StdDuration::from_secs(60))
+                .await
+                .unwrap()
+                .unwrap();
+            worker.run_job(lease).await.unwrap();
+
+            let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+            assert_eq!(
+                manifests[0].status,
+                crate::core::bulk_submit::ManifestStatus::Pending,
+                "independent={independent}: the manifest is queued again"
+            );
+            assert!(
+                backend
+                    .list_submit_files(&tenant, &sub_id)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "independent={independent}: a released run publishes nothing"
+            );
+
+            let lease = backend
+                .claim_next_manifest(&WorkerId::new("w2"), StdDuration::from_secs(60))
+                .await
+                .unwrap()
+                .expect("the released manifest is claimable at once");
+            let worker = with_test_file_scheduling(
+                DefaultSubmitWorker::new(
+                    backend.clone(),
+                    patient_fetcher(&ndjson),
+                    output,
+                    WorkerId::new("w2"),
+                ),
+                independent,
+                2,
+            )
+            .with_batch_size(1);
+            worker.run_job(lease).await.unwrap();
+
+            let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+            assert_eq!(
+                manifests[0].status,
+                crate::core::bulk_submit::ManifestStatus::Completed
+            );
+            let counts = backend
+                .get_entry_counts(&tenant, &sub_id, &manifests[0].manifest_id)
+                .await
+                .unwrap();
+            assert_eq!(counts.success, 50, "independent={independent}");
         }
     }
 
