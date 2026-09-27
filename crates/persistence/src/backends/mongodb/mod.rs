@@ -23,6 +23,7 @@ pub(crate) mod bulk_provider;
 mod bulk_submit;
 mod composite_search;
 mod login_sessions;
+mod reindex_pipeline;
 mod retry;
 pub(crate) mod schema;
 pub use schema::SCHEMA_VERSION;

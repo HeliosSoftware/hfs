@@ -105,6 +105,7 @@ pub mod bulk_submit_worker;
 pub mod capabilities;
 pub mod history;
 pub mod patch;
+pub mod patient_compartment;
 pub mod preconditions;
 pub mod search;
 pub mod sof_runner;

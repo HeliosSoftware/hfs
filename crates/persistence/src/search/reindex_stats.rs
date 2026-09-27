@@ -35,6 +35,11 @@ pub(super) struct PageRecord {
     pub(super) entries: u64,
     pub(super) failed: u64,
     pub(super) fetch: Duration,
+    /// Time the driver actually waited for this page: equal to `fetch`
+    /// unless the source prefetched it while the previous page was being
+    /// written, in which case it is the (possibly zero) time still spent
+    /// waiting once the write finished.
+    pub(super) fetch_wait: Duration,
     pub(super) write: Duration,
     pub(super) writer: ReindexPageStats,
 }
@@ -47,6 +52,7 @@ pub(super) struct Counters {
     pub(super) failed: u64,
     pub(super) pages: u64,
     pub(super) fetch: Duration,
+    pub(super) fetch_wait: Duration,
     pub(super) write: Duration,
     pub(super) yielded: Duration,
     pub(super) writer: ReindexPageStats,
@@ -59,6 +65,7 @@ impl Counters {
         self.failed += page.failed;
         self.pages += 1;
         self.fetch += page.fetch;
+        self.fetch_wait += page.fetch_wait;
         self.write += page.write;
         self.writer.accumulate(&page.writer);
     }
@@ -74,10 +81,12 @@ impl Counters {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct PhaseMillis {
     pub(super) fetch_ms: u64,
+    pub(super) fetch_wait_ms: u64,
     pub(super) write_ms: u64,
     pub(super) extract_ms: u64,
     pub(super) delete_ms: u64,
     pub(super) insert_ms: u64,
+    pub(super) db_wait_ms: u64,
     pub(super) writer_other_ms: u64,
     pub(super) yield_ms: u64,
     pub(super) other_ms: u64,
@@ -85,16 +94,19 @@ pub(super) struct PhaseMillis {
 
 impl PhaseMillis {
     pub(super) fn of(c: &Counters, elapsed: Duration) -> Self {
-        let writer_busy = c.writer.extract + c.writer.delete + c.writer.insert;
+        let db_wait = c.writer.db_wait_or_busy();
+        let writer_busy = c.writer.extract + db_wait;
         let writer_other = c.write.saturating_sub(writer_busy);
-        let busy = c.fetch + c.write + c.yielded;
+        let busy = c.fetch_wait + c.write + c.yielded;
         let other = elapsed.saturating_sub(busy);
         Self {
             fetch_ms: millis(c.fetch),
+            fetch_wait_ms: millis(c.fetch_wait),
             write_ms: millis(c.write),
             extract_ms: millis(c.writer.extract),
             delete_ms: millis(c.writer.delete),
             insert_ms: millis(c.writer.insert),
+            db_wait_ms: millis(db_wait),
             writer_other_ms: millis(writer_other),
             yield_ms: millis(c.yielded),
             other_ms: millis(other),
@@ -606,6 +618,87 @@ mod tests {
         assert_eq!(
             PhaseMillis::of(&c5, Duration::from_nanos(1_999_999)).fetch_ms,
             1
+        );
+    }
+
+    #[test]
+    fn phase_millis_uses_the_critical_path() {
+        let mut c = Counters::default();
+        c.write = Duration::from_millis(100);
+        c.fetch = Duration::from_millis(20);
+        c.fetch_wait = Duration::from_millis(5); // most of the fetch was hidden by prefetch
+        c.yielded = Duration::from_millis(5);
+        c.writer.extract = Duration::from_millis(30);
+        c.writer.delete = Duration::from_millis(10);
+        c.writer.insert = Duration::from_millis(40);
+        // db_wait is unset: db_wait_or_busy() falls back to delete + insert = 50 ms.
+        let m = PhaseMillis::of(&c, Duration::from_millis(130));
+        assert_eq!(m.fetch_ms, 20);
+        assert_eq!(m.fetch_wait_ms, 5);
+        assert_eq!(m.db_wait_ms, 50);
+        assert_eq!(
+            m.writer_other_ms, 20,
+            "write - (extract 30 + db_wait_or_busy 50) = 20"
+        );
+        assert_eq!(
+            m.other_ms, 20,
+            "elapsed 130 - (fetch_wait 5 + write 100 + yield 5) = 20"
+        );
+    }
+
+    #[test]
+    fn unmeasured_db_wait_keeps_the_busy_formula() {
+        // A writer that never sets db_wait (every non-MongoDB writer today)
+        // must give the same writer_other_ms as delete + insert would.
+        let mut c = Counters::default();
+        c.write = Duration::from_millis(10);
+        c.writer.extract = Duration::from_millis(3);
+        c.writer.delete = Duration::from_millis(2);
+        c.writer.insert = Duration::from_millis(4);
+        let m = PhaseMillis::of(&c, Duration::from_millis(10));
+        assert_eq!(m.writer_other_ms, 1);
+    }
+
+    #[test]
+    fn unprefetched_pages_keep_fetch_in_other_ms() {
+        // fetch_wait == fetch (nothing prefetched) must give the same other_ms
+        // as computing it from fetch directly.
+        let mut c = Counters::default();
+        c.fetch = Duration::from_millis(7);
+        c.fetch_wait = Duration::from_millis(7);
+        c.write = Duration::from_millis(3);
+        c.yielded = Duration::from_millis(1);
+        let m = PhaseMillis::of(&c, Duration::from_millis(20));
+        assert_eq!(m.other_ms, 9);
+    }
+
+    #[test]
+    fn record_page_accumulates_fetch_wait_and_db_wait() {
+        let t0 = Instant::now();
+        let mut stats = ReindexRunStats::new(t0, 10, 1, Duration::from_secs(60));
+        stats.mark_pages_started(t0);
+        let _ = stats.start_type("Patient", 10, t0);
+        let page = PageRecord {
+            resources: 5,
+            entries: 5,
+            failed: 0,
+            fetch: Duration::from_millis(50),
+            fetch_wait: Duration::from_millis(10),
+            write: Duration::from_millis(200),
+            writer: ReindexPageStats {
+                db_wait: Some(Duration::from_millis(150)),
+                ..ReindexPageStats::default()
+            },
+        };
+        let recorded = stats.record_page(page, t0 + Duration::from_millis(300));
+        assert_eq!(recorded.page, 1);
+        let summary = stats
+            .finish_type(OUTCOME_COMPLETED, t0 + Duration::from_millis(300))
+            .expect("a type is open");
+        assert_eq!(summary.counters.fetch_wait, Duration::from_millis(10));
+        assert_eq!(
+            summary.counters.writer.db_wait,
+            Some(Duration::from_millis(150))
         );
     }
 

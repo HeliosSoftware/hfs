@@ -906,6 +906,20 @@ async fn bulk_export_lines_carry_server_meta() {
     let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
     let backend = make_prefix_backend(mock);
     let tenant = tenant("tenant-a");
+    // Compartment membership is decided from the CompartmentDefinition (#1122),
+    // and a bare `S3Backend` carries no spec parameters, so the Observation
+    // compartment would be empty without loading them first.
+    {
+        let loader = crate::search::SearchParameterLoader::new(FhirVersion::default());
+        let data_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let mut registry = backend.tenant_registries().base().write();
+        for param in loader.load_embedded().unwrap() {
+            let _ = registry.register(param);
+        }
+        for param in loader.load_from_spec_file(&data_dir).unwrap() {
+            let _ = registry.register(param);
+        }
+    }
     let tag = json!({"system": "http://example.org/tags", "code": "keep-me"});
 
     let created = backend
@@ -4591,6 +4605,45 @@ mod bulk_submit_worker {
             .await
             .expect("add manifest");
         (id, manifest.manifest_id)
+    }
+
+    /// A synchronous `process_entries` call holds its manifest in `processing`
+    /// with no lease until it settles the terminal status on its way out. No
+    /// worker may claim it in that window (#1530). The SQL and MongoDB suites
+    /// pin the same rule through `tests/bulk_submit/claim_contract.rs`; S3 needs
+    /// its own test because the window closes before the call returns.
+    #[tokio::test]
+    async fn an_unleased_processing_manifest_is_not_claimable() {
+        let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+        let t = tenant("tenant-a");
+        let (id, in_flight) = seed(&backend, &t).await;
+        let location = backend.tenant_location(&t).expect("location");
+        backend
+            .mutate_manifest_state(&location, &id, &in_flight, |state| {
+                state.manifest.status = ManifestStatus::Processing;
+            })
+            .await
+            .expect("mark processing");
+        let queued = backend
+            .add_manifest(&t, &id, Some("https://provider.example/queued.json"), None)
+            .await
+            .expect("add manifest")
+            .manifest_id;
+
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("worker-1"), lease_duration())
+            .await
+            .expect("claim")
+            .expect("the pending manifest queued behind it stays claimable");
+        assert_eq!(lease.manifest_id, queued);
+        assert!(
+            backend
+                .claim_next_manifest(&WorkerId::new("worker-2"), lease_duration())
+                .await
+                .expect("claim")
+                .is_none(),
+            "a processing manifest with no lease must not be claimable"
+        );
     }
 
     #[tokio::test]

@@ -94,6 +94,12 @@ with a `Content-Location` status URL. See [Bulk Data Export](#bulk-data-export)
 for configuration; the storage-layer job/output internals are documented in the
 [helios-persistence README](../persistence/README.md).
 
+`Patient/$export` and `Group/[id]/$export` decide compartment membership from
+the spec `CompartmentDefinition`, the same table `GET /Patient/[id]/*` and
+`$everything` use, so the three agree on what belongs to a patient: a resource
+joins through any of its type's compartment parameters (`Observation.performer`,
+`AllergyIntolerance.recorder`, `Patient.link`, …), not only `subject`/`patient`.
+
 ### Administrative Operations
 
 `$purge` and `$reindex` are **not** part of the FHIR specification. Both are
