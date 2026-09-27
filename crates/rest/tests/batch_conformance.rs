@@ -2296,17 +2296,9 @@ mod conditional_entries {
         assert_eq!(patient_count(&backend).await, before);
     }
 
-    /// A conditional patch has no transaction-scoped resolution; it is
-    /// declined intact before anything executes, not stripped of its
-    /// criteria and dispatched against the type.
-    #[tokio::test]
-    async fn a_transaction_conditional_patch_is_declined_intact() {
-        let (server, backend) = create_test_server().await;
-        seed_patient_with_identifier(&backend, "p1", "Nguyen").await;
-        let before = patient_count(&backend).await;
-
-        let patch = json!({
-            "request": { "method": "PATCH", "url": CRITERIA_URL },
+    fn conditional_patch_entry(url: &str) -> Value {
+        json!({
+            "request": { "method": "PATCH", "url": url },
             "resource": {
                 "resourceType": "Parameters",
                 "parameter": [{
@@ -2319,23 +2311,63 @@ mod conditional_entries {
                     ]
                 }]
             }
-        });
-        let response = post_bundle(&server, transaction(vec![sibling_post(), patch])).await;
+        })
+    }
 
-        response.assert_status(StatusCode::BAD_REQUEST);
-        let body: Value = response.json();
-        assert_eq!(body["issue"][0]["code"], "not-supported", "{body}");
-        assert!(
-            body["issue"][0]["details"]["text"]
-                .as_str()
-                .is_some_and(|t| t.contains("conditional patch")),
-            "{body}"
-        );
+    /// `PATCH [type]?[criteria]` is resolved inside the transaction and
+    /// patches the match (#1535).
+    #[tokio::test]
+    async fn a_transaction_conditional_patch_patches_the_match() {
+        let (server, backend) = create_test_server().await;
+        seed_patient_with_identifier(&backend, "p1", "Nguyen").await;
+        let before = patient_count(&backend).await;
+
+        let body = post_batch(
+            &server,
+            transaction(vec![sibling_post(), conditional_patch_entry(CRITERIA_URL)]),
+        )
+        .await;
+
+        assert_eq!(body["entry"][1]["response"]["status"], "200 OK", "{body}");
+        let p1 = backend
+            .read(&test_tenant(), "Patient", "p1")
+            .await
+            .unwrap()
+            .expect("p1");
+        assert_eq!(p1.content()["active"], json!(true), "{body}");
+        assert_eq!(family_of(&backend, "p1").await, "Nguyen");
         assert_eq!(
             patient_count(&backend).await,
-            before,
-            "sibling POST not applied"
+            before + 1,
+            "the sibling committed"
         );
+    }
+
+    /// No match is the `404` `PATCH [type]/[id]` answers, for the whole bundle;
+    /// several matches are `412 multiple-matches`. Nothing is written either way.
+    #[tokio::test]
+    async fn a_transaction_conditional_patch_without_a_single_match_fails_the_bundle() {
+        let (server, backend) = create_test_server().await;
+        let before = patient_count(&backend).await;
+
+        let response = post_bundle(
+            &server,
+            transaction(vec![sibling_post(), conditional_patch_entry(CRITERIA_URL)]),
+        )
+        .await;
+        response.assert_status(StatusCode::NOT_FOUND);
+        assert_eq!(patient_count(&backend).await, before, "sibling rolled back");
+
+        seed_patient_with_identifier(&backend, "p1", "Nguyen").await;
+        seed_patient_with_identifier(&backend, "p2", "Nguyen").await;
+        let response = post_bundle(
+            &server,
+            transaction(vec![conditional_patch_entry(CRITERIA_URL)]),
+        )
+        .await;
+        response.assert_status(StatusCode::PRECONDITION_FAILED);
+        let body: Value = response.json();
+        assert_eq!(body["issue"][0]["code"], "multiple-matches", "{body}");
     }
 
     /// An instance URL's query is a control parameter, not criteria; it is

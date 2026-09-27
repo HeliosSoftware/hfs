@@ -690,7 +690,7 @@ and an unusable value does not apply.
   bundle fails at that entry rather than creating a duplicate.
 
 Conditional interactions expressed in the entry URL (`PUT [type]?[criteria]`,
-`DELETE [type]?[criteria]`):
+`DELETE [type]?[criteria]`, `PATCH [type]?[criteria]`):
 
 - In a `batch`, they are **resolved** with the status mapping the resource
   endpoints use. `PUT`: one match updates (`200`, `location` = `[type]/[id]`), no
@@ -718,7 +718,9 @@ Conditional interactions expressed in the entry URL (`PUT [type]?[criteria]`,
   processing rules, and the outcome is pinned: `PUT` updates the match (`200`,
   `location` = the updated version) or creates (`201`); `DELETE` deletes the match
   (`204`, `location` = the deleted version, so the AuditEvent and a composite's
-  secondaries can name it) or is a no-op `204`. Several matches fail the whole
+  secondaries can name it) or is a no-op `204`; `PATCH` patches the match (`200`)
+  or, when nothing matched, fails the bundle with the `404` `PATCH [type]/[id]`
+  answers (#1535). Several matches fail the whole
   bundle with `412 multiple-matches`. Per R4 §3.1.0.11.2, a resolved identity that
   another entry also addresses — an instance-addressed `PUT`/`DELETE`, or another
   conditional entry resolving to the same resource — fails the bundle with `400`
@@ -728,18 +730,21 @@ Conditional interactions expressed in the entry URL (`PUT [type]?[criteria]`,
   from any entry, whatever its position. `ifMatch` on a conditional entry is
   evaluated against the resolved match before anything is written (#1381): an
   unsatisfied tag, or any `ifMatch` when nothing matched, fails the bundle with
-  `412 conflict`, so a guarded `PUT` never falls through to a create. Criteria on
+  `412 conflict`, so a guarded `PUT` never falls through to a create (a `PATCH`
+  that matched nothing is the `404` above either way). Criteria on
   a `POST` are `400`, as in a batch. A control parameter on an
   instance URL (`PUT Patient/123?_format=json`) is dropped; the entry addresses
   the instance either way.
-- A backend answers `BundleProvider::supports_conditional_in_transaction`. When it
-  is `false` — search offloaded to a secondary (composite SQLite/PostgreSQL +
+- Each conditional entry first passes the per-interaction check `/metadata` is
+  built from (`ConditionalStorage::supports_conditional`, #1384): `ifNoneExist`
+  is a conditional create, URL criteria a conditional update, delete or patch. An
+  interaction the backend does not declare declines the bundle with `501`, as it
+  does a batch entry.
+- A backend also answers `BundleProvider::supports_conditional_in_transaction`.
+  When it is `false` — search offloaded to a secondary (composite SQLite/PostgreSQL +
   Elasticsearch), whose local index is empty — a transaction carrying URL criteria
   or `ifNoneExist` is declined intact with `501` before anything executes, rather
   than failing at the entry.
-- `PATCH [type]?[criteria]` is not resolved inside a transaction yet
-  (`ConditionalTransaction` covers create, update and delete); such a bundle is
-  declined intact with `400 not-supported`. A batch resolves it.
 
 Note that `/metadata` advertises `conditionalCreate`, `conditionalUpdate` and
 `conditionalDelete` for every resource type regardless of backend; gating it per

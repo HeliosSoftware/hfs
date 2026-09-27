@@ -441,3 +441,171 @@ pub async fn conditional_put_honours_if_match<B: BundleProvider>(
     assert_eq!(result.entries[0].status, 200, "{:?}", result.entries[0]);
     assert_eq!(family_of(backend, tenant, "p1").await, "Guarded");
 }
+
+/// A FHIRPath Patch setting `Patient.active` to `true`.
+fn activate_patch() -> serde_json::Value {
+    json!({
+        "resourceType": "Parameters",
+        "parameter": [{
+            "name": "operation",
+            "part": [
+                {"name": "type", "valueCode": "add"},
+                {"name": "path", "valueString": "Patient"},
+                {"name": "name", "valueString": "active"},
+                {"name": "value", "valueBoolean": true}
+            ]
+        }]
+    })
+}
+
+/// `PATCH Patient?identifier=…` activating the match.
+pub fn conditional_patch() -> BundleEntry {
+    BundleEntry {
+        method: BundleMethod::Patch,
+        url: format!("Patient?identifier={IDENTIFIER}"),
+        resource: Some(activate_patch()),
+        criteria: Some(identifier_criteria()),
+        ..Default::default()
+    }
+}
+
+/// One match: the entry patches it in place (#1535).
+pub async fn conditional_patch_updates_the_single_match<B: BundleProvider>(
+    backend: &B,
+    tenant: &TenantContext,
+) {
+    seed_identified_patient(backend, tenant, "p1", "Original").await;
+
+    let result = backend
+        .process_transaction(tenant, vec![conditional_patch()], FhirVersion::default())
+        .await
+        .expect("transaction");
+
+    assert_eq!(result.entries[0].status, 200, "{:?}", result.entries[0]);
+    let patched = backend
+        .read(tenant, "Patient", "p1")
+        .await
+        .expect("read")
+        .expect("patient exists");
+    assert_eq!(patched.content()["active"], json!(true));
+    assert_eq!(patched.version_id(), "2");
+    assert_eq!(family_of(backend, tenant, "p1").await, "Original");
+    assert_eq!(
+        patient_count(backend, tenant).await,
+        1,
+        "a patch creates nothing"
+    );
+}
+
+/// No match: `404`, as `PATCH [type]/[id]` answers, failing the bundle and
+/// rolling back the sibling create — even with an `ifMatch` (#1535).
+pub async fn conditional_patch_with_no_match_fails_the_bundle<B: BundleProvider>(
+    backend: &B,
+    tenant: &TenantContext,
+) {
+    for if_match in [None, Some("*")] {
+        let mut patch = conditional_patch();
+        patch.if_match = if_match.map(String::from);
+        let err = backend
+            .process_transaction(
+                tenant,
+                vec![plain_post("Sibling"), patch],
+                FhirVersion::default(),
+            )
+            .await
+            .expect_err("a conditional patch with no match fails the bundle");
+        match err {
+            TransactionError::PatchEntry { status, .. } => {
+                assert_eq!(status, 404, "ifMatch {if_match:?}")
+            }
+            other => panic!("ifMatch {if_match:?}: unexpected error: {other:?}"),
+        }
+        assert_eq!(
+            patient_count(backend, tenant).await,
+            0,
+            "sibling rolled back"
+        );
+    }
+}
+
+/// Several matches: `412 multiple-matches` naming the patch, nothing written.
+pub async fn conditional_patch_with_several_matches_rolls_back<B: BundleProvider>(
+    backend: &B,
+    tenant: &TenantContext,
+) {
+    seed_identified_patient(backend, tenant, "p1", "One").await;
+    seed_identified_patient(backend, tenant, "p2", "Two").await;
+
+    let err = backend
+        .process_transaction(tenant, vec![conditional_patch()], FhirVersion::default())
+        .await
+        .expect_err("several matches fail the bundle");
+    match err {
+        TransactionError::MultipleMatches { operation, count } => {
+            assert_eq!(operation, "patch");
+            assert_eq!(count, 2);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    let p1 = backend
+        .read(tenant, "Patient", "p1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(p1.content().get("active").is_none(), "nothing was patched");
+}
+
+/// A stale `ifMatch` on a conditional patch fails the bundle with `412`.
+pub async fn conditional_patch_honours_if_match<B: BundleProvider>(
+    backend: &B,
+    tenant: &TenantContext,
+) {
+    seed_identified_patient(backend, tenant, "p1", "Original").await;
+
+    let mut stale = conditional_patch();
+    stale.if_match = Some("W/\"9\"".to_string());
+    let err = backend
+        .process_transaction(tenant, vec![stale], FhirVersion::default())
+        .await
+        .expect_err("a stale ifMatch fails the bundle");
+    assert!(
+        matches!(err, TransactionError::PreconditionFailed { .. }),
+        "{err:?}"
+    );
+
+    let mut current = conditional_patch();
+    current.if_match = Some("W/\"1\"".to_string());
+    let result = backend
+        .process_transaction(tenant, vec![current], FhirVersion::default())
+        .await
+        .expect("the current version satisfies ifMatch");
+    assert_eq!(result.entries[0].status, 200, "{:?}", result.entries[0]);
+}
+
+/// A resolved patch target takes part in the overlap rule like PUT/DELETE.
+pub async fn conditional_patch_overlapping_an_instance_entry_fails<B: BundleProvider>(
+    backend: &B,
+    tenant: &TenantContext,
+) {
+    seed_identified_patient(backend, tenant, "p1", "Original").await;
+
+    let instance_put = BundleEntry {
+        method: BundleMethod::Put,
+        url: "Patient/p1".to_string(),
+        resource: Some(json!({"resourceType": "Patient", "id": "p1", "name": [{"family": "Put"}]})),
+        ..Default::default()
+    };
+    let err = backend
+        .process_transaction(
+            tenant,
+            vec![instance_put, conditional_patch()],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("overlapping identities fail the bundle");
+    assert!(
+        matches!(err, TransactionError::BundleError { .. }),
+        "{err:?}"
+    );
+    assert_eq!(family_of(backend, tenant, "p1").await, "Original");
+}

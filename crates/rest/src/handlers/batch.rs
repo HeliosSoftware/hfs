@@ -18,10 +18,10 @@ use helios_auth::{FhirOperation, Principal, SmartScopePolicy};
 use helios_fhir::FhirVersion;
 use helios_persistence::core::{
     BundleEntry, BundleEntryEffect, BundleEntryResult, BundleMethod, BundleProvider,
-    ConditionalCreateResult, ConditionalDeleteResult, ConditionalPatchPreparation,
-    ConditionalStorage, ConditionalUpdateResult, IncludeProvider, PatchCandidateValidator,
-    ResourceStorage, RevincludeProvider, SearchProvider, WriteKind, WriteNotice,
-    apply_patch_for_version, bundle_if_match_gate, decode_bundle_patch_resource,
+    ConditionalCreateResult, ConditionalDeleteResult, ConditionalInteraction,
+    ConditionalPatchPreparation, ConditionalStorage, ConditionalUpdateResult, IncludeProvider,
+    PatchCandidateValidator, ResourceStorage, RevincludeProvider, SearchProvider, WriteKind,
+    WriteNotice, apply_patch_for_version, bundle_if_match_gate, decode_bundle_patch_resource,
 };
 use helios_persistence::error::{ResourceError, StorageError, TransactionError};
 use helios_persistence::types::SearchParameter;
@@ -453,6 +453,7 @@ where
         + IncludeProvider
         + RevincludeProvider
         + BundleProvider
+        + ConditionalStorage
         + Send
         + Sync,
 {
@@ -489,6 +490,15 @@ where
                 //
                 // GET is exempt: a search entry is partitioned out below and
                 // runs against the committed state (#478).
+                //
+                // A conditional entry first passes the per-interaction check the
+                // CapabilityStatement is built from, before anything else about
+                // it is decided, as every conditional request and batch entry
+                // does — so the transaction arm cannot serve an interaction
+                // `/metadata` says this deployment lacks (#1384, #1535).
+                if let Some(interaction) = transaction_conditional_interaction(&bundle_entry) {
+                    super::conditional_support::require(state.storage(), interaction)?;
+                }
                 if !matches!(bundle_entry.method, BundleMethod::Get) {
                     match conditional_entry_criteria(
                         state,
@@ -1798,6 +1808,30 @@ impl AuditTarget {
     }
 }
 
+/// The conditional interaction a transaction entry asks for, read off its
+/// request before any of it is parsed: `ifNoneExist` on a `POST` is a
+/// conditional create, and a query on a type-level `PUT`/`DELETE`/`PATCH` URL
+/// a conditional update, delete or patch.
+fn transaction_conditional_interaction(entry: &BundleEntry) -> Option<ConditionalInteraction> {
+    if matches!(entry.method, BundleMethod::Post) {
+        return entry
+            .if_none_exist
+            .is_some()
+            .then_some(ConditionalInteraction::Create);
+    }
+    let type_level =
+        entry.url.contains('?') && parse_request_url(&entry.url).is_ok_and(|(_, id)| id.is_empty());
+    if !type_level {
+        return None;
+    }
+    match entry.method {
+        BundleMethod::Put => Some(ConditionalInteraction::Update),
+        BundleMethod::Delete => Some(ConditionalInteraction::Delete),
+        BundleMethod::Patch => Some(ConditionalInteraction::Patch),
+        BundleMethod::Get | BundleMethod::Post => None,
+    }
+}
+
 /// Admits and parses a transaction entry's URL-borne conditional criteria.
 ///
 /// `Ok(None)` for an entry that carries none: an instance URL (its query, if
@@ -1834,20 +1868,6 @@ where
     }
     let method = bundle_method_to_http_method(&entry.method);
     let url = &entry.url;
-    // `PATCH [type]?[criteria]` has no transaction-scoped resolution yet:
-    // `ConditionalTransaction` covers create, update and delete only. Decline
-    // it before anything executes, as the #503 guard did, rather than letting
-    // the criteria be stripped and the entry fail against a type-level URL.
-    if matches!(entry.method, BundleMethod::Patch) {
-        return Err(RestError::NotSupported {
-            feature: format!(
-                "Transaction entry {index} ({method} {url}) is a conditional patch. This \
-                 server cannot resolve one inside a transaction's atomic scope, so no \
-                 entries were applied. Submit it in a batch Bundle, or address the \
-                 instance directly."
-            ),
-        });
-    }
     if matches!(entry.method, BundleMethod::Post) {
         return Err(RestError::BadRequest {
             message: format!(
@@ -5009,6 +5029,87 @@ mod tests {
             !create_text.contains("'search'") && !create_text.contains("'conditional_create'"),
             "must not surface the raw missing capability: {create_text}"
         );
+    }
+
+    // Transactions against `DelayStorage` only ever reach the admission
+    // checks: a test that gets as far as executing one fails loudly.
+    #[async_trait]
+    impl BundleProvider for DelayStorage {
+        fn supports_atomic_transactions(&self) -> bool {
+            true
+        }
+
+        fn supports_conditional_in_transaction(&self) -> bool {
+            true
+        }
+
+        async fn process_transaction_with_patch_validator(
+            &self,
+            _tenant: &TenantContext,
+            _entries: Vec<BundleEntry>,
+            _fhir_version: FhirVersion,
+            _validator: Option<&dyn PatchCandidateValidator>,
+        ) -> Result<helios_persistence::core::BundleResult, TransactionError> {
+            unimplemented!("DelayStorage does not execute transactions")
+        }
+    }
+
+    /// The transaction arm reads the same per-interaction declaration as the
+    /// batch arm and `/metadata`: a storage that declares no conditional
+    /// interaction declines each conditional transaction entry with the `501`
+    /// naming it, before its criteria are parsed or storage is reached (#1535).
+    #[tokio::test]
+    async fn undeclared_conditional_interactions_decline_a_transaction_with_501() {
+        let state = state_with(DelayStorage::conditional(ConditionalReply::Undeclared));
+        let tenant = || TenantExtractor::new("test-tenant", crate::tenant::TenantSource::Default);
+        for (entry, wording) in [
+            (
+                serde_json::json!({
+                    "request": { "method": "PUT", "url": "Patient?unknown-param=x" },
+                    "resource": { "resourceType": "Patient" }
+                }),
+                "conditional update (PUT [type]?criteria)",
+            ),
+            (
+                serde_json::json!({ "request": { "method": "DELETE", "url": "Patient?identifier=x" } }),
+                "conditional delete (DELETE [type]?criteria)",
+            ),
+            (
+                serde_json::json!({
+                    "request": { "method": "PATCH", "url": "Patient?identifier=x" },
+                    "resource": { "resourceType": "Parameters" }
+                }),
+                "conditional patch (PATCH [type]?criteria)",
+            ),
+            (
+                serde_json::json!({
+                    "request": { "method": "POST", "url": "Patient", "ifNoneExist": "identifier=x" },
+                    "resource": { "resourceType": "Patient" }
+                }),
+                "conditional create (If-None-Exist)",
+            ),
+        ] {
+            let bundle = serde_json::json!({
+                "resourceType": "Bundle",
+                "type": "transaction",
+                "entry": [entry],
+            });
+            let error = process_transaction(
+                &state,
+                tenant(),
+                FhirVersion::default(),
+                &PreferHeader::default(),
+                &bundle,
+                None,
+            )
+            .await
+            .expect_err("an undeclared interaction declines the transaction");
+            let (status, code, text) = error.client_response();
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{wording}: {text}");
+            assert_eq!(code, "not-supported", "{wording}");
+            assert!(text.contains(wording), "{wording}: {text}");
+        }
+        assert!(state.storage().conditional_calls().is_empty());
     }
 
     /// A storage that *declares* it serves no conditional interaction is
