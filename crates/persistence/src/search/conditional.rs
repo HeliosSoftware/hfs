@@ -328,6 +328,15 @@ pub fn build_conditional_query_from_pairs(
 ) -> StorageResult<Option<SearchQuery>> {
     let parameters = build_conditional_parameters(registry, resource_type, pairs, types)?;
     if parameters.is_empty() {
+        if !pairs.is_empty() {
+            let names: Vec<&str> = pairs.iter().map(|(name, _)| name.as_str()).collect();
+            return Err(StorageError::Search(SearchError::QueryParseError {
+                message: format!(
+                    "conditional criteria carry only result parameters ({}) and nothing to match on",
+                    names.join(", ")
+                ),
+            }));
+        }
         return Ok(None);
     }
 
@@ -572,20 +581,22 @@ mod tests {
             "_score",
         ];
         assert_eq!(RESULT_PARAMS, expected);
+        // Alone they leave nothing to match on, which is refused rather than
+        // read as "matches nothing": a conditional update would create and a
+        // conditional delete would silently do nothing (#1542).
         for name in expected {
+            let refused = build_conditional_query(&registry, "Patient", &format!("{name}=x"));
             assert!(
-                build_conditional_query(&registry, "Patient", &format!("{name}=x"))
-                    .expect(name)
-                    .is_none(),
-                "{name}"
+                matches!(
+                    refused,
+                    Err(StorageError::Search(SearchError::QueryParseError { ref message }))
+                        if message.contains(name)
+                ),
+                "{name}: {refused:?}"
             );
         }
 
-        assert!(
-            build_conditional_query(&registry, "Patient", "_format=json")
-                .expect("valid")
-                .is_none()
-        );
+        assert!(build_conditional_query(&registry, "Patient", "_format=json").is_err());
         assert!(
             build_conditional_query(&registry, "Patient", "")
                 .expect("valid")
@@ -730,9 +741,10 @@ mod tests {
         assert_eq!(one("_format=&family=Neal&_pretty").name, "family");
         for criteria in ["_format=", "_format", "_count=&_summary"] {
             assert!(
-                build_conditional_query(&registry(), "Patient", criteria)
-                    .expect("valid")
-                    .is_none(),
+                matches!(
+                    build_conditional_query(&registry(), "Patient", criteria),
+                    Err(StorageError::Search(SearchError::QueryParseError { .. }))
+                ),
                 "{criteria}"
             );
         }

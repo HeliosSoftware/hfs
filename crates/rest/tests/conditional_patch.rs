@@ -285,7 +285,7 @@ async fn no_match_is_404_and_creates_nothing() {
     let server = test_server().await;
     seed(&server).await;
 
-    for criteria in ["identifier=nobody", "identifier=123", "_format=json"] {
+    for criteria in ["identifier=nobody", "identifier=123"] {
         let response = patch(
             &server,
             &format!("/Patient?{criteria}"),
@@ -296,6 +296,10 @@ async fn no_match_is_404_and_creates_nothing() {
         let outcome = assert_outcome(&response, StatusCode::NOT_FOUND, criteria);
         assert_eq!(outcome["issue"][0]["code"], "not-found", "{criteria}");
     }
+    // Criteria made only of result parameters leave nothing to match on and
+    // are refused rather than read as no match (#1542).
+    let response = patch(&server, "/Patient?_format=json", JSON_PATCH, &activate()).await;
+    assert_outcome(&response, StatusCode::BAD_REQUEST, "_format=json");
     assert_eq!(snapshot(&server).await, untouched());
 }
 

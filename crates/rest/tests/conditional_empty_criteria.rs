@@ -415,11 +415,12 @@ async fn missing_and_empty_result_parameters_are_unaffected() {
         .assert_status(StatusCode::NO_CONTENT);
     assert_eq!(families(&server).await, pairs(&SEEDED));
 
-    // An empty result parameter on its own still selects nothing.
+    // An empty result parameter on its own leaves nothing to match on and is
+    // refused like empty criteria (#1542); nothing is swept.
     server
         .delete("/Patient?_format=")
         .add_header(X_TENANT_ID, tenant())
         .await
-        .assert_status(StatusCode::NO_CONTENT);
+        .assert_status(StatusCode::BAD_REQUEST);
     assert_eq!(families(&server).await, pairs(&SEEDED));
 }
