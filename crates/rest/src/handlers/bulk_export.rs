@@ -115,7 +115,7 @@ where
 
 // Shared `Prefer` / `Parameters` parsing helpers live in `bulk_common`.
 use super::bulk_common::{
-    collect_multi, first_value, has_respond_async, pairs_from_parameters, parse_instant,
+    collect_multi, first_value, has_respond_async, pairs_from_parameters, parse_instant_param,
     parse_query_pairs, prefer_handling,
 };
 
@@ -176,8 +176,14 @@ where
     // _since / _until
     let since_raw = first_value(&pairs, "_since");
     let until_raw = first_value(&pairs, "_until");
-    let since = since_raw.as_deref().map(parse_instant).transpose()?;
-    let until = until_raw.as_deref().map(parse_instant).transpose()?;
+    let since = since_raw
+        .as_deref()
+        .map(|s| parse_instant_param("_since", s))
+        .transpose()?;
+    let until = until_raw
+        .as_deref()
+        .map(|s| parse_instant_param("_until", s))
+        .transpose()?;
     // Both bounds are inclusive in storage, so `_until` strictly before
     // `_since` is an always-empty window; reject it instead of creating a job
     // that silently exports nothing. `_since == _until` stays valid.

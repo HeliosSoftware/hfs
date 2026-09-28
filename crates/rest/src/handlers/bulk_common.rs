@@ -204,6 +204,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_instant_param_names_parameter_and_value() {
+        assert_eq!(
+            parse_instant_param("_since", "2021-01-01T00:00:00Z")
+                .unwrap()
+                .to_rfc3339(),
+            "2021-01-01T00:00:00+00:00"
+        );
+        let (status, _, text) = parse_instant_param("_since", "yesterday")
+            .unwrap_err()
+            .client_response();
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            text.contains("_since") && text.contains("'yesterday'"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn test_prefer_handling() {
         let mut headers = HeaderMap::new();
         headers.insert("prefer", "respond-async, handling=STRICT".parse().unwrap());
