@@ -1023,6 +1023,58 @@ async fn bulk_export_lines_carry_server_meta() {
     assert_meta(&obs_line, "1", &observation);
 }
 
+/// #1558: the REST kick-off marks a submission complete right after
+/// registering its manifest when the client said submissionStatus=completed;
+/// the manifest must still ingest, and only new manifests are refused.
+#[tokio::test]
+async fn bulk_submit_completed_at_kickoff_still_ingests_its_manifest() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+    let submission_id = SubmissionId::new("http://example.org|smoke", "smoke-1");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+    backend
+        .complete_submission(&tenant, &submission_id)
+        .await
+        .unwrap();
+
+    let results = backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            vec![
+                NdjsonEntry::new(1, "Patient", json!({"resourceType":"Patient","id":"c1"})),
+                NdjsonEntry::new(2, "Patient", json!({"resourceType":"Patient","id":"c2"})),
+            ],
+            &BulkProcessingOptions::new(),
+        )
+        .await
+        .expect("a completed submission still ingests the manifests it registered");
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|r| r.is_success()));
+
+    let refused = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(StorageError::BulkSubmit(
+                BulkSubmitError::AlreadyComplete { .. }
+            ))
+        ),
+        "no new manifest after completion: {refused:?}"
+    );
+}
+
 #[tokio::test]
 async fn bulk_submit_lifecycle_and_processing() {
     let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
