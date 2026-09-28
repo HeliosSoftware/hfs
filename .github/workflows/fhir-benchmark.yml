@@ -1736,49 +1736,37 @@ jobs:
       # Without this the search suite reports a single aggregate latency and we
       # cannot tell which of the ~21 query shapes is slow. Produces a table sorted
       # by p95 so the worst shape is the first line.
+      #
+      # This used to be a `jq -rs` program, which slurps the whole NDJSON point
+      # stream into memory before doing anything else. The self-hosted runner
+      # was lost during this exact step three times — runs 30550776427,
+      # 33515369645 and 36423973848 (the last: backend=sqlite,
+      # tests=prewarm,search — searching a near-empty database is very fast, so
+      # the points file was several GB; the artifact was 317 MB compressed, and
+      # run 36412022609's 854 MB file only just got through). search_by_shape.py
+      # reads the file line by line instead and reproduces the same jq
+      # semantics (see its header) — timeout-minutes below is a backstop, not
+      # the fix.
       - name: Attribute search latency per query shape
         if: always()
+        timeout-minutes: 15
+        env:
+          BACKEND: ${{ matrix.backend }}
         run: |
           set -euo pipefail
-          POINTS="$GITHUB_WORKSPACE/bench-results/${{ matrix.backend }}/search-points.json"
+          POINTS="$GITHUB_WORKSPACE/bench-results/$BACKEND/search-points.json"
           [ -f "$POINTS" ] || { echo "No search points file — search suite did not run."; exit 0; }
 
-          OUT="$GITHUB_WORKSPACE/bench-results/${{ matrix.backend }}/search-by-shape.md"
+          OUT="$GITHUB_WORKSPACE/bench-results/$BACKEND/search-by-shape.md"
 
-          # k6's `--out json` emits one JSON object per line. Keep the
-          # http_req_duration points, group by the tags the suite already sets, and
-          # compute count/median/p95/max per shape.
-          jq -rs '
-            [ .[]
-              | select(.type == "Point" and .metric == "http_req_duration")
-              | { shape: ((.data.tags.searchType   // "?") + " " +
-                          (.data.tags.resourceType // "?") + "?" +
-                          (.data.tags.name         // "?")),
-                  v: .data.value } ]
-            | group_by(.shape)
-            | map(
-                (sort_by(.v))    as $s
-                | ($s | length)  as $n
-                | {
-                    shape: $s[0].shape,
-                    n:     $n,
-                    med:   $s[($n / 2 | floor)].v,
-                    # Clamp the percentile index to the last element; with only a
-                    # handful of samples in a shape, floor(n*0.95) can land past the
-                    # end. Bind $n explicitly rather than calling `length` inside the
-                    # index expression — there `.` is the index number, not the
-                    # array, and `length` would silently return the number itself.
-                    p95:   $s[([($n * 0.95 | floor), ($n - 1)] | min)].v,
-                    max:   $s[$n - 1].v
-                  }
-              )
-            | sort_by(-.p95)
-            | "| Query shape | n | median (ms) | p95 (ms) | max (ms) |",
-              "|---|---:|---:|---:|---:|",
-              (.[] | "| `\(.shape)` | \(.n) | \(.med | round) | \(.p95 | round) | \(.max | round) |")
-          ' "$POINTS" > "$OUT" || { echo "::warning::per-shape attribution failed"; exit 0; }
+          # Keep the http_req_duration points, group by the tags the suite
+          # already sets, and compute count/median/p95/max per shape — see
+          # search_by_shape.py's header for why this streams instead of
+          # slurping, and for the jq-equivalence quirks (the `//` "missing"
+          # semantics and round-half-away-from-zero) it reproduces exactly.
+          python3 "$GITHUB_WORKSPACE/.github/scripts/fhir-bench/search_by_shape.py" "$POINTS" > "$OUT" || { echo "::warning::per-shape attribution failed"; exit 0; }
 
-          echo "### Search latency by query shape (${{ matrix.backend }})" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Search latency by query shape ($BACKEND)" >> "$GITHUB_STEP_SUMMARY"
           cat "$OUT" >> "$GITHUB_STEP_SUMMARY"
           cat "$OUT"
 
