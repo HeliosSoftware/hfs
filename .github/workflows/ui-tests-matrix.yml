@@ -267,9 +267,11 @@ jobs:
       # fresh container per run replaces the old per-run prefix cleanup.
       # Real-AWS coverage stays with the bulk-export/submit smokes.
       #
-      # Images come from quay.io: MinIO removed the `minio/minio` and
-      # `minio/mc` repositories from Docker Hub, so pulls there fail with
-      # "pull access denied" on any runner without a cached copy.
+      # The image is the GHCR mirror the persistence MinIO suites pin (#1520):
+      # MinIO removed its Docker Hub repositories, then made the quay.io
+      # ones private, and the project itself is archived, so this tag is
+      # the last release there will be. The mirror ships `mc` next to
+      # `minio`, so the bucket is created with the same image.
       - name: Start MinIO
         if: matrix.backend == 's3-elasticsearch'
         run: |
@@ -281,7 +283,7 @@ jobs:
             --label github.workflow=ui-tests-matrix \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            quay.io/minio/minio server /data
+            ghcr.io/coollabsio/minio:RELEASE.2025-10-15T17-29-55Z server /data
 
           echo "MINIO_CONTAINER=$MINIO_CONTAINER" >> "$GITHUB_ENV"
 
@@ -299,7 +301,8 @@ jobs:
                   --label github.run_id=${{ github.run_id }} \
                   --label github.workflow=ui-tests-matrix \
                   -e MC_HOST_minio="http://minioadmin:minioadmin@$DOCKER_HOST_IP:$MINIO_PORT" \
-                  quay.io/minio/mc mb minio/hfs-ui-matrix
+                  --entrypoint /usr/bin/mc \
+                  ghcr.io/coollabsio/minio:RELEASE.2025-10-15T17-29-55Z mb minio/hfs-ui-matrix
                 exit 0
               fi
             fi
