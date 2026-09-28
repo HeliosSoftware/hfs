@@ -8175,14 +8175,15 @@ static BEARER_ONLY_AUTH: RwLock<bool> = RwLock::new(false);
 /// startup next to [`set_interactive_login`]; the most recent call wins, and
 /// every later page render reads it for the shell's notice.
 pub fn set_bearer_only_auth(bearer_only: bool) {
-    match BEARER_ONLY_AUTH.write() {
-        Ok(mut guard) => *guard = bearer_only,
-        Err(poisoned) => *poisoned.into_inner() = bearer_only,
-    }
+    *BEARER_ONLY_AUTH
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = bearer_only;
 }
 
 fn bearer_only_auth() -> bool {
-    BEARER_ONLY_AUTH.read().map(|guard| *guard).unwrap_or(false)
+    *BEARER_ONLY_AUTH
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// A short digest of the figures a dashboard render shows, carried on
