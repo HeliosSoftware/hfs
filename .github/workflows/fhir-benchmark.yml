@@ -144,6 +144,7 @@ jobs:
     runs-on: [self-hosted, Linux]
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
+      leg_timeout_min: ${{ steps.matrix.outputs.leg_timeout_min }}
     steps:
       - name: Resolve matrix from backend input
         id: matrix
@@ -158,6 +159,16 @@ jobs:
           esac
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
           echo "Backend matrix: $MATRIX"
+
+          # The benchmark job's timeout-minutes, and the base the reaper
+          # below sizes its age guard from. Must stay <= 175:
+          # .github/actions/docker-host-gc (input container-max-age-min,
+          # default 180; used by ci.yml / ci-extended / hts / keycloak-smoke
+          # / ui-tests-matrix) reaps any `hfs-ci=true` container whose
+          # `.State.StartedAt` is >= 180 min old, and GitHub gives a
+          # cancelled job up to 5 more minutes to exit. Do not raise this
+          # without re-checking that reaper's default.
+          echo "leg_timeout_min=150" >> "$GITHUB_OUTPUT"
 
   # ────────────────────────────────────────────────────────────────────────────
   # Compile one debug `hfs` binary with BOTH backends linked in — the backend is
@@ -235,6 +246,7 @@ jobs:
     # shapes untouched by the change under test) so a code delta can be read
     # within one run instead of across two.
     runs-on: [self-hosted, Linux]
+    timeout-minutes: ${{ fromJSON(needs.setup.outputs.leg_timeout_min) }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
@@ -280,7 +292,7 @@ jobs:
           echo "Docker host IP: $EFFECTIVE_DOCKER_HOST_IP"
 
       # ── Reclaim storage left behind by earlier runs, then prove we can ───
-      # The cleanup steps at the end of this job are `if: always()`, which does
+      # The cleanup steps later in this job are `if: always()`, which does
       # NOT run when the *runner itself* is shut down mid-job. When that happened
       # on run 30550776427 the Postgres and tgz containers were orphaned holding
       # a full Synthea import, the Docker host filled up, and every
@@ -292,6 +304,8 @@ jobs:
       # left behind before allocating anything new. This is the compensating
       # control for that GitHub limitation, not a nicety.
       - name: Reap stale benchmark containers and verify Docker host storage
+        env:
+          LEG_TIMEOUT_MIN: ${{ needs.setup.outputs.leg_timeout_min }}
         run: |
           set -uo pipefail
           RUN_ID="${{ github.run_id }}"
@@ -318,18 +332,24 @@ jobs:
           # other's containers mid-benchmark. Same idiom as ci.yml's
           # "Sweep orphaned testcontainers from dead runs".
           #
-          # 120 minutes is comfortably longer than a full leg (the import suite
-          # alone runs ~22 min, plus corpus download and the other suites), so a
-          # legitimately-running benchmark is never in range. Debris older than
-          # that is unambiguously dead. The canary below is what protects us in
-          # the window where an orphan is younger than the guard but still
-          # holding the host's space.
-          MAX_AGE_MIN=120
+          # The guard is the job's own timeout-minutes (LEG_TIMEOUT_MIN, set by
+          # setup's "Resolve matrix from backend input" step) plus a 30-minute
+          # margin, so a live leg — which GitHub kills at LEG_TIMEOUT_MIN — is
+          # never in range. Debris older than that is unambiguously dead. The
+          # canary below is what protects us in the window where an orphan is
+          # younger than the guard but still holding the host's space.
+          case "$LEG_TIMEOUT_MIN" in
+            ''|*[!0-9]*) echo "::error::LEG_TIMEOUT_MIN='$LEG_TIMEOUT_MIN' is not an integer; refusing to reap with a bad age guard"; exit 1 ;;
+          esac
+          MAX_AGE_MIN=$(( LEG_TIMEOUT_MIN + 30 ))
           echo "── Reaping hfs-bench-* containers older than ${MAX_AGE_MIN}m ──"
           NOW=$(date +%s)
           REAPED=0
           for id in $(docker ps -aq --filter "name=hfs-bench-" 2>/dev/null); do
-            name=$(docker inspect -f '{{.Name}}' "$id" 2>/dev/null | sed 's|^/||')
+            # Under bash -e + pipefail, a container that vanishes between
+            # `docker ps` and here (e.g. a sibling leg's --rm canary finishing)
+            # made `docker inspect` fail and aborted the whole step.
+            name=$(docker inspect -f '{{.Name}}' "$id" 2>/dev/null | sed 's|^/||') || continue
             case "$name" in
               hfs-bench-*) ;;                 # ours — keep checking
               *) continue ;;                  # not ours — never touch
@@ -350,11 +370,48 @@ jobs:
           done
           echo "  reaped: $REAPED"
 
-          # `-v` above drops each container's anonymous volumes; named volumes
-          # from this workflow are labelled, so they can be pruned precisely
-          # without touching anything another workflow owns.
-          echo "── Pruning this workflow's dangling volumes ──"
-          docker volume prune -f --filter "label=hfs-bench=1" 2>/dev/null || true
+          # `-v` above drops each container's anonymous volumes. Named volumes
+          # (Postgres's data volume) need a sweep of their own: on Docker >= 23,
+          # `docker volume prune` without `--all` only considers ANONYMOUS
+          # volumes (see .github/actions/docker-host-gc/action.yml:69-70), so
+          # the old `docker volume prune -f --filter "label=hfs-bench=1"` line
+          # here never matched any volume this workflow creates — runs
+          # 34187014872 and 35867150861 both logged "Total reclaimed space: 0B"
+          # from that line while `docker system df` showed 76-84 GB reclaimable
+          # in local volumes. `--all` would also prune a volume a concurrently
+          # starting container has created but not yet attached to, so it is
+          # not acceptable on this shared host either — same reasoning as
+          # .github/actions/docker-host-gc/action.yml:54-64. Sweep named
+          # volumes explicitly instead, by label, with the same three guards
+          # as the containers
+          # above: only ours, never a concurrent run's, and never a live one
+          # (`docker volume rm` with no `-f` refuses a volume still referenced
+          # by a container, so a live leg's volume survives even if the age
+          # guard were somehow wrong).
+          echo "── Reaping hfs-bench=1 named volumes older than ${MAX_AGE_MIN}m ──"
+          VREAPED=0
+          for v in $(docker volume ls -q --filter "label=hfs-bench=1" 2>/dev/null); do
+            info=$(docker volume inspect -f '{{ index .Labels "hfs-bench-run" }}|{{ .CreatedAt }}' "$v" 2>/dev/null) || continue
+            vrun="${info%%|*}"
+            vcreated="${info#*|}"
+            if [ "$vrun" = "$RUN_ID" ]; then
+              continue          # this run's own — leave alone
+            fi
+            [ -n "$vcreated" ] || continue   # empty CreatedAt would read as "midnight" under `date -d`
+            vcreated_s=$(date -d "$vcreated" +%s 2>/dev/null) || continue
+            vage_min=$(( (NOW - vcreated_s) / 60 ))
+            if [ "$vage_min" -lt "$MAX_AGE_MIN" ]; then
+              echo "  keeping volume $v (age ${vage_min}m — may be a concurrent run)"
+              continue
+            fi
+            if docker volume rm "$v" >/dev/null 2>&1; then
+              echo "  removed volume $v (age ${vage_min}m)"
+              VREAPED=$((VREAPED + 1))
+            else
+              echo "  volume $v could not be removed (still in use?) — kept"
+            fi
+          done
+          echo "  volumes reaped: $VREAPED"
 
           echo "── Docker host usage ──"
           docker system df 2>/dev/null || true
@@ -370,13 +427,22 @@ jobs:
           # during the import. That is a deliberate trade — the point is to turn
           # the common case from "fails confusingly 20 minutes in, leaving more
           # debris" into "fails in 10 seconds with the remedy printed".
+          #
+          # Names (this canary and the df container below) carry the backend,
+          # not just the run id: the sqlite and postgres legs of one run share
+          # RUN_ID and start within the same second, so the plain "$RUN_ID"
+          # name collided between them.
           echo "── Canary: create a container and write 256 MiB ──"
-          if ! docker run --rm --name "hfs-bench-canary-$RUN_ID" alpine:3 \
+          if ! docker run --rm --name "hfs-bench-canary-${{ matrix.backend }}-$RUN_ID" alpine:3 \
                  sh -c 'dd if=/dev/zero of=/canary bs=1M count=256 2>&1 | tail -1'; then
             echo "::error::Docker host cannot create a container or has no writable space."
             echo "The benchmark writes several GB (Synthea corpus + Postgres data), so it"
             echo "would fail slowly and leave more debris. Failing fast instead."
-            echo "Remedy on the Docker host: docker system prune -af --volumes"
+            echo "Remedy: remove orphaned hfs-bench-* containers and their hfs-bench=1 labelled volumes; list them with:"
+            echo "  docker ps -a --filter name=hfs-bench-"
+            echo "  docker volume ls --filter label=hfs-bench=1"
+            echo "Never 'docker system prune -a --volumes' on this shared host — it runs"
+            echo "long-lived services (see .github/actions/docker-host-gc/action.yml:54-64)."
             docker system df 2>/dev/null || true
             exit 1
           fi
@@ -388,7 +454,7 @@ jobs:
           # of WAL segments on top of the Synthea corpus, and this host is
           # shared with every other testcontainers job in the repo.
           echo "── Docker host storage ──"
-          docker run --rm --name "hfs-bench-df-$RUN_ID" -v /:/hostroot:ro alpine:3 \
+          docker run --rm --name "hfs-bench-df-${{ matrix.backend }}-$RUN_ID" -v /:/hostroot:ro alpine:3 \
             df -h /hostroot 2>/dev/null || docker system df 2>/dev/null || true
 
       # ── tgz bundle server ────────────────────────────────────────────────
@@ -404,11 +470,19 @@ jobs:
 
           docker build -t "$TGZ_IMAGE" fhir-benchmark/infra/tgz
           docker rm -fv "$TGZ_CONTAINER" 2>/dev/null || true
-          # Labelled so the start-of-job reaper and volume prune can find this
-          # container precisely if a killed runner ever leaves it behind.
+          # `hfs-bench=1`/`hfs-bench-run` mark this container as this
+          # workflow's and this run's (the start-of-job reaper matches the
+          # `hfs-bench-` name prefix).
+          # `hfs-ci=true` additionally makes .github/actions/docker-host-gc
+          # the backstop if a killed runner leaves this container behind —
+          # it reaps any hfs-ci=true orphan after 180 min regardless of which
+          # workflow leaked it. `hfs-bench-leg` is read by the end-of-job
+          # "Docker host usage after cleanup" leak check.
           docker run -d --name "$TGZ_CONTAINER" \
             --label hfs-bench=1 \
+            --label hfs-ci=true \
             --label "hfs-bench-run=${{ github.run_id }}" \
+            --label "hfs-bench-leg=${{ matrix.backend }}" \
             -p 0:8080 "$TGZ_IMAGE" \
             "https://storage.googleapis.com/aidbox-public/synthea/performance/bulk_1k.tar.gz" >/dev/null
 
@@ -466,7 +540,8 @@ jobs:
           docker rm -fv "$PG_CONTAINER" 2>/dev/null || true
           docker volume rm -f "$PG_VOLUME" 2>/dev/null || true
           docker volume create --label hfs-bench=1 \
-            --label "hfs-bench-run=${{ github.run_id }}" "$PG_VOLUME" >/dev/null
+            --label "hfs-bench-run=${{ github.run_id }}" \
+            --label "hfs-bench-leg=${{ matrix.backend }}" "$PG_VOLUME" >/dev/null
 
           # ── Memory sizing ────────────────────────────────────────────────
           # Postgres runs on the REMOTE Docker host, not the runner, so it is
@@ -582,7 +657,9 @@ jobs:
           docker run -d \
             --name "$PG_CONTAINER" \
             --label hfs-bench=1 \
+            --label hfs-ci=true \
             --label "hfs-bench-run=${{ github.run_id }}" \
+            --label "hfs-bench-leg=${{ matrix.backend }}" \
             --shm-size=${SHM_GB}g \
             -v "$PG_VOLUME:/var/lib/postgresql" \
             -e POSTGRES_PASSWORD=postgres \
@@ -1010,6 +1087,17 @@ jobs:
       # that most needed diagnosing. Everything after this point is derived data
       # that can be recomputed from these artifacts; the artifacts cannot be
       # recovered from anything. Upload first, analyse second.
+      #
+      # Teardown (Stop HFS server / Stop tgz bundle server / Stop ephemeral
+      # Postgres, below) is placed right after these uploads for the same
+      # reason. On run 33515369645 the runner was lost during "Attribute search
+      # latency per query shape", so every step after it — Generate step
+      # summary, Stop HFS server, Stop tgz bundle server, Stop ephemeral
+      # Postgres — was skipped, and its containers survived 6.4 days until the
+      # next reaper caught them. Teardown now runs immediately after the
+      # uploads, before any post-processing step (which only reads the files
+      # already on disk), so a runner lost during any later post-processing
+      # step still leaves cleanup done.
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v7
@@ -1027,6 +1115,37 @@ jobs:
           path: /tmp/hfs-bench-${{ matrix.backend }}.log
           retention-days: 7
           if-no-files-found: ignore
+
+      # ── Cleanup ──────────────────────────────────────────────────────────
+      - name: Stop HFS server
+        if: always()
+        run: |
+          if [ -n "${HFS_PID:-}" ]; then
+            kill "$HFS_PID" 2>/dev/null || true
+          fi
+          fuser -k "${{ matrix.port }}/tcp" 2>/dev/null || true
+
+      - name: Stop tgz bundle server
+        if: always()
+        run: |
+          if [ -n "${TGZ_CONTAINER:-}" ]; then
+            docker rm -fv "$TGZ_CONTAINER" 2>/dev/null || true
+          fi
+
+      # `-v` and the explicit `volume rm` matter: without them the Postgres data
+      # volume outlives the container and is never reclaimed. This is the happy
+      # path — the reaper at the top of the job is what covers the case where
+      # this step never runs at all (killed runner, as in run 33515369645 — see
+      # the Artifacts comment above).
+      - name: Stop ephemeral Postgres
+        if: always() && matrix.backend == 'postgres'
+        run: |
+          if [ -n "${PG_CONTAINER:-}" ]; then
+            docker rm -fv "$PG_CONTAINER" 2>/dev/null || true
+          fi
+          if [ -n "${PG_VOLUME:-}" ]; then
+            docker volume rm -f "$PG_VOLUME" 2>/dev/null || true
+          fi
 
       # ── Per-query-shape attribution ──────────────────────────────────────
       # Without this the search suite reports a single aggregate latency and we
@@ -1167,34 +1286,44 @@ jobs:
           PYEOF
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ── Cleanup ──────────────────────────────────────────────────────────
-      - name: Stop HFS server
+      # ── Final verification ───────────────────────────────────────────────
+      # The only way to confirm cleanup actually reclaimed this leg's
+      # containers/volumes, since developers cannot reach the shared Docker
+      # host directly to check by hand. Filtered on the run id AND the leg
+      # label together (multiple --filter label= are ANDed): sqlite and
+      # postgres legs of one run share the run id and run concurrently, so a
+      # run-id-only filter would report a sibling leg's still-live containers
+      # as if they were this leg's leftovers.
+      - name: Docker host usage after cleanup
         if: always()
         run: |
-          if [ -n "${HFS_PID:-}" ]; then
-            kill "$HFS_PID" 2>/dev/null || true
-          fi
-          fuser -k "${{ matrix.port }}/tcp" 2>/dev/null || true
+          RUN_FILTER="label=hfs-bench-run=${{ github.run_id }}"
+          LEG_FILTER="label=hfs-bench-leg=${{ matrix.backend }}"
 
-      - name: Stop tgz bundle server
-        if: always()
-        run: |
-          if [ -n "${TGZ_CONTAINER:-}" ]; then
-            docker rm -fv "$TGZ_CONTAINER" 2>/dev/null || true
+          echo "── Containers remaining for this leg ──"
+          # Not `$(docker ps ... || true)`: if the daemon can't even list
+          # containers, an empty CONTAINERS would read as "0 survived" — the
+          # same silent-success pattern docker-host-gc/action.yml:106-108 calls
+          # out as what hid the original leak.
+          if ! CONTAINERS=$(docker ps -a --filter "$RUN_FILTER" --filter "$LEG_FILTER" --format '{{.Names}}' 2>/dev/null); then
+            echo "::warning::Could not list containers on the Docker host; leak check for leg '${{ matrix.backend }}' skipped"
+            CONTAINERS=""
+          fi
+          echo "$CONTAINERS"
+          CONTAINER_COUNT=$(printf '%s\n' "$CONTAINERS" | grep -c . || true)
+
+          echo "── Volumes remaining for this leg ──"
+          if ! VOLUMES=$(docker volume ls --filter "$RUN_FILTER" --filter "$LEG_FILTER" --format '{{.Name}}' 2>/dev/null); then
+            echo "::warning::Could not list volumes on the Docker host; leak check for leg '${{ matrix.backend }}' skipped"
+            VOLUMES=""
+          fi
+          echo "$VOLUMES"
+          VOLUME_COUNT=$(printf '%s\n' "$VOLUMES" | grep -c . || true)
+
+          if [ "${CONTAINER_COUNT:-0}" -gt 0 ] || [ "${VOLUME_COUNT:-0}" -gt 0 ]; then
+            echo "::warning::${CONTAINER_COUNT:-0} container(s) and ${VOLUME_COUNT:-0} volume(s) survived cleanup for leg '${{ matrix.backend }}' (run ${{ github.run_id }})"
           fi
 
-      # `-v` and the explicit `volume rm` matter: without them the Postgres data
-      # volume outlives the container and is never reclaimed. This is the happy
-      # path — the reaper at the top of the job is what covers the case where
-      # this step never runs at all (killed runner).
-      - name: Stop ephemeral Postgres
-        if: always() && matrix.backend == 'postgres'
-        run: |
-          if [ -n "${PG_CONTAINER:-}" ]; then
-            docker rm -fv "$PG_CONTAINER" 2>/dev/null || true
-          fi
-          if [ -n "${PG_VOLUME:-}" ]; then
-            docker volume rm -f "$PG_VOLUME" 2>/dev/null || true
-          fi
-          echo "── Docker host usage after cleanup ──"
+          echo "── Docker host usage ──"
           docker system df 2>/dev/null || true
+          exit 0
