@@ -1068,7 +1068,7 @@ async fn bulk_submit_completed_at_kickoff_still_ingests_its_manifest() {
         matches!(
             refused,
             Err(StorageError::BulkSubmit(
-                BulkSubmitError::AlreadyComplete { .. }
+                BulkSubmitError::InvalidState { .. }
             ))
         ),
         "no new manifest after completion: {refused:?}"
