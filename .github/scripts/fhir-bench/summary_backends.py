@@ -177,7 +177,10 @@ if backend.endswith("-elasticsearch"):
               "`_delete_by_query` with a forced refresh across all of the tenant's indices. Cluster "
               "health `yellow` is expected (1 replica per index, 1 node). Compare search latency with "
               "another leg only if both imported the same entry count and the ES drain above says "
-              "`drained`.")
+              "`drained`. **This worker's rate is expected to make import hit k6's 60-minute cap "
+              "before the corpus finishes, leaving the index incomplete** (see the Import and ES "
+              "drain lines above / `es-drain.txt`; run 36412022609 imported 313/1000 bundles and "
+              "the drain gate reported status=incomplete with 194,664 resources never indexed).")
 if backend.startswith("mongodb"):
     pg_shared_buffers = os.environ.get("IN_PG_SHARED_BUFFERS") or "2GB"
     print(f"\n**How to read this leg.** MongoDB 7.0 single-member replica set (directConnection); "

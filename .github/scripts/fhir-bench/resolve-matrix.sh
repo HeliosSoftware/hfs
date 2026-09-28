@@ -119,8 +119,11 @@ fi
 
 # es_sync_mode: defence in depth — workflow_dispatch's UI already
 # restricts this to the choice options, but an API dispatch can send
-# anything.
-ES_SYNC_MODE="${IN_ES_SYNC_MODE:-asynchronous}"
+# anything. Default here matches the workflow input's default
+# (synchronous): async import cannot finish the 1000-bundle corpus
+# inside k6's 60-minute cap (run 36412022609 — 313/1000 bundles, ES
+# drain status=incomplete, 194,664 resources never indexed).
+ES_SYNC_MODE="${IN_ES_SYNC_MODE:-synchronous}"
 case "$ES_SYNC_MODE" in
   asynchronous|synchronous) ;;
   *)

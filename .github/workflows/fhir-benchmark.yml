@@ -146,13 +146,13 @@ on:
         required: false
         default: "1g"
       es_sync_mode:
-        description: "asynchronous (HFS default): ack on primary commit; ONE worker forwards each resource individually (import/crud throughput = that worker) | synchronous: bundles batched via _bulk + refresh=wait_for, 200ms"
+        description: "synchronous (benchmark default — async import cannot finish the corpus within k6's 60-minute cap, see run 36412022609): bundles batched via _bulk + refresh=wait_for, 200ms | asynchronous (HFS's own out-of-the-box default): ack on primary commit; ONE worker forwards each resource individually (import/crud throughput = that worker)"
         type: choice
         required: false
-        default: asynchronous
+        default: synchronous
         options:
-          - asynchronous
           - synchronous
+          - asynchronous
       mongo_wt_cache_gb:
         description: "mongodb legs: --wiredTigerCacheSizeGB (0.25..6). 2 = parity with Postgres shared_buffers; mongod's own default (~5 GB here) risks a host OOM"
         required: false
@@ -689,14 +689,21 @@ jobs:
               echo "ES container:    $ES_CONTAINER"
               echo "ES volume:       $ES_VOLUME"
               echo "ES index prefix: $ES_PREFIX"
-              # asynchronous = HFS's own defaults, set explicitly so the run
-              # records them: a write acks once the PRIMARY commits and one
-              # background worker forwards it to Elasticsearch; the search
-              # suite's drain gate waits for that backlog before measuring.
-              # synchronous = the conformance workflows' read-your-writes
-              # setting (inferno-us-core.yml — wait_for makes the refresh
-              # interval the price of every write, hence 200ms).
-              case "${IN_ES_SYNC_MODE:-asynchronous}" in
+              # synchronous = this benchmark's default (see the es_sync_mode
+              # input): the conformance workflows' read-your-writes setting
+              # (inferno-us-core.yml — wait_for makes the refresh interval
+              # the price of every write, hence 200ms). Async import cannot
+              # finish the 1000-bundle corpus inside k6's 60-minute cap
+              # (run 36412022609: 313/1000 bundles, drain gate
+              # status=incomplete, 194,664 resources never reached the
+              # index), so synchronous is what a full-corpus leg needs.
+              # asynchronous = HFS's own out-of-the-box defaults, set
+              # explicitly so the run records them: a write acks once the
+              # PRIMARY commits and one background worker forwards it to
+              # Elasticsearch; the search suite's drain gate waits for that
+              # backlog before measuring — this is what run 36412022609
+              # measured.
+              case "${IN_ES_SYNC_MODE:-synchronous}" in
                 synchronous)  SYNC_MODE=synchronous;  WRITE_REFRESH=wait_for; REFRESH_INTERVAL=200ms ;;
                 asynchronous) SYNC_MODE=asynchronous; WRITE_REFRESH=false;    REFRESH_INTERVAL=1s ;;
                 *) echo "::error::Unknown es_sync_mode '$IN_ES_SYNC_MODE'"; exit 1 ;;
