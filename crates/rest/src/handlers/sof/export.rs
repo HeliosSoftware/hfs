@@ -88,6 +88,7 @@ use crate::export::controller::{
     ExportTask, ExportWork, JobStatus, NamedSqlQuery, NamedView, SqlExportLimits,
 };
 use crate::extractors::TenantExtractor;
+use crate::handlers::bulk_common::parse_instant_param;
 use crate::state::AppState;
 
 /// Top-level `Parameters` body parameter names recognised by `$sql-export`.
@@ -217,7 +218,7 @@ where
         return Ok(missing_subject_response());
     }
 
-    let inputs = merge_export_inputs(&params, Some(&body));
+    let inputs = merge_export_inputs(&params, Some(&body))?;
     submit_export_job(&state, &tenant, work, inputs).await
 }
 
@@ -1218,7 +1219,10 @@ fn validate_unknown_body_params(body: &Value, allowed: &[&str], op: &str) -> Opt
 /// view of the request. Query string values take precedence over body values
 /// for each scalar field; for the repeating `patient`/`group` lists, a
 /// non-empty query value replaces the body list entirely (lists do not merge).
-fn merge_export_inputs(query: &ExportQueryParams, body: Option<&Value>) -> ExportInputs {
+fn merge_export_inputs(
+    query: &ExportQueryParams,
+    body: Option<&Value>,
+) -> Result<ExportInputs, RestError> {
     let body_params = body
         .and_then(|b| b.get("parameter"))
         .and_then(|p| p.as_array());
@@ -1252,8 +1256,9 @@ fn merge_export_inputs(query: &ExportQueryParams, body: Option<&Value>) -> Expor
     let since = query
         .since
         .as_deref()
-        .and_then(|s| s.parse().ok())
-        .or_else(|| body_since.and_then(|s| s.parse().ok()));
+        .or(body_since.as_deref())
+        .map(|s| parse_instant_param("_since", s))
+        .transpose()?;
     let client_tracking_id = query.client_tracking_id.clone().or(body_tracking);
 
     let query_patient = split_refs(query.patient.as_deref());
@@ -1269,14 +1274,14 @@ fn merge_export_inputs(query: &ExportQueryParams, body: Option<&Value>) -> Expor
         query_group
     };
 
-    ExportInputs {
+    Ok(ExportInputs {
         format,
         header,
         since,
         patient,
         group,
         client_tracking_id,
-    }
+    })
 }
 
 /// Returns the named body parameter's `value*` string (whatever the value

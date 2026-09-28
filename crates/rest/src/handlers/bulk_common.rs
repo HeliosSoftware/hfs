@@ -42,6 +42,21 @@ pub(crate) fn parse_instant(s: &str) -> Result<chrono::DateTime<Utc>, RestError>
         })
 }
 
+/// Parses the value of the named instant parameter (`_since`, `_until`) with
+/// the same RFC 3339 rule as [`parse_instant`]; the `400` names the
+/// parameter as well as the value, so `$export`, `$sql-run` and
+/// `$sql-export` reject a bad instant identically.
+pub(crate) fn parse_instant_param(
+    param: &str,
+    s: &str,
+) -> Result<chrono::DateTime<Utc>, RestError> {
+    parse_instant(s).map_err(|_| RestError::BadRequest {
+        message: format!(
+            "invalid {param} '{s}': expected an RFC 3339 instant such as 2026-08-01T00:00:00Z"
+        ),
+    })
+}
+
 /// Reads the `Prefer: handling=` directive (`strict` / `lenient`).
 pub(crate) fn prefer_handling(headers: &HeaderMap) -> Option<String> {
     headers

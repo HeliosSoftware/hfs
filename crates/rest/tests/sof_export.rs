@@ -1034,6 +1034,120 @@ mod sof_export_tests {
         );
     }
 
+    /// An unparsable `_since` is a `400` naming the parameter and the value,
+    /// as `$export` answers, whether it arrives as a query parameter or in
+    /// the `Parameters` body; no job is created (#1550).
+    #[tokio::test]
+    async fn test_export_rejects_an_unparsable_since_with_400() {
+        let (server, backend) = create_test_server_with_export().await;
+        seed_patients(&backend).await;
+
+        let in_query = server
+            .post("/$sql-export?_since=yesterday")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&patient_view())
+            .await;
+        assert_eq!(
+            in_query.status_code(),
+            StatusCode::BAD_REQUEST,
+            "{}",
+            in_query.text()
+        );
+        assert!(
+            in_query.headers().get("content-location").is_none(),
+            "a rejected kick-off must not create a job"
+        );
+        let outcome: Value = in_query.json();
+        assert_eq!(outcome["resourceType"], "OperationOutcome");
+        let text = outcome["issue"][0]["details"]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            text.contains("_since") && text.contains("yesterday"),
+            "{text}"
+        );
+
+        let in_body = server
+            .post("/$sql-export")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&json!({
+                "resourceType": "Parameters",
+                "parameter": [
+                    {"name": "subject", "part": [
+                        {"name": "subjectResource", "resource": patient_view()}
+                    ]},
+                    {"name": "_since", "valueInstant": "last week"}
+                ]
+            }))
+            .await;
+        assert_eq!(
+            in_body.status_code(),
+            StatusCode::BAD_REQUEST,
+            "{}",
+            in_body.text()
+        );
+        let outcome: Value = in_body.json();
+        let text = outcome["issue"][0]["details"]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            text.contains("_since") && text.contains("last week"),
+            "{outcome}"
+        );
+    }
+
+    /// A parseable `_since` still reaches the job: an instant in the far
+    /// future filters every seeded patient out, so the completed export
+    /// carries no rows.
+    #[tokio::test]
+    async fn test_export_applies_a_valid_since() {
+        let (server, backend) = create_test_server_with_export().await;
+        seed_patients(&backend).await;
+
+        let submit_resp = server
+            .post("/$sql-export?_since=2999-01-01T00:00:00Z")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&patient_view())
+            .await;
+        assert_eq!(
+            submit_resp.status_code(),
+            StatusCode::ACCEPTED,
+            "{}",
+            submit_resp.text()
+        );
+        let location = submit_resp
+            .headers()
+            .get("content-location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let manifest = poll_to_manifest(&server, &location, "test-tenant").await;
+        let params = manifest["parameter"]
+            .as_array()
+            .expect("manifest parameters");
+        let status = params
+            .iter()
+            .find(|p| p["name"].as_str() == Some("status"))
+            .and_then(|p| p["valueCode"].as_str());
+        assert_eq!(status, Some("completed"), "{manifest}");
+        // A shard is only listed when it has rows; with every patient
+        // filtered out the completed manifest carries no output at all.
+        let outputs = params
+            .iter()
+            .filter(|p| p["name"].as_str() == Some("output"))
+            .count();
+        assert_eq!(
+            outputs, 0,
+            "a far-future _since must filter every patient out: {manifest}"
+        );
+    }
+
     // =========================================================================
     // 12. clientTrackingId (T5.4) echoed in the completion manifest
     // =========================================================================
@@ -2178,7 +2292,7 @@ mod sof_export_tests {
             "resourceType": "Parameters",
             "parameter": [
                 {"name": "view", "part": [
-                    {"name": "viewResource", "resource": patient_view()}
+                    {"name": "subjectResource", "resource": patient_view()}
                 ]}
             ]
         });
