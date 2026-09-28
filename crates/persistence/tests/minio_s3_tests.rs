@@ -1992,3 +1992,72 @@ async fn test_minio_patient_export_follows_the_compartment_definition() {
     assert_eq!(exported["Patient"], ["linked", "p1"]);
     assert!(exported["Organization"].is_empty());
 }
+
+/// #1556: a submitter identifier with a URL system (`system|value`, the form
+/// every real client sends) used to put `//` into every key of the submission,
+/// which MinIO refuses with `XMinioInvalidObjectName`; the segment is escaped now.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_bulk_submit_accepts_a_url_system_submitter() {
+    if skip_if_disabled("test_minio_bulk_submit_accepts_a_url_system_submitter") {
+        return;
+    }
+
+    let harness = make_prefix_backend("bulk-submit-url-submitter").await;
+    let tenant = tenant("minio-tenant-submit-url");
+
+    let submission_id = SubmissionId::new(
+        "http://example.org|smoke",
+        format!("sub-{}", Uuid::new_v4()),
+    );
+    harness
+        .backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .expect("a URL-system submitter must be storable on S3");
+    let manifest = harness
+        .backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+    let results = harness
+        .backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            vec![NdjsonEntry::new(
+                1,
+                "Patient",
+                json!({"resourceType":"Patient","id":format!("bs-{}", Uuid::new_v4())}),
+            )],
+            &BulkProcessingOptions::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(results[0].outcome, BulkEntryOutcome::Success);
+
+    let prefix = format!(
+        "{}/{}/bulk/submit/http:%2F%2Fexample.org|smoke/{}/",
+        harness.prefix.trim_matches('/'),
+        tenant.tenant_id().as_str(),
+        submission_id.submission_id
+    );
+    let objects = harness
+        .sdk_client
+        .list_objects_v2()
+        .bucket(&harness.bucket)
+        .prefix(prefix)
+        .send()
+        .await
+        .unwrap();
+    let keys: Vec<String> = objects
+        .contents()
+        .iter()
+        .filter_map(|o| o.key().map(str::to_string))
+        .collect();
+    assert!(
+        keys.iter().any(|k| k.ends_with("/state.json")),
+        "state object under the escaped prefix: {keys:?}"
+    );
+    assert!(keys.iter().all(|k| !k.contains("//")), "{keys:?}");
+}
