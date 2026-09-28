@@ -31,10 +31,10 @@ jobs:
         run: |
           FHIR_VERSIONS='["R4","R4B","R5"]'
           # Keep this backend/output matrix aligned with bulk-export-smoke.yml.
-          # Bulk submit REST worker support is currently wired for SQLite/PostgreSQL
-          # primary stores and their Elasticsearch composites. S3 has only
-          # BulkSubmitIngest provider support, so MongoDB and S3 primary stores are
-          # kept in the matrix to assert the endpoint-unavailable contract.
+          # Every primary store with a bulk-submit job store runs the full flow:
+          # SQLite, PostgreSQL and MongoDB and their Elasticsearch composites, and
+          # the S3 composite (S3 hosts its own job state). The standalone S3 leg
+          # stays in the matrix to assert the endpoint-unavailable contract.
           ROWS='[
             {"backend":"sqlite","output":"local","expectation":"full"},
             {"backend":"sqlite","output":"s3","expectation":"full"},
@@ -44,11 +44,11 @@ jobs:
             {"backend":"sqlite-elasticsearch","output":"s3","expectation":"full"},
             {"backend":"postgres-elasticsearch","output":"local","expectation":"full"},
             {"backend":"postgres-elasticsearch","output":"s3","expectation":"full"},
-            {"backend":"mongodb","output":"local","expectation":"endpoint-unavailable"},
-            {"backend":"mongodb","output":"s3","expectation":"endpoint-unavailable"},
-            {"backend":"mongodb-elasticsearch","output":"local","expectation":"endpoint-unavailable"},
-            {"backend":"mongodb-elasticsearch","output":"s3","expectation":"endpoint-unavailable"},
-            {"backend":"s3-elasticsearch","output":"local","expectation":"endpoint-unavailable"},
+            {"backend":"mongodb","output":"local","expectation":"full"},
+            {"backend":"mongodb","output":"s3","expectation":"full"},
+            {"backend":"mongodb-elasticsearch","output":"local","expectation":"full"},
+            {"backend":"mongodb-elasticsearch","output":"s3","expectation":"full"},
+            {"backend":"s3-elasticsearch","output":"local","expectation":"full"},
             {"backend":"s3","output":"none","expectation":"endpoint-unavailable"}
           ]'
 
