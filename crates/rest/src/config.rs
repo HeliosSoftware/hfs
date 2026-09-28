@@ -1269,6 +1269,18 @@ pub struct ServerConfig {
     )]
     pub elasticsearch_nested_objects_limit: u32,
 
+    /// Most values one Elasticsearch `terms` query may carry
+    /// (`index.max_terms_count`). A chained or `_has` search whose terminal
+    /// hop resolved more ids than this is sent as several `terms` clauses of
+    /// at most this many values each (#1548). Written into the index template
+    /// for new indices.
+    #[arg(
+        long,
+        env = "HFS_ELASTICSEARCH_MAX_TERMS_COUNT",
+        default_value = "65536"
+    )]
+    pub elasticsearch_max_terms_count: u32,
+
     /// Per-request timeout, in milliseconds, of the Elasticsearch HTTP client.
     /// Applies to every request, including each `_bulk` request of a rebuild;
     /// a request that outlives it fails as a transient error (#1125).
@@ -1594,6 +1606,7 @@ impl Default for ServerConfig {
             elasticsearch_refresh_interval: "1s".to_string(),
             elasticsearch_write_refresh: "false".to_string(),
             elasticsearch_nested_objects_limit: 50_000,
+            elasticsearch_max_terms_count: 65_536,
             elasticsearch_request_timeout_ms: 30_000,
             elasticsearch_bulk_max_bytes: 10 * 1024 * 1024,
             elasticsearch_bulk_concurrency: 1,
@@ -1742,6 +1755,10 @@ impl ServerConfig {
             errors.push("Elasticsearch nested objects limit cannot be 0".to_string());
         }
 
+        if self.elasticsearch_max_terms_count == 0 {
+            errors.push("Elasticsearch max terms count cannot be 0".to_string());
+        }
+
         if self.elasticsearch_request_timeout_ms == 0 {
             errors.push("Elasticsearch request timeout cannot be 0".to_string());
         }
@@ -1864,6 +1881,7 @@ impl ServerConfig {
             elasticsearch_refresh_interval: "1s".to_string(),
             elasticsearch_write_refresh: "false".to_string(),
             elasticsearch_nested_objects_limit: 50_000,
+            elasticsearch_max_terms_count: 65_536,
             elasticsearch_request_timeout_ms: 30_000,
             elasticsearch_bulk_max_bytes: 10 * 1024 * 1024,
             elasticsearch_bulk_concurrency: 1,
