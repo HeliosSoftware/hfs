@@ -412,6 +412,10 @@ pub(crate) struct Status {
     /// interactive login's session (#1449). `None` renders the signed-out,
     /// local-operator shape.
     user: Option<UserSummary>,
+    /// Authentication is on but no interactive login is installed (#1560):
+    /// every browser-originated FHIR call is refused, so the shell says so
+    /// once instead of each page failing with the API's 401 text.
+    bearer_only_auth: bool,
 }
 
 /// What the account menu shows for a signed-in user, derived once per request
@@ -8164,6 +8168,23 @@ fn dashboard_refresh() -> DashboardRefresh {
         .unwrap_or_default()
 }
 
+static BEARER_ONLY_AUTH: RwLock<bool> = RwLock::new(false);
+
+/// Record whether the server runs with authentication enabled and no
+/// interactive login installed (#1560). Called once from the server's
+/// startup next to [`set_interactive_login`]; the most recent call wins, and
+/// every later page render reads it for the shell's notice.
+pub fn set_bearer_only_auth(bearer_only: bool) {
+    match BEARER_ONLY_AUTH.write() {
+        Ok(mut guard) => *guard = bearer_only,
+        Err(poisoned) => *poisoned.into_inner() = bearer_only,
+    }
+}
+
+fn bearer_only_auth() -> bool {
+    BEARER_ONLY_AUTH.read().map(|guard| *guard).unwrap_or(false)
+}
+
 /// A short digest of the figures a dashboard render shows, carried on
 /// `#dash-live` as `data-dash-state` (#1078).
 ///
@@ -9033,6 +9054,7 @@ pub(crate) fn current_status(
         show_tenant_picker: tenant.multi,
         terminology: TerminologyNavigation::from_config(state.terminology.as_deref()),
         user: UserSummary::from_session(tenant.signed_in.as_ref()),
+        bearer_only_auth: bearer_only_auth(),
     }
 }
 
@@ -9184,6 +9206,7 @@ mod tests {
                 show_tenant_picker: true,
                 terminology: TerminologyNavigation::Unconfigured,
                 user: None,
+                bearer_only_auth: false,
             },
             metrics: dash.metrics,
             chart: dash.chart,
@@ -9371,6 +9394,7 @@ mod tests {
                 show_tenant_picker: true,
                 terminology: TerminologyNavigation::Unconfigured,
                 user: None,
+                bearer_only_auth: false,
             },
             i18n: i18n("en"),
         }
@@ -9542,6 +9566,7 @@ mod tests {
                 show_tenant_picker: true,
                 terminology: TerminologyNavigation::Unconfigured,
                 user: None,
+                bearer_only_auth: false,
             },
             i18n: i18n("en"),
             active_page: "queries",
@@ -9609,6 +9634,7 @@ mod tests {
                 show_tenant_picker: true,
                 terminology: TerminologyNavigation::Unconfigured,
                 user: None,
+                bearer_only_auth: false,
             },
             i18n: i18n("es"),
             active_page: "queries",
@@ -10466,6 +10492,7 @@ mod user_summary_tests {
             show_tenant_picker: false,
             terminology: TerminologyNavigation::Unconfigured,
             user,
+            bearer_only_auth: false,
         }
     }
 

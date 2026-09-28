@@ -2721,6 +2721,20 @@ select.field__input {
   border: 1px solid var(--warn);
 }
 
+/* The shell's own notice (#1560), between the topbar and the page: aligned
+   with the content gutter, the page's top padding is the gap below it. Styled
+   like .notice--warn but on its own class, so page-level warning counts and
+   locators never see the shell. */
+.shell-notice {
+  margin: 24px 32px 0;
+  padding: 10px 14px;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--warn-soft);
+  border: 1px solid var(--warn);
+  border-radius: 10px;
+}
+
 /* The HTS OperationOutcome box (`crates/hts-ui/templates/partials/
    hts-outcome.html`, #805). It is a `.notice` whose body is a stack of
    `<p>` rows, which the primitive alone cannot spell: HFS's own notices

@@ -1155,6 +1155,8 @@ async fn init_auth_with_audit(
             sessions: Arc::clone(sessions),
         });
     }
+    #[cfg(feature = "ui")]
+    helios_ui::set_bearer_only_auth(sessions.is_none());
 
     let auth_state = Arc::new(AuthMiddlewareState {
         provider: Arc::new(provider),

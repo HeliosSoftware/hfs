@@ -1816,3 +1816,7 @@ hts-home-chart-hint-series-all = todas las clases de estado
 hts-home-chart-hint-series-2xx = solo respuestas 2xx
 hts-home-chart-hint-series-4xx = solo respuestas 4xx
 hts-home-chart-hint-series-5xx = solo respuestas 5xx
+
+## Autenticación solo con bearer (#1560): auth activa, sin inicio de sesión de navegador
+auth-bearer-only = La autenticación está habilitada en este servidor, pero no hay un inicio de sesión de navegador configurado. Las páginas que llaman a la API FHIR desde el navegador — Recursos, Batch / Transaction, consultas guardadas y preferencias — se rechazan con 401. Configura HFS_UI_LOGIN_CLIENT_ID para habilitar el inicio de sesión, o usa la API directamente con un token bearer.
+batch-sign-in-required = Este servidor no tiene un inicio de sesión de navegador configurado, así que esta página no puede autenticar la petición. Configura HFS_UI_LOGIN_CLIENT_ID para ejecutar bundles desde aquí.

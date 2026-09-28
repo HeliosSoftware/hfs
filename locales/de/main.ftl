@@ -1819,3 +1819,7 @@ hts-home-chart-hint-series-all = alle Statusklassen
 hts-home-chart-hint-series-2xx = nur 2xx-Antworten
 hts-home-chart-hint-series-4xx = nur 4xx-Antworten
 hts-home-chart-hint-series-5xx = nur 5xx-Antworten
+
+## Nur-Bearer-Authentifizierung (#1560): Auth aktiv, keine Browser-Anmeldung konfiguriert
+auth-bearer-only = Die Authentifizierung ist auf diesem Server aktiviert, aber keine Browser-Anmeldung ist konfiguriert. Seiten, die die FHIR-API aus dem Browser aufrufen — Ressourcen, Batch / Transaction, gespeicherte Abfragen und Einstellungen — werden mit 401 abgewiesen. Setzen Sie HFS_UI_LOGIN_CLIENT_ID, um die Anmeldung zu aktivieren, oder verwenden Sie die API direkt mit einem Bearer-Token.
+batch-sign-in-required = Dieser Server hat keine Browser-Anmeldung konfiguriert, daher kann diese Seite die Anfrage nicht authentifizieren. Setzen Sie HFS_UI_LOGIN_CLIENT_ID, um Bundles von hier auszuführen.
