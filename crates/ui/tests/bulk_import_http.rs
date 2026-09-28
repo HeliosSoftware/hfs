@@ -2442,7 +2442,10 @@ async fn a_poll_server_error_fails_the_submission_and_keeps_the_card() {
 #[tokio::test]
 async fn a_rejected_poll_credential_keeps_the_submission_in_progress() {
     let recipient = mock_recipient_refusing_polls(StatusCode::UNAUTHORIZED).await;
-    let (ctx, detail_path, detail) = run_one_manifest_to_poll(&recipient).await;
+    // First poll: a progress report. Second poll: refused.
+    let (ctx, detail_path, _) = run_one_manifest_to_poll(&recipient).await;
+    let _ = get(&ctx, &format!("{detail_path}/status")).await;
+    let (_, detail) = get(&ctx, &detail_path).await;
     assert!(detail.contains("In Progress"), "{detail}");
     assert!(!detail.contains("marked failed"), "{detail}");
     assert!(!detail.contains("polling stopped"), "{detail}");
@@ -2458,18 +2461,21 @@ async fn a_rejected_poll_credential_keeps_the_submission_in_progress() {
     assert!(fragment.contains("every 5s"), "{fragment}");
     assert!(!fragment.contains(RESULT_CARD), "{fragment}");
     assert!(
-        fragment
-            .contains("Status unavailable: the credential this page polls with was rejected (401)"),
+        fragment.contains(
+            "Status unavailable: the credential this page polls with was rejected (401); last report: Processing 4% - 702,191 Resources written"
+        ),
         "{fragment}"
     );
     assert!(!fragment.contains("Processing finished at"), "{fragment}");
 }
 
-/// A recipient whose poll URL answers `status` to every poll, after a normal
-/// kick-off.
+/// A recipient whose poll URL reports progress once (`202`, `Retry-After: 0`
+/// so the next poll is due at once) and answers `status` to every poll after
+/// that, following a normal kick-off.
 async fn mock_recipient_refusing_polls(status: StatusCode) -> String {
     use axum::extract::State as AxState;
     let base = Arc::new(std::sync::Mutex::new(String::new()));
+    let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     *base.lock().unwrap() = format!("http://{addr}");
@@ -2493,7 +2499,24 @@ async fn mock_recipient_refusing_polls(status: StatusCode) -> String {
                 },
             ),
         )
-        .route("/poll", axum::routing::get(move || async move { status }))
+        .route(
+            "/poll",
+            axum::routing::get(move || async move {
+                if polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    (
+                        StatusCode::ACCEPTED,
+                        [
+                            ("x-progress", "Processing 4% - 702,191 Resources written"),
+                            ("retry-after", "0"),
+                        ],
+                        "",
+                    )
+                        .into_response()
+                } else {
+                    status.into_response()
+                }
+            }),
+        )
         .with_state(base);
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     format!("http://{addr}")
