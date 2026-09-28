@@ -6625,6 +6625,217 @@ async fn mongodb_integration_search_missing_not_and_param_sort() {
     assert!(page2.resources.page_info.has_previous);
 }
 
+/// #1564: both parameter-sort paths use every key, keep missing values last,
+/// and return stable offset pages and totals against an unchanged dataset.
+#[tokio::test]
+async fn mongodb_integration_sort_by_multiple_search_parameters() {
+    let Some(backend) = create_backend_with_full_registry("sort_multiple_params").await else {
+        eprintln!(
+            "Skipping mongodb_integration_sort_by_multiple_search_parameters (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-sort-multiple-params");
+    for (id, family, birth_date, active) in [
+        ("ms-brown", Some("Brown"), Some("1980-01-01"), true),
+        ("ms-adams", Some("Adams"), Some("1980-01-01"), true),
+        ("ms-z-adams", Some("Adams"), Some("1980-01-01"), true),
+        ("ms-clark", Some("Clark"), Some("1970-06-15"), true),
+        ("ms-nofamily", None, Some("1980-01-01"), true),
+        // IDs deliberately oppose the family-name order.
+        ("ms-z-nobirth", Some("Aaron"), None, true),
+        ("ms-a-nobirth", Some("Zulu"), None, true),
+        ("ms-neither-a", None, None, true),
+        ("ms-neither-z", None, None, true),
+        ("ms-excluded", Some("Baker"), Some("1980-01-01"), false),
+    ] {
+        let mut resource = json!({ "resourceType": "Patient", "id": id, "active": active });
+        if let Some(family) = family {
+            resource["name"] = json!([{ "family": family }]);
+        }
+        if let Some(birth_date) = birth_date {
+            resource["birthDate"] = json!(birth_date);
+        }
+        backend
+            .create(&tenant, "Patient", resource, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+    let ids = |result: &helios_persistence::core::SearchResult| {
+        result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect::<Vec<_>>()
+    };
+    let birthdate =
+        |spec: &str| SortDirective::parse(spec).with_param_type(Some(SearchParamType::Date));
+    let family =
+        |spec: &str| SortDirective::parse(spec).with_param_type(Some(SearchParamType::String));
+    let active = || SearchParameter {
+        name: "active".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: None,
+        values: vec![SearchValue::eq("true")],
+        chain: vec![],
+        components: vec![],
+    };
+    let cases = [
+        (
+            "birthdate,family",
+            birthdate("birthdate"),
+            family("family"),
+            vec![
+                "ms-clark",
+                "ms-adams",
+                "ms-z-adams",
+                "ms-excluded",
+                "ms-brown",
+                "ms-nofamily",
+                "ms-z-nobirth",
+                "ms-a-nobirth",
+                "ms-neither-a",
+                "ms-neither-z",
+            ],
+        ),
+        (
+            "birthdate,-family",
+            birthdate("birthdate"),
+            family("-family"),
+            vec![
+                "ms-clark",
+                "ms-brown",
+                "ms-excluded",
+                "ms-adams",
+                "ms-z-adams",
+                "ms-nofamily",
+                "ms-a-nobirth",
+                "ms-z-nobirth",
+                "ms-neither-a",
+                "ms-neither-z",
+            ],
+        ),
+        (
+            "-birthdate,family",
+            birthdate("-birthdate"),
+            family("family"),
+            vec![
+                "ms-adams",
+                "ms-z-adams",
+                "ms-excluded",
+                "ms-brown",
+                "ms-nofamily",
+                "ms-clark",
+                "ms-z-nobirth",
+                "ms-a-nobirth",
+                "ms-neither-a",
+                "ms-neither-z",
+            ],
+        ),
+    ];
+    for (label, first, second, expected) in cases {
+        for filtered in [false, true] {
+            let mut query = SearchQuery::new("Patient")
+                .with_sort(first.clone())
+                .with_sort(second.clone());
+            query.total = Some(TotalMode::Accurate);
+            if filtered {
+                query = query.with_parameter(active());
+            }
+            let expected: Vec<&str> = expected
+                .iter()
+                .copied()
+                .filter(|id| !filtered || *id != "ms-excluded")
+                .collect();
+            let result = backend.search(&tenant, &query).await.unwrap();
+            assert_eq!(ids(&result), expected, "filtered={filtered} {label}");
+            assert_eq!(
+                result.resources.page_info.total,
+                Some(expected.len() as u64)
+            );
+            let mut paged = Vec::new();
+            // Include the first empty page beyond the final resource.
+            let end = expected.len().div_ceil(2) * 2;
+            for offset in (0..=end).step_by(2) {
+                let mut page_query = query.clone().with_count(2);
+                page_query.offset = Some(offset as u32);
+                let page = backend.search(&tenant, &page_query).await.unwrap();
+                assert!(page.resources.page_info.next_cursor.is_none());
+                assert_eq!(page.resources.page_info.total, Some(expected.len() as u64));
+                assert_eq!(
+                    page.resources.page_info.has_next,
+                    offset + 2 < expected.len(),
+                    "filtered={filtered} {label} @{offset}"
+                );
+                paged.extend(ids(&page));
+            }
+            assert_eq!(paged, expected, "filtered={filtered} paged {label}");
+        }
+    }
+
+    // Test the server's sort-field boundary on both execution paths. Repeated
+    // keys are redundant but valid and exercise the generated field count.
+    for filtered in [false, true] {
+        let mut query = SearchQuery::new("Patient");
+        query.total = Some(TotalMode::Accurate);
+        if filtered {
+            query = query.with_parameter(active());
+        }
+        for _ in 0..15 {
+            query = query.with_sort(birthdate("birthdate"));
+        }
+        let result = backend.search(&tenant, &query).await.unwrap();
+        let single = if filtered {
+            SearchQuery::new("Patient")
+                .with_parameter(active())
+                .with_sort(birthdate("birthdate"))
+        } else {
+            SearchQuery::new("Patient").with_sort(birthdate("birthdate"))
+        };
+        assert_eq!(
+            ids(&result),
+            ids(&backend.search(&tenant, &single).await.unwrap())
+        );
+        query = query.with_sort(family("family"));
+        let err = backend.search(&tenant, &query).await.unwrap_err();
+        match err {
+            StorageError::Search(SearchError::QueryParseError { message }) => assert_eq!(
+                message,
+                "MongoDB supports at most 15 search-parameter sort keys"
+            ),
+            other => panic!("unexpected sort-limit error: {other:?}"),
+        }
+    }
+
+    // These are persistence-layer errors; the REST layer maps them to HTTP 400.
+    for other in ["_id", "-_lastUpdated", "_score"] {
+        for reserved_first in [false, true] {
+            let reserved = SortDirective::parse(other);
+            let expected = format!(
+                "MongoDB cannot combine _sort={} with a search-parameter sort; \
+                 sort by search parameters only",
+                reserved.parameter
+            );
+            let mixed = if reserved_first {
+                SearchQuery::new("Patient")
+                    .with_sort(reserved)
+                    .with_sort(birthdate("birthdate"))
+            } else {
+                SearchQuery::new("Patient")
+                    .with_sort(birthdate("birthdate"))
+                    .with_sort(reserved)
+            };
+            match backend.search(&tenant, &mixed).await.unwrap_err() {
+                StorageError::Search(SearchError::QueryParseError { message }) => {
+                    assert_eq!(message, expected)
+                }
+                err => panic!("{other}: unexpected error: {err:?}"),
+            }
+        }
+    }
+}
+
 /// #1002: `url:below`/`url:above` on MongoDB must be segment-aware, the same
 /// way SQLite and Elasticsearch already are — a `:below=http://example.org/fhir`
 /// must not match `http://example.org/fhirx/...` just because it shares the
