@@ -539,15 +539,23 @@ jobs:
             df -h /hostroot 2>/dev/null || docker system df 2>/dev/null || true
 
       - name: Docker host capacity gate
-        # A floor under the 600s poll loop's own budget (plus the impossible-
-        # fit preflight and the two `docker`/`awk` calls around it) — never
-        # let this step itself become the thing that overruns the leg.
-        timeout-minutes: 12
+        # A floor under the 600s poll loop's own budget — never let this
+        # step itself become the thing that overruns the leg. Every
+        # MemTotal/MemAvailable read now goes through host-mem.sh, whose own
+        # worst case (see its header) is ~120s per call (docker info +
+        # docker stats, each up to the default 60s timeout) — it no longer
+        # starts or cleans up any meminfo-candidate helper containers.
+        # Worst case for the whole step: ~120s preflight MemTotal read +
+        # the 600s poll budget (which already counts each poll's own
+        # host-mem.sh time against it, via bash's SECONDS) + one more
+        # ~120s poll that pushes past that budget before the loop notices
+        # = ~840s (14min). 15 minutes (900s) covers that with a little
+        # margin.
+        timeout-minutes: 15
         # Body (including the per-backend memory model and the poll-loop
         # rationale) moved to .github/scripts/fhir-bench/capacity-gate.sh.
         env:
           BACKEND: ${{ matrix.backend }}
-          RUN_ID: ${{ github.run_id }}
           IN_PG_SHARED_BUFFERS: ${{ inputs.pg_shared_buffers }}
           IN_MONGO_WT_CACHE_GB: ${{ inputs.mongo_wt_cache_gb }}
           ES_HEAP_MB: ${{ needs.setup.outputs.es_heap_mb }}
@@ -1217,6 +1225,7 @@ jobs:
             echo "capacity_need_mb:   ${CAPACITY_NEED_MB:-unknown}"
             echo "capacity_avail_mb:  ${CAPACITY_AVAIL_MB:-unknown}"
             echo "capacity_wait_s:    ${CAPACITY_WAIT_S:-unknown}"
+            echo "capacity_mem_source: ${CAPACITY_MEM_SOURCE:-unknown}"
             # PG_VOL_FREE_MB / MONGO_VOL_FREE_MB / ES_VOL_FREE_MB were written
             # to $GITHUB_ENV by the container-start steps above (they also
             # print into that step's own $GITHUB_STEP_SUMMARY block, but
@@ -1293,24 +1302,43 @@ jobs:
           # cannot be trusted for throughput now says so in its own artifact.
           probe_host() {
             local phase="$1" suite="$2"
-            local la cn mem out
-            # One alpine run answers both questions: how loaded is the host,
-            # and (#1475) how much memory does it have left — the same
-            # MemAvailable the capacity gate polls, recorded in kB so a
-            # suite's own numbers can be read against host memory pressure,
-            # not just load average and container count.
+            local la cn out mem_line mem_mb mem_source
+            # Loadavg still comes from a plain container's own /proc/loadavg,
+            # unvalidated — NOT because lxcfs-style virtualisation is known
+            # to leave /proc/loadavg alone (it doesn't; lxcfs virtualises
+            # loadavg the same way it can virtualise meminfo, scoped to
+            # whatever cgroup it resolves the reader to). What actually
+            # matters here is what a plain nested container's own read
+            # happens to give us on THIS host: run 36410157709 showed it
+            # returning the physical machine's real, unvirtualised figures
+            # for memory, not a cgroup-scoped view — the whole reason
+            # host-mem.sh exists — and there is no reason to expect loadavg
+            # to behave differently on the same host. That is the number
+            # this probe actually wants: the WHOLE box's contention,
+            # including neighbours outside this leg's own cgroup, not a
+            # scoped-down view of just this leg. If that ever turns out
+            # false here (loadavg reads a cgroup-scoped value while meminfo
+            # doesn't), this reading would need the same kind of
+            # cross-validation host-mem.sh does for memory — nothing
+            # currently checks that assumption for loadavg.
             local probe_name="hfs-bench-probe-${{ matrix.backend }}-${{ github.run_id }}"
             out=$(timeout 60 docker run --rm --name "$probe_name" \
                 --label hfs-bench=1 --label "hfs-bench-run=${{ github.run_id }}" --label "hfs-bench-leg=${{ matrix.backend }}" \
-                alpine:3 sh -c 'cat /proc/loadavg; grep MemAvailable /proc/meminfo' 2>/dev/null) || out=""
+                alpine:3 cat /proc/loadavg 2>/dev/null) || out=""
             # `timeout 60` only kills the local docker CLI; force the
             # container gone so repeated probe_host calls (every suite,
             # every phase) never collide on this fixed --name.
             docker rm -f "$probe_name" >/dev/null 2>&1 || true
             la=$(printf '%s\n' "$out" | sed -n '1p' | cut -d' ' -f1-3)
-            mem=$(printf '%s\n' "$out" | sed -n '2p' | awk '{print $2}')
             cn=$(docker ps -q 2>/dev/null | wc -l) || cn=""
-            echo "$(date -u +%H:%M:%SZ) suite=$suite phase=$phase host_loadavg=${la:-unknown} host_containers=${cn:-unknown} host_mem_avail_kb=${mem:-unknown}" \
+            # Memory (#1475 follow-up, run 36410157709): the same
+            # host-mem.sh the capacity gate polls — derived from `docker
+            # info` + `docker stats`, not a bare container /proc/meminfo
+            # read — see that script's header.
+            mem_line=$(bash "$GITHUB_WORKSPACE/.github/scripts/fhir-bench/host-mem.sh" 2>/dev/null) || mem_line=""
+            mem_mb=$(printf '%s\n' "$mem_line" | sed -n 's/.*avail_mb=\(.*\)$/\1/p')
+            mem_source=$(printf '%s\n' "$mem_line" | sed -n 's/^source=\([^ ]*\) .*/\1/p')
+            echo "$(date -u +%H:%M:%SZ) suite=$suite phase=$phase host_loadavg=${la:-unknown} host_containers=${cn:-unknown} host_mem_avail_mb=${mem_mb:-unknown} host_mem_source=${mem_source:-none}" \
               >> "$RESULTS_DIR/host-contention.txt"
           }
 
@@ -1338,8 +1366,14 @@ jobs:
               fi
             fi
 
-            SUITE_START=$(date +%s)
+            # probe_host itself makes two docker calls via host-mem.sh
+            # (docker info + docker stats, up to ~120s worst case at the
+            # default 60s per-call timeout, see that script's header) —
+            # call it BEFORE starting the clock, so a slow host reading
+            # isn't folded into this suite's own wall time / the
+            # pg_exec-vs-wall attribution below.
             probe_host start "$SUITE"
+            SUITE_START=$(date +%s)
             if [ ! -f "$SCRIPT" ]; then
               echo "Skip '$SUITE' — $SCRIPT not found"
               continue
@@ -1582,6 +1616,10 @@ jobs:
       # with `|| true`, so a mid-run OOM would not otherwise fail the job).
       - name: Diagnose backend container failure
         if: failure() || cancelled() || env.LEG_CONTAINER_DIED == 'true'
+        # 3: host-mem.sh no longer starts helper containers to read
+        # /proc/meminfo (just docker info + docker stats), so its capture
+        # below adds only a small, bounded amount on top of this step's
+        # other calls — see the timeout-budget math in diagnose.sh.
         timeout-minutes: 3
         # Body (including the timeout-budget math, the OOM-killer grep and
         # the shared-host caveat) moved to

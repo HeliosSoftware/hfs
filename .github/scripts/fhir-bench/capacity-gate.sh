@@ -24,18 +24,32 @@
 # OTHER CI too) every 60s for up to 10 minutes; still short after that,
 # fail the leg rather than risk taking down a neighbour's container.
 #
+# Both MemTotal and every MemAvailable poll go through host-mem.sh, not a
+# direct `docker info`/`docker run ... /proc/meminfo` read — see that
+# script's header for why (run 36410157709: this host's own /proc/meminfo
+# read from inside a plain container disagreed with `docker info` by more
+# than 5x, most likely an LXC/VM-like daemon host whose /proc/meminfo is
+# virtualised, e.g. lxcfs). The source host-mem.sh actually trusted for a
+# given poll is logged on that poll's line and recorded as
+# CAPACITY_MEM_SOURCE alongside the other CAPACITY_* outputs below.
+#
 # Required environment (exported by the workflow step's env:):
 #   BACKEND                  matrix.backend
-#   RUN_ID                   github.run_id
 #   IN_PG_SHARED_BUFFERS     inputs.pg_shared_buffers
 #   IN_MONGO_WT_CACHE_GB     inputs.mongo_wt_cache_gb
 #   ES_HEAP_MB               needs.setup.outputs.es_heap_mb
 #
-# Outputs: CAPACITY_NEED_MB / CAPACITY_AVAIL_MB / CAPACITY_WAIT_S appended to
-# $GITHUB_ENV (read by "Run benchmark suites" for runner-info.txt, and by
-# summary_backends.py as its fallback Capacity gate row for a leg that
-# failed this gate before runner-info.txt was ever written).
+# Also reads host-mem.sh (same directory) for MemTotal/MemAvailable.
+#
+# Outputs: CAPACITY_NEED_MB / CAPACITY_AVAIL_MB / CAPACITY_WAIT_S /
+# CAPACITY_MEM_SOURCE appended to $GITHUB_ENV (read by "Run benchmark
+# suites" for runner-info.txt, and by summary_backends.py as its fallback
+# Capacity gate row for a leg that failed this gate before
+# runner-info.txt was ever written).
 set -euo pipefail
+
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+HOST_MEM_SH="$SCRIPT_DIR/host-mem.sh"
 
 case "$BACKEND" in
   postgres|postgres-elasticsearch)
@@ -78,19 +92,35 @@ esac
 CAPACITY_NEED_MB=$(( NEED_PRIMARY_MB + NEED_ES_MB ))
 echo "Capacity need for $BACKEND: primary=${NEED_PRIMARY_MB}MB elasticsearch=${NEED_ES_MB}MB total=${CAPACITY_NEED_MB}MB"
 
-MEM_TOTAL_BYTES=$(timeout 60 docker info --format '{{.MemTotal}}' 2>/dev/null) || MEM_TOTAL_BYTES=0
-case "$MEM_TOTAL_BYTES" in ''|*[!0-9]*) MEM_TOTAL_BYTES=0 ;; esac
-MEM_TOTAL_MB=$(( MEM_TOTAL_BYTES / 1024 / 1024 ))
-echo "Docker host MemTotal: ${MEM_TOTAL_MB}MB"
+# read_host_mem: runs host-mem.sh and splits its one guaranteed output
+# line into HOSTMEM_SOURCE / HOSTMEM_TOTAL_MB / HOSTMEM_AVAIL_MB (each
+# "unknown"/"none" on any failure, including host-mem.sh itself being
+# unreadable — a case host-mem.sh's own `set -uo pipefail` guarding
+# cannot cover).
+read_host_mem() {
+  local line
+  line=$(bash "$HOST_MEM_SH" 2>/dev/null) || line=""
+  HOSTMEM_SOURCE=$(printf '%s\n' "$line" | sed -n 's/^source=\([^ ]*\) .*/\1/p')
+  HOSTMEM_TOTAL_MB=$(printf '%s\n' "$line" | sed -n 's/.*total_mb=\([^ ]*\) avail_mb=.*/\1/p')
+  HOSTMEM_AVAIL_MB=$(printf '%s\n' "$line" | sed -n 's/.*avail_mb=\(.*\)$/\1/p')
+  [ -n "$HOSTMEM_SOURCE" ] || HOSTMEM_SOURCE=none
+  [ -n "$HOSTMEM_TOTAL_MB" ] || HOSTMEM_TOTAL_MB=unknown
+  [ -n "$HOSTMEM_AVAIL_MB" ] || HOSTMEM_AVAIL_MB=unknown
+}
 
-# A `docker info` hiccup reads as MEM_TOTAL_MB=0, which would
+read_host_mem
+MEM_TOTAL_MB="$HOSTMEM_TOTAL_MB"
+case "$MEM_TOTAL_MB" in ''|*[!0-9]*) MEM_TOTAL_MB=0 ;; esac
+echo "Docker host MemTotal: ${MEM_TOTAL_MB}MB (source=${HOSTMEM_SOURCE})"
+
+# A host-mem.sh miss reads as MEM_TOTAL_MB=0 (source=none), which would
 # otherwise always trip the impossible-fit check below and tell the
-# user to lower their inputs when the real problem is that the
-# daemon couldn't be read. Skip straight to the poll loop instead —
-# it re-reads memory through a separate `docker run`, so a
-# transient `docker info` failure alone doesn't fail the leg.
+# user to lower their inputs when the real problem is that memory
+# couldn't be read at all. Skip straight to the poll loop instead — it
+# re-reads memory through the same script, so a transient miss alone
+# doesn't fail the leg.
 if [ "$MEM_TOTAL_MB" -eq 0 ]; then
-  echo "::warning::could not read Docker host MemTotal (docker info failed) — skipping the impossible-fit check; the poll below still guards capacity"
+  echo "::warning::could not determine Docker host MemTotal (host-mem.sh source=${HOSTMEM_SOURCE}) — skipping the impossible-fit check; the poll below still guards capacity"
 elif [ $(( CAPACITY_NEED_MB + 2048 )) -gt "$MEM_TOTAL_MB" ]; then
   # Record what this leg needed even though no suite will run, so
   # the summary (which reads these from $GITHUB_ENV when
@@ -100,32 +130,32 @@ elif [ $(( CAPACITY_NEED_MB + 2048 )) -gt "$MEM_TOTAL_MB" ]; then
     echo "CAPACITY_NEED_MB=$CAPACITY_NEED_MB"
     echo "CAPACITY_AVAIL_MB=skipped"
     echo "CAPACITY_WAIT_S=0"
+    echo "CAPACITY_MEM_SOURCE=$HOSTMEM_SOURCE"
   } >> "$GITHUB_ENV"
-  echo "::error::backend=$BACKEND needs ~${CAPACITY_NEED_MB}MB (plus a 2048MB margin), but the Docker host only reports ${MEM_TOTAL_MB}MB total RAM. Lower es_heap / mongo_wt_cache_gb / pg_shared_buffers, or pick a lighter backend — this combination can never fit, even with the whole host free."
+  echo "::error::backend=$BACKEND needs ~${CAPACITY_NEED_MB}MB (plus a 2048MB margin), but the Docker host only reports ${MEM_TOTAL_MB}MB total RAM (source=${HOSTMEM_SOURCE}). Lower es_heap / mongo_wt_cache_gb / pg_shared_buffers, or pick a lighter backend — this combination can never fit, even with the whole host free."
   exit 1
 fi
 
 echo "── Waiting for MemAvailable >= $(( CAPACITY_NEED_MB + 2048 ))MB (poll 60s, timeout 10min) ──"
 CAPACITY_START=$SECONDS
 CAPACITY_AVAIL_MB=""
+CAPACITY_MEM_SOURCE=""
 CAPACITY_OK=0
 while :; do
-  # shellcheck disable=SC2016 # single-quoted deliberately: $2 is awk's field
-  # reference, evaluated inside the container, not a shell variable here.
-  CAPACITY_AVAIL_MB=$(timeout 60 docker run --rm --name "hfs-bench-mem-$BACKEND-$RUN_ID" \
-      --label hfs-bench=1 --label "hfs-bench-run=$RUN_ID" --label "hfs-bench-leg=$BACKEND" \
-      alpine:3 awk '/^MemAvailable:/{print int($2 / 1024)}' /proc/meminfo 2>/dev/null) || CAPACITY_AVAIL_MB=""
-  # `timeout 60` only kills the local docker CLI, not a container
-  # still starting on the daemon — force it gone so the same
-  # `--name` doesn't collide on the next poll (every 60s).
-  docker rm -f "hfs-bench-mem-$BACKEND-$RUN_ID" >/dev/null 2>&1 || true
+  read_host_mem
+  CAPACITY_MEM_SOURCE="$HOSTMEM_SOURCE"
+  CAPACITY_AVAIL_MB="$HOSTMEM_AVAIL_MB"
+  case "$CAPACITY_AVAIL_MB" in ''|*[!0-9]*) CAPACITY_AVAIL_MB="" ;; esac
   CAPACITY_WAIT_S=$((SECONDS - CAPACITY_START))
   if [ -n "$CAPACITY_AVAIL_MB" ] && [ "$CAPACITY_AVAIL_MB" -ge $(( CAPACITY_NEED_MB + 2048 )) ]; then
     CAPACITY_OK=1
-    echo "  t=${CAPACITY_WAIT_S}s MemAvailable=${CAPACITY_AVAIL_MB}MB — capacity OK"
+    echo "  t=${CAPACITY_WAIT_S}s MemAvailable=${CAPACITY_AVAIL_MB}MB (source=${CAPACITY_MEM_SOURCE}) — capacity OK"
     break
   fi
-  echo "  t=${CAPACITY_WAIT_S}s MemAvailable=${CAPACITY_AVAIL_MB:-unknown}MB, need $(( CAPACITY_NEED_MB + 2048 ))MB — waiting"
+  # source=none reads the same as any other unknown MemAvailable above
+  # (CAPACITY_AVAIL_MB blanked by the numeric guard) — keep waiting and
+  # let the 600s budget below be the only thing that fails the leg.
+  echo "  t=${CAPACITY_WAIT_S}s MemAvailable=${CAPACITY_AVAIL_MB:-unknown}MB (source=${CAPACITY_MEM_SOURCE}), need $(( CAPACITY_NEED_MB + 2048 ))MB — waiting"
   # Never sleep past the 600s budget: a plain `sleep 60` here could
   # carry the last iteration well beyond it (e.g. wait_s=590 -> next
   # check at 650s). Cap the sleep to whatever is actually left.
@@ -142,6 +172,7 @@ done
   echo "CAPACITY_NEED_MB=$CAPACITY_NEED_MB"
   echo "CAPACITY_AVAIL_MB=${CAPACITY_AVAIL_MB:-unknown}"
   echo "CAPACITY_WAIT_S=$CAPACITY_WAIT_S"
+  echo "CAPACITY_MEM_SOURCE=${CAPACITY_MEM_SOURCE:-none}"
 } >> "$GITHUB_ENV"
 
 if [ "$CAPACITY_OK" -ne 1 ]; then

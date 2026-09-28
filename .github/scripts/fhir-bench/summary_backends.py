@@ -25,9 +25,14 @@
 #                         reads it
 # Also reads GITHUB_WORKSPACE (set by Actions on every runner, not just this
 # step) and, when present, CAPACITY_NEED_MB / CAPACITY_AVAIL_MB /
-# CAPACITY_WAIT_S — $GITHUB_ENV values "Docker host capacity gate" writes
-# before its own early exit, inherited automatically like any other
-# $GITHUB_ENV value (no env: mapping needed for those three).
+# CAPACITY_WAIT_S / CAPACITY_MEM_SOURCE — $GITHUB_ENV values "Docker host
+# capacity gate" writes before its own early exit, inherited automatically
+# like any other $GITHUB_ENV value (no env: mapping needed for those four).
+# CAPACITY_MEM_SOURCE (and host-contention.txt's host_mem_source below) name
+# which of host-mem.sh's sources (docker-stats / none) that reading actually
+# came from — see host-mem.sh's header for why it derives MemAvailable from
+# `docker info` + `docker stats` instead of ever reading /proc/meminfo
+# (run 36410157709).
 #
 # Input: the *.txt files "Run benchmark suites" wrote under
 # bench-results/<backend>/ — runner-info.txt, import-completeness.txt,
@@ -76,6 +81,7 @@ if not ri:
             "capacity_need_mb": cap_need,
             "capacity_avail_mb": os.environ.get("CAPACITY_AVAIL_MB", "unknown"),
             "capacity_wait_s": os.environ.get("CAPACITY_WAIT_S", "unknown"),
+            "capacity_mem_source": os.environ.get("CAPACITY_MEM_SOURCE", "unknown"),
         }
 if ri:
     print("### Leg configuration\n")
@@ -93,7 +99,9 @@ if ri:
     need = ri.get("capacity_need_mb")
     if need is not None:
         print(f"| **Capacity gate** | need {need} MB, available "
-              f"{ri.get('capacity_avail_mb', '?')} MB, waited {ri.get('capacity_wait_s', '?')} s |")
+              f"{ri.get('capacity_avail_mb', '?')} MB "
+              f"(source `{ri.get('capacity_mem_source', 'unknown')}`), "
+              f"waited {ri.get('capacity_wait_s', '?')} s |")
     print()
 
 # Import completeness (F1b): k6 caps import at 60m, so an async
@@ -138,11 +146,12 @@ if drain:
 contention_path = f"{results_dir}/host-contention.txt"
 if os.path.exists(contention_path):
     hc = re.search(
-        r"suite=crud phase=start host_loadavg=(\S+).*host_containers=(\d+).*host_mem_avail_kb=(\S+)",
+        r"suite=crud phase=start host_loadavg=(\S+).*host_containers=(\d+).*"
+        r"host_mem_avail_mb=(\S+).*host_mem_source=(\S+)",
         open(contention_path).read())
     if hc:
         print(f"\n**Host load at crud start:** loadavg {hc.group(1)}, {hc.group(2)} containers, "
-              f"{hc.group(3)} kB MemAvailable on the Docker host.")
+              f"{hc.group(3)} MB MemAvailable on the Docker host (source `{hc.group(4)}`).")
 
 # "How to read this leg" (F4): what the ES/Mongo numbers actually
 # measure, so they are not misread as directly comparable to a bare
