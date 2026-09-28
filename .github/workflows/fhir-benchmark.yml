@@ -1133,16 +1133,38 @@ jobs:
       - name: Run benchmark suites
         working-directory: fhir-benchmark
         env:
-          # Free-text inputs used below reach bash only through env:, never
-          # inlined as ${{ }} inside run: — same reasoning as "Resolve matrix
-          # from backend input" and "Configure backend env". es_sync_mode
-          # needs no entry here: it is already ambient as
-          # $HFS_COMPOSITE_SYNC_MODE, written to $GITHUB_ENV by "Configure
-          # backend env".
+          # This run: block must contain no ${{ }} — GitHub caps a run block
+          # that contains an expression at 21,000 characters (dispatch of
+          # cffc076b1 failed with "Exceeded max expression length 21000" on
+          # this exact step, which was ~26,300 characters with 31 ${{ }}
+          # substitutions). Every matrix/inputs/github/needs value the block
+          # below uses is passed through here instead and read back as a
+          # plain env var in bash. es_sync_mode needs no entry here: it is
+          # already ambient as $HFS_COMPOSITE_SYNC_MODE, written to
+          # $GITHUB_ENV by "Configure backend env".
+          BACKEND: ${{ matrix.backend }}
+          BENCH_PORT: ${{ matrix.port }}
+          BENCH_RUN_ID: ${{ github.run_id }}
+          BENCH_IN_RUN_ID: ${{ inputs.run_id }}
+          BENCH_SHA: ${{ github.sha }}
+          BENCH_REF_NAME: ${{ github.ref_name }}
+          BENCH_IN_PG_MAX_CONNECTIONS: ${{ inputs.hfs_pg_max_connections }}
+          BENCH_MAX_PARALLEL: ${{ needs.setup.outputs.max_parallel }}
+          BENCH_LEG_TIMEOUT_MIN: ${{ needs.setup.outputs.leg_timeout_min }}
+          BENCH_IN_TESTS: ${{ inputs.tests }}
+          BENCH_IN_VUS: ${{ inputs.vus }}
+          BENCH_IN_DURATION: ${{ inputs.duration }}
           IN_ES_HEAP: ${{ inputs.es_heap }}
           IN_MONGO_WT_CACHE_GB: ${{ inputs.mongo_wt_cache_gb }}
           IN_HFS_MONGO_MAX_CONNECTIONS: ${{ inputs.hfs_mongo_max_connections }}
         run: |
+          # This block must contain no inline GitHub Actions expressions
+          # (the double-curly-brace substitution syntax) — GitHub caps a
+          # run: block that contains one at 21,000 characters. Dispatching
+          # commit cffc076b1 failed with "Exceeded max expression length
+          # 21000" on this exact step, which was about 26,300 characters
+          # using 31 such expressions. New values come in through env:
+          # above and are read back here as plain environment variables.
           set -uo pipefail
           # es_drain_gate, capture_backend_stats, write_import_completeness,
           # write_mongo_txn_errors, write_search_counts,
@@ -1154,30 +1176,26 @@ jobs:
           # substitution.
           source "$GITHUB_WORKSPACE/.github/scripts/fhir-bench/suite-lib.sh"
 
-          # Plain (non-exported) shell variables, not `env:` above: this
-          # inline block, unlike the sourced suite-lib.sh functions, still
-          # gets GitHub Actions expression substitution, so there is no need
-          # to export these to the process environment — doing so would leak
-          # them into k6's __ENV and every other child process this step
-          # spawns. Sourcing puts suite-lib.sh's functions in THIS shell, so
-          # they see these like any other shell variable already set by the
-          # time they're called; no export needed for that either.
+          # BACKEND / BENCH_PORT / BENCH_RUN_ID are already in the process
+          # environment from env: above (same matrix.backend / matrix.port /
+          # github.run_id values suite-lib.sh's functions and everything
+          # below need) — no local re-assignment needed. RUN_ID below stays a
+          # plain shell variable rather than moving to env: above because it
+          # is derived (inputs.run_id with a bash-side fallback), not a 1:1
+          # copy of one context value.
           # BENCH_RUN_ID is deliberately NOT named RUN_ID: this step's own
           # $RUN_ID (below) holds the possibly-user-overridden
           # inputs.run_id tag used for k6 --tag runid=, not the actual
           # github.run_id that container/volume names and the drain-probe
           # identifier need.
-          BACKEND="${{ matrix.backend }}"
-          BENCH_PORT="${{ matrix.port }}"
-          BENCH_RUN_ID="${{ github.run_id }}"
-          RUN_ID="${{ inputs.run_id }}"
-          [ -z "$RUN_ID" ] && RUN_ID="${{ github.run_id }}"
+          RUN_ID="$BENCH_IN_RUN_ID"
+          [ -z "$RUN_ID" ] && RUN_ID="$BENCH_RUN_ID"
 
           # Checkout uses clean:false, so wipe any results left by a prior run on
           # this runner (otherwise a stale sibling backend dir rides along in the
           # uploaded artifact).
           rm -rf "$GITHUB_WORKSPACE/bench-results"
-          RESULTS_DIR="$GITHUB_WORKSPACE/bench-results/${{ matrix.backend }}"
+          RESULTS_DIR="$GITHUB_WORKSPACE/bench-results/$BACKEND"
           mkdir -p "$RESULTS_DIR"
 
           # Which machine measured this run, recorded INSIDE the artifact.
@@ -1193,17 +1211,17 @@ jobs:
           # numbers can always be read back against what produced them.
           # Mongo/ES values read n/a off their own legs. CAPACITY_* were
           # written to $GITHUB_ENV by "Docker host capacity gate", above.
-          case "${{ matrix.backend }}" in
+          case "$BACKEND" in
             mongodb*) MONGO_POOL_REC="${IN_HFS_MONGO_MAX_CONNECTIONS:-32}"; MONGO_WT_REC="${IN_MONGO_WT_CACHE_GB:-2}" ;;
             *)        MONGO_POOL_REC=n/a; MONGO_WT_REC=n/a ;;
           esac
-          case "${{ matrix.backend }}" in
+          case "$BACKEND" in
             *-elasticsearch) ES_HEAP_REC="${IN_ES_HEAP:-1g}"
                              ES_WRITE_REFRESH_REC="${HFS_ELASTICSEARCH_WRITE_REFRESH:-unknown}"
                              ES_REFRESH_INTERVAL_REC="${HFS_ELASTICSEARCH_REFRESH_INTERVAL:-unknown}" ;;
             *)               ES_HEAP_REC=n/a; ES_WRITE_REFRESH_REC=n/a; ES_REFRESH_INTERVAL_REC=n/a ;;
           esac
-          case "${{ matrix.backend }}" in
+          case "$BACKEND" in
             mongodb*) MONGO_TXN_LIFETIME_REC="${MONGO_TXN_LIFETIME_S:-unknown}" ;;
             *)        MONGO_TXN_LIFETIME_REC=n/a ;;
           esac
@@ -1214,11 +1232,11 @@ jobs:
             echo "runner_ram:   $(free -g 2>/dev/null | awk '/^Mem:/{print $2"G"}' || echo '?')"
             echo "runner_ip:    ${RUNNER_IP:-unknown}"
             echo "docker_host:  ${DOCKER_HOST_IP:-unknown}"
-            echo "github_run:   ${{ github.run_id }}"
-            echo "git_sha:      ${{ github.sha }}"
-            echo "git_ref:      ${{ github.ref_name }}"
-            echo "backend:      ${{ matrix.backend }}"
-            echo "pg_pool_max:  ${{ inputs.hfs_pg_max_connections || '32' }}"
+            echo "github_run:   $BENCH_RUN_ID"
+            echo "git_sha:      $BENCH_SHA"
+            echo "git_ref:      $BENCH_REF_NAME"
+            echo "backend:      $BACKEND"
+            echo "pg_pool_max:  ${BENCH_IN_PG_MAX_CONNECTIONS:-32}"
             echo "es_heap:            $ES_HEAP_REC"
             echo "es_sync_mode:       ${HFS_COMPOSITE_SYNC_MODE:-n/a}"
             echo "es_write_refresh:   $ES_WRITE_REFRESH_REC"
@@ -1227,8 +1245,8 @@ jobs:
             echo "mongo_pool_max:     $MONGO_POOL_REC"
             echo "mongo_txn_lifetime_s: $MONGO_TXN_LIFETIME_REC"
             echo "hfs_ready_s:        ${HFS_READY_SECONDS:-unknown}"
-            echo "max_parallel:       ${{ needs.setup.outputs.max_parallel }}"
-            echo "leg_timeout_min:    ${{ needs.setup.outputs.leg_timeout_min }}"
+            echo "max_parallel:       $BENCH_MAX_PARALLEL"
+            echo "leg_timeout_min:    $BENCH_LEG_TIMEOUT_MIN"
             echo "capacity_need_mb:   ${CAPACITY_NEED_MB:-unknown}"
             echo "capacity_avail_mb:  ${CAPACITY_AVAIL_MB:-unknown}"
             echo "capacity_wait_s:    ${CAPACITY_WAIT_S:-unknown}"
@@ -1245,7 +1263,7 @@ jobs:
           # Resolve suite list. 'search' needs data, so 'import' must precede it;
           # canonical order keeps that invariant for the 'all' case.
           CANONICAL="prewarm import crud search"
-          INPUT_TESTS="${{ inputs.tests || 'all' }}"
+          INPUT_TESTS="${BENCH_IN_TESTS:-all}"
           if [ "$INPUT_TESTS" = "all" ]; then
             SUITES="$CANONICAL"
           else
@@ -1254,8 +1272,8 @@ jobs:
 
           # Advisory overrides (see header note — ignored when a script pins a scenario).
           EXTRA_ARGS=""
-          [ -n "${{ inputs.vus }}" ]      && EXTRA_ARGS="$EXTRA_ARGS --vus ${{ inputs.vus }}"
-          [ -n "${{ inputs.duration }}" ] && EXTRA_ARGS="$EXTRA_ARGS --duration ${{ inputs.duration }}"
+          [ -n "$BENCH_IN_VUS" ]      && EXTRA_ARGS="$EXTRA_ARGS --vus $BENCH_IN_VUS"
+          [ -n "$BENCH_IN_DURATION" ] && EXTRA_ARGS="$EXTRA_ARGS --duration $BENCH_IN_DURATION"
 
           # Where does a suite's time actually go?
           #
@@ -1280,7 +1298,7 @@ jobs:
           # (main.rs set_search_offloaded), so they would measure an empty
           # table.
           PG_FAMILY=false
-          case "${{ matrix.backend }}" in postgres|postgres-elasticsearch) PG_FAMILY=true ;; esac
+          case "$BACKEND" in postgres|postgres-elasticsearch) PG_FAMILY=true ;; esac
 
           # ES drain gate: ONE deadline shared across the barrier probe and
           # the settle poll (see es_drain_gate in suite-lib.sh) — not 15 min budgeted to
@@ -1328,9 +1346,9 @@ jobs:
             # doesn't), this reading would need the same kind of
             # cross-validation host-mem.sh does for memory — nothing
             # currently checks that assumption for loadavg.
-            local probe_name="hfs-bench-probe-${{ matrix.backend }}-${{ github.run_id }}"
+            local probe_name="hfs-bench-probe-${BACKEND}-${BENCH_RUN_ID}"
             out=$(timeout 60 docker run --rm --name "$probe_name" \
-                --label hfs-bench=1 --label "hfs-bench-run=${{ github.run_id }}" --label "hfs-bench-leg=${{ matrix.backend }}" \
+                --label hfs-bench=1 --label "hfs-bench-run=${BENCH_RUN_ID}" --label "hfs-bench-leg=${BACKEND}" \
                 alpine:3 cat /proc/loadavg 2>/dev/null) || out=""
             # `timeout 60` only kills the local docker CLI; force the
             # container gone so repeated probe_host calls (every suite,
@@ -1395,7 +1413,7 @@ jobs:
             # so this subsumes the plain ANALYZE.
             #
             # Runs once, after the data is in and before search is measured.
-            if [ "$SUITE" = "search" ] && [ "${{ matrix.backend }}" = "postgres" ] \
+            if [ "$SUITE" = "search" ] && [ "$BACKEND" = "postgres" ] \
                && [ -n "${PG_CONTAINER:-}" ]; then
               echo "── VACUUM (ANALYZE) before search (sets the visibility map) ──"
               docker exec "$PG_CONTAINER" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
@@ -1422,7 +1440,7 @@ jobs:
             fi
 
             echo "=================================================="
-            echo "Suite: $SUITE   backend: ${{ matrix.backend }}   run: $RUN_ID"
+            echo "Suite: $SUITE   backend: $BACKEND   run: $RUN_ID"
             echo "=================================================="
 
             # The search suite tags every request with {name, resourceType,
@@ -1438,7 +1456,7 @@ jobs:
               --no-usage-report \
               --tag runid="$RUN_ID" \
               --tag fhirimpl=hfs \
-              --env BASE_URL="http://localhost:${{ matrix.port }}" \
+              --env BASE_URL="http://localhost:$BENCH_PORT" \
               --env BUNDLE_URL="$BUNDLE_URL" \
               --env FHIRIMPL=hfs \
               --summary-trend-stats "avg,min,med,p(90),p(95),p(99),max" \
@@ -1490,7 +1508,7 @@ jobs:
                 # postgres-elasticsearch writes no search_index (main.rs
                 # set_search_offloaded), so its wall time includes ES sync
                 # backpressure, not just Postgres — say so before the numbers.
-                if [ "${{ matrix.backend }}" = "postgres-elasticsearch" ]; then
+                if [ "$BACKEND" = "postgres-elasticsearch" ]; then
                   echo "note: postgres-elasticsearch — search_index is not written and wall time includes Elasticsearch sync backpressure; a low pg_exec/wall ratio does NOT mean HFS-CPU-bound"
                 fi
                 echo "suite=$SUITE wall_seconds=$SUITE_WALL"
@@ -1547,7 +1565,7 @@ jobs:
           # write still maintained it and it still occupied cache on an 11G host.
           # Evidence for the next round of index pruning; nothing reads it in
           # this run.
-          if [ "${{ matrix.backend }}" = "postgres" ] && [ -n "${PG_CONTAINER:-}" ]; then
+          if [ "$BACKEND" = "postgres" ] && [ -n "${PG_CONTAINER:-}" ]; then
             docker exec "$PG_CONTAINER" psql -U postgres -d postgres \
               -c "SELECT s.indexrelname AS index_name, s.idx_scan AS scans,
                          s.idx_tup_read AS tuples_read,
