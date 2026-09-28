@@ -13,19 +13,38 @@ name: FHIR Server Benchmark
 # Topology (mirrors hts-benchmark.yml — HFS and k6 run natively ON the runner;
 # only the stateful dependencies live in containers on the REMOTE Docker daemon):
 #
-#   k6 (runner) ──HTTP──▶ HFS (runner, :8081/:8082)
-#        │                     │
-#        │                     └──SQL──▶ postgres:18 container  (postgres backend only)
+#   k6 (runner) ──HTTP──▶ HFS (runner, :8081-:8086, one port per backend)
+#        │                  ├──SQL────▶ postgres:18             (postgres, postgres-elasticsearch)
+#        │                  ├──Mongo──▶ mongo:7.0, 1-member rs0 (mongodb, mongodb-elasticsearch)
+#        │                  └──HTTP───▶ elasticsearch:8.15.0    (*-elasticsearch: serves every search)
 #        └──HTTP──▶ tgz bundle server container  (Synthea import corpus)
 #
-#   • HFS is built once with both storage backends compiled in and the backend
-#     is chosen at runtime via HFS_STORAGE_BACKEND:
-#       - sqlite   — file-backed DB on the runner.
-#       - postgres — ephemeral postgres:18 container, tuned to approximate the
+#   • HFS is built once with sqlite, postgres, mongodb and elasticsearch
+#     compiled in; the leg picks one via HFS_STORAGE_BACKEND:
+#       - sqlite (8081)   — file-backed DB on the runner.
+#       - postgres (8082) — ephemeral postgres:18, tuned to approximate the
 #         benchmark's infra/postgres/postgres.conf.
-#       - all      — both, as parallel matrix legs (default).
+#       - mongodb (8083)  — ephemeral single-member replica set (FHIR
+#         transaction Bundles need one), WiredTiger cache capped.
+#       - sqlite-/postgres-/mongodb-elasticsearch (8084/8085/8086) — the same
+#         primary plus a single-node Elasticsearch that serves every search; the
+#         primary's own search index is not written (set_search_offloaded).
+#   • `backend`: core (default) = sqlite + postgres; all = all six;
+#     elasticsearch = the three composites; or any single leg. `max_parallel`
+#     (default 1, clamped to 1..2) caps how many legs share the Docker host at
+#     once.
+#   • s3 / s3-elasticsearch are not benchmarked: bare s3 has no search
+#     (persistence/src/backends/s3/storage.rs:1763-1775) — its only
+#     conditional support is identifier-scoped conditional create
+#     (persistence/src/backends/s3/backend.rs:94), not enough for import's
+#     conditional references or the search suite. s3-elasticsearch is a
+#     follow-up issue.
 #   • The `tgz` bundle server (benchmark's infra/tgz) serves the Synthea
 #     `bulk_1k` corpus consumed by the import suite.
+#   • Every named volume this workflow creates is
+#     `hfs-bench-<kind>-<backend>-<run_id>`, labelled hfs-bench=1 +
+#     hfs-bench-run=<run_id> + hfs-bench-leg=<backend>, so the start-of-job
+#     reaper and the end-of-job leak check both cover it.
 #
 # The upstream suites pin their own k6 `scenarios` blocks (CRUD 300 VUs / 5m,
 # search 30 VUs / 2m, import 20 VUs × 1000 iters) so results stay comparable to
@@ -51,14 +70,20 @@ on:
   workflow_dispatch:
     inputs:
       backend:
-        description: "Storage backend(s) to benchmark"
+        description: "Backend legs: core = sqlite+postgres (default); all = all 6 legs (~3x a core run's runner time); elasticsearch = the 3 *-elasticsearch composites; or one backend"
         type: choice
         required: false
-        default: all
+        default: core
         options:
+          - core
           - all
+          - elasticsearch
           - sqlite
           - postgres
+          - mongodb
+          - sqlite-elasticsearch
+          - postgres-elasticsearch
+          - mongodb-elasticsearch
       tests:
         description: "Suites to run: 'all' | comma-separated (prewarm,import,crud,search)"
         required: false
@@ -111,6 +136,31 @@ on:
         description: "HFS Postgres pool size (crud drives 300 VUs; 32 leaves most of each request queued)"
         required: false
         default: "32"
+      max_parallel:
+        description: "Backend legs running at once (1..2 — every leg shares one 4-CPU / 11 GB Docker host, so 2 skews both legs' numbers)"
+        type: number
+        required: false
+        default: 1
+      es_heap:
+        description: "*-elasticsearch legs: ES JVM heap, -Xms = -Xmx (256m..4g; 512m is the conformance workflows' value)"
+        required: false
+        default: "1g"
+      es_sync_mode:
+        description: "synchronous (benchmark default — async import cannot finish the corpus within k6's 60-minute cap, see run 36412022609): bundles batched via _bulk + refresh=wait_for, 200ms | asynchronous (HFS's own out-of-the-box default): ack on primary commit; ONE worker forwards each resource individually (import/crud throughput = that worker)"
+        type: choice
+        required: false
+        default: synchronous
+        options:
+          - synchronous
+          - asynchronous
+      mongo_wt_cache_gb:
+        description: "mongodb legs: --wiredTigerCacheSizeGB (0.25..6). 2 = parity with Postgres shared_buffers; mongod's own default (~5 GB here) risks a host OOM"
+        required: false
+        default: "2"
+      hfs_mongo_max_connections:
+        description: "HFS MongoDB pool size (HFS default 10 starves crud's 300 VUs; 32 matches hfs_pg_max_connections)"
+        required: false
+        default: "32"
 
 # Self-hosted runner has finite Docker port and disk capacity; superseded
 # runs on the same branch yield to fresh ones.
@@ -125,8 +175,9 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: 2
   CARGO_PROFILE_DEV_DEBUG: 0
-  # Remote Docker daemon wiring — postgres + tgz containers run here, and the
-  # runner reaches their published ports via DOCKER_HOST_IP.
+  # Remote Docker daemon wiring — postgres / mongo / elasticsearch + tgz
+  # containers run here, and the runner reaches their published ports via
+  # DOCKER_HOST_IP.
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
   DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
   # Pin the benchmark repo/ref so a run is reproducible.
@@ -135,49 +186,72 @@ env:
 
 jobs:
   # ────────────────────────────────────────────────────────────────────────────
-  # Resolve the `backend` input into a job matrix. Each leg carries the HFS
-  # server port — distinct per backend so sqlite (8081) and postgres (8082)
-  # can run concurrently on the same self-hosted runner.
+  # Resolve the `backend` input into a job matrix. Each leg carries a fixed HFS
+  # port (8081-8086), distinct per backend so legs never collide even with
+  # max_parallel > 1 (clamped to 1..2 below — the shared 4-CPU / 11 GB Docker
+  # host). Include order = intended run order: bare backends first. Also
+  # validates the free-text tuning inputs here, in one place, before the
+  # ~13-minute build.
   # ────────────────────────────────────────────────────────────────────────────
   setup:
     name: Resolve backend matrix
     runs-on: [self-hosted, Linux]
+    timeout-minutes: 10
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
+      max_parallel: ${{ steps.matrix.outputs.max_parallel }}
+      es_heap_mb: ${{ steps.matrix.outputs.es_heap_mb }}
       leg_timeout_min: ${{ steps.matrix.outputs.leg_timeout_min }}
     steps:
+      # Needed only so the next step can read its own script. `setup`,
+      # `build` and `benchmark` all run on the same `[self-hosted, Linux]`
+      # pool and therefore share one on-disk workspace per runner — they are
+      # separate JOBS, not separate runners. actions/checkout@v5 defaults to
+      # `clean: true` (git clean -ffdx + reset --hard) and a sparse-checkout
+      # narrows the working tree to what it's given, and either effect
+      # landing in that shared root would strip `build`'s warm `target/`
+      # (kept via that job's own `clean: false` — see its Checkout step) plus
+      # every file outside `.github/scripts` whenever `setup` and `build`
+      # land on the same runner. Checking out to a dedicated `path:` keeps
+      # this entirely out of the shared root instead. Sparse (and, via
+      # non-cone mode, narrowed to only this workflow's own scripts under
+      # .github/scripts/fhir-bench rather than cone mode's whole-ancestor-
+      # directory listing) to keep this as cheap as it was before it had any
+      # checkout at all (same idea as ci.yml's "Check out the Docker host GC
+      # action", which sparse-checks-out into the shared root because that
+      # job owns no cache worth protecting there — this one does).
+      - name: Check out benchmark scripts
+        uses: actions/checkout@v5
+        with:
+          path: .fhir-bench-setup
+          persist-credentials: false
+          sparse-checkout: .github/scripts/fhir-bench/
+          sparse-checkout-cone-mode: false
+
       - name: Resolve matrix from backend input
         id: matrix
-        run: |
-          case "${{ inputs.backend || 'all' }}" in
-            sqlite)
-              MATRIX='{"include":[{"backend":"sqlite","port":8081}]}' ;;
-            postgres)
-              MATRIX='{"include":[{"backend":"postgres","port":8082}]}' ;;
-            *)
-              MATRIX='{"include":[{"backend":"sqlite","port":8081},{"backend":"postgres","port":8082}]}' ;;
-          esac
-          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
-          echo "Backend matrix: $MATRIX"
-
-          # The benchmark job's timeout-minutes, and the base the reaper
-          # below sizes its age guard from. Must stay <= 175:
-          # .github/actions/docker-host-gc (input container-max-age-min,
-          # default 180; used by ci.yml / ci-extended / hts / keycloak-smoke
-          # / ui-tests-matrix) reaps any `hfs-ci=true` container whose
-          # `.State.StartedAt` is >= 180 min old, and GitHub gives a
-          # cancelled job up to 5 more minutes to exit. Do not raise this
-          # without re-checking that reaper's default.
-          echo "leg_timeout_min=150" >> "$GITHUB_OUTPUT"
+        # Body (including why inputs reach it only via env:) moved to
+        # .github/scripts/fhir-bench/resolve-matrix.sh.
+        env:
+          IN_BACKEND: ${{ inputs.backend }}
+          IN_MAX_PARALLEL: ${{ inputs.max_parallel }}
+          IN_ES_HEAP: ${{ inputs.es_heap }}
+          IN_ES_SYNC_MODE: ${{ inputs.es_sync_mode }}
+          IN_MONGO_WT_CACHE_GB: ${{ inputs.mongo_wt_cache_gb }}
+          IN_HFS_MONGO_MAX_CONNECTIONS: ${{ inputs.hfs_mongo_max_connections }}
+        run: bash "$GITHUB_WORKSPACE/.fhir-bench-setup/.github/scripts/fhir-bench/resolve-matrix.sh"
 
   # ────────────────────────────────────────────────────────────────────────────
-  # Compile one debug `hfs` binary with BOTH backends linked in — the backend is
-  # selected at runtime via HFS_STORAGE_BACKEND, so a single build serves every
-  # matrix leg. `ui` is dropped so the benchmark exercises the FHIR API only.
+  # Compile one debug `hfs` binary with every benchmarked backend (sqlite,
+  # postgres, mongodb, elasticsearch) linked in — the backend is selected at
+  # runtime via HFS_STORAGE_BACKEND, so a single build serves every matrix
+  # leg. `ui` is dropped so the benchmark exercises the FHIR API only.
   # ────────────────────────────────────────────────────────────────────────────
   build:
     name: Build HFS binary
+    needs: setup
     runs-on: [self-hosted, Linux]
+    timeout-minutes: 120
 
     steps:
       - name: Checkout
@@ -210,18 +284,21 @@ jobs:
       # postgres, so it cannot explain why *postgres specifically* collapsed — but
       # any absolute number taken before this change is not comparable to anything,
       # including our own earlier runs.
-      - name: Build release binary (R4 + sqlite + postgres)
+      # mongodb pulls in mongocrypt-sys (native libmongocrypt, needs cmake);
+      # these runners already build it via ci.yml's --all-features. s3 is not
+      # compiled: no s3 leg is benchmarked (see header).
+      - name: Build release binary (R4 + sqlite + postgres + mongodb + elasticsearch)
         run: |
           cargo build --release -p helios-hfs \
             --no-default-features \
-            --features "R4,sqlite,postgres"
+            --features "R4,sqlite,postgres,mongodb,elasticsearch"
 
       - name: Upload binary
         uses: actions/upload-artifact@v7
         with:
           name: hfs-bench-binary-${{ github.run_id }}
           path: target/release/hfs
-          retention-days: 1
+          retention-days: 3
 
   # ────────────────────────────────────────────────────────────────────────────
   # Run the benchmark suites per backend.
@@ -249,6 +326,7 @@ jobs:
     timeout-minutes: ${{ fromJSON(needs.setup.outputs.leg_timeout_min) }}
     strategy:
       fail-fast: false
+      max-parallel: ${{ fromJSON(needs.setup.outputs.max_parallel) }}
       matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
 
     steps:
@@ -320,8 +398,8 @@ jobs:
           #
           #   1. name starts with `hfs-bench-`   → only ever our own containers
           #   2. name does NOT contain this run id → never a live sibling. The
-          #      matrix legs (sqlite, postgres) share a run id and run
-          #      concurrently, so this stops one leg killing the other.
+          #      matrix legs share a run id (and run concurrently when
+          #      max_parallel > 1), so this stops one leg killing another.
           #   3. older than MAX_AGE_MIN          → never a *different* run that
           #      is still going.
           #
@@ -433,8 +511,9 @@ jobs:
           # RUN_ID and start within the same second, so the plain "$RUN_ID"
           # name collided between them.
           echo "── Canary: create a container and write 256 MiB ──"
-          if ! docker run --rm --name "hfs-bench-canary-${{ matrix.backend }}-$RUN_ID" alpine:3 \
-                 sh -c 'dd if=/dev/zero of=/canary bs=1M count=256 2>&1 | tail -1'; then
+          if ! docker run --rm --name "hfs-bench-canary-${{ matrix.backend }}-$RUN_ID" \
+                 --label hfs-bench=1 --label "hfs-bench-run=$RUN_ID" --label "hfs-bench-leg=${{ matrix.backend }}" \
+                 alpine:3 sh -c 'dd if=/dev/zero of=/canary bs=1M count=256 2>&1 | tail -1'; then
             echo "::error::Docker host cannot create a container or has no writable space."
             echo "The benchmark writes several GB (Synthea corpus + Postgres data), so it"
             echo "would fail slowly and leave more debris. Failing fast instead."
@@ -454,8 +533,33 @@ jobs:
           # of WAL segments on top of the Synthea corpus, and this host is
           # shared with every other testcontainers job in the repo.
           echo "── Docker host storage ──"
-          docker run --rm --name "hfs-bench-df-${{ matrix.backend }}-$RUN_ID" -v /:/hostroot:ro alpine:3 \
+          docker run --rm --name "hfs-bench-df-${{ matrix.backend }}-$RUN_ID" \
+            --label hfs-bench=1 --label "hfs-bench-run=$RUN_ID" --label "hfs-bench-leg=${{ matrix.backend }}" \
+            -v /:/hostroot:ro alpine:3 \
             df -h /hostroot 2>/dev/null || docker system df 2>/dev/null || true
+
+      - name: Docker host capacity gate
+        # A floor under the 600s poll loop's own budget — never let this
+        # step itself become the thing that overruns the leg. Every
+        # MemTotal/MemAvailable read now goes through host-mem.sh, whose own
+        # worst case (see its header) is ~120s per call (docker info +
+        # docker stats, each up to the default 60s timeout) — it no longer
+        # starts or cleans up any meminfo-candidate helper containers.
+        # Worst case for the whole step: ~120s preflight MemTotal read +
+        # the 600s poll budget (which already counts each poll's own
+        # host-mem.sh time against it, via bash's SECONDS) + one more
+        # ~120s poll that pushes past that budget before the loop notices
+        # = ~840s (14min). 15 minutes (900s) covers that with a little
+        # margin.
+        timeout-minutes: 15
+        # Body (including the per-backend memory model and the poll-loop
+        # rationale) moved to .github/scripts/fhir-bench/capacity-gate.sh.
+        env:
+          BACKEND: ${{ matrix.backend }}
+          IN_PG_SHARED_BUFFERS: ${{ inputs.pg_shared_buffers }}
+          IN_MONGO_WT_CACHE_GB: ${{ inputs.mongo_wt_cache_gb }}
+          ES_HEAP_MB: ${{ needs.setup.outputs.es_heap_mb }}
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/fhir-bench/capacity-gate.sh"
 
       # ── tgz bundle server ────────────────────────────────────────────────
       # The import suite pulls the Synthea `bulk_1k` corpus from this service
@@ -483,20 +587,21 @@ jobs:
             --label hfs-ci=true \
             --label "hfs-bench-run=${{ github.run_id }}" \
             --label "hfs-bench-leg=${{ matrix.backend }}" \
+            --log-driver local \
             -p 0:8080 "$TGZ_IMAGE" \
             "https://storage.googleapis.com/aidbox-public/synthea/performance/bulk_1k.tar.gz" >/dev/null
 
           echo "Waiting for tgz bundle server..."
           TGZ_PORT=""
           for i in $(seq 1 60); do
-            TGZ_PORT=$(docker port "$TGZ_CONTAINER" 8080 2>/dev/null | head -1 | sed 's/.*://')
+            TGZ_PORT=$(timeout 30 docker port "$TGZ_CONTAINER" 8080 2>/dev/null | head -1 | sed 's/.*://')
             if [ -n "$TGZ_PORT" ] && curl -sf "http://$DOCKER_HOST_IP:$TGZ_PORT/hospitalInformation.json" -o /dev/null 2>/dev/null; then
               echo "tgz ready on $DOCKER_HOST_IP:$TGZ_PORT after $((i * 2))s"
               break
             fi
             if [ "$i" -eq 60 ]; then
               echo "ERROR: tgz bundle server did not become ready (still downloading corpus?)"
-              docker logs "$TGZ_CONTAINER" | tail -50 || true
+              timeout 60 docker logs --tail 50 "$TGZ_CONTAINER" 2>&1 || true
               exit 1
             fi
             sleep 2
@@ -505,36 +610,123 @@ jobs:
           echo "BUNDLE_URL=http://$DOCKER_HOST_IP:$TGZ_PORT" >> "$GITHUB_ENV"
 
       # ── Backend wiring ───────────────────────────────────────────────────
+      # One explicit branch per backend family — never an if/else. An if/else
+      # keyed only on "sqlite" would send sqlite-elasticsearch down the
+      # Postgres branch: no HFS_DATABASE_URL, so HFS would open the
+      # never-cleaned $GITHUB_WORKSPACE default SQLite path and could replay a
+      # stale WAL. Every container/volume name carries the backend, because
+      # e.g. postgres and postgres-elasticsearch share a run id and each
+      # start step `docker rm -fv`s its name first — a shared name would let
+      # one leg destroy the other's data. All names are written here, before
+      # any container starts.
       - name: Configure backend env
+        env:
+          IN_ES_SYNC_MODE: ${{ inputs.es_sync_mode }}
         run: |
-          echo "HFS_STORAGE_BACKEND=${{ matrix.backend }}" >> "$GITHUB_ENV"
-          if [ "${{ matrix.backend }}" = "sqlite" ]; then
-            DB_PATH="$GITHUB_WORKSPACE/fhir-bench.db"
-            # Remove the WAL sidecars too, not just the database file. The
-            # runner workspace is reused across runs, and a benchmark killed
-            # mid-import (as in run 30550776427) leaves `-wal`/`-shm` behind.
-            # Deleting only the database and then opening a fresh empty one
-            # next to a stale WAL makes SQLite replay that WAL into it, which
-            # both resurrects the previous run's data and stalls startup long
-            # enough to blow the 120s readiness gate.
-            if ls "$DB_PATH"* >/dev/null 2>&1; then
-              echo "Leftover SQLite state from a previous run:"
-              ls -la "$DB_PATH"*
-            fi
-            rm -f "$DB_PATH" "$DB_PATH-wal" "$DB_PATH-shm" "$DB_PATH-journal"
-            echo "HFS_DATABASE_URL=$DB_PATH" >> "$GITHUB_ENV"
-            echo "SQLite DB: $DB_PATH"
-          else
-            PG_CONTAINER="hfs-bench-pg-${{ github.run_id }}"
-            PG_VOLUME="hfs-bench-pgdata-${{ github.run_id }}"
-            echo "PG_CONTAINER=$PG_CONTAINER" >> "$GITHUB_ENV"
-            echo "PG_VOLUME=$PG_VOLUME" >> "$GITHUB_ENV"
-            echo "Container name: $PG_CONTAINER"
-            echo "Data volume:    $PG_VOLUME"
-          fi
+          set -euo pipefail
+          BACKEND="${{ matrix.backend }}"
+          RUN="${{ github.run_id }}"
+          echo "HFS_STORAGE_BACKEND=$BACKEND" >> "$GITHUB_ENV"
+
+          case "$BACKEND" in
+            sqlite|sqlite-elasticsearch)
+              DB_PATH="$GITHUB_WORKSPACE/fhir-bench-$BACKEND.db"
+              # Remove the WAL sidecars too, not just the database file. The
+              # runner workspace is reused across runs, and a benchmark killed
+              # mid-import (as in run 30550776427) leaves `-wal`/`-shm`
+              # behind. Deleting only the database and then opening a fresh
+              # empty one next to a stale WAL makes SQLite replay that WAL
+              # into it, which both resurrects the previous run's data and
+              # stalls startup long enough to blow the readiness gate. The
+              # pre-#1475 shared path (fhir-bench.db) is cleared too so an old
+              # corpus is never stranded there.
+              for P in "$GITHUB_WORKSPACE/fhir-bench.db" "$DB_PATH"; do
+                if ls "$P"* >/dev/null 2>&1; then
+                  echo "Leftover SQLite state from a previous run:"
+                  ls -la "$P"*
+                fi
+                rm -f "$P" "$P-wal" "$P-shm" "$P-journal"
+              done
+              echo "HFS_DATABASE_URL=$DB_PATH" >> "$GITHUB_ENV"
+              echo "SQLite DB: $DB_PATH"
+              ;;
+            postgres|postgres-elasticsearch)
+              PG_CONTAINER="hfs-bench-pg-$BACKEND-$RUN"
+              PG_VOLUME="hfs-bench-pgdata-$BACKEND-$RUN"
+              echo "PG_CONTAINER=$PG_CONTAINER" >> "$GITHUB_ENV"
+              echo "PG_VOLUME=$PG_VOLUME" >> "$GITHUB_ENV"
+              echo "Postgres container: $PG_CONTAINER"
+              echo "Postgres volume:    $PG_VOLUME"
+              ;;
+            mongodb|mongodb-elasticsearch)
+              MONGO_CONTAINER="hfs-bench-mongo-$BACKEND-$RUN"
+              MONGO_VOLUME="hfs-bench-mongodata-$BACKEND-$RUN"
+              echo "MONGO_CONTAINER=$MONGO_CONTAINER" >> "$GITHUB_ENV"
+              echo "MONGO_VOLUME=$MONGO_VOLUME" >> "$GITHUB_ENV"
+              echo "HFS_MONGODB_DATABASE=hfs_bench" >> "$GITHUB_ENV"
+              echo "Mongo container: $MONGO_CONTAINER"
+              echo "Mongo volume:    $MONGO_VOLUME"
+              ;;
+            *)
+              echo "::error::Configure backend env has no wiring for backend '$BACKEND'"
+              exit 1
+              ;;
+          esac
+
+          case "$BACKEND" in
+            *-elasticsearch)
+              ES_CONTAINER="hfs-bench-es-$BACKEND-$RUN"
+              ES_VOLUME="hfs-bench-esdata-$BACKEND-$RUN"
+              # HFS's own default (config.rs elasticsearch_index_prefix); no
+              # workflow input overrides it today, but reading it through the
+              # env var (rather than hardcoding "hfs") keeps this correct if
+              # HFS_ELASTICSEARCH_INDEX_PREFIX is ever set in this workflow's
+              # top-level env:.
+              ES_PREFIX="${HFS_ELASTICSEARCH_INDEX_PREFIX:-hfs}"
+              echo "ES_CONTAINER=$ES_CONTAINER" >> "$GITHUB_ENV"
+              echo "ES_VOLUME=$ES_VOLUME" >> "$GITHUB_ENV"
+              echo "ES_PREFIX=$ES_PREFIX" >> "$GITHUB_ENV"
+              echo "ES container:    $ES_CONTAINER"
+              echo "ES volume:       $ES_VOLUME"
+              echo "ES index prefix: $ES_PREFIX"
+              # synchronous = this benchmark's default (see the es_sync_mode
+              # input): the conformance workflows' read-your-writes setting
+              # (inferno-us-core.yml — wait_for makes the refresh interval
+              # the price of every write, hence 200ms). Async import cannot
+              # finish the 1000-bundle corpus inside k6's 60-minute cap
+              # (run 36412022609: 313/1000 bundles, drain gate
+              # status=incomplete, 194,664 resources never reached the
+              # index), so synchronous is what a full-corpus leg needs.
+              # asynchronous = HFS's own out-of-the-box defaults, set
+              # explicitly so the run records them: a write acks once the
+              # PRIMARY commits and one background worker forwards it to
+              # Elasticsearch; the search suite's drain gate waits for that
+              # backlog before measuring — this is what run 36412022609
+              # measured.
+              case "${IN_ES_SYNC_MODE:-synchronous}" in
+                synchronous)  SYNC_MODE=synchronous;  WRITE_REFRESH=wait_for; REFRESH_INTERVAL=200ms ;;
+                asynchronous) SYNC_MODE=asynchronous; WRITE_REFRESH=false;    REFRESH_INTERVAL=1s ;;
+                *) echo "::error::Unknown es_sync_mode '$IN_ES_SYNC_MODE'"; exit 1 ;;
+              esac
+              {
+                echo "HFS_COMPOSITE_SYNC_MODE=$SYNC_MODE"
+                echo "HFS_ELASTICSEARCH_WRITE_REFRESH=$WRITE_REFRESH"
+                echo "HFS_ELASTICSEARCH_REFRESH_INTERVAL=$REFRESH_INTERVAL"
+                # Explicit even though 60 is HFS's own default, so the run
+                # records it: the periodic sweep that retries secondary-sync
+                # failures (HFS_COMPOSITE_SYNC_REPAIR_INTERVAL).
+                echo "HFS_COMPOSITE_SYNC_REPAIR_INTERVAL=60"
+              } >> "$GITHUB_ENV"
+              echo "ES sync: mode=$SYNC_MODE write_refresh=$WRITE_REFRESH refresh_interval=$REFRESH_INTERVAL repair_interval=60"
+              ;;
+          esac
 
       - name: Start ephemeral Postgres
-        if: matrix.backend == 'postgres'
+        # startsWith, not ==: postgres-elasticsearch also uses Postgres as its
+        # primary (this step still uses the backend-qualified $PG_CONTAINER /
+        # $PG_VOLUME names written by "Configure backend env" — nothing here
+        # recomputes them).
+        if: startsWith(matrix.backend, 'postgres')
         run: |
           set -euo pipefail
           docker rm -fv "$PG_CONTAINER" 2>/dev/null || true
@@ -542,6 +734,22 @@ jobs:
           docker volume create --label hfs-bench=1 \
             --label "hfs-bench-run=${{ github.run_id }}" \
             --label "hfs-bench-leg=${{ matrix.backend }}" "$PG_VOLUME" >/dev/null
+
+          # Volume filesystem free space at start — the volume's OWN
+          # filesystem, not `docker system df`'s aggregate/compressed numbers
+          # (run 34187014872 logged "Local Volumes ... 76.67GB" against a host
+          # root filesystem that was only 19% used — the two don't
+          # reconcile). Recorded for the summary; never fails the leg.
+          PG_VOLDF_NAME="hfs-bench-voldf-${{ matrix.backend }}-${{ github.run_id }}-pg"
+          PG_VOL_DF=$(timeout 60 docker run --rm --name "$PG_VOLDF_NAME" \
+              --label hfs-bench=1 --label "hfs-bench-run=${{ github.run_id }}" --label "hfs-bench-leg=${{ matrix.backend }}" \
+              -v "$PG_VOLUME:/v" alpine:3 df -Pm /v 2>/dev/null | awk 'NR==2{print $4}') || PG_VOL_DF=""
+          # `timeout 60` only kills the local docker CLI, not a container still
+          # starting on the daemon — force it gone so `--rm` never loses a race
+          # against a `timeout` kill and leaks a name/volume-mount hold.
+          timeout 15 docker rm -f "$PG_VOLDF_NAME" >/dev/null 2>&1 || true
+          echo "PG_VOL_FREE_MB=${PG_VOL_DF:-unknown}" >> "$GITHUB_ENV"
+          echo "Postgres volume free space: ${PG_VOL_DF:-unknown} MB"
 
           # ── Memory sizing ────────────────────────────────────────────────
           # Postgres runs on the REMOTE Docker host, not the runner, so it is
@@ -641,6 +849,7 @@ jobs:
             echo "| min_wal_size | \`$PG_MIN_WAL_SIZE\` |"
             echo "| wal_buffers | \`$PG_WAL_BUFFERS\` |"
             echo "| checkpoint_timeout | \`$PG_CHECKPOINT_TIMEOUT\` |"
+            echo "| data volume free space (start) | \`${PG_VOL_DF:-unknown} MB\` |"
           } >> "$GITHUB_STEP_SUMMARY"
           #
           # The data directory is a **named volume**, not the container's
@@ -660,6 +869,7 @@ jobs:
             --label hfs-ci=true \
             --label "hfs-bench-run=${{ github.run_id }}" \
             --label "hfs-bench-leg=${{ matrix.backend }}" \
+            --log-driver local \
             --shm-size=${SHM_GB}g \
             -v "$PG_VOLUME:/var/lib/postgresql" \
             -e POSTGRES_PASSWORD=postgres \
@@ -689,7 +899,7 @@ jobs:
           PG_PORT=""
           for i in $(seq 1 30); do
             if docker exec "$PG_CONTAINER" pg_isready -U postgres -d postgres >/dev/null 2>&1; then
-              PG_PORT=$(docker port "$PG_CONTAINER" 5432 | head -1 | sed 's/.*://')
+              PG_PORT=$(timeout 30 docker port "$PG_CONTAINER" 5432 | head -1 | sed 's/.*://')
               if [ -n "$PG_PORT" ] && timeout 2 bash -c "cat < /dev/null > /dev/tcp/$DOCKER_HOST_IP/$PG_PORT" 2>/dev/null; then
                 echo "Postgres ready on $DOCKER_HOST_IP:$PG_PORT after $((i * 2))s"
                 break
@@ -697,7 +907,7 @@ jobs:
             fi
             if [ "$i" -eq 30 ]; then
               echo "ERROR: Postgres did not become reachable within 60s"
-              docker logs "$PG_CONTAINER" | tail -100 || true
+              timeout 60 docker logs --tail 100 "$PG_CONTAINER" 2>&1 || true
               exit 1
             fi
             sleep 2
@@ -705,6 +915,27 @@ jobs:
 
           echo "PG_PORT=$PG_PORT" >> "$GITHUB_ENV"
           echo "HFS_DATABASE_URL=postgresql://postgres:postgres@$DOCKER_HOST_IP:$PG_PORT/postgres" >> "$GITHUB_ENV"
+
+      - name: Start ephemeral MongoDB (single-member replica set)
+        if: startsWith(matrix.backend, 'mongodb')
+        # Body (including the single-member-replica-set and engine-cap
+        # rationale) moved to .github/scripts/fhir-bench/start-mongodb.sh.
+        env:
+          BACKEND: ${{ matrix.backend }}
+          RUN_ID: ${{ github.run_id }}
+          IN_MONGO_WT_CACHE_GB: ${{ inputs.mongo_wt_cache_gb }}
+          IN_HFS_MONGO_MAX_CONNECTIONS: ${{ inputs.hfs_mongo_max_connections }}
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/fhir-bench/start-mongodb.sh"
+
+      - name: Start ephemeral Elasticsearch
+        if: endsWith(matrix.backend, '-elasticsearch')
+        # Body (including the heap/health/volume rationale) moved to
+        # .github/scripts/fhir-bench/start-elasticsearch.sh.
+        env:
+          BACKEND: ${{ matrix.backend }}
+          RUN_ID: ${{ github.run_id }}
+          ES_HEAP_MB: ${{ needs.setup.outputs.es_heap_mb }}
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/fhir-bench/start-elasticsearch.sh"
 
       # ── Tools (k6) ───────────────────────────────────────────────────────
       - name: Install k6
@@ -714,7 +945,34 @@ jobs:
       - name: Kill any leftover process on port ${{ matrix.port }}
         run: fuser -k "${{ matrix.port }}/tcp" 2>/dev/null || true
 
+      # "Start ephemeral Elasticsearch" only proved ES answered right after
+      # creation; the k6 install and the port-kill step above open a gap
+      # after that, and HFS's own readiness loop only polls /metadata — it
+      # never contacts Elasticsearch — so a dead ES would surface only as HFS
+      # burning its whole readiness budget retrying bootstrap writes against
+      # a backend that will never answer. Re-reads the port (not just the
+      # env var) in case it moved. No restart, deliberately: nothing has been
+      # written to ES yet on this leg, so failing loudly here — where the
+      # logs are still attached to this run — is simpler to read than a
+      # silent recovery would be.
+      - name: Check Elasticsearch is still healthy
+        if: endsWith(matrix.backend, '-elasticsearch')
+        run: |
+          set -euo pipefail
+          ES_PORT=$(timeout 30 docker port "$ES_CONTAINER" 9200 2>/dev/null | head -1 | sed 's/.*://') || ES_PORT=""
+          if [ -n "$ES_PORT" ] && curl -sf --max-time 30 "http://$DOCKER_HOST_IP:$ES_PORT/_cluster/health?wait_for_status=yellow&timeout=5s" >/dev/null 2>&1; then
+            echo "Elasticsearch healthy on $DOCKER_HOST_IP:$ES_PORT"
+            echo "ES_PORT=$ES_PORT" >> "$GITHUB_ENV"
+            echo "HFS_ELASTICSEARCH_NODES=http://$DOCKER_HOST_IP:$ES_PORT" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "::error::Elasticsearch is not answering on port ${ES_PORT:-unknown} — failing here rather than let HFS burn its readiness budget against a dead search backend."
+          timeout 60 docker logs --tail 100 "$ES_CONTAINER" 2>&1 || true
+          exit 1
+
       - name: Start HFS server
+        env:
+          IN_HFS_MONGO_MAX_CONNECTIONS: ${{ inputs.hfs_mongo_max_connections }}
         run: |
           # HFS_STORAGE_BACKEND + HFS_DATABASE_URL already exported. init_schema()
           # runs on startup, so an empty Postgres DB / fresh SQLite file is fine.
@@ -750,12 +1008,24 @@ jobs:
           # pool was pinned at 10 and, on the HFS_DATABASE_URL path, no environment
           # variable could change it). 32 covers the 30 VUs while staying within a
           # few multiples of the container's ~8 cores.
+          #
+          # HFS_MONGODB_MAX_CONNECTIONS: same reasoning as
+          # HFS_PG_MAX_CONNECTIONS above — Mongo's own pool default is 10.
+          # HFS silently falls back to 10 on a non-numeric value
+          # (mongodb/backend.rs, config.max_connections). Already validated
+          # in setup's "Resolve matrix from backend input" (same regex, plus
+          # the 1..1000 range check) before the ~13-minute build — no re-check
+          # here, since re-validating the raw input here too (as this step
+          # used to) is redundant on every leg, including sqlite/postgres.
+          HFS_MONGO_POOL="${IN_HFS_MONGO_MAX_CONNECTIONS:-32}"
+
           HFS_SERVER_HOST="127.0.0.1" \
           HFS_SERVER_PORT="${{ matrix.port }}" \
           HFS_LOG_LEVEL="${{ inputs.log_level || 'info' }}" \
           HFS_MAX_BODY_SIZE="209715200" \
           HFS_REQUEST_TIMEOUT="900" \
           HFS_PG_MAX_CONNECTIONS="${{ inputs.hfs_pg_max_connections || '32' }}" \
+          HFS_MONGODB_MAX_CONNECTIONS="$HFS_MONGO_POOL" \
           HFS_DATA_DIR="$GITHUB_WORKSPACE/data" \
             ./hfs > "/tmp/hfs-bench-${{ matrix.backend }}.log" 2>&1 &
 
@@ -775,11 +1045,17 @@ jobs:
           # line every 10s so a slow start is distinguishable from a hung one.
           echo "Waiting for HFS to become ready..."
           READY_TIMEOUT=300
+          # *-elasticsearch legs seed the SearchParameters bundle THROUGH the
+          # composite (the same "Composite storage initialized: ... +
+          # Elasticsearch (search)" path checked in "Assert search parameters
+          # loaded"), which is slower than seeding the primary alone.
+          if [[ "${{ matrix.backend }}" == *-elasticsearch ]]; then READY_TIMEOUT=600; fi
           START_TS=$SECONDS
           READY=0
           while [ $((SECONDS - START_TS)) -lt "$READY_TIMEOUT" ]; do
-            if curl -sf "http://localhost:${{ matrix.port }}/metadata" -o /dev/null 2>/dev/null; then
+            if curl -sf --max-time 10 "http://localhost:${{ matrix.port }}/metadata" -o /dev/null 2>/dev/null; then
               echo "HFS ready after $((SECONDS - START_TS))s"
+              echo "HFS_READY_SECONDS=$((SECONDS - START_TS))" >> "$GITHUB_ENV"
               READY=1
               break
             fi
@@ -806,9 +1082,21 @@ jobs:
             cat "/proc/$HFS_PID/stack" 2>/dev/null || echo "(stack unavailable)"
             echo "── wait channel ──"
             cat "/proc/$HFS_PID/wchan" 2>/dev/null && echo || true
-            if [ "${{ matrix.backend }}" = "sqlite" ]; then
+            if [[ "${{ matrix.backend }}" == "sqlite" || "${{ matrix.backend }}" == "sqlite-elasticsearch" ]]; then
               echo "── sqlite database state ──"
               ls -la "$HFS_DATABASE_URL"* 2>/dev/null || echo "(no database files)"
+            fi
+            if [ -n "${ES_CONTAINER:-}" ]; then
+              echo "── elasticsearch ($ES_CONTAINER) ──"
+              curl -s --max-time 30 "http://$DOCKER_HOST_IP:$ES_PORT/_cluster/health?pretty" \
+                || echo "::error::Elasticsearch on port $ES_PORT is NOT answering — HFS may have been retrying bootstrap writes against a dead search backend."
+              timeout 60 docker inspect -f 'OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}} Status={{.State.Status}}' "$ES_CONTAINER" || true
+              timeout 60 docker logs --tail 30 "$ES_CONTAINER" 2>&1 || true
+            fi
+            if [ -n "${MONGO_CONTAINER:-}" ]; then
+              echo "── mongodb ($MONGO_CONTAINER) ──"
+              timeout 60 docker inspect -f 'OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}} Status={{.State.Status}}' "$MONGO_CONTAINER" || true
+              timeout 60 docker logs --tail 30 "$MONGO_CONTAINER" 2>&1 || true
             fi
             exit 1
           fi
@@ -826,19 +1114,88 @@ jobs:
             echo "Search parameters loaded from spec bundle."
           fi
 
+          # *-elasticsearch legs: confirm HFS actually started the composite
+          # (SQLite/PostgreSQL/MongoDB primary + Elasticsearch search) rather
+          # than silently falling back to the primary's own search index.
+          # Every composite start logs "Composite storage initialized: ... +
+          # Elasticsearch (search)" (crates/hfs/src/main.rs); grep only the
+          # common prefix so it matches regardless of which primary this leg
+          # uses.
+          if [[ "${{ matrix.backend }}" == *-elasticsearch ]]; then
+            if grep -m1 "Composite storage initialized" "/tmp/hfs-bench-${{ matrix.backend }}.log"; then
+              :
+            else
+              echo "::warning::No 'Composite storage initialized' line in the HFS log — this leg may not be running the Elasticsearch composite (or log_level is above info)."
+            fi
+          fi
+
       # ── Benchmark ────────────────────────────────────────────────────────
       - name: Run benchmark suites
         working-directory: fhir-benchmark
+        env:
+          # This run: block must contain no ${{ }} — GitHub caps a run block
+          # that contains an expression at 21,000 characters (dispatch of
+          # cffc076b1 failed with "Exceeded max expression length 21000" on
+          # this exact step, which was ~26,300 characters with 31 ${{ }}
+          # substitutions). Every matrix/inputs/github/needs value the block
+          # below uses is passed through here instead and read back as a
+          # plain env var in bash. es_sync_mode needs no entry here: it is
+          # already ambient as $HFS_COMPOSITE_SYNC_MODE, written to
+          # $GITHUB_ENV by "Configure backend env".
+          BACKEND: ${{ matrix.backend }}
+          BENCH_PORT: ${{ matrix.port }}
+          BENCH_RUN_ID: ${{ github.run_id }}
+          BENCH_IN_RUN_ID: ${{ inputs.run_id }}
+          BENCH_SHA: ${{ github.sha }}
+          BENCH_REF_NAME: ${{ github.ref_name }}
+          BENCH_IN_PG_MAX_CONNECTIONS: ${{ inputs.hfs_pg_max_connections }}
+          BENCH_MAX_PARALLEL: ${{ needs.setup.outputs.max_parallel }}
+          BENCH_LEG_TIMEOUT_MIN: ${{ needs.setup.outputs.leg_timeout_min }}
+          BENCH_IN_TESTS: ${{ inputs.tests }}
+          BENCH_IN_VUS: ${{ inputs.vus }}
+          BENCH_IN_DURATION: ${{ inputs.duration }}
+          IN_ES_HEAP: ${{ inputs.es_heap }}
+          IN_MONGO_WT_CACHE_GB: ${{ inputs.mongo_wt_cache_gb }}
+          IN_HFS_MONGO_MAX_CONNECTIONS: ${{ inputs.hfs_mongo_max_connections }}
         run: |
+          # This block must contain no inline GitHub Actions expressions
+          # (the double-curly-brace substitution syntax) — GitHub caps a
+          # run: block that contains one at 21,000 characters. Dispatching
+          # commit cffc076b1 failed with "Exceeded max expression length
+          # 21000" on this exact step, which was about 26,300 characters
+          # using 31 such expressions. New values come in through env:
+          # above and are read back here as plain environment variables.
           set -uo pipefail
-          RUN_ID="${{ inputs.run_id }}"
-          [ -z "$RUN_ID" ] && RUN_ID="${{ github.run_id }}"
+          # es_drain_gate, capture_backend_stats, write_import_completeness,
+          # write_mongo_txn_errors, write_search_counts,
+          # write_containers_state, inspect_running and
+          # check_leg_containers_alive (issue #1475's ES/Mongo/composite
+          # per-suite instrumentation) live in suite-lib.sh, sourced here so
+          # they run in THIS shell and inherit its options (see that file's
+          # own header) instead of needing GitHub Actions expression
+          # substitution.
+          source "$GITHUB_WORKSPACE/.github/scripts/fhir-bench/suite-lib.sh"
+
+          # BACKEND / BENCH_PORT / BENCH_RUN_ID are already in the process
+          # environment from env: above (same matrix.backend / matrix.port /
+          # github.run_id values suite-lib.sh's functions and everything
+          # below need) — no local re-assignment needed. RUN_ID below stays a
+          # plain shell variable rather than moving to env: above because it
+          # is derived (inputs.run_id with a bash-side fallback), not a 1:1
+          # copy of one context value.
+          # BENCH_RUN_ID is deliberately NOT named RUN_ID: this step's own
+          # $RUN_ID (below) holds the possibly-user-overridden
+          # inputs.run_id tag used for k6 --tag runid=, not the actual
+          # github.run_id that container/volume names and the drain-probe
+          # identifier need.
+          RUN_ID="$BENCH_IN_RUN_ID"
+          [ -z "$RUN_ID" ] && RUN_ID="$BENCH_RUN_ID"
 
           # Checkout uses clean:false, so wipe any results left by a prior run on
           # this runner (otherwise a stale sibling backend dir rides along in the
           # uploaded artifact).
           rm -rf "$GITHUB_WORKSPACE/bench-results"
-          RESULTS_DIR="$GITHUB_WORKSPACE/bench-results/${{ matrix.backend }}"
+          RESULTS_DIR="$GITHUB_WORKSPACE/bench-results/$BACKEND"
           mkdir -p "$RESULTS_DIR"
 
           # Which machine measured this run, recorded INSIDE the artifact.
@@ -850,24 +1207,63 @@ jobs:
           # the agent's size; the artifact outlives it and travels with the
           # numbers. Anyone reading these results later can tell a 2x from a
           # bigger box apart from a 2x from the code.
+          # #1475 tuning knobs, recorded next to the results so a leg's
+          # numbers can always be read back against what produced them.
+          # Mongo/ES values read n/a off their own legs. CAPACITY_* were
+          # written to $GITHUB_ENV by "Docker host capacity gate", above.
+          case "$BACKEND" in
+            mongodb*) MONGO_POOL_REC="${IN_HFS_MONGO_MAX_CONNECTIONS:-32}"; MONGO_WT_REC="${IN_MONGO_WT_CACHE_GB:-2}" ;;
+            *)        MONGO_POOL_REC=n/a; MONGO_WT_REC=n/a ;;
+          esac
+          case "$BACKEND" in
+            *-elasticsearch) ES_HEAP_REC="${IN_ES_HEAP:-1g}"
+                             ES_WRITE_REFRESH_REC="${HFS_ELASTICSEARCH_WRITE_REFRESH:-unknown}"
+                             ES_REFRESH_INTERVAL_REC="${HFS_ELASTICSEARCH_REFRESH_INTERVAL:-unknown}" ;;
+            *)               ES_HEAP_REC=n/a; ES_WRITE_REFRESH_REC=n/a; ES_REFRESH_INTERVAL_REC=n/a ;;
+          esac
+          case "$BACKEND" in
+            mongodb*) MONGO_TXN_LIFETIME_REC="${MONGO_TXN_LIFETIME_S:-unknown}" ;;
+            *)        MONGO_TXN_LIFETIME_REC=n/a ;;
+          esac
+
           {
             echo "runner_name:  ${RUNNER_NAME:-unknown}"
             echo "runner_cpus:  $(nproc 2>/dev/null || echo '?')"
             echo "runner_ram:   $(free -g 2>/dev/null | awk '/^Mem:/{print $2"G"}' || echo '?')"
             echo "runner_ip:    ${RUNNER_IP:-unknown}"
             echo "docker_host:  ${DOCKER_HOST_IP:-unknown}"
-            echo "github_run:   ${{ github.run_id }}"
-            echo "git_sha:      ${{ github.sha }}"
-            echo "git_ref:      ${{ github.ref_name }}"
-            echo "backend:      ${{ matrix.backend }}"
-            echo "pg_pool_max:  ${{ inputs.hfs_pg_max_connections || '32' }}"
+            echo "github_run:   $BENCH_RUN_ID"
+            echo "git_sha:      $BENCH_SHA"
+            echo "git_ref:      $BENCH_REF_NAME"
+            echo "backend:      $BACKEND"
+            echo "pg_pool_max:  ${BENCH_IN_PG_MAX_CONNECTIONS:-32}"
+            echo "es_heap:            $ES_HEAP_REC"
+            echo "es_sync_mode:       ${HFS_COMPOSITE_SYNC_MODE:-n/a}"
+            echo "es_write_refresh:   $ES_WRITE_REFRESH_REC"
+            echo "es_refresh_interval: $ES_REFRESH_INTERVAL_REC"
+            echo "mongo_wt_cache_gb:  $MONGO_WT_REC"
+            echo "mongo_pool_max:     $MONGO_POOL_REC"
+            echo "mongo_txn_lifetime_s: $MONGO_TXN_LIFETIME_REC"
+            echo "hfs_ready_s:        ${HFS_READY_SECONDS:-unknown}"
+            echo "max_parallel:       $BENCH_MAX_PARALLEL"
+            echo "leg_timeout_min:    $BENCH_LEG_TIMEOUT_MIN"
+            echo "capacity_need_mb:   ${CAPACITY_NEED_MB:-unknown}"
+            echo "capacity_avail_mb:  ${CAPACITY_AVAIL_MB:-unknown}"
+            echo "capacity_wait_s:    ${CAPACITY_WAIT_S:-unknown}"
+            echo "capacity_mem_source: ${CAPACITY_MEM_SOURCE:-unknown}"
+            # PG_VOL_FREE_MB / MONGO_VOL_FREE_MB / ES_VOL_FREE_MB were written
+            # to $GITHUB_ENV by the container-start steps above (they also
+            # print into that step's own $GITHUB_STEP_SUMMARY block, but
+            # weren't otherwise carried into the artifact until now).
+            echo "vol_free_mb_start:  ${PG_VOL_FREE_MB:-${MONGO_VOL_FREE_MB:-n/a}}"
+            echo "es_vol_free_mb_start: ${ES_VOL_FREE_MB:-n/a}"
           } > "$RESULTS_DIR/runner-info.txt"
           cat "$RESULTS_DIR/runner-info.txt"
 
           # Resolve suite list. 'search' needs data, so 'import' must precede it;
           # canonical order keeps that invariant for the 'all' case.
           CANONICAL="prewarm import crud search"
-          INPUT_TESTS="${{ inputs.tests || 'all' }}"
+          INPUT_TESTS="${BENCH_IN_TESTS:-all}"
           if [ "$INPUT_TESTS" = "all" ]; then
             SUITES="$CANONICAL"
           else
@@ -876,8 +1272,8 @@ jobs:
 
           # Advisory overrides (see header note — ignored when a script pins a scenario).
           EXTRA_ARGS=""
-          [ -n "${{ inputs.vus }}" ]      && EXTRA_ARGS="$EXTRA_ARGS --vus ${{ inputs.vus }}"
-          [ -n "${{ inputs.duration }}" ] && EXTRA_ARGS="$EXTRA_ARGS --duration ${{ inputs.duration }}"
+          [ -n "$BENCH_IN_VUS" ]      && EXTRA_ARGS="$EXTRA_ARGS --vus $BENCH_IN_VUS"
+          [ -n "$BENCH_IN_DURATION" ] && EXTRA_ARGS="$EXTRA_ARGS --duration $BENCH_IN_DURATION"
 
           # Where does a suite's time actually go?
           #
@@ -893,7 +1289,24 @@ jobs:
           # clock: if PG's total is a small fraction of the wall time, the
           # bottleneck is on the HFS/k6 side (extraction CPU, serialization,
           # round trips) and not in the database at all.
-          if [ "${{ matrix.backend }}" = "postgres" ] && [ -n "${PG_CONTAINER:-}" ]; then
+          # Postgres-family legs: pg_stat_statements and the per-suite pgstat
+          # capture below run on BOTH postgres and postgres-elasticsearch
+          # (crud/import still hit resources / resource_history on that leg).
+          # The search_index VACUUM + plan capture and index-usage.txt stay
+          # EXACT 'postgres' further down: with search offloaded,
+          # postgres-elasticsearch never writes search_index
+          # (main.rs set_search_offloaded), so they would measure an empty
+          # table.
+          PG_FAMILY=false
+          case "$BACKEND" in postgres|postgres-elasticsearch) PG_FAMILY=true ;; esac
+
+          # ES drain gate: ONE deadline shared across the barrier probe and
+          # the settle poll (see es_drain_gate in suite-lib.sh) — not 15 min budgeted to
+          # each, so a wedged Elasticsearch cannot burn 2x this before search
+          # still runs against a possibly-incomplete index.
+          ES_DRAIN_TIMEOUT_S=600
+
+          if [ "$PG_FAMILY" = true ] && [ -n "${PG_CONTAINER:-}" ]; then
             docker exec "$PG_CONTAINER" psql -U postgres -d postgres -q \
               -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements" >/dev/null 2>&1 \
               || echo "::warning::pg_stat_statements unavailable"
@@ -914,19 +1327,78 @@ jobs:
           # cannot be trusted for throughput now says so in its own artifact.
           probe_host() {
             local phase="$1" suite="$2"
-            local la cn
-            la=$(docker run --rm alpine:3 cat /proc/loadavg 2>/dev/null | cut -d' ' -f1-3)
-            cn=$(docker ps -q 2>/dev/null | wc -l)
-            echo "$(date -u +%H:%M:%SZ) suite=$suite phase=$phase host_loadavg=${la:-unknown} host_containers=${cn:-unknown}" \
+            local la cn out mem_line mem_mb mem_source
+            # Loadavg still comes from a plain container's own /proc/loadavg,
+            # unvalidated — NOT because lxcfs-style virtualisation is known
+            # to leave /proc/loadavg alone (it doesn't; lxcfs virtualises
+            # loadavg the same way it can virtualise meminfo, scoped to
+            # whatever cgroup it resolves the reader to). What actually
+            # matters here is what a plain nested container's own read
+            # happens to give us on THIS host: run 36410157709 showed it
+            # returning the physical machine's real, unvirtualised figures
+            # for memory, not a cgroup-scoped view — the whole reason
+            # host-mem.sh exists — and there is no reason to expect loadavg
+            # to behave differently on the same host. That is the number
+            # this probe actually wants: the WHOLE box's contention,
+            # including neighbours outside this leg's own cgroup, not a
+            # scoped-down view of just this leg. If that ever turns out
+            # false here (loadavg reads a cgroup-scoped value while meminfo
+            # doesn't), this reading would need the same kind of
+            # cross-validation host-mem.sh does for memory — nothing
+            # currently checks that assumption for loadavg.
+            local probe_name="hfs-bench-probe-${BACKEND}-${BENCH_RUN_ID}"
+            out=$(timeout 60 docker run --rm --name "$probe_name" \
+                --label hfs-bench=1 --label "hfs-bench-run=${BENCH_RUN_ID}" --label "hfs-bench-leg=${BACKEND}" \
+                alpine:3 cat /proc/loadavg 2>/dev/null) || out=""
+            # `timeout 60` only kills the local docker CLI; force the
+            # container gone so repeated probe_host calls (every suite,
+            # every phase) never collide on this fixed --name.
+            docker rm -f "$probe_name" >/dev/null 2>&1 || true
+            la=$(printf '%s\n' "$out" | sed -n '1p' | cut -d' ' -f1-3)
+            cn=$(docker ps -q 2>/dev/null | wc -l) || cn=""
+            # Memory (#1475 follow-up, run 36410157709): the same
+            # host-mem.sh the capacity gate polls — derived from `docker
+            # info` + `docker stats`, not a bare container /proc/meminfo
+            # read — see that script's header.
+            mem_line=$(bash "$GITHUB_WORKSPACE/.github/scripts/fhir-bench/host-mem.sh" 2>/dev/null) || mem_line=""
+            mem_mb=$(printf '%s\n' "$mem_line" | sed -n 's/.*avail_mb=\(.*\)$/\1/p')
+            mem_source=$(printf '%s\n' "$mem_line" | sed -n 's/^source=\([^ ]*\) .*/\1/p')
+            echo "$(date -u +%H:%M:%SZ) suite=$suite phase=$phase host_loadavg=${la:-unknown} host_containers=${cn:-unknown} host_mem_avail_mb=${mem_mb:-unknown} host_mem_source=${mem_source:-none}" \
               >> "$RESULTS_DIR/host-contention.txt"
           }
+
+          # es_drain_gate() and capture_backend_stats() (the Elasticsearch
+          # drain gate and the per-suite ES/Mongo/composite snapshot) moved
+          # to .github/scripts/fhir-bench/suite-lib.sh, sourced above.
 
           for SUITE in $SUITES; do
             SUITE="${SUITE// /}"
             [ -z "$SUITE" ] && continue
             SCRIPT="k6/${SUITE}.js"
-            SUITE_START=$(date +%s)
+
+            # Drain before the gate's own probe_host/SUITE_START, so ES
+            # backlog time is not folded into the search suite's own wall
+            # clock or host-contention reading.
+            if [ "$SUITE" = search ] && [ -n "${ES_PORT:-}" ] && [ -f "$SCRIPT" ]; then
+              es_drain_gate || echo '::warning::drain gate errored'
+              # The gate's own primary-count query (postgres-elasticsearch)
+              # ran inside crud's post-suite reset window and would otherwise
+              # be folded into search-pgstat.txt as if it were search traffic
+              # — reset again here so search's pgstat capture starts clean.
+              if [ "$PG_FAMILY" = true ] && [ -n "${PG_CONTAINER:-}" ]; then
+                timeout 60 docker exec "$PG_CONTAINER" psql -U postgres -d postgres -q \
+                  -c "SELECT pg_stat_statements_reset()" >/dev/null 2>&1 || true
+              fi
+            fi
+
+            # probe_host itself makes two docker calls via host-mem.sh
+            # (docker info + docker stats, up to ~120s worst case at the
+            # default 60s per-call timeout, see that script's header) —
+            # call it BEFORE starting the clock, so a slow host reading
+            # isn't folded into this suite's own wall time / the
+            # pg_exec-vs-wall attribution below.
             probe_host start "$SUITE"
+            SUITE_START=$(date +%s)
             if [ ! -f "$SCRIPT" ]; then
               echo "Skip '$SUITE' — $SCRIPT not found"
               continue
@@ -941,7 +1413,7 @@ jobs:
             # so this subsumes the plain ANALYZE.
             #
             # Runs once, after the data is in and before search is measured.
-            if [ "$SUITE" = "search" ] && [ "${{ matrix.backend }}" = "postgres" ] \
+            if [ "$SUITE" = "search" ] && [ "$BACKEND" = "postgres" ] \
                && [ -n "${PG_CONTAINER:-}" ]; then
               echo "── VACUUM (ANALYZE) before search (sets the visibility map) ──"
               docker exec "$PG_CONTAINER" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
@@ -968,7 +1440,7 @@ jobs:
             fi
 
             echo "=================================================="
-            echo "Suite: $SUITE   backend: ${{ matrix.backend }}   run: $RUN_ID"
+            echo "Suite: $SUITE   backend: $BACKEND   run: $RUN_ID"
             echo "=================================================="
 
             # The search suite tags every request with {name, resourceType,
@@ -984,7 +1456,7 @@ jobs:
               --no-usage-report \
               --tag runid="$RUN_ID" \
               --tag fhirimpl=hfs \
-              --env BASE_URL="http://localhost:${{ matrix.port }}" \
+              --env BASE_URL="http://localhost:$BENCH_PORT" \
               --env BUNDLE_URL="$BUNDLE_URL" \
               --env FHIRIMPL=hfs \
               --summary-trend-stats "avg,min,med,p(90),p(95),p(99),max" \
@@ -994,6 +1466,12 @@ jobs:
               "$SCRIPT" 2>&1 | tee "$RESULTS_DIR/${SUITE}.log" || true
             SUITE_WALL=$(( $(date +%s) - SUITE_START ))
             probe_host end "$SUITE"
+
+            # write_import_completeness() and write_mongo_txn_errors() (F1a /
+            # F8) moved to .github/scripts/fhir-bench/suite-lib.sh, sourced
+            # above.
+            write_import_completeness "$SUITE"
+            write_mongo_txn_errors "$SUITE"
 
             # Attribute this suite's time. `wall` is the suite's own elapsed
             # seconds; `pg_exec_total_s` is everything Postgres executed during
@@ -1025,8 +1503,14 @@ jobs:
             # you tell whether v26's `autovacuum_analyze_scale_factor = 0.4`
             # actually cut the number of those, and `n_tup_ins` is the row count
             # every index-insertion estimate is scaled from.
-            if [ "${{ matrix.backend }}" = "postgres" ] && [ -n "${PG_CONTAINER:-}" ]; then
+            if [ "$PG_FAMILY" = true ] && [ -n "${PG_CONTAINER:-}" ]; then
               {
+                # postgres-elasticsearch writes no search_index (main.rs
+                # set_search_offloaded), so its wall time includes ES sync
+                # backpressure, not just Postgres — say so before the numbers.
+                if [ "$BACKEND" = "postgres-elasticsearch" ]; then
+                  echo "note: postgres-elasticsearch — search_index is not written and wall time includes Elasticsearch sync backpressure; a low pg_exec/wall ratio does NOT mean HFS-CPU-bound"
+                fi
                 echo "suite=$SUITE wall_seconds=$SUITE_WALL"
                 docker exec "$PG_CONTAINER" psql -U postgres -d postgres \
                   -c "SELECT round((sum(total_exec_time)/1000.0)::numeric, 1) AS pg_exec_total_s,
@@ -1055,7 +1539,23 @@ jobs:
               docker exec "$PG_CONTAINER" psql -U postgres -d postgres -q \
                 -c "SELECT pg_stat_statements_reset()" >/dev/null 2>&1 || true
             fi
+
+            capture_backend_stats "$SUITE"
           done
+
+          # CRUD residue (search-counts comparability): algorithm and the
+          # upstream check-name rationale are documented in
+          # .github/scripts/fhir-bench/crud_residue.py, moved with the code
+          # it explains. $RESIDUE_PY resolution (python3, falling back to
+          # python) is unchanged from before the move.
+          : > "$RESULTS_DIR/crud-residue.txt"
+          RESIDUE_PY=$(command -v python3 || command -v python || true)
+          if [ -n "$RESIDUE_PY" ]; then
+            "$RESIDUE_PY" "$GITHUB_WORKSPACE/.github/scripts/fhir-bench/crud_residue.py" \
+              "$RESULTS_DIR/prewarm.json" "$RESULTS_DIR/crud.json" \
+              > "$RESULTS_DIR/crud-residue.txt" 2>/dev/null || echo "::warning::crud-residue computation failed"
+          fi
+          cat "$RESULTS_DIR/crud-residue.txt" 2>/dev/null || true
 
           # Which search_index indexes the suites actually read.
           #
@@ -1065,7 +1565,7 @@ jobs:
           # write still maintained it and it still occupied cache on an 11G host.
           # Evidence for the next round of index pruning; nothing reads it in
           # this run.
-          if [ "${{ matrix.backend }}" = "postgres" ] && [ -n "${PG_CONTAINER:-}" ]; then
+          if [ "$BACKEND" = "postgres" ] && [ -n "${PG_CONTAINER:-}" ]; then
             docker exec "$PG_CONTAINER" psql -U postgres -d postgres \
               -c "SELECT s.indexrelname AS index_name, s.idx_scan AS scans,
                          s.idx_tup_read AS tuples_read,
@@ -1079,6 +1579,17 @@ jobs:
               echo "::warning::index usage capture failed"
           fi
 
+          # write_search_counts() (Result-size cross-check, F5) moved to
+          # .github/scripts/fhir-bench/suite-lib.sh, sourced above.
+          write_search_counts
+
+          # write_containers_state(), inspect_running() and
+          # check_leg_containers_alive() (end-of-step container/volume state
+          # dump + liveness gate) moved to
+          # .github/scripts/fhir-bench/suite-lib.sh, sourced above.
+          write_containers_state
+          check_leg_containers_alive
+
       # ── Artifacts ────────────────────────────────────────────────────────
       # Deliberately placed immediately after the suites and BEFORE the
       # post-processing steps below. When run 30550776427's runner was killed
@@ -1088,16 +1599,19 @@ jobs:
       # that can be recomputed from these artifacts; the artifacts cannot be
       # recovered from anything. Upload first, analyse second.
       #
-      # Teardown (Stop HFS server / Stop tgz bundle server / Stop ephemeral
-      # Postgres, below) is placed right after these uploads for the same
-      # reason. On run 33515369645 the runner was lost during "Attribute search
-      # latency per query shape", so every step after it — Generate step
-      # summary, Stop HFS server, Stop tgz bundle server, Stop ephemeral
-      # Postgres — was skipped, and its containers survived 6.4 days until the
-      # next reaper caught them. Teardown now runs immediately after the
-      # uploads, before any post-processing step (which only reads the files
-      # already on disk), so a runner lost during any later post-processing
-      # step still leaves cleanup done.
+      # Teardown (Diagnose backend container failure, then Stop HFS server /
+      # Stop tgz bundle server / Stop ephemeral Postgres / Stop ephemeral
+      # MongoDB / Stop ephemeral Elasticsearch / Remove SQLite database
+      # files, below) is placed right after these uploads for the same
+      # reason. On run 33515369645 the runner was
+      # lost during "Attribute search latency per query shape", so every step
+      # after it — Generate step summary, Stop HFS server, Stop tgz bundle
+      # server, Stop ephemeral Postgres — was skipped, and its containers
+      # survived 6.4 days until the next reaper caught them. Diagnose and
+      # every Stop step now run immediately after the uploads, before any
+      # post-processing step (which only reads the files already on disk), so
+      # a runner lost during any later post-processing step still leaves
+      # diagnostics captured and cleanup done.
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v7
@@ -1115,6 +1629,45 @@ jobs:
           path: /tmp/hfs-bench-${{ matrix.backend }}.log
           retention-days: 7
           if-no-files-found: ignore
+
+      # Why a backend container died (host OOM vs. cgroup OOM vs. crash),
+      # captured before the Stop steps below remove the evidence. Based on
+      # inferno-us-core.yml's "Diagnose MongoDB failure", widened to every
+      # container this leg owns. `cancelled()` matters because a job-timeout
+      # cancellation re-evaluates `if:` for steps not yet run and is not
+      # `failure()` — a hung leg hitting the job timeout is exactly the case
+      # that most needs these diagnostics. `env.LEG_CONTAINER_DIED` catches
+      # the case "Run benchmark suites" already detected on its own (k6 runs
+      # with `|| true`, so a mid-run OOM would not otherwise fail the job).
+      - name: Diagnose backend container failure
+        if: failure() || cancelled() || env.LEG_CONTAINER_DIED == 'true'
+        # 3: host-mem.sh no longer starts helper containers to read
+        # /proc/meminfo (just docker info + docker stats), so its capture
+        # below adds only a small, bounded amount on top of this step's
+        # other calls — see the timeout-budget math in diagnose.sh.
+        timeout-minutes: 3
+        # Body (including the timeout-budget math, the OOM-killer grep and
+        # the shared-host caveat) moved to
+        # .github/scripts/fhir-bench/diagnose.sh.
+        env:
+          BACKEND: ${{ matrix.backend }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          # This step runs on failure()/cancelled(), which includes "Checkout
+          # HFS" itself never completing — in that case the script this
+          # moved to isn't on disk, and no backend container was started
+          # either ("Checkout HFS" runs before any Start-backend step), so
+          # there is nothing here to diagnose. The guard turns that missing
+          # script into a ::warning:: instead of letting a bare `bash
+          # missing-file` (exit 127) fail this step outright; it does not
+          # preserve any dmesg/meminfo/docker-stats diagnostics — there are
+          # none to preserve in that case.
+          D="$GITHUB_WORKSPACE/.github/scripts/fhir-bench/diagnose.sh"
+          if [ -f "$D" ]; then
+            bash "$D"
+          else
+            echo "::warning::diagnose.sh missing (checkout did not complete)"
+          fi
 
       # ── Cleanup ──────────────────────────────────────────────────────────
       - name: Stop HFS server
@@ -1138,13 +1691,45 @@ jobs:
       # this step never runs at all (killed runner, as in run 33515369645 — see
       # the Artifacts comment above).
       - name: Stop ephemeral Postgres
-        if: always() && matrix.backend == 'postgres'
+        # startsWith, not ==: postgres-elasticsearch also uses this Postgres
+        # as its primary and must have its container/volume reclaimed too.
+        if: always() && startsWith(matrix.backend, 'postgres')
         run: |
           if [ -n "${PG_CONTAINER:-}" ]; then
             docker rm -fv "$PG_CONTAINER" 2>/dev/null || true
           fi
           if [ -n "${PG_VOLUME:-}" ]; then
             docker volume rm -f "$PG_VOLUME" 2>/dev/null || true
+          fi
+
+      - name: Stop ephemeral MongoDB
+        if: always() && startsWith(matrix.backend, 'mongodb')
+        run: |
+          if [ -n "${MONGO_CONTAINER:-}" ]; then
+            docker rm -fv "$MONGO_CONTAINER" 2>/dev/null || true
+          fi
+          if [ -n "${MONGO_VOLUME:-}" ]; then
+            docker volume rm -f "$MONGO_VOLUME" 2>/dev/null || true
+          fi
+
+      - name: Stop ephemeral Elasticsearch
+        if: always() && endsWith(matrix.backend, '-elasticsearch')
+        run: |
+          if [ -n "${ES_CONTAINER:-}" ]; then
+            docker rm -fv "$ES_CONTAINER" 2>/dev/null || true
+          fi
+          if [ -n "${ES_VOLUME:-}" ]; then
+            docker volume rm -f "$ES_VOLUME" 2>/dev/null || true
+          fi
+
+      # The sqlite-family DB is several GB and the workspace is never wiped
+      # between runs, so a leg's database (and any WAL sidecars a killed run
+      # left behind) must be removed explicitly rather than left to rot.
+      - name: Remove SQLite database files
+        if: always() && startsWith(matrix.backend, 'sqlite')
+        run: |
+          if [ -n "${HFS_DATABASE_URL:-}" ]; then
+            rm -f "$HFS_DATABASE_URL" "$HFS_DATABASE_URL-wal" "$HFS_DATABASE_URL-shm" "$HFS_DATABASE_URL-journal"
           fi
 
       # ── Per-query-shape attribution ──────────────────────────────────────
@@ -1203,6 +1788,17 @@ jobs:
       # ── Summary ──────────────────────────────────────────────────────────
       - name: Generate step summary
         if: always()
+        env:
+          # pg_shared_buffers is a free-text input; it reaches
+          # summary_backends.py (see the pointer comment below) only
+          # through env:, never inlined as ${{ }} — a value containing a
+          # `"` would otherwise break the Python string literal it lands
+          # in (and, in principle, inject code). Nothing else in this step
+          # reads it.
+          IN_PG_SHARED_BUFFERS: ${{ inputs.pg_shared_buffers }}
+          # Also consumed by summary_backends.py (see the pointer comment
+          # below) — that script cannot use ${{ }} itself.
+          BACKEND: ${{ matrix.backend }}
         run: |
           {
             echo "## FHIR Benchmark — \`${{ github.ref_name }}\` (${{ matrix.backend }})"
@@ -1214,10 +1810,33 @@ jobs:
             echo "| **Suites**  | ${{ inputs.tests || 'all' }} |"
             echo ""
 
+            # PR-1 per-leg diagnostics (tuning table, import completeness, ES
+            # drain, host load, "how to read this leg", search-counts +
+            # crud-residue caption, Mongo txn errors, composite sync
+            # failures, container-state notes) moved to
+            # .github/scripts/fhir-bench/summary_backends.py. Runs here, as
+            # its own python3 process, so its output lands at the same
+            # position it did before: ahead of the Results table below.
+            # Guarded (this step runs on always(), including "Checkout HFS"
+            # never completing): under this step's default `bash -e {0}`, a
+            # missing script would abort the `{ ... }` group here and lose
+            # the "_No summary files were produced._" Results line below
+            # too. A missing script here is only possible when "Checkout
+            # HFS" itself never completed, in which case skipping the whole
+            # leg-detail section — including the "How to read this leg"
+            # paragraph that otherwise prints unconditionally on ES/Mongo
+            # legs — is acceptable: no suite ran, so there is nothing for
+            # that section to report.
+            SUMMARY_PY="$GITHUB_WORKSPACE/.github/scripts/fhir-bench/summary_backends.py"
+            if [ -f "$SUMMARY_PY" ]; then
+              python3 "$SUMMARY_PY"
+            fi
+
             python3 - <<'PYEOF'
           import json, glob, os, sys
 
           results_dir = os.path.join(os.environ["GITHUB_WORKSPACE"], "bench-results", "${{ matrix.backend }}")
+          backend = "${{ matrix.backend }}"
           files = sorted(glob.glob(f"{results_dir}/*.json"))
 
           if not files:
@@ -1281,6 +1900,17 @@ jobs:
                       if c:
                           load = f", host loadavg {c.group(1)} over {c.group(2)} containers at crud start"
                   flag = " ⚠ **contended — do not compare this run's crud to a quiet one**" if per_call > 3.0 else ""
+                  if backend != "postgres":
+                      # postgres-elasticsearch also writes crud-pgstat.txt
+                      # (crud/import still hit resources/resource_history
+                      # there), but it writes no search_index — the 3ms/call
+                      # contention threshold was calibrated on bare postgres,
+                      # where Postgres is the only backend under load. On
+                      # this leg Elasticsearch shares the same 4-CPU host and
+                      # can itself add to per-call cost, so a high number
+                      # here is not necessarily a noisy NEIGHBOUR.
+                      flag = (" _(postgres-elasticsearch writes no search_index, so this is not comparable"
+                              " to bare postgres; contention threshold not applied)_")
                   print(f"\n**Environment:** crud Postgres cost **{per_call:.2f} ms/call** "
                         f"({exec_s:,.0f} s over {calls:,} statements{load}).{flag}")
           PYEOF
@@ -1290,8 +1920,8 @@ jobs:
       # The only way to confirm cleanup actually reclaimed this leg's
       # containers/volumes, since developers cannot reach the shared Docker
       # host directly to check by hand. Filtered on the run id AND the leg
-      # label together (multiple --filter label= are ANDed): sqlite and
-      # postgres legs of one run share the run id and run concurrently, so a
+      # label together (multiple --filter label= are ANDed): the matrix legs
+      # share a run id (and run concurrently when max_parallel > 1), so a
       # run-id-only filter would report a sibling leg's still-live containers
       # as if they were this leg's leftovers.
       - name: Docker host usage after cleanup
