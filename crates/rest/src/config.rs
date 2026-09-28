@@ -1997,6 +1997,21 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_rejects_zero_elasticsearch_max_terms_count() {
+        let config = ServerConfig {
+            elasticsearch_max_terms_count: 0,
+            ..Default::default()
+        };
+        let errors = config
+            .validate()
+            .expect_err("a zero terms ceiling must fail startup validation");
+        assert!(
+            errors.iter().any(|e| e.contains("max terms count")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
     fn test_validate_invalid_port() {
         let config = ServerConfig {
             port: 0,
