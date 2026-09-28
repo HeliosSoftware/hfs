@@ -996,26 +996,19 @@ lib-run-unknown-table-more = Tabla desconocida { $name } — línea { $line }.
 ## Panel de tablas (#842, ambos tipos) — Reads from / Used by / Columns
 
 lib-tables-heading = Lee de
-lib-tables-col-alias = Alias
-lib-tables-col-target = Lee de
 lib-tables-no-alias = (sin etiqueta)
 lib-tables-empty = Aún no hay tablas declaradas.
-lib-tables-note = Cada tabla que la consulta SQL lee, como entradas relatedArtifact depends-on: el alias a la izquierda, la ViewDefinition o SQL View a la que resuelve a la derecha.
-lib-tables-remove = Quitar
 lib-tables-kind-view-definition = ViewDefinition
 lib-tables-target-not-found = No encontrado
 lib-tables-target-not-found-detail = Ninguna ViewDefinition ni SQL View responde a { $resource }. Corrige el canónico en Details o quita la fila.
 lib-tables-target-not-a-table = No es una tabla
 lib-tables-target-not-a-table-detail = Solo se puede leer una ViewDefinition o una SQL View.
-lib-tables-add-toggle = Añadir tabla
 lib-tables-add-table-label = Tabla
-lib-tables-add-table-placeholder = Buscar view definitions y SQL views
-lib-tables-add-table-hint = Escribe para buscar por nombre, o elige de la lista.
+lib-tables-add-table-placeholder = Añadir una tabla…
 lib-tables-add-table-fallback-placeholder = ViewDefinition/{"{"}id{"}"} o Library/{"{"}id{"}"}
-lib-tables-add-table-fallback-hint = Introduce una referencia a una ViewDefinition o una SQL View.
 lib-tables-alias-label = Alias
-lib-tables-alias-hint = Por defecto, el nombre del artefacto
 lib-tables-add-submit = Añadir
+lib-tables-add-hint = Busca una view definition o SQL view; el alias toma su nombre por defecto.
 lib-tables-add-error-required = Elige una view definition o una SQL view
 lib-tables-add-error-alias-required = El alias es obligatorio
 lib-tables-add-error-alias-invalid = El alias debe coincidir con ^[A-Za-z][A-Za-z0-9_]*$
@@ -1024,6 +1017,8 @@ lib-tables-options-empty = Sin coincidencias.
 lib-tables-unknown = Tabla desconocida
 lib-tables-unknown-detail = Se usa en el SQL pero no está declarada. Elige una view definition o SQL view, o corrige el nombre.
 lib-tables-declare = Declarar { $name }
+lib-tables-declare-short = Declarar
+lib-tables-remove-row = Quitar { $alias }
 
 lib-used-by-heading = Usado por
 lib-used-by-empty = Nada lo usa todavía.

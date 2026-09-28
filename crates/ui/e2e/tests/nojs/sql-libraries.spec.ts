@@ -229,8 +229,7 @@ test("with JavaScript disabled, Add table with a typed ViewDefinition reference 
   const tablesCard = page.locator("#lib-tables");
   await expect(tablesCard).toContainText("No tables declared yet.");
 
-  // The disclosure opens natively — no JavaScript required.
-  await tablesCard.locator("details.editor-add > summary").click();
+  // The add row is always visible (#1238) — no disclosure to open first.
   await page.locator('#lib-tables-add-table textarea[name="table"]').fill(`ViewDefinition/${vdId}`);
   await page.locator("input[name='table_alias']").fill("patients");
   await page.locator("button[name='op'][value='add-table']").click();
@@ -238,7 +237,7 @@ test("with JavaScript disabled, Add table with a typed ViewDefinition reference 
   // The whole page re-rendered with the updated (still unsaved) document.
   const jsonField = page.locator("textarea[name='json']");
   await expect(jsonField).toHaveValue(new RegExp(`"resource": "${canonical.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"`));
-  await expect(page.locator("#lib-tables tr", { hasText: "patients" })).toBeVisible();
+  await expect(page.locator("#lib-tables .lib-tables__row", { hasText: "patients" })).toBeVisible();
   expect((await readResource(request, "Library", libId)).relatedArtifact).toBeUndefined();
 
   await page.locator("#lib-editor-form button[name='action'][value='save']").click();
@@ -296,10 +295,10 @@ test("with JavaScript disabled, saving a SQL that reads an unknown table shows t
 
   await expect(page.locator(".notice--warn")).toContainText("Unknown table vv");
   const tablesCard = page.locator("#lib-tables");
-  const row = tablesCard.locator("tr", { hasText: "vv" });
+  const row = tablesCard.locator(".lib-tables__row", { hasText: "vv" });
   await expect(row.locator(".tag--failed")).toHaveText("Unknown table");
-  await expect(tablesCard.locator("details.editor-add")).toHaveAttribute("open", "");
   await expect(page.locator("input[name='table_alias']")).toHaveValue("vv");
+  await expect(page.locator("#lib-tables .lib-tables__add")).toBeVisible();
 
   // Still never saved — the lint is a live/render-time notice only.
   const untouched = await readResource(request, "Library", libId);
