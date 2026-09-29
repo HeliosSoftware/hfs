@@ -9,9 +9,69 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 
 use super::controller::ExportError;
+
+/// Current schema version for persisted completion manifests (see
+/// [`JobManifest`]). An unparsable manifest, or one written by a version this
+/// build doesn't recognize, is always treated as "no manifest" rather than
+/// causing a crash — see [`FilesystemSink::load_completed`].
+pub(crate) const MANIFEST_VERSION: u32 = 1;
+
+/// A durable, serializable record of a completed export job.
+///
+/// [`FilesystemSink::persist_completion`] writes one of these next to a job's
+/// shards (`{dir}/{job_id}/job.json`) when the job finishes, and
+/// [`FilesystemSink::load_completed`] reads them back at controller
+/// construction so a fresh process — after a restart — can keep serving a
+/// job an earlier process already completed (#1474). Not part of the FHIR
+/// wire format: this is server-internal bookkeeping only, mirroring
+/// [`JobStatus::Completed`](super::controller::JobStatus::Completed).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct JobManifest {
+    /// Manifest schema version this record was written with (see the crate's
+    /// internal `MANIFEST_VERSION` constant).
+    pub version: u32,
+    /// The job id this manifest describes. A rehydrating controller MUST
+    /// reject any manifest where this disagrees with the storage key it was
+    /// loaded from (e.g. the containing directory name) — serving a job's
+    /// files by a path that disagrees with the job's own record would let
+    /// that path alone decide which job's files get served.
+    pub job_id: String,
+    /// Tenant that submitted the job, gating status/result/download the same
+    /// way [`InMemoryController`](super::in_memory::InMemoryController) gates
+    /// a job it ran itself.
+    pub tenant_id: String,
+    /// Output format echoed in the completion manifest (e.g. `"ndjson"`).
+    pub format: String,
+    /// Output files produced by the job.
+    pub files: Vec<ManifestFile>,
+    /// Time the job was submitted.
+    pub submitted_at: DateTime<Utc>,
+    /// Time the job finished.
+    pub completed_at: DateTime<Utc>,
+    /// Client-supplied tracking id, echoed back to the caller if present.
+    pub client_tracking_id: Option<String>,
+}
+
+/// One output file inside a [`JobManifest`], mirroring
+/// [`CompletedFile`](super::controller::CompletedFile) (which has no serde
+/// derive of its own, hence this separate on-disk shape).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ManifestFile {
+    /// Logical view name this file belongs to (matches `view.name`).
+    pub view_name: String,
+    /// The shard's stable filename within the job (e.g. `shard-0.ndjson`).
+    pub filename: String,
+    /// Number of data rows written.
+    pub row_count: usize,
+}
+
+/// Filename a persisted [`JobManifest`] is stored under, inside the job's own
+/// directory.
+const MANIFEST_FILENAME: &str = "job.json";
 
 fn server_routed_download_url(
     public_base_url: &str,
@@ -77,6 +137,41 @@ pub trait ExportSink: Send + Sync + Clone + 'static {
     /// Best-effort: a job with no written shards (or an unknown `job_id`) is
     /// not an error.
     fn delete_job(&self, job_id: &str) -> Result<(), ExportError>;
+
+    /// Persists a durable record of a completed job so a controller built by
+    /// a later process — e.g. after a restart — can rehydrate it via
+    /// [`load_completed`](Self::load_completed) and keep serving its status,
+    /// result and downloads (#1474).
+    ///
+    /// Called once, right before the job's in-memory status flips to
+    /// `Completed` — the transition a status poll reports as a 303 — so that
+    /// by the time any client has observed the job as `Completed`, its
+    /// manifest is already durable and a restart after that point still
+    /// serves the job.
+    ///
+    /// A sink that doesn't need this — [`InMemorySink`] (tests only) or
+    /// [`S3Sink`] (out of scope for now) — keeps the default no-op; a job on
+    /// such a sink simply doesn't survive a restart, same as before this fix.
+    /// A failure here is likewise non-fatal to the caller: it degrades to
+    /// that same pre-fix behavior rather than failing the export.
+    fn persist_completion(
+        &self,
+        _job_id: &str,
+        _manifest: &JobManifest,
+    ) -> Result<(), ExportError> {
+        Ok(())
+    }
+
+    /// Loads every persisted completion manifest this sink knows about,
+    /// paired with the storage key (e.g. directory name) it was loaded from.
+    ///
+    /// Called once, at controller construction, to rehydrate `jobs` /
+    /// `job_tenants` after a restart. The default returns nothing, so a sink
+    /// that doesn't persist completions leaves the controller exactly as
+    /// empty as it is today.
+    fn load_completed(&self) -> Vec<(String, JobManifest)> {
+        Vec::new()
+    }
 }
 
 // ============================================================================
@@ -147,6 +242,79 @@ impl ExportSink for FilesystemSink {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(ExportError::Sink(format!("failed to delete job dir: {e}"))),
         }
+    }
+
+    /// Writes the manifest to a temp file and renames it into place, so a
+    /// concurrent [`load_completed`](Self::load_completed) scan — this
+    /// process's own, at its next restart — never observes a partially
+    /// written `job.json`. `create_dir_all` covers the zero-output-file case
+    /// (a completed job with no shards has no directory yet).
+    fn persist_completion(&self, job_id: &str, manifest: &JobManifest) -> Result<(), ExportError> {
+        let job_dir = self.dir.join(job_id);
+        std::fs::create_dir_all(&job_dir)
+            .map_err(|e| ExportError::Sink(format!("failed to create job dir: {e}")))?;
+
+        let data = serde_json::to_vec_pretty(manifest)
+            .map_err(|e| ExportError::Sink(format!("failed to serialize export manifest: {e}")))?;
+        let tmp_path = job_dir.join(format!("{MANIFEST_FILENAME}.tmp"));
+        std::fs::write(&tmp_path, &data)
+            .map_err(|e| ExportError::Sink(format!("failed to write export manifest: {e}")))?;
+        std::fs::rename(&tmp_path, job_dir.join(MANIFEST_FILENAME))
+            .map_err(|e| ExportError::Sink(format!("failed to finalize export manifest: {e}")))?;
+        Ok(())
+    }
+
+    /// Scans `dir` for `{job_id}/job.json` manifests and parses each one.
+    ///
+    /// A directory with no manifest (a job completed before this fix
+    /// shipped, or one that never reached `Completed`) is silently skipped —
+    /// never deleted, never treated as an error. Likewise an unparsable or
+    /// unrecognized-version manifest is logged and skipped rather than
+    /// failing controller construction: a single corrupt directory under the
+    /// export dir must never stop the server from starting.
+    fn load_completed(&self) -> Vec<(String, JobManifest)> {
+        let mut out = Vec::new();
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            // No export dir yet (fresh deployment) — nothing to rehydrate.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return out,
+            // Anything else (e.g. a permissions problem) silently leaves
+            // every already-completed job 404 after a restart — worth a log
+            // line rather than failing controller construction outright.
+            Err(error) => {
+                tracing::warn!(dir = ?self.dir, %error, "failed to scan export dir for completed job manifests");
+                return out;
+            }
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let data = match std::fs::read(path.join(MANIFEST_FILENAME)) {
+                Ok(data) => data,
+                Err(_) => continue,
+            };
+            match serde_json::from_slice::<JobManifest>(&data) {
+                Ok(manifest) if manifest.version == MANIFEST_VERSION => {
+                    out.push((dir_name.to_string(), manifest));
+                }
+                Ok(manifest) => {
+                    tracing::warn!(
+                        job_id = %manifest.job_id,
+                        version = manifest.version,
+                        "skipping export manifest with an unsupported schema version"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(dir = %dir_name, %error, "skipping unparsable export manifest");
+                }
+            }
+        }
+        out
     }
 }
 
