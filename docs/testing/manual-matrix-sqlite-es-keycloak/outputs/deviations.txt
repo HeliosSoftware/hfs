@@ -1,0 +1,2 @@
+2026-09-28T21:41:49Z realm accessTokenLifespan raised 300 → 3600 (declared deviation, #1171 step 2)
+2026-09-28T22:57:22Z harness note: CURL_HOME/.curlrc stale bearer caused the 401s 22:43–23:0x on /bulk-submit-status (monitor only); the WARN 'Token expired' lines in the hfs log in that window come from the monitor

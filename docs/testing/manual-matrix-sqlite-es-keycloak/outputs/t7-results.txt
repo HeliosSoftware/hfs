@@ -1,0 +1,20 @@
+[vd-ndjson] kick-off HTTP 202 poll=http://localhost:8080/export/9b34dd3e-4fbc-4af2-b9b1-e3a02b9ea596/status
+  status: completed | format: ndjson | tracking: None | duration s: 0
+  patient_demographics          1506504 bytes   11706 lines  -> patient_demographics.ndjson
+[vd-csv] kick-off HTTP 202 poll=http://localhost:8080/export/f403c76d-c0a7-41f7-906f-42148e653096/status
+  status: completed | format: csv | tracking: None | duration s: 0
+  patient_demographics           555821 bytes   11707 lines  -> patient_demographics.csv
+[vd-parquet] kick-off HTTP 202 poll=http://localhost:8080/export/e282e960-de5c-450e-8349-b7bdbc7edc86/status
+  status: completed | format: parquet | tracking: None | duration s: 0
+  patient_demographics           472597 bytes    1077 lines  -> patient_demographics.parquet
+[view-ndjson] kick-off HTTP 422 poll=
+[view-parquet] kick-off HTTP 422 poll=
+[query-csv] kick-off HTTP 422 poll=
+[query-ndjson] kick-off HTTP 422 poll=
+[query-parquet] kick-off HTTP 422 poll=
+[all-three-json] kick-off HTTP 422 poll=
+[one-patient] kick-off HTTP 202 poll=http://localhost:8080/export/016c83b0-bcb1-4514-b5c3-6a940e146417/status
+  status: completed | format: ndjson | tracking: None | duration s: 0
+  patient_demographics              128 bytes       1 lines  -> patient_demographics.ndjson
+[tracked-csv-noheader] kick-off HTTP 422 poll=
+done

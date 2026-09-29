@@ -1,0 +1,8 @@
+url http://localhost:8080/ui/batch
+plan: POST [base] · Bundle · batch · 9 entries
+notice: Batch: entries run independently — a failed entry does not stop or undo the others.
+actions: 9 first: 1 | second: 2
+elapsed 6.6 s
+outcome badge: 200 | head: 9 created | summary: 
+rows: 9 statuses: {'201 Created': 9}
+console errors: 0 []

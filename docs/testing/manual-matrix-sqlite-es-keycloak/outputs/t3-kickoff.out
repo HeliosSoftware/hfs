@@ -1,0 +1,14 @@
+list empty: True
+auth radio checked: none
+clicking: Submit
+detail url http://localhost:8080/ui/bulk-import/3ad87fb2-e899-422a-9574-41fc2063488a
+T3START 2026-09-28T21:33:56Z
+  Manifest URL: ?
+  Data Recipient: ?
+  Submission ID: ?
+  Submitter: ?
+  Status: ?
+  Authentication: ?
+  log head: Submission Log 2026-09-28T21:33:56.368Z Status: Queued - starting shortly 2026-09-28T21:33:56.350Z Bulk status kick-off request 2026-09-28T21:33:56.349Z Manifest accepted by the recipient (200). 2026-09-28T21:33:56.340Z Submitting manifest "http://localhost:8000/manifest.json"... 
+  status card: PROCESSING Queued - starting shortly Abort Mark completed
+console errors: ['Failed to load resource: the server responded with a status of 401 (Unauthorized)', 'Failed to load resource: the server responded with a status of 401 (Unauthorized)', 'Failed to load resource: the server responded with a status of 401 (Unauthorized)']

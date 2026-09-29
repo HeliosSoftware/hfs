@@ -1,0 +1,8 @@
+url http://localhost:8080/ui/batch
+plan: POST [base] · Bundle · transaction · 662 entries
+notice: Transaction: all or nothing — if any entry fails, the server rolls the whole bundle back.
+actions: 662 first: 1 | second: 2
+elapsed 18.8 s
+outcome badge: 200 | head: 662 created | summary: 
+rows: 662 statuses: {'201 Created': 655, '200': 1, '201': 1, '400': 1, '404': 1, '409': 1, '422': 1, '500': 1}
+console errors: 0 []

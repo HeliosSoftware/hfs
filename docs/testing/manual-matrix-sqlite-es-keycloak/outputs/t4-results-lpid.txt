@@ -1,0 +1,19 @@
+4.9b   HTTP 200  total=2                        expect=2                            GET /Patient?_id=7d24f7a0-6f2e-ce3b-5568-db7b14695583,01a0e9e9-2e9a-77f3-b878-b31d09772014
+4.17a  HTTP 200  total=5                        expect=5                            GET /Encounter?patient=01a0e9e9-2e9a-77f3-b878-b31d09772014&class=EMER
+4.17b  HTTP 200  total=1                        expect=1                            GET /Encounter?patient=01a0e9e9-2e9a-77f3-b878-b31d09772014&class=IMP
+4.17c  HTTP 200  total=38                       expect=38                           GET /Encounter?patient=01a0e9e9-2e9a-77f3-b878-b31d09772014&date=ge2020
+4.17d  HTTP 200  total=17                       expect=17                           GET /Encounter?patient=01a0e9e9-2e9a-77f3-b878-b31d09772014&type=http://snomed.info/sct|424619006
+4.18a  HTTP 200  total=49 · 4 included          expect=49 · 4 included              GET /Encounter?patient=01a0e9e9-2e9a-77f3-b878-b31d09772014&_include=Encounter:service-provider
+4.18b  HTTP 200  total=49 · 4 included          expect=49 · 4 included              GET /Encounter?patient=01a0e9e9-2e9a-77f3-b878-b31d09772014&_include=Encounter:participant
+4.19a  HTTP 200  total=38                       expect=38                           GET /Encounter?patient=01a0e9e9-2e9a-77f3-b878-b31d09772014&service-provider.name=ENCOMPASS
+4.19b  HTTP 200  total=38                       expect=38                           GET /Encounter?patient=01a0e9e9-2e9a-77f3-b878-b31d09772014&participant.identifier=http://hl7.org/fhir/sid/us-npi|9999989798
+4.21a  HTTP 200  total=6                        expect=6                            GET /Condition?patient=01a0e9e9-2e9a-77f3-b878-b31d09772014&clinical-status=active
+4.21b  HTTP 200  total=3                        expect=3                            GET /Condition?patient=01a0e9e9-2e9a-77f3-b878-b31d09772014&code=http://snomed.info/sct|72892002
+4.21c  HTTP 200  total=2                        expect=2                            GET /Observation?patient=01a0e9e9-2e9a-77f3-b878-b31d09772014&code=29463-7&value-quantity=gt60
+4.21d  HTTP 200  total=3                        expect=3                            GET /Observation?patient=01a0e9e9-2e9a-77f3-b878-b31d09772014&code-value-quantity=http://loinc.org|8302-2$gt160
+4.21e  HTTP 200  total=3                        expect=3                            GET /Immunization?patient=01a0e9e9-2e9a-77f3-b878-b31d09772014&vaccine-code=http://hl7.org/fhir/sid/cvx|140
+4.21f  HTTP 200  total=9                        expect=9                            GET /MedicationRequest?patient=01a0e9e9-2e9a-77f3-b878-b31d09772014&status=stopped
+4.21g  HTTP 200  total=4                        expect=4                            GET /MedicationRequest?patient=01a0e9e9-2e9a-77f3-b878-b31d09772014&code=http://www.nlm.nih.gov/research/umls/rxnorm|757594
+4.22a  HTTP 200  total=1 · 8 included           expect=1 · 8 included               GET /Patient?_id=01a0e9e9-2e9a-77f3-b878-b31d09772014&_revinclude=Immunization:patient
+4.22b  HTTP 200  total=5294                     expect=LPID among rows              GET /Patient?_has:Condition:patient:code=http://snomed.info/sct|706893006&_count=50
+4.22c  HTTP 200  total=4                        expect=4 (55.4,58.5,60.2,64.5)      GET /Observation?patient=01a0e9e9-2e9a-77f3-b878-b31d09772014&code=29463-7&_sort=date

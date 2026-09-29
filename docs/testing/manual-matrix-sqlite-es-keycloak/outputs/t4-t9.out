@@ -1,0 +1,121 @@
+=== T4 fixtures
+PUT RiskAssessment/manual-risk 201
+PUT ValueSet/manual-test-vs 201
+=== T4 queries (API, bearer)
+8.2/8.4: 84/84 HTTP 200 | 8.3 (LPID): 19/19 HTTP 200
+=== T5
+PUT Group 201
+[5.1-everything-small] kick-off HTTP 202  poll=http://localhost:8080/export-status/c67d399a-d26a-49bd-a334-3e2f98b29472
+[5.1-everything-small] complete in 2 s
+  requiresAccessToken=True transactionTime=2026-09-29T02:37:27.739380926Z output files=6 error files=0
+  Location              1000 lines  http://localhost:8080/export-file/c67d399a-d26a-49bd-a334-3e2f98b29472/Location-0
+  Location               142 lines  http://localhost:8080/export-file/c67d399a-d26a-49bd-a334-3e2f98b29472/Location-1
+  Organization          1000 lines  http://localhost:8080/export-file/c67d399a-d26a-49bd-a334-3e2f98b29472/Organization-0
+  Organization           140 lines  http://localhost:8080/export-file/c67d399a-d26a-49bd-a334-3e2f98b29472/Organization-1
+  Practitioner          1000 lines  http://localhost:8080/export-file/c67d399a-d26a-49bd-a334-3e2f98b29472/Practitioner-0
+  Practitioner           140 lines  http://localhost:8080/export-file/c67d399a-d26a-49bd-a334-3e2f98b29472/Practitioner-1
+[5.2-one-patient] kick-off HTTP 202  poll=http://localhost:8080/export-status/afaaa3bc-9229-4489-a5b5-284e93db3b9b
+[5.2-one-patient] complete in 29 s
+  Condition               15 lines  http://localhost:8080/export-file/afaaa3bc-9229-4489-a5b5-284e93db3b9b/Condition-0
+  Observation            165 lines  http://localhost:8080/export-file/afaaa3bc-9229-4489-a5b5-284e93db3b9b/Observation-0
+  Patient                  1 lines  http://localhost:8080/export-file/afaaa3bc-9229-4489-a5b5-284e93db3b9b/Patient-0
+[5.3-group] kick-off HTTP 202  poll=http://localhost:8080/export-status/bf5cdaa4-f7ed-46db-b6a7-143adf323b7d
+[5.3-group] complete in 4 s
+  Condition                1 lines  http://localhost:8080/export-file/bf5cdaa4-f7ed-46db-b6a7-143adf323b7d/Condition-0
+  Patient                  1 lines  http://localhost:8080/export-file/bf5cdaa4-f7ed-46db-b6a7-143adf323b7d/Patient-0
+[5.4-elements] kick-off HTTP 202  poll=http://localhost:8080/export-status/ccf0738e-6d5b-454f-ac7c-36dd40703f7f
+[5.4-elements] complete in 2 s
+  Patient               1000 lines  http://localhost:8080/export-file/ccf0738e-6d5b-454f-ac7c-36dd40703f7f/Patient-0
+  Patient               1000 lines  http://localhost:8080/export-file/ccf0738e-6d5b-454f-ac7c-36dd40703f7f/Patient-1
+  Patient               1000 lines  http://localhost:8080/export-file/ccf0738e-6d5b-454f-ac7c-36dd40703f7f/Patient-2
+  Patient               1000 lines  http://localhost:8080/export-file/ccf0738e-6d5b-454f-ac7c-36dd40703f7f/Patient-3
+  Patient               1000 lines  http://localhost:8080/export-file/ccf0738e-6d5b-454f-ac7c-36dd40703f7f/Patient-4
+  Patient               1000 lines  http://localhost:8080/export-file/ccf0738e-6d5b-454f-ac7c-36dd40703f7f/Patient-5
+  Patient               1000 lines  http://localhost:8080/export-file/ccf0738e-6d5b-454f-ac7c-36dd40703f7f/Patient-6
+  Patient               1000 lines  http://localhost:8080/export-file/ccf0738e-6d5b-454f-ac7c-36dd40703f7f/Patient-7
+  Patient               1000 lines  http://localhost:8080/export-file/ccf0738e-6d5b-454f-ac7c-36dd40703f7f/Patient-8
+  Patient               1000 lines  http://localhost:8080/export-file/ccf0738e-6d5b-454f-ac7c-36dd40703f7f/Patient-9
+  Patient               1000 lines  http://localhost:8080/export-file/ccf0738e-6d5b-454f-ac7c-36dd40703f7f/Patient-10
+  Patient                706 lines  http://localhost:8080/export-file/ccf0738e-6d5b-454f-ac7c-36dd40703f7f/Patient-11
+{"resourceType":"Patient","id":"53595c88-46dc-b059-c5c4-d8beecd0049a","gender":"male","meta":{"profile":["http://hl7.org/fhir/us/core/StructureDefinition/us-core-patient"],"versionId":"1","lastUpdated
+[5.7-since-import] kick-off HTTP 202  poll=http://localhost:8080/export-status/8ba76486-2f90-432e-9070-ae0504f37e75
+[5.7-since-import] complete in 2 s
+  Patient               1000 lines  http://localhost:8080/export-file/8ba76486-2f90-432e-9070-ae0504f37e75/Patient-0
+  Patient               1000 lines  http://localhost:8080/export-file/8ba76486-2f90-432e-9070-ae0504f37e75/Patient-1
+  Patient               1000 lines  http://localhost:8080/export-file/8ba76486-2f90-432e-9070-ae0504f37e75/Patient-2
+  Patient               1000 lines  http://localhost:8080/export-file/8ba76486-2f90-432e-9070-ae0504f37e75/Patient-3
+  Patient               1000 lines  http://localhost:8080/export-file/8ba76486-2f90-432e-9070-ae0504f37e75/Patient-4
+  Patient               1000 lines  http://localhost:8080/export-file/8ba76486-2f90-432e-9070-ae0504f37e75/Patient-5
+  Patient               1000 lines  http://localhost:8080/export-file/8ba76486-2f90-432e-9070-ae0504f37e75/Patient-6
+  Patient               1000 lines  http://localhost:8080/export-file/8ba76486-2f90-432e-9070-ae0504f37e75/Patient-7
+  Patient               1000 lines  http://localhost:8080/export-file/8ba76486-2f90-432e-9070-ae0504f37e75/Patient-8
+  Patient               1000 lines  http://localhost:8080/export-file/8ba76486-2f90-432e-9070-ae0504f37e75/Patient-9
+  Patient               1000 lines  http://localhost:8080/export-file/8ba76486-2f90-432e-9070-ae0504f37e75/Patient-10
+  Patient                704 lines  http://localhost:8080/export-file/8ba76486-2f90-432e-9070-ae0504f37e75/Patient-11
+[5.8-until-import] kick-off HTTP 202  poll=http://localhost:8080/export-status/e9558073-5d49-4f80-817a-ccb75d1603d5
+[5.8-until-import] complete in 2 s
+  Patient                  2 lines  http://localhost:8080/export-file/e9558073-5d49-4f80-817a-ccb75d1603d5/Patient-0
+[5.10-since-fixtures] kick-off HTTP 202  poll=http://localhost:8080/export-status/3f0a2cf7-2e98-40bc-8e69-43ffa39b8687
+[5.10-since-fixtures] complete in 2 s
+  Group                    1 lines  http://localhost:8080/export-file/3f0a2cf7-2e98-40bc-8e69-43ffa39b8687/Group-0
+  RiskAssessment           1 lines  http://localhost:8080/export-file/3f0a2cf7-2e98-40bc-8e69-43ffa39b8687/RiskAssessment-0
+  ValueSet                 1 lines  http://localhost:8080/export-file/3f0a2cf7-2e98-40bc-8e69-43ffa39b8687/ValueSet-0
+[5.12-bad-since] kick-off HTTP 400  poll=
+[5.12-bad-since] body: {"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"invalid","details":{"text":"invalid instant 'yesterday': premature end of input"}}]}
+[5.13-bad-group] kick-off HTTP 404  poll=
+[5.13-bad-group] body: {"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"not-found","details":{"text":"Could not find the resource 'Group/does-not-exist'."}}]}
+=== T5 page (no session): Export list + kick-off
+No exports yet
+=== T6
+VD=01a0eb06-dd13-7a81-a383-56c8cfab00f2 VD2=01a0eb06-e13e-7e53-88b1-7b0c4e983d1e
+$sql-run json HTTP 200 application/json 1000641B 0.342921s
+$sql-run csv HTTP 200 text/csv; charset=utf-8 555821B 0.319940s
+$sql-run ndjson HTTP 200 application/x-ndjson 1506504B 0.300097s
+$sql-run parquet HTTP 200 application/vnd.apache.parquet 472597B 0.320111s
+json rows 11706 csv lines 11707 ndjson lines 11706 parquet magic PAR1
+anchor row: [{'id': '7d24f7a0-6f2e-ce3b-5568-db7b14695583', 'family': 'Parker433'}]
+$sql-run observation_flat ndjson HTTP 200 1271084403B 64.881539s
+obs rows 7699987, 8302-2 rows 175355
+$sql-run without token → 401
+View Definitions page (no session, outbound token): 
+=== T7
+QV=01a0eb07-ec63-7373-9e95-ec2f782df52f QQ=01a0eb07-f092-77c1-9dc4-a0ab18fa67e3
+sed: -e expression #1, char 0: no previous regular expression
+sed: -e expression #1, char 0: no previous regular expression
+sed: -e expression #1, char 0: no previous regular expression
+sed: -e expression #1, char 0: no previous regular expression
+sed: -e expression #1, char 0: no previous regular expression
+sed: -e expression #1, char 0: no previous regular expression
+sed: -e expression #1, char 0: no previous regular expression
+sed: -e expression #1, char 0: no previous regular expression
+sed: -e expression #1, char 0: no previous regular expression
+sed: -e expression #1, char 0: no previous regular expression
+sed: -e expression #1, char 0: no previous regular expression
+[vd-ndjson] kick-off HTTP 404 poll=
+[vd-csv] kick-off HTTP 404 poll=
+[vd-parquet] kick-off HTTP 404 poll=
+[view-ndjson] kick-off HTTP 404 poll=
+[view-parquet] kick-off HTTP 404 poll=
+[query-csv] kick-off HTTP 404 poll=
+[query-ndjson] kick-off HTTP 404 poll=
+[query-parquet] kick-off HTTP 404 poll=
+[all-three-json] kick-off HTTP 404 poll=
+[one-patient] kick-off HTTP 404 poll=
+[tracked-csv-noheader] kick-off HTTP 404 poll=
+SQL Export pages (no session, outbound token):
+  /ui/sql/views        {'female_patients': True, 'tall_female_patients': True, 'patient_demographics': True, 'could not': True, '401': False}
+  /ui/sql/queries      {'female_patients': True, 'tall_female_patients': True, 'patient_demographics': False, 'could not': True, '401': False}
+  /ui/sql/export/new   {'female_patients': True, 'tall_female_patients': True, 'patient_demographics': True, 'could not': True, '401': False}
+  /ui/sql/export       {'female_patients': False, 'tall_female_patients': False, 'patient_demographics': False, 'could not': False, '401': False}
+=== T8
+topic 201 sub manual-sub active v2
+handshake lines: 1: {"path": "/webhook", "auth": "Bearer manual-token", "body": {"resourceType": "Bundle", "id": "b5784b21-06c1-4226-96c7-e6f6a0774bec", "type": "history", "timestamp": "2026-09-29T02:39:25.675489314+00:0
+notifications after 3 Encounters: 3
+{"path": "/webhook", "auth": "Bearer manual-token", "body": {"resourceType": "Bundle", "id": "0e4c8316-dbaa-4d7a-bf88-8da04c7eb07c", "type": "history", "timestamp": "2026-09-29T02:39:37.937169588+00:00", "entry": [{"fullUrl": "urn:uuid:848862c3-78fc-49e9-9253-dc41f27c6ee7", "resource": {"resourceTyp
+after a Condition (no match): 4 lines
+$status HTTP 200 {'status': 'active', 'events-since-subscription-start': '3'}
+$events 200
+$status without token → 401
+delivered after receiver returned: 3 in 5 s
+=== T9 (page, no session)
+exit 0

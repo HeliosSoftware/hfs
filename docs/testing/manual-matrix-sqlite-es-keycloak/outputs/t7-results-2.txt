@@ -1,0 +1,18 @@
+[view-ndjson] kick-off HTTP 202 poll=http://localhost:8080/export/2059049c-fd86-4729-8b1a-ddbdbb811e41/status
+  status: completed | format: ndjson | tracking: None | duration s: 0
+  female_patients                524405 bytes    5814 lines  -> female_patients.ndjson
+[view-parquet] kick-off HTTP 202 poll=http://localhost:8080/export/ab7c866c-3cac-4493-82eb-5713f7503c9a/status
+  status: completed | format: parquet | tracking: None | duration s: 0
+  female_patients                268742 bytes    1056 lines  -> female_patients.parquet
+[query-csv] kick-off HTTP 202 poll=http://localhost:8080/export/71a0a83f-0ff0-4ad0-9106-58181fe9de81/status
+[query-csv] poll HTTP 500: {"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"processing","diagnostics":"Export job '71a0a83f-0ff0-4ad0-910
+[query-ndjson] kick-off HTTP 202 poll=http://localhost:8080/export/1d31c70e-7667-4359-9a0f-35a8d0dc4260/status
+[query-ndjson] poll HTTP 500: {"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"processing","diagnostics":"Export job '1d31c70e-7667-4359-
+[query-parquet] kick-off HTTP 202 poll=http://localhost:8080/export/72b8cb75-2306-4c39-ad83-b2f3bf8a87f1/status
+[query-parquet] poll HTTP 500: {"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"processing","diagnostics":"Export job '72b8cb75-2306-4c39
+[all-three-json] kick-off HTTP 202 poll=http://localhost:8080/export/20aebdac-0351-43df-863d-1d7acbf6e1d3/status
+[all-three-json] poll HTTP 500: {"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"processing","diagnostics":"Export job '20aebdac-0351-43d
+[tracked-csv-noheader] kick-off HTTP 202 poll=http://localhost:8080/export/7317631f-c896-4b0b-948c-38273bd3c9fe/status
+  status: completed | format: csv | tracking: release-check-01 | duration s: 0
+  female_patients                332543 bytes    5814 lines  -> female_patients.csv
+done

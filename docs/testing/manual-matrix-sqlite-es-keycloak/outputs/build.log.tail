@@ -1,0 +1,5 @@
+   Compiling helios-rest v0.2.3 (/home/angela/src/hfs/crates/rest)
+   Compiling pysof v0.2.3 (/home/angela/src/hfs/crates/pysof)
+   Compiling helios-hfs v0.2.3 (/home/angela/src/hfs/crates/hfs)
+    Finished `release` profile [optimized] target(s) in 189m 53s
+exit 0
