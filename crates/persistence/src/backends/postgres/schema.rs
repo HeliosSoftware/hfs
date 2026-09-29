@@ -12,7 +12,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 44;
+pub const SCHEMA_VERSION: i32 = 45;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -36,10 +36,31 @@ const POST_MIGRATION_ANALYZE_TIMEOUT: &str = "30s";
 /// between attempts. A deployment-wide `statement_timeout` therefore cannot
 /// abort startup merely because another instance is still migrating, and
 /// cancellation while waiting cannot strand a newly acquired session lock.
+#[cfg(test)]
 pub async fn initialize_schema(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
+    initialize_schema_with_patient_export_index(client, true)
+        .await
+        .map(|_| ())
+}
+
+/// Initializes the schema and optionally builds the patient export candidate index.
+/// Audit-only and search-offloaded PostgreSQL instances do not need this large
+/// index. The returned capability is true only for a verified usable index.
+pub async fn initialize_schema_with_patient_export_index(
+    client: &mut deadpool_postgres::Client,
+    build_patient_export_index: bool,
+) -> StorageResult<bool> {
     acquire_migration_lock(client).await?;
 
-    let result = run_migrations(client).await;
+    let result = async {
+        run_migrations(client).await?;
+        if build_patient_export_index {
+            ensure_patient_export_index(client).await
+        } else {
+            Ok(false)
+        }
+    }
+    .await;
 
     // Release even on failure; the connection may be recycled into the pool.
     if let Err(e) = client
@@ -413,6 +434,11 @@ async fn migrate_schema(
                 // The helper writes the v44 marker inside its own transaction,
                 // like v43, so the common loop must not stamp it again.
                 migrate_v43_to_v44(client).await?;
+                version += 1;
+                continue;
+            }
+            44 => {
+                migrate_v44_to_v45(client).await?;
                 version += 1;
                 continue;
             }
@@ -4052,6 +4078,139 @@ async fn migrate_v43_to_v44(client: &mut deadpool_postgres::Client) -> StorageRe
         .await
         .map_err(|e| pg_error(format!("commit v44 migration: {e}")))?;
     Ok(())
+}
+
+/// v44 -> v45: provide a stable expression for patient compartment candidates.
+///
+/// The index is installed separately after this transaction. Building it inside
+/// the migration would hold a write-blocking table lock for the entire scan of
+/// `resources`; it must use `CREATE INDEX CONCURRENTLY` in autocommit mode.
+async fn migrate_v44_to_v45(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|e| pg_error(format!("begin v45 migration: {e}")))?;
+    tx.execute("SET LOCAL statement_timeout = 0", &[])
+        .await
+        .map_err(|e| pg_error(format!("disable statement timeout for v45 migration: {e}")))?;
+    tx.batch_execute(
+        "CREATE OR REPLACE FUNCTION hfs_patient_references_v1(resource jsonb)
+         RETURNS text[]
+         LANGUAGE sql IMMUTABLE PARALLEL SAFE
+         AS $function$
+             SELECT COALESCE(array_agg(DISTINCT patient_ref ORDER BY patient_ref), ARRAY[]::text[])
+             FROM (
+                 SELECT split_part(reference #>> '{}', '/_history/', 1) AS patient_ref
+                 FROM jsonb_path_query(resource, '$.**.reference') AS refs(reference)
+             ) AS extracted
+             WHERE patient_ref LIKE 'Patient/%'
+         $function$;",
+    )
+    .await
+    .map_err(|e| pg_error(format!("Migration v44->v45 failed: {e}")))?;
+    set_schema_version(&tx, 45).await?;
+    tx.commit()
+        .await
+        .map_err(|e| pg_error(format!("commit v45 migration: {e}")))?;
+    Ok(())
+}
+
+const PATIENT_EXPORT_INDEX_NAME: &str = "idx_resources_patient_refs_v1";
+
+/// Verify the exact expression and live-row predicate before the export path
+/// relies on the index. An interrupted concurrent build leaves an invalid
+/// catalog entry under the desired name; `IF NOT EXISTS` alone cannot repair it.
+async fn patient_export_index_state(
+    client: &deadpool_postgres::Client,
+) -> StorageResult<Option<bool>> {
+    let row = client
+        .query_opt(
+            "SELECT COALESCE(i.indisvalid AND i.indisready AND i.indislive
+                    AND am.amname = 'gin'
+                    AND i.indnatts = 1
+                    AND pg_get_expr(i.indexprs, i.indrelid) = 'hfs_patient_references_v1(data)'
+                    AND replace(replace(pg_get_expr(i.indpred, i.indrelid), '(', ''), ')', '')
+                        = 'is_deleted = false', FALSE)
+             FROM pg_class c
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             JOIN pg_index i ON i.indexrelid = c.oid
+             JOIN pg_am am ON am.oid = c.relam
+             WHERE n.nspname = current_schema()
+               AND c.relname = $1
+               AND i.indrelid = 'resources'::regclass",
+            &[&PATIENT_EXPORT_INDEX_NAME],
+        )
+        .await
+        .map_err(|e| pg_error(format!("inspect patient export index: {e}")))?;
+    Ok(row.map(|r| r.get(0)))
+}
+
+/// Runs under the schema advisory lock, outside a transaction. Failure to
+/// build the optional acceleration index leaves exports on the JSON predicate;
+/// the next standalone PostgreSQL startup retries it.
+async fn ensure_patient_export_index(client: &deadpool_postgres::Client) -> StorageResult<bool> {
+    let must_drop = match patient_export_index_state(client).await {
+        Ok(Some(true)) => return Ok(true),
+        Ok(None) => false,
+        Ok(Some(false)) => {
+            tracing::warn!("Rebuilding unusable patient export index");
+            true
+        }
+        Err(error) => {
+            tracing::warn!(%error, "Could not inspect patient export index; using JSON fallback");
+            return Ok(false);
+        }
+    };
+
+    // The configured timeout applies to every pooled session. Disable it only
+    // on this migration connection for the potentially long concurrent build.
+    if let Err(error) = client.batch_execute("SET statement_timeout = 0").await {
+        tracing::warn!(%error, "Could not disable timeout for patient export index build");
+        return Ok(false);
+    }
+    let build_result = async {
+        if must_drop {
+            client
+                .batch_execute(&format!(
+                    "DROP INDEX CONCURRENTLY {PATIENT_EXPORT_INDEX_NAME}"
+                ))
+                .await?;
+        }
+        client
+            .batch_execute(
+                "CREATE INDEX CONCURRENTLY idx_resources_patient_refs_v1
+                 ON resources USING gin (hfs_patient_references_v1(data))
+                 WHERE is_deleted = FALSE",
+            )
+            .await
+    }
+    .await;
+    client
+        .batch_execute("RESET statement_timeout")
+        .await
+        .map_err(|e| {
+            pg_error(format!(
+                "restore statement timeout after patient index build: {e}"
+            ))
+        })?;
+    if let Err(error) = build_result {
+        tracing::warn!(%error, "Could not build patient export index; using JSON fallback");
+        return Ok(false);
+    }
+
+    match patient_export_index_state(client).await {
+        Ok(Some(true)) => Ok(true),
+        Ok(_) => {
+            tracing::warn!(
+                "Patient export index build did not produce a usable index; using JSON fallback"
+            );
+            Ok(false)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "Could not verify patient export index; using JSON fallback");
+            Ok(false)
+        }
+    }
 }
 
 /// v23 -> v24: drop `fk_search_resource`.
