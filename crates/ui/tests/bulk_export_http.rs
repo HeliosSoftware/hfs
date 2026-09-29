@@ -2302,6 +2302,54 @@ async fn cancelling_deletes_the_job_server_side() {
     assert!(html.contains("Cancelled"));
 }
 
+/// #1571: a DELETE the server refuses (a 403 for a user-scoped session) must
+/// not turn the card into Cancelled while the export keeps running; the
+/// card stays in progress and shows the refusal.
+#[tokio::test]
+async fn a_refused_cancel_keeps_the_card_in_progress_and_says_why() {
+    let (base, mock, _) = serve().await;
+    *mock.delete_status.lock().unwrap() = StatusCode::FORBIDDEN;
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Refused cancel"), ("scope", "system")],
+    )
+    .await;
+
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    let cancel_path = html
+        .split("action=\"")
+        .find(|s| s.starts_with("/ui/bulk-export/active/") && s.contains("/cancel"))
+        .and_then(|s| s.split('"').next())
+        .expect("cancel action")
+        .to_string();
+    let (status, location) = post_form(&base, &cancel_path, &[]).await;
+    assert_eq!(status, 303);
+    assert_eq!(location, "/ui/bulk-export");
+    assert_eq!(*mock.cancels.lock().unwrap(), 1, "DELETE reached the API");
+
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    assert!(!html.contains("Cancelled"), "{html}");
+    assert!(html.contains("In progress"), "{html}");
+    assert!(
+        html.contains("The server refused the cancel: 403 Forbidden"),
+        "{html}"
+    );
+    // Cancel is still offered: the job is still running.
+    assert!(
+        html.contains(&format!("action=\"{cancel_path}\"")),
+        "{html}"
+    );
+
+    // Once the server lets the DELETE through, the card settles as before.
+    *mock.delete_status.lock().unwrap() = StatusCode::ACCEPTED;
+    let (status, _) = post_form(&base, &cancel_path, &[]).await;
+    assert_eq!(status, 303);
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    assert!(html.contains("Cancelled"), "{html}");
+    assert!(!html.contains("refused the cancel"), "{html}");
+}
+
 #[tokio::test]
 async fn terminal_cards_have_an_accessible_no_js_delete_disclosure() {
     let (base, _, _) = serve().await;
