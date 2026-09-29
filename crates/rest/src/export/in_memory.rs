@@ -17,6 +17,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use futures::StreamExt;
@@ -32,6 +33,73 @@ use super::controller::{
 };
 use super::planner;
 use super::sink::ExportSink;
+use crate::error::RestError;
+use crate::handlers::sof::run::map_sof_error_to_rest;
+use crate::handlers::sof::sqlquery::sqlquery_err_to_rest;
+use helios_persistence::core::sof_runner::SofError;
+
+/// Why a job failed and how its result endpoint reports it. Every worker
+/// error funnels through here: a failure that is the request's own keeps the
+/// 4xx and issue code `$sql-run` would have answered with, everything else
+/// is a `500` carrying the underlying error's text.
+#[derive(Debug)]
+struct JobFailure {
+    message: String,
+    status: StatusCode,
+    code: &'static str,
+}
+
+impl JobFailure {
+    fn server(message: String) -> Self {
+        Self {
+            message,
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "processing",
+        }
+    }
+
+    /// A client-attributable REST error becomes a client failure with its
+    /// own wording; a server error keeps `detail` (the REST wording hides
+    /// backend detail from clients, the job log wants it).
+    fn from_rest(prefix: &str, err: RestError, detail: String) -> Self {
+        let (status, code, message) = err.client_response();
+        if status.is_client_error() {
+            Self {
+                message: format!("{prefix}: {message}"),
+                status,
+                code,
+            }
+        } else {
+            Self::server(format!("{prefix}: {detail}"))
+        }
+    }
+
+    fn from_sof(prefix: &str, err: SofError) -> Self {
+        let detail = err.to_string();
+        Self::from_rest(prefix, map_sof_error_to_rest(err), detail)
+    }
+
+    fn from_export(prefix: &str, err: ExportError) -> Self {
+        match err {
+            ExportError::Client {
+                status,
+                code,
+                message,
+            } => Self {
+                message: format!("{prefix}: {message}"),
+                status,
+                code,
+            },
+            other => Self::server(format!("{prefix}: {other}")),
+        }
+    }
+}
+
+impl From<String> for JobFailure {
+    fn from(message: String) -> Self {
+        Self::server(message)
+    }
+}
 
 /// Default maximum number of concurrent export jobs.
 pub const DEFAULT_MAX_CONCURRENCY: usize = 4;
@@ -212,7 +280,7 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
 
                 files.extend(query_files);
                 rows += query_rows;
-                Ok::<_, String>((files, rows))
+                Ok::<_, JobFailure>((files, rows))
             }
             .await;
 
@@ -236,13 +304,20 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
                         },
                     );
                 }
-                Err(message) => {
-                    warn!(job_id = %jid, error = %message, "export job failed");
+                Err(failure) => {
+                    warn!(
+                        job_id = %jid,
+                        error = %failure.message,
+                        status = %failure.status,
+                        "export job failed"
+                    );
                     set_status_if_running(
                         &jobs,
                         &jid,
                         JobStatus::Failed {
-                            message,
+                            message: failure.message,
+                            status: failure.status,
+                            code: failure.code,
                             submitted_at,
                             failed_at: Utc::now(),
                         },
@@ -254,7 +329,7 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
             // - Cancelled: a concurrent DELETE set this state; shards this task
             //   wrote before observing it are orphaned (the cancel handler
             //   cleaned up whatever existed at DELETE time — this covers the race).
-            // - Failed: the result URL returns 500 with no manifest, so the
+            // - Failed: the result URL returns the failure's status with no manifest, so the
             //   partial shards are unreachable and just waste storage.
             if matches!(
                 jobs.get(&jid).as_deref(),
@@ -480,7 +555,7 @@ async fn run_views_job<Sink: ExportSink>(
     // `total_subjects`: subjects in the whole job, views and queries together.
     progress_offset: u32,
     total_subjects: u32,
-) -> Result<(Vec<CompletedFile>, usize), String> {
+) -> Result<(Vec<CompletedFile>, usize), JobFailure> {
     let format = task.format.to_lowercase();
     let ext = ext_for(&format);
 
@@ -503,7 +578,7 @@ async fn run_views_job<Sink: ExportSink>(
         let stream = runner
             .run_view(&task.tenant, named.view.clone(), task.filters.clone())
             .await
-            .map_err(|e| format!("view '{}': {e}", named.name))?;
+            .map_err(|e| JobFailure::from_sof(&format!("view '{}'", named.name), e))?;
 
         let mut rows: Vec<serde_json::Value> = Vec::new();
         let mut stream = stream;
@@ -512,7 +587,7 @@ async fn run_views_job<Sink: ExportSink>(
                 Ok(v) => rows.push(v),
                 Err(e) => {
                     warn!(view = %named.name, error = %e, "export row stream failed");
-                    return Err(format!("view '{}': {e}", named.name));
+                    return Err(format!("view '{}': {e}", named.name).into());
                 }
             }
         }
@@ -579,7 +654,7 @@ async fn run_sqlquery_job<Sink: ExportSink>(
     progress_offset: u32,
     total_subjects: u32,
     shard_offset: usize,
-) -> Result<(Vec<CompletedFile>, usize), String> {
+) -> Result<(Vec<CompletedFile>, usize), JobFailure> {
     let format = task.format.to_lowercase();
     let ext = ext_for(&format);
 
@@ -598,7 +673,7 @@ async fn run_sqlquery_job<Sink: ExportSink>(
 
         let result = execute_sql_query(runner, task, query, limits)
             .await
-            .map_err(|e| format!("query '{}': {e}", query.name))?;
+            .map_err(|e| JobFailure::from_export(&format!("query '{}'", query.name), e))?;
 
         total_rows += result.rows.len();
 
@@ -662,7 +737,22 @@ async fn execute_sql_query(
         exec_limits,
     )
     .await
-    .map_err(|e| ExportError::Runner(e.to_string()))?;
+    .map_err(|e| {
+        // A limit the request ran into, or a subject the engine refuses, is
+        // the client's answer; the REST wording of a server fault hides the
+        // backend detail, so that path keeps the engine's own text.
+        let detail = e.to_string();
+        let (status, code, message) = sqlquery_err_to_rest(e).client_response();
+        if status.is_client_error() {
+            ExportError::Client {
+                status,
+                code,
+                message,
+            }
+        } else {
+            ExportError::Runner(detail)
+        }
+    })?;
 
     Ok(result)
 }
@@ -1248,6 +1338,152 @@ mod tests {
 
         fn runner_name(&self) -> &'static str {
             "failing-test-runner"
+        }
+    }
+
+    /// A runner that refuses every ViewDefinition it is handed, the way the
+    /// compilers refuse a malformed one.
+    struct RefusingRunner;
+
+    #[async_trait]
+    impl SofRunner for RefusingRunner {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            _view_definition: serde_json::Value,
+            _filters: ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            Err(SofError::InvalidViewDefinition(
+                "column 'city' declares `collection: false` but path 'address.city' may yield multiple values".to_string(),
+            ))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "refusing-test-runner"
+        }
+    }
+
+    async fn terminal_status(
+        controller: &InMemoryController<InMemorySink>,
+        job_id: &str,
+    ) -> JobStatus {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                match controller.get_status("t1", job_id) {
+                    Some(status @ JobStatus::Completed { .. })
+                    | Some(status @ JobStatus::Failed { .. }) => return status,
+                    _ => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            }
+        })
+        .await
+        .expect("export job must reach a terminal state before the timeout")
+    }
+
+    /// #1570: a ViewDefinition the runner refuses is the request's fault —
+    /// the job fails with the 422 `$sql-run` answers, not a 500.
+    #[tokio::test]
+    async fn a_refused_view_fails_the_job_as_the_clients_fault() {
+        let controller = InMemoryController::new(
+            Arc::new(RefusingRunner),
+            InMemorySink::new("http://localhost"),
+            None,
+        );
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let job_id = controller.submit(ExportTask {
+            work: ExportWork {
+                views: vec![NamedView {
+                    name: "demo".to_string(),
+                    view: serde_json::json!({"resourceType": "ViewDefinition", "resource": "Patient"}),
+                }],
+                queries: vec![],
+                limits: SqlExportLimits::default(),
+            },
+            tenant,
+            filters: ViewFilters::default(),
+            format: "ndjson".to_string(),
+            header: true,
+            client_tracking_id: None,
+        });
+        match terminal_status(&controller, &job_id).await {
+            JobStatus::Failed {
+                message,
+                status,
+                code,
+                ..
+            } => {
+                assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+                assert_eq!(code, "processing");
+                assert!(
+                    message.starts_with("view 'demo': column 'city'"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// #1570: a SQL Query subject that runs into the source-row limit fails
+    /// the job with the 422 and wording `$sql-run` gives the same limit.
+    #[tokio::test]
+    async fn a_row_limit_fails_the_job_as_the_clients_fault() {
+        let controller = InMemoryController::new(
+            Arc::new(FailingRunner),
+            InMemorySink::new("http://localhost"),
+            None,
+        );
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let query_plan = crate::handlers::sof::graph::GraphPlan {
+            nodes: vec![crate::handlers::sof::graph::PlanNode::Leaf {
+                internal_name: "vd_0".to_string(),
+                view: serde_json::json!({
+                    "resourceType": "ViewDefinition",
+                    "resource": "Patient",
+                    "status": "active",
+                    "select": [{"column": [{"name": "id", "path": "id"}]}]
+                }),
+            }],
+            subject_edges: Vec::new(),
+        };
+        let job_id = controller.submit(ExportTask {
+            work: ExportWork {
+                views: vec![],
+                queries: vec![NamedSqlQuery {
+                    name: "tall_female_patients".to_string(),
+                    sql: "SELECT * FROM vd_0".to_string(),
+                    plan: query_plan,
+                    bindings: Vec::new(),
+                }],
+                // The runner yields 200 rows before its own failure: the cap
+                // is what the job runs into.
+                limits: SqlExportLimits {
+                    max_source_rows_per_vd: 10,
+                    max_rows: 10_000,
+                    timeout_secs: 5,
+                },
+            },
+            tenant,
+            filters: ViewFilters::default(),
+            format: "csv".to_string(),
+            header: true,
+            client_tracking_id: None,
+        });
+        match terminal_status(&controller, &job_id).await {
+            JobStatus::Failed {
+                message,
+                status,
+                code,
+                ..
+            } => {
+                assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{message}");
+                assert_eq!(code, "processing");
+                assert!(message.contains("exceeds 10-row limit"), "{message}");
+                assert!(
+                    message.starts_with("query 'tall_female_patients'"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
         }
     }
 
