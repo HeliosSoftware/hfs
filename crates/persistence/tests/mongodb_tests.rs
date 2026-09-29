@@ -1153,6 +1153,10 @@ mod reindex_id_walk;
 #[path = "mongodb/reindex_pipeline.rs"]
 mod reindex_pipeline;
 
+/// #1500: MongoDB's `ReindexSource::fetch_resources_by_ids` override.
+#[path = "mongodb/reindex_fetch_by_ids.rs"]
+mod reindex_fetch_by_ids;
+
 /// #1405: of several writers holding the same version, one `update` writes and
 /// every loser is a `ConcurrencyError` — the server's `WriteConflict` used to
 /// reach them as `BackendError::Internal`.
