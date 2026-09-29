@@ -4485,6 +4485,7 @@ impl MongoBackend {
                             resource_type,
                             param,
                             &candidate_ids,
+                            None,
                             Some(&mut *session),
                         )
                         .await?;
