@@ -215,7 +215,9 @@ Supported on the **SQLite, PostgreSQL, MongoDB, and S3** backends. Elasticsearch
 search-only and never a standalone primary, so an Elasticsearch-only deployment
 gets an explained `501 Not Implemented`. On S3 the store is also unavailable (and
 reports the same `501`) in bucket-per-tenant mode with no default system bucket,
-since there is nowhere tenant-independent to keep a user-global document.
+since there is nowhere tenant-independent to keep a user-global document — a
+library configuration only: the `hfs` binary builds prefix-per-tenant from
+`HFS_S3_BUCKET` and cannot express it (#1514; #1598 asks whether it should).
 
 When authentication is disabled, every caller resolves to the same fallback user
 key (`l2:`) and therefore **shares one settings document**. When auth is enabled,
