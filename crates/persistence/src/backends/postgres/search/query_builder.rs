@@ -721,6 +721,7 @@ impl PostgresQueryBuilder {
         // set operation evaluated once per arm, so the rescanning shape is not
         // in the plan space at all.
         let grouped = Self::foldable_groups(query, param_offset, layout);
+        let scoped_composite = Self::patient_scoped_composite(query, layout);
 
         let mut conditions = Vec::new();
         let mut current_offset = param_offset;
@@ -785,8 +786,23 @@ impl PostgresQueryBuilder {
                 continue;
             }
 
-            if let Some(condition) = Self::build_parameter_condition(param, current_offset, layout)
+            if let Some(mut condition) =
+                Self::build_parameter_condition(param, current_offset, layout)
             {
+                if scoped_composite && param.param_type == SearchParamType::Composite {
+                    // Keep the existing row predicate and its binds intact. A fence
+                    // around this resource's rows prevents a global composite-index
+                    // scan from being repeated for every patient candidate (#1579).
+                    if let Some(predicate) = Self::single_index_predicate(&condition.sql) {
+                        condition.sql = format!(
+                            "EXISTS (WITH scoped_composite AS MATERIALIZED \
+                             (SELECT * FROM search_index WHERE tenant_id = $1 \
+                             AND resource_type = $2 AND resource_id = resources.id \
+                             AND param_name = 'code-value-quantity') \
+                             SELECT 1 FROM scoped_composite WHERE {predicate})"
+                        );
+                    }
+                }
                 current_offset += condition.params.len();
                 conditions.push(condition);
             }
@@ -812,6 +828,41 @@ impl PostgresQueryBuilder {
         }
 
         Some(combined)
+    }
+
+    /// Only the measured patient + top-level token/quantity composite shape uses
+    /// per-resource probes. Global composites and Legacy retain their candidate
+    /// scans; OR, repeats and other parameters retain the ordinary conjunction.
+    fn patient_scoped_composite(query: &SearchQuery, layout: IndexLayout) -> bool {
+        if layout != IndexLayout::Denormalized
+            || query.resource_type != "Observation"
+            || query.parameters.len() != 2
+            || query.compartment.is_some()
+        {
+            return false;
+        }
+        let patient = query.parameters.iter().find(|p| p.name == "patient");
+        let composite = query
+            .parameters
+            .iter()
+            .find(|p| p.name == "code-value-quantity");
+        match (patient, composite) {
+            (Some(patient), Some(composite)) => {
+                patient.param_type == SearchParamType::Reference
+                    && patient.modifier.is_none()
+                    && patient.chain.is_empty()
+                    && patient.values.len() == 1
+                    && patient.values[0].prefix == SearchPrefix::Eq
+                    && composite.param_type == SearchParamType::Composite
+                    && composite.modifier.is_none()
+                    && composite.chain.is_empty()
+                    && composite.values.len() == 1
+                    && composite.components.len() == 2
+                    && composite.components[0].param_type == SearchParamType::Token
+                    && composite.components[1].param_type == SearchParamType::Quantity
+            }
+            _ => false,
+        }
     }
 
     /// Groups the parameter occurrences that may be folded into one membership
@@ -3153,6 +3204,141 @@ impl PostgresQueryBuilder {
 mod tests {
     use super::*;
     use crate::types::{CompositeSearchComponent, SearchModifier, SearchQuery};
+
+    fn query_1579() -> SearchQuery {
+        SearchQuery::new("Observation")
+            .with_parameter(SearchParameter {
+                name: "patient".into(),
+                param_type: SearchParamType::Reference,
+                modifier: None,
+                chain: vec![],
+                components: vec![],
+                values: vec![SearchValue::eq("anchor")],
+            })
+            .with_parameter(SearchParameter {
+                name: "code-value-quantity".into(),
+                param_type: SearchParamType::Composite,
+                modifier: None,
+                chain: vec![],
+                values: vec![SearchValue::eq("http://loinc.org|8302-2$gt160")],
+                components: vec![
+                    CompositeSearchComponent {
+                        param_type: SearchParamType::Token,
+                        param_name: "code".into(),
+                    },
+                    CompositeSearchComponent {
+                        param_type: SearchParamType::Quantity,
+                        param_name: "value-quantity".into(),
+                    },
+                ],
+            })
+    }
+
+    #[test]
+    fn patient_composite_1579_fences_only_resource_rows_and_preserves_binds() {
+        for offset in [2, 4] {
+            for reversed in [false, true] {
+                let mut query = query_1579();
+                if reversed {
+                    query.parameters.reverse();
+                }
+                let frag = PostgresQueryBuilder::build_search_query(&query, offset).unwrap();
+                assert!(
+                    frag.sql.contains("WITH scoped_composite AS MATERIALIZED"),
+                    "{}",
+                    frag.sql
+                );
+                assert!(
+                    frag.sql.contains("resource_id = resources.id"),
+                    "{}",
+                    frag.sql
+                );
+                assert!(
+                    frag.sql
+                        .contains("AND param_name = 'code-value-quantity') SELECT 1"),
+                    "{}",
+                    frag.sql
+                );
+                let mut expected = Vec::new();
+                let mut next = offset;
+                for param in &query.parameters {
+                    let original = PostgresQueryBuilder::build_parameter_condition(
+                        param,
+                        next,
+                        IndexLayout::Denormalized,
+                    )
+                    .unwrap();
+                    if param.param_type == SearchParamType::Composite {
+                        let predicate =
+                            PostgresQueryBuilder::single_index_predicate(&original.sql).unwrap();
+                        assert!(
+                            frag.sql.contains(&format!(
+                                "SELECT 1 FROM scoped_composite WHERE {predicate}"
+                            )),
+                            "{}",
+                            frag.sql
+                        );
+                    } else {
+                        assert!(frag.sql.contains(&original.sql), "{}", frag.sql);
+                    }
+                    next += original.params.len();
+                    expected.extend(original.params);
+                }
+                assert_eq!(format!("{:?}", frag.params), format!("{:?}", expected));
+                assert_eq!(
+                    bind_numbers(&frag.sql, offset),
+                    (offset + 1..=offset + frag.params.len()).collect::<Vec<_>>()
+                );
+                assert!(PostgresQueryBuilder::single_index_predicate(&frag.sql).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn patient_composite_1579_keeps_other_shapes_unchanged() {
+        let base = query_1579();
+        let mut cases = Vec::new();
+        let mut q = base.clone();
+        q.parameters.remove(0);
+        cases.push(q);
+        let mut q = base.clone();
+        q.parameters[1].name = "combo-code-value-quantity".into();
+        cases.push(q);
+        let mut q = base.clone();
+        q.parameters[0].modifier = Some(SearchModifier::Identifier);
+        cases.push(q);
+        let mut q = base.clone();
+        q.parameters[0].values.push(SearchValue::eq("other"));
+        cases.push(q);
+        let mut q = base.clone();
+        q.parameters[1].values.push(SearchValue::eq("8302-2$gt170"));
+        cases.push(q);
+        let mut q = base.clone();
+        q.parameters.push(q.parameters[1].clone());
+        cases.push(q);
+        let mut q = base.clone();
+        q.resource_type = "DiagnosticReport".into();
+        cases.push(q);
+        for query in cases {
+            let frag = PostgresQueryBuilder::build_search_query(&query, 2).unwrap();
+            assert!(!frag.sql.contains("MATERIALIZED"), "{}", frag.sql);
+        }
+        let frag =
+            PostgresQueryBuilder::build_search_query_for(&base, 2, IndexLayout::Legacy).unwrap();
+        let patient = PostgresQueryBuilder::build_parameter_condition(
+            &base.parameters[0],
+            2,
+            IndexLayout::Legacy,
+        )
+        .unwrap();
+        let composite = PostgresQueryBuilder::build_parameter_condition(
+            &base.parameters[1],
+            2 + patient.params.len(),
+            IndexLayout::Legacy,
+        )
+        .unwrap();
+        assert_eq!(frag.sql, patient.and(composite).sql);
+    }
 
     fn date_param(name: &str, prefix: SearchPrefix, value: &str) -> SearchParameter {
         SearchParameter {
