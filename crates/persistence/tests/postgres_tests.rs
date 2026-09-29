@@ -24529,6 +24529,83 @@ mod postgres_integration {
         assert_eq!(timeout, "300ms");
     }
 
+    /// #939 C9: during the full-corpus rebuild the hourly SearchParameter
+    /// refresh scanned the whole table (no `tenant_id` in its predicate) and hit
+    /// the session `statement_timeout` every hour. The refresh now probes each
+    /// tenant through the primary key and lifts the timeout for itself only; it
+    /// still sees every tenant's stored definitions.
+    #[tokio::test]
+    async fn postgres_search_param_refresh_outlives_statement_timeout_and_sees_every_tenant() {
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let baseline = backend.refresh_stored_search_parameters().await.unwrap();
+
+        let tenants = [create_tenant("sp-refresh-a"), create_tenant("sp-refresh-b")];
+        for (i, tenant) in tenants.iter().enumerate() {
+            // Rows of other types too, so the tenant walk has something to skip.
+            backend
+                .create(
+                    tenant,
+                    "Patient",
+                    json!({"resourceType":"Patient","id":format!("sp-refresh-patient-{i}")}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            backend
+                .create(
+                    tenant,
+                    "SearchParameter",
+                    json!({
+                        "resourceType": "SearchParameter",
+                        "id": format!("sp-refresh-{i}"),
+                        "url": format!("http://example.org/fhir/SearchParameter/sp-refresh-{i}"),
+                        "name": format!("sprefresh{i}"),
+                        "status": "active",
+                        "code": format!("sprefresh{i}"),
+                        "base": ["Patient"],
+                        "type": "string",
+                        "expression": "Patient.name.family"
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let pooled = backend.get_client().await.unwrap();
+        pooled
+            .batch_execute("SET statement_timeout = '300ms'")
+            .await
+            .unwrap();
+        drop(pooled);
+
+        // Hold the refresh past the timeout, then let it through.
+        let locker = reindex_test_client_for(&dbname).await;
+        locker
+            .batch_execute("BEGIN; LOCK TABLE resources IN ACCESS EXCLUSIVE MODE")
+            .await
+            .unwrap();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+            locker.batch_execute("ROLLBACK").await.unwrap();
+        });
+
+        let stored = backend.refresh_stored_search_parameters().await.unwrap();
+        release.await.unwrap();
+        assert_eq!(
+            stored,
+            baseline + 2,
+            "one active stored SearchParameter per tenant"
+        );
+
+        let pooled = backend.get_client().await.unwrap();
+        let timeout: String = pooled
+            .query_one("SHOW statement_timeout", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(timeout, "300ms");
+    }
+
     #[tokio::test]
     async fn postgres_bulk_submit_batch_commits_bookkeeping_and_contains_errors() {
         use helios_persistence::core::{
