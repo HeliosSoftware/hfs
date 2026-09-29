@@ -97,6 +97,8 @@ struct MockExport {
     cancels: Arc<Mutex<u32>>,
     delete_status: Arc<Mutex<StatusCode>>,
     delete_statuses: Arc<Mutex<VecDeque<StatusCode>>>,
+    /// When set, the DELETE answer carries this body (an OperationOutcome).
+    delete_body: Arc<Mutex<Option<String>>>,
     requires_access_token: Arc<Mutex<bool>>,
     outputs: Arc<Mutex<Vec<MockOutput>>>,
     downloads: Arc<Mutex<Vec<SeenDownload>>>,
@@ -144,6 +146,7 @@ impl Default for MockExport {
             cancels: Default::default(),
             delete_status: Arc::new(Mutex::new(StatusCode::ACCEPTED)),
             delete_statuses: Default::default(),
+            delete_body: Default::default(),
             requires_access_token: Arc::new(Mutex::new(true)),
             outputs: Arc::new(Mutex::new(vec![
                 MockOutput {
@@ -305,7 +308,7 @@ fn mock_fhir_app(state: MockExport) -> Router {
         headers: HeaderMap,
         uri: axum::http::Uri,
         body: Bytes,
-    ) -> StatusCode {
+    ) -> axum::response::Response {
         s.requests
             .lock()
             .unwrap()
@@ -316,11 +319,18 @@ fn mock_fhir_app(state: MockExport) -> Router {
             gate.release.notified().await;
         }
         *s.cancels.lock().unwrap() += 1;
-        s.delete_statuses
+        let status = s
+            .delete_statuses
             .lock()
             .unwrap()
             .pop_front()
-            .unwrap_or_else(|| *s.delete_status.lock().unwrap())
+            .unwrap_or_else(|| *s.delete_status.lock().unwrap());
+        match s.delete_body.lock().unwrap().clone() {
+            Some(body) => {
+                (status, [("content-type", "application/fhir+json")], body).into_response()
+            }
+            None => status.into_response(),
+        }
     }
     async fn output(
         AxState(s): AxState<MockExport>,
@@ -2340,6 +2350,27 @@ async fn a_refused_cancel_keeps_the_card_in_progress_and_says_why() {
         html.contains(&format!("action=\"{cancel_path}\"")),
         "{html}"
     );
+
+    // A refusal that carries an OperationOutcome shows its text.
+    *mock.delete_body.lock().unwrap() = Some(
+        serde_json::json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{"severity": "error", "code": "forbidden",
+                "details": {"text": "This endpoint requires a system-level scope (system/*.read)"}}]
+        })
+        .to_string(),
+    );
+    let (status, _) = post_form(&base, &cancel_path, &[]).await;
+    assert_eq!(status, 303);
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    assert!(html.contains("In progress"), "{html}");
+    assert!(
+        html.contains(
+            "The server refused the cancel: 403: This endpoint requires a system-level scope (system/*.read)"
+        ),
+        "{html}"
+    );
+    *mock.delete_body.lock().unwrap() = None;
 
     // Once the server lets the DELETE through, the card settles as before.
     *mock.delete_status.lock().unwrap() = StatusCode::ACCEPTED;
