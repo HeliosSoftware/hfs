@@ -1423,6 +1423,67 @@ mod tests {
         }
     }
 
+    /// A runner whose backend is gone before the first row.
+    struct BackendDownRunner;
+
+    #[async_trait]
+    impl SofRunner for BackendDownRunner {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            _view_definition: serde_json::Value,
+            _filters: ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            Err(SofError::Backend("connection reset by peer".to_string()))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "backend-down-test-runner"
+        }
+    }
+
+    /// #1570: a backend failure at kick-off stays a server fault — 500,
+    /// with the backend's own text kept for the job log rather than the
+    /// REST wording that hides it from clients.
+    #[tokio::test]
+    async fn a_backend_failure_at_kickoff_stays_a_server_fault() {
+        let controller = InMemoryController::new(
+            Arc::new(BackendDownRunner),
+            InMemorySink::new("http://localhost"),
+            None,
+        );
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let job_id = controller.submit(ExportTask {
+            work: ExportWork {
+                views: vec![NamedView {
+                    name: "demo".to_string(),
+                    view: serde_json::json!({"resourceType": "ViewDefinition", "resource": "Patient"}),
+                }],
+                queries: vec![],
+                limits: SqlExportLimits::default(),
+            },
+            tenant,
+            filters: ViewFilters::default(),
+            format: "ndjson".to_string(),
+            header: true,
+            client_tracking_id: None,
+        });
+        match terminal_status(&controller, &job_id).await {
+            JobStatus::Failed {
+                message,
+                status,
+                code,
+                ..
+            } => {
+                assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+                assert_eq!(code, "processing");
+                assert!(message.starts_with("view 'demo': "), "{message}");
+                assert!(message.contains("connection reset by peer"), "{message}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
     /// #1570: a SQL Query subject that runs into the source-row limit fails
     /// the job with the 422 and wording `$sql-run` gives the same limit.
     #[tokio::test]
