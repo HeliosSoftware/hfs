@@ -67,6 +67,9 @@ pub struct EsQueryBuilder<'a> {
     /// The index's `index.max_result_window` setting, used to clamp the
     /// over-fetched `size` so `from + size` never exceeds it (#1079).
     max_result_window: u32,
+    /// The index's `index.max_terms_count`: an id list longer than this is
+    /// split into several `terms` clauses.
+    max_terms_count: u32,
 }
 
 impl<'a> EsQueryBuilder<'a> {
@@ -80,6 +83,7 @@ impl<'a> EsQueryBuilder<'a> {
             // (`backend.rs`); overridden via `with_max_result_window` when
             // the caller knows the actual configured window.
             max_result_window: 10_000,
+            max_terms_count: 65_536,
         }
     }
 
@@ -87,6 +91,13 @@ impl<'a> EsQueryBuilder<'a> {
     /// over-fetched `size` so `from + size` stays within the window (#1079).
     pub fn with_max_result_window(mut self, window: u32) -> Self {
         self.max_result_window = window;
+        self
+    }
+
+    /// Overrides the index's `index.max_terms_count`, the most values one
+    /// `terms` clause is given.
+    pub fn with_max_terms_count(mut self, count: u32) -> Self {
+        self.max_terms_count = count.max(1);
         self
     }
 
@@ -345,10 +356,19 @@ impl<'a> EsQueryBuilder<'a> {
             return None;
         }
         let ids: Vec<&str> = param.values.iter().map(|v| v.value.as_str()).collect();
+        // A `terms` query may carry at most `index.max_terms_count` values;
+        // a chained search that resolved a wide terminal set (#1548) pins
+        // more, so the list goes out as several `terms` clauses ORed.
         let clause = if ids.len() == 1 {
             json!({ "term": { "resource_id": ids[0] } })
-        } else {
+        } else if ids.len() <= self.max_terms_count as usize {
             json!({ "terms": { "resource_id": ids } })
+        } else {
+            let chunks: Vec<Value> = ids
+                .chunks(self.max_terms_count as usize)
+                .map(|chunk| json!({ "terms": { "resource_id": chunk } }))
+                .collect();
+            json!({ "bool": { "should": chunks, "minimum_should_match": 1 } })
         };
 
         if matches!(param.modifier, Some(SearchModifier::Not)) {
@@ -611,6 +631,48 @@ mod tests {
         let clause = &es_query.body["query"]["bool"]["must"][0];
 
         assert_eq!(clause, &json!({ "term": { "resource_id": "a" } }));
+    }
+
+    /// A chained search whose terminal hop resolved more ids than
+    /// `index.max_terms_count` used to be refused by Elasticsearch as a
+    /// malformed query (#1548); the list now goes out as several `terms`
+    /// clauses ORed, each within the ceiling, and `:not` negates the whole.
+    #[test]
+    fn id_lists_past_the_terms_ceiling_are_split_into_should_clauses() {
+        let ids: Vec<SearchValue> = (0..7).map(|i| SearchValue::eq(format!("id-{i}"))).collect();
+        let param = |modifier| SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier,
+            values: ids.clone(),
+            chain: vec![],
+            components: vec![],
+        };
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string())
+            .with_max_terms_count(3);
+
+        let es_query = builder.build(&SearchQuery::new("Patient").with_parameter(param(None)));
+        let clause = &es_query.body["query"]["bool"]["must"][0];
+        let should = clause["bool"]["should"]
+            .as_array()
+            .expect("bool.should of terms");
+        assert_eq!(clause["bool"]["minimum_should_match"], json!(1));
+        let sizes: Vec<usize> = should
+            .iter()
+            .map(|c| c["terms"]["resource_id"].as_array().unwrap().len())
+            .collect();
+        assert_eq!(sizes, [3, 3, 1]);
+        assert_eq!(should[2]["terms"]["resource_id"], json!(["id-6"]));
+
+        let within = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string())
+            .with_max_terms_count(7)
+            .build(&SearchQuery::new("Patient").with_parameter(param(None)));
+        assert!(within.body["query"]["bool"]["must"][0]["terms"].is_object());
+
+        let negated = builder
+            .build(&SearchQuery::new("Patient").with_parameter(param(Some(SearchModifier::Not))));
+        let inner = &negated.body["query"]["bool"]["must"][0]["bool"]["must_not"][0];
+        assert_eq!(inner["bool"]["should"].as_array().unwrap().len(), 3);
     }
 
     /// Matches the SQL backends' `_id` builders, which both guard on

@@ -310,13 +310,11 @@ impl BulkSubmitProvider for S3Backend {
         let location = self.tenant_location(tenant)?;
         let mut submission = self.load_submission_state(&location, submission_id).await?;
 
+        // A submission completed at kick-off (submissionStatus=completed) still
+        // drains the manifests it registered, as the worker and the other
+        // backends read it; only an abort stops the ingest.
         match submission.summary.status {
-            SubmissionStatus::InProgress => {}
-            SubmissionStatus::Complete => {
-                return Err(StorageError::BulkSubmit(BulkSubmitError::AlreadyComplete {
-                    submission_id: submission_id.submission_id.clone(),
-                }));
-            }
+            SubmissionStatus::InProgress | SubmissionStatus::Complete => {}
             SubmissionStatus::Aborted => {
                 return Err(StorageError::BulkSubmit(BulkSubmitError::Aborted {
                     submission_id: submission_id.submission_id.clone(),
@@ -1461,7 +1459,7 @@ impl S3Backend {
     /// holding the lease handle — `process_entries` — must therefore never
     /// write back a copy it read earlier: it goes through here, and `mutate`
     /// states its change relative to whatever is stored (#1229).
-    async fn mutate_manifest_state<F>(
+    pub(super) async fn mutate_manifest_state<F>(
         &self,
         location: &TenantLocation,
         submission_id: &SubmissionId,
