@@ -13950,6 +13950,15 @@ mod bulk_submit {
             )
             .await
             .unwrap();
+        assert_eq!(
+            backend
+                .get_manifest_for_worker(&lease)
+                .await
+                .unwrap()
+                .file_resume_lines,
+            vec![("https://provider.example/b.ndjson".to_string(), 1)],
+            "an unfinished file resumes after its last charged line"
+        );
         for url in [
             "https://provider.example/b.ndjson",
             "https://provider.example/a.ndjson",
@@ -13970,13 +13979,11 @@ mod bulk_submit {
             "https://provider.example/a.ndjson".to_string(),
             "https://provider.example/b.ndjson".to_string(),
         ];
-        assert_eq!(
-            backend
-                .get_manifest_for_worker(&lease)
-                .await
-                .unwrap()
-                .completed_output_files,
-            expected
+        let view = backend.get_manifest_for_worker(&lease).await.unwrap();
+        assert_eq!(view.completed_output_files, expected);
+        assert!(
+            view.file_resume_lines.is_empty(),
+            "a completed file is skipped whole, not resumed"
         );
 
         assert!(SubmitClaimStrategy::release(&backend, lease).await.unwrap());

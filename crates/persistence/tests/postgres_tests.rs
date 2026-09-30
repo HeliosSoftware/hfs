@@ -20799,6 +20799,27 @@ mod postgres_integration {
         )
         .await;
 
+        // A batch of file b charged its lines before the file finished; a
+        // batch of file c did too, and c stays unfinished.
+        for (url, line) in [
+            ("https://provider/b.ndjson", 2),
+            ("https://provider/c.ndjson", 3),
+        ] {
+            backend
+                .process_entries(
+                    &tenant,
+                    &sub_id,
+                    &manifest.manifest_id,
+                    vec![helios_persistence::core::NdjsonEntry::new(
+                        line,
+                        "Patient",
+                        json!({"resourceType": "Patient"}),
+                    )],
+                    &helios_persistence::core::BulkProcessingOptions::new().with_file_url(url),
+                )
+                .await
+                .unwrap();
+        }
         for url in [
             "https://provider/b.ndjson",
             "https://provider/a.ndjson",
@@ -20819,13 +20840,12 @@ mod postgres_integration {
             "https://provider/a.ndjson".to_string(),
             "https://provider/b.ndjson".to_string(),
         ];
+        let view = backend.get_manifest_for_worker(&lease).await.unwrap();
+        assert_eq!(view.completed_output_files, expected);
         assert_eq!(
-            backend
-                .get_manifest_for_worker(&lease)
-                .await
-                .unwrap()
-                .completed_output_files,
-            expected
+            view.file_resume_lines,
+            vec![("https://provider/c.ndjson".to_string(), 3)],
+            "a completed file is skipped whole, an unfinished one resumes after its last charged line"
         );
 
         assert!(SubmitClaimStrategy::release(&backend, lease).await.unwrap());

@@ -121,6 +121,26 @@ impl ManifestLease {
     }
 }
 
+/// Splits per-file progress rows — `(file URL, highest charged line,
+/// completed)` — into the two resume lists of a [`ManifestWorkerView`]
+/// (#1610): the files to skip whole, and the line each unfinished file
+/// resumes after. A file with nothing charged yet appears in neither.
+pub(crate) fn split_file_progress(
+    rows: &[(String, u64, bool)],
+) -> (Vec<String>, Vec<(String, u64)>) {
+    let completed = rows
+        .iter()
+        .filter(|(_, _, completed)| *completed)
+        .map(|(url, _, _)| url.clone())
+        .collect();
+    let resume = rows
+        .iter()
+        .filter(|(_, line, completed)| !*completed && *line > 0)
+        .map(|(url, line, _)| (url.clone(), *line))
+        .collect();
+    (completed, resume)
+}
+
 /// The worker's view of a claimed manifest: everything needed to fetch + ingest it.
 #[derive(Debug, Clone)]
 pub struct ManifestWorkerView {
@@ -151,12 +171,19 @@ pub struct ManifestWorkerView {
     pub metadata: Vec<(String, String)>,
     /// Entries this manifest has already walked, across every run of it.
     ///
-    /// Informational only — nothing resumes from it. A reclaimed manifest
-    /// re-walks each of its files from the top and the re-ingested entries
-    /// upsert idempotently; this cursor is the checkpoint a future per-line
-    /// resume would read, but no such consumer exists yet. Counted like the
-    /// other progress columns, so it only ever moves forward (#969).
+    /// Informational only — nothing resumes from it: a resume reads the
+    /// per-file progress in [`Self::file_resume_lines`] and
+    /// [`Self::completed_output_files`] instead (#1610), because line
+    /// numbers restart per file. Counted like the other progress columns, so
+    /// it only ever moves forward (#969).
     pub last_processed_line: u64,
+    /// The highest line an earlier run of this manifest committed and
+    /// charged, for each output file it did not finish, as `(file URL,
+    /// line)` (#1610). The run that reclaims the manifest reads past those
+    /// lines instead of ingesting them again. Empty on S3, which keeps no
+    /// per-file progress. A file in `completed_output_files` is never listed
+    /// here: it is skipped whole.
+    pub file_resume_lines: Vec<(String, u64)>,
     /// Output files an earlier run of this manifest walked to their end.
     ///
     /// A reclaimed manifest skips these instead of re-walking them (#1610):
@@ -797,6 +824,7 @@ struct OwnedFileRunContext {
     options: BulkProcessingOptions,
     file_count: u64,
     completed_files: std::collections::HashSet<String>,
+    resume_lines: std::collections::HashMap<String, u64>,
     presized: bool,
     failed: AtomicU64,
     file_level_failed: AtomicU64,
@@ -1742,6 +1770,7 @@ where
             options: opts,
             file_count,
             completed_files,
+            resume_lines: view.file_resume_lines.iter().cloned().collect(),
             presized,
             failed: AtomicU64::new(0),
             file_level_failed: AtomicU64::new(0),
@@ -2845,7 +2874,25 @@ where
         inner,
         consumed: Arc::clone(&run.progress.consumed),
     });
-    let file_options = run.options.clone().with_file_url(&context.file.url);
+    let resume_after_line = run
+        .resume_lines
+        .get(&context.file.url)
+        .copied()
+        .unwrap_or(0);
+    if resume_after_line > 0 {
+        tracing::info!(
+            submission = %run.lease.submission_id,
+            manifest = %run.lease.manifest_id,
+            url = %redact_url(&context.file.url),
+            resume_after_line,
+            "bulk-submit resumes an output file past the lines an earlier run of this manifest committed"
+        );
+    }
+    let file_options = run
+        .options
+        .clone()
+        .with_file_url(&context.file.url)
+        .with_resume_after_line(resume_after_line);
     match jobs
         .process_ndjson_stream(
             &run.lease.tenant,
@@ -3293,7 +3340,7 @@ mod tests {
     use crate::backends::sqlite::SqliteBackend;
     use crate::core::ManifestStatus;
     use crate::core::bulk_submit::{
-        BulkEntryResult, BulkSubmitProvider, EntryResultContinuation, PagedEntryResult,
+        BulkEntryResult, BulkSubmitProvider, EntryResultContinuation, NdjsonEntry, PagedEntryResult,
     };
     use crate::core::bulk_submit_input::{RemoteFile, RemoteManifest, submission_output_job_id};
     use crate::core::storage::ResourceStorage;
@@ -4700,6 +4747,7 @@ mod tests {
             options: BulkProcessingOptions::new(),
             file_count: count as u64,
             completed_files: Default::default(),
+            resume_lines: Default::default(),
             presized: false,
             failed: AtomicU64::new(0),
             file_level_failed: AtomicU64::new(0),
@@ -7927,6 +7975,119 @@ mod tests {
                 completed, 2,
                 "the run records the file it walked to its end"
             );
+        }
+    }
+
+    /// A reclaimed manifest resumes its unfinished file past the lines an
+    /// earlier run committed (#1610): those lines are neither parsed nor
+    /// ingested again, so the resources they carry keep their version, and
+    /// the rest of the file is ingested and counted.
+    #[tokio::test]
+    async fn test_worker_resumes_the_in_flight_file_past_its_committed_lines() {
+        for independent in [false, true] {
+            let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+            backend.init_schema().unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            let output = Arc::new(LocalFsOutputStore::new(
+                tmp.path().to_path_buf(),
+                "http://x",
+            ));
+            let tenant = tenant();
+            let sub_id = seed(&backend, &tenant).await;
+            let manifest_id = backend.list_manifests(&tenant, &sub_id).await.unwrap()[0]
+                .manifest_id
+                .clone();
+            let patient = |id: &str| serde_json::json!({"resourceType": "Patient", "id": id});
+            let ndjson: String = ["p1", "p2", "p3", "p4"]
+                .iter()
+                .map(|id| format!("{}\n", patient(id)))
+                .collect();
+
+            // Stands in for an earlier run that committed lines 1 and 2 of the
+            // file and died before line 3: its batches were charged under its
+            // lease, then the lease went back to the queue.
+            let earlier = backend
+                .claim_next_manifest(&WorkerId::new("w1"), StdDuration::from_secs(60))
+                .await
+                .unwrap()
+                .unwrap();
+            backend
+                .process_entries(
+                    &tenant,
+                    &sub_id,
+                    &manifest_id,
+                    vec![
+                        NdjsonEntry::new(1, "Patient", patient("p1")),
+                        NdjsonEntry::new(2, "Patient", patient("p2")),
+                    ],
+                    &BulkProcessingOptions::new().with_file_url("http://provider/p.ndjson"),
+                )
+                .await
+                .unwrap();
+            assert!(
+                SubmitClaimStrategy::release(backend.as_ref(), earlier)
+                    .await
+                    .unwrap()
+            );
+
+            let lease = backend
+                .claim_next_manifest(&WorkerId::new("w"), StdDuration::from_secs(60))
+                .await
+                .unwrap()
+                .expect("the released manifest is claimable again");
+            let view = backend.get_manifest_for_worker(&lease).await.unwrap();
+            assert_eq!(
+                view.file_resume_lines,
+                vec![("http://provider/p.ndjson".to_string(), 2)]
+            );
+            assert!(view.completed_output_files.is_empty());
+
+            let worker = with_test_file_scheduling(
+                DefaultSubmitWorker::new(
+                    backend.clone(),
+                    patient_fetcher(&ndjson),
+                    output,
+                    WorkerId::new("w"),
+                ),
+                independent,
+                2,
+            )
+            .with_batch_size(1);
+            worker.run_job(lease).await.unwrap();
+
+            let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+            assert_eq!(manifests[0].status, ManifestStatus::Completed);
+            assert_eq!(
+                manifests[0].processed_entries, 4,
+                "independent={independent}: two lines from the earlier run plus two from this one"
+            );
+            let counts = backend
+                .get_entry_counts(&tenant, &sub_id, &manifest_id)
+                .await
+                .unwrap();
+            assert_eq!(counts.success, 4);
+            for (id, version) in [("p1", "1"), ("p2", "1"), ("p3", "1"), ("p4", "1")] {
+                let stored = backend
+                    .read(&tenant, "Patient", id)
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{id} is stored"));
+                assert_eq!(
+                    stored.content_with_meta()["meta"]["versionId"],
+                    version,
+                    "independent={independent}: {id} is written exactly once"
+                );
+            }
+            let completed: i64 = backend
+                .get_connection()
+                .unwrap()
+                .query_row(
+                    "SELECT completed FROM bulk_manifest_file_progress WHERE file_url = ?1",
+                    ["http://provider/p.ndjson"],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(completed, 1);
         }
     }
 

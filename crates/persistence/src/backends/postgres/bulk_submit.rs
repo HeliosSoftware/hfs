@@ -24,6 +24,7 @@ use crate::core::bulk_submit::{
 use crate::core::bulk_submit_publication::{
     ManifestPublicationResult, ManifestPublicationStatus, canonical_publication_files,
 };
+use crate::core::bulk_submit_worker::split_file_progress;
 use crate::core::bulk_submit_worker::{
     ManifestFetchParams, ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy,
     SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
@@ -1996,6 +1997,9 @@ impl StreamingBulkSubmitProvider for PostgresBackend {
 
             line_number += 1;
             result.lines_processed = line_number;
+            if line_number <= options.resume_after_line {
+                continue;
+            }
 
             let line = line.trim();
             if line.is_empty() {
@@ -2434,11 +2438,11 @@ impl SubmitWorkerStorage for PostgresBackend {
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_default();
         let fhir_version = fhir_version_from_output_format(output_format.as_deref());
-        let completed_output_files: Vec<String> = client
+        let progress: Vec<(String, u64, bool)> = client
             .query(
-                "SELECT file_url FROM bulk_manifest_file_progress
+                "SELECT file_url, max_line, completed FROM bulk_manifest_file_progress
                  WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
-                   AND manifest_id = $4 AND completed
+                   AND manifest_id = $4
                  ORDER BY file_url",
                 &[
                     &lease.tenant.tenant_id().as_str(),
@@ -2448,10 +2452,17 @@ impl SubmitWorkerStorage for PostgresBackend {
                 ],
             )
             .await
-            .map_err(|e| LeaseError::Storage(internal_error(format!("load completed files: {e}"))))?
+            .map_err(|e| LeaseError::Storage(internal_error(format!("load file progress: {e}"))))?
             .iter()
-            .map(|row| row.get(0))
+            .map(|row| {
+                (
+                    row.get::<_, String>(0),
+                    row.get::<_, i64>(1).max(0) as u64,
+                    row.get::<_, bool>(2),
+                )
+            })
             .collect();
+        let (completed_output_files, file_resume_lines) = split_file_progress(&progress);
 
         Ok(ManifestWorkerView {
             manifest_id: lease.manifest_id.clone(),
@@ -2464,6 +2475,7 @@ impl SubmitWorkerStorage for PostgresBackend {
             import_directives,
             metadata,
             last_processed_line: last_processed_line.max(0) as u64,
+            file_resume_lines,
             completed_output_files,
             fhir_version,
         })

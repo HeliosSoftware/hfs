@@ -702,6 +702,7 @@ impl SubmitWorkerStorage for S3Backend {
             import_directives: state.import_directives,
             metadata: state.submission_metadata,
             last_processed_line: state.last_processed_line,
+            file_resume_lines: Vec::new(),
             completed_output_files: state.completed_output_files,
         })
     }

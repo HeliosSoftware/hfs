@@ -24,6 +24,7 @@ use crate::core::bulk_submit::{
 use crate::core::bulk_submit_publication::{
     ManifestPublicationResult, ManifestPublicationStatus, canonical_publication_files,
 };
+use crate::core::bulk_submit_worker::split_file_progress;
 use crate::core::bulk_submit_worker::{
     ManifestFetchParams, ManifestLease, ManifestWorkerView, PendingReindex, PollTokenTarget,
     SubmitClaimStrategy, SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
@@ -50,20 +51,20 @@ static SUBMIT_CLAIM_LOCK: Mutex<()> = Mutex::const_new(());
 
 /// Builds a `LeaseError::LeaseLost` for a submit manifest (the shared variant
 /// carries an `ExportJobId`, so we encode `submission/manifest` into it).
-/// The output files of the leased manifest recorded as walked to their end
-/// (#1610), in a stable order.
-fn completed_output_files(
+/// The per-file progress of the leased manifest as `(file URL, highest
+/// charged line, completed)` rows (#1610), in a stable order.
+fn file_progress_rows(
     conn: &rusqlite::Connection,
     lease: &ManifestLease,
-) -> StorageResult<Vec<String>> {
+) -> StorageResult<Vec<(String, u64, bool)>> {
     let mut stmt = conn
         .prepare_cached(
-            "SELECT file_url FROM bulk_manifest_file_progress
+            "SELECT file_url, max_line, completed FROM bulk_manifest_file_progress
              WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3
-               AND manifest_id = ?4 AND completed = 1
+               AND manifest_id = ?4
              ORDER BY file_url",
         )
-        .map_err(|e| internal_error(format!("prepare completed files read: {e}")))?;
+        .map_err(|e| internal_error(format!("prepare file progress read: {e}")))?;
     let rows = stmt
         .query_map(
             params![
@@ -72,11 +73,17 @@ fn completed_output_files(
                 lease.submission_id.submission_id,
                 lease.manifest_id
             ],
-            |row| row.get::<_, String>(0),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?.max(0) as u64,
+                    row.get::<_, i64>(2)? != 0,
+                ))
+            },
         )
-        .map_err(|e| internal_error(format!("read completed files: {e}")))?;
+        .map_err(|e| internal_error(format!("read file progress: {e}")))?;
     rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|e| internal_error(format!("read completed files: {e}")))
+        .map_err(|e| internal_error(format!("read file progress: {e}")))
 }
 
 fn lease_lost(lease: &ManifestLease) -> LeaseError {
@@ -1881,6 +1888,9 @@ impl StreamingBulkSubmitProvider for SqliteBackend {
 
             line_number += 1;
             result.lines_processed = line_number;
+            if line_number <= options.resume_after_line {
+                continue;
+            }
 
             let line = line.trim();
             if line.is_empty() {
@@ -2549,8 +2559,8 @@ impl SubmitWorkerStorage for SqliteBackend {
             internal_error(format!("invalid manifest submission_metadata: {error}"))
         })?;
         let fhir_version = fhir_version_from_output_format(output_format.as_deref());
-        let completed_output_files =
-            completed_output_files(&conn, lease).map_err(LeaseError::Storage)?;
+        let (completed_output_files, file_resume_lines) =
+            split_file_progress(&file_progress_rows(&conn, lease).map_err(LeaseError::Storage)?);
 
         Ok(ManifestWorkerView {
             manifest_id: lease.manifest_id.clone(),
@@ -2565,6 +2575,7 @@ impl SubmitWorkerStorage for SqliteBackend {
             last_processed_line: u64::try_from(last_processed_line).map_err(|_| {
                 internal_error("manifest last_processed_line does not fit u64".to_string())
             })?,
+            file_resume_lines,
             completed_output_files,
             fhir_version,
         })

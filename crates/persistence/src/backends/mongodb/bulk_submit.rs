@@ -56,6 +56,7 @@ use crate::core::bulk_submit::{
 use crate::core::bulk_submit_publication::{
     ManifestPublicationResult, ManifestPublicationStatus, canonical_publication_files,
 };
+use crate::core::bulk_submit_worker::split_file_progress;
 use crate::core::bulk_submit_worker::{
     ManifestFetchParams, ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy,
     SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
@@ -336,30 +337,42 @@ fn recorded_max_line(manifest: &Document, file_url: &str) -> Option<i64> {
         .iter()
         .filter_map(Bson::as_document)
         .find(|entry| entry.get_str("file_url").ok() == Some(file_url))
-        .map(|entry| match entry.get("max_line") {
-            Some(Bson::Int32(n)) => i64::from(*n),
-            Some(Bson::Int64(n)) => *n,
-            Some(Bson::Double(n)) if n.is_finite() => *n as i64,
-            _ => 0,
-        })
+        .map(entry_max_line)
 }
 
-/// The files whose progress entry carries the `completed` marker (#1610), in
-/// a stable order.
-fn completed_output_files(manifest: &Document) -> Vec<String> {
-    let mut files: Vec<String> = manifest
+/// The per-file progress entries of a manifest document as `(file URL,
+/// highest charged line, completed)` rows (#1610), in a stable order.
+fn file_progress_rows(manifest: &Document) -> Vec<(String, u64, bool)> {
+    let mut rows: Vec<(String, u64, bool)> = manifest
         .get_array(FILE_PROGRESS_FIELD)
         .map(|entries| {
             entries
                 .iter()
                 .filter_map(Bson::as_document)
-                .filter(|entry| entry.get_bool("completed").unwrap_or(false))
-                .filter_map(|entry| entry.get_str("file_url").ok().map(str::to_string))
+                .filter_map(|entry| {
+                    let url = entry.get_str("file_url").ok()?;
+                    Some((
+                        url.to_string(),
+                        entry_max_line(entry).max(0) as u64,
+                        entry.get_bool("completed").unwrap_or(false),
+                    ))
+                })
                 .collect()
         })
         .unwrap_or_default();
-    files.sort();
-    files
+    rows.sort();
+    rows
+}
+
+/// The `max_line` of one progress entry, whichever numeric type the driver
+/// stored it as.
+fn entry_max_line(entry: &Document) -> i64 {
+    match entry.get("max_line") {
+        Some(Bson::Int32(n)) => i64::from(*n),
+        Some(Bson::Int64(n)) => *n,
+        Some(Bson::Double(n)) if n.is_finite() => *n as i64,
+        _ => 0,
+    }
 }
 
 /// The guarded filter and update that charge `tally` for `file_url`, given the
@@ -1511,6 +1524,9 @@ impl StreamingBulkSubmitProvider for MongoBackend {
 
             line_number += 1;
             result.lines_processed = line_number;
+            if line_number <= options.resume_after_line {
+                continue;
+            }
             let line = line.trim();
             if line.is_empty() {
                 continue;
@@ -1817,6 +1833,8 @@ impl SubmitWorkerStorage for MongoBackend {
             .ok_or_else(|| lease_lost(lease))?;
 
         let output_format = opt_str(&document, "output_format");
+        let (completed_output_files, file_resume_lines) =
+            split_file_progress(&file_progress_rows(&document));
         Ok(ManifestWorkerView {
             manifest_id: lease.manifest_id.clone(),
             manifest_url: opt_str(&document, "manifest_url"),
@@ -1829,7 +1847,8 @@ impl SubmitWorkerStorage for MongoBackend {
             import_directives: opt_json(&document, "import_directives").unwrap_or_default(),
             metadata: opt_json(&document, "submission_metadata").unwrap_or_default(),
             last_processed_line: document.get_i64("last_processed_line").unwrap_or(0).max(0) as u64,
-            completed_output_files: completed_output_files(&document),
+            file_resume_lines,
+            completed_output_files,
         })
     }
 
@@ -2559,7 +2578,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_output_files_reads_the_flagged_entries() {
+    fn file_progress_rows_reads_the_entries() {
         let manifest = doc! {
             FILE_PROGRESS_FIELD: [
                 { "file_url": "https://x.test/b.ndjson", "max_line": 7_i64, "completed": true },
@@ -2569,13 +2588,15 @@ mod tests {
             ],
         };
         assert_eq!(
-            completed_output_files(&manifest),
+            file_progress_rows(&manifest),
             vec![
-                "https://x.test/0.ndjson".to_string(),
-                "https://x.test/b.ndjson".to_string(),
+                ("https://x.test/0.ndjson".to_string(), 0, true),
+                ("https://x.test/a.ndjson".to_string(), 3, false),
+                ("https://x.test/b.ndjson".to_string(), 7, true),
+                ("https://x.test/c.ndjson".to_string(), 0, false),
             ]
         );
-        assert!(completed_output_files(&doc! {}).is_empty());
+        assert!(file_progress_rows(&doc! {}).is_empty());
     }
 
     #[test]

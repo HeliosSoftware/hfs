@@ -354,8 +354,9 @@ them, and exposes results through a status manifest.
   error message, artifact and log line.
 - **Resume after a lease reclaim**: every backend records each output file the
   worker walked to its end, and the run that reclaims the manifest skips those
-  files and re-walks only the one that was in flight (#1610). A file whose stream
-  was cut short is never recorded.
+  files; the file that was in flight resumes past the lines its committed batches
+  charged on SQLite, PostgreSQL and MongoDB, and is re-walked from the top on S3
+  (#1610). A file whose stream was cut short is never recorded as completed.
 - **Replays and status polls**: manifest counters are kept per file, so a re-walked
   file counts its entries once, and the submission summary is read from those
   counters rather than by scanning every receipt, so a status poll costs the same at
