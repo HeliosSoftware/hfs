@@ -6836,6 +6836,81 @@ async fn mongodb_integration_sort_by_multiple_search_parameters() {
     }
 }
 
+/// #1564: `_sort` names reach the backend unvalidated, so a `$`-prefixed one
+/// must be matched as a literal parameter name, not evaluated as an
+/// aggregation field path or variable. Unevaluated, it names no indexed
+/// parameter and leaves the order to the other key; evaluated, `$` and
+/// `$$nope` failed the aggregation and `$param_name` matched every row.
+#[tokio::test]
+async fn mongodb_integration_sort_param_name_is_a_literal() {
+    let Some(backend) = create_backend_with_full_registry("sort_param_name_literal").await else {
+        eprintln!(
+            "Skipping mongodb_integration_sort_param_name_is_a_literal (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-sort-param-name-literal");
+    for (id, family, birth_date) in [
+        ("sl-a", "Clark", "1970-01-01"),
+        ("sl-b", "Adams", "1990-01-01"),
+        ("sl-c", "Brown", "1980-01-01"),
+    ] {
+        let resource = json!({
+            "resourceType": "Patient",
+            "id": id,
+            "name": [{ "family": family }],
+            "birthDate": birth_date,
+        });
+        backend
+            .create(&tenant, "Patient", resource, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+    let family = || SortDirective::parse("family").with_param_type(Some(SearchParamType::String));
+    let all_ids = || SearchParameter {
+        name: "_id".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: None,
+        values: vec![
+            SearchValue::eq("sl-a"),
+            SearchValue::eq("sl-b"),
+            SearchValue::eq("sl-c"),
+        ],
+        chain: vec![],
+        components: vec![],
+    };
+    for name in ["$", "$$nope", "$$ROOT", "$param_name", "$value_date"] {
+        for name_first in [false, true] {
+            for filtered in [false, true] {
+                let unknown = SortDirective::parse(name);
+                let mut query = SearchQuery::new("Patient");
+                query = if name_first {
+                    query.with_sort(unknown).with_sort(family())
+                } else {
+                    query.with_sort(family()).with_sort(unknown)
+                };
+                if filtered {
+                    query = query.with_parameter(all_ids());
+                }
+                let result = backend.search(&tenant, &query).await.unwrap_or_else(|err| {
+                    panic!("_sort name {name} (first={name_first}, filtered={filtered}): {err:?}")
+                });
+                let ids: Vec<String> = result
+                    .resources
+                    .items
+                    .iter()
+                    .map(|r| r.id().to_string())
+                    .collect();
+                assert_eq!(
+                    ids,
+                    vec!["sl-b", "sl-c", "sl-a"],
+                    "_sort name {name} (first={name_first}, filtered={filtered})"
+                );
+            }
+        }
+    }
+}
+
 /// #1002: `url:below`/`url:above` on MongoDB must be segment-aware, the same
 /// way SQLite and Elasticsearch already are — a `:below=http://example.org/fhir`
 /// must not match `http://example.org/fhirx/...` just because it shares the

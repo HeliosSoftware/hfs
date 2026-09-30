@@ -516,6 +516,9 @@ fn add_sort_key_row_filter(filter: &mut Document, directives: &[crate::types::So
 /// sort directive, `key0`, `key1`, …: `$min` for an ascending key and `$max`
 /// for a descending one, over that directive's rows only. A resource with no
 /// row for a directive gets a null key, since `$min`/`$max` ignore nulls.
+/// The parameter name is wrapped in `$literal`: `_sort` names reach the
+/// backend unvalidated, and a bare `$`-prefixed string in an aggregation
+/// expression is a field path or variable, not a value.
 fn sort_key_group(directives: &[crate::types::SortDirective]) -> Document {
     use crate::types::SortDirection;
     let mut group = doc! { "_id": "$resource_id" };
@@ -528,7 +531,11 @@ fn sort_key_group(directives: &[crate::types::SortDirective]) -> Document {
         group.insert(
             format!("key{index}"),
             doc! { accumulator: {
-                "$cond": [{ "$eq": ["$param_name", &directive.parameter] }, value, Bson::Null]
+                "$cond": [
+                    { "$eq": ["$param_name", { "$literal": &directive.parameter }] },
+                    value,
+                    Bson::Null,
+                ]
             }},
         );
     }

@@ -409,8 +409,10 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
   the resources table directly. Cursor (keyset) pagination is consistent with the active sort: the
   sort key value is encoded into the opaque cursor and the keyset comparison runs on it, so deep
   paging preserves the sort order. A multi-field `_sort` returns a single page (no cursor). MongoDB
-  sorts by `_id`/`_lastUpdated` only and cannot combine a custom sort with cursor pagination, hence
-  ◐ for multiple fields.
+  sorts by `_id`/`_lastUpdated`, or by up to 15 indexed search parameters (each key in its own
+  direction, a missing value last for that key, ties broken by id); it cannot combine a
+  search-parameter sort with `_id`/`_lastUpdated`/`_score` or with cursor pagination, hence ◐ for
+  multiple fields.
 - **`:above` / `:below`** — two mechanisms (◐ = both, conditional on context): (1) hierarchical
   **URI** prefix matching is native to SQLite, PostgreSQL, and Elasticsearch (no external service);
   (2) **token/code** hierarchy (e.g. `code:below=http://snomed.info/sct|73211009`) is resolved at
@@ -618,8 +620,9 @@ MongoDB provides document-centric primary storage with full FHIR capabilities in
   supported; chained/`_has` work via the REST-layer resolver)
 - `_include` and `_revinclude` resolution
 - Conditional create, update, and delete operations
-- Cursor and offset pagination; sorting by `_id`/`_lastUpdated` (a custom sort cannot be combined
-  with cursor pagination)
+- Cursor and offset pagination; sorting by `_id`/`_lastUpdated` or by up to 15 indexed search
+  parameters (a search-parameter sort is offset-paged and cannot be combined with
+  `_id`/`_lastUpdated`/`_score` or with cursor pagination)
 - Shared-schema multitenancy with strict tenant filtering
 - Optimistic locking with ETag support
 
