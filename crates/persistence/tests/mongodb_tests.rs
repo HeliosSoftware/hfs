@@ -16031,6 +16031,85 @@ async fn mongodb_integration_if_none_exist_offloaded_search_uses_resource_scan()
     );
 }
 
+/// #1542: `ifNoneExist` criteria made only of result parameters (`_count`,
+/// `_sort`, …) leave nothing to match on. Typed to nothing and read as "no
+/// match", the entry used to create unconditionally; it is refused, the
+/// bundle rolls back, and nothing is written — with search local and with it
+/// offloaded, whose resource scan is a separate resolver.
+#[tokio::test]
+async fn mongodb_integration_if_none_exist_of_only_result_parameters_is_refused() {
+    let Some(mut backend) =
+        create_backend_with_full_registry("if_none_exist_only_result_params").await
+    else {
+        eprintln!(
+            "Skipping mongodb_integration_if_none_exist_of_only_result_parameters_is_refused \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-if-none-exist-only-result-params");
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "name": [{"family": "Existing"}]}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    for offloaded in [false, true] {
+        backend.set_search_offloaded(offloaded);
+        for criteria in ["_count=1", "_sort=name&_format=json"] {
+            let entries = vec![
+                BundleEntry {
+                    method: BundleMethod::Post,
+                    url: "Patient".to_string(),
+                    resource: Some(json!({"resourceType": "Patient"})),
+                    if_match: None,
+                    if_none_match: None,
+                    if_none_exist: None,
+                    full_url: None,
+                },
+                BundleEntry {
+                    method: BundleMethod::Post,
+                    url: "Patient".to_string(),
+                    resource: Some(json!({"resourceType": "Patient"})),
+                    if_match: None,
+                    if_none_match: None,
+                    if_none_exist: Some(criteria.to_string()),
+                    full_url: None,
+                },
+            ];
+            let context = format!("offloaded={offloaded} ifNoneExist={criteria}");
+            match backend
+                .process_transaction(&tenant, entries, FhirVersion::default())
+                .await
+            {
+                Err(TransactionError::UnsupportedIsolationLevel { .. })
+                    if !transactions_required() =>
+                {
+                    eprintln!(
+                        "Skipping {context} (MongoDB topology does not support transactions)"
+                    );
+                    return;
+                }
+                Err(error) => assert!(
+                    error.to_string().contains("nothing to match on"),
+                    "{context}: {error}"
+                ),
+                Ok(result) => panic!("{context}: expected a refusal, got {result:?}"),
+            }
+            assert_eq!(
+                backend.count(&tenant, Some("Patient")).await.unwrap(),
+                1,
+                "{context}: nothing was written, the plain create included"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn mongodb_integration_if_none_exist_broad_param_beyond_probe_limit() {
     let Some(backend) = create_backend_with_full_registry("if_none_exist_broad_param").await else {
@@ -18716,31 +18795,33 @@ async fn i1394r1_offloaded_if_none_exist_empty_value_fails() {
     assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
 }
 
-/// Result-shaping parameters are not criteria: with nothing else left, the
-/// entry is created (no match), exactly as on the endpoint path.
+/// Result-shaping parameters are not criteria: with nothing else left there
+/// is nothing to match on, and the entry is refused rather than created — as
+/// on the endpoint path (#1542).
 #[tokio::test]
-async fn i1394r1_offloaded_if_none_exist_result_only_creates() {
+async fn i1394r1_offloaded_if_none_exist_result_only_fails() {
     let Some(backend) = i1394r1_offloaded_backend("i1394r1_result_only").await else {
         eprintln!(
-            "Skipping i1394r1_offloaded_if_none_exist_result_only_creates (requires Docker or HFS_TEST_MONGODB_URL)"
+            "Skipping i1394r1_offloaded_if_none_exist_result_only_fails (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
     let tenant = i1394r1_tenant("result-only");
     i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
 
-    let Some(result) = process_transaction_or_skip(
-        &backend,
-        &tenant,
-        vec![i1394r1_create_entry("New", "MRN-NEW-1", "_format=json")],
-        "i1394r1_offloaded_if_none_exist_result_only_creates",
-    )
-    .await
-    else {
-        return;
-    };
-    assert_eq!(result.entries[0].status, 201);
-    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 2);
+    let err = backend
+        .process_transaction(
+            &tenant,
+            vec![i1394r1_create_entry("New", "MRN-NEW-1", "_format=json")],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("an ifNoneExist of only result parameters must fail the bundle");
+    assert!(
+        matches!(err, TransactionError::BundleError { index: 0, .. }),
+        "the failure must surface as a BundleError at entry 0, got: {err}"
+    );
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
 }
 
 /// Repeated parameters AND: both must hold for a match, so a half-matching

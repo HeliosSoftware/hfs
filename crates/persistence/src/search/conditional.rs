@@ -318,6 +318,22 @@ pub fn build_conditional_query(
     build_conditional_query_from_pairs(registry, resource_type, &pairs, types)
 }
 
+/// The refusal for criteria that were not empty but carried only result
+/// parameters (`_count=5`): read as "selects nothing", every backend would
+/// treat them as no match, so a `PUT` would create and an `If-None-Exist`
+/// would write the duplicate it exists to prevent (#1542). A resolver that
+/// reads the parsed pairs without going through
+/// [`build_conditional_query_from_pairs`] has to raise this itself.
+pub(crate) fn only_result_parameters(pairs: &[(String, String)]) -> StorageError {
+    let names: Vec<&str> = pairs.iter().map(|(name, _)| name.as_str()).collect();
+    StorageError::Search(SearchError::QueryParseError {
+        message: format!(
+            "conditional criteria carry only result parameters ({}) and nothing to match on",
+            names.join(", ")
+        ),
+    })
+}
+
 /// [`build_conditional_query`] for criteria that are already decoded
 /// `(name, value)` pairs.
 pub fn build_conditional_query_from_pairs(
@@ -329,13 +345,7 @@ pub fn build_conditional_query_from_pairs(
     let parameters = build_conditional_parameters(registry, resource_type, pairs, types)?;
     if parameters.is_empty() {
         if !pairs.is_empty() {
-            let names: Vec<&str> = pairs.iter().map(|(name, _)| name.as_str()).collect();
-            return Err(StorageError::Search(SearchError::QueryParseError {
-                message: format!(
-                    "conditional criteria carry only result parameters ({}) and nothing to match on",
-                    names.join(", ")
-                ),
-            }));
+            return Err(only_result_parameters(pairs));
         }
         return Ok(None);
     }

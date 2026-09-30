@@ -4735,6 +4735,12 @@ impl MongoBackend {
     /// Types already-split criteria pairs, for the in-transaction
     /// `ifNoneExist` resolver, which drives the `search_index` collection
     /// parameter by parameter instead of running a [`SearchQuery`].
+    ///
+    /// Through [`crate::search::build_conditional_query_from_pairs`], not the
+    /// bare parameter builder, so criteria made only of result parameters
+    /// (`_count=1`) are refused as on every other conditional path rather
+    /// than typed to nothing and read as "no match" — which would create
+    /// (#1542).
     pub(super) fn build_search_parameters(
         &self,
         tenant: &TenantContext,
@@ -4743,12 +4749,13 @@ impl MongoBackend {
     ) -> StorageResult<Vec<SearchParameter>> {
         let registry_arc = self.tenant_registry(tenant.tenant_id().as_str());
         let registry = registry_arc.read();
-        crate::search::build_conditional_parameters(
+        let query = crate::search::build_conditional_query_from_pairs(
             &registry,
             resource_type,
             params,
             crate::search::ResourceTypeScope::version(self.config().fhir_version),
-        )
+        )?;
+        Ok(query.map(|query| query.parameters).unwrap_or_default())
     }
 
     fn merge_unique(target: &mut Vec<StoredResource>, additions: Vec<StoredResource>) {

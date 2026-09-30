@@ -4482,18 +4482,24 @@ async fn conditional_create_by_id_reads_the_named_objects() {
 }
 
 /// A criterion the scan cannot evaluate is refused before anything is read or
-/// written; criteria that only shape a response leave nothing to match, so the
-/// create goes ahead.
+/// written, and so are criteria that only shape a response: they leave nothing
+/// to match on, and the create would go ahead unconditionally (#1542).
 #[tokio::test]
 async fn conditional_create_refuses_criteria_a_scan_cannot_evaluate() {
-    use crate::core::{ConditionalCreateResult, ConditionalStorage};
+    use crate::core::ConditionalStorage;
 
     let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
     let backend = make_prefix_backend(Arc::clone(&mock));
     let tenant = tenant("tenant-a");
     let puts_before = mock.put_count();
 
-    for criteria in ["active=true", "identifier:exact=1", "identifier="] {
+    // `_format=json` alone leaves nothing to match on (#1542).
+    for criteria in [
+        "active=true",
+        "identifier:exact=1",
+        "identifier=",
+        "_format=json",
+    ] {
         let err = backend
             .conditional_create(
                 &tenant,
@@ -4514,20 +4520,6 @@ async fn conditional_create_refuses_criteria_a_scan_cannot_evaluate() {
         puts_before,
         "a refused create writes nothing"
     );
-
-    assert!(matches!(
-        backend
-            .conditional_create(
-                &tenant,
-                "Patient",
-                mrn_patient("1"),
-                "_format=json",
-                FhirVersion::R4
-            )
-            .await
-            .unwrap(),
-        ConditionalCreateResult::Created(_)
-    ));
 }
 
 /// A transaction bundle must be refused outright, and refused *before* any
