@@ -77,5 +77,7 @@
     "nullable-materialized-limit.sql": "f0365cb3ee7876a0f59a10cede8768d90a58c90dc3b93b8d0ae5c22a0826069c",
     "nullable-prefix-results.json": "1c3caa6bda9ba98ff43db9c1185ed525c825e534cb9f1d834b6a61d205eed0e1",
     "nullable-unlimited.sql": "893f8898735133f5fe05123943daced6bb9c53fd053b6de3dab620ea899acb97"
-  }
+  },
+  "candidate_source_commit": "5f48f35374afe72f3d54195b3b5f50092c56fc2f",
+  "captured_before_subsequent_main_merge": true
 }

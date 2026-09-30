@@ -8,9 +8,11 @@ SQLite SQL output. PostgreSQL expansions, unions and recursion retain their
 previous SQL and client cap because adding a SQL cap changed observed prefixes.
 
 These files preserve evidence captured on 2026-09-30. Publishing the files did
-not rerun the benchmark. The measured PostgreSQL compiler and runner source
-hashes match the PR's implementation; the later changes are test cleanup and
-this documentation. Binary/source hashes and artifact checksums are recorded in
+not rerun the benchmark. The measured compiler and runner source hashes match
+the PR implementation at `5f48f35374afe72f3d54195b3b5f50092c56fc2f`, before
+the subsequent merge of `main`. That merge also brings upstream tracing, SQLite
+NULL-column preservation and REST `_since` fixes; these are not new full-corpus
+performance measurements of the merged branch. Binary/source hashes and artifact checksums are recorded in
 [measurement-provenance.json](evidence/1581/measurement-provenance.json).
 
 ## Full-corpus preview measurements
@@ -142,10 +144,12 @@ dependencies to the preview cap.
 
 The original captured verification reports 194 focused tests and the release
 build passing. The PR's later remote Rust, lint, security, coverage and
-`codecov/patch` checks passed. No code changed while publishing this evidence;
-artifact integrity, source fingerprints, JSON structure, relative links and
-recorded plan/measurement invariants were checked again. These are not new
-performance runs.
+`codecov/patch` checks passed on the pre-merge PR. Publishing this evidence does
+not change the limit implementation. Artifact integrity, historical source
+fingerprints, JSON structure, relative links and recorded plan/measurement
+invariants were checked again. The subsequent merge is verified separately;
+the historical test totals and measurements above do not describe that new
+verification or new performance runs.
 
 The follow-up must define tie ordering for nested/cartesian/nullable expansion,
 union branch ties and recursive traversal before applying a cap universally.
