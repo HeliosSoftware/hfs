@@ -31,10 +31,10 @@ jobs:
         run: |
           FHIR_VERSIONS='["R4","R4B","R5"]'
           # Keep this backend/output matrix aligned with bulk-export-smoke.yml.
-          # Bulk submit REST worker support is currently wired for SQLite/PostgreSQL
-          # primary stores and their Elasticsearch composites. S3 has only
-          # BulkSubmitIngest provider support, so MongoDB and S3 primary stores are
-          # kept in the matrix to assert the endpoint-unavailable contract.
+          # Every primary store with a bulk-submit job store runs the full flow:
+          # SQLite, PostgreSQL and MongoDB and their Elasticsearch composites, and
+          # the S3 composite (S3 hosts its own job state). The standalone S3 leg
+          # stays in the matrix to assert the endpoint-unavailable contract.
           ROWS='[
             {"backend":"sqlite","output":"local","expectation":"full"},
             {"backend":"sqlite","output":"s3","expectation":"full"},
@@ -44,11 +44,11 @@ jobs:
             {"backend":"sqlite-elasticsearch","output":"s3","expectation":"full"},
             {"backend":"postgres-elasticsearch","output":"local","expectation":"full"},
             {"backend":"postgres-elasticsearch","output":"s3","expectation":"full"},
-            {"backend":"mongodb","output":"local","expectation":"endpoint-unavailable"},
-            {"backend":"mongodb","output":"s3","expectation":"endpoint-unavailable"},
-            {"backend":"mongodb-elasticsearch","output":"local","expectation":"endpoint-unavailable"},
-            {"backend":"mongodb-elasticsearch","output":"s3","expectation":"endpoint-unavailable"},
-            {"backend":"s3-elasticsearch","output":"local","expectation":"endpoint-unavailable"},
+            {"backend":"mongodb","output":"local","expectation":"full"},
+            {"backend":"mongodb","output":"s3","expectation":"full"},
+            {"backend":"mongodb-elasticsearch","output":"local","expectation":"full"},
+            {"backend":"mongodb-elasticsearch","output":"s3","expectation":"full"},
+            {"backend":"s3-elasticsearch","output":"local","expectation":"full"},
             {"backend":"s3","output":"none","expectation":"endpoint-unavailable"}
           ]'
 
@@ -211,7 +211,7 @@ jobs:
           docker run -d --name "$MINIO_CONTAINER" -p 0:9000 -p 0:9001 \
             -e MINIO_ROOT_USER=hfs-minio \
             -e MINIO_ROOT_PASSWORD=hfs-minio-secret \
-            quay.io/minio/minio:latest server /data --console-address ":9001"
+            ghcr.io/coollabsio/minio:RELEASE.2025-10-15T17-29-55Z server /data --console-address ":9001"
           echo "MINIO_CONTAINER=$MINIO_CONTAINER" >> "$GITHUB_ENV"
 
           for i in {1..30}; do
@@ -220,7 +220,7 @@ jobs:
               echo "MINIO_PORT=$MINIO_PORT" >> "$GITHUB_ENV"
               docker run --rm --network "container:$MINIO_CONTAINER" \
                 --entrypoint /bin/sh \
-                quay.io/minio/mc:latest \
+                ghcr.io/coollabsio/minio:RELEASE.2025-10-15T17-29-55Z \
                 -c 'mc alias set local http://127.0.0.1:9000 hfs-minio hfs-minio-secret && mc mb -p local/hfs-primary || true'
               echo "MinIO is ready on port $MINIO_PORT"
               exit 0

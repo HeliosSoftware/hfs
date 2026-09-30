@@ -1519,6 +1519,16 @@ none of them. Treat a rebuild as a repair only once `GET /$reindex-status/{job_i
 reports `errorCount` 0 for the type. The `hfs` binary exposes the limit as
 `HFS_ELASTICSEARCH_NESTED_OBJECTS_LIMIT`.
 
+A search that pins many ids — a chained or `_has` search whose terminal hop
+resolved a wide set, sent to Elasticsearch as `_id` values — meets a second
+ceiling, `index.max_terms_count` (Elasticsearch's default 65,536 values per
+`terms` query). `ElasticsearchConfig::max_terms_count` (default 65536) is written
+into the index template, and the query builder splits an id list longer than it
+into several `terms` clauses ORed under one `bool.should`, so such a search
+succeeds instead of being refused (#1548); when Elasticsearch still refuses a
+query for a limit it names, the `400` names that limit. The `hfs` binary exposes
+it as `HFS_ELASTICSEARCH_MAX_TERMS_COUNT`.
+
 #### Bulk writes and rebuilds on Elasticsearch-backed composites
 
 `create_many` and `ReindexTarget::write_search_entries_page` put documents on the

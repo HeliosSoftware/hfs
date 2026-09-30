@@ -1153,6 +1153,10 @@ mod reindex_id_walk;
 #[path = "mongodb/reindex_pipeline.rs"]
 mod reindex_pipeline;
 
+/// #1500: MongoDB's `ReindexSource::fetch_resources_by_ids` override.
+#[path = "mongodb/reindex_fetch_by_ids.rs"]
+mod reindex_fetch_by_ids;
+
 /// #1405: of several writers holding the same version, one `update` writes and
 /// every loser is a `ConcurrencyError` — the server's `WriteConflict` used to
 /// reach them as `BackendError::Internal`.
@@ -7488,6 +7492,1265 @@ async fn mongodb_integration_search_id_and_last_updated_modifiers() {
     });
     let result = backend.search(&tenant, &lu_missing_true).await.unwrap();
     assert!(ids(&result).is_empty());
+}
+
+/// #1528 review round 2 finding 2: no test combined a positive `_id` seed
+/// with `:not`, `:missing`, a compartment, or a top-level composite — the
+/// path that replaces `matching_resource_ids_complement_only` for a positive
+/// `_id` (`seeded_matching_resource_ids` with an empty `normal`, and the
+/// `hint: true` branches of `retain_matching_candidates` it drives) had no
+/// coverage for any of them. Each case here is also checked with
+/// `search_count`.
+#[tokio::test]
+async fn mongodb_integration_search_id_seed_with_not_missing_compartment_and_composite() {
+    let Some(backend) =
+        create_backend_with_full_registry("id_seed_not_missing_compartment_composite").await
+    else {
+        eprintln!(
+            "Skipping mongodb_integration_search_id_seed_with_not_missing_compartment_and_composite \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-id-seed-not-missing-compartment");
+
+    let ids = |result: &helios_persistence::core::SearchResult| {
+        let mut got = result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect::<Vec<_>>();
+        got.sort();
+        got
+    };
+
+    // --- _id=a,b & status:not=amended -> [a] ----------------------------
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-idn-a",
+                "status": "final",
+                "code": {"coding": [{"system": "http://loinc.org", "code": "idn-code"}]},
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-idn-b",
+                "status": "amended",
+                "code": {"coding": [{"system": "http://loinc.org", "code": "idn-code"}]},
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let id_not = SearchQuery::new("Observation")
+        .with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("obs-idn-a"), SearchValue::eq("obs-idn-b")],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_parameter(SearchParameter {
+            name: "status".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::Not),
+            values: vec![SearchValue::eq("amended")],
+            chain: vec![],
+            components: vec![],
+        });
+    let result = backend
+        .search(&tenant, &id_not)
+        .await
+        .expect("_id seed plus status:not must stay inside the seed");
+    assert_eq!(
+        ids(&result),
+        vec!["obs-idn-a"],
+        "obs-idn-b has status=amended and must be excluded by :not"
+    );
+    assert_eq!(backend.search_count(&tenant, &id_not).await.unwrap(), 1);
+
+    // --- _id=a,c & code:missing=true/false -> [c] / [a] ------------------
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-idm-with-code",
+                "status": "final",
+                "code": {"coding": [{"system": "http://loinc.org", "code": "idm-code"}]},
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-idm-no-code",
+                "status": "final",
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let id_missing_true = SearchQuery::new("Observation")
+        .with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![
+                SearchValue::eq("obs-idm-with-code"),
+                SearchValue::eq("obs-idm-no-code"),
+            ],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_parameter(SearchParameter {
+            name: "code".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::Missing),
+            values: vec![SearchValue::eq("true")],
+            chain: vec![],
+            components: vec![],
+        });
+    let result = backend
+        .search(&tenant, &id_missing_true)
+        .await
+        .expect("_id seed plus code:missing=true must stay inside the seed");
+    assert_eq!(
+        ids(&result),
+        vec!["obs-idm-no-code"],
+        "only the resource with no `code` at all satisfies :missing=true"
+    );
+    assert_eq!(
+        backend
+            .search_count(&tenant, &id_missing_true)
+            .await
+            .unwrap(),
+        1
+    );
+
+    let id_missing_false = SearchQuery::new("Observation")
+        .with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![
+                SearchValue::eq("obs-idm-with-code"),
+                SearchValue::eq("obs-idm-no-code"),
+            ],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_parameter(SearchParameter {
+            name: "code".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::Missing),
+            values: vec![SearchValue::eq("false")],
+            chain: vec![],
+            components: vec![],
+        });
+    let result = backend
+        .search(&tenant, &id_missing_false)
+        .await
+        .expect("_id seed plus code:missing=false must stay inside the seed");
+    assert_eq!(
+        ids(&result),
+        vec!["obs-idm-with-code"],
+        "only the resource that actually has `code` satisfies :missing=false"
+    );
+    assert_eq!(
+        backend
+            .search_count(&tenant, &id_missing_false)
+            .await
+            .unwrap(),
+        1
+    );
+
+    // --- _id + compartment + status:not -----------------------------------
+    use helios_persistence::types::CompartmentMembership;
+
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-idc-member-final",
+                "status": "final",
+                "subject": {"reference": "Patient/idc-p1"}
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-idc-member-amended",
+                "status": "amended",
+                "subject": {"reference": "Patient/idc-p1"}
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-idc-non-member",
+                "status": "final",
+                "subject": {"reference": "Patient/idc-p2"}
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let mut id_compartment_not = SearchQuery::new("Observation").with_parameter(SearchParameter {
+        name: "_id".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: None,
+        values: vec![
+            SearchValue::eq("obs-idc-member-final"),
+            SearchValue::eq("obs-idc-member-amended"),
+            SearchValue::eq("obs-idc-non-member"),
+        ],
+        chain: vec![],
+        components: vec![],
+    });
+    id_compartment_not = id_compartment_not.with_parameter(SearchParameter {
+        name: "status".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: Some(SearchModifier::Not),
+        values: vec![SearchValue::eq("amended")],
+        chain: vec![],
+        components: vec![],
+    });
+    id_compartment_not.compartment = Some(CompartmentMembership {
+        params: vec!["subject".to_string()],
+        reference: "Patient/idc-p1".to_string(),
+    });
+
+    let result = backend
+        .search(&tenant, &id_compartment_not)
+        .await
+        .expect("_id seed plus compartment plus status:not must stay inside the seed");
+    assert_eq!(
+        ids(&result),
+        vec!["obs-idc-member-final"],
+        "the amended member is excluded by :not and the non-member is excluded by the \
+         compartment, leaving only the final member"
+    );
+    assert_eq!(
+        backend
+            .search_count(&tenant, &id_compartment_not)
+            .await
+            .unwrap(),
+        1
+    );
+
+    // --- _id + component-code-value-quantity, with the seed driving -------
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-idcc-hit",
+                "status": "final",
+                "code": {"coding": [{"system": "http://loinc.org", "code": "85354-9"}]},
+                "component": [{
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "8480-6"}]},
+                    "valueQuantity": {
+                        "value": 120,
+                        "unit": "mmHg",
+                        "system": "http://unitsofmeasure.org"
+                    }
+                }]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-idcc-seed-nomatch",
+                "status": "final",
+                "code": {"coding": [{"system": "http://loinc.org", "code": "85354-9"}]},
+                "component": [{
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "8480-6"}]},
+                    "valueQuantity": {
+                        "value": 50,
+                        "unit": "mmHg",
+                        "system": "http://unitsofmeasure.org"
+                    }
+                }]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    // Match the composite but sit outside the `_id` seed -- proves the
+    // *seed*, not just the composite filter, is doing the constraining, and
+    // pads the composite's total population past the 2-id seed so the seed
+    // wins the driver race.
+    for id in ["obs-idcc-outside-1", "obs-idcc-outside-2"] {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": id,
+                    "status": "final",
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "85354-9"}]},
+                    "component": [{
+                        "code": {"coding": [{"system": "http://loinc.org", "code": "8480-6"}]},
+                        "valueQuantity": {
+                            "value": 130,
+                            "unit": "mmHg",
+                            "system": "http://unitsofmeasure.org"
+                        }
+                    }]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let id_composite = SearchQuery::new("Observation")
+        .with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![
+                SearchValue::eq("obs-idcc-hit"),
+                SearchValue::eq("obs-idcc-seed-nomatch"),
+            ],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_parameter(SearchParameter {
+            name: "component-code-value-quantity".to_string(),
+            param_type: SearchParamType::Composite,
+            modifier: None,
+            values: vec![SearchValue::eq("8480-6$gt100")],
+            chain: vec![],
+            components: vec![
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "component-code".to_string(),
+                },
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Quantity,
+                    param_name: "component-value-quantity".to_string(),
+                },
+            ],
+        });
+
+    // The 2-id seed is smaller than the composite's 3-match population
+    // (obs-idcc-hit plus the two outside-seed hits), so the seed drives here
+    // — exercising the composite-pair-check branch of
+    // `retain_matching_candidates` under `hint: true`, which no other
+    // composite test in this file reaches (they all go through the
+    // `hint: false` driver-cursor branch instead).
+    let result = backend
+        .search(&tenant, &id_composite)
+        .await
+        .expect("_id seed plus a composite must stay inside the seed");
+    assert_eq!(
+        ids(&result),
+        vec!["obs-idcc-hit"],
+        "obs-idcc-seed-nomatch is in the seed but fails the composite; the two outside-seed \
+         hits match the composite but are outside the seed"
+    );
+    assert_eq!(
+        backend.search_count(&tenant, &id_composite).await.unwrap(),
+        1
+    );
+}
+
+/// #1528: `_id` never bounded what `matching_resource_ids` read from
+/// `search_index` — a single `_id` plus an unrelated normal parameter drove
+/// entirely off that parameter's own population, however large. With enough
+/// rows for that parameter this hits the 300,000-id cap (`TooManyResults`,
+/// a 422) even though the query can only ever match the one requested id.
+/// This test stays far below the cap (a plain profiler assertion instead) so
+/// it runs in milliseconds; `mongodb_integration_large_id_seed_with_selective_term_drives_from_the_term`
+/// below is what actually exercises the driver-competition logic the cap
+/// motivates.
+#[tokio::test]
+async fn mongodb_integration_search_id_bounds_a_broad_term() {
+    let Some(backend) = create_backend_with_full_registry("id_bounds_broad_term").await else {
+        eprintln!(
+            "Skipping mongodb_integration_search_id_bounds_a_broad_term (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-id-bounds-broad-term");
+
+    for (id, status) in [("obs-ibt-a", "final"), ("obs-ibt-b", "amended")] {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": id,
+                    "status": status,
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "29463-7" }] },
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // A broad `status=final` population: pre-fix, the driver cursor for the
+    // lone normal parameter has to read every one of these before `_id` is
+    // ever consulted.
+    let raw_client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect raw MongoDB client");
+    let raw_db = raw_client.database(&backend.config().database_name);
+    let search_index: Collection<Document> = raw_db.collection("search_index");
+    let synthetic: Vec<Document> = (0..2000)
+        .map(|n| {
+            doc! {
+                "tenant_id": tenant.tenant_id().as_str(),
+                "resource_type": "Observation",
+                "resource_id": format!("syn-ibt-{n}"),
+                "param_name": "status",
+                "param_url": "http://hl7.org/fhir/SearchParameter/Observation-status",
+                "value_token_system": "http://hl7.org/fhir/observation-status",
+                "value_token_code": "final",
+            }
+        })
+        .collect();
+    search_index
+        .insert_many(synthetic)
+        .await
+        .expect("failed to insert synthetic search_index rows");
+
+    let query = SearchQuery::new("Observation")
+        .with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("obs-ibt-a")],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_parameter(SearchParameter {
+            name: "status".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("final")],
+            chain: vec![],
+            components: vec![],
+        });
+
+    // Functional check first, unconditionally (#1528 review finding 6): if
+    // the server below refuses profiling, the test must still have verified
+    // correctness rather than exiting having checked nothing at all.
+    let result = backend
+        .search(&tenant, &query)
+        .await
+        .expect("_id plus a broad term must not scan that term's whole population");
+    assert_eq!(
+        result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect::<Vec<_>>(),
+        vec!["obs-ibt-a".to_string()]
+    );
+
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect raw MongoDB client");
+    let db_name = backend.config().database_name.clone();
+    let database = client.database(&db_name);
+    if let Err(e) = database.run_command(doc! { "profile": 2_i32 }).await {
+        eprintln!(
+            "Skipping mongodb_integration_search_id_bounds_a_broad_term plan assertions: \
+             {{profile: 2}} was refused ({e})"
+        );
+        return;
+    }
+
+    let _ = backend
+        .search(&tenant, &query)
+        .await
+        .expect("_id plus a broad term must not scan that term's whole population");
+
+    let _ = database.run_command(doc! { "profile": 0_i32 }).await;
+
+    // Sum every `search_index` command's `keysExamined` in the window,
+    // including `getmore` continuations (a driver cursor spanning more than
+    // one batch would otherwise hide its cost from a query-only count).
+    let profile: Collection<Document> = database.collection("system.profile");
+    let mut cursor = profile
+        .find(doc! { "ns": format!("{db_name}.search_index") })
+        .await
+        .expect("failed to query system.profile");
+    let mut total_keys_examined: i64 = 0;
+    while cursor
+        .advance()
+        .await
+        .expect("failed to advance profile cursor")
+    {
+        let entry: Document = cursor
+            .deserialize_current()
+            .expect("failed to deserialize profile entry");
+        if let Ok(k) = entry
+            .get_i64("keysExamined")
+            .or_else(|_| entry.get_i32("keysExamined").map(i64::from))
+        {
+            total_keys_examined += k;
+        }
+    }
+    assert!(
+        total_keys_examined <= 50,
+        "keysExamined {total_keys_examined} — `_id=obs-ibt-a&status=final` must not scan \
+         the 2,000-row `status=final` population to find the one requested id"
+    );
+}
+
+/// #1528: a seed of several hundred `_id` values — realistic once a chain,
+/// `_has` or `_list` resolves to one (`search/chain_resolver.rs`,
+/// `search/list_resolver.rs`) — combined with a broad `date` range must stay
+/// bounded by the *seed*, not by the date population, and must use
+/// `idx_search_composite` (the only index a seeded check can be hinted onto;
+/// `distinct` cannot take a hint).
+#[tokio::test]
+async fn mongodb_integration_search_id_seed_of_600_bounds_a_date_range() {
+    let Some(backend) = create_backend_with_full_registry("id_seed_600_date_range").await else {
+        eprintln!(
+            "Skipping mongodb_integration_search_id_seed_of_600_bounds_a_date_range (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-id-seed-600-date");
+
+    let hit_ids = ["obs-s600-hit-0", "obs-s600-hit-1", "obs-s600-hit-2"];
+    for id in hit_ids {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": id,
+                    "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "29463-7" }] },
+                    "effectiveDateTime": "2020-06-01",
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // ~10k synthetic `date` rows the seed must NOT be bounded by. (#1528
+    // review finding 1: at 2,000 rows the fixed cost — a ~601-key seed probe
+    // plus ~600 seeded keys — and the unfixed cost — scanning the whole
+    // population — landed too close together (2,003 examined against a
+    // 2,000 budget) to reliably fail if the fix regressed; 10,000 widens
+    // that margin by 5x while the fixed cost stays flat, since it tracks the
+    // seed's size, not the population's.)
+    let raw_client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect raw MongoDB client");
+    let raw_db = raw_client.database(&backend.config().database_name);
+    let search_index: Collection<Document> = raw_db.collection("search_index");
+    let synthetic: Vec<Document> = (0..10_000)
+        .map(|n| {
+            doc! {
+                "tenant_id": tenant.tenant_id().as_str(),
+                "resource_type": "Observation",
+                "resource_id": format!("syn-s600-{n}"),
+                "param_name": "date",
+                "param_url": "http://hl7.org/fhir/SearchParameter/Observation-date",
+                "value_date": mongodb::bson::DateTime::from_millis(1_590_000_000_000),
+                "value_date_end": mongodb::bson::DateTime::from_millis(1_590_000_000_001),
+                "value_date_precision": "second",
+            }
+        })
+        .collect();
+    search_index
+        .insert_many(synthetic)
+        .await
+        .expect("failed to insert synthetic search_index date rows");
+
+    // 600 `_id` values: the 3 real hits plus 597 of the synthetic ids (which
+    // have a matching `date` row but are not live resources, so they drop
+    // out at the final `resources` fetch — only correctness-neutral padding
+    // to reach a realistic chain-resolved seed size).
+    let seed_ids: Vec<SearchValue> = hit_ids
+        .iter()
+        .map(|id| SearchValue::eq(*id))
+        .chain((0..597).map(|n| SearchValue::eq(format!("syn-s600-{n}"))))
+        .collect();
+    assert_eq!(seed_ids.len(), 600);
+
+    let query = SearchQuery::new("Observation")
+        .with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: seed_ids,
+            chain: vec![],
+            components: vec![],
+        })
+        .with_parameter(SearchParameter {
+            name: "date".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: vec![SearchValue::new(SearchPrefix::Ge, "2000")],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_count(10);
+
+    // Functional check first, unconditionally (#1528 review finding 6): if
+    // the server below refuses profiling, the test must still have verified
+    // correctness rather than exiting having checked nothing at all.
+    let result = backend
+        .search(&tenant, &query)
+        .await
+        .expect("a 600-id seed plus a date range must not hit the id-set cap");
+    let mut ids: Vec<String> = result
+        .resources
+        .items
+        .iter()
+        .map(|r| r.id().to_string())
+        .collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec!["obs-s600-hit-0", "obs-s600-hit-1", "obs-s600-hit-2"]
+    );
+
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect raw MongoDB client");
+    let db_name = backend.config().database_name.clone();
+    let database = client.database(&db_name);
+    if let Err(e) = database.run_command(doc! { "profile": 2_i32 }).await {
+        eprintln!(
+            "Skipping mongodb_integration_search_id_seed_of_600_bounds_a_date_range plan \
+             assertions: {{profile: 2}} was refused ({e})"
+        );
+        return;
+    }
+
+    let _ = backend
+        .search(&tenant, &query)
+        .await
+        .expect("a 600-id seed plus a date range must not hit the id-set cap");
+
+    let _ = database.run_command(doc! { "profile": 0_i32 }).await;
+
+    // #1528 review finding 1: every v2 value index (`idx_search_date_v3`
+    // included) ends its key pattern in `resource_id` (`search_index_catalog.rs`),
+    // so an *unhinted* IXSCAN on the date population also satisfies
+    // `planSummary.contains("resource_id: 1")` — this pinned nothing, and
+    // would have passed on origin/main's own (unfixed) driver-cursor plan for
+    // this same query too. Pin the literal `hint` field on an actual `find`
+    // command instead, which only a seeded check ever sets.
+    let profile: Collection<Document> = database.collection("system.profile");
+    let mut cursor = profile
+        .find(doc! { "ns": format!("{db_name}.search_index") })
+        .await
+        .expect("failed to query system.profile");
+    let mut total_keys_examined: i64 = 0;
+    let mut saw_composite_hint = false;
+    while cursor
+        .advance()
+        .await
+        .expect("failed to advance profile cursor")
+    {
+        let entry: Document = cursor
+            .deserialize_current()
+            .expect("failed to deserialize profile entry");
+        if let Ok(k) = entry
+            .get_i64("keysExamined")
+            .or_else(|_| entry.get_i32("keysExamined").map(i64::from))
+        {
+            total_keys_examined += k;
+        }
+        if let Ok(command) = entry.get_document("command")
+            && command.contains_key("find")
+            && command.get_str("hint") == Ok("idx_search_composite")
+        {
+            saw_composite_hint = true;
+        }
+    }
+    assert!(
+        saw_composite_hint,
+        "expected at least one `find` on search_index hinted onto idx_search_composite, \
+         proving a seeded check ran"
+    );
+    assert!(
+        total_keys_examined <= 2_000,
+        "keysExamined {total_keys_examined} — a 600-id seed must not scan the 10,000-row \
+         `date` population"
+    );
+}
+
+/// #1528: a seed always driving is a speed regression once chains/`_has`/
+/// `_list` can push tens or hundreds of thousands of ids into `_id` with no
+/// cap (`search/chain_resolver.rs`) — a sibling parameter that is far more
+/// selective must still win the driver slot and drive in roughly one round
+/// trip, not one per 512-id chunk of the seed.
+#[tokio::test]
+async fn mongodb_integration_large_id_seed_with_selective_term_drives_from_the_term() {
+    let Some(backend) = create_backend_with_full_registry("large_seed_selective_term").await else {
+        eprintln!(
+            "Skipping mongodb_integration_large_id_seed_with_selective_term_drives_from_the_term \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-large-seed-selective-term");
+
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-lsst-hit",
+                "status": "final",
+                "code": { "coding": [{ "system": "http://loinc.org", "code": "29463-7-lsst-only" }] },
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-lsst-other",
+                "status": "final",
+                "code": { "coding": [{ "system": "http://loinc.org", "code": "other-code" }] },
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    // A chain/`_has`/`_list` resolution with no cap (#1528) can realistically
+    // push tens of thousands of ids into `_id`.
+    let mut seed_values: Vec<SearchValue> = (0..50_000)
+        .map(|n| SearchValue::eq(format!("absent-lsst-{n}")))
+        .collect();
+    seed_values.push(SearchValue::eq("obs-lsst-hit"));
+
+    let query = SearchQuery::new("Observation")
+        .with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: seed_values,
+            chain: vec![],
+            components: vec![],
+        })
+        .with_parameter(SearchParameter {
+            name: "code".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("29463-7-lsst-only")],
+            chain: vec![],
+            components: vec![],
+        });
+
+    // Functional check first, unconditionally (#1528 review finding 6): if
+    // the server below refuses profiling, the test must still have verified
+    // correctness rather than exiting having checked nothing at all.
+    let result = backend
+        .search(&tenant, &query)
+        .await
+        .expect("a large _id seed plus a selective term must not hit the id-set cap");
+    assert_eq!(
+        result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect::<Vec<_>>(),
+        vec!["obs-lsst-hit".to_string()]
+    );
+
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect raw MongoDB client");
+    let db_name = backend.config().database_name.clone();
+    let database = client.database(&db_name);
+    if let Err(e) = database.run_command(doc! { "profile": 2_i32 }).await {
+        eprintln!(
+            "Skipping mongodb_integration_large_id_seed_with_selective_term_drives_from_the_term \
+             plan assertions: {{profile: 2}} was refused ({e})"
+        );
+        return;
+    }
+
+    let _ = backend
+        .search(&tenant, &query)
+        .await
+        .expect("a large _id seed plus a selective term must not hit the id-set cap");
+
+    let _ = database.run_command(doc! { "profile": 0_i32 }).await;
+
+    // The selective term must drive: a handful of `search_index` commands
+    // total (the driver-selection probe plus one driver find), never one per
+    // 512-id chunk of the 50,001-id seed (which would be about 98).
+    let profile: Collection<Document> = database.collection("system.profile");
+    let command_count = profile
+        .count_documents(doc! { "ns": format!("{db_name}.search_index") })
+        .await
+        .expect("failed to count profile entries");
+    assert!(
+        command_count <= 5,
+        "expected the selective `code` term to drive (a handful of search_index commands), \
+         got {command_count} — the _id seed must have driven instead"
+    );
+}
+
+/// #1528 review finding 3: `matching_resource_ids`'s in-memory
+/// `candidates.retain(|id| seed.contains(id))` (right after a *normal*
+/// parameter — not the seed — wins the driver race) has no test that fails
+/// if it's deleted. None of the three tests above exercise it: in the first
+/// two the seed itself drives, and in the third the driver's one surviving
+/// candidate is already inside the seed. This sets up a driver whose
+/// surviving candidates are only *mostly* outside the seed.
+///
+/// Note the functional `assert_eq!` below is a sanity check only: even with
+/// the `retain` deleted, the 300 outside-seed synthetic ids have no
+/// `resources` row, and `build_resource_filter` re-applies `_id` against
+/// `resources`, so they could never reach `result.resources` either way. The
+/// actual regression guard is the profiler assertion further down —
+/// `smallest_in_len <= 3` — which fails if the sibling `status` check ever
+/// sees the undrained 303 instead of the (at most 3) seed-intersected
+/// candidates.
+#[tokio::test]
+async fn mongodb_integration_id_seed_bounds_a_non_seed_drivers_sibling_check() {
+    let Some(backend) = create_backend_with_full_registry("id_seed_bounds_non_seed_driver").await
+    else {
+        eprintln!(
+            "Skipping mongodb_integration_id_seed_bounds_a_non_seed_drivers_sibling_check \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-id-seed-non-seed-driver");
+
+    let hit_ids = ["obs-tgap-hit-0", "obs-tgap-hit-1", "obs-tgap-hit-2"];
+    for id in hit_ids {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": id,
+                    "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "29463-7-tgap-only" }] },
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let raw_client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect raw MongoDB client");
+    let raw_db = raw_client.database(&backend.config().database_name);
+    let search_index: Collection<Document> = raw_db.collection("search_index");
+
+    // 597 synthetic ids INSIDE the seed: a `status=final` row only, no
+    // `code` row — padding to a realistic seed size, and proof the seed
+    // intersection isn't a no-op (these must NOT survive, either, since they
+    // never match `code`).
+    let in_seed_synthetic: Vec<Document> = (0..597)
+        .map(|n| {
+            doc! {
+                "tenant_id": tenant.tenant_id().as_str(),
+                "resource_type": "Observation",
+                "resource_id": format!("syn-tgap-in-{n}"),
+                "param_name": "status",
+                "param_url": "http://hl7.org/fhir/SearchParameter/Observation-status",
+                "value_token_system": "http://hl7.org/fhir/observation-status",
+                "value_token_code": "final",
+            }
+        })
+        .collect();
+    search_index
+        .insert_many(in_seed_synthetic)
+        .await
+        .expect("failed to insert in-seed synthetic rows");
+
+    // 300 synthetic ids OUTSIDE the seed: both a `code` row (so `code` drives
+    // with a population of 303, well under the 600-id seed) and a
+    // `status=final` row, so that if the seed intersection were skipped
+    // they'd also survive the sibling `status` check — widening that check's
+    // `resource_id: $in` to up to 303 entries, which the profiler assertion
+    // below catches. They can never appear in `result.resources` regardless,
+    // since they have no `resources` row.
+    let mut outside_seed_synthetic = Vec::with_capacity(600);
+    for n in 0..300 {
+        let id = format!("syn-tgap-out-{n}");
+        outside_seed_synthetic.push(doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": "Observation",
+            "resource_id": &id,
+            "param_name": "code",
+            "param_url": "http://hl7.org/fhir/SearchParameter/Observation-code",
+            "value_token_system": "http://loinc.org",
+            "value_token_code": "29463-7-tgap-only",
+        });
+        outside_seed_synthetic.push(doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": "Observation",
+            "resource_id": &id,
+            "param_name": "status",
+            "param_url": "http://hl7.org/fhir/SearchParameter/Observation-status",
+            "value_token_system": "http://hl7.org/fhir/observation-status",
+            "value_token_code": "final",
+        });
+    }
+    search_index
+        .insert_many(outside_seed_synthetic)
+        .await
+        .expect("failed to insert outside-seed synthetic rows");
+
+    // 600-id seed: the 3 real hits plus the 597 in-seed synthetic ids. `code`
+    // matches 303 ids (300 outside-seed + the 3 hits) — less than 600, so
+    // `code` (not the seed) wins the driver race.
+    let seed_ids: Vec<SearchValue> = hit_ids
+        .iter()
+        .map(|id| SearchValue::eq(*id))
+        .chain((0..597).map(|n| SearchValue::eq(format!("syn-tgap-in-{n}"))))
+        .collect();
+    assert_eq!(seed_ids.len(), 600);
+
+    let query = SearchQuery::new("Observation")
+        .with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: seed_ids,
+            chain: vec![],
+            components: vec![],
+        })
+        .with_parameter(SearchParameter {
+            name: "code".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("29463-7-tgap-only")],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_parameter(SearchParameter {
+            name: "status".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("final")],
+            chain: vec![],
+            components: vec![],
+        });
+
+    // Functional check first, unconditionally (#1528 review finding 6).
+    let result = backend
+        .search(&tenant, &query)
+        .await
+        .expect("a non-seed driver's sibling check must still stay inside the _id seed");
+    let mut ids: Vec<String> = result
+        .resources
+        .items
+        .iter()
+        .map(|r| r.id().to_string())
+        .collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec!["obs-tgap-hit-0", "obs-tgap-hit-1", "obs-tgap-hit-2"],
+        "sanity check only, not the regression guard: the synthetic ids have no `resources` \
+         row, so `build_resource_filter` keeps them out of the result regardless of whether \
+         the seed-intersection `retain` under test even runs — see the `smallest_in_len` \
+         profiler assertion below for the check that actually catches its removal"
+    );
+
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect raw MongoDB client");
+    let db_name = backend.config().database_name.clone();
+    let database = client.database(&db_name);
+    if let Err(e) = database.run_command(doc! { "profile": 2_i32 }).await {
+        eprintln!(
+            "Skipping mongodb_integration_id_seed_bounds_a_non_seed_drivers_sibling_check plan \
+             assertions: {{profile: 2}} was refused ({e})"
+        );
+        return;
+    }
+
+    let _ = backend
+        .search(&tenant, &query)
+        .await
+        .expect("a non-seed driver's sibling check must still stay inside the _id seed");
+
+    let _ = database.run_command(doc! { "profile": 0_i32 }).await;
+
+    // The sibling `status` check is an unhinted `distinct` bounded to
+    // `resource_id: {"$in": [...]}` (the driver is `code`, so `hint: false`
+    // here — see `retain_matching_candidates`'s doc comment). Its `$in` must
+    // carry only the (up to 3) seed-intersected candidates, not the 303 the
+    // `code` driver cursor actually read.
+    fn find_resource_id_in_len(doc: &Document) -> Option<usize> {
+        if let Ok(sub) = doc.get_document("resource_id")
+            && let Ok(arr) = sub.get_array("$in")
+        {
+            return Some(arr.len());
+        }
+        for (_, v) in doc.iter() {
+            match v {
+                Bson::Document(d) => {
+                    if let Some(n) = find_resource_id_in_len(d) {
+                        return Some(n);
+                    }
+                }
+                Bson::Array(items) => {
+                    for item in items {
+                        if let Bson::Document(d) = item
+                            && let Some(n) = find_resource_id_in_len(d)
+                        {
+                            return Some(n);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    let profile: Collection<Document> = database.collection("system.profile");
+    let mut cursor = profile
+        .find(doc! {
+            "ns": format!("{db_name}.search_index"),
+            "command.distinct": "search_index",
+        })
+        .await
+        .expect("failed to query system.profile");
+    let mut smallest_in_len: Option<usize> = None;
+    while cursor
+        .advance()
+        .await
+        .expect("failed to advance profile cursor")
+    {
+        let entry: Document = cursor
+            .deserialize_current()
+            .expect("failed to deserialize profile entry");
+        let command = entry
+            .get_document("command")
+            .expect("profile entry missing command");
+        if let Some(n) = find_resource_id_in_len(command) {
+            smallest_in_len = Some(smallest_in_len.map_or(n, |prev| prev.min(n)));
+        }
+    }
+    let smallest_in_len = smallest_in_len
+        .expect("expected a `distinct` command on search_index checking `resource_id: $in`");
+    assert!(
+        smallest_in_len <= 3,
+        "resource_id $in had {smallest_in_len} entries — the sibling `status` check must only \
+         ever see the (at most 3) candidates left after intersecting with the _id seed, not the \
+         303 the `code` driver actually read"
+    );
+}
+
+/// #1528 review finding 4: a compartment-only query (no normal params, no
+/// `:missing`/`:not`) combined with an `_id` seed must not always walk the
+/// *seed* in 512-id chunks — a compartment's own membership is usually a
+/// small, natural population (a few hundred encounters for one patient),
+/// unrelated to the size of a resolved `_id` seed, which a chain/`_has`/
+/// `_list` can make far larger. Probing the membership filter first, bounded
+/// to `|seed|+1`, must let a small compartment answer in about one query
+/// instead of one per seed chunk.
+#[tokio::test]
+async fn mongodb_integration_large_id_seed_with_small_compartment_drives_from_the_compartment() {
+    use helios_persistence::types::CompartmentMembership;
+
+    let Some(backend) = create_backend_with_full_registry("large_seed_small_compartment").await
+    else {
+        eprintln!(
+            "Skipping mongodb_integration_large_id_seed_with_small_compartment_drives_from_the_compartment \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-large-seed-small-compartment");
+
+    // In the compartment AND in the seed: must be in the result.
+    for id in ["obs-lsc-a", "obs-lsc-b", "obs-lsc-c"] {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": id,
+                    "status": "final",
+                    "subject": {"reference": "Patient/lsc-p1"}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    // In the compartment but NOT in the seed: must be excluded (`_id` AND
+    // compartment, not compartment alone).
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-lsc-unseeded-member",
+                "status": "final",
+                "subject": {"reference": "Patient/lsc-p1"}
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    // In the seed but NOT in the compartment: must be excluded.
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-lsc-other-patient",
+                "status": "final",
+                "subject": {"reference": "Patient/lsc-p2"}
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    // A chain/`_has`/`_list` resolution with no cap (#1528) can realistically
+    // push tens of thousands of ids into `_id`.
+    let mut seed_values: Vec<SearchValue> = (0..50_000)
+        .map(|n| SearchValue::eq(format!("absent-lsc-{n}")))
+        .collect();
+    seed_values.push(SearchValue::eq("obs-lsc-a"));
+    seed_values.push(SearchValue::eq("obs-lsc-b"));
+    seed_values.push(SearchValue::eq("obs-lsc-c"));
+    seed_values.push(SearchValue::eq("obs-lsc-other-patient"));
+
+    let mut query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+        name: "_id".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: None,
+        values: seed_values,
+        chain: vec![],
+        components: vec![],
+    });
+    query.compartment = Some(CompartmentMembership {
+        params: vec!["subject".to_string()],
+        reference: "Patient/lsc-p1".to_string(),
+    });
+
+    // Functional check first, unconditionally (#1528 review finding 6).
+    let result = backend
+        .search(&tenant, &query)
+        .await
+        .expect("a large _id seed plus a small compartment must not hit the id-set cap");
+    let mut ids: Vec<String> = result
+        .resources
+        .items
+        .iter()
+        .map(|r| r.id().to_string())
+        .collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec!["obs-lsc-a", "obs-lsc-b", "obs-lsc-c"],
+        "must be exactly the seed intersected with compartment membership"
+    );
+
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect raw MongoDB client");
+    let db_name = backend.config().database_name.clone();
+    let database = client.database(&db_name);
+    if let Err(e) = database.run_command(doc! { "profile": 2_i32 }).await {
+        eprintln!(
+            "Skipping mongodb_integration_large_id_seed_with_small_compartment_drives_from_the_compartment \
+             plan assertions: {{profile: 2}} was refused ({e})"
+        );
+        return;
+    }
+
+    let _ = backend
+        .search(&tenant, &query)
+        .await
+        .expect("a large _id seed plus a small compartment must not hit the id-set cap");
+
+    let _ = database.run_command(doc! { "profile": 0_i32 }).await;
+
+    // The small compartment must drive: a membership probe plus one
+    // `distinct`, never one hinted `find` per 512-id chunk of the 50,004-id
+    // seed (which would be about 98).
+    let profile: Collection<Document> = database.collection("system.profile");
+    let command_count = profile
+        .count_documents(doc! { "ns": format!("{db_name}.search_index") })
+        .await
+        .expect("failed to count profile entries");
+    assert!(
+        command_count <= 6,
+        "expected the small compartment to drive (a probe plus one distinct, with headroom for \
+         incidental commands — same margin as the analogous selective-term test above), got \
+         {command_count} — the _id seed must have driven instead"
+    );
 }
 
 /// The in-DB runner compiles no compartment predicate, so a run carrying

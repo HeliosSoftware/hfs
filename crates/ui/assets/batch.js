@@ -378,6 +378,11 @@
       if (body && body.issue && body.issue[0]) {
         diag = body.issue[0].diagnostics || (body.issue[0].details && body.issue[0].details.text) || "";
       }
+      // Auth on, no browser sign-in (#1560): the shell notice is the
+      // marker, and the missing setting beats the raw header text.
+      if (response.status === 401 && document.getElementById("auth-bearer-only")) {
+        diag = messages.msgSignInRequired;
+      }
       executeError.textContent = messages.msgRequestFailed + (diag ? " — " + diag : "");
       executeError.hidden = false;
       return;
