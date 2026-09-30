@@ -175,11 +175,7 @@ where
                 "Returning resource"
             );
 
-            format_resource_response(StatusCode::OK, headers, &content, negotiated.format).map_err(
-                |_| RestError::InternalError {
-                    message: "Failed to serialize response".to_string(),
-                },
-            )
+            format_resource_response(StatusCode::OK, headers, &content, negotiated.format)
         }
         None => {
             debug!(
