@@ -22,8 +22,8 @@
   Details (#840): a JSON editor (CodeMirror 6, `sql-library-details.js`)
   beside the guided form the Resource Editor and View Definitions already
   share (`editor::build_form_pane`, `crate::render_lib_details_pane`) — the
-  Library minus its `application/sql` attachment, which the SQL card below
-  owns instead (`sql_libraries::strip_sql_attachment`). The two panes sync
+  full stored Library, `application/sql` attachment included; the SQL card
+  below is a second view of that same attachment (#1233). The two panes sync
   in both directions through the shared host (`editor-pair.js`, #840); the
   guided form's own "+ Add" and mutations never touch `content`
   (`hidden=content`, #840's engine). One Save posts both cards and the
@@ -152,7 +152,7 @@
     <p class="notice notice--warn">{{ error }}</p>
     {% endif %}
 
-    {#- Details (#840): the Library minus its SQL attachment, edited two
+    {#- Details (#840, #1233): the full stored Library, edited two
         ways at once — a JSON editor (left) and the guided form the
         Resource Editor and View Definitions already share (right,
         `details`, built server-side by `crate::render_lib_details_pane`
@@ -164,7 +164,11 @@
         submit (and, via `hx-include`, live-preview) alongside the SQL
         card's own form below even though it lives outside it in the DOM
         — see that card's own comment for the merge rule the two sides of
-        this document follow at Save/Run. -#}
+        this document follow at Save/Run. `sql-library-sync.js` (#1233)
+        keeps this JSON's own `application/sql` attachment and the SQL card
+        below reading as one document live, in both directions, on top of
+        both editors above — typing in either updates the other, with no
+        Save or Run needed to see it. -#}
     <h2 class="form-legend">{{ i18n.t("lib-details-heading") }}</h2>
     {% if is_new %}
     <p class="page-head__lede">{{ i18n.t("lib-details-new-lede") }}</p>
@@ -175,11 +179,17 @@
           <h3>{{ i18n.t("lib-details-json-heading") }}</h3>
         </div>
         <div class="card__body editor__doc">
+          {#- #1233: `hx-sync` shares one scope with the SQL textarea below -
+              a sync-driven write on either side and a manual edit of the
+              other can each queue their own 500ms live-run; whichever
+              request lands second replaces the first in flight, instead of
+              a stale response settling after a fresher one. -#}
           <textarea class="json-editor" name="json" form="lib-editor-form" spellcheck="false"
                     hx-post="{{ run_href }}"
                     hx-trigger="input changed delay:500ms"
                     hx-include="#lib-editor-form"
                     hx-target="#run-notice" hx-swap="outerHTML"
+                    hx-sync="#lib-editor-form:replace"
                     aria-label="{{ i18n.t("lib-details-json-heading") }}">{{ sel.json }}</textarea>
           <p class="editor__source-hint">{{ i18n.t("lib-details-json-note") }}</p>
         </div>
@@ -191,18 +201,29 @@
     </div>
 
     {#- The SQL card (#839): the only other card in this layout, always
-        open. Save/Run fuse this pane into Details on the server
-        (`sql_libraries::embed_sql`, #840): it replaces the first
-        `content[]` attachment whose `contentType` is `application/sql`, or
-        appends one when Details carries none — so a SQL attachment typed
-        by hand into the Details JSON card is always overwritten by this
-        one, never the reverse. The textarea carries the same live-preview
-        wiring the View Definitions editor uses (#752): htmx reposts it
-        500ms after the last change, targeting the notice region below. -#}
+        open. The Details JSON's own `application/sql` attachment is the
+        document of record (#1233): Save/Run only fold this pane's text
+        into Details' `content[]` (`sql_libraries::fill_sql_attachment`)
+        when Details carries no readable SQL attachment of its own — none,
+        missing `data`, invalid base64, or non-UTF-8 bytes. A readable
+        attachment already in Details always wins, and the run/analysis
+        that follows always uses that effective SQL. The textarea carries
+        the same live-preview wiring the View Definitions editor uses
+        (#752): htmx reposts it 500ms after the last change, targeting the
+        notice region below. -#}
     <section class="card">
       <div class="card-head">
         <h3>{{ i18n.t(editor_heading_key) }}</h3>
         <div class="card-head__tools">
+          {#- #1233: the "unreadable attachment" chip. `sql-library-sync.js`
+              is the only thing that ever un-hides it (client-side only, for
+              its own "unreadable" state) and fills its text from
+              `data-msg-unreadable` — the server never renders it visible,
+              since without that script there is no synchroniser and the
+              Details<->SQL card fallback (`sql_libraries::fill_sql_attachment`)
+              already covers an unreadable stored attachment. -#}
+          <span class="editor-validity" id="sql-attachment-state" hidden
+                data-msg-unreadable="{{ i18n.t("lib-sql-attachment-unreadable") }}"></span>
           <p class="editor-legend">
             <span class="editor-legend__live">{{ i18n.t("lib-run-hint") }}</span>
           </p>
@@ -210,10 +231,13 @@
       </div>
       <form method="post" action="{{ base_href }}" id="lib-editor-form" class="card__body">
         <input type="hidden" name="id" value="{{ sel.id }}">
+        {#- #1233: same `hx-sync` scope as the Details JSON textarea above -
+            see that textarea's own comment for why. -#}
         <textarea class="json-editor" name="sql" spellcheck="false"
                   hx-post="{{ run_href }}"
                   hx-trigger="input changed delay:500ms"
                   hx-target="#run-notice" hx-swap="outerHTML"
+                  hx-sync="#lib-editor-form:replace"
                   aria-label="{{ i18n.t(editor_heading_key) }}">{{ sel.sql }}</textarea>
         <div class="form-actions">
           <button type="submit" class="btn btn--primary" name="action" value="save">{{ i18n.t("vd-save") }}</button>
@@ -282,29 +306,41 @@
 <script src="/ui/assets/resource-filter.js" defer></script>
 <script src="/ui/assets/conformance-crud.js" defer></script>
 <!-- The two CodeMirror editors this page mounts — the Details JSON pane
-     (#840) and the SQL pane (#838) — and the Details guided-form pairing
-     (#840, shared with View Definitions) all read globals the previous
-     script in this list defines, so the order below is load-bearing: the
-     vendored CodeMirror 6 bundle before its shared mount helper, before
-     the guided form's shared loop, before the shared editor/form pairing,
-     before either page-specific editor script. editor-form.js and
-     editor-pair.js are loaded here, not from base.html, the same as on
-     View Definitions — nothing outside this page drives the Details
-     pairing through them yet. sql-library-panels.js (#841) is last: its own
-     `htmx:afterSwap` listener only ever reads `window.HfsSqlLibraryDetails`
-     from inside that handler, well after every script here has already
-     run, so the order relative to sql-library-details.js does not change
-     behavior — it is placed after it anyway, to read the same top-to-
-     bottom as the dependency it names. Loaded on both /ui/sql/queries and
-     /ui/sql/views, since this one template serves both routes — the
-     Parameters card (and so this script's own listener) simply never
-     matches anything on SQL Views, which render no `#lib-params` at all. -->
+     (#840) and the SQL pane (#838) — the Details guided-form pairing
+     (#840, shared with View Definitions), and the live Details<->SQL sync
+     (#1233) all read globals the previous script in this list defines, so
+     the order below is load-bearing: the vendored CodeMirror 6 bundle
+     before its shared mount helper, before the guided form's shared loop,
+     before the shared editor/form pairing, before either page-specific
+     editor script (editor-add.js, #1239, right before editor-form.js,
+     which reads window.HfsEditorAdd when it mounts), before the sync that
+     reaches both of them by their own globals (`window.HfsSqlEditor`, set at the end of sql-editor.js;
+     `window.HfsSqlLibraryDetails`, set at the end of
+     sql-library-details.js; `window.HfsEditorPair.minimalChange`, already
+     loaded by then). editor-form.js and editor-pair.js are loaded here, not
+     from base.html, the same as on View Definitions — nothing outside this
+     page drives the Details pairing through them yet.
+     sql-library-sync.js reads its two globals lazily, on every keystroke,
+     rather than once at load — so it degrades the same way every other
+     script here does when the bundle, `editor-pair.js`, or a mount itself
+     is missing, instead of needing its own place in this order relative to
+     either. sql-library-panels.js (#841) is last: its own `htmx:afterSwap`
+     listener only ever reads `window.HfsSqlLibraryDetails` from inside
+     that handler, well after every script here has already run, so the
+     order relative to sql-library-details.js does not change behavior — it
+     is placed after it anyway, to read the same top-to-bottom as the
+     dependency it names. Loaded on both /ui/sql/queries and /ui/sql/views,
+     since this one template serves both routes — the Parameters card (and
+     so this script's own listener) simply never matches anything on SQL
+     Views, which render no `#lib-params` at all. -->
 <script src="/ui/assets/vendor/codemirror.bundle.js" defer></script>
 <script src="/ui/assets/code-editor.js" defer></script>
+<script src="/ui/assets/editor-add.js" defer></script>
 <script src="/ui/assets/editor-form.js" defer></script>
 <script src="/ui/assets/editor-pair.js" defer></script>
 <script src="/ui/assets/sql-editor.js" defer></script>
 <script src="/ui/assets/sql-library-details.js" defer></script>
+<script src="/ui/assets/sql-library-sync.js" defer></script>
 <!-- combobox.js (#842): the Tables panel's own *Add table* field — the
      same shared script Bulk Export and SQL Export load for their own
      Patient/Group pickers, not otherwise pulled in on this page. -->

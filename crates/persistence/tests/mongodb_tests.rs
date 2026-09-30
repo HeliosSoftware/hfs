@@ -108,6 +108,8 @@ fn test_mongodb_config_defaults() {
     assert_eq!(config.server_selection_timeout_ms, 15_000);
     assert!(!config.search_offloaded);
     assert_eq!(config.fhir_version, FhirVersion::default());
+    // #1403: the `$reindex` walk's clock-skew and commit-lag allowance.
+    assert_eq!(config.reindex_catch_up_margin_ms, 120_000);
 }
 
 #[test]
@@ -612,6 +614,16 @@ async fn mongodb_contained_sort_and_id_only_contained() {
     contained_suite::sort_and_id_only_contained(&backend, "contained-sort-1407").await;
 }
 
+/// The backend-agnostic `ap` prefix suite for number and quantity
+/// (#1390). Same `#[path]` arrangement.
+#[path = "search/ap_prefix_suite.rs"]
+mod ap_prefix_suite;
+
+/// The backend-agnostic `ap` suite for quantity composites
+/// (#1390). Same `#[path]` arrangement.
+#[path = "search/ap_relations_suite.rs"]
+mod ap_relations_suite;
+
 /// #1407: composites under `_contained` are matched within one contained
 /// resource — a code pairs with the quantity of the *same* component, never
 /// across components or sibling contained resources. Strict: unlike the
@@ -911,6 +923,29 @@ async fn mongodb_exponent_values_use_significant_figures() {
     .await;
 }
 
+/// #1390: one number/quantity `ap` window, shared by every backend. Needs the
+/// full registry so `factor-override` and `value-quantity` extract. No
+/// canonical-unit quantity match, hence `false`.
+#[tokio::test]
+async fn mongodb_ap_prefix_suite() {
+    let Some(backend) = create_backend_with_full_registry("ap_prefix").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    ap_prefix_suite::ap_prefix(&backend, "ap-prefix-1390", false).await;
+}
+
+/// #1390: `ap` in the quantity component of a composite. Needs the full
+/// registry so the composites and their components extract.
+#[tokio::test]
+async fn mongodb_ap_composite() {
+    let Some(backend) = create_backend_with_full_registry("ap_composite").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    ap_relations_suite::ap_composite(&backend, "ap-composite-1390").await;
+}
+
 /// The backend-agnostic number / quantity validation suite (#1319, #1340).
 /// Same `#[path]` arrangement.
 #[path = "search/numeric_validation_suite.rs"]
@@ -969,7 +1004,6 @@ async fn mongodb_system_qualified_tokens_match_code_elements() {
     token_code_system_suite::system_qualified_tokens_match_code_elements(
         &backend,
         "token-code-system-1379",
-        false,
     )
     .await;
 }
@@ -1110,6 +1144,14 @@ async fn mongodb_conditional_patch() {
 /// Same `#[path]` arrangement.
 #[path = "search/versioned_write_race_suite.rs"]
 mod versioned_write_race_suite;
+
+/// #1403: the id-order `$reindex` walk and its catch-up rounds.
+#[path = "mongodb/reindex_id_walk.rs"]
+mod reindex_id_walk;
+
+/// #1499: MongoDB honours `HFS_REINDEX_BATCH_BYTES` (PR2a).
+#[path = "mongodb/reindex_pipeline.rs"]
+mod reindex_pipeline;
 
 /// #1405: of several writers holding the same version, one `update` writes and
 /// every loser is a `ConcurrencyError` — the server's `WriteConflict` used to
@@ -8938,6 +8980,135 @@ async fn mongodb_integration_reindex_page_counts_contained_entries() {
     );
 }
 
+/// #1403 PR0: MongoDB is the only writer that measures its own phases in this
+/// PR. Every call goes through `&dyn ReindexTarget` to prove dynamic dispatch
+/// reaches MongoDB's override rather than the trait's zero-measuring default
+/// (S1 "default-method trap").
+#[tokio::test]
+async fn mongodb_integration_reindex_page_reports_phase_stats() {
+    use helios_persistence::search::{ReindexPageStats, ReindexTarget};
+    use helios_persistence::types::StoredResource;
+
+    let Some(backend) = create_backend_with_full_registry("reindex_page_phase_stats").await else {
+        eprintln!(
+            "Skipping mongodb_integration_reindex_page_reports_phase_stats (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("reindex-phase-stats-tenant");
+    let target: &dyn ReindexTarget = &backend;
+
+    // Step 1: seed 8 Patients.
+    let patients: Vec<StoredResource> = (0..8)
+        .map(|i| {
+            StoredResource::from_storage(
+                "Patient",
+                format!("phase-stats-{i}"),
+                "1",
+                tenant.tenant_id().clone(),
+                json!({
+                    "resourceType": "Patient",
+                    "id": format!("phase-stats-{i}"),
+                    "name": [{"family": "Stats"}],
+                    "gender": "female",
+                    "birthDate": "1990-01-01"
+                }),
+                chrono::Utc::now(),
+                chrono::Utc::now(),
+                None,
+                FhirVersion::default(),
+            )
+        })
+        .collect();
+    let mut first = ReindexPageStats::default();
+    let outcomes = target
+        .write_search_entries_page_timed(&tenant, &patients, &mut first)
+        .await;
+    assert!(outcomes.iter().all(|r| r.is_ok()), "{outcomes:?}");
+    assert_eq!(first.deleted_entries, 0, "the database is unique per test");
+    assert!(first.inserted_entries > 0);
+    assert_eq!(first.insert_commands, 1);
+    assert!(first.extract > std::time::Duration::ZERO);
+    assert!(first.delete > std::time::Duration::ZERO);
+    assert!(first.insert > std::time::Duration::ZERO);
+
+    // Step 2: rewrite the same page.
+    let mut second = ReindexPageStats::default();
+    let outcomes = target
+        .write_search_entries_page_timed(&tenant, &patients, &mut second)
+        .await;
+    assert!(outcomes.iter().all(|r| r.is_ok()), "{outcomes:?}");
+    assert_eq!(second.deleted_entries, first.inserted_entries);
+    assert_eq!(second.inserted_entries, first.inserted_entries);
+    let mut total_after_rewrite = 0u64;
+    for p in &patients {
+        total_after_rewrite += search_index_entry_count(&backend, &tenant, "Patient", p.id()).await;
+    }
+    assert_eq!(total_after_rewrite, first.inserted_entries);
+
+    // Step 3: contained.
+    let with_contained = StoredResource::from_storage(
+        "Observation",
+        "phase-stats-contained",
+        "1",
+        tenant.tenant_id().clone(),
+        json!({
+            "resourceType": "Observation",
+            "id": "phase-stats-contained",
+            "status": "final",
+            "contained": [{
+                "resourceType": "Patient",
+                "id": "inner",
+                "name": [{"family": "Contained"}]
+            }],
+            "subject": {"reference": "#inner"},
+            "code": {"coding": [{"system": "http://loinc.org", "code": "1234-5"}]}
+        }),
+        chrono::Utc::now(),
+        chrono::Utc::now(),
+        None,
+        FhirVersion::default(),
+    );
+    let mut third = ReindexPageStats::default();
+    let outcomes = target
+        .write_search_entries_page_timed(&tenant, std::slice::from_ref(&with_contained), &mut third)
+        .await;
+    assert!(outcomes.iter().all(|r| r.is_ok()), "{outcomes:?}");
+    let own_rows =
+        search_index_entry_count(&backend, &tenant, "Observation", "phase-stats-contained").await;
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect MongoDB client for search_index_contained assertions");
+    let database = client.database(&backend.config().database_name);
+    let contained_rows = database
+        .collection::<Document>("search_index_contained")
+        .count_documents(doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": "Observation",
+            "resource_id": "phase-stats-contained",
+        })
+        .await
+        .expect("failed to count search_index_contained rows");
+    assert!(contained_rows > 0);
+    assert_eq!(third.inserted_entries, own_rows + contained_rows);
+    assert_eq!(third.insert_commands, 2);
+
+    // Step 4: offloaded.
+    let Some(offloaded) =
+        create_backend_with_search_offloaded("reindex_page_phase_stats_offloaded", true).await
+    else {
+        eprintln!("Skipping the offloaded step (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let offloaded_target: &dyn ReindexTarget = &offloaded;
+    let mut offloaded_stats = ReindexPageStats::default();
+    let outcomes = offloaded_target
+        .write_search_entries_page_timed(&tenant, &patients, &mut offloaded_stats)
+        .await;
+    assert!(outcomes.iter().all(|r| matches!(r, Ok(0))), "{outcomes:?}");
+    assert_eq!(offloaded_stats, ReindexPageStats::default());
+}
+
 /// Guard for the `is_search_offloaded()` short-circuit the batched override
 /// needs. The default loop honors the flag via `delete_search_entries` and
 /// `write_search_entries`'s own guards; the page override has to reproduce
@@ -10079,6 +10250,197 @@ async fn mongodb_integration_settings_delete_is_idempotent() {
     assert!(!backend.delete_settings(&user).await.unwrap());
 }
 
+// ── Web UI login sessions (#1481) ──────────────────────────────────────
+//
+// The `SessionPersistence` contract the auth crate's `SessionStore` relies
+// on: conditional writes by version, pending logins consumed exactly once,
+// kinds kept apart, and a sweep by `expires_at`.
+
+fn login_session(id: &str) -> helios_auth::PersistedSession {
+    let now = chrono::Utc::now();
+    helios_auth::PersistedSession {
+        id: id.to_string(),
+        principal: helios_auth::SessionPrincipal {
+            subject: "demo-sub".to_string(),
+            issuer: "https://idp".to_string(),
+            name: Some("Demo User".to_string()),
+            preferred_username: None,
+            email: None,
+            picture: None,
+        },
+        access_token: "at-1".to_string(),
+        access_expires_at: now + chrono::TimeDelta::minutes(5),
+        refresh_token: Some("rt-1".to_string()),
+        id_token: None,
+        last_seen: now,
+        created_at: now,
+        version: 0,
+    }
+}
+
+fn pending_login(id: &str) -> helios_auth::PersistedPending {
+    helios_auth::PersistedPending {
+        id: id.to_string(),
+        state: "state-1".to_string(),
+        code_verifier: "verifier-1".to_string(),
+        next: "/ui/resources".to_string(),
+        started_at: chrono::Utc::now(),
+    }
+}
+
+#[tokio::test]
+async fn mongodb_integration_login_session_round_trips_with_its_version() {
+    use helios_auth::{SaveOutcome, SessionPersistence};
+    let Some(backend) = settings_mongo::backend("login_round_trip").await else {
+        eprintln!(
+            "Skipping mongodb_integration_login_session_round_trips_with_its_version (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let id = unique_user_key("login-session");
+    assert!(backend.load_session(&id).await.unwrap().is_none());
+
+    let saved = backend
+        .save_session(&login_session(&id), Some(0))
+        .await
+        .unwrap();
+    assert_eq!(saved, SaveOutcome::Saved(1));
+
+    let loaded = backend.load_session(&id).await.unwrap().unwrap();
+    assert_eq!(loaded.version, 1);
+    assert_eq!(loaded.access_token, "at-1");
+    assert_eq!(loaded.principal.display(), "Demo User");
+
+    let mut newer = loaded.clone();
+    newer.access_token = "at-2".to_string();
+    assert_eq!(
+        backend.save_session(&newer, Some(1)).await.unwrap(),
+        SaveOutcome::Saved(2)
+    );
+    assert_eq!(
+        backend
+            .load_session(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .access_token,
+        "at-2"
+    );
+    backend.delete_session(&id).await.unwrap();
+    assert!(backend.load_session(&id).await.unwrap().is_none());
+    backend.delete_session(&id).await.unwrap();
+}
+
+#[tokio::test]
+async fn mongodb_integration_login_session_stale_version_is_a_conflict() {
+    use helios_auth::{SaveOutcome, SessionPersistence};
+    let Some(backend) = settings_mongo::backend("login_conflict").await else {
+        eprintln!(
+            "Skipping mongodb_integration_login_session_stale_version_is_a_conflict (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let id = unique_user_key("login-conflict");
+    backend
+        .save_session(&login_session(&id), Some(0))
+        .await
+        .unwrap();
+    let mut stale = login_session(&id);
+    stale.access_token = "at-stale".to_string();
+    assert_eq!(
+        backend.save_session(&stale, Some(0)).await.unwrap(),
+        SaveOutcome::Conflict { current: 1 }
+    );
+    assert_eq!(
+        backend.save_session(&stale, Some(7)).await.unwrap(),
+        SaveOutcome::Conflict { current: 1 }
+    );
+    assert_eq!(
+        backend
+            .load_session(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .access_token,
+        "at-1"
+    );
+    let missing = unique_user_key("login-missing");
+    assert_eq!(
+        backend
+            .save_session(&login_session(&missing), Some(1))
+            .await
+            .unwrap(),
+        SaveOutcome::Conflict { current: 0 }
+    );
+    assert_eq!(
+        backend.save_session(&stale, None).await.unwrap(),
+        SaveOutcome::Saved(2)
+    );
+    backend.delete_session(&id).await.unwrap();
+}
+
+#[tokio::test]
+async fn mongodb_integration_pending_login_is_consumed_exactly_once_and_kinds_do_not_cross() {
+    use helios_auth::SessionPersistence;
+    let Some(backend) = settings_mongo::backend("login_pending").await else {
+        eprintln!(
+            "Skipping mongodb_integration_pending_login_is_consumed_exactly_once_and_kinds_do_not_cross (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let id = unique_user_key("pending");
+    backend.save_pending(&pending_login(&id)).await.unwrap();
+    let loaded = backend.load_pending(&id).await.unwrap().unwrap();
+    assert_eq!(loaded.state, "state-1");
+    assert_eq!(loaded.next, "/ui/resources");
+    assert!(backend.load_session(&id).await.unwrap().is_none());
+    backend.delete_session(&id).await.unwrap();
+    assert!(backend.load_pending(&id).await.unwrap().is_some());
+
+    assert!(backend.delete_pending(&id).await.unwrap());
+    assert!(!backend.delete_pending(&id).await.unwrap());
+    assert!(backend.load_pending(&id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn mongodb_integration_login_sweep_drops_only_what_has_expired() {
+    use helios_auth::SessionPersistence;
+    let Some(backend) = settings_mongo::backend("login_sweep").await else {
+        eprintln!(
+            "Skipping mongodb_integration_login_sweep_drops_only_what_has_expired (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let idle_id = unique_user_key("sweep-idle");
+    let live_id = unique_user_key("sweep-live");
+    let old_id = unique_user_key("sweep-old");
+    let fresh_id = unique_user_key("sweep-fresh");
+    let mut idle = login_session(&idle_id);
+    idle.last_seen = chrono::Utc::now() - chrono::TimeDelta::hours(9);
+    backend.save_session(&idle, None).await.unwrap();
+    backend
+        .save_session(&login_session(&live_id), None)
+        .await
+        .unwrap();
+    let mut old = pending_login(&old_id);
+    old.started_at = chrono::Utc::now() - chrono::TimeDelta::minutes(11);
+    backend.save_pending(&old).await.unwrap();
+    backend
+        .save_pending(&pending_login(&fresh_id))
+        .await
+        .unwrap();
+
+    // Other tests share the collection, so only what this test planted is
+    // asserted on, not the count.
+    backend.sweep(chrono::Utc::now()).await.unwrap();
+    assert!(backend.load_session(&idle_id).await.unwrap().is_none());
+    assert!(backend.load_session(&live_id).await.unwrap().is_some());
+    assert!(backend.load_pending(&old_id).await.unwrap().is_none());
+    assert!(backend.load_pending(&fresh_id).await.unwrap().is_some());
+    backend.delete_session(&live_id).await.unwrap();
+    backend.delete_pending(&fresh_id).await.unwrap();
+}
+
 #[tokio::test]
 async fn mongodb_integration_settings_get_missing_is_none() {
     let Some(backend) = settings_mongo::backend("settings_missing").await else {
@@ -10454,7 +10816,13 @@ mod bulk_submit {
 
     /// Creates a submission with one fetchable manifest — the shape the REST
     /// kickoff handler produces.
-    async fn seed(backend: &MongoBackend, tenant: &TenantContext) -> (SubmissionId, String) {
+    ///
+    /// `pub(super)` so the sibling `#[path]`-included `reindex_id_walk.rs`
+    /// module can reach it as `super::bulk_submit::seed` (#1403 P11).
+    pub(super) async fn seed(
+        backend: &MongoBackend,
+        tenant: &TenantContext,
+    ) -> (SubmissionId, String) {
         let id = SubmissionId::generate("data-provider");
         backend.create_submission(tenant, &id, None).await.unwrap();
         let manifest = backend
@@ -10511,7 +10879,7 @@ mod bulk_submit {
     static FAILPOINT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// A `failCommand` failpoint scoped to one client's `appName`.
-    struct FailPoint {
+    pub(super) struct FailPoint {
         admin: mongodb::Database,
         initial_count: i64,
         _lock: tokio::sync::MutexGuard<'static, ()>,
@@ -10522,7 +10890,11 @@ mod bulk_submit {
         /// Returns `None`, after printing why, when no Mongo is available or
         /// the server was not started with `enableTestCommands=1` (an
         /// external `HFS_TEST_MONGODB_URL`).
-        async fn enable(app_name: &str, mut data: Document, mode: Document) -> Option<FailPoint> {
+        pub(super) async fn enable(
+            app_name: &str,
+            mut data: Document,
+            mode: Document,
+        ) -> Option<FailPoint> {
             let lock = FAILPOINT_LOCK.lock().await;
             let Some(connection_string) = shared_mongo::connection_string().await else {
                 eprintln!("Skipping failpoint test (requires Docker or HFS_TEST_MONGODB_URL)");
@@ -10567,7 +10939,7 @@ mod bulk_submit {
         }
 
         /// Waits until this configuration has matched `additional` commands.
-        async fn wait_until_entered(&self, additional: i64) {
+        pub(super) async fn wait_until_entered(&self, additional: i64) {
             self.admin
                 .run_command(doc! {
                     "waitForFailPoint": "failCommand",
@@ -10581,7 +10953,7 @@ mod bulk_submit {
         /// Turns the failpoint off and releases the lock. Call at the end of
         /// every test; a `times`-bounded failpoint that is never turned off
         /// still only affects its own `appName`.
-        async fn off(self) {
+        pub(super) async fn off(self) {
             let _ = self
                 .admin
                 .run_command(doc! { "configureFailPoint": "failCommand", "mode": "off" })
@@ -11687,6 +12059,61 @@ mod bulk_submit {
         ));
     }
 
+    mod release_contract {
+        use helios_persistence as persistence;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/bulk_submit/release_contract.rs"
+        ));
+    }
+
+    /// See `release_contract::release_requeues_and_fences_out_a_zombie` (#1531).
+    #[tokio::test]
+    async fn test_submit_release_requeues_and_fences_out_a_zombie() {
+        let Some(backend) = create_backend("submit_release").await else {
+            return;
+        };
+        release_contract::release_requeues_and_fences_out_a_zombie(
+            &backend,
+            &create_tenant("submit-release"),
+        )
+        .await;
+    }
+
+    /// See `release_contract::release_after_abort_is_a_no_op` (#1531).
+    #[tokio::test]
+    async fn test_submit_release_after_abort_is_a_no_op() {
+        let Some(backend) = create_backend("submit_release_abort").await else {
+            return;
+        };
+        release_contract::release_after_abort_is_a_no_op(
+            &backend,
+            &create_tenant("submit-release-abort"),
+        )
+        .await;
+    }
+
+    mod claim_contract {
+        use helios_persistence as persistence;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/bulk_submit/claim_contract.rs"
+        ));
+    }
+
+    /// See `claim_contract::unleased_processing_is_not_claimable` (#1530).
+    #[tokio::test]
+    async fn test_unleased_processing_manifest_is_not_claimable() {
+        let Some(backend) = create_backend("submit_unleased_processing").await else {
+            return;
+        };
+        claim_contract::unleased_processing_is_not_claimable(
+            &backend,
+            &create_tenant("submit-tenant"),
+        )
+        .await;
+    }
+
     #[async_trait::async_trait]
     impl receipt_paging_contract::ReceiptFixture for MongoBackend {
         async fn seed_receipts(
@@ -12736,7 +13163,10 @@ mod bulk_submit {
             .await
             .unwrap()
             .expect("schema version document");
-        assert_eq!(schema_version.get_i32("version").unwrap(), 10_i32);
+        assert_eq!(
+            schema_version.get_i32("version").unwrap(),
+            helios_persistence::backends::mongodb::SCHEMA_VERSION
+        );
 
         let receipt_indexes: Vec<_> = entry_results
             .list_indexes()
@@ -13947,6 +14377,118 @@ async fn mongodb_integration_export_until_is_inclusive() {
         1,
         "a resource exactly on the bound is included"
     );
+}
+
+/// Exported lines carry `meta.versionId` / `meta.lastUpdated` from the stored
+/// document (#1273) on all three export queries, and client-supplied `meta`
+/// members survive the merge.
+#[tokio::test]
+async fn mongodb_integration_export_lines_carry_server_meta() {
+    use helios_persistence::core::bulk_export::{
+        ExportDataProvider, ExportRequest, PatientExportProvider,
+    };
+
+    let Some(backend) = create_backend("export_meta").await else {
+        eprintln!(
+            "Skipping mongodb_integration_export_lines_carry_server_meta (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("export-meta");
+
+    let tag = serde_json::json!([{"system": "http://example.org/tags", "code": "keep"}]);
+    let v1 = backend
+        .create(
+            &tenant,
+            "Patient",
+            serde_json::json!({"resourceType": "Patient", "meta": {"tag": tag.clone()}}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let patient_id = v1.id().to_string();
+    backend
+        .update(
+            &tenant,
+            &v1,
+            serde_json::json!({
+                "resourceType": "Patient",
+                "id": patient_id,
+                "meta": {"tag": tag.clone()}
+            }),
+        )
+        .await
+        .unwrap();
+    pin_last_updated(&backend, &patient_id, instant("2026-02-01T12:00:00Z")).await;
+
+    let obs = backend
+        .create(
+            &tenant,
+            "Observation",
+            serde_json::json!({
+                "resourceType": "Observation",
+                "status": "final",
+                "code": {"text": "x"},
+                "subject": {"reference": format!("Patient/{patient_id}")}
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let obs_id = obs.id().to_string();
+    pin_last_updated(&backend, &obs_id, instant("2026-02-02T08:30:00Z")).await;
+
+    fn meta_of(line: &str) -> serde_json::Value {
+        let resource: serde_json::Value = serde_json::from_str(line).unwrap();
+        resource["meta"].clone()
+    }
+
+    let system = backend
+        .fetch_export_batch(&tenant, &ExportRequest::system(), "Patient", None, 10)
+        .await
+        .unwrap();
+    assert_eq!(system.lines.len(), 1);
+    let meta = meta_of(&system.lines[0]);
+    assert_eq!(meta["versionId"], "2", "system export carries versionId");
+    assert_eq!(meta["lastUpdated"], "2026-02-01T12:00:00.000Z");
+    assert_eq!(meta["tag"], tag, "client meta.tag is preserved");
+
+    let ids = vec![patient_id.clone()];
+    let patient_branch = backend
+        .fetch_patient_compartment_batch(
+            &tenant,
+            &ExportRequest::patient(),
+            "Patient",
+            &ids,
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(patient_branch.lines.len(), 1);
+    let meta = meta_of(&patient_branch.lines[0]);
+    assert_eq!(meta["versionId"], "2", "Patient branch carries versionId");
+    assert_eq!(meta["lastUpdated"], "2026-02-01T12:00:00.000Z");
+    assert_eq!(meta["tag"], tag);
+
+    let compartment = backend
+        .fetch_patient_compartment_batch(
+            &tenant,
+            &ExportRequest::patient(),
+            "Observation",
+            &ids,
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(compartment.lines.len(), 1);
+    let meta = meta_of(&compartment.lines[0]);
+    assert_eq!(
+        meta["versionId"], "1",
+        "compartment branch carries versionId"
+    );
+    assert_eq!(meta["lastUpdated"], "2026-02-02T08:30:00.000Z");
 }
 
 #[tokio::test]
@@ -16653,6 +17195,605 @@ async fn mongodb_integration_composite_multi_batch_driver_paging() {
     assert_eq!(count as usize, MATCHING);
 }
 
+/// #1394: `ifNoneExist` inside a MongoDB transaction with search offloaded
+/// goes through the shared conditional builder, exactly like `If-None-Exist`
+/// on the resource endpoint. The scan only evaluates `_id`, `_lastUpdated`
+/// and plain `identifier` values against the raw `resources` documents; every
+/// other shape is rejected, never silently ignored or silently unmatched.
+///
+/// All tests below run on an offloaded backend against the harness's own
+/// single-node replica-set container, so multi-document transactions really
+/// execute (see [`process_transaction_or_skip`]).
+/// Builds an offloaded backend: no `search_index` rows, so the in-transaction
+/// resolver takes the raw-document scan.
+async fn i1394r1_offloaded_backend(test_name: &str) -> Option<MongoBackend> {
+    create_backend_with_search_offloaded(test_name, true).await
+}
+
+fn i1394r1_tenant(label: &str) -> TenantContext {
+    create_tenant(&format!("i1394r1-{label}"))
+}
+
+fn i1394r1_patient(family: &str, identifier_value: &str) -> serde_json::Value {
+    json!({
+        "resourceType": "Patient",
+        "identifier": [{"system": "http://example.org/mrn", "value": identifier_value}],
+        "name": [{"family": family}]
+    })
+}
+
+fn i1394r1_create_entry(family: &str, identifier_value: &str, criteria: &str) -> BundleEntry {
+    BundleEntry {
+        method: BundleMethod::Post,
+        url: "Patient".to_string(),
+        resource: Some(i1394r1_patient(family, identifier_value)),
+        if_match: None,
+        if_none_match: None,
+        if_none_exist: Some(criteria.to_string()),
+        full_url: Some(format!("urn:uuid:i1394r1-{family}")),
+    }
+}
+
+async fn i1394r1_seed(
+    backend: &MongoBackend,
+    tenant: &TenantContext,
+    family: &str,
+    identifier_value: &str,
+) {
+    backend
+        .create(
+            tenant,
+            "Patient",
+            i1394r1_patient(family, identifier_value),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed patient");
+}
+
+async fn i1394r1_patient_count(backend: &MongoBackend, tenant: &TenantContext) -> u64 {
+    // `count` reads the raw `resources` documents; `search` would consult the
+    // local `search_index`, which stays empty when search is offloaded.
+    backend
+        .count(tenant, Some("Patient"))
+        .await
+        .expect("count patients")
+}
+
+/// A `_lastUpdated` criterion with a future prefix matches nothing, so the
+/// entry is created. Before the fix the scan silently ignored `_lastUpdated`,
+/// matched the whole type and answered 200 without creating.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_prefixed_last_updated_creates() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_last_updated").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_prefixed_last_updated_creates (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("last-updated");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![i1394r1_create_entry(
+            "New",
+            "MRN-NEW-1",
+            "_lastUpdated=ge9999-01-01",
+        )],
+        "i1394r1_offloaded_if_none_exist_prefixed_last_updated_creates",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 201);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 2);
+}
+
+/// An OR-list over `identifier` matches when any alternative does, so the
+/// entry is answered from the match. Before the fix the raw comma string
+/// matched nothing and the entry was duplicated.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_identifier_or_list_matches() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_or_list").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_identifier_or_list_matches (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("or-list");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![i1394r1_create_entry(
+            "Duplicate",
+            "MRN-OTHER",
+            "identifier=MRN-BASE-1,OTHER",
+        )],
+        "i1394r1_offloaded_if_none_exist_identifier_or_list_matches",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 200);
+    assert_eq!(result.entries[0].effect, BundleEntryEffect::NoOp);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// A system-less `|code` criterion matches an identifier carrying any system,
+/// so the entry is answered from the seeded match instead of being created.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_identifier_any_system_matches() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_any_system").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_identifier_any_system_matches (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("any-system");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![i1394r1_create_entry(
+            "Duplicate",
+            "MRN-OTHER",
+            "identifier=|MRN-BASE-1",
+        )],
+        "i1394r1_offloaded_if_none_exist_identifier_any_system_matches",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 200);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// An unknown parameter rolls the bundle back instead of being ignored.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_unknown_parameter_fails() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_unknown").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_unknown_parameter_fails (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("unknown");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let err = backend
+        .process_transaction(
+            &tenant,
+            vec![i1394r1_create_entry("New", "MRN-NEW-1", "nickname=Seeded")],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("an unknown ifNoneExist parameter must fail the bundle");
+    assert!(
+        matches!(err, TransactionError::BundleError { index: 0, .. }),
+        "the failure must surface as a BundleError at entry 0, got: {err}"
+    );
+    assert!(
+        err.to_string().contains("'nickname'"),
+        "the error must name the parameter, got: {err}"
+    );
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// A modifier the raw scan cannot evaluate rolls the bundle back. A bare
+/// modifier on `identifier` is rejected by the shared builder with the same
+/// rule direct search applies.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_modifier_fails() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_modifier").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_modifier_fails (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("modifier");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let err = backend
+        .process_transaction(
+            &tenant,
+            vec![i1394r1_create_entry(
+                "New",
+                "MRN-NEW-1",
+                "identifier:missing=true",
+            )],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("an unscoped :missing modifier must fail the bundle");
+    assert!(
+        matches!(err, TransactionError::BundleError { index: 0, .. }),
+        "the failure must surface as a BundleError at entry 0, got: {err}"
+    );
+    assert!(
+        err.to_string()
+            .contains("unsupported modifier 'missing' for parameter type 'token'"),
+        "the error must name the modifier and parameter type, got: {err}"
+    );
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// An empty criterion value rolls the bundle back instead of widening the
+/// match to the whole type.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_empty_value_fails() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_empty").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_empty_value_fails (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("empty");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let err = backend
+        .process_transaction(
+            &tenant,
+            vec![i1394r1_create_entry("New", "MRN-NEW-1", "identifier=")],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("an empty ifNoneExist value must fail the bundle");
+    assert!(
+        matches!(err, TransactionError::BundleError { index: 0, .. }),
+        "the failure must surface as a BundleError at entry 0, got: {err}"
+    );
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// Result-shaping parameters are not criteria: with nothing else left, the
+/// entry is created (no match), exactly as on the endpoint path.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_result_only_creates() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_result_only").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_result_only_creates (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("result-only");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![i1394r1_create_entry("New", "MRN-NEW-1", "_format=json")],
+        "i1394r1_offloaded_if_none_exist_result_only_creates",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 201);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 2);
+}
+
+/// Repeated parameters AND: both must hold for a match, so a half-matching
+/// entry is created.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_repeated_params_and() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_and").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_repeated_params_and (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("and");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![i1394r1_create_entry(
+            "New",
+            "MRN-NEW-1",
+            "identifier=MRN-BASE-1&identifier=MRN-ABSENT",
+        )],
+        "i1394r1_offloaded_if_none_exist_repeated_params_and",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 201);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 2);
+}
+
+/// Positive control: a supported `system|code` identifier criterion matches
+/// and the entry is answered from the existing resource.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_identifier_matches() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_identifier").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_identifier_matches (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("identifier");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![i1394r1_create_entry(
+            "Duplicate",
+            "MRN-OTHER",
+            "identifier=http://example.org/mrn|MRN-BASE-1",
+        )],
+        "i1394r1_offloaded_if_none_exist_identifier_matches",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 200);
+    assert_eq!(result.entries[0].effect, BundleEntryEffect::NoOp);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// An invalid `_lastUpdated` value rolls the bundle back with a
+/// `BundleError` instead of matching or creating: the date parses nowhere,
+/// so nothing is written.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_invalid_last_updated_fails() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_bad_date").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_invalid_last_updated_fails (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("bad-date");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let err = backend
+        .process_transaction(
+            &tenant,
+            vec![i1394r1_create_entry(
+                "New",
+                "MRN-NEW-1",
+                "_lastUpdated=not-a-date",
+            )],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("an invalid _lastUpdated value must fail the bundle");
+    assert!(
+        matches!(err, TransactionError::BundleError { index: 0, .. }),
+        "the failure must surface as a BundleError at entry 0, got: {err}"
+    );
+    assert!(
+        err.to_string().contains("_lastUpdated"),
+        "the error must name the parameter, got: {err}"
+    );
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// A registered but unevaluatable parameter rolls the bundle back instead of
+/// being ignored: `family` never widens into a whole-type match.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_registered_string_fails() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_family").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_registered_string_fails (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("family");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let err = backend
+        .process_transaction(
+            &tenant,
+            vec![i1394r1_create_entry("New", "MRN-NEW-1", "family=Seeded")],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("a registered but unevaluatable parameter must fail the bundle");
+    assert!(
+        matches!(err, TransactionError::BundleError { index: 0, .. }),
+        "the failure must surface as a BundleError at entry 0, got: {err}"
+    );
+    assert!(
+        err.to_string().contains("'family'"),
+        "the error must name the parameter, got: {err}"
+    );
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// A `system|` value with an empty code is not a usable identifier criterion,
+/// so the bundle rolls back instead of matching or creating.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_identifier_empty_code_fails() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_empty_code").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_identifier_empty_code_fails (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("empty-code");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let err = backend
+        .process_transaction(
+            &tenant,
+            vec![i1394r1_create_entry(
+                "New",
+                "MRN-NEW-1",
+                "identifier=http://example.org/mrn|",
+            )],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("an identifier with an empty code must fail the bundle");
+    assert!(
+        matches!(err, TransactionError::BundleError { index: 0, .. }),
+        "the failure must surface as a BundleError at entry 0, got: {err}"
+    );
+    assert!(
+        err.to_string().contains("'identifier'"),
+        "the error must name the parameter, got: {err}"
+    );
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// A value with more than one pipe is not a `system|code` pair the raw scan
+/// can evaluate, so the bundle rolls back.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_identifier_multi_pipe_fails() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_multi_pipe").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_identifier_multi_pipe_fails (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("multi-pipe");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let err = backend
+        .process_transaction(
+            &tenant,
+            vec![i1394r1_create_entry("New", "MRN-NEW-1", "identifier=a|b|c")],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("an identifier with more than one pipe must fail the bundle");
+    assert!(
+        matches!(err, TransactionError::BundleError { index: 0, .. }),
+        "the failure must surface as a BundleError at entry 0, got: {err}"
+    );
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// Tenant isolation: an identifier living in another tenant must not
+/// suppress a create. The scan filters on `tenant_id`, so the entry in
+/// tenant B is created even though tenant A holds the same identifier.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_tenant_isolation_creates() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_tenant_iso").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_tenant_isolation_creates (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant_a = i1394r1_tenant("iso-a");
+    let tenant_b = i1394r1_tenant("iso-b");
+    i1394r1_seed(&backend, &tenant_a, "Seeded", "MRN-BASE-1").await;
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant_b,
+        vec![i1394r1_create_entry(
+            "New",
+            "MRN-NEW-1",
+            "identifier=MRN-BASE-1",
+        )],
+        "i1394r1_offloaded_if_none_exist_tenant_isolation_creates",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 201);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant_b).await, 1);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant_a).await, 1);
+}
+
+/// Read-your-writes: two entries in one bundle, where the second entry's
+/// `ifNoneExist` matches the resource the first entry created. The scan
+/// runs inside the transaction session, so it sees the pending write and
+/// answers the second entry from it instead of creating a duplicate.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_read_your_writes_matches() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_ryw").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_read_your_writes_matches (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("ryw");
+
+    let create = BundleEntry {
+        method: BundleMethod::Post,
+        url: "Patient".to_string(),
+        resource: Some(i1394r1_patient("First", "MRN-NEW-1")),
+        if_match: None,
+        if_none_match: None,
+        if_none_exist: None,
+        full_url: Some("urn:uuid:i1394r1-ryw-first".to_string()),
+    };
+    let conditional = i1394r1_create_entry("Second", "MRN-OTHER", "identifier=MRN-NEW-1");
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![create, conditional],
+        "i1394r1_offloaded_if_none_exist_read_your_writes_matches",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 201);
+    assert_eq!(result.entries[1].status, 200);
+    assert_eq!(result.entries[1].effect, BundleEntryEffect::NoOp);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// A comma-separated `_id` list matches when any alternative does: the
+/// seeded id is present, so the entry is answered from the match instead
+/// of creating a duplicate. `_id` reuses the resource-level predicate
+/// direct search builds (`$in`), evaluated against the raw documents.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_id_or_list_matches() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_id_list").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_id_or_list_matches (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("id-list");
+    let seeded = backend
+        .create(
+            &tenant,
+            "Patient",
+            i1394r1_patient("Seeded", "MRN-BASE-1"),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed patient");
+    let real_id = seeded.id().to_string();
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![i1394r1_create_entry(
+            "Duplicate",
+            "MRN-OTHER",
+            &format!("_id=absent,{real_id}"),
+        )],
+        "i1394r1_offloaded_if_none_exist_id_or_list_matches",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 200);
+    assert_eq!(result.entries[0].effect, BundleEntryEffect::NoOp);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
 /// The backend-agnostic contract of the secondary sync failure ledger
 /// (#1334). Same `#[path]` arrangement as the search suites.
 #[path = "common/sync_failure_ledger_suite.rs"]
@@ -16670,4 +17811,78 @@ async fn mongodb_sync_failure_ledger_contract() {
         &format!("ledger-1334-{}", uuid::Uuid::new_v4()),
     )
     .await;
+}
+
+/// `Patient/$export` decides membership with the compartment's own parameter
+/// set (#1122): a resource that joins through `recorder`, `performer` or
+/// `link` is exported, one that merely mentions the patient elsewhere is not.
+#[tokio::test]
+async fn mongodb_integration_export_compartment_membership_follows_the_compartment_definition() {
+    use helios_persistence::core::bulk_export::{ExportRequest, PatientExportProvider};
+
+    let Some(backend) = create_backend("export_compartment_params").await else {
+        eprintln!(
+            "Skipping mongodb_integration_export_compartment_membership_follows_the_compartment_definition (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("export-compartment-params");
+
+    for resource in [
+        serde_json::json!({"resourceType": "Patient", "id": "p1"}),
+        serde_json::json!({"resourceType": "Patient", "id": "other"}),
+        serde_json::json!({"resourceType": "Patient", "id": "linked",
+            "link": [{"other": {"reference": "Patient/p1"}, "type": "seealso"}]}),
+        serde_json::json!({"resourceType": "AllergyIntolerance", "id": "recorded",
+            "patient": {"reference": "Patient/other"},
+            "recorder": {"reference": "Patient/p1"}}),
+        serde_json::json!({"resourceType": "AllergyIntolerance", "id": "someone-elses",
+            "patient": {"reference": "Patient/other"}}),
+        serde_json::json!({"resourceType": "Observation", "id": "performed", "status": "final",
+            "code": {"text": "x"}, "subject": {"reference": "Patient/other"},
+            "performer": [{"reference": "Patient/p1/_history/2"}]}),
+        serde_json::json!({"resourceType": "Observation", "id": "about", "status": "final",
+            "code": {"text": "x"}, "subject": {"reference": "Patient/p1"}}),
+        serde_json::json!({"resourceType": "Observation", "id": "mentions-only", "status": "final",
+            "code": {"text": "x"}, "subject": {"reference": "Patient/other"},
+            "focus": [{"reference": "Patient/p1"}]}),
+    ] {
+        let resource_type = resource["resourceType"].as_str().unwrap().to_string();
+        backend
+            .create(&tenant, &resource_type, resource, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+
+    let request = ExportRequest::patient();
+    let ids = ["p1".to_string()];
+    let exported = |resource_type: &'static str| {
+        let backend = &backend;
+        let tenant = &tenant;
+        let request = &request;
+        let ids = &ids;
+        async move {
+            let batch = backend
+                .fetch_patient_compartment_batch(tenant, request, resource_type, ids, None, 100)
+                .await
+                .unwrap();
+            let mut out: Vec<String> = batch
+                .lines
+                .iter()
+                .map(|line| {
+                    serde_json::from_str::<serde_json::Value>(line).unwrap()["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect();
+            out.sort();
+            out
+        }
+    };
+
+    assert_eq!(exported("AllergyIntolerance").await, ["recorded"]);
+    assert_eq!(exported("Observation").await, ["about", "performed"]);
+    assert_eq!(exported("Patient").await, ["linked", "p1"]);
+    assert!(exported("Organization").await.is_empty());
 }

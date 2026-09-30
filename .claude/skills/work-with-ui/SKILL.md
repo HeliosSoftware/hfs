@@ -88,7 +88,11 @@ through to the normal REST surface.
   `{% include %}`d into pages so the first render and the swap emit identical markup.
 - `templates/icons/*.svg` — Figma exports, fills normalized to `currentColor`, inlined.
 - `assets/` — `htmx.min.js` (pinned), `app.css`, `fonts/`, `logo.png`, the
-  shared `busy.js` (#679, `window.hfsBusy`), the vendored CodeMirror 6 bundle
+  shared `busy.js` (#679, `window.hfsBusy`), the shared unsaved-changes
+  tracker `unsaved.js` (`window.HfsUnsaved.track({ root, form?, read?,
+  cue? })`, #1240 — one dirty flag per form, the `.tag--unsaved` pill, the
+  `beforeunload` guard, and `confirmDiscard(scope)` for in-page closes; no
+  storage), the vendored CodeMirror 6 bundle
   (`vendor/codemirror.bundle.js`, `window.HfsCodeMirror`) with its shared
   mount helper `code-editor.js` (`window.HfsCodeEditor`, #838, also the
   shared JSON token-color preset `jsonHighlight()`, #840), the shared

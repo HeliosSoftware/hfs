@@ -1313,11 +1313,16 @@ pub struct ServerConfig {
     pub reindex_batch_size: u32,
 
     /// Byte cap of one page of the automatic rebuild, on top of
-    /// `HFS_REINDEX_BATCH_SIZE`. `0` (the default) means count only; with a
-    /// cap set, a page of ~108 KB `Provenance` resources ends at the first one
-    /// that crosses it instead of holding ~108 MB in memory (#1125). Honoured
-    /// by the SQLite source; other sources page by count only.
-    #[arg(long, env = "HFS_REINDEX_BATCH_BYTES", default_value = "0")]
+    /// `HFS_REINDEX_BATCH_SIZE`. `0` means count only; with a cap set, a page
+    /// of ~108 KB `Provenance` resources stays near the cap instead of
+    /// holding ~108 MB in memory (#1125). Honoured by the SQLite source (a
+    /// page may exceed the cap by one resource) and by the PostgreSQL and
+    /// MongoDB sources (a page never exceeds the cap unless it holds a single
+    /// resource, #1499); the Elasticsearch and S3 sources page by count only.
+    /// Defaults to 32 MiB so an automatic rebuild is bounded even when an
+    /// operator never sets it; `ReindexRequest` and `AutomaticRunOptions`
+    /// keep a library default of `0`, so manual `$reindex` is unchanged.
+    #[arg(long, env = "HFS_REINDEX_BATCH_BYTES", default_value = "33554432")]
     pub reindex_batch_bytes: u64,
 
     /// Enable SQL-on-FHIR operations ($sql-run, $sql-export).
@@ -1594,7 +1599,7 @@ impl Default for ServerConfig {
             elasticsearch_bulk_concurrency: 1,
             elasticsearch_reindex_refresh: None,
             reindex_batch_size: 1000,
-            reindex_batch_bytes: 0,
+            reindex_batch_bytes: 32 * 1024 * 1024,
             sof_enabled: true,
             ui_enabled: true,
             dashboard_reconcile_interval_secs: 30,
@@ -1864,7 +1869,7 @@ impl ServerConfig {
             elasticsearch_bulk_concurrency: 1,
             elasticsearch_reindex_refresh: None,
             reindex_batch_size: 1000,
-            reindex_batch_bytes: 0,
+            reindex_batch_bytes: 32 * 1024 * 1024,
             sof_enabled: true,
             ui_enabled: true,
             dashboard_reconcile_interval_secs: 30,
@@ -2458,9 +2463,10 @@ mod tests {
 
     // ── Elasticsearch client / rebuild knobs (#1125) ──────────────
 
-    /// Every default reproduces today's behavior: a 30 s client timeout, the
-    /// 1000-row deferred rebuild page, and a rebuild refresh that follows
-    /// `HFS_ELASTICSEARCH_WRITE_REFRESH`.
+    /// Every default reproduces today's behavior, except the reindex byte cap
+    /// (32 MiB, #1499 — the new default is intentional, not a regression): a
+    /// 30 s client timeout, the 1000-row deferred rebuild page, and a rebuild
+    /// refresh that follows `HFS_ELASTICSEARCH_WRITE_REFRESH`.
     #[test]
     fn test_elasticsearch_rebuild_knob_defaults() {
         let parsed = ServerConfig::try_parse_from(["rest-server"]).unwrap();
@@ -2469,7 +2475,7 @@ mod tests {
             assert_eq!(config.elasticsearch_bulk_max_bytes, 10 * 1024 * 1024);
             assert_eq!(config.elasticsearch_reindex_refresh, None);
             assert_eq!(config.reindex_batch_size, 1000);
-            assert_eq!(config.reindex_batch_bytes, 0);
+            assert_eq!(config.reindex_batch_bytes, 32 * 1024 * 1024);
             assert_eq!(config.elasticsearch_bulk_concurrency, 1);
         }
     }

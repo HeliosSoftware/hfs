@@ -139,6 +139,19 @@ loudly; one that silently *ignores* them would turn every concurrent write into 
 lost update with no error anywhere, so verify support before pointing HFS at an
 unfamiliar S3-compatible provider.
 
+### Conditional interactions on S3
+
+S3 has no search index, so of the four conditional interactions it serves only
+**conditional create** (`POST [type]` with `If-None-Exist`, and `batch` entries
+with `ifNoneExist`), identifier-scoped (#1435): `_id` criteria read the objects
+they name, `identifier` criteria walk the type's prefix (one `LIST` plus `GET`s
+until the second match) and are read as token search reads them (`code`,
+`system|code`, `|code`, `system|`; repeated criteria AND, comma lists OR). Any
+other parameter is refused with `400` before anything is read. Conditional
+update, delete and patch answer `501`, and the CapabilityStatement says so.
+The scan costs what an export or SQL-on-FHIR scan of the type costs; see #1502
+for the `LIST` curve on large prefixes.
+
 ### S3 key prefixes (IAM)
 
 The backend writes under these prefixes inside `HFS_S3_BUCKET` (each below the
@@ -150,16 +163,18 @@ optional `HFS_S3_PREFIX`):
 | `{tenant}/bulk/submit/` | Bulk-submit staging |
 | `tenants/` | Tenant registry |
 | `_system.user-settings/` | Per-user UI settings (`/_user/settings`) |
+| `_system.login-sessions/` | Web UI login sessions and pending logins (#1481) |
 
-The last two are **cross-tenant** and sit outside any tenant prefix. A
+The last three are **cross-tenant** and sit outside any tenant prefix. A
 least-privilege bucket policy scoped only to the FHIR prefixes will pass startup
 validation (which only issues `HeadBucket`) and then return `AccessDenied` — a
 500 on every affected request. Grant the policy these prefixes too.
 
 Note also that a **bucket-wide** lifecycle rule (expiration or Glacier
-transition) will apply to `_system.user-settings/` as well: expiry silently resets
-users' preferences, and a Glacier transition makes them unreadable. Scope lifecycle
-rules to the FHIR prefixes.
+transition) will apply to `_system.user-settings/` and `_system.login-sessions/`
+as well: expiry silently resets users' preferences or signs everyone out, and a
+Glacier transition makes them unreadable. Scope lifecycle rules to the FHIR
+prefixes.
 
 ## Per-user UI settings
 

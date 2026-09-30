@@ -115,13 +115,15 @@ pub enum Phase {
     ReindexPage,
     /// Acquire the PostgreSQL connection used by a reindex page.
     ReindexConnection,
-    /// Extract and marshal every resource in a PostgreSQL reindex page.
+    /// Extract and marshal every resource in a PostgreSQL or MongoDB reindex page.
     ReindexExtract,
-    /// Grouped delete from `search_index` for a PostgreSQL reindex page.
+    /// Grouped delete from `search_index` (MongoDB: and `search_index_contained`)
+    /// for a PostgreSQL or MongoDB reindex page.
     ReindexSearchDelete,
     /// Grouped delete from `resource_fts` for a PostgreSQL reindex page.
     ReindexFtsDelete,
-    /// Batched insert into `search_index` for a PostgreSQL reindex page.
+    /// Batched insert into `search_index` (MongoDB: and `search_index_contained`)
+    /// for a PostgreSQL or MongoDB reindex page.
     ReindexSearchInsert,
     /// Rebuild full-text rows for a PostgreSQL reindex page.
     ReindexFts,
@@ -140,11 +142,15 @@ pub enum Phase {
     SubmitHeartbeatScheduleDelay,
     /// The job-store heartbeat RPC, excluding its scheduling delay.
     SubmitHeartbeatRpc,
+    /// Time a MongoDB reindex page's thread waited on its delete/insert tasks (#1403).
+    ReindexDbWait,
+    /// Time the reindex driver waited for a prefetched page (#1403).
+    ReindexFetchWait,
 }
 
 impl Phase {
     /// All phases, in report order.
-    pub const ALL: [Phase; 36] = [
+    pub const ALL: [Phase; 38] = [
         Phase::NdjsonParse,
         Phase::Entry,
         Phase::EntryRead,
@@ -181,6 +187,8 @@ impl Phase {
         Phase::PostgresPoolCheckout,
         Phase::SubmitHeartbeatScheduleDelay,
         Phase::SubmitHeartbeatRpc,
+        Phase::ReindexDbWait,
+        Phase::ReindexFetchWait,
     ];
 
     /// The phase this one is measured inside of, if any. Drives the report's
@@ -212,7 +220,8 @@ impl Phase {
             | Phase::ReindexSearchInsert
             | Phase::ReindexFts
             | Phase::ReindexCommit
-            | Phase::ReindexFallback => Some(Phase::ReindexPage),
+            | Phase::ReindexFallback
+            | Phase::ReindexDbWait => Some(Phase::ReindexPage),
             _ => None,
         }
     }
@@ -256,11 +265,13 @@ impl Phase {
             Phase::PostgresPoolCheckout => "postgres_pool_checkout",
             Phase::SubmitHeartbeatScheduleDelay => "submit_heartbeat_schedule_delay",
             Phase::SubmitHeartbeatRpc => "submit_heartbeat_rpc",
+            Phase::ReindexDbWait => "reindex_db_wait",
+            Phase::ReindexFetchWait => "reindex_fetch_wait",
         }
     }
 }
 
-const PHASE_COUNT: usize = 36;
+const PHASE_COUNT: usize = 38;
 
 #[allow(clippy::declare_interior_mutable_const)]
 const ZERO: AtomicU64 = AtomicU64::new(0);
@@ -865,6 +876,26 @@ mod tests {
                 assert!(depth < PHASE_COUNT, "{phase:?} nests without terminating");
             }
         }
+    }
+
+    #[test]
+    fn reindex_db_wait_and_fetch_wait_are_wired_correctly() {
+        assert_eq!(
+            Phase::ALL.len(),
+            38,
+            "PHASE_COUNT and ALL must both grow to 38 (#1403)"
+        );
+        assert_eq!(PHASE_COUNT, 38);
+        assert_eq!(Phase::ReindexDbWait.label(), "reindex_db_wait");
+        assert_eq!(Phase::ReindexDbWait.nested_in(), Some(Phase::ReindexPage));
+        assert_eq!(Phase::ReindexFetchWait.label(), "reindex_fetch_wait");
+        assert_eq!(Phase::ReindexFetchWait.nested_in(), None);
+        assert_eq!(
+            Phase::ALL[36],
+            Phase::ReindexDbWait,
+            "appended after SubmitHeartbeatRpc, before ReindexFetchWait"
+        );
+        assert_eq!(Phase::ALL[37], Phase::ReindexFetchWait);
     }
 
     #[cfg(perf_phases)]

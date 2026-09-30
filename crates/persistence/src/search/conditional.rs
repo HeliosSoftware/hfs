@@ -57,7 +57,7 @@ const CONDITIONAL_MATCH_LIMIT: u32 = 1000;
 /// negotiating content, not adding a criterion. Treated as a filter, such a
 /// name has no index rows, never matches, and turns every conditional update
 /// into a create — so they are dropped, as direct search drops them.
-const RESULT_PARAMS: &[&str] = &[
+pub(crate) const RESULT_PARAMS: &[&str] = &[
     "_format",
     "_pretty",
     "_count",

@@ -70,16 +70,19 @@ table and Columns card left on screen under a "last successful run" meta,
 it through the combobox clears the lint, refreshes the table, and fills
 Columns with the newly declared label's own origin |
 | `tests/editor-pair.spec.ts` | The shared editor/guided-form host (`assets/editor-pair.js`, #840) — coverage of the pairing's own contract that is not tied to one page: the invalid-JSON chip still switches after a guided-form round trip has replaced the `.editor-form` card underneath it |
-| `tests/nojs/*.spec.ts` | the README promise: the UI works with JavaScript disabled (`nojs` project) — includes `sql-view-definitions.spec.ts`'s and `sql-libraries.spec.ts`'s own cases: the guided-form card (#843/#840) stays hidden and both editors work alone; (#821) a ViewDefinition with lint errors still saves through Save with no dialog and no `.cm-editor` on the page at all; for `sql-libraries.spec.ts`, editing both the Details and SQL textareas by hand and saving persists the merged Library, (#841) the Parameters card's native `<details>` disclosure plus a plain `formaction` submit adds a declaration and re-renders the page around it, with the saved page then showing the "waiting" notice for the still-unfilled value, (#842) the Tables panel's own fallback textarea (`data-combobox-fallback`) takes a hand-typed `ViewDefinition/{id}` reference — *Add table* re-renders the page around the resolved row and Save persists the `depends-on` entry, and (#842/04) saving a SQL that reads an undeclared table shows the same lint notice and red row on `?…&saved=1`'s own server-rendered page, with *Add table* already open and its alias pre-filled — the only way a no-JS visitor can reach it |
+| `tests/nojs/*.spec.ts` | the README promise: the UI works with JavaScript disabled (`nojs` project) — includes `sql-view-definitions.spec.ts`'s and `sql-libraries.spec.ts`'s own cases: the guided-form card (#843/#840) stays hidden and both editors work alone; (#821) a ViewDefinition with lint errors still saves through Save with no dialog and no `.cm-editor` on the page at all; for `sql-libraries.spec.ts`, editing the Details JSON's own `application/sql` attachment by hand wins over the SQL card on Save (#1233 — the JSON is the document of record, the card only fills in when the JSON carries no readable SQL attachment of its own), (#841) the Parameters card's native `<details>` disclosure plus a plain `formaction` submit adds a declaration and re-renders the page around it, with the saved page then showing the "waiting" notice for the still-unfilled value, (#842) the Tables panel's own fallback textarea (`data-combobox-fallback`) takes a hand-typed `ViewDefinition/{id}` reference — *Add table* re-renders the page around the resolved row and Save persists the `depends-on` entry, and (#842/04) saving a SQL that reads an undeclared table shows the same lint notice and red row on `?…&saved=1`'s own server-rendered page, with *Add table* already open and its alias pre-filled — the only way a no-JS visitor can reach it |
 
 Pure-function browser modules (`assets/combobox.js`; `assets/editor-pair.js`'s
 `minimalChange`; `assets/vd-editor.js`'s completion/diagnostic-fix helpers
 (#821) — `skeletonForDetail`, `classifyObjectGap`, `buildKeyInsertion`,
 `codePointOffset`/`utf16OffsetForCodePoints`, `stringContentRange`,
-`escapeJsonStringContent`, `removeKeyRange`; the vendored bundle's own export
-surface and size budget) get a third, faster ring: plain Node tests under
-`unit/` (`editor-pair.test.cjs`, `vd-editor.test.cjs`,
-`codemirror-bundle.test.cjs`), run with `npm run test:unit` — no browser, no
+`escapeJsonStringContent`, `removeKeyRange`; `assets/sql-library-sync.js`'s
+own base64/JSON helpers behind the live Details JSON <-> SQL card sync
+(#1233) — `encodeSql`, `decodeSql`, `findSqlAttachment`, `sqlFromJson`,
+`jsonWithSql`; the vendored bundle's own export surface and size budget) get
+a third, faster ring: plain Node tests under `unit/` (`editor-pair.test.cjs`,
+`vd-editor.test.cjs`, `codemirror-bundle.test.cjs`,
+`sql-library-sync.test.cjs`), run with `npm run test:unit` — no browser, no
 server. `editor-pair.js` and `vd-editor.js` are wired UMD-style
 (`module.exports` under Node; `window.HfsEditorPair` / auto-mount under a
 real `document`) specifically so this stays possible without a second copy

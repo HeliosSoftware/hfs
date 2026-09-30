@@ -232,29 +232,6 @@ where
         "unresolvable path"
     );
 
-    // FHIRPath Patch used to be a stub that changed nothing and still wrote a
-    // new version. It is refused, and no version is written.
-    let result = backend
-        .conditional_patch(
-            &t,
-            "Patient",
-            CRITERIA,
-            &PatchFormat::FhirPathPatch(json!({
-                "resourceType": "Parameters",
-                "parameter": [{"name": "operation", "part": [
-                    {"name": "type", "valueCode": "replace"},
-                    {"name": "path", "valueString": "Patient.name[0].family"},
-                    {"name": "value", "valueString": "Changed"}
-                ]}]
-            })),
-            ABSENT,
-        )
-        .await;
-    assert!(
-        matches!(patch_error(result), PatchError::UnsupportedFormat { .. }),
-        "FHIRPath Patch"
-    );
-
     assert_eq!(state_of(backend, &t, "target").await, untouched);
 
     // ---- one match: JSON Patch, with a satisfied If-Match -------------------
@@ -299,6 +276,34 @@ where
         "Merge Patch on one match: {result:?}"
     );
     assert_eq!(state_of(backend, &t, "target").await, "v3 null Merged");
+
+    // FHIRPath PATCH uses the same resolved row and shared applier, then
+    // commits one new version without disturbing the matching identifier.
+    let result = backend
+        .conditional_patch(
+            &t,
+            "Patient",
+            CRITERIA,
+            &PatchFormat::FhirPathPatch(json!({
+                "resourceType": "Parameters",
+                "parameter": [{"name": "operation", "part": [
+                    {"name": "type", "valueCode": "replace"},
+                    {"name": "path", "valueString": "Patient.name[0].family"},
+                    {"name": "value", "valueString": "Changed"}
+                ]}]
+            })),
+            ABSENT,
+        )
+        .await;
+    match &result {
+        Ok(ConditionalPatchResult::Patched(stored)) => {
+            assert_eq!(stored.id(), "target");
+            assert_eq!(stored.version_id(), "4");
+            assert_eq!(stored.content()["name"][0]["family"], "Changed");
+        }
+        other => panic!("FHIRPath Patch on one match: {other:?}"),
+    }
+    assert_eq!(state_of(backend, &t, "target").await, "v4 null Changed");
 
     assert_eq!(state_of(backend, &t, "decoy").await, "v1 false Smith");
 }

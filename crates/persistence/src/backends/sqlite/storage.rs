@@ -12,6 +12,7 @@ use crate::core::history::{
 };
 use crate::core::transaction::{
     BundleEntry, BundleEntryResult, BundleMethod, BundleProvider, BundleResult, BundleType,
+    PatchCandidateValidator, patch_update_result, prepare_bundle_patch,
 };
 use crate::core::{
     ConditionalCreateResult, ConditionalDeleteResult, ConditionalStorage, ConditionalUpdateResult,
@@ -3396,11 +3397,12 @@ impl BundleProvider for SqliteBackend {
         true
     }
 
-    async fn process_transaction(
+    async fn process_transaction_with_patch_validator(
         &self,
         tenant: &TenantContext,
         entries: Vec<BundleEntry>,
         fhir_version: helios_fhir::FhirVersion,
+        validator: Option<&dyn PatchCandidateValidator>,
     ) -> Result<BundleResult, TransactionError> {
         use crate::core::transaction::{Transaction, TransactionOptions, TransactionProvider};
         use std::collections::HashMap;
@@ -3415,6 +3417,7 @@ impl BundleProvider for SqliteBackend {
 
         let mut results = Vec::with_capacity(entries.len());
         let mut error_info: Option<(usize, String)> = None;
+        let mut patch_error: Option<TransactionError> = None;
 
         // Build a map of fullUrl -> assigned reference for reference resolution
         // This maps urn:uuid:xxx to ResourceType/assigned-id after creates
@@ -3439,12 +3442,21 @@ impl BundleProvider for SqliteBackend {
                 resolve_bundle_references(resource, &reference_map);
             }
 
-            let result = self.process_bundle_entry_tx(tenant, &mut tx, entry).await;
+            let result = self
+                .process_bundle_entry_tx(tenant, &mut tx, entry, fhir_version, validator)
+                .await;
 
             match result {
                 Ok(entry_result) => {
                     // Check for error status codes
                     if entry_result.status >= 400 {
+                        if entry.method == BundleMethod::Patch {
+                            patch_error = Some(TransactionError::PatchEntry {
+                                index: idx,
+                                status: entry_result.status,
+                                outcome: entry_result.outcome.clone().unwrap_or_default(),
+                            });
+                        }
                         error_info = Some((
                             idx,
                             format!("Entry failed with status {}", entry_result.status),
@@ -3512,7 +3524,7 @@ impl BundleProvider for SqliteBackend {
         // Handle error or commit
         if let Some((index, message)) = error_info {
             let _ = Box::new(tx).rollback().await;
-            return Err(TransactionError::BundleError { index, message });
+            return Err(patch_error.unwrap_or(TransactionError::BundleError { index, message }));
         }
 
         // Commit the transaction
@@ -3545,6 +3557,8 @@ impl SqliteBackend {
         tenant: &TenantContext,
         tx: &mut crate::backends::sqlite::transaction::SqliteTransaction,
         entry: &BundleEntry,
+        bundle_version: helios_fhir::FhirVersion,
+        validator: Option<&dyn PatchCandidateValidator>,
     ) -> StorageResult<BundleEntryResult> {
         use crate::core::transaction::Transaction;
 
@@ -3667,14 +3681,46 @@ impl SqliteBackend {
                 Ok(BundleEntryResult::deleted())
             }
             BundleMethod::Patch => {
-                // PATCH is not fully implemented yet
-                Ok(BundleEntryResult::error(
-                    501,
-                    serde_json::json!({
-                        "resourceType": "OperationOutcome",
-                        "issue": [{"severity": "error", "code": "not-supported", "diagnostics": "PATCH not implemented"}]
-                    }),
-                ))
+                let (resource_type, id) = self.parse_url(&entry.url)?;
+                if resource_type == "AuditEvent" {
+                    return Ok(BundleEntryResult::error(
+                        405,
+                        serde_json::json!({
+                            "resourceType": "OperationOutcome",
+                            "issue": [{"severity": "error", "code": "not-supported", "details": {"text": "AuditEvent resources are immutable"}}]
+                        }),
+                    ));
+                }
+                let existing = tx.read(&resource_type, &id).await?;
+                if let Some(failure) = bundle_if_match_gate(
+                    entry.if_match.as_deref(),
+                    existing.as_ref().map(|r| r.version_id()),
+                ) {
+                    return Ok(failure);
+                }
+                let Some(existing) = existing else {
+                    return Ok(BundleEntryResult::error(
+                        404,
+                        serde_json::json!({
+                            "resourceType": "OperationOutcome",
+                            "issue": [{"severity": "error", "code": "not-found", "details": {"text": format!("{resource_type}/{id} not found")}}]
+                        }),
+                    ));
+                };
+                let candidate = match prepare_bundle_patch(
+                    tenant,
+                    &resource_type,
+                    &existing,
+                    entry.resource.as_ref(),
+                    bundle_version,
+                    validator,
+                )
+                .await
+                {
+                    Ok(candidate) => candidate,
+                    Err(failure) => return Ok(*failure),
+                };
+                patch_update_result(tx.update(&existing, candidate).await)
             }
         }
     }

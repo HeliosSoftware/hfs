@@ -292,6 +292,24 @@ async fn test_date_precision_and_validation_suite() {
     super::date_precision_suite::sub_day_precision_and_validation(&backend, "date-precision").await;
 }
 
+/// The shared number/quantity `ap` tables (#1390);
+/// PostgreSQL, MongoDB and Elasticsearch run the same ones.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_ap_prefix_suite() {
+    let backend = super::make_sqlite_backend();
+    super::ap_prefix_suite::ap_prefix(&backend, "ap-prefix", true).await;
+}
+
+/// `ap` in the quantity component of a composite (#1390);
+/// PostgreSQL, MongoDB and Elasticsearch run the same tables.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_ap_composite_suite() {
+    let backend = super::make_sqlite_backend();
+    super::ap_relations_suite::ap_composite(&backend, "ap-composite").await;
+}
+
 /// `_filter` must keep the date range and the following token bind separate.
 #[cfg(feature = "sqlite")]
 #[tokio::test]

@@ -434,7 +434,7 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
   each instance as one nested object with inline component values and matches with a single nested
   query. See `docs/search-spec-assessment.md`.
 
-The S3 backend is intentionally storage-focused (CRUD/version/history and the full `$bulk-submit` surface) and does not act as a full FHIR search engine. For bulk export, S3 can feed system-level batches through `ExportDataProvider` and can store output files through `S3OutputStore`, but export job state belongs to SQLite or PostgreSQL. `$bulk-submit` is different: S3 hosts its own job state, since the submission and manifest objects the ingestion engine writes *are* the job state — leases are compare-and-swapped against those objects' ETags, with a small cross-tenant index for claim/poll-token/TTL lookups. Patient-level and Group-level export compartment enumeration are not supported by S3 as the resource store. For query-heavy deployments, use a DB/search backend as primary query engine and compose S3 as archive/history/output storage.
+The S3 backend is intentionally storage-focused (CRUD/version/history and the full `$bulk-submit` surface) and does not act as a full FHIR search engine; the one conditional interaction it serves is an identifier-scoped conditional create (`_id` and `identifier` criteria, decided by reading the stored objects, #1435). For bulk export, S3 can feed system-level batches through `ExportDataProvider` and can store output files through `S3OutputStore`, but export job state belongs to SQLite or PostgreSQL. `$bulk-submit` is different: S3 hosts its own job state, since the submission and manifest objects the ingestion engine writes *are* the job state — leases are compare-and-swapped against those objects' ETags, with a small cross-tenant index for claim/poll-token/TTL lookups. Patient-level and Group-level export on S3 enumerate the compartment by reading every current object of each type and applying the Patient compartment parameters in memory (`PatientCompartmentMatcher`), which is correct but scans the whole type per batch. For query-heavy deployments, use a DB/search backend as primary query engine and compose S3 as archive/history/output storage.
 
 **Multitenancy notes.** The four Multitenancy rows describe *where a tenant's records physically live*, not how strongly the boundary is enforced; a deployment sits in exactly one of the first three.
 
@@ -659,6 +659,8 @@ MongoDB remains the canonical write/read store while Elasticsearch owns delegate
 - MongoDB search index population is automatically disabled via `search_offloaded`
 - Composite routing preserves MongoDB as the source of truth for reads and writes
 
+> **MongoDB + Elasticsearch note:** with search offloaded, an in-transaction `ifNoneExist` is resolved by scanning the raw `resources` documents inside the transaction session. Only `_id`, `_lastUpdated` and plain `identifier` values (`code`, `|code`, or `system|code`, with a nonempty code) are evaluated; `|code` matches any system, same as Mongo direct search. Every other shape is rejected so the bundle rolls back instead of matching the wrong set (#1394).
+
 **Prerequisites:** Running MongoDB and Elasticsearch 8.x instances.
 
 ```bash
@@ -685,7 +687,7 @@ HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
 
 ### S3 + Elasticsearch
 
-S3 handles CRUD, versioning, history, and the whole `$bulk-submit` surface (ingestion and job state alike). Elasticsearch handles all search operations. For bulk export, this topology can use S3 as the resource data provider for system-level exports and `S3OutputStore` as the output-file store; export job state still lives in the configured SQLite or PostgreSQL bulk-export job store.
+S3 handles CRUD, versioning, history, and the whole `$bulk-submit` surface (ingestion and job state alike). Elasticsearch handles all search operations, and — since the S3 primary keeps no counts — the Home dashboard's totals, per-type breakdown and write marker (#1280); it keeps no history, so the dashboard's creation-time series is empty on this topology. For bulk export, this topology can use S3 as the resource data provider for system-level exports and `S3OutputStore` as the output-file store; export job state still lives in the configured SQLite or PostgreSQL bulk-export job store.
 
 - CRUD persistence via S3 objects (current pointer + immutable history versions)
 - Versioning (`vread`, optimistic locking via version checks)

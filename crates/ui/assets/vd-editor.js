@@ -1436,6 +1436,16 @@
     // template) or a missing `editor-pair.js`/`editor-form.js` load leaves
     // the editor above exactly as it is and touches nothing else.
     if (EditorPair) EditorPair.mount({ textarea: textarea, view: view, grid: grid });
+
+    // #1240: `serialize(form)` alone covers this form's own `id` and `json`
+    // fields (compared in canonical form, so reindenting the JSON is not a
+    // change) — including the mutations a lint fix applies to the textarea,
+    // since those already dispatch `input`. The native Save submit suspends
+    // `beforeunload` on its own (the shared `document`-level `submit`
+    // listener in unsaved.js), so nothing else needs wiring here.
+    if (root.HfsUnsaved) {
+      root.HfsUnsaved.track({ root: form, cue: form.querySelector(".form-actions") });
+    }
   }
 
   return {

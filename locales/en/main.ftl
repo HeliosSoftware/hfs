@@ -512,12 +512,21 @@ editor-save = Save Changes
 editor-delete = Delete
 editor-remove = Remove This Node
 editor-saved = Saved.
+# Shared unsaved-changes tracker (#1240): the pill next to a Save button and
+# the confirm shown for in-page closes (a modal, an addbox disclosure).
+unsaved-changes = Unsaved changes
+unsaved-discard-confirm = You have unsaved changes. Discard them and close?
 editor-load-error = Could not load that resource.
 editor-confirm-delete = Delete this resource? This cannot be undone.
 editor-invalid-json = That is not valid JSON, so it cannot be edited as a form. Your text is untouched.
 editor-source-hint = Edit the source directly. Switching back to the guided form parses it.
 
 editor-add = Add Element
+editor-add-close = Close
+editor-add-added = added
+editor-add-undo = Undo
+editor-add-elements = Elements
+editor-add-extensions = Extensions
 editor-must-support-badge = MS
 editor-binding-hint = Bound to a value set — codes come from it; strength shown
 editor-legend-live = Checked as you type: structure, cardinality, required bindings
@@ -533,16 +542,19 @@ vd-form-legend-live = Checked as you type: structure, cardinality, required bind
 # states ("No issues.", "3 issues"), never the longer editor-invalid-json
 # sentence.
 vd-form-invalid-chip = Invalid JSON
-# SQL Query / SQL View's own two-line legend (#840): Save there gates the
-# SQL on FHIR Library type and the SQL attachment, not the generic
+# SQL Query / SQL View's own three-line legend (#840/#1233): Save there
+# gates the SQL on FHIR Library type and the SQL attachment, not the generic
 # constraints/terminology promise `editor-legend-save` makes — a promise
-# `HFS_VALIDATION_MODE` off (the default) would make false.
+# `HFS_VALIDATION_MODE` off (the default) would make false. The third line
+# says where that attachment is actually edited, since this guided form
+# never lists it (`hidden=["content"]`).
 lib-form-legend-live = Checked as you type: structure, cardinality, required bindings
 lib-form-legend-save = Checked on save: SQL on FHIR Library type and the SQL attachment
+lib-form-legend-content = The SQL attachment (content) is not listed here: edit it in the SQL card below
 editor-deferred-badge = on save
 editor-deferred-hint = Codes are verified against the value set when you save (and live in the picker where a terminology server is configured)
 editor-must-support-hint = Must-support: consumers of this profile are expected to handle this element
-editor-add-filter = Filter elements
+editor-add-filter = Filter elements and extensions
 editor-add-another = add another
 editor-pick-type = Pick a type…
 editor-extension-url = Extension URL
@@ -788,6 +800,7 @@ bulk-export-field-since-custom = Custom instant
 bulk-export-since-invalid = Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z.
 bulk-export-field-until = Until
 bulk-export-field-until-hint = Optional upper bound. RFC 3339, e.g. 2026-08-01T00:00:00Z.
+bulk-export-until-before-since = Until must not be earlier than Since.
 bulk-export-window-since = Since
 bulk-export-window-until = Until
 bulk-export-start = Start Export
@@ -995,13 +1008,21 @@ lib-degraded = The library list could not be loaded.
 # The SQL card's "runs as you type" legend (#839) — shared verbatim by SQL
 # Queries and SQL Views, unlike the headings/failure prefix above.
 lib-run-hint = Runs as you type — results follow the current SQL, saved or not
+# The SQL card's own notice (#1233), shown next to the legend above only
+# while the Details JSON's `application/sql` attachment does not decode
+# (invalid base64, non-UTF-8 bytes, or a missing `data`) — the card keeps
+# showing its last readable text rather than clearing it, and typing there
+# repairs the attachment. `sql-library-sync.js` is the only thing that ever
+# shows it; the server always paints it hidden.
+lib-sql-attachment-unreadable = SQL attachment unreadable: the SQL card keeps its last readable text; typing here repairs it
 lib-delete-confirm = Delete "{ $name }"? This cannot be undone.
 lib-delete-failed = Could not delete the library.
-# Details section (#840): the Library minus its SQL attachment, edited as
-# JSON (left) and through the guided form (right).
+# Details section (#840): the full stored Library (SQL attachment
+# included, #1233), edited as JSON (left) and through the guided form
+# (right).
 lib-details-heading = Details
 lib-details-json-heading = Library (JSON)
-lib-details-json-note = The SQL attachment is edited in the SQL card below and is not part of this view.
+lib-details-json-note = The SQL attachment (content[].data) is part of this document. The SQL card below edits the same attachment.
 # Shown only for `?lib=new`, under the Details heading — closes the #839
 # follow-up asking for a hint about the starter's `change-me` placeholder.
 lib-details-new-lede = Rename it and point relatedArtifact[0] at a ViewDefinition that exists.

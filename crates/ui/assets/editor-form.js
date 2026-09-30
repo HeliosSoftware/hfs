@@ -4,11 +4,13 @@
  * Resources modal's own copy, onto this helper is a follow-up): every
  * interaction the guided form offers — `[data-add]`/`[data-remove]`/
  * `[data-extension]` clicks, `[data-choose]` changes, a settled `[data-set]`
- * blur, the add-picker's typeahead, live `$expand` on a bound field —
- * turned into one round trip to `/ui/editor/render` (`pane=form`, #843) and
- * a DOM swap, focus/caret/picker/scroll preserved across it (#547) —
- * without knowing which page it runs on or what the other half of the
- * document is.
+ * blur, live `$expand` on a bound field — turned into one round trip to
+ * `/ui/editor/render` (`pane=form`, #843) and a DOM swap, focus/caret/
+ * picker/scroll preserved across it (#547) — without knowing which page it
+ * runs on or what the other half of the document is. The add-picker's own
+ * state across that swap, filter typeahead, and extension-URL read are
+ * `window.HfsEditorAdd`'s job (#1239), shared with `editor.js` and
+ * `resources.js` — this file calls it rather than keeping its own copy.
  *
  * `window.HfsEditorForm.attach(root, host)` wires all of that inside `root`
  * — an element that already contains the hidden `#editor-form` state, the
@@ -40,6 +42,12 @@
   function attach(root, host) {
     if (!root || !host || !window.fetch) return { refresh: function () {} };
     var renderUrl = host.renderUrl || DEFAULT_RENDER_URL;
+    // #1239: the add-picker module, called wherever this file used to keep
+    // its own copy of that logic. Guarded the same way `host.fields` is —
+    // if the script did not load, the rest of this loop still works, just
+    // without the picker's own state surviving a re-render.
+    var picker = window.HfsEditorAdd;
+    if (picker) picker.attach(root);
 
     /* ---- the round trip -------------------------------------------------- */
 
@@ -145,25 +153,8 @@
           end: active.selectionEnd,
         };
       }
-      root.querySelectorAll("details.editor-add[open]").forEach(function (box) {
-        var row = box.closest("[data-path]");
-        var filter = box.querySelector(".editor-add__filter");
-        state.pickers.push({
-          path: row ? row.dataset.path : "",
-          filter: filter ? filter.value : "",
-          focusFilter: filter === document.activeElement,
-        });
-      });
+      if (picker) state.pickers = picker.capturePickers(root);
       return state;
-    }
-
-    function rowByPath(path) {
-      if (!path) return root;
-      var rows = root.querySelectorAll("[data-path]");
-      for (var i = 0; i < rows.length; i++) {
-        if (rows[i].dataset.path === path) return rows[i];
-      }
-      return null;
     }
 
     function inputByPath(path) {
@@ -175,25 +166,14 @@
     }
 
     function restoreUiState(state) {
-      state.pickers.forEach(function (saved) {
-        var row = rowByPath(saved.path);
-        if (!row) return;
-        var box = row.querySelector("details.editor-add");
-        if (!box) return;
-        box.setAttribute("open", "");
-        var filter = box.querySelector(".editor-add__filter");
-        if (filter && saved.filter) {
-          filter.value = saved.filter;
-          filter.dispatchEvent(new Event("input", { bubbles: true }));
-        }
-        if (saved.focusFilter && filter) filter.focus();
-      });
-
-      // The server names the node the mutation created; the caret goes
-      // there. Otherwise it returns to the field that was focused before
-      // the swap.
+      // The server names the node the mutation created; the picker that
+      // created it clears its filter and shows the added signal, #1239.
       var formEl = root.querySelector("#editor-form");
       var createdPath = formEl && formEl.dataset ? formEl.dataset.focus : null;
+      if (picker) picker.restorePickers(root, state.pickers, createdPath);
+
+      // The caret goes to the node the mutation created. Otherwise it
+      // returns to the field that was focused before the swap.
       var target = createdPath ? inputByPath(createdPath) : null;
       if (target) {
         target.focus();
@@ -231,10 +211,7 @@
 
       var extension = event.target.closest("[data-extension]");
       if (extension) {
-        var panel = extension.closest(".editor-add__ext");
-        var url =
-          extension.dataset.url ||
-          (panel ? panel.querySelector(".editor-add__ext-url").value.trim() : "");
+        var url = picker ? picker.extensionUrl(extension) : "";
         send("extension", { path: extension.dataset.extension, url: url });
       }
     });
@@ -269,61 +246,50 @@
     /* Live $expand picker (#365): bound inputs carry data-vs-url; typing
      * debounces a request to the UI's terminology proxy and fills a per-row
      * datalist. 204 (no server configured) leaves the plain input alone.
-     * Typeahead over the "add" list is the only thing here that is purely
-     * cosmetic, and the only thing that would be silly to round-trip. */
+     * The add-picker's own typeahead is `window.HfsEditorAdd.attach(root)`,
+     * wired once above (#1239). */
     var expandTimer = null;
     var expandSeq = 0;
     var liveListSeq = 0;
     root.addEventListener("input", function (event) {
       var input = event.target.closest("[data-vs-url]");
-      if (input) {
-        clearTimeout(expandTimer);
-        expandTimer = setTimeout(function () {
-          var seq = ++expandSeq;
-          fetch(
-            "/ui/editor/expand?url=" +
-              encodeURIComponent(input.dataset.vsUrl) +
-              "&filter=" +
-              encodeURIComponent(input.value),
-            { credentials: "same-origin" },
-          )
-            .then(function (r) {
-              return r.status === 200 ? r.json() : null;
-            })
-            .then(function (data) {
-              if (!data || seq !== expandSeq) return;
-              var listId = input.getAttribute("list");
-              if (!listId) {
-                listId = "vs-live-" + ++liveListSeq;
-                input.setAttribute("list", listId);
-              }
-              var list = document.getElementById(listId);
-              if (!list) {
-                list = document.createElement("datalist");
-                list.id = listId;
-                input.parentElement.appendChild(list);
-              }
-              list.textContent = "";
-              data.codes.forEach(function (item) {
-                var opt = document.createElement("option");
-                opt.value = item.code;
-                if (item.display) opt.label = item.display;
-                list.appendChild(opt);
-              });
-            })
-            .catch(function () {});
-        }, 300);
-        return;
-      }
-
-      var filter = event.target.closest(".editor-add__filter");
-      if (filter) {
-        var needle = filter.value.trim().toLowerCase();
-        var panel = filter.closest(".editor-add__panel");
-        panel.querySelectorAll("[data-add-name]").forEach(function (item) {
-          item.hidden = needle && item.dataset.addName.toLowerCase().indexOf(needle) === -1;
-        });
-      }
+      if (!input) return;
+      clearTimeout(expandTimer);
+      expandTimer = setTimeout(function () {
+        var seq = ++expandSeq;
+        fetch(
+          "/ui/editor/expand?url=" +
+            encodeURIComponent(input.dataset.vsUrl) +
+            "&filter=" +
+            encodeURIComponent(input.value),
+          { credentials: "same-origin" },
+        )
+          .then(function (r) {
+            return r.status === 200 ? r.json() : null;
+          })
+          .then(function (data) {
+            if (!data || seq !== expandSeq) return;
+            var listId = input.getAttribute("list");
+            if (!listId) {
+              listId = "vs-live-" + ++liveListSeq;
+              input.setAttribute("list", listId);
+            }
+            var list = document.getElementById(listId);
+            if (!list) {
+              list = document.createElement("datalist");
+              list.id = listId;
+              input.parentElement.appendChild(list);
+            }
+            list.textContent = "";
+            data.codes.forEach(function (item) {
+              var opt = document.createElement("option");
+              opt.value = item.code;
+              if (item.display) opt.label = item.display;
+              list.appendChild(opt);
+            });
+          })
+          .catch(function () {});
+      }, 300);
     });
 
     return {

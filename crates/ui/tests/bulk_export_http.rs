@@ -1075,6 +1075,39 @@ async fn the_export_page_uses_form_panels_with_name_and_all_resources_up_top() {
     ));
     assert!(!html.contains("Used when Since is Custom"));
     assert!(!html.contains("bulk-export-field-since-custom-hint"));
+
+    // Until carries the same app-owned instant pattern as Custom instant
+    // (#1271), described by its hint and with a hidden inline error channel.
+    let until = input_tag(&html, "until");
+    assert!(until.contains(r#"data-pattern="([0-9]([0-9]"#), "{until}");
+    assert!(until.contains(r#"([0-5][0-9]|60)"#), "{until}");
+    assert!(until.contains(r#"|14:00))"#), "{until}");
+    assert!(!until.contains(" pattern="), "{until}");
+    assert!(!until.contains("aria-invalid"), "{until}");
+    assert!(!until.contains("autofocus"), "{until}");
+    assert!(
+        until.contains(r#"aria-describedby="bulk-export-until-hint""#),
+        "{until}"
+    );
+    assert!(html.contains(
+        r#"id="bulk-export-until-error" class="field__hint field__hint--error" role="alert" hidden>Enter a valid FHIR instant"#
+    ));
+}
+
+/// The opening `<input ...>` tag of the form control named `name`.
+fn input_tag<'a>(html: &'a str, name: &str) -> &'a str {
+    let needle = format!(r#"name="{name}""#);
+    let pos = html
+        .find(&needle)
+        .unwrap_or_else(|| panic!("{name} input present"));
+    let start = html[..pos]
+        .rfind("<input")
+        .unwrap_or_else(|| panic!("{name} input starts"));
+    let end = pos
+        + html[pos..]
+            .find('>')
+            .unwrap_or_else(|| panic!("{name} input ends"));
+    &html[start..=end]
 }
 
 #[tokio::test]
@@ -1776,6 +1809,167 @@ async fn fhir_r4_lexically_invalid_instants_fail_without_a_job_or_kickoff() {
 
     assert!(mock.kickoffs.lock().unwrap().is_empty());
     assert_no_default_user_jobs(&backend).await;
+}
+
+/// A malformed Until is rejected in the form like Custom instant (#1271):
+/// 400, the field marked invalid with its inline error, the typed value
+/// round-tripped for correction, and no kick-off or job. Until is validated
+/// on its own, whatever the Since preset.
+#[tokio::test]
+async fn an_invalid_until_is_rejected_inline_without_a_job_or_kickoff() {
+    let (base, mock, backend) = serve().await;
+
+    for until in [
+        // Three-digit year: the dropped-leading-character typo from the issue.
+        "026-09-17T10:38:49Z",
+        // Lexically fine but not a calendar date.
+        "2026-02-31T00:00:00Z",
+    ] {
+        let (status, html) = post_form_body(
+            &base,
+            "/ui/bulk-export",
+            &[
+                ("name", "until-import"),
+                ("scope", "system"),
+                ("types", "Patient"),
+                ("since_preset", ""),
+                ("until", until),
+            ],
+        )
+        .await;
+
+        assert_eq!(status, 400, "{until}: {html}");
+        assert!(
+            html.contains(r#"novalidate data-validation-started="true""#),
+            "{html}"
+        );
+        let input = input_tag(&html, "until");
+        assert!(input.contains(&format!(r#"value="{until}""#)), "{input}");
+        assert!(
+            input.contains(
+                r#"autofocus aria-invalid="true" aria-describedby="bulk-export-until-hint bulk-export-until-error""#
+            ),
+            "{input}"
+        );
+        assert_eq!(html.matches(r#"aria-invalid="true""#).count(), 1, "{html}");
+        assert_eq!(html.matches("autofocus").count(), 1, "{html}");
+        assert!(
+            html.contains(
+                r#"id="bulk-export-until-error" class="field__hint field__hint--error" role="alert">Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z.</span>"#
+            ),
+            "{html}"
+        );
+        // Custom instant is untouched: its error stays hidden.
+        assert!(
+            html.contains(r#"id="bulk-export-since-custom-error" class="field__hint field__hint--error" role="alert" hidden>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"name="types" value="Patient" checked"#),
+            "{html}"
+        );
+    }
+
+    assert!(mock.kickoffs.lock().unwrap().is_empty());
+    assert_no_default_user_jobs(&backend).await;
+}
+
+/// Autofocus goes to the first invalid field: with a blank name and a bad
+/// Until, the name keeps focus and Until is only marked invalid.
+#[tokio::test]
+async fn an_invalid_until_yields_autofocus_to_an_earlier_invalid_field() {
+    let (base, mock, backend) = serve().await;
+    let (status, html) = post_form_body(
+        &base,
+        "/ui/bulk-export",
+        &[
+            ("name", "   "),
+            ("scope", "system"),
+            ("since_preset", "custom"),
+            ("since_custom", "not-a-date"),
+            ("until", "026-09-17T10:38:49Z"),
+        ],
+    )
+    .await;
+
+    assert_eq!(status, 400, "{html}");
+    assert_eq!(html.matches(r#"aria-invalid="true""#).count(), 3, "{html}");
+    assert_eq!(html.matches("autofocus").count(), 1, "{html}");
+    assert!(
+        html.contains(r#"autofocus aria-invalid="true" aria-describedby="bulk-export-name-error""#),
+        "{html}"
+    );
+    let input = input_tag(&html, "until");
+    assert!(!input.contains("autofocus"), "{input}");
+    assert!(
+        input.contains(
+            r#"aria-invalid="true" aria-describedby="bulk-export-until-hint bulk-export-until-error""#
+        ),
+        "{input}"
+    );
+    assert!(mock.kickoffs.lock().unwrap().is_empty());
+    assert_no_default_user_jobs(&backend).await;
+}
+
+/// An Until earlier than Since is a well-formed but empty window: `$export`
+/// bounds are inclusive, so nothing could ever match. The form rejects it on
+/// Until with its own message, for a custom Since and for a preset alike,
+/// while an equal pair is still a valid (one-instant) window.
+#[tokio::test]
+async fn an_until_before_since_is_rejected_inline_without_a_job_or_kickoff() {
+    let (base, mock, backend) = serve().await;
+
+    for (preset, custom) in [("custom", "2026-09-17T10:38:49Z"), ("day", "")] {
+        let (status, html) = post_form_body(
+            &base,
+            "/ui/bulk-export",
+            &[
+                ("name", "until-before-since"),
+                ("scope", "system"),
+                ("since_preset", preset),
+                ("since_custom", custom),
+                ("until", "2026-01-01T00:00:00Z"),
+            ],
+        )
+        .await;
+
+        assert_eq!(status, 400, "{preset}: {html}");
+        let input = input_tag(&html, "until");
+        assert!(input.contains(r#"value="2026-01-01T00:00:00Z""#), "{input}");
+        assert!(
+            input.contains(
+                r#"autofocus aria-invalid="true" aria-describedby="bulk-export-until-hint bulk-export-until-error""#
+            ),
+            "{input}"
+        );
+        assert!(
+            html.contains(
+                r#"id="bulk-export-until-error" class="field__hint field__hint--error" role="alert">Until must not be earlier than Since.</span>"#
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"id="bulk-export-since-custom-error" class="field__hint field__hint--error" role="alert" hidden>"#),
+            "{html}"
+        );
+    }
+    assert!(mock.kickoffs.lock().unwrap().is_empty());
+    assert_no_default_user_jobs(&backend).await;
+
+    let (status, _) = post_form(
+        &base,
+        "/ui/bulk-export",
+        &[
+            ("name", "one-instant window"),
+            ("scope", "system"),
+            ("since_preset", "custom"),
+            ("since_custom", "2026-01-01T00:00:00Z"),
+            ("until", "2026-01-01T00:00:00Z"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 303);
+    assert_eq!(mock.kickoffs.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]

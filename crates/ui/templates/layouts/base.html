@@ -16,11 +16,16 @@
   <!-- The shared busy states (#679); ahead of every page script by defer's
        document order, because page scripts call into window.hfsBusy. -->
   <script src="/ui/assets/busy.js" defer></script>
+  <!-- Shared unsaved-changes tracker (#1240), window.HfsUnsaved: addbox.js
+       reads it at click time, so it must be defined before then. -->
+  <script src="/ui/assets/unsaved.js" defer></script>
   <script src="/ui/assets/addbox.js" defer></script>
   <script src="/ui/assets/dashboard.js" defer></script>
   <script src="/ui/assets/editor-sync.js" defer></script>
 </head>
-<body class="{% block body_class %}{% endblock %}">
+<body class="{% block body_class %}{% endblock %}"
+      data-msg-unsaved="{{ i18n.t("unsaved-changes") }}"
+      data-msg-unsaved-discard="{{ i18n.t("unsaved-discard-confirm") }}">
   <aside class="sidebar" id="sidebar">
     <a class="brand" href="/ui" aria-label="{{ i18n.t("app-title") }} hfs v{{ status.version }} — {{ i18n.t("nav-home") }}">
       <img class="brand__logo" src="/ui/assets/logo.png" alt="">

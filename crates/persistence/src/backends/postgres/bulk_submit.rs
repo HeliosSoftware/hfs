@@ -2258,9 +2258,13 @@ impl SubmitClaimStrategy for PostgresBackend {
                  -- registered ones should be dropped. `aborted` stays excluded.
                  WHERE m.manifest_url IS NOT NULL
                    AND s.status IN ('in-progress', 'complete')
+                 -- A `processing` manifest is reclaimable only once its lease
+                 -- lapses. One with no lease at all is being ingested right now
+                 -- by a synchronous `process_entries` caller, which promotes
+                 -- `pending` without taking a lease; every worker path writes
+                 -- the lease together with `processing` (#1530).
                    AND (m.status = 'pending'
-                        OR (m.status = 'processing'
-                            AND (m.lease_expiry IS NULL OR m.lease_expiry < $1)))
+                        OR (m.status = 'processing' AND m.lease_expiry < $1))
                  ORDER BY m.added_at
                  LIMIT 1
                  FOR UPDATE OF m SKIP LOCKED",
@@ -2342,9 +2346,9 @@ impl SubmitClaimStrategy for PostgresBackend {
         }
     }
 
-    async fn release(&self, lease: ManifestLease) -> StorageResult<()> {
+    async fn release(&self, lease: ManifestLease) -> StorageResult<bool> {
         let client = self.get_client().await?;
-        client
+        let released = client
             .execute(
                 "UPDATE bulk_manifests
                  SET status = 'pending', worker_id = NULL, lease_expiry = NULL
@@ -2362,7 +2366,7 @@ impl SubmitClaimStrategy for PostgresBackend {
             )
             .await
             .map_err(|e| internal_error(format!("Failed to release manifest lease: {}", e)))?;
-        Ok(())
+        Ok(released == 1)
     }
 }
 

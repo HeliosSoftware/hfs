@@ -25,7 +25,8 @@
  * own first paint with — see `editor::Legend`).
  *
  * The SQL pane on the same page (`#lib-editor-form textarea[name='sql']`,
- * `sql-editor.js`) is a separate document entirely and untouched here.
+ * `sql-editor.js`) is kept in sync with this Details JSON's own
+ * `application/sql` attachment by `sql-library-sync.js` (#1233).
  *
  * `EditorPair.mount`'s own return value — `{formApi, host}` — is kept and
  * exposed as `window.HfsSqlLibraryDetails` (#841), the one point a page

@@ -63,6 +63,14 @@ export class BulkExportPage {
     return this.form.locator("#bulk-export-since-custom-error");
   }
 
+  get until(): Locator {
+    return this.form.locator('input[name="until"]');
+  }
+
+  get untilError(): Locator {
+    return this.form.locator("#bulk-export-until-error");
+  }
+
   scopeRadio(scope: "system" | "patient" | "group"): Locator {
     return this.form.locator(`input[name="scope"][value="${scope}"]`);
   }

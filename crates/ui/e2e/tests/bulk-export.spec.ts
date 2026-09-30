@@ -620,6 +620,163 @@ test("server rejects an impossible Custom date without creating an export", asyn
   await expect(page.locator(".job-card").filter({ hasText: exportName })).toHaveCount(0);
 });
 
+// #1271: Until used to accept any text, so a typo created a job that only
+// failed at kick-off. It now validates inline, independent of the Since preset.
+test("Start Export rejects a malformed Until inline without submitting", async ({
+  page,
+  bulkExport,
+}) => {
+  await bulkExport.goto();
+  let submissions = 0;
+  page.on("request", (request) => {
+    if (request.url().endsWith("/ui/bulk-export") && request.method() === "POST") {
+      submissions += 1;
+    }
+  });
+
+  await expect(bulkExport.until).toHaveAttribute("data-pattern", /\[1-9\]000\)-/);
+  await expect(bulkExport.until).not.toHaveAttribute("pattern", /.+/);
+  await expect(bulkExport.until).toHaveAttribute("aria-describedby", "bulk-export-until-hint");
+  await bulkExport.nameInput.fill("Until typo must not start");
+  await expect(bulkExport.sincePreset).toHaveValue("");
+  await bulkExport.until.fill("026-09-17T10:38:49Z");
+  await bulkExport.until.press("Tab");
+  await expect(bulkExport.untilError).toBeHidden();
+  await expect(bulkExport.until).not.toHaveAttribute("aria-invalid", /.+/);
+
+  await bulkExport.startButton.click();
+
+  await expect(bulkExport.until).toBeFocused();
+  await expect(bulkExport.until).toHaveAttribute("aria-invalid", "true");
+  await expect(bulkExport.until).toHaveAttribute(
+    "aria-describedby",
+    "bulk-export-until-hint bulk-export-until-error",
+  );
+  await expect(bulkExport.untilError).toBeVisible();
+  await expect(bulkExport.untilError).toHaveText(
+    "Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z.",
+  );
+  await expect(bulkExport.nameError).toBeHidden();
+  await expect(bulkExport.sinceCustomError).toBeHidden();
+  expect(submissions).toBe(0);
+
+  await bulkExport.until.fill("2026-09-17T10:38:49Z");
+  await expect(bulkExport.untilError).toBeHidden();
+  await expect(bulkExport.until).not.toHaveAttribute("aria-invalid", /.+/);
+  await expect(bulkExport.until).toHaveAttribute("aria-describedby", "bulk-export-until-hint");
+
+  for (const instant of ["2026-02-31T00:00:00Z", "2026-08-01T24:00:00Z", "not-an-instant"]) {
+    await bulkExport.until.fill(instant);
+    await expect(bulkExport.untilError).toBeVisible();
+  }
+
+  await bulkExport.until.fill("   ");
+  await expect(bulkExport.untilError).toBeHidden();
+
+  await page.route("**/ui/bulk-export", (route) =>
+    route.request().method() === "POST"
+      ? route.fulfill({ status: 204 })
+      : route.continue(),
+  );
+  const submitted = page.waitForRequest(
+    (request) => request.url().endsWith("/ui/bulk-export") && request.method() === "POST",
+  );
+  await bulkExport.startButton.click();
+  await submitted;
+  expect(submissions).toBe(1);
+});
+
+test("server rejects a malformed Until without creating an export", async ({
+  page,
+  bulkExport,
+}) => {
+  const exportName = "Browser malformed Until must not start";
+  await bulkExport.goto();
+  await bulkExport.nameInput.fill(exportName);
+  await bulkExport.allResources.uncheck();
+  await bulkExport.typeCheckbox("Patient").check();
+  await bulkExport.until.fill("026-09-17T10:38:49Z");
+
+  const submitted = page.waitForResponse(
+    (response) =>
+      response.url().endsWith("/ui/bulk-export") &&
+      response.request().method() === "POST",
+  );
+  // Bypass the enhanced submit handler, as a no-JavaScript client would.
+  await bulkExport.form.evaluate((form) => (form as HTMLFormElement).submit());
+  expect((await submitted).status()).toBe(400);
+
+  await expect(page).toHaveURL(/\/ui\/bulk-export$/);
+  await expect(bulkExport.nameInput).toHaveValue(exportName);
+  await expect(bulkExport.typeCheckbox("Patient")).toBeChecked();
+  await expect(bulkExport.until).toHaveValue("026-09-17T10:38:49Z");
+  await expect(bulkExport.until).toHaveAttribute("aria-invalid", "true");
+  await expect(bulkExport.until).toHaveAttribute(
+    "aria-describedby",
+    "bulk-export-until-hint bulk-export-until-error",
+  );
+  await expect(bulkExport.untilError).toBeVisible();
+  await expect(bulkExport.untilError).toHaveText(
+    "Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z.",
+  );
+  await expect(bulkExport.until).toBeFocused();
+  await expect(bulkExport.sinceCustomError).toBeHidden();
+
+  await bulkExport.until.fill("2026-09-17T10:38:49Z");
+  await expect(bulkExport.untilError).toBeHidden();
+  await expect(bulkExport.until).not.toHaveAttribute("aria-invalid", /.+/);
+
+  const { violations } = await new AxeBuilder({ page }).analyze();
+  expect(violations, axeSummary(violations)).toEqual([]);
+
+  await page.goto("/ui/bulk-export");
+  await expect(page.locator(".job-card").filter({ hasText: exportName })).toHaveCount(0);
+});
+
+test("Until earlier than Since is rejected inline and revalidates when Since changes", async ({
+  page,
+  bulkExport,
+}) => {
+  await bulkExport.goto();
+  let submissions = 0;
+  page.on("request", (request) => {
+    if (request.url().endsWith("/ui/bulk-export") && request.method() === "POST") {
+      submissions += 1;
+    }
+  });
+
+  await bulkExport.nameInput.fill("Until before Since must not start");
+  await bulkExport.sincePreset.selectOption("custom");
+  await bulkExport.sinceCustom.fill("2026-09-17T10:38:49Z");
+  await bulkExport.until.fill("2026-01-01T00:00:00Z");
+  await bulkExport.startButton.click();
+
+  await expect(bulkExport.until).toBeFocused();
+  await expect(bulkExport.until).toHaveAttribute("aria-invalid", "true");
+  await expect(bulkExport.untilError).toHaveText("Until must not be earlier than Since.");
+  await expect(bulkExport.sinceCustomError).toBeHidden();
+  expect(submissions).toBe(0);
+
+  // Moving Since back clears the error without touching Until.
+  await bulkExport.sinceCustom.fill("2025-12-01T00:00:00Z");
+  await expect(bulkExport.untilError).toBeHidden();
+  await expect(bulkExport.until).not.toHaveAttribute("aria-invalid", /.+/);
+
+  // A preset resolves to a recent instant, so an old Until is rejected again.
+  await bulkExport.sincePreset.selectOption("day");
+  await expect(bulkExport.untilError).toHaveText("Until must not be earlier than Since.");
+
+  // A malformed Until still reports the format message, not the order one.
+  await bulkExport.until.fill("026-09-17T10:38:49Z");
+  await expect(bulkExport.untilError).toHaveText(
+    "Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z.",
+  );
+
+  await bulkExport.sincePreset.selectOption("");
+  await bulkExport.until.fill("2026-01-01T00:00:00Z");
+  await expect(bulkExport.untilError).toBeHidden();
+});
+
 test("Patient combobox supports keyboard selection, dedupe, removal, and scope serialization", async ({
   page,
   bulkExport,

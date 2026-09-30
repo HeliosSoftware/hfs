@@ -9,6 +9,8 @@
   var OPEN = "details.addbox[open], details.menu[open]";
 
   function close(box) {
+    /* #1240: ask before discarding a dirty panel's edits. */
+    if (window.HfsUnsaved && !window.HfsUnsaved.confirmDiscard(box)) return;
     box.removeAttribute("open");
     /* Every close this script performs is a dismissal, so the dialog starts
        blank next time (#682). The failure path never comes through here — an
@@ -49,6 +51,17 @@
         event.preventDefault();
         close(own);
       }
+      return;
+    }
+    /* An open addbox--modal's <summary> is itself the full-screen backdrop
+       (app.css): its native toggle would close the <details> without ever
+       reaching close(), skipping the confirm and the reset. Route a closing
+       summary click (modal or not) through close() instead (#1240). */
+    var summary = event.target.closest("summary");
+    var owner = summary && summary.parentElement;
+    if (owner && owner.matches("details.addbox[open]")) {
+      event.preventDefault();
+      close(owner);
       return;
     }
     document.querySelectorAll(OPEN).forEach(function (box) {

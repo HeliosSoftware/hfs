@@ -19,8 +19,9 @@
  * lint's own diagnostics/gutter (#842/04) below. No fold, no
  * autocomplete yet (follow-up A of #842).
  *
- * The Library JSON pane on the same page (`input[type="hidden"][name="json"]`,
- * no fold since #839) is untouched - #840 replaces it with a Details view.
+ * The Library JSON pane on the same page (#840's own Details view) is kept
+ * in sync with this file's own textarea live, in both directions, by
+ * `sql-library-sync.js` (#1233 - see `window.HfsSqlEditor` below).
  *
  * Without the bundle, without the helper, without a `#lib-editor-form`
  * (the page's empty state has none), without JS, or if anything below
@@ -34,6 +35,26 @@
   var CM = window.HfsCodeMirror;
   var form = document.getElementById("lib-editor-form");
   var textarea = form ? form.querySelector('textarea[name="sql"]') : null;
+
+  // #1240: tracked before the CodeMirror early return below, so the cue
+  // still works over the plain textarea with no bundle mounted. `root` is
+  // the form's own `<main>` ancestor, not the form itself: the Details JSON
+  // textarea (`textarea[name="json"][form="lib-editor-form"]`) lives outside
+  // this `<form>` in the DOM, associated only by its `form` attribute, so
+  // its `input` events never bubble through the form — but they do bubble
+  // through their common `<main>`, same as the `htmx:afterSwap` a server-
+  // driven document mutation (Declare parameter, Add table) dispatches on
+  // it. `serialize(form)` still reads every associated control (`id`,
+  // `sql`, `json`) since `form.elements` already includes them regardless
+  // of DOM position.
+  if (form && window.HfsUnsaved) {
+    window.HfsUnsaved.track({
+      root: form.closest("main") || document.body,
+      form: form,
+      cue: form.querySelector(".form-actions"),
+    });
+  }
+
   if (!CodeEditor || !CM || !textarea) return;
 
   var sqlLanguage = CM.sql({ dialect: CM.SQLite });
@@ -123,6 +144,14 @@
     id: "sql-editor",
   });
   if (!view) return;
+
+  // #1233: the one point `sql-library-sync.js` reaches this editor through,
+  // to write the SQL card from the Details JSON with a minimal transaction
+  // instead of a full-text replace. `undefined` (no property at all) when
+  // the mount above returned early - that file's own `getSqlView` already
+  // treats a missing `window.HfsSqlEditor` as "no view", same as every
+  // other optional host in this family.
+  window.HfsSqlEditor = { view: view };
 
   /* ---- Unknown-table diagnostics (#842/04): `partials/lib_run_unknown_
    * tables.html` marks its own notice with `data-diagnostics` - a JSON

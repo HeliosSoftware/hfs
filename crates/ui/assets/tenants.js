@@ -17,6 +17,8 @@
     var form = event.target && event.target.closest("form[hx-post='/ui/tenants']");
     if (!form) return;
     form.reset();
+    // #1240: re-baseline to the now-empty form before the panel closes.
+    if (unsaved) unsaved.reset();
     var box = form.closest("details.addbox");
     if (!box) return;
     box.removeAttribute("open");
@@ -50,6 +52,15 @@
   }
 
   var form = document.querySelector("form[hx-post='/ui/tenants']");
+  // #1240: opt the add-tenant panel into the shared unsaved-changes tracker,
+  // cued next to its own Cancel/Add row. The slug mirror below writes
+  // idInput.value without an event when the user types the name, but the
+  // name field's own `input` already schedules a recheck, and `serialize`
+  // reads both fields — nothing else is needed.
+  var unsaved =
+    form && window.HfsUnsaved
+      ? window.HfsUnsaved.track({ root: form, cue: form.querySelector(".addbox__actions") })
+      : null;
   var nameInput = form && form.querySelector("[data-tenant-name]");
   var idInput = form && form.querySelector("[data-tenant-id]");
   if (form && nameInput && idInput) {

@@ -204,7 +204,7 @@ test("a manifest submitted from the Import page ingests, and its counters only e
       expect(Math.max(...written)).toBeLessThanOrEqual(RESOURCES);
     });
 
-    await test.step("§7.4 the imported data is searchable from the query builder", async () => {
+    await test.step("§7.5 the imported data is searchable from the query builder", async () => {
       await queries.goto("Patient");
       await queries.builder.run(`Patient?family=${family}`);
       await queries.results.waitShown();
@@ -214,7 +214,7 @@ test("a manifest submitted from the Import page ingests, and its counters only e
       await expect(queries.results.rows.first()).toContainText(family);
     });
 
-    await test.step("§7.4 and all of it landed, not just the first page", async () => {
+    await test.step("§7.5 and all of it landed, not just the first page", async () => {
       // A plain search returns one page, and its Bundle carries no `total`, so
       // the results meta counts the rows on screen — 20, the default page size.
       // `_summary=count` is the query that asks the server for the whole tally,

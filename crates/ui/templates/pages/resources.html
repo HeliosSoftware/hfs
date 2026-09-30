@@ -156,8 +156,8 @@ HFS_NL_SEARCH_MODEL={{ nl.model }}</code></pre>
         <span class="modal__subject" id="resource-modal-subject"></span>
       </div>
       <div class="modal__tabs" role="tablist">
-        <button type="button" class="modal__tab modal__tab--on" data-modal-tab="edit" aria-selected="true">{{ i18n.t("resources-tab-edit") }}</button>
-        <button type="button" class="modal__tab" data-modal-tab="history" aria-selected="false">{{ i18n.t("resources-tab-history") }}</button>
+        <button type="button" role="tab" class="modal__tab modal__tab--on" data-modal-tab="edit" aria-selected="true">{{ i18n.t("resources-tab-edit") }}</button>
+        <button type="button" role="tab" class="modal__tab" data-modal-tab="history" aria-selected="false">{{ i18n.t("resources-tab-history") }}</button>
       </div>
       <div class="modal__actions">
         <button type="button" class="btn" id="resource-delete">{{ i18n.t("editor-delete") }}</button>
@@ -206,5 +206,6 @@ HFS_NL_SEARCH_MODEL={{ nl.model }}</code></pre>
 <script src="/ui/assets/row-navigation.js" defer></script>
 {% if nl.configured %}<script src="/ui/assets/nl-search.js" defer></script>{% endif %}
 <script src="/ui/assets/resource-filter.js" defer></script>
+<script src="/ui/assets/editor-add.js" defer></script>
 <script src="/ui/assets/resources.js" defer></script>
 {% endblock %}

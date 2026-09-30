@@ -162,20 +162,24 @@ fn cases() -> Vec<Case> {
             format!("{LOINC}|"),
             &["ob-loinc", "ob-prelim"],
         ),
+        // `|code` on an element that does carry systems means "has no
+        // system", on every backend (#1388): not `ob-loinc`.
+        (
+            "Observation",
+            "code",
+            none.clone(),
+            "|1234-5".into(),
+            &["ob-nosys"],
+        ),
+        // ...and `:not` is its exact negation.
+        (
+            "Observation",
+            "code",
+            not.clone(),
+            "|1234-5".into(),
+            &["ob-loinc", "ob-prelim"],
+        ),
     ]
-}
-
-/// `|code` on an element that does carry systems. SQLite and Elasticsearch
-/// implement "has no system"; PostgreSQL and MongoDB treat `|code` as a bare
-/// code (pre-existing, out of scope for #1379), so the expectation is the
-/// caller's.
-fn no_system_case(strict: bool) -> Case {
-    let expected: &'static [&'static str] = if strict {
-        &["ob-nosys"]
-    } else {
-        &["ob-loinc", "ob-nosys"]
-    };
-    ("Observation", "code", None, "|1234-5".into(), expected)
 }
 
 fn query(
@@ -216,13 +220,8 @@ fn ids(expected: &[&str]) -> BTreeSet<String> {
 }
 
 /// Seeds the resources under a caller-unique tenant and asserts the table.
-/// `strict_no_system` says whether the backend implements `|code` as "has no
-/// system" (see [`no_system_case`]).
-pub async fn system_qualified_tokens_match_code_elements<S>(
-    backend: &S,
-    tenant_base: &str,
-    strict_no_system: bool,
-) where
+pub async fn system_qualified_tokens_match_code_elements<S>(backend: &S, tenant_base: &str)
+where
     S: ResourceStorage + SearchProvider,
 {
     let tenant = TenantContext::new(TenantId::new(tenant_base), TenantPermissions::full_access());
@@ -288,11 +287,8 @@ pub async fn system_qualified_tokens_match_code_elements<S>(
         );
     }
 
-    let mut table = cases();
-    table.push(no_system_case(strict_no_system));
-
     let mut failures = Vec::new();
-    for (resource_type, param, modifier, value, expected) in table {
+    for (resource_type, param, modifier, value, expected) in cases() {
         let got = matched(
             backend,
             &tenant,

@@ -5363,10 +5363,8 @@ struct SqlLibQuery {
 
 /// Shapes a stored `Library` resource into the editor's `(id, name, json,
 /// sql)` quadruple: `sql` decoded out of the base64 `application/sql`
-/// attachment for the SQL card, `json` the Details card's own document —
-/// `lib` with that same attachment stripped back out (#840,
-/// [`sql_libraries::strip_sql_attachment`]) — so the two cards never show
-/// the SQL text twice.
+/// attachment for the SQL card, `json` the full stored document — the SQL
+/// card below is a second view of its `application/sql` attachment (#1233).
 fn shape_lib(lib: &serde_json::Value) -> (String, String, String, String) {
     let id = lib
         .get("id")
@@ -5379,8 +5377,7 @@ fn shape_lib(lib: &serde_json::Value) -> (String, String, String, String) {
         .unwrap_or(&id)
         .to_string();
     let sql = sql_libraries::extract_sql(lib);
-    let json =
-        serde_json::to_string_pretty(&sql_libraries::strip_sql_attachment(lib)).unwrap_or_default();
+    let json = serde_json::to_string_pretty(lib).unwrap_or_default();
     (id, name, json, sql)
 }
 
@@ -5392,9 +5389,11 @@ fn shape_lib(lib: &serde_json::Value) -> (String, String, String, String) {
 /// place on first paint, not fetched after the fact. Mirrors
 /// [`render_vd_form_pane`]; `document`'s own `resourceType` decides the
 /// fallback resource type when absent, falling back to `"Library"` — every
-/// caller on this page hands it a `Library` (its SQL attachment already
-/// stripped by the caller), except the one Save-error path where the
-/// submitted document parses but carries some other type.
+/// caller on this page hands it the full `Library` document, `application/sql`
+/// attachment included (#1233), except the one Save-error path where the
+/// submitted document parses but carries some other type; `hidden=["content"]`
+/// below is what keeps that attachment out of the form's own rows and its
+/// "+ Add" list.
 fn render_lib_details_pane(
     i18n: I18n,
     version: helios_fhir::FhirVersion,
@@ -5425,9 +5424,10 @@ fn render_lib_details_pane(
 }
 
 /// The Details panel for whichever document this render selected (#840):
-/// the stored library — its SQL attachment stripped — or `?lib=new`'s
-/// starter document (which carries none to begin with), mirroring
-/// [`vd_form_pane_for_selection`]. `None` only alongside `selected: None`.
+/// the stored library — full document, `application/sql` attachment
+/// included (#1233) — or `?lib=new`'s starter document (which carries none
+/// to begin with), mirroring [`vd_form_pane_for_selection`]. `None` only
+/// alongside `selected: None`.
 fn lib_details_pane_for_selection(
     i18n: I18n,
     version: helios_fhir::FhirVersion,
@@ -5442,9 +5442,7 @@ fn lib_details_pane_for_selection(
             sql_libraries::starter_library_value(kind.code),
         ))
     } else {
-        selected_value.map(|lib| {
-            render_lib_details_pane(i18n, version, sql_libraries::strip_sql_attachment(lib))
-        })
+        selected_value.map(|lib| render_lib_details_pane(i18n, version, lib.clone()))
     }
 }
 
@@ -5704,10 +5702,18 @@ async fn sql_library_page(
     // in before `?…&saved=1` can show a table; until then this render's own
     // `run_results` below shows the same "waiting" notice the `/run`
     // fragment would.
+    //
+    // #1276: built off `tables_document`, not `selected_value`, so
+    // `?lib=new` analyzes its starter document too. Without that the page
+    // renders no `#lib-params` at all, and `/run`'s own out-of-band card —
+    // sent once the pasted JSON declares a parameter — has no element to
+    // replace, so htmx drops it and no value can ever be typed in. The
+    // starter's own signature is what `/run` computes for an unedited
+    // document, so the card is swapped only once a declaration changes.
     let no_values = std::collections::HashMap::new();
     let analysis = kind
         .declares_parameters
-        .then_some(selected_value.as_ref())
+        .then_some(tables_document.as_ref())
         .flatten()
         .map(|lib| {
             let sql = selected
@@ -6197,8 +6203,9 @@ async fn sql_library_save(
     // #840: this page only ever shows and saves Libraries of its own kind —
     // saving a `sql-view` from SQL Queries (or the reverse) would silently
     // vanish it from the rail it was just edited on. Checked ahead of
-    // `embed_sql` below, against the resource exactly as submitted, so a
-    // rejected Save changes nothing about what the user typed.
+    // `fill_sql_attachment` below, against the resource exactly as
+    // submitted, so a rejected Save changes nothing about what the user
+    // typed.
     if !sql_libraries::has_library_code(&resource, kind.code) {
         let status = sql_libraries::extract_status(&resource);
         return render(
@@ -6218,7 +6225,8 @@ async fn sql_library_save(
     // `0..0` — reject a save (or Duplicate) that would persist a non-empty
     // one rather than silently keeping declarations the page never lets the
     // user act on. Checked after #840's own type gate above, against the
-    // resource exactly as submitted (before `embed_sql`), same as it is.
+    // resource exactly as submitted (before `fill_sql_attachment`), same as
+    // it is.
     if !kind.declares_parameters
         && resource
             .get("parameter")
@@ -6239,7 +6247,10 @@ async fn sql_library_save(
             .await,
         );
     }
-    sql_libraries::embed_sql(&mut resource, &form.sql);
+    // #1233: the Details JSON attachment wins over the SQL card — this only
+    // fills in when the JSON carries no readable `application/sql`
+    // attachment of its own.
+    sql_libraries::fill_sql_attachment(&mut resource, &form.sql);
     // Read before `resource` moves into `save_resource` below — only the
     // save-failure branch needs it, but the value must be captured here.
     let status = sql_libraries::extract_status(&resource);
@@ -6298,9 +6309,10 @@ struct SqlLibRunForm {
     /// The editor's full text, exactly as posted — never reformatted or
     /// re-serialized before either parsing it or embedding `sql` into it.
     json: String,
-    /// The SQL pane's exact posted text, embedded into `json`'s
-    /// `application/sql` attachment the same way Save does
-    /// ([`sql_libraries::embed_sql`]).
+    /// The SQL pane's exact posted text, folded into `json`'s
+    /// `application/sql` attachment the same way Save does — only when
+    /// `json` carries no readable one of its own (#1233,
+    /// [`sql_libraries::fill_sql_attachment`]).
     sql: String,
     /// Every submitted `param:{name}` value (#841), keyed by name.
     values: std::collections::HashMap<String, String>,
@@ -6509,6 +6521,13 @@ async fn sql_library_run(
         );
     }
 
+    // #1233: the Details JSON attachment wins over the SQL card — fill in
+    // only when the JSON carries no readable `application/sql` attachment
+    // of its own, once, ahead of every analysis below. `sql` is the
+    // effective SQL this run analyzes and executes from here on.
+    sql_libraries::fill_sql_attachment(&mut resource, &form.sql);
+    let sql = sql_libraries::extract_sql(&resource);
+
     // #841: a SQL View's own profile fixes `Library.parameter` to
     // `0..0` — this kind never declares parameters, so it never builds the
     // Parameters card (`kind.declares_parameters` gates that below) and
@@ -6541,7 +6560,7 @@ async fn sql_library_run(
     // always runs — the run/notice gate below needs its result regardless
     // of whether the card travels.
     let deps = sql_libraries::table_dependencies(&resource);
-    let unknown_tables = sql_libraries::unknown_tables(&form.sql, &deps);
+    let unknown_tables = sql_libraries::unknown_tables(&sql, &deps);
     let unknown_names: Vec<String> = unknown_tables.iter().map(|t| t.name.clone()).collect();
     let tables_signature = sql_libraries::tables_signature_with_unknown(&deps, &unknown_names);
     let tables_card = if tables_signature != form.tables_sig {
@@ -6592,7 +6611,6 @@ async fn sql_library_run(
     }
 
     if !kind.declares_parameters {
-        sql_libraries::embed_sql(&mut resource, &form.sql);
         let (run_results, columns) =
             match run_sql_preview(&state, &resource, &[], rv.0, &rt.id).await {
                 Ok((table, raw_rows, ms)) => {
@@ -6603,7 +6621,7 @@ async fn sql_library_run(
                         "ran a Library preview"
                     );
                     let columns = columns_fragment_for_success(
-                        &state, rv.0, &rt.id, i18n, kind, &table, &raw_rows, &form.sql, &deps,
+                        &state, rv.0, &rt.id, i18n, kind, &table, &raw_rows, &sql, &deps,
                     )
                     .await;
                     (standard(RunResultsState::Success(table, ms)), columns)
@@ -6622,7 +6640,7 @@ async fn sql_library_run(
     // #841: SQL Query — declared parameters, undeclared-placeholder hints,
     // and the values/bindings this run supplies, all from one analysis so
     // the signature comparison below and the run itself never disagree.
-    let analysis = analyze_params(&resource, &form.sql, &form.values);
+    let analysis = analyze_params(&resource, &sql, &form.values);
     let oob = analysis.signature != form.params_sig;
 
     let (run_results, columns) = if !analysis.missing_required.is_empty() {
@@ -6634,7 +6652,6 @@ async fn sql_library_run(
             stale_columns(),
         )
     } else {
-        sql_libraries::embed_sql(&mut resource, &form.sql);
         // Borrowed across the `await`, not cloned: `analysis` itself is
         // untouched until after this call returns, so its own `bindings`
         // stay valid for the whole request.
@@ -6647,7 +6664,7 @@ async fn sql_library_run(
                     "ran a Library preview"
                 );
                 let columns = columns_fragment_for_success(
-                    &state, rv.0, &rt.id, i18n, kind, &table, &raw_rows, &form.sql, &deps,
+                    &state, rv.0, &rt.id, i18n, kind, &table, &raw_rows, &sql, &deps,
                 )
                 .await;
                 (standard(RunResultsState::Success(table, ms)), columns)
@@ -9386,6 +9403,13 @@ mod tests {
         assert!(Assets::get("logo.png").is_some());
     }
 
+    /// #1240: the shared unsaved-changes tracker (`window.HfsUnsaved`),
+    /// loaded from the layout like every other shared helper.
+    #[test]
+    fn unsaved_helper_is_embedded() {
+        assert!(Assets::get("unsaved.js").is_some());
+    }
+
     /// #753: the CodeMirror 6 + lezer-fhirpath vendoring ritual's
     /// one committed output (`crates/ui/vendor/codemirror/README.md`) is
     /// embedded exactly like any other subfolder asset — `assets/fonts/` is
@@ -9480,6 +9504,14 @@ mod tests {
     #[test]
     fn code_editor_helper_script_is_embedded() {
         assert!(Assets::get("code-editor.js").is_some());
+    }
+
+    /// #1239: `editor-add.js`, the "+ Add Element" picker module shared by
+    /// the three editor hosts (the standalone editor, the Resources modal and
+    /// the `pane=form` guided form), is embedded like every other page script.
+    #[test]
+    fn editor_add_helper_script_is_embedded() {
+        assert!(Assets::get("editor-add.js").is_some());
     }
 
     /// The theme script persists the choice to the per-user settings document

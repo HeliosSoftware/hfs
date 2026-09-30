@@ -18,6 +18,20 @@ use helios_persistence::core::{
 use helios_persistence::error::{ResourceError, StorageError};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 
+#[path = "search/large_id_set_suite.rs"]
+mod large_id_set_suite;
+
+#[tokio::test]
+async fn sqlite_large_id_set_search_count_cursor_not_and_tenant() {
+    let backend = create_backend();
+    large_id_set_suite::large_id_set_search_count_cursor_not_and_tenant(
+        &backend,
+        "large-id-set-sqlite",
+    )
+    .await;
+    large_id_set_suite::wide_chain_and_nested_has(&backend, "wide-chain-sqlite").await;
+}
+
 /// The backend-agnostic conditional-criteria suite (#1312). `#[path]` resolves
 /// relative to this file, the same arrangement the other backends' binaries
 /// use for their shared suites.
@@ -4868,4 +4882,32 @@ mod last_updated_millisecond_precision {
             }
         }
     }
+}
+
+mod release_contract {
+    use helios_persistence as persistence;
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/bulk_submit/release_contract.rs"
+    ));
+}
+
+/// See `release_contract::release_requeues_and_fences_out_a_zombie` (#1531).
+#[tokio::test]
+async fn test_bulk_submit_release_requeues_and_fences_out_a_zombie() {
+    release_contract::release_requeues_and_fences_out_a_zombie(
+        &create_backend(),
+        &create_tenant("submit-release"),
+    )
+    .await;
+}
+
+/// See `release_contract::release_after_abort_is_a_no_op` (#1531).
+#[tokio::test]
+async fn test_bulk_submit_release_after_abort_is_a_no_op() {
+    release_contract::release_after_abort_is_a_no_op(
+        &create_backend(),
+        &create_tenant("submit-release-abort"),
+    )
+    .await;
 }

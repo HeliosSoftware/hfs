@@ -47,16 +47,16 @@ use crate::core::{
     BundleEntry, BundleProvider, BundleResult, CapabilityProvider, ChainedSearchProvider,
     ConditionalCreateResult, ConditionalDeleteResult, ConditionalStorage, ConditionalUpdateResult,
     ExportDataProvider, ExportRequest, GroupExportProvider, IncludeProvider,
-    InstanceHistoryProvider, NdjsonBatch, PatientExportProvider, PurgableStorage, ResourceStorage,
-    RevincludeProvider, SearchProvider, SearchResult, SofRunner, StorageCapabilities,
-    SystemHistoryProvider, TerminologySearchProvider, TextSearchProvider, TypeHistoryProvider,
-    VersionedStorage,
+    InstanceHistoryProvider, NdjsonBatch, PatchCandidateValidator, PatientExportProvider,
+    PurgableStorage, ResourceStorage, RevincludeProvider, SearchProvider, SearchResult, SofRunner,
+    StorageCapabilities, SystemHistoryProvider, TerminologySearchProvider, TextSearchProvider,
+    TypeHistoryProvider, VersionedStorage,
 };
 use crate::error::{BackendError, ResourceError, StorageError, StorageResult, TransactionError};
 use crate::search::ChainResolveOptions;
 use crate::tenant::TenantContext;
 use crate::types::{
-    IncludeDirective, Pagination, ReverseChainedParameter, SearchParamType, SearchParameter,
+    IncludeDirective, Page, Pagination, ReverseChainedParameter, SearchParamType, SearchParameter,
     SearchQuery, SearchValue, StoredResource,
 };
 
@@ -195,6 +195,22 @@ impl CompositeStorage {
             .backends_with_role(super::config::BackendRole::Search)
             .next()
             .is_some()
+    }
+
+    /// The backend the dashboard's count aggregates come from: the primary,
+    /// which owns the authoritative store, unless it keeps no counts at all
+    /// and a Search-role secondary does — an S3 primary with Elasticsearch
+    /// (#1280). Such a secondary may lag the primary by its sync mode; the
+    /// alternative on that deployment was no figures at all.
+    fn counting_storage(&self) -> &DynStorage {
+        if self.primary.supports_type_counts() {
+            return &self.primary;
+        }
+        self.config
+            .backends_with_role(super::config::BackendRole::Search)
+            .filter_map(|entry| self.secondaries.get(&entry.id))
+            .find(|backend| backend.supports_type_counts())
+            .unwrap_or(&self.primary)
     }
 
     async fn find_conditional_matches(
@@ -1195,11 +1211,12 @@ impl ResourceStorage for CompositeStorage {
         resource_type: &str,
         since: chrono::DateTime<chrono::Utc>,
     ) -> StorageResult<Vec<crate::core::DailyResourceCount>> {
-        // Counts are an authoritative-store concern; the search secondary may
-        // lag or omit soft-deletes. Delegate to the primary backend, which owns
-        // the canonical `resources` table. (`count_by_types` uses the default
-        // impl, which routes through `count` — also primary-backed above.)
-        self.primary
+        // Counts are an authoritative-store concern: the primary answers
+        // whenever it keeps them, and only a primary that keeps none hands
+        // them to a counting search secondary (`counting_storage`, #1280).
+        // (`count_by_types` uses the default impl, which routes through
+        // `count` — primary-backed above.)
+        self.counting_storage()
             .count_by_day(tenant, resource_type, since)
             .await
     }
@@ -1211,9 +1228,10 @@ impl ResourceStorage for CompositeStorage {
         since: chrono::DateTime<chrono::Utc>,
         bucket_seconds: i64,
     ) -> StorageResult<Vec<crate::core::ResourceCountDelta>> {
-        // The history log lives with the authoritative primary store, same as the
-        // counts above and `activity_histogram` below.
-        self.primary
+        // The history log lives with the authoritative primary store; a
+        // counting secondary answers only when the primary keeps no counts,
+        // as for `count_by_day` above.
+        self.counting_storage()
             .count_deltas_by_bucket(tenant, resource_type, since, bucket_seconds)
             .await
     }
@@ -1225,9 +1243,9 @@ impl ResourceStorage for CompositeStorage {
         since: chrono::DateTime<chrono::Utc>,
         bucket_seconds: i64,
     ) -> StorageResult<Vec<(String, crate::core::ResourceCountDelta)>> {
-        // Same history log as `count_deltas_by_bucket`: the primary's, which
+        // Same routing as `count_deltas_by_bucket`; a primary that counts
         // answers with its own grouped query rather than the per-type default.
-        self.primary
+        self.counting_storage()
             .count_deltas_by_type_and_bucket(tenant, resource_types, since, bucket_seconds)
             .await
     }
@@ -1242,12 +1260,12 @@ impl ResourceStorage for CompositeStorage {
     }
 
     async fn count_all_types(&self, tenant: &TenantContext) -> StorageResult<Vec<(String, u64)>> {
-        self.primary.count_all_types(tenant).await
+        self.counting_storage().count_all_types(tenant).await
     }
 
     fn supports_type_counts(&self) -> bool {
-        // Both count aggregates above delegate to the primary, so it decides.
-        self.primary.supports_type_counts()
+        // The count aggregates above all go to `counting_storage`, so it decides.
+        self.counting_storage().supports_type_counts()
     }
 
     async fn latest_write_marker(
@@ -1255,9 +1273,11 @@ impl ResourceStorage for CompositeStorage {
         tenant: &TenantContext,
         recent_since: Option<chrono::DateTime<chrono::Utc>>,
     ) -> StorageResult<Option<crate::core::WriteMarker>> {
-        // The history log the marker reads lives with the authoritative primary,
-        // same as the count aggregates above.
-        self.primary.latest_write_marker(tenant, recent_since).await
+        // Read where the count aggregates above are read, so the reconcile
+        // loop's marker and its counts describe the same store.
+        self.counting_storage()
+            .latest_write_marker(tenant, recent_since)
+            .await
     }
 
     async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
@@ -1335,6 +1355,51 @@ impl SearchProvider for CompositeStorage {
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
         self.execute_routed_search(tenant, query).await
+    }
+
+    async fn search_ids(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<Page<String>> {
+        // A merged search needs resource-level ordering and page information.
+        // Delegate id pages only when the normal route has one search provider.
+        if !self.has_dedicated_search_backend() {
+            let decision = self
+                .router
+                .route(query)
+                .map_err(|error| self.routing_error_to_storage_error(error))?;
+            if !decision.auxiliary_targets.is_empty() {
+                return Ok(self
+                    .search(tenant, query)
+                    .await?
+                    .resources
+                    .map(|resource| resource.id().to_string()));
+            }
+        }
+
+        let preferred_id = self
+            .config
+            .backends_with_role(super::config::BackendRole::Search)
+            .next()
+            .map(|backend| backend.id.as_str());
+        let primary_id = self.config.primary_id().unwrap_or("primary");
+        let backend_id = preferred_id
+            .filter(|id| self.search_providers.contains_key(*id))
+            .unwrap_or(primary_id);
+        let provider = self.search_providers.get(backend_id).ok_or_else(|| {
+            StorageError::Backend(BackendError::UnsupportedCapability {
+                backend_name: backend_id.to_string(),
+                capability: "SearchProvider".to_string(),
+            })
+        })?;
+        let result = provider.search_ids(tenant, query).await;
+        self.update_health(
+            backend_id,
+            result.is_ok(),
+            result.as_ref().err().map(|error| error.to_string()),
+        );
+        result
     }
 
     async fn search_count(
@@ -2040,11 +2105,12 @@ impl BundleProvider for CompositeStorage {
             .is_some_and(|p| p.supports_atomic_transactions())
     }
 
-    async fn process_transaction(
+    async fn process_transaction_with_patch_validator(
         &self,
         tenant: &TenantContext,
         entries: Vec<BundleEntry>,
         fhir_version: helios_fhir::FhirVersion,
+        validator: Option<&dyn PatchCandidateValidator>,
     ) -> Result<BundleResult, TransactionError> {
         let provider =
             self.bundle_provider
@@ -2055,7 +2121,7 @@ impl BundleProvider for CompositeStorage {
                 })?;
 
         let result = provider
-            .process_transaction(tenant, entries, fhir_version)
+            .process_transaction_with_patch_validator(tenant, entries, fhir_version, validator)
             .await?;
 
         // Sync successful entries to secondaries by reading resources from primary
@@ -3573,6 +3639,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_ids_uses_the_same_provider_fallback_as_search() {
+        let tenant = TenantContext::new(
+            TenantId::new("composite-test"),
+            TenantPermissions::full_access(),
+        );
+        let query = SearchQuery::new("Patient");
+        let (mut composite, primary, search) = make_composite_with_dedicated_search(
+            vec![fake_patient("primary-id")],
+            vec![fake_patient("search-id")],
+        );
+
+        let ids = composite.search_ids(&tenant, &query).await.unwrap().items;
+        assert_eq!(ids, ["search-id"]);
+        assert_eq!(primary.call_count(), 0);
+        assert_eq!(search.call_count(), 1);
+
+        composite.search_providers.remove("search");
+        let ids = composite.search_ids(&tenant, &query).await.unwrap().items;
+        assert_eq!(ids, ["primary-id"]);
+        assert_eq!(primary.call_count(), 1);
+
+        composite.search_providers.remove("primary");
+        let error = composite.search_ids(&tenant, &query).await.unwrap_err();
+        assert!(matches!(
+            error,
+            StorageError::Backend(BackendError::UnsupportedCapability { backend_name, .. })
+                if backend_name == "primary"
+        ));
+    }
+
+    #[tokio::test]
+    async fn search_ids_without_dedicated_backend_uses_primary() {
+        let tenant = TenantContext::new(
+            TenantId::new("composite-test"),
+            TenantPermissions::full_access(),
+        );
+        let (composite, primary) =
+            make_composite_no_search_backend(vec![fake_patient("primary-id")]);
+        let ids = composite
+            .search_ids(&tenant, &SearchQuery::new("Patient"))
+            .await
+            .unwrap()
+            .items;
+        assert_eq!(ids, ["primary-id"]);
+        assert_eq!(primary.call_count(), 1);
+    }
+
+    #[tokio::test]
     async fn resolve_includes_delegates_to_shared_resolver_via_search_backend() {
         use crate::search::{SearchParameterDefinition, SearchParameterRegistry};
         use crate::types::IncludeType;
@@ -5038,5 +5152,298 @@ mod tests {
                 crate::search::SearchParameterRegistry::new(),
             ))
         }
+    }
+}
+
+/// Where the dashboard's count aggregates come from on a composite (#1280):
+/// the primary whenever it keeps counts; a counting search secondary only
+/// when the primary keeps none, the way an S3 primary with Elasticsearch is.
+#[cfg(test)]
+mod count_routing_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use chrono::{DateTime, NaiveDate, Utc};
+    use helios_fhir::FhirVersion;
+    use serde_json::Value;
+
+    use super::{CompositeStorage, DynStorage};
+    use crate::composite::config::CompositeConfig;
+    use crate::core::{
+        BackendKind, DailyResourceCount, ResourceCountDelta, ResourceStorage, WriteMarker,
+    };
+    use crate::error::{BackendError, StorageError, StorageResult};
+    use crate::tenant::{TenantContext, TenantId, TenantPermissions};
+    use crate::types::StoredResource;
+
+    /// A backend that either keeps counts (answering with its `label`) or,
+    /// like an S3 primary, keeps none.
+    struct Counting {
+        label: &'static str,
+        counts: bool,
+    }
+
+    fn unsupported(what: &str) -> StorageError {
+        StorageError::Backend(BackendError::UnsupportedCapability {
+            backend_name: "mock".to_string(),
+            capability: what.to_string(),
+        })
+    }
+
+    #[async_trait]
+    impl ResourceStorage for Counting {
+        fn backend_name(&self) -> &'static str {
+            self.label
+        }
+
+        async fn create(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _resource: Value,
+            _fhir_version: FhirVersion,
+        ) -> StorageResult<StoredResource> {
+            Err(unsupported("create"))
+        }
+
+        async fn create_or_update(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+            _resource: Value,
+            _fhir_version: FhirVersion,
+        ) -> StorageResult<(StoredResource, bool)> {
+            Err(unsupported("create_or_update"))
+        }
+
+        async fn read(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<Option<StoredResource>> {
+            Ok(None)
+        }
+
+        async fn update(
+            &self,
+            _tenant: &TenantContext,
+            _current: &StoredResource,
+            _resource: Value,
+        ) -> StorageResult<StoredResource> {
+            Err(unsupported("update"))
+        }
+
+        async fn delete(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<()> {
+            Err(unsupported("delete"))
+        }
+
+        async fn count(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: Option<&str>,
+        ) -> StorageResult<u64> {
+            Ok(0)
+        }
+
+        fn supports_type_counts(&self) -> bool {
+            self.counts
+        }
+
+        async fn count_all_types(
+            &self,
+            _tenant: &TenantContext,
+        ) -> StorageResult<Vec<(String, u64)>> {
+            Ok(vec![(self.label.to_string(), 1)])
+        }
+
+        async fn latest_write_marker(
+            &self,
+            _tenant: &TenantContext,
+            recent_since: Option<DateTime<Utc>>,
+        ) -> StorageResult<Option<WriteMarker>> {
+            Ok(Some(WriteMarker {
+                latest: None,
+                recent_writes: recent_since.map(|_| self.label.len() as u64),
+            }))
+        }
+
+        async fn count_by_day(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _since: DateTime<Utc>,
+        ) -> StorageResult<Vec<DailyResourceCount>> {
+            Ok(vec![DailyResourceCount {
+                day: NaiveDate::from_ymd_opt(2026, 9, 25).unwrap(),
+                count: self.label.len() as u64,
+            }])
+        }
+
+        async fn count_deltas_by_bucket(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            since: DateTime<Utc>,
+            _bucket_seconds: i64,
+        ) -> StorageResult<Vec<ResourceCountDelta>> {
+            Ok(vec![ResourceCountDelta {
+                bucket_start: since,
+                delta: self.label.len() as i64,
+            }])
+        }
+
+        async fn count_deltas_by_type_and_bucket(
+            &self,
+            _tenant: &TenantContext,
+            resource_types: &[&str],
+            since: DateTime<Utc>,
+            _bucket_seconds: i64,
+        ) -> StorageResult<Vec<(String, ResourceCountDelta)>> {
+            Ok(resource_types
+                .iter()
+                .map(|resource_type| {
+                    (
+                        resource_type.to_string(),
+                        ResourceCountDelta {
+                            bucket_start: since,
+                            delta: self.label.len() as i64,
+                        },
+                    )
+                })
+                .collect())
+        }
+    }
+
+    fn composite(primary_counts: bool, secondary_counts: bool) -> CompositeStorage {
+        let config = CompositeConfig::builder()
+            .primary("primary", BackendKind::S3)
+            .search_backend("es", BackendKind::Elasticsearch)
+            .build()
+            .unwrap();
+        let mut backends: HashMap<String, DynStorage> = HashMap::new();
+        backends.insert(
+            "primary".to_string(),
+            Arc::new(Counting {
+                label: "primary",
+                counts: primary_counts,
+            }),
+        );
+        backends.insert(
+            "es".to_string(),
+            Arc::new(Counting {
+                label: "es",
+                counts: secondary_counts,
+            }),
+        );
+        CompositeStorage::new(config, backends).unwrap()
+    }
+
+    fn tenant() -> TenantContext {
+        TenantContext::new(TenantId::new("t"), TenantPermissions::full_access())
+    }
+
+    #[tokio::test]
+    async fn a_counting_primary_answers_itself() {
+        let composite = composite(true, true);
+        assert!(composite.supports_type_counts());
+        assert_eq!(
+            composite.count_all_types(&tenant()).await.unwrap(),
+            vec![("primary".to_string(), 1)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_primary_without_counts_hands_them_to_the_counting_secondary() {
+        let composite = composite(false, true);
+        assert!(composite.supports_type_counts());
+        assert_eq!(
+            composite.count_all_types(&tenant()).await.unwrap(),
+            vec![("es".to_string(), 1)]
+        );
+        let marker = composite
+            .latest_write_marker(&tenant(), Some(Utc::now()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(marker.recent_writes, Some("es".len() as u64));
+    }
+
+    #[tokio::test]
+    async fn the_time_series_follow_the_same_routing_as_the_totals() {
+        let since = Utc::now();
+        for (primary_counts, expected) in [(true, "primary"), (false, "es")] {
+            let composite = composite(primary_counts, true);
+            let days = composite
+                .count_by_day(&tenant(), "Patient", since)
+                .await
+                .unwrap();
+            assert_eq!(days[0].count, expected.len() as u64);
+            let deltas = composite
+                .count_deltas_by_bucket(&tenant(), "Patient", since, 3600)
+                .await
+                .unwrap();
+            assert_eq!(deltas[0].delta, expected.len() as i64);
+            let by_type = composite
+                .count_deltas_by_type_and_bucket(
+                    &tenant(),
+                    &["Patient", "Observation"],
+                    since,
+                    3600,
+                )
+                .await
+                .unwrap();
+            assert_eq!(by_type.len(), 2);
+            assert!(
+                by_type
+                    .iter()
+                    .all(|(_, delta)| delta.delta == expected.len() as i64)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_mock_refuses_writes_and_reads_nothing() {
+        let backend = Counting {
+            label: "primary",
+            counts: false,
+        };
+        let t = tenant();
+        let version = FhirVersion::default();
+        assert!(
+            backend
+                .create(&t, "Patient", Value::Null, version)
+                .await
+                .is_err()
+        );
+        assert!(
+            backend
+                .create_or_update(&t, "Patient", "p1", Value::Null, version)
+                .await
+                .is_err()
+        );
+        assert!(backend.read(&t, "Patient", "p1").await.unwrap().is_none());
+        assert!(backend.delete(&t, "Patient", "p1").await.is_err());
+        assert_eq!(backend.count(&t, None).await.unwrap(), 0);
+        assert_eq!(backend.backend_name(), "primary");
+        assert!(!backend.supports_type_counts());
+    }
+
+    #[tokio::test]
+    async fn no_counting_backend_means_no_counts() {
+        let composite = composite(false, false);
+        assert!(!composite.supports_type_counts());
+        assert_eq!(
+            composite.count_all_types(&tenant()).await.unwrap(),
+            vec![("primary".to_string(), 1)],
+            "the primary is still asked, as before; the dashboard gates on supports_type_counts"
+        );
     }
 }

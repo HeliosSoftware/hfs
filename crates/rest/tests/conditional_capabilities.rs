@@ -258,12 +258,18 @@ async fn a_conditional_patch_on_the_composite_patches_the_one_match() {
     for body in [
         json!([{"op": "replace", "path": "/id", "value": "other"}]),
         json!([{"op": "replace", "path": "/resourceType", "value": "Person"}]),
-        json!([{"op": "test", "path": "/active", "value": true}]),
     ] {
         patch("/Patient?identifier=urn:zzz:probe|P-1", None, body)
             .await
             .assert_status(StatusCode::BAD_REQUEST);
     }
+    patch(
+        "/Patient?identifier=urn:zzz:probe|P-1",
+        None,
+        json!([{"op": "test", "path": "/active", "value": true}]),
+    )
+    .await
+    .assert_status(StatusCode::UNPROCESSABLE_ENTITY);
 
     let response = patch(
         "/Patient?identifier=urn:zzz:probe|P-1",

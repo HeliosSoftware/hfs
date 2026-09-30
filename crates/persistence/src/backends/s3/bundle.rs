@@ -12,7 +12,7 @@
 
 use async_trait::async_trait;
 
-use crate::core::{BundleEntry, BundleProvider, BundleResult};
+use crate::core::{BundleEntry, BundleProvider, BundleResult, PatchCandidateValidator};
 use crate::error::TransactionError;
 use crate::tenant::TenantContext;
 
@@ -48,11 +48,12 @@ impl BundleProvider for S3Backend {
         false
     }
 
-    async fn process_transaction(
+    async fn process_transaction_with_patch_validator(
         &self,
         _tenant: &TenantContext,
         _entries: Vec<BundleEntry>,
         _fhir_version: helios_fhir::FhirVersion,
+        _validator: Option<&dyn PatchCandidateValidator>,
     ) -> Result<BundleResult, TransactionError> {
         // Refused before any work. A partial commit is worse than a rejection:
         // the caller cannot distinguish 408-with-466-writes from 408-with-none,
