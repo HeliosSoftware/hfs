@@ -144,6 +144,7 @@ test.describe.serial("Active SQL Exports", () => {
     const card = sqlExport.card(prefix);
     await expect(card).toBeVisible();
     await expect(card.locator(".tag")).toHaveText("In progress");
+    await expect(sqlExport.lede).toHaveText("1 export · 1 running");
 
     // The overflow's `<details>` is server-rendered hidden — it would
     // otherwise hold nothing but the JS-only Copy job id button — but with
@@ -176,6 +177,7 @@ test.describe.serial("Active SQL Exports", () => {
     // line naming the output files.
     await expect(card.locator(".tag")).toHaveText("Complete", { timeout: POLL_TIMEOUT });
     await expect(progressbar).toHaveAttribute("aria-valuenow", "100");
+    await expect(sqlExport.lede).toHaveText("1 export · 0 running");
     await expect(card).toContainText("file");
 
     // (e) View files leads to the job's own permalink (#835), listing every
@@ -235,6 +237,7 @@ test.describe.serial("Active SQL Exports", () => {
     // The rerun lands first (most recent `startedAt`).
     const rerun = sqlExport.card(vdName).first();
     await expect(rerun.locator(".tag")).toHaveText("Complete", { timeout: POLL_TIMEOUT });
+    await expect(sqlExport.lede).toHaveText("2 exports · 0 running");
 
     // (g) Remove from list drops it back to one card.
     await rerun.locator("summary").click();
@@ -543,6 +546,8 @@ test.describe.serial("SQL Export job detail (#835)", () => {
     await page.getByRole("button", { name: "Retry" }).click();
     await expect(page).toHaveURL(/\/ui\/sql\/export$/);
     await expect(sqlExport.card(queryName)).toHaveCount(2);
+    await expect(sqlExport.card(queryName).first().locator(".tag")).toHaveText("Failed", { timeout: POLL_TIMEOUT });
+    await expect(sqlExport.lede).toHaveText("2 exports · 0 running");
   });
 });
 

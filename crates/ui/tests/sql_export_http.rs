@@ -18,6 +18,12 @@ use helios_persistence::core::SettingsStore;
 use helios_ui::{SqlExportStatus, StaticConformanceSource};
 use tower::ServiceExt;
 
+#[path = "support/export_settings.rs"]
+mod export_settings;
+
+#[path = "support/html.rs"]
+mod html;
+
 fn nl() -> helios_ui::NlSearch {
     helios_ui::NlSearch {
         enabled: true,
@@ -718,7 +724,10 @@ async fn starting_an_export_stores_an_in_progress_record_and_the_list_polls_its_
     assert!(html.contains(&format!(r#"id="job-{id}""#)));
     assert!(html.contains(&format!(r#"hx-get="/ui/sql/export/{id}/card""#)));
     assert!(html.contains("every 5s"));
-    assert!(html.contains("1 exports"));
+    assert_eq!(
+        html::Dom::page(&html).one("#sql-export-summary").text(),
+        "1 export · 1 running"
+    );
     assert!(html.contains("1 running"));
 }
 
@@ -3040,4 +3049,187 @@ async fn card_shows_the_right_contextual_action_and_overflow_items_per_status() 
     assert!(html.contains(r#"action="/ui/sql/export/job-a/rerun""#));
     assert!(html.contains(r#"action="/ui/sql/export/job-a/remove""#));
     assert!(html.contains(r#"data-copy-job-id="job-1""#));
+}
+
+fn assert_sql_summary(html: &str, total: usize, running: usize) {
+    let dom = html::Dom::fragment(html);
+    let summary = dom.one("#sql-export-summary");
+    assert!(summary.has_class("page-head__lede"));
+    assert_eq!(summary.attr("hx-swap-oob"), Some("outerHTML"));
+    let word = if total == 1 { "export" } else { "exports" };
+    assert_eq!(
+        summary.text(),
+        format!("{total} {word} · {running} running")
+    );
+    assert_eq!(dom.count(".job-card"), 1);
+    assert_eq!(
+        dom.count(".job-card [hx-swap-oob]"),
+        0,
+        "summary must be a sibling, not part of the replaced card"
+    );
+    assert_eq!(dom.count("[hx-swap-oob]"), 1);
+    assert_eq!(dom.count("#bulk-export-summary"), 0);
+}
+
+#[tokio::test]
+async fn terminal_card_responses_refresh_the_summary_for_complete_failed_and_cancelled() {
+    for outcome in [SqlExportStatus::Done, SqlExportStatus::Unknown] {
+        for fail_manifest in [false, true] {
+            let backend = backend_with_schema().await;
+            seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+            seed_job(&backend, "default", "job-b", in_progress_job("job-2")).await;
+            seed_job(&backend, "other", "job-c", in_progress_job("job-3")).await;
+            seed_job_for_user(
+                &backend,
+                "u2:4:test:other",
+                "default",
+                "job-d",
+                in_progress_job("job-4"),
+            )
+            .await;
+            let running = app(
+                &backend,
+                StaticConformanceSource::empty().with_export_status(SqlExportStatus::running(None)),
+            );
+            let page = body_text(running.oneshot(get("/ui/sql/export")).await.unwrap()).await;
+            let dom = html::Dom::page(&page);
+            assert_eq!(
+                dom.one("#sql-export-summary").text(),
+                "2 exports · 2 running"
+            );
+            assert_eq!(
+                dom.one("#sql-export-jobs").attr("hx-sync"),
+                Some("#sql-export-jobs:drop")
+            );
+            assert_eq!(dom.one("#sql-export-jobs").all(".job-card").len(), 2);
+            assert_eq!(dom.count("[hx-swap-oob]"), 0);
+            let mut source = StaticConformanceSource::empty()
+                .with_export_status(outcome.clone())
+                .with_export_manifest(Ok(
+                    serde_json::json!({"resourceType": "Parameters", "parameter": []}),
+                ));
+            if fail_manifest {
+                source = source.with_export_manifest(Err("simulated manifest failure".to_string()));
+            }
+            let app = app(&backend, source);
+            let response = app
+                .clone()
+                .oneshot(get("/ui/sql/export/job-a/card"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let html = body_text(response).await;
+            assert_sql_summary(&html, 2, 1);
+            let terminal = match outcome {
+                SqlExportStatus::Unknown => "cancelled",
+                _ if fail_manifest => "failed",
+                _ => "complete",
+            };
+            assert!(
+                html::Dom::fragment(&html)
+                    .one(".job-card .tag")
+                    .has_class(&format!("tag--{terminal}"))
+            );
+            assert!(
+                !html::Dom::fragment(&html)
+                    .one(".job-card")
+                    .has_attr("hx-trigger")
+            );
+            // Sibling job-b was counted, never polled by the first request.
+            let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+            assert_eq!(
+                stored.document["byTenant"]["default"]["sqlExport"]["jobs"]["job-b"]["status"],
+                "in-progress"
+            );
+            let html =
+                body_text(app.oneshot(get("/ui/sql/export/job-b/card")).await.unwrap()).await;
+            assert_sql_summary(&html, 2, 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_post_poll_settings_read_failure_returns_no_swap_and_the_next_tick_recovers() {
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+    let store = Arc::new(export_settings::ExportSettings::new(backend, 2, None));
+    let app = mount(
+        Some(store),
+        StaticConformanceSource::empty().with_export_status(SqlExportStatus::Done),
+    );
+    let response = app
+        .clone()
+        .oneshot(get("/ui/sql/export/job-a/card"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let html = body_text(response).await;
+    assert_eq!(html::Dom::fragment(&html).count("[hx-swap-oob]"), 0);
+    assert_eq!(html::Dom::fragment(&html).count("#job-job-a"), 0);
+    let response = app.oneshot(get("/ui/sql/export/job-a/card")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_sql_summary(&body_text(response).await, 1, 0);
+}
+
+#[tokio::test]
+async fn a_stale_sql_poll_renders_a_concurrent_cancel_or_404_for_a_removed_member() {
+    for replacement in [
+        serde_json::json!({"status": "cancelled"}),
+        serde_json::Value::Null,
+    ] {
+        let backend = backend_with_schema().await;
+        seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+        let deleted = replacement.is_null();
+        let race = serde_json::json!({"byTenant": {"default": {"sqlExport": {"jobs": {"job-a": replacement}}}}});
+        let store = Arc::new(export_settings::ExportSettings::new(
+            backend.clone(),
+            0,
+            Some(race),
+        ));
+        let app = mount(
+            Some(store),
+            StaticConformanceSource::empty().with_export_status(SqlExportStatus::Done),
+        );
+        let response = app.oneshot(get("/ui/sql/export/job-a/card")).await.unwrap();
+        if deleted {
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        } else {
+            assert_eq!(response.status(), StatusCode::OK);
+            let html = body_text(response).await;
+            assert!(
+                html::Dom::fragment(&html)
+                    .one(".job-card .tag")
+                    .has_class("tag--cancelled")
+            );
+            assert_eq!(html::Dom::fragment(&html).count(".tag--complete"), 0);
+            assert_sql_summary(&html, 1, 0);
+        }
+        let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+        let member = stored.document["byTenant"]["default"]["sqlExport"]["jobs"].get("job-a");
+        assert_eq!(member.is_none(), deleted);
+        if let Some(member) = member {
+            assert_eq!(member["status"], "cancelled");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_failed_sql_poll_write_keeps_the_persisted_running_card_polling() {
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+    let app = mount(
+        Some(Arc::new(FailingPatchSettingsStore(backend))),
+        StaticConformanceSource::empty().with_export_status(SqlExportStatus::Done),
+    );
+    let response = app.oneshot(get("/ui/sql/export/job-a/card")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert_eq!(
+        html::Dom::fragment(&html)
+            .one(".job-card")
+            .attr("hx-trigger"),
+        Some("every 5s")
+    );
+    assert_eq!(html::Dom::fragment(&html).count("#sql-export-summary"), 0);
+    assert_eq!(html::Dom::fragment(&html).count(".tag--complete"), 0);
 }
