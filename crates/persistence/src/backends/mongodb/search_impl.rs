@@ -493,6 +493,73 @@ pub(super) fn missing_presence_filter(
     filter
 }
 
+/// A positive `_id` filter's implied resource-id universe (#1528): every
+/// `_id` search value is itself an id, so a query carrying one already names
+/// a finite set to check everything else against — no `search_index` scan
+/// can ever need to look past it. Chains, `_has` and `_list` all resolve to
+/// a plain `_id` parameter before `search()` ever runs
+/// (`search/chain_resolver.rs`, `search/list_resolver.rs`), so this covers
+/// those too, not just a literal `?_id=` in the URL — which is also why the
+/// resolved set can realistically hold hundreds of thousands of ids, not
+/// just the handful a hand-written query would carry.
+///
+/// Comma-separated values within one `_id` parameter are OR'd (FHIR's
+/// standard comma semantics); a *repeated* `_id` parameter — `_id=a&_id=b`
+/// — is the AND form and intersects with every other one seen. `_id:not`
+/// and `_id:missing` are exclusionary, not a positive set to check against,
+/// so a parameter with any modifier is skipped here and is left exactly as
+/// today: applied only on `resources`, by `build_resource_filter`.
+///
+/// Returns `None` when there is no positive `_id` parameter to seed from, so
+/// the caller falls back to today's behavior unchanged. A value with a
+/// prefix other than `Eq` is not a valid `_id` value at all
+/// (`build_resource_id_condition` rejects it with `QueryParseError`); rather
+/// than guess at its meaning here, this bails out to `None` for the whole
+/// query so that error is still the one the caller ultimately surfaces, from
+/// the ordinary resource-level `_id` condition.
+fn positive_id_seed(query: &SearchQuery) -> Option<HashSet<String>> {
+    let mut seed: Option<HashSet<String>> = None;
+    for param in &query.parameters {
+        if param.name != "_id" || param.modifier.is_some() {
+            continue;
+        }
+        if param.values.iter().any(|v| v.prefix != SearchPrefix::Eq) {
+            return None;
+        }
+        let values: HashSet<String> = param.values.iter().map(|v| v.value.clone()).collect();
+        seed = Some(match seed {
+            Some(current) => current.intersection(&values).cloned().collect(),
+            None => values,
+        });
+    }
+    seed
+}
+
+/// The `search_index` filter naming every row that names `comp.reference` as
+/// a member through any of `comp.params` (logical OR) — reference matching is
+/// version-agnostic, matching the base reference or a `/_history/<vid>`
+/// suffix. Shared by `compartment_resource_ids` (the unbounded compartment
+/// population) and the #1528 seed-vs-compartment driver probe in
+/// `matching_resource_ids`, which needs the identical shape without a
+/// `resource_id` bound.
+fn compartment_membership_filter(
+    tenant_id: &str,
+    resource_type: &str,
+    comp: &CompartmentMembership,
+) -> Document {
+    let base = strip_reference_version(&comp.reference);
+    let params: Vec<Bson> = comp.params.iter().cloned().map(Bson::String).collect();
+    doc! {
+        "tenant_id": tenant_id,
+        "resource_type": resource_type,
+        "param_name": { "$in": Bson::Array(params) },
+        "$or": [
+            { "value_reference": &base },
+            { "value_reference": { "$regex": format!("^{}/_history/", regex_escape(base)) } },
+        ],
+    }
+}
+
 /// Rejects the `_contained=true|both` constraints that select *top-level*
 /// resources, which a contained resource never is (#1383, #1407).
 ///
@@ -2239,6 +2306,51 @@ impl MongoBackend {
             .compartment
             .as_ref()
             .is_some_and(|c| !c.params.is_empty() && !c.reference.is_empty());
+        let compartment = query.compartment.as_ref().filter(|_| has_compartment);
+
+        // #1528: a positive `_id` parameter names a finite candidate universe
+        // — chains, `_has` and `_list` all resolve to one before `search()`
+        // ever runs (`search/chain_resolver.rs`, `search/list_resolver.rs`),
+        // so this is not just a literal `?_id=` in the URL and can realistically
+        // hold hundreds of thousands of ids. `None` here means "no positive
+        // `_id`", and every branch below falls back to today's behavior
+        // unchanged in that case.
+        let id_seed = positive_id_seed(query);
+        if id_seed.as_ref().is_some_and(HashSet::is_empty) {
+            // #1528: an empty seed (e.g. disjoint
+            // repeated `_id` params) does make the overall AND certainly
+            // match nothing, but short-circuiting here — before any sibling
+            // parameter's filter gets built — would silently drop the
+            // `QueryParseError` a malformed sibling value raises today
+            // (`_id=a&_id=b&date=<bad-date>` returning empty instead of
+            // rejecting the bad date). Build (and discard) every plain
+            // normal filter first so that still surfaces. Composites and
+            // `:identifier` references are left alone: the former has its
+            // own preflight above, and the latter needs a database round
+            // trip to validate, which isn't worth paying for a query this
+            // narrow (an unsatisfiable `_id` AND an unresolvable target is
+            // "no results" either way).
+            for param in &normal {
+                if param.param_type != SearchParamType::Composite
+                    && !matches!(param.modifier, Some(SearchModifier::Identifier))
+                {
+                    self.build_search_index_filter(tenant_id, resource_type, param)?;
+                }
+            }
+            // #1528 review round 2 finding 4: `:not` needs the same
+            // validation, built the same way `retain_matching_candidates`
+            // builds it (a clone with `modifier` cleared, since the filter
+            // builder itself doesn't know `:not` semantics) — otherwise
+            // `_id=a&_id=b&date:not=<bad-date>` would silently return empty
+            // instead of surfacing the bad date, the same gap this whole
+            // block exists to close for plain parameters.
+            for param in &not_params {
+                let mut positive = (**param).clone();
+                positive.modifier = None;
+                self.build_search_index_filter(tenant_id, resource_type, &positive)?;
+            }
+            return Ok(Some(HashSet::new()));
+        }
 
         if normal.is_empty() && missing.is_empty() && not_params.is_empty() && !has_compartment {
             return Ok(None);
@@ -2246,8 +2358,69 @@ impl MongoBackend {
 
         // :missing=true and :not require complementing against the full resource
         // universe. When no normal params exist to drive paging, fall back to the
-        // complement-only path that materialises the universe via distinct().
+        // complement-only path that materialises the universe via distinct() —
+        // unless a positive `_id` seed already names a finite universe: driving
+        // from it instead avoids both the id-set cap and MongoDB's own
+        // `distinct` result-size limit, either of which `all_resource_ids`
+        // can hit at the scale a resolved chain/`_has`/`_list` produces (#1528).
         if normal.is_empty() {
+            if let Some(seed) = id_seed {
+                // #1528 review finding 4: a compartment's own membership is
+                // usually a small, natural population (patient/123 has a few
+                // hundred encounters) — unrelated to the size of a resolved
+                // `_id` seed, which a chain/`_has`/`_list` can make far
+                // larger. Walking the *seed* in 512-id chunks against a
+                // membership filter that would have answered in one query is
+                // a real regression (e.g. ~196 hinted finds against a
+                // 100,000-id seed instead of the one `distinct` compartment
+                // membership already used to cost). Probe it first, bounded
+                // to `|seed|+1`, and only take that cheaper route when
+                // `:missing`/`:not` aren't also in play (their complement
+                // semantics need the full seed-driven per-batch checks).
+                if missing.is_empty()
+                    && not_params.is_empty()
+                    && let Some(comp) = compartment
+                {
+                    let probe_filter =
+                        compartment_membership_filter(tenant_id, resource_type, comp);
+                    let count = search_index
+                        .count_documents(probe_filter)
+                        .limit(seed.len() as u64 + 1)
+                        .await
+                        .or_query_error(
+                            "Failed to probe compartment membership against the _id seed",
+                        )?;
+                    if count < seed.len() as u64 {
+                        let members = self
+                            .compartment_resource_ids(&search_index, tenant_id, resource_type, comp)
+                            .await?
+                            .unwrap_or_default();
+                        let confirmed: HashSet<String> =
+                            members.into_iter().filter(|id| seed.contains(id)).collect();
+                        if confirmed.len() > MAX_RESULT_ID_SET {
+                            return Err(StorageError::Search(SearchError::TooManyResults {
+                                count: confirmed.len(),
+                                max: MAX_RESULT_ID_SET,
+                            }));
+                        }
+                        return Ok(Some(confirmed));
+                    }
+                }
+                return self
+                    .seeded_matching_resource_ids(
+                        &search_index,
+                        tenant_id,
+                        resource_type,
+                        &[],
+                        &HashMap::new(),
+                        &missing,
+                        &not_params,
+                        compartment,
+                        seed,
+                    )
+                    .await
+                    .map(Some);
+            }
             return self
                 .matching_resource_ids_complement_only(
                     db,
@@ -2294,47 +2467,151 @@ impl MongoBackend {
         // composite driver, if chosen, doesn't re-run them below.
         let mut composite_probes: HashMap<usize, (Document, u64)> = HashMap::new();
 
-        let driver_idx = if normal.len() == 1 && normal[0].param_type != SearchParamType::Composite
-        {
-            0
-        } else {
-            let mut best: Option<(usize, u64)> = None;
-            for (i, param) in normal.iter().enumerate() {
-                let count = if param.param_type == SearchParamType::Composite {
-                    match self
-                        .composite_driver_probe(
-                            &search_index,
-                            tenant_id,
-                            resource_type,
-                            param,
-                            PROBE_ROW_LIMIT,
-                            None,
-                        )
-                        .await?
-                    {
-                        None => return Ok(Some(HashSet::new())),
-                        Some((filter, count)) => {
-                            composite_probes.insert(i, (filter, count));
-                            count
-                        }
-                    }
+        // #1528: which candidate set drives the search — a normal parameter
+        // (as today), or the `_id` seed itself. `Copy` so it can be read out
+        // of `best` without fighting the borrow checker across the loop.
+        #[derive(Clone, Copy)]
+        enum Driver {
+            Param(usize),
+            Seed,
+        }
+
+        let single_plain_normal =
+            normal.len() == 1 && normal[0].param_type != SearchParamType::Composite;
+
+        let driver = match (&id_seed, single_plain_normal) {
+            (None, true) => Driver::Param(0),
+            // #1528 review round 2 finding 1: a seed that already fits in one
+            // `CANDIDATE_BATCH_SIZE` chunk costs exactly one hinted, bounded
+            // find to drive from — never more than the probe below costs on
+            // its own, and the probe can be expensive in its own right (a
+            // case-insensitive or unanchored regex parameter, e.g.
+            // `:contains`/`:text`, walks its whole key range to find a rare
+            // match). Skip the probe entirely rather than pay for it and then
+            // read the same range again from the driver cursor.
+            (Some(seed), true) if seed.len() <= CANDIDATE_BATCH_SIZE => Driver::Seed,
+            // A seed competing against exactly one plain parameter needs no
+            // probe loop: a single cheap `count_documents(...).limit(|seed|+1)`
+            // — at most `|seed|+1` keys examined — decides which side is
+            // smaller (#1528: driving from the seed unconditionally would
+            // turn a chain-resolved seed of hundreds of thousands of ids into
+            // one query per 512-id chunk even when the sibling parameter is
+            // far more selective).
+            (Some(seed), true) => {
+                let filter = normal_filter(0)?;
+                let count = search_index
+                    .count_documents(filter)
+                    .limit(seed.len() as u64 + 1)
+                    .await
+                    .or_query_error("Failed to probe search_index against the _id seed")?;
+                if count == 0 {
+                    return Ok(Some(HashSet::new()));
+                }
+                if count < seed.len() as u64 {
+                    Driver::Param(0)
                 } else {
-                    let filter = normal_filter(i)?;
-                    let count = search_index
-                        .count_documents(filter)
-                        .limit(PROBE_ROW_LIMIT)
-                        .await
-                        .or_query_error("Failed to probe search_index for driver selection")?;
-                    if count == 0 {
-                        return Ok(Some(HashSet::new()));
-                    }
-                    count
-                };
-                if best.is_none_or(|(_, prev)| count < prev) {
-                    best = Some((i, count));
+                    Driver::Seed
                 }
             }
-            best.map(|(i, _)| i).unwrap_or(0)
+            (_, false) => {
+                // Two or more normal parameters, or a single composite: the
+                // existing probe loop already computes every candidate's
+                // count (composites via `composite_driver_probe`, which also
+                // raises `InvalidComposite` for an all-`ne` value — #1528
+                // relies on that still running here unconditionally, whether
+                // or not the seed ends up winning). The seed, when present,
+                // just enters the same race at its known size, for free.
+                //
+                // #1528 review finding 2: cap each probe's budget to the
+                // seed's own size, not the flat `PROBE_ROW_LIMIT` — a small
+                // seed has no reason to pay up to 100,000 keys per sibling
+                // parameter just to lose to it (mirrors the single-parameter
+                // arm above). A probe that still *saturates* at that capped
+                // budget only proves "count >= probe_limit", not an exact
+                // count below the seed's, so it must not be allowed to win
+                // the race off that alone — only an unsaturated probe (a real
+                // count) can beat the incumbent.
+                let probe_limit = id_seed.as_ref().map_or(PROBE_ROW_LIMIT, |seed| {
+                    PROBE_ROW_LIMIT.min(seed.len() as u64 + 1)
+                });
+                let mut best: Option<(Driver, u64)> = id_seed
+                    .as_ref()
+                    .map(|seed| (Driver::Seed, seed.len() as u64));
+                // #1528 review round 2 finding 1 (optional): a seed that
+                // already fits in one `CANDIDATE_BATCH_SIZE` chunk is never
+                // more expensive to drive from than probing a plain
+                // parameter would be (same reasoning as the single-parameter
+                // arm above), so skip that probe entirely rather than pay
+                // for one just to lose the race. `composite_driver_probe`
+                // still runs unconditionally for composites: it is the only
+                // thing that raises `InvalidComposite` for an all-`ne` value,
+                // and that must not depend on how the driver race turns out.
+                let seed_fits_one_batch = id_seed
+                    .as_ref()
+                    .is_some_and(|seed| seed.len() <= CANDIDATE_BATCH_SIZE);
+                for (i, param) in normal.iter().enumerate() {
+                    if seed_fits_one_batch && param.param_type != SearchParamType::Composite {
+                        continue;
+                    }
+                    let count = if param.param_type == SearchParamType::Composite {
+                        match self
+                            .composite_driver_probe(
+                                &search_index,
+                                tenant_id,
+                                resource_type,
+                                param,
+                                probe_limit,
+                                None,
+                            )
+                            .await?
+                        {
+                            None => return Ok(Some(HashSet::new())),
+                            Some((filter, count)) => {
+                                composite_probes.insert(i, (filter, count));
+                                count
+                            }
+                        }
+                    } else {
+                        let filter = normal_filter(i)?;
+                        let count = search_index
+                            .count_documents(filter)
+                            .limit(probe_limit)
+                            .await
+                            .or_query_error("Failed to probe search_index for driver selection")?;
+                        if count == 0 {
+                            return Ok(Some(HashSet::new()));
+                        }
+                        count
+                    };
+                    let inconclusive_against_seed = id_seed.is_some() && count >= probe_limit;
+                    if !inconclusive_against_seed && best.is_none_or(|(_, prev)| count < prev) {
+                        best = Some((Driver::Param(i), count));
+                    }
+                }
+                best.map(|(d, _)| d)
+                    .expect("normal is non-empty in this arm")
+            }
+        };
+
+        let driver_idx = match driver {
+            Driver::Param(i) => i,
+            Driver::Seed => {
+                let seed = id_seed.expect("Driver::Seed implies a positive _id seed");
+                return self
+                    .seeded_matching_resource_ids(
+                        &search_index,
+                        tenant_id,
+                        resource_type,
+                        &normal,
+                        &identifier_filters,
+                        &missing,
+                        &not_params,
+                        compartment,
+                        seed,
+                    )
+                    .await
+                    .map(Some);
+            }
         };
 
         // Every composite index visited by the loop above has its probe
@@ -2370,137 +2647,30 @@ impl MongoBackend {
                 }
             }
 
-            for (i, param) in normal.iter().enumerate() {
-                if candidates.is_empty() {
-                    continue;
-                }
-                // A composite's driver arm only proves ONE component
-                // matched (its most selective one) — every composite in
-                // `normal`, including the driver, still needs the grouped
-                // pair check to confirm every component matched within the
-                // same `composite_group` (#1206).
-                if param.param_type == SearchParamType::Composite {
-                    let passing = self
-                        .composite_pair_check(
-                            &search_index,
-                            tenant_id,
-                            resource_type,
-                            param,
-                            &candidates,
-                            None,
-                        )
-                        .await?;
-                    candidates.retain(|id| passing.contains(id));
-                    continue;
-                }
-                if i == driver_idx {
-                    continue;
-                }
-                let param_filter = normal_filter(i)?;
-                let bounded = doc! {
-                    "$and": [
-                        param_filter,
-                        { "resource_id": { "$in": candidates.iter().cloned().collect::<Vec<_>>() } }
-                    ]
-                };
-                let passing: HashSet<String> = search_index
-                    .distinct("resource_id", bounded)
-                    .await
-                    .or_query_error("Failed to intersect search_index")?
-                    .into_iter()
-                    .filter_map(|v| v.as_str().map(ToString::to_string))
-                    .collect();
-                candidates.retain(|id| passing.contains(id));
+            // #1528 stage 1: free, in-memory bound to the positive `_id` seed
+            // — so `confirmed` stays a subset of it even here, where a normal
+            // parameter (not the seed) won the driver race above. This alone
+            // is what keeps a broad sibling parameter from ever re-tripping
+            // the id-set cap when the true intersection with `_id` is small.
+            if let Some(seed) = &id_seed {
+                candidates.retain(|id| seed.contains(id));
             }
 
-            // :missing — check per batch against surviving candidates.
-            for param in &missing {
-                if candidates.is_empty() {
-                    break;
-                }
-                let wants_missing = param
-                    .values
-                    .first()
-                    .map(|v| v.value == "true")
-                    .unwrap_or(false);
-                let with_entry: HashSet<String> = search_index
-                    .distinct(
-                        "resource_id",
-                        doc! {
-                            "tenant_id": tenant_id,
-                            "resource_type": resource_type,
-                            "param_name": &param.name,
-                            "resource_id": { "$in": candidates.iter().cloned().collect::<Vec<_>>() },
-                        },
-                    )
-                    .await
-                    .or_query_error("Failed to check :missing")?
-                    .into_iter()
-                    .filter_map(|v| v.as_str().map(ToString::to_string))
-                    .collect();
-                if wants_missing {
-                    candidates.retain(|id| !with_entry.contains(id));
-                } else {
-                    candidates.retain(|id| with_entry.contains(id));
-                }
-            }
-
-            // :not — per the spec, includes resources with no value for the
-            // parameter at all (#881). Check per batch against surviving candidates.
-            for param in &not_params {
-                if candidates.is_empty() {
-                    break;
-                }
-                let mut positive = (*param).clone();
-                positive.modifier = None;
-                let pos_filter =
-                    self.build_search_index_filter(tenant_id, resource_type, &positive)?;
-                let bounded = doc! {
-                    "$and": [
-                        pos_filter,
-                        { "resource_id": { "$in": candidates.iter().cloned().collect::<Vec<_>>() } }
-                    ]
-                };
-                let matching: HashSet<String> = search_index
-                    .distinct("resource_id", bounded)
-                    .await
-                    .or_query_error("Failed to check :not")?
-                    .into_iter()
-                    .filter_map(|v| v.as_str().map(ToString::to_string))
-                    .collect();
-                candidates.retain(|id| !matching.contains(id));
-            }
-
-            // Compartment — checked per batch against surviving candidates.
-            if has_compartment {
-                if let Some(comp) = &query.compartment {
-                    if !candidates.is_empty() {
-                        let base = strip_reference_version(&comp.reference);
-                        let params: Vec<Bson> =
-                            comp.params.iter().cloned().map(Bson::String).collect();
-                        let comp_filter = doc! {
-                            "tenant_id": tenant_id,
-                            "resource_type": resource_type,
-                            "param_name": { "$in": Bson::Array(params) },
-                            "resource_id": { "$in": candidates.iter().cloned().collect::<Vec<_>>() },
-                            "$or": [
-                                { "value_reference": &base },
-                                { "value_reference": {
-                                    "$regex": format!("^{}/_history/", regex_escape(base))
-                                }},
-                            ],
-                        };
-                        let in_comp: HashSet<String> = search_index
-                            .distinct("resource_id", comp_filter)
-                            .await
-                            .or_query_error("Failed to check compartment membership")?
-                            .into_iter()
-                            .filter_map(|v| v.as_str().map(ToString::to_string))
-                            .collect();
-                        candidates.retain(|id| in_comp.contains(id));
-                    }
-                }
-            }
+            let candidates = self
+                .retain_matching_candidates(
+                    &search_index,
+                    tenant_id,
+                    resource_type,
+                    &normal,
+                    &identifier_filters,
+                    &missing,
+                    &not_params,
+                    compartment,
+                    Some(driver_idx),
+                    false,
+                    candidates,
+                )
+                .await?;
 
             confirmed.extend(candidates);
 
@@ -2517,6 +2687,341 @@ impl MongoBackend {
         }
 
         Ok(Some(confirmed))
+    }
+
+    /// The per-batch body every check in `matching_resource_ids` shares:
+    /// intersects `candidates` against every normal parameter other than
+    /// `skip_idx` (already proven by whichever cursor selected them — a
+    /// normal parameter's driver cursor, or a chunk of the `_id` seed),
+    /// every `:missing`/`:not` parameter, and the compartment membership
+    /// filter, bounded to `candidates` throughout.
+    ///
+    /// `hint` selects the query shape (#1528): `false` reproduces exactly
+    /// the unhinted `distinct` shape every driver-selected normal parameter
+    /// has used since #1040/#1083. That shape is left unchanged here by
+    /// scope decision — the driver path itself is out of scope for this fix
+    /// and stays as today pending a follow-up, not because there is nothing
+    /// for the planner to get wrong. `true` is used only when the `_id` seed
+    /// itself drives (`seeded_matching_resource_ids`): `distinct` cannot take
+    /// a hint, and this same shape — a candidate chunk checked against a
+    /// sibling predicate — measured 1,655,936 keys examined unhinted against
+    /// 8,191 hinted onto `idx_search_composite`, against the real
+    /// 11.2M-resource corpus (#999) — so this shape lifts
+    /// `tenant_id`/`resource_type`/`resource_id: {"$in": …}` to the top
+    /// level (required so the date `$or` shape from `scoped_date_alternatives`
+    /// still has a fully-bound prefix in every arm) and hints
+    /// `idx_search_composite` explicitly.
+    #[allow(clippy::too_many_arguments)]
+    async fn retain_matching_candidates(
+        &self,
+        search_index: &mongodb::Collection<Document>,
+        tenant_id: &str,
+        resource_type: &str,
+        normal: &[&SearchParameter],
+        identifier_filters: &HashMap<usize, Document>,
+        missing: &[&SearchParameter],
+        not_params: &[&SearchParameter],
+        compartment: Option<&CompartmentMembership>,
+        skip_idx: Option<usize>,
+        hint: bool,
+        mut candidates: HashSet<String>,
+    ) -> StorageResult<HashSet<String>> {
+        const IDX_SEARCH_COMPOSITE: &str = "idx_search_composite";
+
+        for (i, param) in normal.iter().enumerate() {
+            if candidates.is_empty() {
+                continue;
+            }
+            // A composite's driver arm only proves ONE component matched
+            // (its most selective one) — every composite in `normal`,
+            // including the driver, still needs the grouped pair check to
+            // confirm every component matched within the same
+            // `composite_group` (#1206). This already queries `find` bounded
+            // to `candidates`, never `distinct`, but (#1528 review finding 5)
+            // still takes the same `idx_search_composite` hint as every other
+            // check here when `hint` is set, for the same planner-risk reason
+            // (#999) documented on this function's `hint` parameter.
+            if param.param_type == SearchParamType::Composite {
+                let passing = self
+                    .composite_pair_check(
+                        search_index,
+                        tenant_id,
+                        resource_type,
+                        param,
+                        &candidates,
+                        hint.then_some(IDX_SEARCH_COMPOSITE),
+                        None,
+                    )
+                    .await?;
+                candidates.retain(|id| passing.contains(id));
+                continue;
+            }
+            if Some(i) == skip_idx {
+                continue;
+            }
+            let param_filter = match identifier_filters.get(&i) {
+                Some(filter) => filter.clone(),
+                None => self.build_search_index_filter(tenant_id, resource_type, param)?,
+            };
+            let candidate_ids: Vec<Bson> = candidates.iter().cloned().map(Bson::String).collect();
+            let passing: HashSet<String> = if hint {
+                let bounded = doc! {
+                    "tenant_id": tenant_id,
+                    "resource_type": resource_type,
+                    "resource_id": { "$in": candidate_ids },
+                    "$and": [ param_filter ],
+                };
+                let cursor = search_index
+                    .find(bounded)
+                    .projection(doc! { "resource_id": 1, "_id": 0 })
+                    .hint(mongodb::options::Hint::Name(
+                        IDX_SEARCH_COMPOSITE.to_string(),
+                    ))
+                    .await
+                    .or_query_error("Failed to intersect search_index against the _id seed")?;
+                collect_documents(cursor)
+                    .await?
+                    .into_iter()
+                    .filter_map(|d| d.get_str("resource_id").ok().map(ToString::to_string))
+                    .collect()
+            } else {
+                let bounded = doc! {
+                    "$and": [
+                        param_filter,
+                        { "resource_id": { "$in": candidate_ids } }
+                    ]
+                };
+                search_index
+                    .distinct("resource_id", bounded)
+                    .await
+                    .or_query_error("Failed to intersect search_index")?
+                    .into_iter()
+                    .filter_map(|v| v.as_str().map(ToString::to_string))
+                    .collect()
+            };
+            candidates.retain(|id| passing.contains(id));
+        }
+
+        // :missing — check per batch against surviving candidates.
+        for param in missing {
+            if candidates.is_empty() {
+                break;
+            }
+            let wants_missing = param
+                .values
+                .first()
+                .map(|v| v.value == "true")
+                .unwrap_or(false);
+            let candidate_ids: Vec<Bson> = candidates.iter().cloned().map(Bson::String).collect();
+            let with_entry: HashSet<String> = if hint {
+                let bounded = doc! {
+                    "tenant_id": tenant_id,
+                    "resource_type": resource_type,
+                    "resource_id": { "$in": candidate_ids },
+                    "param_name": &param.name,
+                };
+                let cursor = search_index
+                    .find(bounded)
+                    .projection(doc! { "resource_id": 1, "_id": 0 })
+                    .hint(mongodb::options::Hint::Name(
+                        IDX_SEARCH_COMPOSITE.to_string(),
+                    ))
+                    .await
+                    .or_query_error("Failed to check :missing against the _id seed")?;
+                collect_documents(cursor)
+                    .await?
+                    .into_iter()
+                    .filter_map(|d| d.get_str("resource_id").ok().map(ToString::to_string))
+                    .collect()
+            } else {
+                search_index
+                    .distinct(
+                        "resource_id",
+                        doc! {
+                            "tenant_id": tenant_id,
+                            "resource_type": resource_type,
+                            "param_name": &param.name,
+                            "resource_id": { "$in": candidate_ids },
+                        },
+                    )
+                    .await
+                    .or_query_error("Failed to check :missing")?
+                    .into_iter()
+                    .filter_map(|v| v.as_str().map(ToString::to_string))
+                    .collect()
+            };
+            if wants_missing {
+                candidates.retain(|id| !with_entry.contains(id));
+            } else {
+                candidates.retain(|id| with_entry.contains(id));
+            }
+        }
+
+        // :not — per the spec, includes resources with no value for the
+        // parameter at all (#881). Check per batch against surviving candidates.
+        for param in not_params {
+            if candidates.is_empty() {
+                break;
+            }
+            let mut positive = (*param).clone();
+            positive.modifier = None;
+            let pos_filter = self.build_search_index_filter(tenant_id, resource_type, &positive)?;
+            let candidate_ids: Vec<Bson> = candidates.iter().cloned().map(Bson::String).collect();
+            let matching: HashSet<String> = if hint {
+                let bounded = doc! {
+                    "tenant_id": tenant_id,
+                    "resource_type": resource_type,
+                    "resource_id": { "$in": candidate_ids },
+                    "$and": [ pos_filter ],
+                };
+                let cursor = search_index
+                    .find(bounded)
+                    .projection(doc! { "resource_id": 1, "_id": 0 })
+                    .hint(mongodb::options::Hint::Name(
+                        IDX_SEARCH_COMPOSITE.to_string(),
+                    ))
+                    .await
+                    .or_query_error("Failed to check :not against the _id seed")?;
+                collect_documents(cursor)
+                    .await?
+                    .into_iter()
+                    .filter_map(|d| d.get_str("resource_id").ok().map(ToString::to_string))
+                    .collect()
+            } else {
+                let bounded = doc! {
+                    "$and": [
+                        pos_filter,
+                        { "resource_id": { "$in": candidate_ids } }
+                    ]
+                };
+                search_index
+                    .distinct("resource_id", bounded)
+                    .await
+                    .or_query_error("Failed to check :not")?
+                    .into_iter()
+                    .filter_map(|v| v.as_str().map(ToString::to_string))
+                    .collect()
+            };
+            candidates.retain(|id| !matching.contains(id));
+        }
+
+        // Compartment — checked per batch against surviving candidates.
+        if let Some(comp) = compartment
+            && !candidates.is_empty()
+        {
+            let base = strip_reference_version(&comp.reference);
+            let params: Vec<Bson> = comp.params.iter().cloned().map(Bson::String).collect();
+            let candidate_ids: Vec<Bson> = candidates.iter().cloned().map(Bson::String).collect();
+            let in_comp: HashSet<String> = if hint {
+                let bounded = doc! {
+                    "tenant_id": tenant_id,
+                    "resource_type": resource_type,
+                    "resource_id": { "$in": candidate_ids },
+                    "param_name": { "$in": Bson::Array(params) },
+                    "$or": [
+                        { "value_reference": &base },
+                        { "value_reference": {
+                            "$regex": format!("^{}/_history/", regex_escape(base))
+                        }},
+                    ],
+                };
+                let cursor = search_index
+                    .find(bounded)
+                    .projection(doc! { "resource_id": 1, "_id": 0 })
+                    .hint(mongodb::options::Hint::Name(
+                        IDX_SEARCH_COMPOSITE.to_string(),
+                    ))
+                    .await
+                    .or_query_error(
+                        "Failed to check compartment membership against the _id seed",
+                    )?;
+                collect_documents(cursor)
+                    .await?
+                    .into_iter()
+                    .filter_map(|d| d.get_str("resource_id").ok().map(ToString::to_string))
+                    .collect()
+            } else {
+                let comp_filter = doc! {
+                    "tenant_id": tenant_id,
+                    "resource_type": resource_type,
+                    "param_name": { "$in": Bson::Array(params) },
+                    "resource_id": { "$in": candidate_ids },
+                    "$or": [
+                        { "value_reference": &base },
+                        { "value_reference": {
+                            "$regex": format!("^{}/_history/", regex_escape(base))
+                        }},
+                    ],
+                };
+                search_index
+                    .distinct("resource_id", comp_filter)
+                    .await
+                    .or_query_error("Failed to check compartment membership")?
+                    .into_iter()
+                    .filter_map(|v| v.as_str().map(ToString::to_string))
+                    .collect()
+            };
+            candidates.retain(|id| in_comp.contains(id));
+        }
+
+        Ok(candidates)
+    }
+
+    /// #1528: drives entirely from a positive `_id` seed — used both when no
+    /// normal parameter competes with it (`_id=X&status:not=…`,
+    /// `_id=X&code:missing=true`, a compartment-only query — `normal` is
+    /// `&[]` there) and when the driver competition in `matching_resource_ids`
+    /// picks it over every normal parameter's own probe. Every check runs in
+    /// chunks of `CANDIDATE_BATCH_SIZE`, hinted onto `idx_search_composite`
+    /// (see `retain_matching_candidates`), so a seed of hundreds of thousands
+    /// of ids — realistic once a chain, `_has` or `_list` resolves to one
+    /// (#1528) — never falls back to an unindexed scan.
+    #[allow(clippy::too_many_arguments)]
+    async fn seeded_matching_resource_ids(
+        &self,
+        search_index: &mongodb::Collection<Document>,
+        tenant_id: &str,
+        resource_type: &str,
+        normal: &[&SearchParameter],
+        identifier_filters: &HashMap<usize, Document>,
+        missing: &[&SearchParameter],
+        not_params: &[&SearchParameter],
+        compartment: Option<&CompartmentMembership>,
+        seed: HashSet<String>,
+    ) -> StorageResult<HashSet<String>> {
+        let mut sorted: Vec<&String> = seed.iter().collect();
+        sorted.sort();
+
+        let mut confirmed: HashSet<String> = HashSet::new();
+        for chunk in sorted.chunks(CANDIDATE_BATCH_SIZE) {
+            let candidates: HashSet<String> = chunk.iter().map(|id| (*id).clone()).collect();
+            let candidates = self
+                .retain_matching_candidates(
+                    search_index,
+                    tenant_id,
+                    resource_type,
+                    normal,
+                    identifier_filters,
+                    missing,
+                    not_params,
+                    compartment,
+                    None,
+                    true,
+                    candidates,
+                )
+                .await?;
+
+            confirmed.extend(candidates);
+
+            if confirmed.len() > MAX_RESULT_ID_SET {
+                return Err(StorageError::Search(SearchError::TooManyResults {
+                    count: confirmed.len(),
+                    max: MAX_RESULT_ID_SET,
+                }));
+            }
+        }
+
+        Ok(confirmed)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2624,18 +3129,7 @@ impl MongoBackend {
             return Ok(None);
         }
 
-        let base = strip_reference_version(&comp.reference);
-        let params: Vec<Bson> = comp.params.iter().cloned().map(Bson::String).collect();
-
-        let filter = doc! {
-            "tenant_id": tenant_id,
-            "resource_type": resource_type,
-            "param_name": { "$in": Bson::Array(params) },
-            "$or": [
-                { "value_reference": &base },
-                { "value_reference": { "$regex": format!("^{}/_history/", regex_escape(base)) } },
-            ],
-        };
+        let filter = compartment_membership_filter(tenant_id, resource_type, comp);
 
         let ids = search_index
             .distinct("resource_id", filter)
@@ -3132,6 +3626,15 @@ impl MongoBackend {
     /// `candidates` bounds every query issued here — this is the per-batch
     /// check reused by both `matching_resource_ids` (no session) and the
     /// ifNoneExist matcher in `storage.rs` (with a transaction session).
+    ///
+    /// `hint` (#1528 review finding 5) names an index to force via
+    /// `Hint::Name` — passed as `Some("idx_search_composite")` only when this
+    /// is called from the `_id`-seeded path (`retain_matching_candidates`
+    /// with `hint: true`), where an unhinted planner risk is already measured
+    /// (#999) for this same "bounded batch check" query shape; `None`
+    /// everywhere else (the driver-path call here and the `storage.rs`
+    /// ifNoneExist call), unchanged.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn composite_pair_check(
         &self,
         search_index: &mongodb::Collection<Document>,
@@ -3139,6 +3642,7 @@ impl MongoBackend {
         resource_type: &str,
         param: &SearchParameter,
         candidates: &HashSet<String>,
+        hint: Option<&str>,
         mut session: Option<&mut mongodb::ClientSession>,
     ) -> StorageResult<HashSet<String>> {
         if candidates.is_empty() {
@@ -3165,9 +3669,11 @@ impl MongoBackend {
 
                 let pairs: HashSet<(String, i32)> = match session.as_deref_mut() {
                     Some(s) => {
-                        let mut cursor = search_index
-                            .find(bounded)
-                            .projection(projection.clone())
+                        let mut find = search_index.find(bounded).projection(projection.clone());
+                        if let Some(name) = hint {
+                            find = find.hint(mongodb::options::Hint::Name(name.to_string()));
+                        }
+                        let mut cursor = find
                             .session(&mut *s)
                             .await
                             .or_query_error("Failed to query composite component rows (session)")?;
@@ -3189,9 +3695,11 @@ impl MongoBackend {
                         out
                     }
                     None => {
-                        let cursor = search_index
-                            .find(bounded)
-                            .projection(projection.clone())
+                        let mut find = search_index.find(bounded).projection(projection.clone());
+                        if let Some(name) = hint {
+                            find = find.hint(mongodb::options::Hint::Name(name.to_string()));
+                        }
+                        let cursor = find
                             .await
                             .or_query_error("Failed to query composite component rows")?;
                         collect_documents(cursor)
@@ -6212,6 +6720,111 @@ mod metadata_param_modifier_tests {
                 )
                 .is_ok()
         );
+    }
+}
+
+/// #1528: `positive_id_seed`'s AND/OR/skip semantics, pinned without a live
+/// MongoDB — the same reasoning as `metadata_param_modifier_tests` above.
+#[cfg(test)]
+mod id_seed_tests {
+    use super::*;
+
+    fn id_param(modifier: Option<SearchModifier>, values: &[&str]) -> SearchParameter {
+        SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier,
+            values: values.iter().map(|v| SearchValue::eq(*v)).collect(),
+            chain: vec![],
+            components: vec![],
+        }
+    }
+
+    fn last_updated_param(value: &str) -> SearchParameter {
+        SearchParameter {
+            name: "_lastUpdated".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: vec![SearchValue::eq(value)],
+            chain: vec![],
+            components: vec![],
+        }
+    }
+
+    fn ids(values: &[&str]) -> HashSet<String> {
+        values.iter().map(|v| v.to_string()).collect()
+    }
+
+    #[test]
+    fn no_parameters_gives_none() {
+        let query = SearchQuery::new("Patient");
+        assert_eq!(positive_id_seed(&query), None);
+    }
+
+    #[test]
+    fn only_last_updated_gives_none() {
+        let query = SearchQuery::new("Patient").with_parameter(last_updated_param("2020"));
+        assert_eq!(positive_id_seed(&query), None);
+    }
+
+    #[test]
+    fn single_id_value_seeds_that_one_id() {
+        let query = SearchQuery::new("Patient").with_parameter(id_param(None, &["a"]));
+        assert_eq!(positive_id_seed(&query), Some(ids(&["a"])));
+    }
+
+    #[test]
+    fn comma_separated_values_are_ored() {
+        let query = SearchQuery::new("Patient").with_parameter(id_param(None, &["a", "b"]));
+        assert_eq!(positive_id_seed(&query), Some(ids(&["a", "b"])));
+    }
+
+    #[test]
+    fn repeated_id_parameters_are_anded() {
+        let query = SearchQuery::new("Patient")
+            .with_parameter(id_param(None, &["a", "b"]))
+            .with_parameter(id_param(None, &["b", "c"]));
+        assert_eq!(positive_id_seed(&query), Some(ids(&["b"])));
+    }
+
+    #[test]
+    fn disjoint_repeated_id_parameters_seed_the_empty_set() {
+        // Empty, not None: an empty seed means the query can never match
+        // anything, not "no seed to drive from".
+        let query = SearchQuery::new("Patient")
+            .with_parameter(id_param(None, &["a"]))
+            .with_parameter(id_param(None, &["b"]));
+        assert_eq!(positive_id_seed(&query), Some(HashSet::new()));
+    }
+
+    #[test]
+    fn id_not_never_seeds() {
+        let query =
+            SearchQuery::new("Patient").with_parameter(id_param(Some(SearchModifier::Not), &["a"]));
+        assert_eq!(positive_id_seed(&query), None);
+    }
+
+    #[test]
+    fn id_missing_never_seeds() {
+        let query = SearchQuery::new("Patient")
+            .with_parameter(id_param(Some(SearchModifier::Missing), &["true"]));
+        assert_eq!(positive_id_seed(&query), None);
+    }
+
+    #[test]
+    fn id_not_is_skipped_but_a_sibling_positive_id_still_seeds() {
+        let query = SearchQuery::new("Patient")
+            .with_parameter(id_param(Some(SearchModifier::Not), &["a"]))
+            .with_parameter(id_param(None, &["b"]));
+        assert_eq!(positive_id_seed(&query), Some(ids(&["b"])));
+    }
+
+    #[test]
+    fn a_non_eq_prefix_bails_out_to_none() {
+        let mut param = id_param(None, &["a"]);
+        param.values[0].prefix = SearchPrefix::Gt;
+        let query = SearchQuery::new("Patient").with_parameter(param);
+        assert_eq!(positive_id_seed(&query), None);
     }
 }
 
