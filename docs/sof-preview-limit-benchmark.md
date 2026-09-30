@@ -149,8 +149,11 @@ build passing. The PR's later remote Rust, lint, security, coverage and
 not change the limit implementation. Artifact integrity, historical source
 fingerprints, JSON structure, relative links and recorded plan/measurement
 invariants were checked again. The subsequent merge is verified separately;
-the historical test totals and measurements above do not describe that new
-verification or new performance runs.
+the historical test totals and measurements above do not describe new performance
+runs. The merged branch separately passed 113 focused debug tests: 56 SOF units,
+20 PostgreSQL runner tests, 33 SQLite runner tests, two REST NULL-column tests and
+two REST `_since` tests. Per-crate formatting and `git diff --check` passed. These
+checks verify the integrated behavior; they do not rerun the full-corpus timings.
 
 [The follow-up](https://github.com/HeliosSoftware/hfs/issues/1623) must define tie ordering for nested/cartesian/nullable expansion,
 union branch ties and recursive traversal before applying a cap universally.
