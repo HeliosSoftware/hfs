@@ -186,26 +186,27 @@ pub trait ExportClaimStrategy: Send + Sync {
     /// `LeaseError::LeaseLost` if the job was reclaimed.
     async fn heartbeat(&self, lease: &ExportJobLease) -> Result<DateTime<Utc>, LeaseError>;
 
-    /// Releases a lease early (graceful shutdown). Best-effort: the job goes
-    /// back to `accepted` for the next worker to pick up.
+    /// Hands a lease back early, on graceful shutdown, so another worker can
+    /// claim the job at once instead of waiting out the lease (#1531).
     ///
-    /// **Currently unused** — nothing in the workspace calls it; the worker
-    /// loop lets a shutdown lease lapse instead. Before wiring up a caller,
-    /// note that the implementations do *not* give back the attempt they
-    /// consumed (see `max_attempts` on [`Self::claim_next`]): a job released
-    /// and re-claimed still burns one of its attempts, so a few rolling
-    /// restarts would retire a perfectly healthy export. A caller must first
-    /// make `release` decrement `attempts` — fenced on `worker_id` +
-    /// `fencing_token`, so a zombie cannot spend another worker's attempt.
+    /// In one fenced write (`worker_id` + `fencing_token`, still
+    /// `in_progress`) the job goes back to `accepted` and:
     ///
-    /// The same caller also has to deal with the released job's half-written
-    /// rows: it goes back as `accepted`, which is the one status
-    /// [`Self::claim_next`] does *not* wipe, so the next attempt would resume
-    /// from the cursor and overwrite the parts already recorded — the very
-    /// loss the wipe exists to prevent (#1041). `release` must therefore clear
-    /// the job's progress and file rows itself, or leave the job
-    /// `in_progress` with a lapsed lease.
-    async fn release(&self, lease: ExportJobLease) -> StorageResult<()>;
+    /// - **gets its attempt back.** [`Self::claim_next`] charged one of
+    ///   `max_attempts` for this run. A shutdown is not a failure of the job,
+    ///   so without the refund a few rolling restarts would retire a healthy
+    ///   export.
+    /// - **loses this run's progress and file rows.** `accepted` is the one
+    ///   status [`Self::claim_next`] does not wipe, so the next attempt would
+    ///   otherwise resume from the cursor, restart `part_index` at 0, and
+    ///   leave the manifest pointing at a mix of both runs (#1041). The
+    ///   artifacts stay on disk/S3 for the TTL sweep, as on a reclaim.
+    ///
+    /// Returns whether the lease was released. `false` means this worker no
+    /// longer held it: the job was reclaimed, retired, cancelled, or deleted.
+    /// The fence makes that a no-op, so a zombie cannot refund or wipe an
+    /// attempt that another worker is running.
+    async fn release(&self, lease: ExportJobLease) -> StorageResult<bool>;
 }
 
 /// Worker-owned mutations of job state.
@@ -346,6 +347,8 @@ pub struct DefaultExportWorker<Js: ?Sized, Dp: ?Sized, Os: ?Sized> {
     audit: Option<WorkerAudit>,
     /// How often the lease keeper renews the lease while a job runs.
     heartbeat_interval: Duration,
+    /// Tripped on graceful shutdown; see [`Self::with_shutdown`].
+    shutdown: tokio_util::sync::CancellationToken,
 }
 
 /// Fallback renewal cadence when the caller does not configure one.
@@ -622,7 +625,22 @@ where
             exclude_since_newly_added: false,
             audit: None,
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+            shutdown: tokio_util::sync::CancellationToken::new(),
         }
+    }
+
+    /// Stops a running job when `shutdown` is cancelled, and hands its lease
+    /// back rather than letting it lapse (#1531).
+    ///
+    /// The run stops where abandoning it costs nothing: between batches, or
+    /// in the middle of a read or `_typeFilter` search, where no part is
+    /// open. A part already being written is finished and recorded first.
+    /// Then [`ExportClaimStrategy::release`] returns the job to `accepted`,
+    /// refunds its attempt, and discards this run's progress, so another
+    /// instance can claim it right away instead of waiting out the lease.
+    pub fn with_shutdown(mut self, shutdown: tokio_util::sync::CancellationToken) -> Self {
+        self.shutdown = shutdown;
+        self
     }
 
     /// Sets how often the lease keeper renews the lease while a job runs.
@@ -716,7 +734,16 @@ where
         // that requested the export.
         let mut view: Option<WorkerJobView> = None;
 
-        match self.run_job_inner(&lease, &keeper, &mut view).await {
+        let outcome = self.run_job_inner(&lease, &keeper, &mut view).await;
+        // Renewals stop before the lease is handed back: a heartbeat that
+        // lands after the release finds the lease gone and would report it
+        // stolen.
+        drop(keeper);
+        match outcome {
+            Ok(JobOutcome::ShuttingDown) => {
+                self.release_for_shutdown(lease).await;
+                Ok(())
+            }
             // Another worker owns the job now — stop, and emit nothing: the
             // worker that reclaimed the job will record its terminal event, and
             // a second one here would double-count. Not silently, though: this
@@ -738,7 +765,9 @@ where
                 let (phase, code) = match outcome {
                     JobOutcome::Completed => ("complete", "0"),
                     JobOutcome::Cancelled => ("cancelled", "4"),
-                    JobOutcome::Abandoned | JobOutcome::Gone => unreachable!("handled above"),
+                    JobOutcome::Abandoned | JobOutcome::Gone | JobOutcome::ShuttingDown => {
+                        unreachable!("handled above")
+                    }
                 };
                 self.emit_audit(&lease.job_id, view.as_ref(), phase, code, None)
                     .await;
@@ -787,6 +816,35 @@ where
                 .await;
                 Err(e)
             }
+        }
+    }
+
+    /// Hands the lease of a run stopped by shutdown back to the job store.
+    ///
+    /// Best-effort. If the release fails, the lease lapses on its own, as it
+    /// did before #1531, and a later claim wipes the run as a reclaim.
+    async fn release_for_shutdown(&self, lease: ExportJobLease) {
+        let job_id = lease.job_id.clone();
+        let worker = lease.worker_id.clone();
+        match self.jobs.release(lease).await {
+            Ok(true) => tracing::info!(
+                job_id = %job_id,
+                worker = %worker,
+                "bulk-export run stopped for shutdown; lease released and the job \
+                 re-queued without spending an attempt"
+            ),
+            Ok(false) => tracing::debug!(
+                job_id = %job_id,
+                worker = %worker,
+                "bulk-export run stopped for shutdown; its lease was no longer held"
+            ),
+            Err(e) => tracing::warn!(
+                job_id = %job_id,
+                worker = %worker,
+                error = %e,
+                "bulk-export run stopped for shutdown, but releasing its lease failed; \
+                 the job waits for the lease to expire"
+            ),
         }
     }
 
@@ -910,6 +968,7 @@ where
             let resolved = tokio::select! {
                 biased;
                 _ = keeper.lost() => return Ok(JobOutcome::Abandoned),
+                _ = self.shutdown.cancelled() => return Ok(JobOutcome::ShuttingDown),
                 resolved = resolving => resolved.map_err(LeaseError::Storage)?,
             };
             filters.insert(tf.resource_type.as_str(), resolved);
@@ -994,6 +1053,11 @@ where
                 if keeper.should_stop() {
                     return Ok(JobOutcome::Abandoned);
                 }
+                // Shutdown stops here too, with nothing open, so the lease can
+                // be handed back (#1531).
+                if self.shutdown.is_cancelled() {
+                    return Ok(JobOutcome::ShuttingDown);
+                }
 
                 // Cooperative cancellation check — and a deleted job is as
                 // final as a cancelled one (#1272).
@@ -1071,6 +1135,7 @@ where
                 let batch = tokio::select! {
                     biased;
                     _ = keeper.lost() => return Ok(JobOutcome::Abandoned),
+                    _ = self.shutdown.cancelled() => return Ok(JobOutcome::ShuttingDown),
                     fetched = fetch => fetched.map_err(LeaseError::Storage)?,
                 };
 
@@ -1089,6 +1154,9 @@ where
                         tokio::select! {
                             biased;
                             _ = keeper.lost() => return Ok(JobOutcome::Abandoned),
+                            _ = self.shutdown.cancelled() => {
+                                return Ok(JobOutcome::ShuttingDown);
+                            }
                             filtered = filtering => filtered.map_err(LeaseError::Storage)?,
                         }
                     }
@@ -1267,6 +1335,10 @@ enum JobOutcome {
     /// The job was deleted mid-run: there is no state left to record, only
     /// whatever this run wrote after the delete to remove (#1272).
     Gone,
+    /// The server is shutting down: the run stopped at a batch boundary and
+    /// hands its lease back so another worker can take the job at once
+    /// (#1531).
+    ShuttingDown,
 }
 
 /// What the per-batch status check says about continuing the run.
@@ -1977,6 +2049,153 @@ mod tests {
             ) -> StorageResult<()> {
                 self.inner.delete_job_outputs(tenant, job_id).await
             }
+        }
+
+        /// Starts the server's shutdown as soon as the first part is finalized,
+        /// so the run has recorded real progress when it notices.
+        struct ShutdownAfterFirstPart {
+            inner: Arc<LocalFsOutputStore>,
+            shutdown: tokio_util::sync::CancellationToken,
+        }
+
+        #[async_trait::async_trait]
+        impl ExportOutputStore for ShutdownAfterFirstPart {
+            async fn open_writer(
+                &self,
+                key: &ExportPartKey,
+            ) -> StorageResult<crate::core::bulk_export_output::ExportPartWriter> {
+                self.inner.open_writer(key).await
+            }
+
+            async fn finalize_part(
+                &self,
+                key: &ExportPartKey,
+                writer: crate::core::bulk_export_output::ExportPartWriter,
+            ) -> StorageResult<FinalizedPart> {
+                let part = self.inner.finalize_part(key, writer).await;
+                self.shutdown.cancel();
+                part
+            }
+
+            async fn download_url(
+                &self,
+                key: &ExportPartKey,
+                ttl: Duration,
+            ) -> StorageResult<crate::core::bulk_export_output::DownloadUrl> {
+                self.inner.download_url(key, ttl).await
+            }
+
+            async fn open_reader(
+                &self,
+                key: &ExportPartKey,
+            ) -> StorageResult<std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>> {
+                self.inner.open_reader(key).await
+            }
+
+            async fn delete_job_outputs(
+                &self,
+                tenant: &TenantContext,
+                job_id: &ExportJobId,
+            ) -> StorageResult<()> {
+                self.inner.delete_job_outputs(tenant, job_id).await
+            }
+        }
+
+        /// A shutdown mid-run stops the job at the next batch boundary and
+        /// hands the lease back: the job is `accepted` again, the part it
+        /// finished is no longer on the manifest, and the attempt is refunded,
+        /// so another worker claims it at once under a cap of one (#1531).
+        #[tokio::test]
+        async fn test_run_job_releases_its_lease_on_shutdown() {
+            let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+            backend.init_schema().unwrap();
+            let tenant = tenant();
+            for i in 0..3 {
+                backend
+                    .create(
+                        &tenant,
+                        "Patient",
+                        serde_json::json!({"resourceType": "Patient", "id": format!("p{i}")}),
+                        helios_fhir::FhirVersion::default(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let job_id = backend
+                .start_export(
+                    &tenant,
+                    StartExportInput {
+                        request: ExportRequest::system()
+                            .with_types(vec!["Patient".to_string()])
+                            .with_batch_size(2),
+                        transaction_time: Utc::now(),
+                        request_url: "http://localhost/$export".to_string(),
+                        owner_subject: Some("sub".to_string()),
+                        fhir_version: helios_fhir::FhirVersion::default(),
+                    },
+                )
+                .await
+                .unwrap();
+
+            let tmp = tempfile::tempdir().unwrap();
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let output = Arc::new(ShutdownAfterFirstPart {
+                inner: Arc::new(LocalFsOutputStore::new(tmp.path(), "http://localhost:8080")),
+                shutdown: shutdown.clone(),
+            });
+            let worker_id = WorkerId::new("w1");
+            let worker = DefaultExportWorker::new(
+                Arc::clone(&backend),
+                Arc::clone(&backend),
+                output,
+                worker_id.clone(),
+            )
+            .with_shutdown(shutdown.clone());
+
+            let lease = backend
+                .claim_next(&worker_id, Duration::from_secs(60), 1)
+                .await
+                .unwrap()
+                .expect("job claimable");
+            worker.run_job(lease).await.unwrap();
+            assert!(shutdown.is_cancelled(), "the first part was written");
+
+            let status = backend.get_export_status(&tenant, &job_id).await.unwrap();
+            assert_eq!(status.status, ExportStatus::Accepted);
+            assert!(
+                backend
+                    .get_export_manifest(&tenant, &job_id)
+                    .await
+                    .unwrap()
+                    .output
+                    .is_empty(),
+                "the released run's part is not on the manifest"
+            );
+
+            let next = WorkerId::new("w2");
+            let lease = backend
+                .claim_next(&next, Duration::from_secs(60), 1)
+                .await
+                .unwrap()
+                .expect("the released job is claimable under the same cap");
+            assert_eq!(lease.job_id, job_id);
+            let view = backend
+                .get_export_job_for_worker(&tenant, &job_id, &next, lease.fencing_token)
+                .await
+                .unwrap();
+            assert!(view.type_progress.is_empty(), "the next run starts over");
+
+            // And that run, left alone, completes with every resource.
+            let output = Arc::new(LocalFsOutputStore::new(tmp.path(), "http://localhost:8080"));
+            DefaultExportWorker::new(Arc::clone(&backend), Arc::clone(&backend), output, next)
+                .run_job(lease)
+                .await
+                .unwrap();
+            let status = backend.get_export_status(&tenant, &job_id).await.unwrap();
+            assert_eq!(status.status, ExportStatus::Complete);
+            let manifest = backend.get_export_manifest(&tenant, &job_id).await.unwrap();
+            let exported: u64 = manifest.output.iter().map(|o| o.count).sum();
+            assert_eq!(exported, 3);
         }
 
         /// The worker marks a type as current, with `types_done` reflecting how

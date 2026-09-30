@@ -4552,6 +4552,29 @@ async fn transaction_bundle_is_refused_without_writing_anything() {
 mod bulk_submit_worker {
     use super::*;
 
+    mod release_contract {
+        use crate as persistence;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/bulk_submit/release_contract.rs"
+        ));
+    }
+
+    /// See `release_contract::release_requeues_and_fences_out_a_zombie` (#1531).
+    #[tokio::test]
+    async fn release_requeues_and_fences_out_a_zombie() {
+        let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+        release_contract::release_requeues_and_fences_out_a_zombie(&backend, &tenant("tenant-a"))
+            .await;
+    }
+
+    /// See `release_contract::release_after_abort_is_a_no_op` (#1531).
+    #[tokio::test]
+    async fn release_after_abort_is_a_no_op() {
+        let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+        release_contract::release_after_abort_is_a_no_op(&backend, &tenant("tenant-a")).await;
+    }
+
     use std::time::Duration;
 
     use crate::core::bulk_export_worker::WorkerId;
@@ -4582,6 +4605,45 @@ mod bulk_submit_worker {
             .await
             .expect("add manifest");
         (id, manifest.manifest_id)
+    }
+
+    /// A synchronous `process_entries` call holds its manifest in `processing`
+    /// with no lease until it settles the terminal status on its way out. No
+    /// worker may claim it in that window (#1530). The SQL and MongoDB suites
+    /// pin the same rule through `tests/bulk_submit/claim_contract.rs`; S3 needs
+    /// its own test because the window closes before the call returns.
+    #[tokio::test]
+    async fn an_unleased_processing_manifest_is_not_claimable() {
+        let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+        let t = tenant("tenant-a");
+        let (id, in_flight) = seed(&backend, &t).await;
+        let location = backend.tenant_location(&t).expect("location");
+        backend
+            .mutate_manifest_state(&location, &id, &in_flight, |state| {
+                state.manifest.status = ManifestStatus::Processing;
+            })
+            .await
+            .expect("mark processing");
+        let queued = backend
+            .add_manifest(&t, &id, Some("https://provider.example/queued.json"), None)
+            .await
+            .expect("add manifest")
+            .manifest_id;
+
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("worker-1"), lease_duration())
+            .await
+            .expect("claim")
+            .expect("the pending manifest queued behind it stays claimable");
+        assert_eq!(lease.manifest_id, queued);
+        assert!(
+            backend
+                .claim_next_manifest(&WorkerId::new("worker-2"), lease_duration())
+                .await
+                .expect("claim")
+                .is_none(),
+            "a processing manifest with no lease must not be claimable"
+        );
     }
 
     #[tokio::test]

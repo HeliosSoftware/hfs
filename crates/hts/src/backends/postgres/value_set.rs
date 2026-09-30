@@ -1748,6 +1748,14 @@ impl ValueSetOperations for PostgresTerminologyBackend {
         )
     }
 
+    async fn count(
+        &self,
+        _ctx: &TenantContext,
+        query: ResourceSearchQuery,
+    ) -> Result<u64, HtsError> {
+        self.count_search_matches("value_sets", query).await
+    }
+
     /// Search ValueSet resources by query parameters.
     ///
     /// `url`, `version`, and `status` use exact matching. `name` and `title`
