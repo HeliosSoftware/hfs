@@ -702,6 +702,7 @@ impl SubmitWorkerStorage for S3Backend {
             import_directives: state.import_directives,
             metadata: state.submission_metadata,
             last_processed_line: state.last_processed_line,
+            completed_output_files: state.completed_output_files,
         })
     }
 
@@ -754,6 +755,23 @@ impl SubmitWorkerStorage for S3Backend {
             state.manifest.phase = Some(phase);
             state.manifest.files_done = files_done;
             state.manifest.files_total = files_total;
+        })
+        .await
+    }
+
+    async fn record_output_file_done(
+        &self,
+        lease: &ManifestLease,
+        file_url: &str,
+    ) -> Result<(), LeaseError> {
+        self.fenced_mutate(lease, |state| {
+            if !state
+                .completed_output_files
+                .iter()
+                .any(|url| url == file_url)
+            {
+                state.completed_output_files.push(file_url.to_string());
+            }
         })
         .await
     }

@@ -684,6 +684,14 @@ impl SubmitWorkerStorage for IndexingSubmitJobs {
             .await
     }
 
+    async fn record_output_file_done(
+        &self,
+        lease: &ManifestLease,
+        file_url: &str,
+    ) -> Result<(), LeaseError> {
+        self.inner.record_output_file_done(lease, file_url).await
+    }
+
     async fn record_submit_file(
         &self,
         lease: &ManifestLease,

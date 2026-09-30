@@ -12,7 +12,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 45;
+pub const SCHEMA_VERSION: i32 = 46;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -442,6 +442,7 @@ async fn migrate_schema(
                 version += 1;
                 continue;
             }
+            45 => migrate_v45_to_v46(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -4115,6 +4116,23 @@ async fn migrate_v44_to_v45(client: &mut deadpool_postgres::Client) -> StorageRe
     Ok(())
 }
 
+/// v45 -> v46: `completed` on `bulk_manifest_file_progress` (#1610).
+///
+/// Set once the worker walked the file's stream to its end, so a reclaimed
+/// manifest skips the file instead of re-walking it from the top. A file that
+/// failed part-way keeps `FALSE` and is walked again.
+async fn migrate_v45_to_v46(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .execute(
+            "ALTER TABLE bulk_manifest_file_progress
+             ADD COLUMN IF NOT EXISTS completed BOOLEAN NOT NULL DEFAULT FALSE",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Migration v45->v46 failed: {e}")))?;
+    Ok(())
+}
+
 const PATIENT_EXPORT_INDEX_NAME: &str = "idx_resources_patient_refs_v1";
 
 /// Verify the exact expression and live-row predicate before the export path
@@ -5729,6 +5747,11 @@ mod postgres_integration_migrations {
         assert_eq!(
             column_type(&client, "bulk_manifest_file_progress", "max_line").await,
             Some("bigint".to_string())
+        );
+        // v46 (#1610): the whole-file resume marker.
+        assert_eq!(
+            column_type(&client, "bulk_manifest_file_progress", "completed").await,
+            Some("boolean".to_string())
         );
         assert_eq!(
             classification(&client, completed).await,

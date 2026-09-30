@@ -10,7 +10,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 36;
+pub const SCHEMA_VERSION: i32 = 37;
 
 /// The `search_index` value indexes. Excludes `idx_search_composite`, which the
 /// delete-by-resource path needs at all times, and `idx_search_token_display`,
@@ -451,6 +451,7 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             33 => migrate_v33_to_v34(conn)?,
             34 => migrate_v34_to_v35(conn)?,
             35 => migrate_v35_to_v36(conn)?,
+            36 => migrate_v36_to_v37(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -1768,6 +1769,23 @@ fn migrate_v35_to_v36(conn: &Connection) -> StorageResult<()> {
             ON login_sessions (expires_at);",
     )
     .map_err(|e| migration_err(format!("v36 create login_sessions: {e}")))?;
+    Ok(())
+}
+
+/// Adds `completed` to `bulk_manifest_file_progress` (#1610): set once the
+/// worker walked the file's stream to its end, so a reclaimed manifest skips
+/// the file instead of re-walking it from the top. A file that failed
+/// part-way keeps `0` and is walked again.
+fn migrate_v36_to_v37(conn: &Connection) -> StorageResult<()> {
+    let columns = table_columns(conn, "bulk_manifest_file_progress")?;
+    if !columns.iter().any(|column| column == "completed") {
+        conn.execute(
+            "ALTER TABLE bulk_manifest_file_progress
+             ADD COLUMN completed INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|e| migration_err(format!("v37 add completed: {e}")))?;
+    }
     Ok(())
 }
 
@@ -4118,6 +4136,32 @@ mod tests {
 
         // Every row now has an end: a replay visits nothing and counts nothing.
         assert_eq!(backfill_value_date_end(&conn).unwrap(), 0);
+    }
+
+    /// #1610: `completed` on the per-file progress table, on a fresh database
+    /// and on one migrated from v36.
+    #[test]
+    fn test_v37_adds_file_progress_completed() {
+        let has_completed = |conn: &Connection| {
+            table_columns(conn, "bulk_manifest_file_progress")
+                .unwrap()
+                .iter()
+                .any(|column| column == "completed")
+        };
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        assert!(has_completed(&conn));
+
+        let migrated = Connection::open_in_memory().unwrap();
+        initialize_schema(&migrated).unwrap();
+        migrated
+            .execute_batch("ALTER TABLE bulk_manifest_file_progress DROP COLUMN completed;")
+            .unwrap();
+        set_schema_version(&migrated, 36).unwrap();
+        assert!(!has_completed(&migrated));
+        initialize_schema(&migrated).unwrap();
+        assert_eq!(get_schema_version(&migrated).unwrap(), SCHEMA_VERSION);
+        assert!(has_completed(&migrated));
     }
 
     /// #1481: the v36 login-sessions table exists on a fresh database and on

@@ -157,6 +157,17 @@ pub struct ManifestWorkerView {
     /// resume would read, but no such consumer exists yet. Counted like the
     /// other progress columns, so it only ever moves forward (#969).
     pub last_processed_line: u64,
+    /// Output files an earlier run of this manifest walked to their end.
+    ///
+    /// A reclaimed manifest skips these instead of re-walking them (#1610):
+    /// every re-ingested entry would upsert idempotently, but a manifest that
+    /// died near its end used to replay every file from the first, and a
+    /// fault that recurs kept it replaying. Recorded by
+    /// [`SubmitWorkerStorage::record_output_file_done`], keyed by the file
+    /// URL as the manifest lists it. A file that failed part-way is not in
+    /// here and is walked again from the top (its already-counted lines are
+    /// charged nothing, #1127).
+    pub completed_output_files: Vec<String>,
     /// FHIR version this submission ingests against.
     pub fhir_version: FhirVersion,
 }
@@ -386,6 +397,16 @@ pub trait SubmitWorkerStorage: Send + Sync {
         phase: ManifestPhase,
         files_done: u64,
         files_total: u64,
+    ) -> Result<(), LeaseError>;
+
+    /// Records that `file_url` was walked to its end, so a later run of the
+    /// manifest skips it (#1610). Fenced, and idempotent: recording a file
+    /// twice is not an error. Read back through
+    /// [`ManifestWorkerView::completed_output_files`].
+    async fn record_output_file_done(
+        &self,
+        lease: &ManifestLease,
+        file_url: &str,
     ) -> Result<(), LeaseError>;
 
     /// Idempotent upsert of a finalized status-manifest artifact row. Fenced.
@@ -775,6 +796,7 @@ struct OwnedFileRunContext {
     requires_access_token: bool,
     options: BulkProcessingOptions,
     file_count: u64,
+    completed_files: std::collections::HashSet<String>,
     presized: bool,
     failed: AtomicU64,
     file_level_failed: AtomicU64,
@@ -1592,6 +1614,24 @@ where
                 ));
             }
         }
+        // Files an earlier run of this manifest walked to their end are
+        // neither sized nor fetched again (#1610); they still count as done
+        // in the phase counters so the status endpoint sees the full total.
+        let completed_files: std::collections::HashSet<String> = view
+            .completed_output_files
+            .iter()
+            .filter(|url| manifest.output.iter().any(|file| &file.url == *url))
+            .cloned()
+            .collect();
+        if !completed_files.is_empty() {
+            tracing::info!(
+                submission = %lease.submission_id,
+                manifest = %lease.manifest_id,
+                skipped = completed_files.len(),
+                files = manifest.output.len(),
+                "bulk-submit resumes a reclaimed manifest: output files an earlier run walked to their end are skipped"
+            );
+        }
         // Pre-size the byte denominator: every output file's advertised size
         // up front, so the percentage never recomputes against a partial
         // total — learned lazily per file, each newly opened file yanked the
@@ -1615,6 +1655,7 @@ where
             let view_ref = &view;
             let lease_ref = &lease;
             let manifest_ref = &manifest;
+            let completed_ref = &completed_files;
 
             // Indexed like the ingest fan-out below, so the closure's argument
             // stays owned and the future may borrow `manifest.output[i]`.
@@ -1627,6 +1668,12 @@ where
                         return;
                     }
                     let file = &manifest_ref.output[i];
+                    if completed_ref.contains(&file.url) {
+                        let done = sized_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                        self.report_phase(lease_ref, ManifestPhase::Sizing, done, file_count)
+                            .await;
+                        return;
+                    }
                     match self
                         .fetcher
                         .file_size(
@@ -1694,6 +1741,7 @@ where
             requires_access_token: manifest.requires_access_token,
             options: opts,
             file_count,
+            completed_files,
             presized,
             failed: AtomicU64::new(0),
             file_level_failed: AtomicU64::new(0),
@@ -2733,6 +2781,15 @@ where
         run.file_count,
     )
     .await;
+    if run.completed_files.contains(&context.file.url) {
+        tracing::info!(
+            submission = %run.lease.submission_id,
+            manifest = %run.lease.manifest_id,
+            url = %redact_url(&context.file.url),
+            "bulk-submit skips an output file an earlier run of this manifest walked to its end"
+        );
+        return Ok(());
+    }
     let (inner, file_bytes_total) = match fetcher
         .open_file_stream(
             &context.file.url,
@@ -2811,6 +2868,15 @@ where
                         result.unbatched_errors,
                         result.unbatched_errors,
                     )
+                    .await
+            {
+                return fenced_write_outcome(&run.lease_control, e);
+            }
+            // An aborted stream (cancelled, shut down, or over its error
+            // budget) stopped short of the end: the next run walks it again.
+            if !result.aborted
+                && let Err(e) = jobs
+                    .record_output_file_done(&run.lease, &context.file.url)
                     .await
             {
                 return fenced_write_outcome(&run.lease_control, e);
@@ -4633,6 +4699,7 @@ mod tests {
             requires_access_token: false,
             options: BulkProcessingOptions::new(),
             file_count: count as u64,
+            completed_files: Default::default(),
             presized: false,
             failed: AtomicU64::new(0),
             file_level_failed: AtomicU64::new(0),
@@ -7710,6 +7777,156 @@ mod tests {
                 "the re-walked entry must add to the earlier run's total, not replace it"
             );
             assert_eq!(manifests[0].failed_entries, 7);
+        }
+    }
+
+    /// Records every input file it is asked to open.
+    struct RecordingOpens {
+        inner: Arc<MockFetcher>,
+        opened: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl SubmitInputFetcher for RecordingOpens {
+        async fn fetch_manifest(
+            &self,
+            url: &str,
+            headers: &[(String, String)],
+            oauth: &[String],
+            key: Option<&Value>,
+        ) -> StorageResult<RemoteManifest> {
+            self.inner.fetch_manifest(url, headers, oauth, key).await
+        }
+
+        async fn open_file_stream(
+            &self,
+            url: &str,
+            headers: &[(String, String)],
+            requires_token: bool,
+            oauth: &[String],
+            key: Option<&Value>,
+        ) -> StorageResult<(Box<dyn tokio::io::AsyncBufRead + Send + Unpin>, Option<u64>)> {
+            self.opened.lock().unwrap().push(url.to_string());
+            self.inner
+                .open_file_stream(url, headers, requires_token, oauth, key)
+                .await
+        }
+    }
+
+    /// A reclaimed manifest skips the output files an earlier run walked to
+    /// their end and ingests only the rest (#1610). The first run records each
+    /// file as it finishes; a stale lease cannot record one.
+    #[tokio::test]
+    async fn test_worker_skips_output_files_an_earlier_run_completed() {
+        for independent in [false, true] {
+            let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+            backend.init_schema().unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            let output = Arc::new(LocalFsOutputStore::new(
+                tmp.path().to_path_buf(),
+                "http://x",
+            ));
+            let tenant = tenant();
+            let sub_id = seed(&backend, &tenant).await;
+
+            let mut files = std::collections::HashMap::new();
+            files.insert(
+                "http://provider/a.ndjson".to_string(),
+                b"{\"resourceType\":\"Patient\",\"id\":\"a1\"}\n".to_vec(),
+            );
+            files.insert(
+                "http://provider/b.ndjson".to_string(),
+                b"{\"resourceType\":\"Patient\",\"id\":\"b1\"}\n{\"resourceType\":\"Patient\",\"id\":\"b2\"}\n"
+                    .to_vec(),
+            );
+            let remote = |url: &str| RemoteFile {
+                resource_type: Some("Patient".to_string()),
+                url: url.to_string(),
+                count: None,
+            };
+            let fetcher = Arc::new(RecordingOpens {
+                inner: Arc::new(MockFetcher {
+                    files,
+                    manifest: RemoteManifest {
+                        requires_access_token: false,
+                        output: vec![
+                            remote("http://provider/a.ndjson"),
+                            remote("http://provider/b.ndjson"),
+                        ],
+                        deleted: vec![],
+                    },
+                }),
+                opened: std::sync::Mutex::new(Vec::new()),
+            });
+
+            // Stands in for an earlier run that finished file a and died in b.
+            let lease = backend
+                .claim_next_manifest(&WorkerId::new("w"), StdDuration::from_secs(60))
+                .await
+                .unwrap()
+                .unwrap();
+            backend
+                .record_output_file_done(&lease, "http://provider/a.ndjson")
+                .await
+                .unwrap();
+            backend
+                .record_output_file_done(&lease, "http://provider/a.ndjson")
+                .await
+                .expect("recording a file twice is not an error");
+            let mut stale = lease.clone();
+            stale.fencing_token += 1;
+            assert!(matches!(
+                backend
+                    .record_output_file_done(&stale, "http://provider/b.ndjson")
+                    .await,
+                Err(LeaseError::LeaseLost { .. })
+            ));
+            assert_eq!(
+                backend
+                    .get_manifest_for_worker(&lease)
+                    .await
+                    .unwrap()
+                    .completed_output_files,
+                vec!["http://provider/a.ndjson".to_string()]
+            );
+
+            let worker = with_test_file_scheduling(
+                DefaultSubmitWorker::new(
+                    backend.clone(),
+                    Arc::clone(&fetcher),
+                    output,
+                    WorkerId::new("w"),
+                ),
+                independent,
+                2,
+            );
+            worker.run_job(lease).await.unwrap();
+
+            assert_eq!(
+                *fetcher.opened.lock().unwrap(),
+                vec!["http://provider/b.ndjson".to_string()],
+                "the completed file must not be fetched again"
+            );
+            let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+            assert_eq!(manifests[0].status, ManifestStatus::Completed);
+            assert_eq!(manifests[0].processed_entries, 2);
+            assert_eq!(
+                manifests[0].files_done, 2,
+                "a skipped file still counts as done"
+            );
+            let completed: i64 = backend
+                .get_connection()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM bulk_manifest_file_progress WHERE completed = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                completed, 2,
+                "the run records the file it walked to its end"
+            );
         }
     }
 

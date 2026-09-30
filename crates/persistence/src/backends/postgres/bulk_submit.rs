@@ -2434,6 +2434,24 @@ impl SubmitWorkerStorage for PostgresBackend {
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_default();
         let fhir_version = fhir_version_from_output_format(output_format.as_deref());
+        let completed_output_files: Vec<String> = client
+            .query(
+                "SELECT file_url FROM bulk_manifest_file_progress
+                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
+                   AND manifest_id = $4 AND completed
+                 ORDER BY file_url",
+                &[
+                    &lease.tenant.tenant_id().as_str(),
+                    &lease.submission_id.submitter,
+                    &lease.submission_id.submission_id,
+                    &lease.manifest_id,
+                ],
+            )
+            .await
+            .map_err(|e| LeaseError::Storage(internal_error(format!("load completed files: {e}"))))?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
 
         Ok(ManifestWorkerView {
             manifest_id: lease.manifest_id.clone(),
@@ -2446,6 +2464,7 @@ impl SubmitWorkerStorage for PostgresBackend {
             import_directives,
             metadata,
             last_processed_line: last_processed_line.max(0) as u64,
+            completed_output_files,
             fhir_version,
         })
     }
@@ -2585,6 +2604,45 @@ impl SubmitWorkerStorage for PostgresBackend {
             )
             .await
             .map_err(|e| LeaseError::Storage(internal_error(format!("update phase: {e}"))))?;
+        if affected == 0 {
+            Err(lease_lost(lease))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn record_output_file_done(
+        &self,
+        lease: &ManifestLease,
+        file_url: &str,
+    ) -> Result<(), LeaseError> {
+        let client = self.get_client().await.map_err(LeaseError::Storage)?;
+        // The fence is the SELECT from the leased manifest row: once the lease
+        // has moved on it yields no row to insert, and nothing is written.
+        let affected = client
+            .execute(
+                "INSERT INTO bulk_manifest_file_progress
+                    (tenant_id, submitter, submission_id, manifest_id, file_url, completed)
+                 SELECT $1, $2, $3, $4, $5, TRUE
+                 FROM bulk_manifests
+                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
+                   AND manifest_id = $4 AND worker_id = $6 AND fencing_token = $7
+                 ON CONFLICT (tenant_id, submitter, submission_id, manifest_id, file_url)
+                 DO UPDATE SET completed = TRUE",
+                &[
+                    &lease.tenant.tenant_id().as_str(),
+                    &lease.submission_id.submitter,
+                    &lease.submission_id.submission_id,
+                    &lease.manifest_id,
+                    &file_url,
+                    &lease.worker_id.as_str(),
+                    &(lease.fencing_token as i64),
+                ],
+            )
+            .await
+            .map_err(|e| {
+                LeaseError::Storage(internal_error(format!("record completed file: {e}")))
+            })?;
         if affected == 0 {
             Err(lease_lost(lease))
         } else {

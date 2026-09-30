@@ -344,6 +344,24 @@ fn recorded_max_line(manifest: &Document, file_url: &str) -> Option<i64> {
         })
 }
 
+/// The files whose progress entry carries the `completed` marker (#1610), in
+/// a stable order.
+fn completed_output_files(manifest: &Document) -> Vec<String> {
+    let mut files: Vec<String> = manifest
+        .get_array(FILE_PROGRESS_FIELD)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(Bson::as_document)
+                .filter(|entry| entry.get_bool("completed").unwrap_or(false))
+                .filter_map(|entry| entry.get_str("file_url").ok().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    files
+}
+
 /// The guarded filter and update that charge `tally` for `file_url`, given the
 /// `counted` line read beforehand.
 ///
@@ -1811,6 +1829,7 @@ impl SubmitWorkerStorage for MongoBackend {
             import_directives: opt_json(&document, "import_directives").unwrap_or_default(),
             metadata: opt_json(&document, "submission_metadata").unwrap_or_default(),
             last_processed_line: document.get_i64("last_processed_line").unwrap_or(0).max(0) as u64,
+            completed_output_files: completed_output_files(&document),
         })
     }
 
@@ -1885,6 +1904,52 @@ impl SubmitWorkerStorage for MongoBackend {
                 "phase": phase.to_string(),
                 "files_done": files_done as i64,
                 "files_total": files_total as i64,
+            }},
+        )
+        .await
+    }
+
+    async fn record_output_file_done(
+        &self,
+        lease: &ManifestLease,
+        file_url: &str,
+    ) -> Result<(), LeaseError> {
+        // The file has a progress entry once one of its batches was charged
+        // and none when it was empty, so flag the entry in place first and
+        // push a fresh one only when there was none to flag. Both writes carry
+        // the lease fence; the lease is lost only when neither matches. No
+        // batch of this file can race the push: the stream has ended.
+        let mut flagged = fenced_filter(lease);
+        flagged.insert(
+            FILE_PROGRESS_FIELD,
+            doc! { "$elemMatch": { "file_url": file_url } },
+        );
+        match self
+            .fenced_update_filtered(
+                lease,
+                flagged,
+                doc! { "$set": { format!("{FILE_PROGRESS_FIELD}.$.completed"): true } },
+            )
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(LeaseError::LeaseLost { .. }) => {}
+            Err(e) => return Err(e),
+        }
+        let mut absent = fenced_filter(lease);
+        absent.insert(
+            format!("{FILE_PROGRESS_FIELD}.file_url"),
+            doc! { "$ne": file_url },
+        );
+        self.fenced_update_filtered(
+            lease,
+            absent,
+            doc! { "$push": {
+                FILE_PROGRESS_FIELD: {
+                    "file_url": file_url,
+                    "max_line": 0_i64,
+                    "completed": true,
+                },
             }},
         )
         .await
@@ -2491,6 +2556,26 @@ mod tests {
         let rewalk = BatchTally::beyond(&results, Some(10));
         assert_eq!(rewalk.entries, 0);
         assert_eq!(rewalk.last_line, 10);
+    }
+
+    #[test]
+    fn completed_output_files_reads_the_flagged_entries() {
+        let manifest = doc! {
+            FILE_PROGRESS_FIELD: [
+                { "file_url": "https://x.test/b.ndjson", "max_line": 7_i64, "completed": true },
+                { "file_url": "https://x.test/a.ndjson", "max_line": 3_i32 },
+                { "file_url": "https://x.test/c.ndjson", "max_line": 0_i64, "completed": false },
+                { "file_url": "https://x.test/0.ndjson", "max_line": 0_i64, "completed": true },
+            ],
+        };
+        assert_eq!(
+            completed_output_files(&manifest),
+            vec![
+                "https://x.test/0.ndjson".to_string(),
+                "https://x.test/b.ndjson".to_string(),
+            ]
+        );
+        assert!(completed_output_files(&doc! {}).is_empty());
     }
 
     #[test]

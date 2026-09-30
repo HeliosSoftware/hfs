@@ -13915,6 +13915,86 @@ mod bulk_submit {
         );
     }
 
+    /// A file the worker walked to its end is recorded on the manifest
+    /// document and read back by the run that reclaims it, which skips it
+    /// (#1610). Recording is fenced and idempotent, and works both for a file
+    /// that already has a progress entry and for one that has none. The
+    /// MongoDB half of `test_worker_skips_output_files_an_earlier_run_completed`.
+    #[tokio::test]
+    async fn test_completed_output_files_survive_a_reclaim() {
+        let Some(backend) = create_backend("submit_completed_files").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("worker-1"), lease_duration())
+            .await
+            .unwrap()
+            .expect("the seeded manifest is claimable");
+
+        // File b already has a progress entry from a charged batch; file a
+        // has none.
+        backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                vec![NdjsonEntry::new(
+                    1,
+                    "Patient",
+                    json!({"resourceType": "Patient"}),
+                )],
+                &BulkProcessingOptions::new().with_file_url("https://provider.example/b.ndjson"),
+            )
+            .await
+            .unwrap();
+        for url in [
+            "https://provider.example/b.ndjson",
+            "https://provider.example/a.ndjson",
+            "https://provider.example/a.ndjson",
+        ] {
+            backend.record_output_file_done(&lease, url).await.unwrap();
+        }
+        let mut stale = lease.clone();
+        stale.fencing_token += 1;
+        assert!(matches!(
+            backend
+                .record_output_file_done(&stale, "https://provider.example/c.ndjson")
+                .await,
+            Err(LeaseError::LeaseLost { .. })
+        ));
+
+        let expected = vec![
+            "https://provider.example/a.ndjson".to_string(),
+            "https://provider.example/b.ndjson".to_string(),
+        ];
+        assert_eq!(
+            backend
+                .get_manifest_for_worker(&lease)
+                .await
+                .unwrap()
+                .completed_output_files,
+            expected
+        );
+
+        assert!(SubmitClaimStrategy::release(&backend, lease).await.unwrap());
+        let reclaimed = backend
+            .claim_next_manifest(&WorkerId::new("worker-2"), lease_duration())
+            .await
+            .unwrap()
+            .expect("a released manifest is claimable at once");
+        assert_eq!(
+            backend
+                .get_manifest_for_worker(&reclaimed)
+                .await
+                .unwrap()
+                .completed_output_files,
+            expected
+        );
+    }
+
     #[tokio::test]
     async fn test_claim_heartbeat_and_finish() {
         let Some(backend) = create_backend("submit_claim_lifecycle").await else {
