@@ -6906,9 +6906,26 @@ mod postgres_integration {
                 ))
                 .await
                 .unwrap();
-            for mode in ["force_custom_plan", "force_generic_plan"] {
+            for (mode, force_bitmap) in [
+                ("force_custom_plan", false),
+                ("force_generic_plan", false),
+                ("force_custom_plan", true),
+                ("force_generic_plan", true),
+            ] {
+                // A shared test database can make a bitmap resource probe
+                // cheaper than an index scan. Exercise that valid alternative
+                // even when this fixture runs alone with fresh statistics.
+                let access = if force_bitmap {
+                    "SET enable_indexscan=off; SET enable_seqscan=off"
+                } else {
+                    "RESET enable_indexscan; RESET enable_seqscan"
+                };
                 client
-                    .batch_execute(&format!("SET plan_cache_mode={mode}"))
+                    // Cached generic plans otherwise retain the previous
+                    // access method despite the changed planner settings.
+                    .batch_execute(&format!(
+                        "SET plan_cache_mode={mode}; {access}; DISCARD PLANS"
+                    ))
                     .await
                     .unwrap();
                 let args = format!(
@@ -6932,8 +6949,25 @@ mod postgres_integration {
                     .collect::<Vec<_>>();
                 assert_eq!(probes.len(), 1, "{mode}: {plan}");
                 assert_eq!(probes[0]["Actual Loops"], 165, "{mode}: {plan}");
+                if force_bitmap {
+                    assert_eq!(
+                        probes[0]["Node Type"], "Bitmap Index Scan",
+                        "{mode}: {plan}"
+                    );
+                }
                 assert!(
-                    probes[0]["Actual Rows"].as_u64().unwrap() <= 2,
+                    // A bitmap reports all nine indexed parameter entries
+                    // before the heap applies the composite parameter filter.
+                    probes[0]["Actual Rows"].as_u64().unwrap() <= 9,
+                    "{mode}: {plan}"
+                );
+                let slice = nodes
+                    .iter()
+                    .find(|node| node["Subplan Name"] == "CTE scoped_composite")
+                    .expect("materialized per-resource composite slice");
+                assert_eq!(slice["Actual Loops"], 165, "{mode}: {plan}");
+                assert!(
+                    slice["Actual Rows"].as_u64().unwrap() <= 2,
                     "{mode}: {plan}"
                 );
                 assert!(
@@ -6955,7 +6989,7 @@ mod postgres_integration {
                         + p[0]["Plan"]["Shared Read Blocks"].as_u64().unwrap()
                 };
                 println!(
-                    "1579 {mode} {} buffers: {} -> {}",
+                    "1579 {mode} bitmap={force_bitmap} {} buffers: {} -> {}",
                     if sql.starts_with("SELECT COUNT") {
                         "count"
                     } else {
@@ -6971,7 +7005,10 @@ mod postgres_integration {
                 }
             }
             client
-                .batch_execute("DEALLOCATE old_plan; RESET plan_cache_mode")
+                .batch_execute(
+                    "DEALLOCATE old_plan; RESET plan_cache_mode; \
+                     RESET enable_indexscan; RESET enable_seqscan",
+                )
                 .await
                 .unwrap();
         }
