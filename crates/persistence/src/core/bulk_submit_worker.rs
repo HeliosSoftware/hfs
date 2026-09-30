@@ -125,6 +125,7 @@ impl ManifestLease {
 /// completed)` — into the two resume lists of a [`ManifestWorkerView`]
 /// (#1610): the files to skip whole, and the line each unfinished file
 /// resumes after. A file with nothing charged yet appears in neither.
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
 pub(crate) fn split_file_progress(
     rows: &[(String, u64, bool)],
 ) -> (Vec<String>, Vec<(String, u64)>) {
