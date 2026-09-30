@@ -130,7 +130,8 @@ and client cap rather than introduce a change to tie ordering. This solves the
 reported flat Observation preview and preserves unlimited exports. It does
 **not** satisfy the original unconditional SQL-limit criterion for every
 PostgreSQL ViewDefinition. Deterministic ordering and SQL pushdown for complex
-views require an explicit follow-up; this is a current scope decision, not
+views are tracked in [#1623](https://github.com/HeliosSoftware/hfs/issues/1623);
+this is a current scope decision, not
 evidence that the original checklist was universally fulfilled.
 
 ## Regression coverage and remaining work
@@ -151,7 +152,7 @@ invariants were checked again. The subsequent merge is verified separately;
 the historical test totals and measurements above do not describe that new
 verification or new performance runs.
 
-The follow-up must define tie ordering for nested/cartesian/nullable expansion,
+[The follow-up](https://github.com/HeliosSoftware/hfs/issues/1623) must define tie ordering for nested/cartesian/nullable expansion,
 union branch ties and recursive traversal before applying a cap universally.
 It must preserve visible columns, row counts, filters and FHIRPath `%rowIndex`
 semantics, disclose any change to unlimited/export order, test both SQL
