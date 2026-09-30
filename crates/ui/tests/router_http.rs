@@ -171,6 +171,554 @@ fn production_app() -> Router {
     )
 }
 
+/// #1576: a mutable loopback FHIR service exercises the production conformance
+/// adapter, including overflow paging, headers and writes visible to the next
+/// Duplicate. The usual StaticConformanceSource intentionally does not persist.
+mod sql_duplicate_http {
+    use super::*;
+    use axum::{Json, extract::State, response::IntoResponse};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    const TENANT: &str = "duplicate-test-tenant";
+    const ROUTES: [(&str, &str, &str); 3] = [
+        ("/ui/sql/view-definitions", "ViewDefinition", ""),
+        ("/ui/sql/views", "Library", "sql-view"),
+        ("/ui/sql/queries", "Library", "sql-query"),
+    ];
+
+    #[derive(Debug)]
+    struct Call {
+        method: String,
+        resource_type: String,
+        params: HashMap<String, String>,
+        tenant: String,
+        accept: String,
+        content_type: String,
+    }
+
+    #[derive(Default)]
+    struct FhirStore {
+        resources: HashMap<(String, String), Vec<Value>>,
+        calls: Vec<Call>,
+        writes: Vec<Value>,
+        fail_second_page: Option<String>,
+        max_count: Option<usize>,
+        empty_page_at: Option<usize>,
+    }
+
+    struct Fixture {
+        app: Router,
+        store: Arc<Mutex<FhirStore>>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    async fn serve_fhir(
+        State(store): State<Arc<Mutex<FhirStore>>>,
+        request: Request<Body>,
+    ) -> axum::response::Response {
+        let (parts, body) = request.into_parts();
+        let mut path = parts.uri.path().trim_start_matches('/').split('/');
+        let resource_type = path.next().unwrap_or_default().to_string();
+        let id = path.next().map(str::to_owned);
+        let params: HashMap<String, String> =
+            form_urlencoded::parse(parts.uri.query().unwrap_or_default().as_bytes())
+                .into_owned()
+                .collect();
+        let tenant = parts.headers["x-tenant-id"].to_str().unwrap().to_string();
+        let accept = parts.headers["accept"].to_str().unwrap().to_string();
+        let content_type = parts
+            .headers
+            .get("content-type")
+            .map(|value| value.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        let method = parts.method.to_string();
+        let document = if method == "POST" || method == "PUT" {
+            Some(
+                serde_json::from_slice::<Value>(
+                    &axum::body::to_bytes(body, 1024 * 1024).await.unwrap(),
+                )
+                .unwrap(),
+            )
+        } else {
+            None
+        };
+        let mut store = store.lock().unwrap();
+        store.calls.push(Call {
+            method: method.clone(),
+            resource_type: resource_type.clone(),
+            params: params.clone(),
+            tenant: tenant.clone(),
+            accept,
+            content_type,
+        });
+        let key = (tenant, resource_type.clone());
+        if let Some(mut document) = document {
+            let stored_id = id.unwrap_or_else(|| format!("created-{}", store.writes.len() + 1));
+            document["id"] = Value::String(stored_id.clone());
+            let resources = store.resources.entry(key).or_default();
+            if let Some(existing) = resources.iter_mut().find(|value| value["id"] == stored_id) {
+                *existing = document.clone();
+            } else {
+                resources.push(document.clone());
+            }
+            store.writes.push(document.clone());
+            return Json(document).into_response();
+        }
+        let offset = params
+            .get("_offset")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        if store.fail_second_page.as_deref() == Some(&resource_type) && offset >= 500 {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "catalog temporarily unavailable",
+            )
+                .into_response();
+        }
+        let resources = store.resources.get(&key).cloned().unwrap_or_default();
+        if let Some(id) = id {
+            return match resources.into_iter().find(|value| value["id"] == id) {
+                Some(document) => Json(document).into_response(),
+                None => StatusCode::NOT_FOUND.into_response(),
+            };
+        }
+        let count = params
+            .get("_count")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(100)
+            .min(store.max_count.unwrap_or(usize::MAX));
+        let matches: Vec<Value> = resources
+            .into_iter()
+            .filter(|value| {
+                params
+                    .get("url")
+                    .is_none_or(|url| value["url"] == url.as_str())
+            })
+            .collect();
+        let total = matches.len();
+        let entries: Vec<Value> = matches
+            .into_iter()
+            .skip(offset)
+            .take(if store.empty_page_at == Some(offset) {
+                0
+            } else {
+                count
+            })
+            .map(|resource| serde_json::json!({"resource": resource}))
+            .collect();
+        // Deliberately no next link: like S3, capped definition listings must
+        // rely on the accurate total when the overflow row cannot arrive.
+        Json(serde_json::json!({"resourceType": "Bundle", "type": "searchset", "total": total, "entry": entries}))
+            .into_response()
+    }
+
+    async fn fixture(resources: Vec<Value>, fail_second_page: Option<&str>) -> Fixture {
+        let mut store = FhirStore {
+            fail_second_page: fail_second_page.map(str::to_owned),
+            ..Default::default()
+        };
+        for resource in resources {
+            store
+                .resources
+                .entry((
+                    TENANT.to_string(),
+                    resource["resourceType"].as_str().unwrap().to_string(),
+                ))
+                .or_default()
+                .push(resource);
+        }
+        let store = Arc::new(Mutex::new(store));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let fhir = Router::new().fallback(serve_fhir).with_state(store.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, fhir).await.unwrap() });
+        let app = helios_ui::mount(
+            Router::new(),
+            "9.9.9",
+            Some(std::path::PathBuf::from("../../data")),
+            nl(true, true),
+            None,
+            None,
+            TENANT.to_string(),
+            base_url,
+            Arc::new(helios_auth::NoOpOutboundAuthProvider),
+            helios_fhir::FhirVersion::R4,
+            None,
+            "http://localhost:8080".to_string(),
+            None,
+        );
+        Fixture { app, store, server }
+    }
+
+    fn artifact(resource_type: &str, kind: &str) -> Value {
+        let mut document = serde_json::json!({
+            "resourceType": resource_type,
+            "id": "original",
+            "name": "patients",
+            "url": "http://example.org/patients",
+            "version": "1.0",
+            "status": "active",
+            "extension": [{"url": "http://example.org/marker", "valueString": "keep & preserve"}],
+        });
+        if resource_type == "Library" {
+            document["type"] = serde_json::json!({"coding": [{
+                "system": "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes",
+                "code": kind,
+            }]});
+            document["content"] = serde_json::json!([{
+                "contentType": "application/sql", "data": BASE64.encode("SELECT 1"),
+            }]);
+            document["relatedArtifact"] = serde_json::json!([{
+                "type": "depends-on", "resource": "http://example.org/source", "label": "src",
+            }]);
+        } else {
+            document["resource"] = Value::String("Patient".into());
+            document["select"] =
+                serde_json::json!([{"column": [{"name": "id", "path": "getResourceKey()"}]}]);
+        }
+        document
+    }
+
+    fn submit(route: &str, document: &Value, action: &str) -> Request<Body> {
+        submit_text(route, &document.to_string(), action, "SELECT 2", None)
+    }
+
+    fn submit_text(
+        route: &str,
+        json: &str,
+        action: &str,
+        sql: &str,
+        parameter: Option<&str>,
+    ) -> Request<Body> {
+        let mut body = form_urlencoded::Serializer::new(String::new());
+        body.append_pair("id", "original")
+            .append_pair("json", json)
+            .append_pair("action", action)
+            .append_pair("sql", sql);
+        if let Some(value) = parameter {
+            body.append_pair("param:ward", value);
+        }
+        Request::post(route)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(body.finish()))
+            .unwrap()
+    }
+
+    fn assert_context(store: &FhirStore) {
+        for call in &store.calls {
+            assert_eq!(call.tenant, TENANT);
+            assert_eq!(call.accept, "application/fhir+json; fhirVersion=4.0");
+            if call.method != "GET" {
+                assert_eq!(call.content_type, call.accept);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_twice_assigns_distinct_identities_and_preserves_source_for_all_routes() {
+        for (route, resource_type, kind) in ROUTES {
+            let original = artifact(resource_type, kind);
+            let fixture = fixture(vec![original.clone()], None).await;
+            // A collision in another tenant must not consume this tenant's suffix.
+            fixture.store.lock().unwrap().resources.insert(
+                ("other-tenant".into(), resource_type.into()),
+                vec![serde_json::json!({"name": "patients_copy", "url": "http://example.org/patients_copy"})],
+            );
+            for suffix in ["_copy", "_copy_2"] {
+                let response = fixture
+                    .app
+                    .clone()
+                    .oneshot(submit(route, &original, "duplicate"))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::SEE_OTHER, "{route}");
+                let store = fixture.store.lock().unwrap();
+                let copy = store.writes.last().unwrap();
+                let mut expected = original.clone();
+                expected["id"] = copy["id"].clone();
+                expected["name"] = Value::String(format!("patients{suffix}"));
+                expected["url"] = Value::String(format!("http://example.org/patients{suffix}"));
+                assert_eq!(copy, &expected);
+                assert_ne!(copy["id"], original["id"]);
+                assert!(
+                    response.headers()["location"]
+                        .to_str()
+                        .unwrap()
+                        .contains(copy["id"].as_str().unwrap())
+                );
+                assert_eq!(
+                    store.resources[&(TENANT.into(), resource_type.into())][0],
+                    original
+                );
+                assert_context(&store);
+            }
+            let store = fixture.store.lock().unwrap();
+            assert_ne!(store.writes[0]["id"], store.writes[1]["id"]);
+            assert!(
+                store
+                    .calls
+                    .iter()
+                    .filter(|call| call.method == "GET")
+                    .all(|call| {
+                        call.params.get("_count").map(String::as_str) == Some("501")
+                            && call.params.get("_offset").map(String::as_str) == Some("0")
+                            && call.params.len() == 2
+                    })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_skips_name_url_cross_type_and_later_page_collisions() {
+        for (route, resource_type, kind) in ROUTES {
+            for collision in ["name", "url", "other-type", "later-page"] {
+                let original = artifact(resource_type, kind);
+                let other_type = if resource_type == "Library" {
+                    "ViewDefinition"
+                } else {
+                    "Library"
+                };
+                let mut resources = vec![original.clone()];
+                if collision == "later-page" {
+                    for index in 1..500 {
+                        resources.push(serde_json::json!({"resourceType": resource_type, "id": format!("padding-{index}")}));
+                    }
+                }
+                resources.push(serde_json::json!({
+                    "resourceType": if collision == "other-type" { other_type } else { resource_type },
+                    "id": "collision",
+                    "name": if collision == "name" { "patients_copy" } else { "other" },
+                    "url": if collision == "name" { "http://example.org/unrelated" } else { "http://example.org/patients_copy" },
+                }));
+                let fixture = fixture(resources, None).await;
+                let response = fixture
+                    .app
+                    .clone()
+                    .oneshot(submit(route, &original, "duplicate"))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::SEE_OTHER,
+                    "{route} {collision}"
+                );
+                let store = fixture.store.lock().unwrap();
+                assert_eq!(store.writes[0]["name"], "patients_copy_2");
+                assert_eq!(store.writes[0]["url"], "http://example.org/patients_copy_2");
+                if collision == "later-page" {
+                    assert!(
+                        store
+                            .calls
+                            .iter()
+                            .any(|call| call.resource_type == resource_type
+                                && call.params.get("_offset").map(String::as_str) == Some("500"))
+                    );
+                }
+                assert_context(&store);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_reads_capped_linkless_catalogs_before_choosing_identity() {
+        for (route, resource_type, kind) in ROUTES {
+            let original = artifact(resource_type, kind);
+            let resources = vec![
+                original.clone(),
+                serde_json::json!({"resourceType": resource_type, "id": "padding-1"}),
+                serde_json::json!({"resourceType": resource_type, "id": "padding-2"}),
+                serde_json::json!({"resourceType": resource_type, "id": "collision",
+                    "name": "patients_copy", "url": "http://example.org/patients_copy"}),
+            ];
+            let fixture = fixture(resources, None).await;
+            fixture.store.lock().unwrap().max_count = Some(2);
+            let response = fixture
+                .app
+                .clone()
+                .oneshot(submit(route, &original, "duplicate"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SEE_OTHER, "{route}");
+            let store = fixture.store.lock().unwrap();
+            assert_eq!(store.writes[0]["name"], "patients_copy_2");
+            assert_eq!(store.writes[0]["url"], "http://example.org/patients_copy_2");
+            let offsets: Vec<&str> = store
+                .calls
+                .iter()
+                .filter(|call| call.method == "GET" && call.resource_type == resource_type)
+                .map(|call| {
+                    assert_eq!(call.params["_count"], "501");
+                    call.params["_offset"].as_str()
+                })
+                .collect();
+            assert_eq!(offsets, ["0", "2"]);
+            assert_context(&store);
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_rejects_empty_capped_pages_with_a_pending_total_without_saving() {
+        for (route, resource_type, kind) in ROUTES {
+            let mut original = artifact(resource_type, kind);
+            original.as_object_mut().unwrap().remove("relatedArtifact");
+            let fixture = fixture(vec![original.clone()], None).await;
+            {
+                let mut store = fixture.store.lock().unwrap();
+                store.max_count = Some(2);
+                store.empty_page_at = Some(0);
+            }
+            let json = format!("  {}\n", serde_json::to_string_pretty(&original).unwrap());
+            let response = fixture
+                .app
+                .clone()
+                .oneshot(submit_text(route, &json, "duplicate", "SELECT 2", None))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let html = body_text(response).await;
+            assert!(html.contains("Could not check all existing artifacts"));
+            assert_eq!(lib_json_textarea_value(&html), json);
+            let store = fixture.store.lock().unwrap();
+            assert!(store.writes.is_empty());
+            assert_eq!(
+                store.resources[&(TENANT.into(), resource_type.into())][0],
+                original
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_keeps_missing_identity_fields_missing_and_avoids_unneeded_reads() {
+        for (route, resource_type, kind) in ROUTES {
+            for missing in ["url", "name", "both"] {
+                let mut original = artifact(resource_type, kind);
+                if missing != "name" {
+                    original.as_object_mut().unwrap().remove("url");
+                }
+                if missing != "url" {
+                    original.as_object_mut().unwrap().remove("name");
+                }
+                let fixture = fixture(vec![original.clone()], None).await;
+                for suffix in ["_copy", "_copy_2"] {
+                    let response = fixture
+                        .app
+                        .clone()
+                        .oneshot(submit(route, &original, "duplicate"))
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+                    let store = fixture.store.lock().unwrap();
+                    let copy = store.writes.last().unwrap();
+                    if missing != "name" {
+                        assert!(copy.get("url").is_none());
+                    }
+                    if missing != "url" {
+                        assert!(copy.get("name").is_none());
+                    }
+                    if missing == "url" {
+                        assert_eq!(copy["name"], format!("patients{suffix}"));
+                    }
+                    if missing == "name" {
+                        assert_eq!(copy["url"], format!("http://example.org/patients{suffix}"));
+                    }
+                }
+                let store = fixture.store.lock().unwrap();
+                if missing == "both" {
+                    assert!(store.calls.iter().all(|call| call.method == "POST"));
+                } else if missing == "url" {
+                    assert!(
+                        store
+                            .calls
+                            .iter()
+                            .all(|call| call.resource_type == resource_type)
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_later_page_failure_does_not_save_and_preserves_submitted_form() {
+        for (route, resource_type, kind) in ROUTES {
+            let mut original = artifact(resource_type, kind);
+            // No dependencies: re-rendering the error itself does not need another lookup.
+            original.as_object_mut().unwrap().remove("relatedArtifact");
+            if kind == "sql-query" {
+                original["parameter"] =
+                    serde_json::json!([{"name": "ward", "use": "in", "type": "string"}]);
+            }
+            let mut resources = vec![original.clone()];
+            for index in 1..501 {
+                resources.push(serde_json::json!({"resourceType": resource_type, "id": format!("padding-{index}")}));
+            }
+            let fixture = fixture(resources, Some(resource_type)).await;
+            let json = format!("  {}\n", serde_json::to_string_pretty(&original).unwrap());
+            let sql = "SELECT 'ward & city'\n-- exact text\n";
+            let response = fixture
+                .app
+                .clone()
+                .oneshot(submit_text(route, &json, "duplicate", sql, Some("3B & 5")))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let html = body_text(response).await;
+            assert!(html.contains("Could not check existing artifacts before duplicating"));
+            assert!(html.contains("503"));
+            assert_eq!(lib_json_textarea_value(&html), json);
+            if resource_type == "Library" {
+                assert_eq!(sql_textarea_value(&html), sql);
+            }
+            if kind == "sql-query" {
+                let parsed = scraper::Html::parse_document(&html);
+                let selector = scraper::Selector::parse("input[name='param:ward']").unwrap();
+                assert_eq!(
+                    parsed
+                        .select(&selector)
+                        .next()
+                        .unwrap()
+                        .value()
+                        .attr("value"),
+                    Some("3B & 5")
+                );
+            }
+            let store = fixture.store.lock().unwrap();
+            assert!(store.writes.is_empty());
+            assert_eq!(
+                store.resources[&(TENANT.into(), resource_type.into())][0],
+                original
+            );
+            assert_context(&store);
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_save_keeps_identity_and_does_not_read_catalogs() {
+        for (route, resource_type, kind) in ROUTES {
+            let original = artifact(resource_type, kind);
+            let fixture = fixture(vec![original.clone()], Some(resource_type)).await;
+            let response = fixture
+                .app
+                .clone()
+                .oneshot(submit(route, &original, "save"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SEE_OTHER);
+            let store = fixture.store.lock().unwrap();
+            assert_eq!(store.writes, vec![original]);
+            assert_eq!(store.calls.len(), 1);
+            assert_eq!(store.calls[0].method, "PUT");
+            assert_context(&store);
+        }
+    }
+}
+
 fn app_with_unavailable_settings() -> Router {
     helios_ui::mount_with_conformance_source(
         Router::new(),
