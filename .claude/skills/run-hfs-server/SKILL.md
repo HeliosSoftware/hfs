@@ -76,6 +76,7 @@ HFS_SERVER_PORT=3000 HFS_LOG_LEVEL=debug cargo run --bin hfs
 | `HFS_ELASTICSEARCH_PASSWORD` | none | Elasticsearch basic auth password |
 | `HFS_ELASTICSEARCH_REFRESH_INTERVAL` | `1s` | Index `refresh_interval` applied when an index is created (`-1` disables periodic refresh) |
 | `HFS_ELASTICSEARCH_WRITE_REFRESH` | `false` | `refresh` parameter on index/delete writes: `false`, `wait_for`, or `true` |
+| `HFS_ELASTICSEARCH_MAX_TERMS_COUNT` | `65536` | Index `max_terms_count`: most values one `terms` query carries; a chained or `_has` search that pins more ids is sent as several `terms` clauses of at most this many each (#1548). Set on new indices |
 | `HFS_ELASTICSEARCH_NESTED_OBJECTS_LIMIT` | `50000` | Index `mapping.nested_objects.limit`: max nested objects per document across all nested search-parameter fields. Set on new indices; raised at startup on existing indices below it |
 | `HFS_COMPOSITE_SYNC_MODE` | `asynchronous` | ES-backed composite write sync mode: asynchronous, synchronous, or hybrid |
 
