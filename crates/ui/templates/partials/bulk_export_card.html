@@ -59,6 +59,9 @@
 
   {% if card.status == "in-progress" %}
   <p class="job-card__meta">{{ card.progress_label }}</p>
+  {% if !card.error.is_empty() %}
+  <p class="job-card__meta job-card__refusal" role="status">{{ i18n.t("bulk-export-cancel-refused") }} {{ card.error }}</p>
+  {% endif %}
   {% endif %}
 
   {% if card.status == "complete" %}
