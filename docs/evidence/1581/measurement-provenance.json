@@ -1,0 +1,81 @@
+{
+  "captured_date": "2026-09-30",
+  "baseline_commit": "4427ae16c5dda7338e43032ac49d7c4e79b9875f",
+  "baseline_binary_sha256": "b247b20a834921bfdf99c3977852d88ee052f2acf3510013b5dcb4e42e44fdb6",
+  "candidate_binary_sha256": "adeca0396b0f370139a8fd22bab977d9c62e0d74707caeedb9881aaa21e11a28",
+  "candidate_source_sha256": {
+    "crates/persistence/src/sof/compiler.rs": "9f52185992926b6619d310015e0abfa36960da4657a6a19f497a3ffc59c50cfd",
+    "crates/persistence/src/sof/postgres.rs": "faf2a6b18fdc859e7e285ef2837f2f90bb10672872e531634d58a14b75ad91b8",
+    "crates/persistence/src/sof/sqlite.rs": "55b80c120df9f9e710fefa427ff379c3869d768c3b4335b871525020ccf59a0a"
+  },
+  "compiler": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "build_command": "cargo build -p helios-hfs --release --locked --no-default-features --features R4,postgres,ui",
+  "measurements": [
+    {
+      "definition": "observation_flat",
+      "condition": "pg-and-clone-files-cold",
+      "beforeCardMs": 117,
+      "afterCardMs": 6,
+      "rows": 50,
+      "httpResponseMs": 9.592,
+      "actionToFreshDomMs": 182.35191299999997,
+      "cardCriterionPassed": true
+    },
+    {
+      "definition": "observation_flat",
+      "condition": "warm",
+      "beforeCardMs": 62,
+      "afterCardMs": 2,
+      "rows": 50,
+      "httpResponseMs": 5.229,
+      "actionToFreshDomMs": 157.29197999999997,
+      "cardCriterionPassed": true
+    },
+    {
+      "definition": "patient_demographics",
+      "condition": "pg-and-clone-files-cold",
+      "beforeCardMs": 1118,
+      "afterCardMs": 10,
+      "rows": 50,
+      "httpResponseMs": 13.018,
+      "actionToFreshDomMs": 194.36379599999998,
+      "cardCriterionPassed": true
+    },
+    {
+      "definition": "patient_demographics",
+      "condition": "warm",
+      "beforeCardMs": 232,
+      "afterCardMs": 3,
+      "rows": 50,
+      "httpResponseMs": 8.217,
+      "actionToFreshDomMs": 249.18639900000005,
+      "cardCriterionPassed": true
+    }
+  ],
+  "cold_protocol": "PostgreSQLclone restart plus clonefile-only DONTNEED; mincore resident_after_bytes=0 and errors=0 before restart for bothdefinitions",
+  "historical_11_15s_not_reproduced": true,
+  "query_bindings": [
+    "default",
+    "Observation"
+  ],
+  "plan_cache_mode": "force_custom_plan",
+  "artifacts": {
+    "after-explain.json": "8aa75eb38639086742ebe6ecc41e1cda34af1d5f01d07e442e0cfb2ca43a3850",
+    "after-observation-cold.png": "0df8da8174a6afbce66a3583f20176720fe9abb979035e03ed582674dd16ad64",
+    "after-runtime.sql": "9ee18db2fb0cd915840176aa015e6aa20337477614d0a4d2d6b54cb37c556bb2",
+    "before-explain.json": "33c37f16dfccc0389047b7a50fadbed0561f870fed92dfa9aea2998473715bce",
+    "before-explain.txt": "f57a415b0aadc62916ff5fff03a262807af789f2b727ff9cdc61a6aa6ed0422b",
+    "before-observation-cold.png": "88a2f718897e4465bb42e2a6f18013057f53af0c67b7ee129ab6961125974e71",
+    "before-runtime.sql": "ab844817ce5e0644bc3014e5a9b12f8c3f69be9fe11e0fbdfd0ba76eff64ce52",
+    "nullable-analyzed-direct-limit-plan.json": "35b02b6afb4910a048db731e63a49483aa8d7675c1a8383417cb6097628b429d",
+    "nullable-analyzed-materialized-limit-plan.json": "0931d3babb575ebfd6d10cd1923e0aaac59df48ff25644f49b81b78ab37d504d",
+    "nullable-analyzed-unlimited-plan.json": "441c792e406edc45a426930f225fdb6d4a5adb5867a0e617d4ee28b9515f7f37",
+    "nullable-direct-limit.sql": "515c40ea5fa43557f5a0b84f3ece39eec4525867cfb041b8436f4020787d8126",
+    "nullable-initial-direct-limit-plan.json": "bdf2357907e056ec24a02ae8a9f605bb9e825e5a362f1c0e408c378d6aa45048",
+    "nullable-initial-materialized-limit-plan.json": "b4cf41eadfd61eebca4e796a64666fb815a629beb7eb68965b88bc3c87b05694",
+    "nullable-initial-unlimited-plan.json": "7a8ad3796a3ee1fa4d252c41910b0f012492884db63f13ddfbd47b7cc708956f",
+    "nullable-materialized-limit.sql": "f0365cb3ee7876a0f59a10cede8768d90a58c90dc3b93b8d0ae5c22a0826069c",
+    "nullable-prefix-results.json": "1c3caa6bda9ba98ff43db9c1185ed525c825e534cb9f1d834b6a61d205eed0e1",
+    "nullable-unlimited.sql": "893f8898735133f5fe05123943daced6bb9c53fd053b6de3dab620ea899acb97"
+  }
+}

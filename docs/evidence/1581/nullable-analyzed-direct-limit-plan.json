@@ -1,0 +1,215 @@
+[
+  {
+    "Plan": {
+      "Node Type": "Limit",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Startup Cost": 9.74,
+      "Total Cost": 13.58,
+      "Plan Rows": 50,
+      "Plan Width": 49,
+      "Actual Startup Time": 0.286,
+      "Actual Total Time": 0.29,
+      "Actual Rows": 50,
+      "Actual Loops": 1,
+      "Output": [
+        "((fe.value ->> 'family'::text))",
+        "r.last_updated",
+        "r.id"
+      ],
+      "Shared Hit Blocks": 44,
+      "Shared Read Blocks": 0,
+      "Shared Dirtied Blocks": 0,
+      "Shared Written Blocks": 0,
+      "Local Hit Blocks": 0,
+      "Local Read Blocks": 0,
+      "Local Dirtied Blocks": 0,
+      "Local Written Blocks": 0,
+      "Temp Read Blocks": 0,
+      "Temp Written Blocks": 0,
+      "Plans": [
+        {
+          "Node Type": "Incremental Sort",
+          "Parent Relationship": "Outer",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Startup Cost": 9.74,
+          "Total Cost": 32.74,
+          "Plan Rows": 300,
+          "Plan Width": 49,
+          "Actual Startup Time": 0.285,
+          "Actual Total Time": 0.287,
+          "Actual Rows": 50,
+          "Actual Loops": 1,
+          "Output": [
+            "((fe.value ->> 'family'::text))",
+            "r.last_updated",
+            "r.id"
+          ],
+          "Sort Key": [
+            "r.last_updated",
+            "r.id"
+          ],
+          "Presorted Key": [
+            "r.last_updated"
+          ],
+          "Full-sort Groups": {
+            "Group Count": 1,
+            "Sort Methods Used": [
+              "quicksort"
+            ],
+            "Sort Space Memory": {
+              "Average Sort Space Used": 29,
+              "Peak Sort Space Used": 29
+            }
+          },
+          "Pre-sorted Groups": {
+            "Group Count": 1,
+            "Sort Methods Used": [
+              "top-N heapsort"
+            ],
+            "Sort Space Memory": {
+              "Average Sort Space Used": 28,
+              "Peak Sort Space Used": 28
+            }
+          },
+          "Shared Hit Blocks": 44,
+          "Shared Read Blocks": 0,
+          "Shared Dirtied Blocks": 0,
+          "Shared Written Blocks": 0,
+          "Local Hit Blocks": 0,
+          "Local Read Blocks": 0,
+          "Local Dirtied Blocks": 0,
+          "Local Written Blocks": 0,
+          "Temp Read Blocks": 0,
+          "Temp Written Blocks": 0,
+          "Plans": [
+            {
+              "Node Type": "Nested Loop",
+              "Parent Relationship": "Outer",
+              "Parallel Aware": false,
+              "Async Capable": false,
+              "Join Type": "Left",
+              "Startup Cost": 0.15,
+              "Total Cost": 18.96,
+              "Plan Rows": 300,
+              "Plan Width": 49,
+              "Actual Startup Time": 0.162,
+              "Actual Total Time": 0.209,
+              "Actual Rows": 151,
+              "Actual Loops": 1,
+              "Output": [
+                "(fe.value ->> 'family'::text)",
+                "r.last_updated",
+                "r.id"
+              ],
+              "Inner Unique": false,
+              "Shared Hit Blocks": 35,
+              "Shared Read Blocks": 0,
+              "Shared Dirtied Blocks": 0,
+              "Shared Written Blocks": 0,
+              "Local Hit Blocks": 0,
+              "Local Read Blocks": 0,
+              "Local Dirtied Blocks": 0,
+              "Local Written Blocks": 0,
+              "Temp Read Blocks": 0,
+              "Temp Written Blocks": 0,
+              "Plans": [
+                {
+                  "Node Type": "Index Scan",
+                  "Parent Relationship": "Outer",
+                  "Parallel Aware": false,
+                  "Async Capable": false,
+                  "Scan Direction": "Forward",
+                  "Index Name": "idx_resources_updated",
+                  "Relation Name": "resources",
+                  "Schema": "public",
+                  "Alias": "r",
+                  "Startup Cost": 0.13,
+                  "Total Cost": 12.19,
+                  "Plan Rows": 3,
+                  "Plan Width": 77,
+                  "Actual Startup Time": 0.008,
+                  "Actual Total Time": 0.009,
+                  "Actual Rows": 2,
+                  "Actual Loops": 1,
+                  "Output": [
+                    "r.tenant_id",
+                    "r.resource_type",
+                    "r.id",
+                    "r.version_id",
+                    "r.data",
+                    "r.last_updated",
+                    "r.is_deleted",
+                    "r.deleted_at"
+                  ],
+                  "Index Cond": "(r.tenant_id = 'probe'::text)",
+                  "Rows Removed by Index Recheck": 0,
+                  "Filter": "((NOT r.is_deleted) AND (r.resource_type = 'Patient'::text))",
+                  "Rows Removed by Filter": 0,
+                  "Shared Hit Blocks": 2,
+                  "Shared Read Blocks": 0,
+                  "Shared Dirtied Blocks": 0,
+                  "Shared Written Blocks": 0,
+                  "Local Hit Blocks": 0,
+                  "Local Read Blocks": 0,
+                  "Local Dirtied Blocks": 0,
+                  "Local Written Blocks": 0,
+                  "Temp Read Blocks": 0,
+                  "Temp Written Blocks": 0
+                },
+                {
+                  "Node Type": "Function Scan",
+                  "Parent Relationship": "Inner",
+                  "Parallel Aware": false,
+                  "Async Capable": false,
+                  "Function Name": "jsonb_array_elements",
+                  "Schema": "pg_catalog",
+                  "Alias": "fe",
+                  "Startup Cost": 0.02,
+                  "Total Cost": 1.02,
+                  "Plan Rows": 100,
+                  "Plan Width": 32,
+                  "Actual Startup Time": 0.084,
+                  "Actual Total Time": 0.088,
+                  "Actual Rows": 75,
+                  "Actual Loops": 2,
+                  "Output": [
+                    "fe.value",
+                    "fe.ordinality"
+                  ],
+                  "Function Call": "jsonb_array_elements(CASE WHEN (jsonb_typeof((r.data -> 'name'::text)) = 'array'::text) THEN (r.data -> 'name'::text) WHEN (jsonb_typeof((r.data -> 'name'::text)) IS NOT NULL) THEN jsonb_build_array((r.data -> 'name'::text)) ELSE '[]'::jsonb END)",
+                  "Shared Hit Blocks": 33,
+                  "Shared Read Blocks": 0,
+                  "Shared Dirtied Blocks": 0,
+                  "Shared Written Blocks": 0,
+                  "Local Hit Blocks": 0,
+                  "Local Read Blocks": 0,
+                  "Local Dirtied Blocks": 0,
+                  "Local Written Blocks": 0,
+                  "Temp Read Blocks": 0,
+                  "Temp Written Blocks": 0
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "Planning": {
+      "Shared Hit Blocks": 209,
+      "Shared Read Blocks": 0,
+      "Shared Dirtied Blocks": 0,
+      "Shared Written Blocks": 0,
+      "Local Hit Blocks": 0,
+      "Local Read Blocks": 0,
+      "Local Dirtied Blocks": 0,
+      "Local Written Blocks": 0,
+      "Temp Read Blocks": 0,
+      "Temp Written Blocks": 0
+    },
+    "Planning Time": 0.715,
+    "Triggers": [],
+    "Execution Time": 0.337
+  }
+]
