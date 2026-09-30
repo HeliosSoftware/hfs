@@ -1153,6 +1153,83 @@ mod sof_run_tests {
     // Filter tests — `_since`, `patient`, `group`
     // =========================================================================
 
+    /// An unparsable `_since` is a `400` naming the parameter and the value,
+    /// as `$export` answers, never a silently dropped filter (#1550).
+    #[tokio::test]
+    async fn test_run_rejects_an_unparsable_since_with_400() {
+        let (server, backend) = create_test_server_with_indb().await;
+        seed_patient(&backend, "p-since-bad", "Any").await;
+
+        let flat_view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [{"path": "id", "name": "patient_id", "type": "string"}]}]
+        });
+
+        for path in [
+            "/$sql-run?_format=ndjson&_since=yesterday",
+            "/$sql-run?_format=json&_since=yesterday&_limit=3",
+        ] {
+            let response = server
+                .post(path)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .add_header(
+                    CONTENT_TYPE,
+                    HeaderValue::from_static("application/fhir+json"),
+                )
+                .json(&flat_view)
+                .await;
+            assert_eq!(
+                response.status_code(),
+                StatusCode::BAD_REQUEST,
+                "{path}: {}",
+                response.text()
+            );
+            let outcome: Value = response.json();
+            assert_eq!(outcome["resourceType"], "OperationOutcome");
+            let text = outcome["issue"][0]["details"]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            assert!(text.contains("_since"), "{path}: {text}");
+            assert!(text.contains("yesterday"), "{path}: {text}");
+        }
+
+        // The inline-resources path parses the same parameter.
+        let inline = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "subjectResource", "resource": flat_view},
+                {"name": "resource", "resource": {"resourceType": "Patient", "id": "inline-1"}}
+            ]
+        });
+        let response = server
+            .post("/$sql-run?_format=ndjson&_since=yesterday")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&inline)
+            .await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::BAD_REQUEST,
+            "inline: {}",
+            response.text()
+        );
+        let outcome: Value = response.json();
+        let text = outcome["issue"][0]["details"]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            text.contains("_since") && text.contains("yesterday"),
+            "{text}"
+        );
+    }
+
     /// `_since` returns only resources whose `last_updated` is at or after the given instant.
     #[tokio::test]
     async fn test_run_view_definition_since_filter() {
