@@ -177,12 +177,46 @@ impl ExportOutputStore for LocalFsOutputStore {
     }
 }
 
+/// How many times a job-directory removal is attempted when a concurrent
+/// writer keeps it non-empty. A running export worker adds at most one part
+/// between the cancel and its next batch gate, so a handful of short retries
+/// outlasts it.
+const REMOVE_DIR_ATTEMPTS: usize = 20;
+const REMOVE_DIR_RETRY_DELAY: Duration = Duration::from_millis(50);
+
 /// Removes a directory if it exists; a missing directory is `Ok`.
 async fn delete_dir_idempotent(dir: &Path) -> StorageResult<()> {
-    match tokio::fs::remove_dir_all(dir).await {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(io_err(format!("remove_dir_all {}: {e}", dir.display()))),
+    remove_dir_all_retrying(dir, REMOVE_DIR_ATTEMPTS, |d| {
+        tokio::fs::remove_dir_all(d.to_path_buf())
+    })
+    .await
+}
+
+/// Removes `dir` and everything under it with `remove`. A missing directory
+/// is `Ok`. A part finalized into the directory while it is being walked
+/// makes the final `rmdir` fail with `DirectoryNotEmpty`; that is retried up
+/// to `attempts` times, pausing [`REMOVE_DIR_RETRY_DELAY`] between attempts.
+/// Any other failure is returned at once.
+async fn remove_dir_all_retrying<F, Fut>(
+    dir: &Path,
+    attempts: usize,
+    mut remove: F,
+) -> StorageResult<()>
+where
+    F: FnMut(&Path) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<()>>,
+{
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match remove(dir).await {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty && attempt < attempts => {
+                tokio::time::sleep(REMOVE_DIR_RETRY_DELAY).await;
+            }
+            Err(e) => return Err(io_err(format!("remove_dir_all {}: {e}", dir.display()))),
+        }
     }
 }
 
@@ -483,5 +517,112 @@ mod tests {
         assert_eq!(state.paths_at_drop, Some((true, false)));
         assert!(!store.tmp_path(&key).exists());
         assert!(store.part_path(&key).exists());
+    }
+
+    fn not_empty() -> io::Error {
+        io::Error::new(io::ErrorKind::DirectoryNotEmpty, "Directory not empty")
+    }
+
+    /// The cancel race: a worker finalizes a part while the handler walks the
+    /// job directory, so the first removal reports `DirectoryNotEmpty`. The
+    /// next attempt finds the directory quiet and removes it.
+    #[tokio::test]
+    async fn remove_dir_retries_when_a_concurrent_writer_keeps_it_non_empty() {
+        let calls = Arc::new(Mutex::new(0usize));
+        let seen = Arc::clone(&calls);
+        let result = remove_dir_all_retrying(Path::new("/job"), 5, move |_| {
+            let seen = Arc::clone(&seen);
+            async move {
+                let mut n = seen.lock().unwrap();
+                *n += 1;
+                if *n < 3 { Err(not_empty()) } else { Ok(()) }
+            }
+        })
+        .await;
+        assert!(
+            result.is_ok(),
+            "the removal should succeed once the directory is quiet"
+        );
+        assert_eq!(*calls.lock().unwrap(), 3);
+    }
+
+    /// The retries are bounded: a directory that never empties is reported
+    /// after exactly `attempts` removals, naming the directory.
+    #[tokio::test]
+    async fn remove_dir_gives_up_after_the_attempt_budget() {
+        let calls = Arc::new(Mutex::new(0usize));
+        let seen = Arc::clone(&calls);
+        let err = remove_dir_all_retrying(Path::new("/busy"), 4, move |_| {
+            let seen = Arc::clone(&seen);
+            async move {
+                *seen.lock().unwrap() += 1;
+                Err(not_empty())
+            }
+        })
+        .await
+        .expect_err("a directory that never empties is an error");
+        assert_eq!(*calls.lock().unwrap(), 4);
+        assert!(err.to_string().contains("/busy"), "{err}");
+        assert!(err.to_string().contains("Directory not empty"), "{err}");
+    }
+
+    /// Only the race is retried. A missing directory is success on the first
+    /// call and any other failure is returned without a second attempt.
+    #[tokio::test]
+    async fn remove_dir_does_not_retry_other_outcomes() {
+        let calls = Arc::new(Mutex::new(0usize));
+        let seen = Arc::clone(&calls);
+        let missing = remove_dir_all_retrying(Path::new("/gone"), 5, move |_| {
+            let seen = Arc::clone(&seen);
+            async move {
+                *seen.lock().unwrap() += 1;
+                Err(io::Error::new(io::ErrorKind::NotFound, "gone"))
+            }
+        })
+        .await;
+        assert!(missing.is_ok());
+        assert_eq!(*calls.lock().unwrap(), 1);
+
+        let calls = Arc::new(Mutex::new(0usize));
+        let seen = Arc::clone(&calls);
+        let denied = remove_dir_all_retrying(Path::new("/denied"), 5, move |_| {
+            let seen = Arc::clone(&seen);
+            async move {
+                *seen.lock().unwrap() += 1;
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
+            }
+        })
+        .await;
+        assert!(denied.is_err());
+        assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    /// End to end on a real directory: files keep landing in the job
+    /// directory while it is being removed, as a worker's parts do, and every
+    /// removal still returns `Ok`.
+    #[tokio::test]
+    async fn delete_job_outputs_survives_parts_landing_during_the_sweep() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalFsOutputStore::new(tmp.path(), "http://localhost:8080");
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let job = ExportJobId::from_string("racing");
+        let dir = store.job_dir(tenant.tenant_id().as_str(), &job);
+
+        let writer_dir = dir.clone();
+        let writer = tokio::task::spawn_blocking(move || {
+            for i in 0..200 {
+                std::fs::create_dir_all(&writer_dir).unwrap();
+                let _ = std::fs::write(
+                    writer_dir.join(format!("output-Patient-{i}-1.ndjson")),
+                    b"{}\n",
+                );
+            }
+        });
+        for _ in 0..50 {
+            store.delete_job_outputs(&tenant, &job).await.unwrap();
+        }
+        writer.await.unwrap();
+        store.delete_job_outputs(&tenant, &job).await.unwrap();
+        assert!(!dir.exists(), "the last sweep leaves no directory behind");
     }
 }

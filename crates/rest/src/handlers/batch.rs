@@ -549,6 +549,17 @@ where
         }
     }
 
+    // A backend that cannot honour a transaction's atomicity refuses the
+    // bundle here, before conditional references are resolved or entries
+    // validated: on S3 the resolver's search used to answer first, with the
+    // misleading "Feature 'search' is not implemented" (#1590). The storage
+    // layer keeps its own refusal for callers that reach it directly.
+    if !state.storage().supports_atomic_transactions() {
+        return transaction_error_to_response(TransactionError::AtomicityUnsupported {
+            backend_name: state.storage().backend_name().to_string(),
+        });
+    }
+
     // Admit every mutation before reference resolution, configurable
     // validation, or storage. A transaction with one invalid write is declined
     // whole, so none of its otherwise valid siblings can commit or delete.

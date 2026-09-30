@@ -91,6 +91,7 @@ pub fn create_index_mapping(config: &super::backend::ElasticsearchConfig) -> ser
             "number_of_shards": config.number_of_shards,
             "number_of_replicas": config.number_of_replicas,
             "index.max_result_window": config.max_result_window,
+            "index.max_terms_count": config.max_terms_count,
             "index.mapping.nested_objects.limit": config.nested_objects_limit,
             "refresh_interval": config.refresh_interval,
             "analysis": {

@@ -6381,16 +6381,24 @@ async fn sql_view_page_resolves_reads_from_and_lists_used_by() {
     // the *Used by* card — never one per Library or per *Used by* row.
     assert_eq!(store.get_settings_calls(), 2);
 
-    // Reads from: resolved row.
+    // Reads from: resolved row, rendered as a flat list (#1238) — never a
+    // horizontally-scrolling data table.
     let reads_from = text_between(&html, r#"id="lib-tables""#, r#"id="lib-tables-add-table""#);
-    assert!(reads_from.contains("<code>v</code>"), "{reads_from}");
+    assert!(!reads_from.contains("table-wrap"), "{reads_from}");
+    assert!(
+        reads_from.contains(r#"<code class="lib-tables__alias">v</code>"#),
+        "{reads_from}"
+    );
     assert!(
         reads_from.contains(r#"href="/ui/sql/view-definitions?vd=vd1""#),
         "{reads_from}"
     );
     assert!(reads_from.contains("patients_flat"), "{reads_from}");
     // Reads from: unresolved row, tinted with the shared failing-row class.
-    assert!(reads_from.contains("row--alert"), "{reads_from}");
+    assert!(
+        reads_from.contains(r#"class="lib-tables__row row--alert""#),
+        "{reads_from}"
+    );
     assert!(reads_from.contains("Not found"), "{reads_from}");
 
     // Used by: the SQL Query (by url) and the export job, both linked.
@@ -6398,6 +6406,119 @@ async fn sql_view_page_resolves_reads_from_and_lists_used_by() {
     assert!(html.contains("by_ward"), "{html}");
     assert!(html.contains(r#"href="/ui/sql/export/job-a""#), "{html}");
     assert!(html.contains("Nightly extract"), "{html}");
+}
+
+/// #1238: the Tables card's own add row — search, alias, *Add* — is
+/// always visible, right after *Reads from*'s own list, never behind a
+/// disclosure the way the guided-form editor's own "+ Add" panels still
+/// are.
+#[tokio::test]
+async fn sql_views_page_tables_card_renders_the_add_row_without_a_disclosure() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            helios_fhir::FhirVersion::R4,
+            vec![tables_view_definition()],
+        )
+        .with(
+            "Library",
+            helios_fhir::FhirVersion::R4,
+            vec![tables_sql_view()],
+        );
+    let app = library_app(source);
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/views?lib=v1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    // Scoped to the Tables card itself — the page also loads an unrelated
+    // `editor-add.js` script (#1239's own "+ Add Element" picker) whose own
+    // name would otherwise false-positive a page-wide `editor-add` search.
+    let tables_card = text_between(&html, r#"id="lib-tables""#, r#"id="lib-columns""#);
+
+    assert!(
+        tables_card.contains(r#"class="lib-tables__add""#),
+        "{tables_card}"
+    );
+    assert!(
+        tables_card.contains(r#"id="lib-tables-add-table""#),
+        "{tables_card}"
+    );
+    assert!(
+        tables_card.contains(r#"name="table_alias""#),
+        "{tables_card}"
+    );
+    assert!(
+        tables_card.contains(r#"name="op" value="add-table""#),
+        "{tables_card}"
+    );
+    assert!(
+        tables_card
+            .contains("Search a view definition or SQL view; the alias defaults to its name."),
+        "{tables_card}"
+    );
+    assert!(
+        tables_card.contains(r#"aria-label="Remove v""#),
+        "{tables_card}"
+    );
+    assert!(
+        tables_card.contains(r#"aria-label="Remove missing""#),
+        "{tables_card}"
+    );
+
+    assert!(!tables_card.contains("table-wrap"), "{tables_card}");
+    assert!(!tables_card.contains("<table"), "{tables_card}");
+    assert!(!tables_card.contains("editor-add"), "{tables_card}");
+    assert!(
+        !tables_card.contains("Every table the SQL reads"),
+        "{tables_card}"
+    );
+}
+
+/// #1238: *Used by* renders the same flat-list markup as *Reads from* —
+/// no `<table>`, one `li.lib-tables__row` per entry.
+#[tokio::test]
+async fn used_by_rows_are_a_flat_list() {
+    let store = Arc::new(InMemorySettingsStore::new());
+    seed_export_job(
+        &store,
+        "job-a",
+        seed_export_job_value("Nightly extract", "Library/v1"),
+    )
+    .await;
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            helios_fhir::FhirVersion::R4,
+            vec![tables_view_definition()],
+        )
+        .with(
+            "Library",
+            helios_fhir::FhirVersion::R4,
+            vec![tables_sql_view(), tables_sql_query()],
+        );
+    let app = library_app_with_settings(source, store);
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/views?lib=v1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    let used_by = text_between(&html, "Used by", "</section>");
+    assert!(used_by.contains(r#"class="lib-tables__row""#), "{used_by}");
+    assert!(!used_by.contains("<table"), "{used_by}");
 }
 
 /// #842: the SQL Query's own *Used by* never lists an artifact — the
@@ -6832,7 +6953,11 @@ async fn sql_query_run_unknown_table_never_calls_sql_run() {
         html.contains(r#"id="lib-tables" hx-swap-oob="outerHTML""#),
         "{html}"
     );
-    let unknown_row = text_between(&html, "<code>vv</code>", "</tr>");
+    let unknown_row = text_between(
+        &html,
+        r#"<code class="lib-tables__alias">vv</code>"#,
+        "</li>",
+    );
     assert!(
         unknown_row.contains(r#"tag tag--failed">Unknown table"#),
         "{unknown_row}"
@@ -6844,26 +6969,25 @@ async fn sql_query_run_unknown_table_never_calls_sql_run() {
         "{unknown_row}"
     );
     assert!(
-        unknown_row.contains(r#"data-declare-table="vv">"#) && unknown_row.contains("Declare vv"),
+        unknown_row.contains(r#"data-declare-table="vv""#)
+            && unknown_row.contains(r#"aria-label="Declare vv""#),
         "{unknown_row}"
     );
-    // The `/run` fragment's own OOB companion never auto-opens the panel —
+    // The `/run` fragment's own OOB companion never pre-fills the add row —
     // only the JS *Declare* click does (`sql-library-panels.js`); a no-JS
-    // page-level render is the one that pre-opens it (see the `document`
-    // endpoint test below).
-    assert!(
-        !html.contains(r#"<details class="editor-add" open>"#),
-        "{html}"
-    );
+    // page-level render is the one that pre-fills it (see the `document`
+    // endpoint test below). The add row has no disclosure at all (#1238).
+    assert!(!html.contains("editor-add"), "{html}");
 }
 
 /// *Declare*'s own no-JS affordance (#842/04): `?…&saved=1`'s own page-level render (Save's
 /// own redirect, so this is exactly what a no-JS Save of a SQL with an
-/// unknown table shows) opens *Add table* on its own, with the alias
-/// already the unknown table's own name — the only way a visitor without
-/// JavaScript can reach the panel at all.
+/// unknown table shows) pre-fills the always-visible add row's own alias
+/// field with the unknown table's own name — the only way a visitor
+/// without JavaScript can reach it at all (#1238: the add row has no
+/// open/closed state of its own to toggle).
 #[tokio::test]
-async fn sql_queries_page_saved_redirect_opens_add_table_for_an_unknown_table() {
+async fn sql_queries_page_saved_redirect_prefills_the_alias_for_an_unknown_table() {
     let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
     let lib = serde_json::json!({
         "resourceType": "Library", "id": "q1", "name": "q", "status": "active",
@@ -6889,15 +7013,22 @@ async fn sql_queries_page_saved_redirect_opens_add_table_for_an_unknown_table() 
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
     assert!(html.contains("Unknown table vv"), "{html}");
-    let unknown_row = text_between(&html, "<code>vv</code>", "</tr>");
+    let unknown_row = text_between(
+        &html,
+        r#"<code class="lib-tables__alias">vv</code>"#,
+        "</li>",
+    );
     assert!(
         unknown_row.contains(r#"tag tag--failed">Unknown table"#),
         "{unknown_row}"
     );
-    assert!(
-        html.contains(r#"<details class="editor-add" open>"#),
-        "{html}"
-    );
+    // No disclosure at all (#1238) — the add row is always visible, its own
+    // alias field already carries the prefill. Scoped to the Tables card
+    // itself: the page also loads an unrelated `editor-add.js` script
+    // (#1239's own "+ Add Element" picker) whose own name would otherwise
+    // false-positive a page-wide `editor-add` search.
+    let tables_card = text_between(&html, r#"id="lib-tables""#, r#"id="lib-columns""#);
+    assert!(!tables_card.contains("editor-add"), "{tables_card}");
     assert!(html.contains(r#"name="table_alias""#), "{html}");
     let alias_field = text_between(&html, r#"name="table_alias""#, ">");
     assert!(alias_field.contains(r#"value="vv""#), "{alias_field}");

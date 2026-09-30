@@ -120,6 +120,13 @@ pub struct ElasticsearchConfig {
     #[serde(default = "default_max_result_window")]
     pub max_result_window: u32,
 
+    /// Most values one `terms` query may carry, `index.max_terms_count`
+    /// (default: 65536). A search that pins more ids than this — a chained
+    /// search whose terminal hop resolved a wide set — is sent as several
+    /// `terms` clauses of at most this many values each.
+    #[serde(default = "default_max_terms_count")]
+    pub max_terms_count: u32,
+
     /// Maximum nested objects one document may contain, summed across every
     /// `nested` search-parameter field (default: 50000).
     ///
@@ -199,6 +206,10 @@ fn default_max_result_window() -> u32 {
     10000
 }
 
+fn default_max_terms_count() -> u32 {
+    65536
+}
+
 fn default_nested_objects_limit() -> u32 {
     50_000
 }
@@ -232,6 +243,7 @@ impl Default for ElasticsearchConfig {
             refresh_interval: default_refresh_interval(),
             write_refresh: WriteRefreshPolicy::default(),
             max_result_window: default_max_result_window(),
+            max_terms_count: default_max_terms_count(),
             nested_objects_limit: default_nested_objects_limit(),
             request_timeout_ms: default_request_timeout_ms(),
             bulk_max_bytes: default_bulk_max_bytes(),

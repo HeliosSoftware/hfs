@@ -20,7 +20,7 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::types::ValueRef;
 use serde_json::{Map, Value};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::debug;
+use tracing::{debug, trace};
 
 use crate::core::sof_runner::{
     RowStream, SofError, SofRunner, ViewFilters, ViewRow, watch_row_producer,
@@ -80,6 +80,13 @@ impl SofRunner for SqliteInDbRunner {
             runner = "sqlite-indb",
             tenant = %tenant.tenant_id(),
             "executing compiled ViewDefinition"
+        );
+        trace!(
+            runner = "sqlite-indb",
+            sql = %compiled.sql,
+            columns = ?compiled.columns,
+            constants = compiled.constants.len(),
+            "compiled ViewDefinition SQL"
         );
 
         let tenant_id = tenant.tenant_id().to_string();
@@ -498,6 +505,11 @@ fn stream_sqlite_rows(
     // tx is dropped here, closing the ReceiverStream on the consumer side
 }
 
+/// One result row as the flat JSON object every runner emits: every
+/// compiled column is present, a SQL NULL as JSON `null`. A row must not
+/// drop its NULL columns — the formatters take the column list from the
+/// first row, so a first row without `gender` would cut the header and
+/// every later row down to its own non-null keys (#1569).
 fn map_sqlite_row(
     row: &rusqlite::Row<'_>,
     columns: &[String],
@@ -519,9 +531,7 @@ fn map_sqlite_row(
                 serde_json::from_str(&s).unwrap_or(Value::String(s))
             }
         };
-        if val != Value::Null {
-            map.insert(name.clone(), val);
-        }
+        map.insert(name.clone(), val);
     }
     Ok(map)
 }

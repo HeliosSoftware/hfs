@@ -730,7 +730,7 @@ impl PostgresQueryBuilder {
         for (index, param) in query.parameters.iter().enumerate() {
             if let Some(members) = grouped[index].as_ref() {
                 if members[0] != index {
-                    // Emitted with the group's first occurrence, which is where
+                    // Emitted with the group's first member, which is where
                     // the intersection is written.
                     continue;
                 }
@@ -767,16 +767,21 @@ impl PostgresQueryBuilder {
 
                 match arms {
                     Some(arms) => {
-                        let params: Vec<SqlParam> =
-                            built.into_iter().flat_map(|(_, f)| f.params).collect();
-                        conditions.push(SqlFragment::with_params(
+                        let sql = if members.len() == 2
+                            && query.parameters[members[0]].name == "code"
+                            && query.parameters[members[1]].name == "value-quantity"
+                        {
+                            Self::adaptive_code_quantity_membership(&built[0].1, &built[1].1, &arms)
+                        } else {
                             format!(
                                 "{}{})",
                                 Self::INDEX_MEMBERSHIP_OPEN,
                                 arms.join(" INTERSECT ")
-                            ),
-                            params,
-                        ));
+                            )
+                        };
+                        let params: Vec<SqlParam> =
+                            built.into_iter().flat_map(|(_, f)| f.params).collect();
+                        conditions.push(SqlFragment::with_params(sql, params));
                     }
                     // Unreachable: an offset only numbers placeholders, so a
                     // member cannot stop being the test the plan pass saw. If one
@@ -929,6 +934,39 @@ impl PostgresQueryBuilder {
         })
     }
 
+    /// Choose the measured broad-set plan without making rare/absent codes
+    /// scan all quantity candidates. The policy probes matching INDEX ROWS,
+    /// including duplicates/stale rows, not distinct live resources. 1024 is
+    /// an internal heuristic validated on the issue corpus, not an optimal
+    /// threshold for every distribution. Both mutually exclusive branches
+    /// reuse the original predicates and binds; outer membership deduplicates.
+    fn adaptive_code_quantity_membership(
+        code: &SqlFragment,
+        quantity: &SqlFragment,
+        arms: &[String],
+    ) -> String {
+        const BROAD_TOKEN_ROWS: usize = 1024;
+        let quantity_guard = if quantity.params.len() == 1 {
+            // Only called for eligible simple gt/lt arms. Here one numeric
+            // bind means raw-only, without unit/system/canonical alternatives.
+            // A cheap range seek avoids scanning broad code sets for an empty
+            // quantity range. Unit/canonical startup is not cheap enough.
+            format!(" AND EXISTS({} LIMIT 1)", arms[1])
+        } else {
+            String::new()
+        };
+        let original = code.clone().and(quantity.clone());
+        format!(
+            "id IN (WITH policy AS MATERIALIZED (SELECT EXISTS({code_arm} OFFSET {BROAD_TOKEN_ROWS} LIMIT 1){quantity_guard} AS broad) \
+             SELECT resource_id FROM ({code_arm} INTERSECT {quantity_arm}) AS intersection_ids WHERE (SELECT broad FROM policy) \
+             UNION ALL SELECT id FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE \
+             AND ({original}) AND NOT (SELECT broad FROM policy))",
+            code_arm = arms[0],
+            quantity_arm = arms[1],
+            original = original.sql,
+        )
+    }
+
     /// Groups the parameter occurrences that may be folded into one membership
     /// test, keyed by occurrence index.
     ///
@@ -943,9 +981,11 @@ impl PostgresQueryBuilder {
     /// legacy composite aggregate are all of that kind.
     ///
     /// Keying on the name rather than on adjacency is what catches
-    /// `?date=a&gender=m&date=b`, and `members` is in occurrence order, so
-    /// `members[0]` is both the group's first occurrence and the one that emits
-    /// it.
+    /// `?date=a&gender=m&date=b`. Repeated-name members stay in occurrence
+    /// order, with the first member emitting the group. The measured plain
+    /// Observation code/quantity pair is also eligible under the narrower
+    /// guards below, with canonical code-first emission. All other distinct
+    /// names keep their per-parameter conjunction.
     fn foldable_groups(
         query: &SearchQuery,
         offset: usize,
@@ -960,8 +1000,7 @@ impl PostgresQueryBuilder {
                 .push(index);
         }
 
-        // A name that occurs once cannot fold, and that is every parameter of the
-        // common query — so only a repeat is built here at all.
+        // Existing repeated-name groups keep their independent AND semantics.
         for members in occurrences.values().filter(|members| members.len() >= 2) {
             let foldable = members.iter().all(|&index| {
                 let param = &query.parameters[index];
@@ -974,6 +1013,53 @@ impl PostgresQueryBuilder {
                     groups[index] = Some(members.clone());
                 }
             }
+        }
+
+        // A broad Observation quantity leg can otherwise cause resource/token
+        // probes for every quantity candidate before the code is checked (#1580).
+        // Intersect broad independently scoped ID sets before joining resources,
+        // retaining the original live-resource conjunction for rare codes.
+        // Only this measured gt/lt pair is eligible; unrelated conjunctions retain
+        // their existing plans, and the quantity arm's raw/canonical OR survives.
+        if layout == IndexLayout::Denormalized
+            && query.resource_type == "Observation"
+            && query.parameters.len() == 2
+            && query.reverse_chains.is_empty()
+            && query.list.is_empty()
+            && query.compartment.is_none()
+            && query.contained == ContainedMode::Off
+            && query.parameters.iter().all(|param| {
+                param.modifier.is_none()
+                    && param.chain.is_empty()
+                    && param.components.is_empty()
+                    && param.values.len() == 1
+            })
+            && query
+                .parameters
+                .iter()
+                .any(|param| param.name == "code" && param.param_type == SearchParamType::Token)
+            && query.parameters.iter().any(|param| {
+                param.name == "value-quantity"
+                    && param.param_type == SearchParamType::Quantity
+                    && matches!(param.values[0].prefix, SearchPrefix::Gt | SearchPrefix::Lt)
+            })
+            && query.parameters.iter().all(|param| {
+                Self::build_parameter_condition(param, offset, layout).is_some_and(|fragment| {
+                    Self::simple_membership_arm(&fragment.sql, &param.name).is_some()
+                })
+            })
+        {
+            // Canonical emission is code first even for reversed input: policy
+            // references code first, so rebuild at that order's offsets. The
+            // eligible pair has no intervening parameter to emit out of order.
+            let code = query
+                .parameters
+                .iter()
+                .position(|param| param.name == "code")
+                .unwrap();
+            let members = vec![code, 1 - code];
+            groups[0] = Some(members.clone());
+            groups[1] = Some(members);
         }
 
         groups
@@ -3594,6 +3680,221 @@ mod tests {
             }
         }
         seen
+    }
+
+    fn observation_code_quantity_query() -> SearchQuery {
+        SearchQuery::new("Observation")
+            .with_parameter(token_param("code", None, "http://loinc.org|8302-2"))
+            .with_parameter(multi_value_param(
+                "value-quantity",
+                SearchParamType::Quantity,
+                vec![SearchValue::new(
+                    SearchPrefix::Lt,
+                    "50|http://unitsofmeasure.org|cm",
+                )],
+            ))
+    }
+
+    #[test]
+    fn observation_code_quantity_intersection_preserves_arms_and_typed_bind_order() {
+        for reversed in [false, true] {
+            let mut query = observation_code_quantity_query();
+            if reversed {
+                query.parameters.reverse();
+            }
+            for offset in [2, 4] {
+                let fragment = PostgresQueryBuilder::build_search_query(&query, offset).unwrap();
+                assert_eq!(fragment.sql.matches("id IN (").count(), 3);
+                assert_eq!(fragment.sql.matches(" INTERSECT ").count(), 1);
+                assert_eq!(fragment.sql.matches(" UNION ALL ").count(), 1);
+                assert!(fragment.sql.contains("OFFSET 1024 LIMIT 1"));
+                assert!(!fragment.sql.contains(" AND EXISTS("));
+                assert!(PostgresQueryBuilder::single_index_predicate(&fragment.sql).is_none());
+                assert_eq!(
+                    bind_numbers(&fragment.sql, offset),
+                    (offset + 1..=offset + 7).collect::<Vec<_>>()
+                );
+
+                // Both original arms, including tenant/type and the raw OR
+                // canonical quantity comparison, are copied without rewriting.
+                let mut next = offset;
+                for param in [
+                    query
+                        .parameters
+                        .iter()
+                        .find(|param| param.name == "code")
+                        .unwrap(),
+                    query
+                        .parameters
+                        .iter()
+                        .find(|param| param.name == "value-quantity")
+                        .unwrap(),
+                ] {
+                    let arm = PostgresQueryBuilder::build_parameter_condition(
+                        param,
+                        next,
+                        IndexLayout::Denormalized,
+                    )
+                    .unwrap();
+                    next += arm.params.len();
+                    assert!(fragment.sql.contains(
+                        PostgresQueryBuilder::simple_membership_arm(&arm.sql, &param.name).unwrap()
+                    ));
+                }
+                let (token, quantity) = (&fragment.params[..2], &fragment.params[2..]);
+                assert!(matches!(&token[0], SqlParam::Text(value) if value == "http://loinc.org"));
+                assert!(matches!(&token[1], SqlParam::Text(value) if value == "8302-2"));
+                assert!(matches!(quantity[0], SqlParam::Float(value) if value == 50.0));
+                assert!(matches!(&quantity[1], SqlParam::Text(value) if value == "cm"));
+                assert!(
+                    matches!(&quantity[2], SqlParam::Text(value) if value == "http://unitsofmeasure.org")
+                );
+                assert!(matches!(quantity[3], SqlParam::Float(value) if value == 0.5));
+                assert!(matches!(&quantity[4], SqlParam::Text(value) if value == "m"));
+            }
+        }
+        for prefix in [SearchPrefix::Gt, SearchPrefix::Lt] {
+            let mut bare = observation_code_quantity_query();
+            bare.parameters[0].values = vec![SearchValue::eq("other-code")];
+            bare.parameters[1].values = vec![SearchValue::new(prefix, "75")];
+            bare.parameters.reverse();
+            for offset in [2, 4] {
+                let fragment = PostgresQueryBuilder::build_search_query(&bare, offset).unwrap();
+                assert!(fragment.sql.contains(" AND EXISTS("));
+                assert_eq!(
+                    bind_numbers(&fragment.sql, offset),
+                    vec![offset + 1, offset + 2]
+                );
+                assert_eq!(fragment.params.len(), 2);
+                assert!(
+                    matches!(&fragment.params[0], SqlParam::Text(value) if value == "other-code")
+                );
+                assert!(matches!(fragment.params[1], SqlParam::Float(value) if value == 75.0));
+            }
+        }
+    }
+
+    #[test]
+    fn observation_code_quantity_intersection_has_narrow_eligibility() {
+        use crate::types::{ChainedParameter, ReverseChainedParameter};
+
+        let base = observation_code_quantity_query();
+        let mut ineligible = Vec::new();
+        let mut query = base.clone();
+        query.resource_type = "DiagnosticReport".into();
+        ineligible.push(query);
+        let mut query = base.clone();
+        query.parameters[0].name = "component-code".into();
+        ineligible.push(query);
+        let mut query = base.clone();
+        query.parameters[0].param_type = SearchParamType::String;
+        ineligible.push(query);
+        let mut query = base.clone();
+        query.parameters[1].param_type = SearchParamType::Number;
+        ineligible.push(query);
+        for modifier in [
+            SearchModifier::Not,
+            SearchModifier::Missing,
+            SearchModifier::Text,
+        ] {
+            let mut query = base.clone();
+            query.parameters[0].modifier = Some(modifier);
+            ineligible.push(query);
+        }
+        let mut query = base.clone();
+        query.parameters[1]
+            .values
+            .push(SearchValue::new(SearchPrefix::Gt, "150|cm"));
+        ineligible.push(query);
+        let mut query = base.clone();
+        query.parameters[0].values.push(SearchValue::eq("29463-7"));
+        ineligible.push(query);
+        let mut query = base.clone();
+        query.parameters[1].values.clear();
+        ineligible.push(query);
+        let mut query = base.clone();
+        query.parameters[1].modifier = Some(SearchModifier::Missing);
+        ineligible.push(query);
+        let mut query = base.clone();
+        query.parameters[1]
+            .components
+            .push(crate::types::CompositeSearchComponent {
+                param_type: SearchParamType::Quantity,
+                param_name: "value-quantity".into(),
+            });
+        ineligible.push(query);
+        for prefix in [
+            SearchPrefix::Eq,
+            SearchPrefix::Ne,
+            SearchPrefix::Ap,
+            SearchPrefix::Ge,
+            SearchPrefix::Le,
+            SearchPrefix::Sa,
+            SearchPrefix::Eb,
+        ] {
+            let mut query = base.clone();
+            query.parameters[1].values[0].prefix = prefix;
+            ineligible.push(query);
+        }
+        let mut query = base.clone();
+        query.parameters.push(token_param("status", None, "final"));
+        ineligible.push(query);
+        let mut query = base.clone();
+        query.parameters[0].chain.push(ChainedParameter {
+            reference_param: "subject".into(),
+            target_type: Some("Patient".into()),
+            target_param: "code".into(),
+        });
+        ineligible.push(query);
+        let mut query = base.clone();
+        query.reverse_chains.push(ReverseChainedParameter::terminal(
+            "Provenance",
+            "target",
+            "agent",
+            SearchValue::eq("Practitioner/p"),
+        ));
+        ineligible.push(query);
+        let mut query = base.clone();
+        query.list.push("list".into());
+        ineligible.push(query);
+        let mut query = base.clone();
+        query.compartment = Some(CompartmentMembership {
+            params: vec!["subject".into()],
+            reference: "Patient/p".into(),
+        });
+        ineligible.push(query);
+        for mode in [ContainedMode::On, ContainedMode::Both] {
+            let mut query = base.clone();
+            query.contained = mode;
+            ineligible.push(query);
+        }
+        for query in ineligible {
+            assert!(
+                PostgresQueryBuilder::foldable_groups(&query, 2, IndexLayout::Denormalized)
+                    .iter()
+                    .all(Option::is_none),
+                "{query:?}"
+            );
+        }
+        assert!(
+            PostgresQueryBuilder::foldable_groups(&base, 2, IndexLayout::Legacy)
+                .iter()
+                .all(Option::is_none)
+        );
+
+        // An invalid quantity fails closed and cannot become an unconstrained
+        // candidate arm. A repeat keeps its pre-existing repeated-name fold.
+        let mut invalid = base.clone();
+        invalid.parameters[1].values[0].value = "bogus".into();
+        let fragment = PostgresQueryBuilder::build_search_query(&invalid, 2).unwrap();
+        assert!(fragment.sql.contains("FALSE"));
+        assert!(!fragment.sql.contains(" INTERSECT "));
+        let mut repeated = base;
+        repeated.parameters.push(repeated.parameters[1].clone());
+        let groups = PostgresQueryBuilder::foldable_groups(&repeated, 2, IndexLayout::Denormalized);
+        assert!(groups[0].is_none());
+        assert_eq!(groups[1], Some(vec![1, 2]));
+        assert_eq!(groups[2], Some(vec![1, 2]));
     }
 
     #[test]

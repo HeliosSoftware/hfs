@@ -20,7 +20,7 @@ use futures::StreamExt as _;
 use helios_fhir::FhirVersion;
 use serde_json::{Map, Value};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::debug;
+use tracing::{debug, trace};
 
 use crate::core::sof_runner::{
     RowStream, SofError, SofRunner, ViewFilters, ViewRow, watch_row_producer,
@@ -80,6 +80,13 @@ impl SofRunner for PgInDbRunner {
             runner = "postgres-indb",
             tenant = %tenant.tenant_id(),
             "executing compiled ViewDefinition"
+        );
+        trace!(
+            runner = "postgres-indb",
+            sql = %compiled.sql,
+            columns = ?compiled.columns,
+            constants = compiled.constants.len(),
+            "compiled ViewDefinition SQL"
         );
 
         let tenant_id = tenant.tenant_id().to_string();

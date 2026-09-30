@@ -310,13 +310,11 @@ impl BulkSubmitProvider for S3Backend {
         let location = self.tenant_location(tenant)?;
         let mut submission = self.load_submission_state(&location, submission_id).await?;
 
+        // A submission completed at kick-off (submissionStatus=completed) still
+        // drains the manifests it registered, as the worker and the other
+        // backends read it; only an abort stops the ingest.
         match submission.summary.status {
-            SubmissionStatus::InProgress => {}
-            SubmissionStatus::Complete => {
-                return Err(StorageError::BulkSubmit(BulkSubmitError::AlreadyComplete {
-                    submission_id: submission_id.submission_id.clone(),
-                }));
-            }
+            SubmissionStatus::InProgress | SubmissionStatus::Complete => {}
             SubmissionStatus::Aborted => {
                 return Err(StorageError::BulkSubmit(BulkSubmitError::Aborted {
                     submission_id: submission_id.submission_id.clone(),
