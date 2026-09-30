@@ -4,8 +4,8 @@
 //! - Basic single-type search
 //! - Multi-type search
 //! - _include and _revinclude support
-//! - Chained search (`ChainedSearchProvider`); `search()` itself refuses a
-//!   query whose chains were not resolved first (#1389)
+//! - Chained search (`ChainedSearchProvider`); `search()` evaluates the bounded
+//!   native Patient `_has` shape and refuses other unresolved chains (#1389)
 //! - Full-text search using tsvector/tsquery
 
 use std::collections::HashSet;
@@ -27,8 +27,10 @@ use crate::types::{
 
 use super::PostgresBackend;
 use super::cached::{query_dyn_cached, query_one_dyn_cached};
-use super::search::chain_builder::ChainQueryBuilder;
-use super::search::query_builder::{PostgresQueryBuilder, SortValueKind, SqlParam};
+use super::search::chain_builder::{
+    ChainQueryBuilder, native_patient_code_predicate, native_patient_code_token,
+};
+use super::search::query_builder::{PostgresQueryBuilder, SortValueKind, SqlFragment, SqlParam};
 
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -68,7 +70,10 @@ fn statement_is_reusable(query: &SearchQuery) -> bool {
 /// Every one of those paths must also refuse a date value that is not a date
 /// (#1293, #1295), so the shared date gate runs here too: an invalid value is
 /// an error, never a query the builder has to make something of.
-fn reject_unsupported_metadata_modifier(query: &SearchQuery) -> StorageResult<()> {
+fn reject_unsupported_metadata_modifier(
+    query: &SearchQuery,
+    native_reverse: bool,
+) -> StorageResult<()> {
     crate::search::reject_unsupported_metadata_modifier(query)?;
     crate::search::validate_date_values(query)?;
     // And a number or quantity value that is not a number (#1319, #1340).
@@ -77,7 +82,11 @@ fn reject_unsupported_metadata_modifier(query: &SearchQuery) -> StorageResult<()
     // is a prefix match on `""`, which is every family name (#1380).
     crate::search::validate_value_presence(query)?;
     // And a chain nobody resolved (#1389).
-    reject_unresolved_chains(query)
+    if native_reverse {
+        Ok(())
+    } else {
+        reject_unresolved_chains(query)
+    }
 }
 
 /// Refuses a query that still carries chained or reverse-chained (`_has`)
@@ -134,7 +143,8 @@ fn fast_index_pred(
     layout: super::schema::IndexLayout,
     has_cursor: bool,
 ) -> Option<String> {
-    if has_cursor
+    if !query.reverse_chains.is_empty()
+        || has_cursor
         || query.offset.is_some()
         || !query.sort.is_empty()
         || layout != super::schema::IndexLayout::Denormalized
@@ -246,6 +256,35 @@ fn open_range_needs_empty_guard(query: &SearchQuery) -> bool {
 }
 
 impl PostgresBackend {
+    /// Page and count build precisely the same search predicate. Only cursor
+    /// bindings change the initial offset.
+    fn search_filter(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        offset: usize,
+    ) -> StorageResult<Option<SqlFragment>> {
+        let ordinary =
+            PostgresQueryBuilder::build_search_query_for(query, offset, self.index_layout());
+        if !self.supports_native_reverse_chains(tenant, query) {
+            if query.reverse_chains.is_empty() {
+                return Ok(ordinary);
+            }
+            return Err(StorageError::Search(SearchError::ReverseChainNotSupported));
+        }
+        let registry = self.search_param_registry(tenant);
+        let (system, code) = native_patient_code_token(query, &registry.read())
+            .ok_or(StorageError::Search(SearchError::ReverseChainNotSupported))?;
+        let next = offset
+            + ordinary
+                .as_ref()
+                .map_or(0, |fragment| fragment.params.len());
+        let reverse = native_patient_code_predicate(&system, &code, next);
+        Ok(Some(match ordinary {
+            Some(ordinary) => ordinary.and(reverse),
+            None => reverse,
+        }))
+    }
     /// The body of [`SearchProvider::search`], run on a caller-supplied client.
     ///
     /// `SearchProvider::search` takes a fresh pooled client, which cannot see
@@ -261,7 +300,10 @@ impl PostgresBackend {
         query: &SearchQuery,
         total: Option<u64>,
     ) -> StorageResult<SearchResult> {
-        reject_unsupported_metadata_modifier(query)?;
+        reject_unsupported_metadata_modifier(
+            query,
+            self.supports_native_reverse_chains(tenant, query),
+        )?;
 
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
@@ -288,8 +330,11 @@ impl PostgresBackend {
         // then the search-filter params.
         let param_offset = if cursor.is_some() { 4 } else { 2 };
 
-        let search_filter = if !query.parameters.is_empty() || query.compartment.is_some() {
-            PostgresQueryBuilder::build_search_query_for(query, param_offset, self.index_layout())
+        let search_filter = if !query.parameters.is_empty()
+            || query.compartment.is_some()
+            || !query.reverse_chains.is_empty()
+        {
+            self.search_filter(tenant, query, param_offset)?
         } else {
             None
         };
@@ -549,13 +594,33 @@ impl PostgresBackend {
 
 #[async_trait]
 impl SearchProvider for PostgresBackend {
+    fn supports_native_reverse_chains(&self, tenant: &TenantContext, query: &SearchQuery) -> bool {
+        #[cfg(feature = "R4")]
+        {
+            if self.config().fhir_version != FhirVersion::R4
+                || self.index_layout() != super::schema::IndexLayout::Denormalized
+            {
+                return false;
+            }
+            let registry = self.search_param_registry(tenant);
+            native_patient_code_token(query, &registry.read()).is_some()
+        }
+        #[cfg(not(feature = "R4"))]
+        {
+            let _ = (tenant, query);
+            false
+        }
+    }
     async fn search(
         &self,
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
         reject_contained_missing(query)?;
-        reject_unsupported_metadata_modifier(query)?;
+        reject_unsupported_metadata_modifier(
+            query,
+            self.supports_native_reverse_chains(tenant, query),
+        )?;
 
         // `_contained` search uses a dedicated path (different index columns and
         // heterogeneous result types); standard search handles `_contained=false`.
@@ -610,7 +675,10 @@ impl SearchProvider for PostgresBackend {
         }
 
         reject_contained_missing(query)?;
-        reject_unsupported_metadata_modifier(query)?;
+        reject_unsupported_metadata_modifier(
+            query,
+            self.supports_native_reverse_chains(tenant, query),
+        )?;
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
         let param_offset = if cursor.is_some() { 4 } else { 2 };
@@ -704,7 +772,10 @@ impl SearchProvider for PostgresBackend {
         query: &SearchQuery,
     ) -> StorageResult<u64> {
         reject_contained_missing(query)?;
-        reject_unsupported_metadata_modifier(query)?;
+        reject_unsupported_metadata_modifier(
+            query,
+            self.supports_native_reverse_chains(tenant, query),
+        )?;
 
         // Under `_contained` the count is of what `search` returns (#1383),
         // not of the top-level resources matching the same criteria.
@@ -720,9 +791,11 @@ impl SearchProvider for PostgresBackend {
         let (sql, params): (
             String,
             Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
-        ) = if !query.parameters.is_empty() || query.compartment.is_some() {
-            let filter =
-                PostgresQueryBuilder::build_search_query_for(query, 2, self.index_layout());
+        ) = if !query.parameters.is_empty()
+            || query.compartment.is_some()
+            || !query.reverse_chains.is_empty()
+        {
+            let filter = self.search_filter(tenant, query, 2)?;
 
             let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
                 Box::new(tenant_id.to_string()),

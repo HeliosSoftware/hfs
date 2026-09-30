@@ -722,6 +722,7 @@ impl PostgresQueryBuilder {
         // in the plan space at all.
         let grouped = Self::foldable_groups(query, param_offset, layout);
         let scoped_composite = Self::patient_scoped_composite(query, layout);
+        let scoped_quantity = Self::patient_scoped_quantity(query, layout);
 
         let mut conditions = Vec::new();
         let mut current_offset = param_offset;
@@ -803,6 +804,20 @@ impl PostgresQueryBuilder {
                         );
                     }
                 }
+                if scoped_quantity && param.name == "value-quantity" {
+                    // The global raw/canonical union chose 160k candidates
+                    // before checking the patient. Probe this resource's rows
+                    // instead, preserving the complete quantity predicate.
+                    if let Some(predicate) = Self::single_index_predicate(&condition.sql) {
+                        condition.sql = format!(
+                            "EXISTS (WITH scoped_quantity AS MATERIALIZED \
+                             (SELECT * FROM search_index WHERE tenant_id = $1 \
+                             AND resource_type = $2 AND resource_id = resources.id \
+                             AND param_name = 'value-quantity') \
+                             SELECT 1 FROM scoped_quantity WHERE {predicate})"
+                        );
+                    }
+                }
                 current_offset += condition.params.len();
                 conditions.push(condition);
             }
@@ -863,6 +878,55 @@ impl PostgresQueryBuilder {
             }
             _ => false,
         }
+    }
+
+    /// The measured patient + code + convertible open quantity shape.
+    /// Repeats, OR-lists and different parameter combinations retain their
+    /// original membership plans.
+    fn patient_scoped_quantity(query: &SearchQuery, layout: IndexLayout) -> bool {
+        if layout != IndexLayout::Denormalized
+            || query.resource_type != "Observation"
+            || query.parameters.len() != 3
+            || query.contained != ContainedMode::Off
+            || query.compartment.is_some()
+            || !query.reverse_chains.is_empty()
+            || !query.list.is_empty()
+            || query.parameters.iter().any(|param| {
+                param.modifier.is_some()
+                    || !param.chain.is_empty()
+                    || !param.components.is_empty()
+                    || param.values.len() != 1
+            })
+        {
+            return false;
+        }
+        let patient = query
+            .parameters
+            .iter()
+            .find(|param| param.name == "patient");
+        let code = query.parameters.iter().find(|param| param.name == "code");
+        let quantity = query
+            .parameters
+            .iter()
+            .find(|param| param.name == "value-quantity");
+        let (Some(patient), Some(code), Some(quantity)) = (patient, code, quantity) else {
+            return false;
+        };
+        if patient.param_type != SearchParamType::Reference
+            || patient.values[0].prefix != SearchPrefix::Eq
+            || code.param_type != SearchParamType::Token
+            || code.values[0].prefix != SearchPrefix::Eq
+            || quantity.param_type != SearchParamType::Quantity
+            || quantity.values[0].prefix != SearchPrefix::Gt
+        {
+            return false;
+        }
+        let Ok(parsed) = crate::search::FhirQuantityValue::parse(&quantity.values[0].value) else {
+            return false;
+        };
+        parsed.code.as_deref().is_some_and(|unit| {
+            helios_fhirpath::ucum::canonicalize_quantity(parsed.number.value, unit).is_some()
+        })
     }
 
     /// Groups the parameter occurrences that may be folded into one membership
@@ -3232,6 +3296,117 @@ mod tests {
                     },
                 ],
             })
+    }
+
+    fn quantity_1579_query() -> SearchQuery {
+        let mut query = query_1579();
+        query.parameters[1] = SearchParameter {
+            name: "code".into(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            chain: vec![],
+            components: vec![],
+            values: vec![SearchValue::eq("8302-2")],
+        };
+        query.parameters.push(SearchParameter {
+            name: "value-quantity".into(),
+            param_type: SearchParamType::Quantity,
+            modifier: None,
+            chain: vec![],
+            components: vec![],
+            values: vec![SearchValue::parse("gt100||cm")],
+        });
+        query
+    }
+
+    #[test]
+    fn patient_quantity_1579_fences_original_raw_and_canonical_union() {
+        let base = quantity_1579_query();
+        for offset in [2, 4] {
+            for order in [
+                [0, 1, 2],
+                [0, 2, 1],
+                [1, 0, 2],
+                [1, 2, 0],
+                [2, 0, 1],
+                [2, 1, 0],
+            ] {
+                let mut query = base.clone();
+                query.parameters = order.map(|index| base.parameters[index].clone()).to_vec();
+                let fragment = PostgresQueryBuilder::build_search_query(&query, offset).unwrap();
+                assert!(
+                    fragment
+                        .sql
+                        .contains("WITH scoped_quantity AS MATERIALIZED")
+                );
+                assert!(fragment.sql.contains("resource_id = resources.id"));
+                assert!(fragment.sql.contains("value_quantity_canonical_value"));
+                assert!(fragment.sql.contains(" OR "));
+                let mut next = offset;
+                let mut expected = vec![];
+                for param in &query.parameters {
+                    let original = PostgresQueryBuilder::build_parameter_condition(
+                        param,
+                        next,
+                        IndexLayout::Denormalized,
+                    )
+                    .unwrap();
+                    if param.name == "value-quantity" {
+                        let predicate =
+                            PostgresQueryBuilder::single_index_predicate(&original.sql).unwrap();
+                        assert!(
+                            fragment.sql.contains(&format!(
+                                "SELECT 1 FROM scoped_quantity WHERE {predicate}"
+                            ))
+                        );
+                    } else {
+                        assert!(fragment.sql.contains(&original.sql));
+                    }
+                    next += original.params.len();
+                    expected.extend(original.params);
+                }
+                assert_eq!(format!("{:?}", fragment.params), format!("{:?}", expected));
+                assert_eq!(
+                    bind_numbers(&fragment.sql, offset),
+                    (offset + 1..=next).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn patient_quantity_1579_keeps_unmeasured_shapes_unchanged() {
+        let base = quantity_1579_query();
+        let mut cases = vec![];
+        let mut q = base.clone();
+        q.parameters.pop();
+        cases.push(q);
+        let mut q = base.clone();
+        q.parameters[2].values.push(SearchValue::parse("gt200||cm"));
+        cases.push(q);
+        let mut q = base.clone();
+        q.parameters[2].values[0] = SearchValue::parse("gt100");
+        cases.push(q);
+        let mut q = base.clone();
+        q.parameters[2].values[0].prefix = SearchPrefix::Eq;
+        cases.push(q);
+        let mut q = base.clone();
+        q.parameters[1].modifier = Some(SearchModifier::Not);
+        cases.push(q);
+        let mut q = base.clone();
+        q.contained = ContainedMode::Both;
+        cases.push(q);
+        for query in cases {
+            let fragment = PostgresQueryBuilder::build_search_query(&query, 2).unwrap();
+            assert!(
+                !fragment.sql.contains("scoped_quantity"),
+                "{}",
+                fragment.sql
+            );
+        }
+        let legacy =
+            PostgresQueryBuilder::build_search_query_for(&base, 2, IndexLayout::Legacy).unwrap();
+        assert!(!legacy.sql.contains("scoped_quantity"));
     }
 
     #[test]
