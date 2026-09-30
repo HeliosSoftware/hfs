@@ -55,6 +55,9 @@ struct ProcessedEntryBatch {
 struct MixedEntryBatch {
     results: Vec<BulkEntryResult>,
     changes: Vec<SubmissionChange>,
+    /// The resources as committed, in input order of the entries that wrote
+    /// one; collected only when an observer asked for them (#939).
+    resources: Vec<crate::types::StoredResource>,
 }
 
 enum MixedAttemptError {
@@ -159,16 +162,18 @@ fn grouped_fresh_create_ranges(
 fn is_grouped_fresh_create_eligible(
     entries: &[NdjsonEntry],
     options: &BulkProcessingOptions,
+    search_offloaded: bool,
 ) -> bool {
     if entries.is_empty()
-        // Grouped creates yield receipts and rollback records, not the
-        // resources as committed, so an observer that indexes them (#1127)
-        // would silently miss this batch. This guard, not whether search is
-        // offloaded, is what keeps the composite's inline index sink on the
-        // individual path; an offloaded backend with deferred indexing writes
-        // the same rows either way and belongs on the grouped path (#939).
-        || options.wants_committed_resources()
-        || !options.defer_indexing
+        // A primary that indexes inline (search neither offloaded to a
+        // secondary nor deferred to a rebuild) keeps the individual path,
+        // whose per-entry writes are what its index rows were measured
+        // against. When Postgres indexes nothing, grouped and individual
+        // creates write the same rows, so the batch belongs on the grouped
+        // path (#939) — also when an observer indexes it (#1127): the grouped
+        // run hands over the resources exactly as committed, so the
+        // composite's ingest sink no longer forces one savepoint per resource.
+        || (!options.defer_indexing && !search_offloaded)
         || options.import_mode != ImportMode::Replace
         || !options.continue_on_error
         || options.max_errors != 0
@@ -928,7 +933,11 @@ impl BulkSubmitProvider for PostgresBackend {
                 .await?
             }
         };
-        let processed = if is_grouped_fresh_create_eligible(&entries, options) {
+        let processed = if is_grouped_fresh_create_eligible(
+            &entries,
+            options,
+            self.is_search_offloaded(),
+        ) {
             let existing_keys = self.classify_existing_keys(&txn, &entries).await;
             let attempt = match existing_keys {
                 Ok(existing_keys) if existing_keys.len() == entries.len() => Ok(None),
@@ -1013,9 +1022,7 @@ impl BulkSubmitProvider for PostgresBackend {
                 ProcessedEntryBatch {
                     results: mixed.results,
                     aborted_on_max_errors: false,
-                    // This path is excluded whenever an observer wants the
-                    // committed resources; see `is_grouped_fresh_create_eligible`.
-                    committed_resources: Vec::new(),
+                    committed_resources: mixed.resources,
                 }
             } else {
                 self.process_entries_individually(
@@ -1475,19 +1482,24 @@ impl PostgresBackend {
             })
             .collect();
 
+        let want_resources = options.wants_committed_resources();
         let mut results = Vec::with_capacity(entries.len());
         let mut changes = Vec::with_capacity(entries.len());
+        let mut resources = Vec::new();
         let mut position = 0;
 
         while position < entries.len() {
             if existing_by_position[position] {
-                let (result, change, _) = self
+                let (result, change, stored) = self
                     .ingest_entry_with_savepoint(txn, manifest_id, &entries[position], options)
                     .await
                     .map_err(MixedAttemptError::Fatal)?;
                 results.push(result);
                 if let Some(change) = change {
                     changes.push(change);
+                }
+                if want_resources && let Some(stored) = stored {
+                    resources.push(stored);
                 }
                 position += 1;
                 continue;
@@ -1499,13 +1511,18 @@ impl PostgresBackend {
                 position += 1;
             }
             let fresh = self
-                .create_fresh_run(txn, manifest_id, &entries[start..position])
+                .create_fresh_run(txn, manifest_id, &entries[start..position], want_resources)
                 .await?;
             results.extend(fresh.results);
             changes.extend(fresh.changes);
+            resources.extend(fresh.resources);
         }
 
-        Ok(MixedEntryBatch { results, changes })
+        Ok(MixedEntryBatch {
+            results,
+            changes,
+            resources,
+        })
     }
 
     /// Stages one maximal fresh run, then flushes it before control can move
@@ -1514,11 +1531,17 @@ impl PostgresBackend {
     /// flushed a group at a time, still ahead of the next savepoint. Any error
     /// here invalidates the routing snapshot and replays the whole batch
     /// through the individual path.
+    ///
+    /// `want_resources` keeps what `create` returns — the resource with the
+    /// version and timestamp the flush writes — so an observer that indexes
+    /// committed batches (#1127) gets the grouped run's contents exactly as
+    /// committed, in input order (#939).
     async fn create_fresh_run(
         &self,
         txn: &mut super::transaction::PostgresTransaction,
         manifest_id: &str,
         entries: &[NdjsonEntry],
+        want_resources: bool,
     ) -> Result<MixedEntryBatch, MixedAttemptError> {
         use crate::core::Transaction;
 
@@ -1526,6 +1549,7 @@ impl PostgresBackend {
             grouped_fresh_create_ranges(entries).map_err(MixedAttemptError::ReplayWholeBatch)?;
         let mut results = Vec::with_capacity(entries.len());
         let mut changes = Vec::with_capacity(entries.len());
+        let mut resources = Vec::with_capacity(if want_resources { entries.len() } else { 0 });
         for range in ranges {
             for entry in &entries[range] {
                 let created = txn
@@ -1544,6 +1568,9 @@ impl PostgresBackend {
                     created.id(),
                     created.version_id(),
                 ));
+                if want_resources {
+                    resources.push(created);
+                }
             }
 
             txn.flush()
@@ -1551,7 +1578,11 @@ impl PostgresBackend {
                 .map_err(MixedAttemptError::ReplayWholeBatch)?;
         }
 
-        Ok(MixedEntryBatch { results, changes })
+        Ok(MixedEntryBatch {
+            results,
+            changes,
+            resources,
+        })
     }
 
     /// Runs one entry under the original savepoint boundary. An ingestion or
@@ -3697,26 +3728,31 @@ mod tests {
     #[test]
     fn grouped_fresh_create_eligibility_accepts_supported_batch_sizes() {
         let options = eligible_options();
-        assert!(!is_grouped_fresh_create_eligible(&[], &options));
+        assert!(!is_grouped_fresh_create_eligible(&[], &options, false));
         assert!(is_grouped_fresh_create_eligible(
             &[entry(1, "Patient", "p-1")],
-            &options
+            &options,
+            false
         ));
 
         let hundred: Vec<_> = (1..=100)
             .map(|line| entry(line, "Patient", &format!("p-{line}")))
             .collect();
-        assert!(is_grouped_fresh_create_eligible(&hundred, &options));
+        assert!(is_grouped_fresh_create_eligible(&hundred, &options, false));
 
         let hundred_and_one: Vec<_> = (1..=101)
             .map(|line| entry(line, "Patient", &format!("p-{line}")))
             .collect();
-        assert!(is_grouped_fresh_create_eligible(&hundred_and_one, &options));
+        assert!(is_grouped_fresh_create_eligible(
+            &hundred_and_one,
+            &options,
+            false
+        ));
 
         let thousand: Vec<_> = (1..=1000)
             .map(|line| entry(line, "Patient", &format!("p-{line}")))
             .collect();
-        assert!(is_grouped_fresh_create_eligible(&thousand, &options));
+        assert!(is_grouped_fresh_create_eligible(&thousand, &options, false));
     }
 
     #[test]
@@ -3727,7 +3763,8 @@ mod tests {
         missing_cached.resource_id = None;
         assert!(!is_grouped_fresh_create_eligible(
             &[missing_cached],
-            &options
+            &options,
+            false
         ));
 
         let mut missing_payload = entry(1, "Patient", "p-1");
@@ -3738,19 +3775,25 @@ mod tests {
             .remove("id");
         assert!(!is_grouped_fresh_create_eligible(
             &[missing_payload],
-            &options
+            &options,
+            false
         ));
 
         let mut non_string_payload = entry(1, "Patient", "p-1");
         non_string_payload.resource["id"] = json!(1);
         assert!(!is_grouped_fresh_create_eligible(
             &[non_string_payload],
-            &options
+            &options,
+            false
         ));
 
         let mut mismatched = entry(1, "Patient", "p-1");
         mismatched.resource_id = Some("cached-id".to_string());
-        assert!(!is_grouped_fresh_create_eligible(&[mismatched], &options));
+        assert!(!is_grouped_fresh_create_eligible(
+            &[mismatched],
+            &options,
+            false
+        ));
     }
 
     #[test]
@@ -3763,15 +3806,27 @@ mod tests {
             .as_object_mut()
             .expect("test resource is an object")
             .remove("resourceType");
-        assert!(!is_grouped_fresh_create_eligible(&[missing], &options));
+        assert!(!is_grouped_fresh_create_eligible(
+            &[missing],
+            &options,
+            false
+        ));
 
         let mut non_string = entry(1, "Patient", "p-1");
         non_string.resource["resourceType"] = json!(1);
-        assert!(!is_grouped_fresh_create_eligible(&[non_string], &options));
+        assert!(!is_grouped_fresh_create_eligible(
+            &[non_string],
+            &options,
+            false
+        ));
 
         let mut mismatched = entry(1, "Patient", "p-1");
         mismatched.resource["resourceType"] = json!("Observation");
-        assert!(!is_grouped_fresh_create_eligible(&[mismatched], &options));
+        assert!(!is_grouped_fresh_create_eligible(
+            &[mismatched],
+            &options,
+            false
+        ));
     }
 
     #[test]
@@ -3779,14 +3834,16 @@ mod tests {
         let options = eligible_options();
         assert!(!is_grouped_fresh_create_eligible(
             &[entry(1, "Patient", "shared"), entry(2, "Patient", "shared")],
-            &options
+            &options,
+            false
         ));
         assert!(is_grouped_fresh_create_eligible(
             &[
                 entry(1, "Patient", "shared"),
                 entry(2, "Observation", "shared")
             ],
-            &options
+            &options,
+            false
         ));
     }
 
@@ -3797,7 +3854,11 @@ mod tests {
             .map(|line| entry(line, "Patient", &format!("p-{line}")))
             .collect();
         across_chunks[100] = entry(101, "Patient", "p-1");
-        assert!(!is_grouped_fresh_create_eligible(&across_chunks, &options));
+        assert!(!is_grouped_fresh_create_eligible(
+            &across_chunks,
+            &options,
+            false
+        ));
     }
 
     fn entry_with_compact_size(line_number: u64, target_bytes: usize) -> NdjsonEntry {
@@ -3910,39 +3971,56 @@ mod tests {
                 allow_updates,
                 ..eligible_options()
             };
-            assert!(is_grouped_fresh_create_eligible(&entries, &options));
+            assert!(is_grouped_fresh_create_eligible(&entries, &options, false));
         }
 
         let merge = BulkProcessingOptions {
             import_mode: ImportMode::Merge,
             ..eligible_options()
         };
-        assert!(!is_grouped_fresh_create_eligible(&entries, &merge));
+        assert!(!is_grouped_fresh_create_eligible(&entries, &merge, false));
 
         let stop_on_error = BulkProcessingOptions {
             continue_on_error: false,
             ..eligible_options()
         };
-        assert!(!is_grouped_fresh_create_eligible(&entries, &stop_on_error));
+        assert!(!is_grouped_fresh_create_eligible(
+            &entries,
+            &stop_on_error,
+            false
+        ));
 
         let bounded_errors = BulkProcessingOptions {
             max_errors: 1,
             ..eligible_options()
         };
-        assert!(!is_grouped_fresh_create_eligible(&entries, &bounded_errors));
+        assert!(!is_grouped_fresh_create_eligible(
+            &entries,
+            &bounded_errors,
+            false
+        ));
 
+        // Inline indexing keeps the individual path only while Postgres is
+        // the one indexing: offloaded to Elasticsearch, the same options
+        // write the same rows on either path (#939).
         let inline_indexing = BulkProcessingOptions {
             defer_indexing: false,
             ..eligible_options()
         };
         assert!(!is_grouped_fresh_create_eligible(
             &entries,
-            &inline_indexing
+            &inline_indexing,
+            false
+        ));
+        assert!(is_grouped_fresh_create_eligible(
+            &entries,
+            &inline_indexing,
+            true
         ));
 
         // The composite's inline index sink (#1127) wants the committed
-        // resources, which grouped creates never yield; it must keep the
-        // individual path even with every other fast-path option set.
+        // resources; since #939 the grouped run hands them over, so the
+        // observer no longer keeps a batch individual — deferred or offloaded.
         struct WantsResources;
         #[async_trait::async_trait]
         impl crate::core::BatchCommitObserver for WantsResources {
@@ -3953,6 +4031,22 @@ mod tests {
             }
         }
         let observed = eligible_options().with_batch_observer(std::sync::Arc::new(WantsResources));
-        assert!(!is_grouped_fresh_create_eligible(&entries, &observed));
+        assert!(observed.wants_committed_resources());
+        assert!(is_grouped_fresh_create_eligible(&entries, &observed, false));
+        let observed_offloaded = BulkProcessingOptions {
+            defer_indexing: false,
+            ..eligible_options()
+        }
+        .with_batch_observer(std::sync::Arc::new(WantsResources));
+        assert!(is_grouped_fresh_create_eligible(
+            &entries,
+            &observed_offloaded,
+            true
+        ));
+        assert!(!is_grouped_fresh_create_eligible(
+            &entries,
+            &observed_offloaded,
+            false
+        ));
     }
 }

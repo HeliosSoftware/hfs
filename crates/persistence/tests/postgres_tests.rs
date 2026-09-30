@@ -20150,6 +20150,24 @@ mod postgres_integration {
         );
     }
 
+    /// Like `RecordingCommittedResources`, but keeps the handed resources
+    /// whole so a test can compare them with the rows.
+    #[derive(Default)]
+    struct RecordingCommittedStoredResources {
+        batches: std::sync::Mutex<Vec<Vec<helios_persistence::types::StoredResource>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl helios_persistence::core::BatchCommitObserver for RecordingCommittedStoredResources {
+        async fn batch_committed(&self, batch: &helios_persistence::core::BatchCommitted<'_>) {
+            self.batches.lock().unwrap().push(batch.resources.to_vec());
+        }
+
+        fn wants_resources(&self) -> bool {
+            true
+        }
+    }
+
     #[derive(Default)]
     struct RecordingCommittedResources {
         batches: std::sync::Mutex<Vec<(Vec<String>, Vec<String>)>>,
@@ -23376,8 +23394,12 @@ mod postgres_integration {
         assert_eq!(histories.get("offloaded-099"), Some(&1));
     }
 
+    /// An observer that wants the committed resources no longer keeps a batch
+    /// on the individual path (#939): the fresh entries flush grouped, the
+    /// existing ones keep their savepoint, and the observer still receives
+    /// every written resource in input order — the unchanged one excluded.
     #[tokio::test]
-    async fn postgres_bulk_submit_resource_observer_keeps_the_individual_path() {
+    async fn postgres_bulk_submit_resource_observer_takes_the_grouped_path() {
         use helios_persistence::core::{
             BulkEntryOutcome, BulkProcessingOptions, BulkSubmitProvider, NdjsonEntry,
         };
@@ -23640,8 +23662,7 @@ mod postgres_integration {
 
     /// A PostgreSQL primary whose search is offloaded (the pg-es wiring) takes
     /// the grouped path like a standalone one (#939): it writes no index rows
-    /// on either path, so only an observer that wants the committed resources
-    /// (see the next test) keeps a batch individual.
+    /// on either path.
     #[tokio::test]
     async fn postgres_bulk_submit_grouped_over_100_includes_search_offload() {
         use helios_persistence::core::BulkSubmitProvider;
@@ -23685,10 +23706,11 @@ mod postgres_integration {
         assert_eq!(index_rows, 0);
     }
 
-    /// An observer that asks for committed resources keeps the individual path
-    /// and receives the exact ordered contents for a batch above 100.
+    /// An observer that asks for committed resources rides the grouped path
+    /// (#939) and still receives the exact ordered contents for a batch above
+    /// 100: two grouped statements, not one per resource.
     #[tokio::test]
-    async fn postgres_bulk_submit_grouped_over_100_excludes_resource_observer() {
+    async fn postgres_bulk_submit_grouped_over_100_includes_resource_observer() {
         use helios_persistence::core::{BulkProcessingOptions, BulkSubmitProvider};
 
         let (backend, dbname) = isolated_reindex_backend().await;
@@ -23722,11 +23744,102 @@ mod postgres_integration {
                 .iter()
                 .all(|result| result.is_success() && result.created)
         );
-        assert_eq!(resource_insert_statements(&client).await, 101);
+        // 100 + 1: one grouped write holds at most 100 creates.
+        assert_eq!(resource_insert_statements(&client).await, 2);
         let observed = observer.batches.lock().unwrap();
         assert_eq!(observed.len(), 1);
         assert_eq!(observed[0].0, expected);
         assert_eq!(observed[0].1, expected);
+    }
+
+    /// The pg-es ingest-time index sink (#1127) runs with indexing neither
+    /// deferred nor done by Postgres. Since #939 that batch flushes grouped and
+    /// the observer gets each resource exactly as committed: same version,
+    /// same `last_updated`, same content as the row in `resources`.
+    #[tokio::test]
+    async fn postgres_bulk_submit_offloaded_inline_indexing_hands_grouped_resources_to_observer() {
+        use helios_persistence::core::{BulkProcessingOptions, BulkSubmitProvider};
+
+        let (mut backend, dbname) = isolated_reindex_backend().await;
+        backend.set_search_offloaded(true);
+        let tenant = create_tenant("grouped-offloaded-inline-observer");
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        let (submission, manifest) =
+            new_bulk_submit_manifest(&backend, &tenant, "grouped-offloaded-inline-observer").await;
+        let client = reindex_test_client_for(&dbname).await;
+        install_resource_insert_statement_counter(&client).await;
+        let observer = std::sync::Arc::new(RecordingCommittedStoredResources::default());
+        let options = BulkProcessingOptions::new()
+            .with_defer_indexing(false)
+            .with_file_url("https://provider.example/inline.ndjson")
+            .with_batch_observer(observer.clone());
+        let results = backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest.manifest_id,
+                fresh_patient_entries(101, "inline"),
+                &options,
+            )
+            .await
+            .unwrap();
+        assert!(
+            results
+                .iter()
+                .all(|result| result.is_success() && result.created)
+        );
+        assert_eq!(resource_insert_statements(&client).await, 2);
+
+        // Cloned out of the lock: the guard must not be held across the
+        // awaits below.
+        let observed = observer.batches.lock().unwrap().clone();
+        assert_eq!(observed.len(), 1);
+        let handed = &observed[0];
+        assert_eq!(handed.len(), 101);
+        let rows = client
+            .query(
+                "SELECT id, version_id, last_updated, data FROM resources \
+                 WHERE tenant_id = $1 AND resource_type = 'Patient'",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 101);
+        let stored: std::collections::HashMap<
+            String,
+            (String, chrono::DateTime<chrono::Utc>, serde_json::Value),
+        > = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<_, String>(0),
+                    (row.get::<_, String>(1), row.get(2), row.get(3)),
+                )
+            })
+            .collect();
+        for (position, resource) in handed.iter().enumerate() {
+            assert_eq!(resource.id(), format!("inline-{:04}", position + 1));
+            let (version_id, last_updated, data) = stored
+                .get(resource.id())
+                .unwrap_or_else(|| panic!("{} was handed over but not stored", resource.id()));
+            assert_eq!(resource.version_id(), version_id);
+            // The handed timestamp is the one the flush wrote; Postgres keeps
+            // microseconds, so compare at that precision.
+            assert_eq!(
+                resource.last_modified().timestamp_micros(),
+                last_updated.timestamp_micros()
+            );
+            assert_eq!(resource.content(), data);
+        }
+        let index_rows: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM search_index WHERE tenant_id = $1",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(index_rows, 0, "an offloaded primary indexes nothing");
     }
 
     /// The candidate query can race a competing insert. A trigger blocks the
