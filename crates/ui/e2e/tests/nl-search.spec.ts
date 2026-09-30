@@ -1,3 +1,4 @@
+import { holdSearches } from "../pages/search-lifecycle";
 import { test, expect } from "../pages/fixtures";
 
 // Natural-language search (/ui/search). The translator is mounted because the
@@ -117,4 +118,16 @@ test("translating busies the submit button, and re-entry cannot double-POST", as
   await expect(search.nlSubmit).not.toHaveAttribute("aria-busy", "true");
   await expect(search.nlSubmit).toBeEnabled();
   expect(posts, "re-entry while busy must not issue a second POST").toBe(1);
+});
+
+test("issue1577 shared search builder exposes cancellation without changing NL translation", async ({ page, search }) => {
+  const pending = await holdSearches(page);
+  await search.goto();
+  await search.modeButton("builder").click();
+  await search.builder.run("Patient?_id=issue1577-nl");
+  await expect.poll(() => pending.held.has("issue1577-nl")).toBe(true);
+  await expect(search.builder.status).toBeVisible();
+  await search.builder.cancel.click();
+  await expect(search.builder.status).toBeHidden();
+  await expect(search.builder.error).toBeHidden();
 });

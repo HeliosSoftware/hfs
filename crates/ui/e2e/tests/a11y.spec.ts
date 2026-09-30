@@ -1,3 +1,5 @@
+import { SearchBuilder } from "../pages/search-builder";
+import { holdSearches } from "../pages/search-lifecycle";
 import { test, expect } from "../pages/fixtures";
 import type { Page } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
@@ -272,3 +274,28 @@ test("terminal export delete disclosure is accessible and viewport-bound", async
     expect(panel!.y + panel!.height).toBeLessThanOrEqual(viewport.height);
   }
 });
+
+for (const theme of THEMES) {
+  test(`issue1577 pending and slow search are accessible — ${theme}`, async ({ page, chrome }) => {
+    test.setTimeout(2 * SCAN_BUDGET_MS);
+    await chrome.seedTheme(theme);
+    await page.clock.install();
+    await holdSearches(page);
+    await page.goto("/ui/queries", { waitUntil: "networkidle" });
+    await page.clock.pauseAt(await page.evaluate(() => Date.now() + 1000));
+    const builder = new SearchBuilder(page);
+    await builder.run("Patient?_id=issue1577-axe");
+    await expect(builder.status).toBeVisible();
+    await expect(page.locator(".builder-row__modifier")).toHaveAccessibleName("Modifiers");
+    await expect(builder.status).toBeInViewport();
+    await page.clock.resume();
+    await expectNoViolations(page, "pending search");
+    await page.clock.pauseAt(await page.evaluate(() => Date.now() + 1000));
+    await page.clock.runFor(60000);
+    await expect(builder.slow).toBeVisible();
+    await page.clock.resume();
+    await expectNoViolations(page, "slow search");
+    await builder.cancel.click();
+    await page.clock.resume();
+  });
+}

@@ -1,3 +1,4 @@
+import { searchLifecycleTests } from "../pages/search-lifecycle";
 import { test, expect } from "../pages/fixtures";
 import {
   createResource,
@@ -1403,3 +1404,5 @@ test("an empty page falls back to the type's summary columns", async ({ resource
     expect(headers).toContain(col);
   }
 });
+
+searchLifecycleTests("/ui/resources?type=Patient");

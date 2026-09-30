@@ -874,6 +874,15 @@ button scale.
 
 ### Busy states
 
+FHIR searches use a status next to QUERY and remain replaceable with Run or
+Enter. A new request aborts the preceding request. Cancel preserves the candidate
+query and previous results; previous results are labelled and their total is
+hidden while another search is pending. Elapsed time appears after two seconds
+and updates every second without repeated live announcements. After sixty
+seconds, Keep waiting dismisses the notice while preserving the same request.
+Sort hydrates the candidate query and its builder controls before running it.
+
+
 One convention for "this control is doing something" (#679), in two lanes:
 
 - **Fetch-driven scripts** call `window.hfsBusy` (`assets/busy.js`).
