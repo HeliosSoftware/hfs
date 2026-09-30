@@ -561,6 +561,23 @@ async fn mongodb_date_period_targets_are_ranges() {
     date_period_suite::period_targets_are_ranges(&backend, "date-period-1391").await;
 }
 
+/// The backend-agnostic suite for where `_sort` puts a missing value (#1606).
+/// Same `#[path]` arrangement.
+#[path = "search/sort_missing_suite.rs"]
+mod sort_missing_suite;
+
+/// #1606: MongoDB already sorted a missing value last in both directions; the
+/// other backends now do too, and this pins it to the same shared data.
+#[tokio::test]
+async fn mongodb_missing_sort_values_sort_last() {
+    let Some(backend) = create_backend_with_full_registry("sort_missing").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    // Multi-key parameter sorts are refused here until #1564 lands.
+    sort_missing_suite::missing_sort_values_sort_last(&backend, "sort-missing-1606", false).await;
+}
+
 /// The backend-agnostic `_contained` suite (#1336, #1362, #1363). Same
 /// `#[path]` arrangement.
 #[path = "search/contained_suite.rs"]

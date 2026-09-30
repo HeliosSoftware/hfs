@@ -581,6 +581,19 @@ pub struct KeysetKey {
     pub direction: crate::types::SortDirection,
     /// How the value is typed for binding/reading.
     pub kind: SortValueKind,
+    /// Whether `expr` can be NULL (a resource with no value for the sort
+    /// parameter). Such a resource sorts after every resource that has one,
+    /// in either direction (#1606), and the keyset comparison must place it
+    /// there too.
+    pub nullable: bool,
+}
+
+/// Whether a sort directive's expression can be NULL: true for a parameter
+/// sorted on its indexed value, which a resource may not have. `_id`,
+/// `_lastUpdated` and the unsortable `id` fallback are never NULL.
+fn sort_is_nullable(directive: &crate::types::SortDirective) -> bool {
+    !matches!(directive.parameter.as_str(), "_id" | "_lastUpdated")
+        && directive.param_type.and_then(sort_value_column).is_some()
 }
 
 /// Determines the value kind for a sort parameter.
@@ -1330,19 +1343,14 @@ impl PostgresQueryBuilder {
     /// honored in order, with an `id ASC` tie-breaker appended for stable
     /// pagination when `_id` is not already part of the sort.
     ///
-    /// # Supported sort parameters
+    /// `_id` and `_lastUpdated` sort on their `resources` columns; any other
+    /// sortable parameter sorts on its indexed value (see `sort_expression`).
+    /// A resource with no value for a parameter sorts after those that have
+    /// one, ascending or descending (`NULLS LAST`, #1606).
     ///
-    /// - `_id` → `id`
-    /// - `_lastUpdated` → `last_updated`
-    ///
-    /// Any other parameter currently falls back to `id`. Sorting by arbitrary
-    /// search parameters would require an additional join against `search_index`
-    /// and is not yet implemented (see the search spec assessment).
-    ///
-    /// Note: this is applied to the first-page and offset paths only. The
-    /// cursor (keyset) paths keep their `(last_updated, id)` ordering, which is
-    /// required by the keyset `WHERE` comparison; cursor pages therefore always
-    /// use the default ordering.
+    /// Note: this is applied to the first-page and offset paths only. Cursor
+    /// pages order by their keyset key (`primary_keyset_key`) in
+    /// `search_with_client`, which must agree with this ordering.
     pub fn build_order_by(query: &SearchQuery) -> String {
         if query.sort.is_empty() {
             return "ORDER BY last_updated DESC, id ASC".to_string();
@@ -1356,7 +1364,12 @@ impl PostgresQueryBuilder {
                     crate::types::SortDirection::Ascending => "ASC",
                     crate::types::SortDirection::Descending => "DESC",
                 };
-                format!("{} {}", Self::sort_expression(s), dir)
+                let nulls = if sort_is_nullable(s) {
+                    " NULLS LAST"
+                } else {
+                    ""
+                };
+                format!("{} {}{}", Self::sort_expression(s), dir, nulls)
             })
             .collect();
 
@@ -1452,6 +1465,7 @@ impl PostgresQueryBuilder {
                 expr: "last_updated".to_string(),
                 direction: crate::types::SortDirection::Descending,
                 kind: SortValueKind::Timestamp,
+                nullable: false,
             }),
             1 => {
                 let directive = &query.sort[0];
@@ -1459,6 +1473,7 @@ impl PostgresQueryBuilder {
                     expr: Self::sort_expression(directive),
                     direction: directive.direction,
                     kind: sort_value_kind(&directive.parameter, directive.param_type),
+                    nullable: sort_is_nullable(directive),
                 })
             }
             _ => None,
