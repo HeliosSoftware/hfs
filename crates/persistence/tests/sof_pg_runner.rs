@@ -138,6 +138,43 @@ mod sof_pg_runner_tests {
         )
     }
 
+    /// Keep plan-sensitive fixtures on fixed tables isolated from concurrent
+    /// tests, with normal schema and planner settings.
+    async fn create_dedicated_backend() -> (
+        Arc<PostgresBackend>,
+        testcontainers::ContainerAsync<Postgres>,
+    ) {
+        let container = super::container_cleanup::with_cleanup_label(
+            Postgres::default().with_tag("16-alpine").with_label(
+                "github.run_id",
+                std::env::var("GITHUB_RUN_ID").unwrap_or_default(),
+            ),
+        )
+        .start()
+        .await
+        .expect("start isolated fixture PostgreSQL");
+        let config = PostgresConfig {
+            host: container.get_host().await.unwrap().to_string(),
+            port: container.get_host_port_ipv4(5432).await.unwrap(),
+            dbname: "postgres".into(),
+            user: "postgres".into(),
+            password: Some("postgres".into()),
+            max_connections: 5,
+            data_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")),
+            ..Default::default()
+        };
+        let backend = Arc::new(
+            PostgresBackend::new(config)
+                .await
+                .expect("create isolated backend"),
+        );
+        backend
+            .init_schema()
+            .await
+            .expect("initialize isolated fixture schema");
+        (backend, container)
+    }
+
     fn test_tenant() -> TenantContext {
         let unique_id = format!("sof_pg_{}", uuid::Uuid::new_v4().simple());
         TenantContext::new(TenantId::new(&unique_id), TenantPermissions::full_access())
@@ -527,5 +564,729 @@ mod sof_pg_runner_tests {
         });
         let rows = collect_rows(runner.as_ref(), &tenant, view).await;
         assert_eq!(rows.len(), 2);
+    }
+    /// Preserve the database's order and fail on every row error.
+    async fn collect_rows_in_order(
+        runner: &dyn SofRunner,
+        tenant: &TenantContext,
+        view: Value,
+        filters: ViewFilters,
+    ) -> Vec<Value> {
+        let mut stream = runner
+            .run_view(tenant, view, filters)
+            .await
+            .expect("run view");
+        let mut rows = Vec::new();
+        while let Some(row) = stream.next().await {
+            rows.push(row.expect("row must succeed"));
+        }
+        rows
+    }
+
+    fn preview_flat_view(resource: &str, alias: &str) -> Value {
+        json!({"resourceType":"ViewDefinition", "resource":resource,
+            "select":[{"column":[{"path":"id","name":alias}]}]})
+    }
+
+    #[tokio::test]
+    async fn test_pg_preview_limit_is_in_executed_sql_and_none_is_unlimited() {
+        // Query aliases do not distinguish pg_stat_statements query IDs. Use a
+        // dedicated container so another test cannot supply representative SQL.
+        let container = super::container_cleanup::with_cleanup_label(
+            Postgres::default()
+                .with_tag("16-alpine")
+                .with_label(
+                    "github.run_id",
+                    std::env::var("GITHUB_RUN_ID").unwrap_or_default(),
+                )
+                .with_cmd([
+                    "postgres",
+                    "-c",
+                    "fsync=off",
+                    "-c",
+                    "shared_preload_libraries=pg_stat_statements",
+                    "-c",
+                    "compute_query_id=on",
+                ]),
+        )
+        .start()
+        .await
+        .expect("start observable PostgreSQL");
+        let host = container.get_host().await.unwrap().to_string();
+        let port = container.get_host_port_ipv4(5432).await.unwrap();
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let backend = PostgresBackend::new(PostgresConfig {
+            host: host.clone(),
+            port,
+            dbname: "postgres".into(),
+            user: "postgres".into(),
+            password: Some("postgres".into()),
+            data_dir: Some(data_dir),
+            ..Default::default()
+        })
+        .await
+        .expect("create observable backend");
+        backend
+            .init_schema()
+            .await
+            .expect("initialize observable schema");
+        let mut config = tokio_postgres::Config::new();
+        config
+            .host(&host)
+            .port(port)
+            .user("postgres")
+            .password("postgres")
+            .dbname("postgres");
+        let (observer, connection) = config.connect(tokio_postgres::NoTls).await.unwrap();
+        let connection_task = tokio::spawn(async move {
+            connection.await.expect("observer connection");
+        });
+        observer
+            .batch_execute("CREATE EXTENSION pg_stat_statements")
+            .await
+            .unwrap();
+        let tenant = test_tenant();
+        for index in 0..80 {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({
+                        "resourceType":"Patient", "id":format!("p-{index:03}")
+                    }),
+                    FhirVersion::R4,
+                )
+                .await
+                .expect("seed patient");
+        }
+        let runner = backend.sof_runner().unwrap();
+        let alias = format!("sof_pg_sql_limit_{}", uuid::Uuid::new_v4().simple());
+        let view = preview_flat_view("Patient", &alias);
+        let unlimited = collect_rows_in_order(
+            runner.as_ref(),
+            &tenant,
+            view.clone(),
+            ViewFilters::default(),
+        )
+        .await;
+        let limited = collect_rows_in_order(
+            runner.as_ref(),
+            &tenant,
+            view,
+            ViewFilters {
+                limit: Some(50),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(unlimited.len(), 80);
+        assert_eq!(limited, unlimited[..50]);
+        let pattern = format!("%\"{alias}\"%");
+        let mut statements = Vec::new();
+        // The row producer has finished before the channel closes. A bounded
+        // poll also accommodates statistics publication at query completion.
+        for _ in 0..20 {
+            statements = observer.query(
+                "SELECT query, calls, rows FROM pg_stat_statements                  WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())                  AND toplevel AND query LIKE $1", &[&pattern]
+            ).await.unwrap().iter().map(|row| (
+                row.get::<_, String>(0), row.get::<_, i64>(1), row.get::<_, i64>(2)
+            )).collect::<Vec<_>>();
+            if statements
+                .iter()
+                .any(|(sql, _, rows)| has_normalized_final_limit(sql) && *rows == 50)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            statements
+                .iter()
+                .any(|(sql, calls, rows)| has_normalized_final_limit(sql)
+                    && !sql.contains("MATERIALIZED")
+                    && *calls == 1
+                    && *rows == 50),
+            "executed preview SQL must end in LIMIT and produce 50 rows: {statements:?}"
+        );
+        assert!(
+            statements
+                .iter()
+                .any(|(sql, calls, rows)| !has_normalized_final_limit(sql)
+                    && *calls == 1
+                    && *rows == 80),
+            "unlimited execution must produce all 80 rows: {statements:?}"
+        );
+        // Expansion retains identical SQL for both runs, with the cap applied
+        // only by the row consumer. pg_stat_statements merges their calls.
+        backend
+            .create(&tenant, "Patient", large_patient_fixture(), FhirVersion::R4)
+            .await
+            .expect("seed observable expansion");
+        let complex_alias = format!("{alias}_expanded");
+        let complex_view = json!({"resourceType":"ViewDefinition","resource":"Patient",
+            "select":[{"column":[{"path":"id","name":complex_alias}]},
+                {"forEach":"name","column":[{"path":"family","name":"family"}]}]});
+        let unlimited = collect_rows_in_order(
+            runner.as_ref(),
+            &tenant,
+            complex_view.clone(),
+            ViewFilters::default(),
+        )
+        .await;
+        let limited = collect_rows_in_order(
+            runner.as_ref(),
+            &tenant,
+            complex_view,
+            ViewFilters {
+                limit: Some(50),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(unlimited.len(), 150);
+        assert_eq!(limited, unlimited[..50]);
+        let pattern = format!("%\"{complex_alias}\"%");
+        let mut complex_statements = Vec::new();
+        for _ in 0..20 {
+            complex_statements = observer.query(
+                "SELECT query, calls, rows FROM pg_stat_statements WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database()) AND toplevel AND query LIKE $1",
+                &[&pattern],
+            ).await.unwrap().iter().map(|row| (
+                row.get::<_, String>(0),row.get::<_, i64>(1),row.get::<_, i64>(2)
+            )).collect::<Vec<_>>();
+            if complex_statements.iter().any(|(_, calls, _)| *calls == 2) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            complex_statements.len(),
+            1,
+            "both expansion calls must share SQL identity: {complex_statements:?}"
+        );
+        assert!(
+            complex_statements.iter().any(|(sql, calls, rows)| {
+                !sql.contains("MATERIALIZED")
+                    && !has_normalized_final_limit(sql)
+                    && sql.starts_with("SELECT")
+                    && sql.contains("ORDER BY r.last_updated, r.id")
+                    && *calls == 2
+                    && *rows == 300
+            }),
+            "both expansions must execute the same unlimited SQL despite the client cap: {complex_statements:?}"
+        );
+        connection_task.abort();
+    }
+
+    fn has_normalized_final_limit(sql: &str) -> bool {
+        let mut words = sql.split_whitespace().rev();
+        let Some(value) = words.next().and_then(|word| word.strip_prefix('$')) else {
+            return false;
+        };
+        !value.is_empty()
+            && value.bytes().all(|byte| byte.is_ascii_digit())
+            && words.next() == Some("LIMIT")
+    }
+
+    async fn seed_preview_patient(
+        backend: &PostgresBackend,
+        tenant: &TenantContext,
+        index: usize,
+        gender: &str,
+    ) {
+        backend
+            .create(
+                tenant,
+                "Patient",
+                json!({
+                    "resourceType":"Patient", "id":format!("p-{index:03}"), "gender":gender,
+                    "name":[{"family":format!("Family-{index:03}-a")},
+                        {"family":format!("Family-{index:03}-b")},
+                        {"family":format!("Family-{index:03}-c")}]
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed preview patient");
+    }
+
+    async fn assert_preview_prefix(
+        runner: &dyn SofRunner,
+        tenant: &TenantContext,
+        view: Value,
+        expected_total: usize,
+    ) {
+        let unlimited =
+            collect_rows_in_order(runner, tenant, view.clone(), ViewFilters::default()).await;
+        assert_eq!(unlimited.len(), expected_total);
+        let limited = collect_rows_in_order(
+            runner,
+            tenant,
+            view,
+            ViewFilters {
+                limit: Some(50),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(limited.len(), 50);
+        assert_eq!(
+            limited,
+            unlimited[..50],
+            "preview must preserve the ordered output prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pg_preview_limit_preserves_flat_observation_and_patient_prefix() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        for index in 0..80 {
+            seed_preview_patient(&backend, &tenant, index, "male").await;
+            backend.create(&tenant, "Observation", json!({
+                "resourceType":"Observation", "id":format!("o-{index:03}"), "status":"final",
+                "code":{"text":"preview fixture"}
+            }), FhirVersion::R4).await.expect("seed observation");
+        }
+        let runner = backend.sof_runner().unwrap();
+        for resource in ["Patient", "Observation"] {
+            let view = preview_flat_view(resource, "id");
+            assert_preview_prefix(runner.as_ref(), &tenant, view.clone(), 80).await;
+            for (limit, expected) in [(0, 0), (1, 1), (500, 80)] {
+                let rows = collect_rows_in_order(
+                    runner.as_ref(),
+                    &tenant,
+                    view.clone(),
+                    ViewFilters {
+                        limit: Some(limit),
+                        ..Default::default()
+                    },
+                )
+                .await;
+                assert_eq!(rows.len(), expected);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pg_preview_limit_applies_after_where() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        for index in 0..120 {
+            seed_preview_patient(
+                &backend,
+                &tenant,
+                index,
+                if index < 60 { "female" } else { "male" },
+            )
+            .await;
+        }
+        let runner = backend.sof_runner().unwrap();
+        let mut view = preview_flat_view("Patient", "id");
+        view["where"] = json!([{"path":"gender = 'male'"}]);
+        assert_preview_prefix(runner.as_ref(), &tenant, view, 60).await;
+    }
+
+    #[tokio::test]
+    async fn test_pg_preview_preserves_single_large_foreach_prefix() {
+        let (backend, _container) = create_dedicated_backend().await;
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient", "id": "p-large",
+                    "name": (1..=150).map(|index| json!({"family": format!("Family-{index}")}))
+                        .collect::<Vec<_>>()
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed large collection");
+        let runner = backend.sof_runner().unwrap();
+        let view = json!({"resourceType":"ViewDefinition", "resource":"Patient",
+            "select":[{"column":[{"path":"id","name":"id"}]},
+                {"forEach":"name","column":[{"path":"family","name":"family"}]}]});
+        assert_preview_prefix(runner.as_ref(), &tenant, view.clone(), 150).await;
+        let mut limits = vec![(0, 0), (1, 1), (150, 150), (10_000, 150)];
+        #[cfg(target_pointer_width = "64")]
+        limits.push((usize::MAX, 150));
+        for (limit, expected) in limits {
+            let rows = collect_rows_in_order(
+                runner.as_ref(),
+                &tenant,
+                view.clone(),
+                ViewFilters {
+                    limit: Some(limit),
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert_eq!(rows.len(), expected, "runtime-only limit {limit}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pg_preview_limit_preserves_foreach_prefix_with_interior_cut() {
+        let (backend, _container) = create_dedicated_backend().await;
+        let tenant = test_tenant();
+        for index in 0..20 {
+            seed_preview_patient(&backend, &tenant, index, "male").await;
+        }
+        let runner = backend.sof_runner().unwrap();
+        let view = json!({"resourceType":"ViewDefinition", "resource":"Patient",
+            "select":[{"column":[{"path":"id","name":"id"}]},
+                {"forEach":"name","column":[{"path":"family","name":"family"}]}]});
+        assert_preview_prefix(runner.as_ref(), &tenant, view.clone(), 60).await;
+        let limited = collect_rows_in_order(
+            runner.as_ref(),
+            &tenant,
+            view,
+            ViewFilters {
+                limit: Some(50),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            limited[48]["id"], limited[49]["id"],
+            "cap must cut inside a three-name resource"
+        );
+        assert_ne!(limited[47]["id"], limited[49]["id"]);
+    }
+
+    #[tokio::test]
+    async fn test_pg_preview_limit_is_global_across_union_all() {
+        let (backend, _container) = create_dedicated_backend().await;
+        let tenant = test_tenant();
+        for index in 0..40 {
+            seed_preview_patient(&backend, &tenant, index, &format!("branch-b-{index:03}")).await;
+        }
+        let runner = backend.sof_runner().unwrap();
+        let view = json!({"resourceType":"ViewDefinition", "resource":"Patient",
+        "select":[{"unionAll":[
+            {"column":[{"path":"id","name":"value"}]},
+            {"column":[{"path":"gender","name":"value"}]}
+        ]}]});
+        assert_preview_prefix(runner.as_ref(), &tenant, view, 80).await;
+    }
+
+    #[tokio::test]
+    async fn test_pg_preview_limit_preserves_constants_runtime_filters_and_tenant() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        let other = TenantContext::new(
+            TenantId::new(format!("other_{}", uuid::Uuid::new_v4().simple())),
+            TenantPermissions::full_access(),
+        );
+        let since = chrono::Utc::now();
+        for index in 0..81 {
+            seed_preview_patient(
+                &backend,
+                &tenant,
+                index,
+                if index < 20 { "female" } else { "male" },
+            )
+            .await;
+        }
+        seed_preview_patient(&backend, &other, 20, "male").await;
+        backend
+            .delete(&tenant, "Patient", "p-021")
+            .await
+            .expect("delete patient");
+        let runner = backend.sof_runner().unwrap();
+        let mut view = preview_flat_view("Patient", "id");
+        view["constant"] = json!([{"name":"g","valueString":"male"}]);
+        view["where"] = json!([{"path":"gender = %g"}]);
+        let mut filters = ViewFilters {
+            since: Some(since),
+            patient: (10..80)
+                .map(|index| format!("Patient/p-{index:03}"))
+                .collect(),
+            ..Default::default()
+        };
+        let unlimited =
+            collect_rows_in_order(runner.as_ref(), &tenant, view.clone(), filters.clone()).await;
+        assert_eq!(unlimited.len(), 59);
+        assert!(
+            unlimited
+                .iter()
+                .all(|row| row["id"] != "p-021" && row["id"] != "p-080")
+        );
+        filters.limit = Some(50);
+        let limited =
+            collect_rows_in_order(runner.as_ref(), &tenant, view.clone(), filters.clone()).await;
+        assert_eq!(limited, unlimited[..50]);
+        // A future since filter must still exclude every otherwise eligible row.
+        filters.since = Some(chrono::Utc::now() + chrono::Duration::days(1));
+        assert!(
+            collect_rows_in_order(runner.as_ref(), &tenant, view, filters)
+                .await
+                .is_empty()
+        );
+    }
+
+    fn large_patient_fixture() -> Value {
+        json!({
+            "resourceType":"Patient", "id":"p-large", "gender":"male", "active":true,
+            "name": (1..=150).map(|index| json!({
+                "family":format!("Family-{index}"),
+                "use":if index <= 75 { "official" } else { "temp" },
+                "given":[format!("Given-{index}-a"),format!("Given-{index}-b")]
+            })).collect::<Vec<_>>(),
+            "address":(1..=10).map(|index| json!({"city":format!("City-{index}")})).collect::<Vec<_>>()
+        })
+    }
+
+    async fn assert_large_preview_prefix(
+        runner: &dyn SofRunner,
+        tenant: &TenantContext,
+        view: Value,
+        total: usize,
+        case: &str,
+    ) {
+        let unlimited =
+            collect_rows_in_order(runner, tenant, view.clone(), ViewFilters::default()).await;
+        assert_eq!(unlimited.len(), total, "{case}: unlimited count");
+        let limited = collect_rows_in_order(
+            runner,
+            tenant,
+            view,
+            ViewFilters {
+                limit: Some(50),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(limited.len(), 50, "{case}: output cap");
+        assert_eq!(limited, unlimited[..50], "{case}: ordered prefix");
+    }
+
+    #[tokio::test]
+    async fn test_pg_large_nested_chained_cartesian_and_nullable_preview_prefixes() {
+        let (backend, _container) = create_dedicated_backend().await;
+        let tenant = test_tenant();
+        for resource in [
+            large_patient_fixture(),
+            json!({"resourceType":"Patient","id":"p-empty"}),
+            json!({"resourceType":"Patient","id":"p-filtered","name":[{"family":"Rejected","use":"temp"}]}),
+        ] {
+            backend
+                .create(&tenant, "Patient", resource, FhirVersion::R4)
+                .await
+                .expect("seed expanded fixture");
+        }
+        let runner = backend.sof_runner().unwrap();
+        let cases = [
+            (
+                "single-large",
+                json!([{"forEach":"name","column":[{"path":"family","name":"family"}]}]),
+                150,
+            ),
+            (
+                "nested",
+                json!([{"forEach":"name","select":[
+                    {"column":[{"path":"family","name":"family"}]},
+                    {"forEach":"given","column":[{"path":"$this","name":"given"}]}
+                ]}]),
+                300,
+            ),
+            (
+                "chained",
+                json!([{"forEach":"name.given","column":[{"path":"$this","name":"given"}]}]),
+                300,
+            ),
+            (
+                "cartesian",
+                json!([
+                    {"forEach":"name","column":[{"path":"family","name":"family"}]},
+                    {"forEach":"address","column":[{"path":"city","name":"city"}]}
+                ]),
+                1500,
+            ),
+            (
+                "nullable",
+                json!([{"forEachOrNull":"name","column":[{"path":"family","name":"family"}]}]),
+                152,
+            ),
+            (
+                "nullable-where-on",
+                json!([{"forEachOrNull":"name.where(use = 'official')",
+                "column":[{"path":"family","name":"family"}]}]),
+                77,
+            ),
+            (
+                "row-index",
+                json!([{"forEach":"name","column":[
+                    {"path":"family","name":"family"},{"path":"%rowIndex","name":"index","type":"integer"}
+                ]}]),
+                150,
+            ),
+            (
+                "expanded-union-ties",
+                json!([{"unionAll":[
+                    {"forEach":"name","column":[{"path":"'tie'","name":"tie"},{"path":"family","name":"value"}]},
+                    {"forEach":"name","column":[{"path":"'tie'","name":"tie"},{"path":"given[0]","name":"value"}]}
+                ]}]),
+                300,
+            ),
+            (
+                "outer-foreach-union",
+                json!([{"forEach":"name","unionAll":[
+                    {"column":[{"path":"'tie'","name":"tie"},{"path":"family","name":"value"}]},
+                    {"forEach":"given","column":[{"path":"'tie'","name":"tie"},{"path":"$this","name":"value"}]}
+                ]}]),
+                450,
+            ),
+        ];
+        for (case, select, total) in cases {
+            let mut view =
+                json!({"resourceType":"ViewDefinition","resource":"Patient","select":select});
+            // Nullable cases include absent/rejected collections; the others
+            // isolate the large resource so every output sort key can tie.
+            if !case.starts_with("nullable") {
+                view["where"] = json!([{"path":"id = 'p-large'"}]);
+            }
+            assert_large_preview_prefix(runner.as_ref(), &tenant, view, total, case).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pg_flat_union_ties_keep_second_column_prefix() {
+        let (backend, _container) = create_dedicated_backend().await;
+        let tenant = test_tenant();
+        for index in 0..80 {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType":"Patient","id":format!("u-{index:03}"),"gender":format!("Second-{index}")}),
+                    FhirVersion::R4,
+                )
+                .await
+                .expect("seed union");
+        }
+        let runner = backend.sof_runner().unwrap();
+        let view = json!({"resourceType":"ViewDefinition","resource":"Patient",
+        "select":[{"unionAll":[
+            {"column":[{"path":"'tie'","name":"tie"},{"path":"id","name":"value"}]},
+            {"column":[{"path":"'tie'","name":"tie"},{"path":"gender","name":"value"}]}
+        ]}]});
+        assert_large_preview_prefix(runner.as_ref(), &tenant, view, 160, "flat-union-ties").await;
+    }
+
+    #[tokio::test]
+    async fn test_pg_large_repeat_nested_multipath_and_union_preview_prefixes() {
+        let (backend, _container) = create_dedicated_backend().await;
+        let tenant = test_tenant();
+        backend.create(&tenant, "QuestionnaireResponse", json!({
+            "resourceType":"QuestionnaireResponse", "id":"qr-large", "status":"completed",
+            "item":(1..=150).map(|index| json!({
+                "linkId":format!("Item-{index}"),
+                "answer":[{"valueString":format!("Answer-{index}"),"item":[{"linkId":format!("Child-{index}")}]}]
+            })).collect::<Vec<_>>()
+        }), FhirVersion::R4).await.expect("seed repeat");
+        let runner = backend.sof_runner().unwrap();
+        let cases = [
+            (
+                "repeat",
+                json!([{"repeat":["item"],"column":[
+                {"path":"'tie'","name":"tie"},{"path":"linkId","name":"value"}]}]),
+                150,
+            ),
+            (
+                "repeat-nested",
+                json!([{"repeat":["item"],"select":[
+                    {"column":[{"path":"'tie'","name":"tie"},{"path":"linkId","name":"item"}]},
+                    {"forEachOrNull":"answer","column":[{"path":"valueString","name":"answer"}]}
+                ]}]),
+                150,
+            ),
+            (
+                "repeat-multipath",
+                json!([{"repeat":["item","answer.item"],"column":[
+                {"path":"'tie'","name":"tie"},{"path":"linkId","name":"value"}]}]),
+                300,
+            ),
+            (
+                "repeat-union",
+                json!([{"unionAll":[
+                    {"repeat":["item"],"column":[{"path":"'tie'","name":"tie"},{"path":"linkId","name":"value"}]},
+                    {"repeat":["item","answer.item"],"column":[{"path":"'tie'","name":"tie"},{"path":"linkId","name":"value"}]}
+                ]}]),
+                450,
+            ),
+            (
+                "repeat-row-index",
+                json!([{"repeat":["item"],"column":[
+                {"path":"'tie'","name":"tie"},{"path":"linkId","name":"value"},
+                {"path":"%rowIndex","name":"index","type":"integer"}]}]),
+                150,
+            ),
+        ];
+        for (case, select, total) in cases {
+            assert_large_preview_prefix(runner.as_ref(), &tenant, json!({
+                "resourceType":"ViewDefinition","resource":"QuestionnaireResponse","select":select
+            }), total, case).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pg_large_expansion_preserves_runtime_filters_constants_and_isolation() {
+        let (backend, _container) = create_dedicated_backend().await;
+        let tenant = test_tenant();
+        let other = TenantContext::new(
+            TenantId::new(&format!("other-{}", uuid::Uuid::new_v4().simple())),
+            TenantPermissions::full_access(),
+        );
+        let since = chrono::Utc::now() - chrono::Duration::seconds(1);
+        for context in [&tenant, &other] {
+            backend
+                .create(context, "Patient", large_patient_fixture(), FhirVersion::R4)
+                .await
+                .expect("seed eligible expansion");
+        }
+        let mut deleted = large_patient_fixture();
+        deleted["id"] = json!("p-deleted");
+        backend
+            .create(&tenant, "Patient", deleted, FhirVersion::R4)
+            .await
+            .expect("seed deleted expansion");
+        backend
+            .delete(&tenant, "Patient", "p-deleted")
+            .await
+            .expect("delete expansion");
+        let runner = backend.sof_runner().unwrap();
+        let view = json!({"resourceType":"ViewDefinition","resource":"Patient",
+            "constant":[{"name":"g","valueString":"male"}],"where":[{"path":"gender = %g"}],
+            "select":[{"column":[{"path":"id","name":"id"}]},
+                {"forEach":"name","column":[{"path":"family","name":"family"}]}]});
+        let mut filters = ViewFilters {
+            since: Some(since),
+            patient: vec!["Patient/p-large".into(), "Patient/p-deleted".into()],
+            ..Default::default()
+        };
+        let unlimited =
+            collect_rows_in_order(runner.as_ref(), &tenant, view.clone(), filters.clone()).await;
+        assert_eq!(unlimited.len(), 150);
+        assert!(unlimited.iter().all(|row| row["id"] == "p-large"));
+        filters.limit = Some(50);
+        let limited =
+            collect_rows_in_order(runner.as_ref(), &tenant, view.clone(), filters.clone()).await;
+        assert_eq!(limited, unlimited[..50]);
+        filters.since = Some(chrono::Utc::now() + chrono::Duration::days(1));
+        assert!(
+            collect_rows_in_order(runner.as_ref(), &tenant, view.clone(), filters.clone())
+                .await
+                .is_empty()
+        );
+        filters.since = Some(since);
+        filters.patient = vec!["Patient/missing".into()];
+        assert!(
+            collect_rows_in_order(runner.as_ref(), &tenant, view, filters)
+                .await
+                .is_empty()
+        );
     }
 }

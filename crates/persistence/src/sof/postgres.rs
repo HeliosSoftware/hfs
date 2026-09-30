@@ -27,7 +27,9 @@ use crate::core::sof_runner::{
 };
 use crate::tenant::TenantContext;
 
-use super::compiler::{SqlDialect, compile_view_definition_dialect};
+use super::compiler::{
+    OutputLimitStrategy, SqlDialect, compile_view_definition_with_limit_strategy,
+};
 
 /// Channel buffer depth (rows that can be queued ahead of the consumer).
 const CHANNEL_BUFFER: usize = 256;
@@ -70,7 +72,7 @@ impl SofRunner for PgInDbRunner {
         mut filters: ViewFilters,
     ) -> Result<RowStream, SofError> {
         // Compile synchronously (cheap, no I/O)
-        let compiled = compile_view_definition_dialect(
+        let (compiled, limit_strategy) = compile_view_definition_with_limit_strategy(
             &view_definition,
             SqlDialect::Postgres,
             self.fhir_version,
@@ -117,6 +119,7 @@ impl SofRunner for PgInDbRunner {
             &compiled.constants,
             &filters,
             self.fhir_version,
+            limit_strategy,
         );
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<ViewRow, SofError>>(CHANNEL_BUFFER);
@@ -185,7 +188,7 @@ async fn resolve_group_refs_to_patient_refs(
 // SQL runtime-filter injection
 // ============================================================================
 
-/// Builds the final SQL and typed params list for a PG query.
+/// Builds the final SQL, including the output limit, and typed params for a PG query.
 ///
 /// The base SQL uses `$1 = tenant_id` and `$2 = resource_type`.
 /// Extra filter conditions inject `$3`, `$4`, … as needed.
@@ -196,6 +199,7 @@ fn build_pg_sql_and_params(
     constants: &[super::ir::LitValue],
     filters: &ViewFilters,
     fhir_version: FhirVersion,
+    limit_strategy: OutputLimitStrategy,
 ) -> (String, Vec<PgParam>) {
     let mut conditions: Vec<String> = Vec::new();
     let mut extra: Vec<PgParam> = Vec::new();
@@ -235,12 +239,22 @@ fn build_pg_sql_and_params(
         conditions.push(c);
     }
 
-    let sql = if conditions.is_empty() {
+    let mut sql = if conditions.is_empty() {
         base_sql.to_string()
     } else {
         let joined = conditions.join(" AND ");
         inject_before_order_by(base_sql, &format!(" AND {joined}"))
     };
+
+    // Flat views expose the cap to the optimizer. Row-producing expansions,
+    // unions and recursion keep their existing SQL and client-side cap: adding
+    // LIMIT can change the sort's treatment of otherwise indistinguishable keys.
+    // Oversized public usize limits also retain the existing client-side path.
+    if limit_strategy == OutputLimitStrategy::Direct
+        && let Some(limit) = filters.limit.and_then(|limit| i64::try_from(limit).ok())
+    {
+        sql.push_str(&format!("\nLIMIT {limit}"));
+    }
 
     let mut all_params = vec![PgParam::Text(tenant_id), PgParam::Text(resource_type)];
     all_params.extend(constant_params);
@@ -524,4 +538,171 @@ fn row_to_json(pg_row: &tokio_postgres::Row, columns: &[String]) -> Result<ViewR
         }
     }
     Ok(Value::Object(map))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::compiler::compile_view_definition_dialect;
+    use super::*;
+    use serde_json::json;
+
+    fn runtime_sql(view: &Value, filters: &ViewFilters) -> (String, Vec<String>) {
+        let (compiled, strategy) = compile_view_definition_with_limit_strategy(
+            view,
+            SqlDialect::Postgres,
+            FhirVersion::default_enabled(),
+        )
+        .expect("compile test view");
+        let (sql, params) = build_pg_sql_and_params(
+            &compiled.sql,
+            "tenant".into(),
+            "Patient".into(),
+            &compiled.constants,
+            filters,
+            FhirVersion::default_enabled(),
+            strategy,
+        );
+        let bindings = params
+            .iter()
+            .map(|param| match param {
+                PgParam::Text(v) => format!("text:{v}"),
+                PgParam::Bool(v) => format!("bool:{v}"),
+                PgParam::Int(v) => format!("int:{v}"),
+                PgParam::Decimal(v) => format!("decimal:{v}"),
+                PgParam::Null => "null".into(),
+                PgParam::Timestamp(v) => format!("timestamp:{v}"),
+            })
+            .collect();
+        (sql, bindings)
+    }
+
+    fn flat_view() -> Value {
+        json!({"resourceType":"ViewDefinition", "resource":"Patient",
+            "select":[{"column":[{"path":"id","name":"id"}]}]})
+    }
+
+    #[test]
+    fn test_pg_runtime_sql_appends_final_output_limit() {
+        let view = flat_view();
+        let compiled = compile_view_definition_dialect(
+            &view,
+            SqlDialect::Postgres,
+            FhirVersion::default_enabled(),
+        )
+        .unwrap();
+        let (unlimited, bindings) = runtime_sql(&view, &ViewFilters::default());
+        assert_eq!(unlimited, compiled.sql);
+        let mut limits = vec![0, 1, 50, 10_000];
+        #[cfg(target_pointer_width = "64")]
+        limits.push(i64::MAX as usize);
+        for limit in limits {
+            let (sql, limited_bindings) = runtime_sql(
+                &view,
+                &ViewFilters {
+                    limit: Some(limit),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(sql, format!("{unlimited}\nLIMIT {limit}"));
+            assert_eq!(limited_bindings, bindings);
+        }
+    }
+
+    #[test]
+    fn test_pg_limit_preserves_constant_and_runtime_bindings() {
+        let view = json!({"resourceType":"ViewDefinition", "resource":"Patient",
+            "constant":[{"name":"g","valueString":"male"}],
+            "where":[{"path":"gender = %g"}],
+            "select":[{"column":[{"path":"id","name":"id"}]}]});
+        let mut filters = ViewFilters {
+            since: Some("2024-01-01T00:00:00Z".parse().unwrap()),
+            patient: vec!["Patient/p-eligible".into()],
+            ..Default::default()
+        };
+        let (unlimited, bindings) = runtime_sql(&view, &filters);
+        assert!(unlimited.contains("$3"), "{unlimited}");
+        assert!(unlimited.contains("r.last_updated >= $4"), "{unlimited}");
+        assert!(unlimited.contains("r.id = $5"), "{unlimited}");
+        assert_eq!(bindings[2], "text:male");
+        assert_eq!(bindings.last().unwrap(), "text:p-eligible");
+        filters.limit = Some(50);
+        let (limited, limited_bindings) = runtime_sql(&view, &filters);
+        assert_eq!(limited, format!("{unlimited}\nLIMIT 50"));
+        assert_eq!(limited_bindings, bindings);
+    }
+
+    #[test]
+    fn test_pg_union_and_recursive_limits_keep_existing_sql() {
+        let views = [
+            json!({"resourceType":"ViewDefinition", "resource":"Patient",
+            "select":[{"unionAll":[
+                {"column":[{"path":"id","name":"id"}]},
+                {"column":[{"path":"gender","name":"id"}]}
+            ]}]}),
+            json!({"resourceType":"ViewDefinition", "resource":"QuestionnaireResponse",
+                "select":[{"repeat":["item"],
+                    "column":[{"path":"linkId","name":"link_id"}]}]}),
+        ];
+        for view in views {
+            let (unlimited, bindings) = runtime_sql(&view, &ViewFilters::default());
+            let (limited, limited_bindings) = runtime_sql(
+                &view,
+                &ViewFilters {
+                    limit: Some(50),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(limited, unlimited);
+            assert_eq!(limited_bindings, bindings);
+        }
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn test_pg_unrepresentable_limit_keeps_existing_sql() {
+        for view in [
+            flat_view(),
+            json!({"resourceType":"ViewDefinition","resource":"Patient",
+            "select":[{"forEach":"name","column":[{"name":"family","path":"family"}]}]}),
+        ] {
+            let unlimited = runtime_sql(&view, &ViewFilters::default());
+            for limit in [i64::MAX as usize + 1, usize::MAX] {
+                assert_eq!(
+                    runtime_sql(
+                        &view,
+                        &ViewFilters {
+                            limit: Some(limit),
+                            ..Default::default()
+                        }
+                    ),
+                    unlimited
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_pg_runtime_only_limit_preserves_filtered_sql_and_bindings() {
+        let view = json!({"resourceType":"ViewDefinition", "resource":"Patient",
+            "constant":[{"name":"g","valueString":"male"}],
+            "where":[{"path":"gender = %g"}],
+            "select":[{"forEach":"name","column":[{"path":"family","name":"family"}]}]});
+        let mut filters = ViewFilters {
+            since: Some("2024-01-01T00:00:00Z".parse().unwrap()),
+            patient: vec!["Patient/p-eligible".into()],
+            ..Default::default()
+        };
+        let (unlimited, bindings) = runtime_sql(&view, &filters);
+        assert!(unlimited.contains("r.last_updated >= $4"));
+        assert!(unlimited.contains("r.id = $5"));
+        let mut limits = vec![0, 1, 50, 10_000];
+        #[cfg(target_pointer_width = "64")]
+        limits.push(i64::MAX as usize);
+        for limit in limits {
+            filters.limit = Some(limit);
+            let (limited, limited_bindings) = runtime_sql(&view, &filters);
+            assert_eq!(limited, unlimited);
+            assert_eq!(limited_bindings, bindings);
+        }
+    }
 }
