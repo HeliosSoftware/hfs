@@ -2289,12 +2289,14 @@ fn composite_submit_jobs(
             concurrency: cfg.index_concurrency as usize,
             coalesce: cfg.index_coalesce as usize,
             max_wait: std::time::Duration::from_secs(cfg.index_max_wait_secs),
+            page_bytes: usize::try_from(cfg.index_page_bytes).unwrap_or(usize::MAX),
         };
         info!(
             queue = sink_config.queue,
             concurrency = sink_config.concurrency,
             coalesce = sink_config.coalesce,
             max_wait_secs = cfg.index_max_wait_secs,
+            page_bytes = sink_config.page_bytes,
             "Bulk submit indexes into Elasticsearch during ingest (DEFER_INDEXING=false); \
              the deferred reindex runs only for types the search index rejected"
         );

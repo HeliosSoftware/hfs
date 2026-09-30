@@ -75,6 +75,9 @@ type IngestedEntry = (
 
 const BOOKKEEPING_FLUSH_SIZE: usize = 1000;
 
+/// Entries one `mark_entries_unindexed` statement carries (#939).
+const UNINDEXED_MARK_SLICE: usize = 10_000;
+
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
         backend_name: "postgres".to_string(),
@@ -1376,26 +1379,39 @@ impl BulkSubmitProvider for PostgresBackend {
             .await
             .map_err(|e| internal_error(format!("Failed to begin unindexed-mark txn: {}", e)))?;
 
+        // One statement per slice of entries, joined against the ids as
+        // arrays: no index covers (`resource_type`, `resource_id`) on this
+        // table, so each statement is one pass over the manifest's rows — one
+        // statement per entry was one pass per entry, measured at 4.8 s each
+        // on a 19 M-row manifest, 56 h for 43 k rejected entries (#939).
         let mut affected = 0u64;
-        for entry in entries {
+        for slice in entries.chunks(UNINDEXED_MARK_SLICE) {
+            let resource_types: Vec<&str> =
+                slice.iter().map(|e| e.resource_type.as_str()).collect();
+            let resource_ids: Vec<&str> = slice.iter().map(|e| e.resource_id.as_str()).collect();
+            let outcomes: Vec<&serde_json::Value> =
+                slice.iter().map(|e| &e.operation_outcome).collect();
             let rows = txn
                 .execute(
-                    "UPDATE bulk_entry_results
-                     SET outcome = 'processing-error', operation_outcome = $1
-                     WHERE tenant_id = $2 AND submitter = $3 AND submission_id = $4
-                       AND manifest_id = $5 AND resource_type = $6 AND resource_id = $7",
+                    "UPDATE bulk_entry_results AS r
+                     SET outcome = 'processing-error', operation_outcome = u.operation_outcome
+                     FROM unnest($5::text[], $6::text[], $7::jsonb[])
+                          AS u(resource_type, resource_id, operation_outcome)
+                     WHERE r.tenant_id = $1 AND r.submitter = $2 AND r.submission_id = $3
+                       AND r.manifest_id = $4
+                       AND r.resource_type = u.resource_type AND r.resource_id = u.resource_id",
                     &[
-                        &entry.operation_outcome,
                         &tenant_id,
                         &submission_id.submitter.as_str(),
                         &submission_id.submission_id.as_str(),
                         &manifest_id,
-                        &entry.resource_type.as_str(),
-                        &entry.resource_id.as_str(),
+                        &resource_types,
+                        &resource_ids,
+                        &outcomes,
                     ],
                 )
                 .await
-                .map_err(|e| internal_error(format!("Failed to mark entry unindexed: {}", e)))?;
+                .map_err(|e| internal_error(format!("Failed to mark entries unindexed: {}", e)))?;
             affected += rows;
         }
 

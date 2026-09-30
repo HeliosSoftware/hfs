@@ -75,7 +75,18 @@ pub struct IngestIndexSinkConfig {
     /// attempt into a target may take. [`IngestIndexSink::drain`] derives its
     /// no-progress window from it ([`IngestIndexSink::settle_window`]).
     pub max_wait: Duration,
+    /// Most bytes of resource content one write into a target carries; a
+    /// coalesced page above it goes out in several writes, each with its own
+    /// `max_wait`. `0` means unbounded. Measured (#939): four batches of
+    /// 1,000 Provenance (~100 KB each) made one 400 MB page that no timeout
+    /// could cover, and Elasticsearch applied it after the sink had already
+    /// given up on it.
+    pub page_bytes: usize,
 }
+
+/// Default for [`IngestIndexSinkConfig::page_bytes`]: 32 MiB, the same cap
+/// `HFS_REINDEX_BATCH_BYTES` puts on a reindex page.
+pub const DEFAULT_PAGE_BYTES: usize = 32 * 1024 * 1024;
 
 impl Default for IngestIndexSinkConfig {
     fn default() -> Self {
@@ -84,6 +95,7 @@ impl Default for IngestIndexSinkConfig {
             concurrency: 4,
             coalesce: 4,
             max_wait: Duration::from_secs(30),
+            page_bytes: DEFAULT_PAGE_BYTES,
         }
     }
 }
@@ -157,6 +169,10 @@ struct Tally {
     /// Unindexed resources.
     rejected: HashMap<ResourceKey, Rejection>,
     written: u64,
+    /// Writes into a target completed for this manifest, sub-pages included:
+    /// progress a drain can see while a large coalesced page is still going
+    /// out in several writes (#939).
+    pages_written: u64,
 }
 
 impl Tally {
@@ -329,6 +345,7 @@ impl IngestIndexSink {
             concurrency: config.concurrency.max(1),
             coalesce: config.coalesce.max(1),
             max_wait: config.max_wait,
+            page_bytes: config.page_bytes,
         };
         Self {
             context: Arc::new(WriterContext {
@@ -550,25 +567,74 @@ fn manifest_key(
 /// jobs finished for `window`. Returns whether it settled.
 async fn wait_idle(state: &ManifestState, window: Duration) -> bool {
     let mut remaining = usize::MAX;
+    let mut pages_written = 0u64;
     let mut deadline = Instant::now() + window;
     loop {
         let notified = state.changed.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        let now_in_flight = state.tally.lock().in_flight.len();
+        let (now_in_flight, now_pages) = {
+            let tally = state.tally.lock();
+            (tally.in_flight.len(), tally.pages_written)
+        };
         if now_in_flight == 0 {
             return true;
         }
-        if now_in_flight < remaining {
+        // A job finishing or a write completing is progress; either resets
+        // the window.
+        if now_in_flight < remaining || now_pages > pages_written {
             remaining = now_in_flight;
+            pages_written = now_pages;
             deadline = Instant::now() + window;
         }
-        if tokio::time::timeout_at(deadline, notified).await.is_err()
-            && state.tally.lock().in_flight.len() >= remaining
-        {
-            return false;
+        if tokio::time::timeout_at(deadline, notified).await.is_err() {
+            let tally = state.tally.lock();
+            if tally.in_flight.len() >= remaining && tally.pages_written <= pages_written {
+                return false;
+            }
         }
     }
+}
+
+/// Splits a page into runs whose content stays within `page_bytes` — a run
+/// exceeds it only when it holds one resource. `0` keeps the page whole.
+fn sub_pages(resources: &[StoredResource], page_bytes: usize) -> Vec<std::ops::Range<usize>> {
+    if page_bytes == 0 || resources.is_empty() {
+        return std::iter::once(0..resources.len()).collect();
+    }
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    let mut bytes = 0usize;
+    for (index, resource) in resources.iter().enumerate() {
+        let size = content_bytes(resource);
+        if index > start && bytes.saturating_add(size) > page_bytes {
+            ranges.push(start..index);
+            start = index;
+            bytes = 0;
+        }
+        bytes = bytes.saturating_add(size);
+    }
+    ranges.push(start..resources.len());
+    ranges
+}
+
+/// Serialized size of a resource's content, counted without allocating it.
+fn content_bytes(resource: &StoredResource) -> usize {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    // A value that cannot serialize is counted as empty; the write itself
+    // reports the failure per resource.
+    let _ = serde_json::to_writer(&mut counter, resource.content());
+    counter.0
 }
 
 #[async_trait]
@@ -751,16 +817,37 @@ async fn write_jobs(context: &WriterContext, jobs: Vec<Job>) -> bool {
             .collect();
 
         let mut failures: Vec<Option<Failure>> = vec![None; resources.len()];
+        // Each manifest with a copy in this page, once: their tallies record
+        // every completed write so a drain sees the page progressing (#939).
+        let mut states: Vec<&Arc<ManifestState>> = Vec::new();
+        for entry in &entries {
+            if !states.iter().any(|state| Arc::ptr_eq(state, &entry.state)) {
+                states.push(&entry.state);
+            }
+        }
+        let ranges = sub_pages(&resources, context.config.page_bytes);
         for target in &context.targets {
-            let outcome = write_page(target.as_ref(), &tenant, &resources, max_wait).await;
-            for (slot, failure) in failures.iter_mut().zip(outcome) {
-                let Some(failure) = failure else {
-                    continue;
-                };
-                if let Some(first) = slot.as_mut() {
-                    first.may_land |= failure.may_land;
-                } else {
-                    *slot = Some(failure);
+            for range in &ranges {
+                let outcome = write_page(
+                    target.as_ref(),
+                    &tenant,
+                    &resources[range.clone()],
+                    max_wait,
+                )
+                .await;
+                for (slot, failure) in failures[range.clone()].iter_mut().zip(outcome) {
+                    let Some(failure) = failure else {
+                        continue;
+                    };
+                    if let Some(first) = slot.as_mut() {
+                        first.may_land |= failure.may_land;
+                    } else {
+                        *slot = Some(failure);
+                    }
+                }
+                for state in &states {
+                    state.tally.lock().pages_written += 1;
+                    state.changed.notify_waiters();
                 }
             }
         }
@@ -1223,6 +1310,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn sub_pages_split_on_the_byte_budget_and_never_split_one_resource() {
+        let page: Vec<StoredResource> = (1..=5).map(|v| patient("p", v)).collect();
+        let one = content_bytes(&page[0]);
+        assert!(one > 0);
+        assert_eq!(sub_pages(&page, 0), vec![0..5]);
+        assert_eq!(sub_pages(&page, one * 5), vec![0..5]);
+        assert_eq!(sub_pages(&page, one * 2), vec![0..2, 2..4, 4..5]);
+        assert_eq!(sub_pages(&page, 1), vec![0..1, 1..2, 2..3, 3..4, 4..5]);
+        assert_eq!(sub_pages(&[], 1), vec![0..0]);
+    }
+
+    /// #939: a page above the byte budget goes out in several writes, each
+    /// within its own `max_wait`, and every resource is still accepted.
+    #[tokio::test]
+    async fn a_page_over_the_byte_budget_is_written_in_several_calls() {
+        let target = Arc::new(SpyTarget::default());
+        let one = content_bytes(&patient("a", 1));
+        let sink = sink_with(
+            target.clone(),
+            empty_source(),
+            IngestIndexSinkConfig {
+                concurrency: 1,
+                coalesce: 1,
+                page_bytes: one * 2,
+                ..Default::default()
+            },
+        );
+        let sub = SubmissionId::generate("page-bytes");
+        let ids = ["a", "b", "c", "d", "e"];
+        let results: Vec<_> = ids.iter().map(|id| success(1, id)).collect();
+        let resources: Vec<_> = ids.iter().map(|id| patient(id, 1)).collect();
+        commit(&sink, &sub, &results, &resources).await;
+        let drain = sink.drain(&tenant(), &sub, "m1").await;
+        assert!(drain.rejected.is_empty(), "{:?}", drain.rejected);
+        assert_eq!(drain.written, 5);
+        assert_eq!(
+            target.pages.load(Ordering::SeqCst),
+            3,
+            "2 + 2 + 1 resources"
+        );
+        assert_eq!(target.ids(), vec!["a", "b", "c", "d", "e"]);
+    }
+
     #[tokio::test]
     async fn coalesced_duplicates_write_only_the_newest_version() {
         let target = Arc::new(SpyTarget::default());
@@ -1516,6 +1647,7 @@ mod tests {
                 concurrency: 1,
                 coalesce: 1,
                 max_wait,
+                ..Default::default()
             },
         );
         let sub = SubmissionId::generate("stalled");

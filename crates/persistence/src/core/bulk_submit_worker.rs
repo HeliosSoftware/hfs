@@ -57,6 +57,10 @@ pub struct IngestSyncReport {
     /// and deduplicated. When [`Self::indexed_during_ingest`] is set, these are
     /// the only types the deferred reindex needs to rebuild (#1127).
     pub rejected_types: Vec<String>,
+    /// The resources a secondary rejected, sorted by type then id and
+    /// deduplicated: with [`Self::indexed_during_ingest`] set, the deferred
+    /// reindex rebuilds exactly these instead of their whole types (#939).
+    pub rejected: Vec<crate::search::ResourceRef>,
     /// Whether the secondaries were written batch by batch while the manifest
     /// ingested (index-during-ingest, #1127) and this report closes that out.
     /// When `false`, whatever deferred indexing the deployment uses still
@@ -631,6 +635,23 @@ pub trait DeferredReindexHook: Send + Sync {
         _context: DeferredReindexContext,
     ) {
         self.reindex_types(tenant, resource_types).await;
+    }
+
+    /// Kicks a reindex of individual resources: the ones an ingest-time
+    /// index sink could not index (#939). The default widens to their types,
+    /// which every existing hook already handles.
+    async fn reindex_resources_with_context(
+        &self,
+        tenant: &TenantContext,
+        resources: Vec<crate::search::ResourceRef>,
+        context: DeferredReindexContext,
+    ) {
+        let types: std::collections::BTreeSet<String> = resources
+            .into_iter()
+            .map(|resource| resource.resource_type)
+            .collect();
+        self.reindex_types_with_context(tenant, types.into_iter().collect(), context)
+            .await;
     }
 }
 
@@ -2530,10 +2551,11 @@ where
         output_files: &[RemoteFile],
         sync: &IngestSyncReport,
     ) {
-        let Some(types) = deferred_reindex_types(self.defer_indexing, output_files, sync) else {
+        let Some(scope) = deferred_reindex_scope(self.defer_indexing, output_files, sync) else {
             return;
         };
-        if sync.indexed_during_ingest && types.is_empty() {
+        let types = scope.types();
+        if sync.indexed_during_ingest && scope.is_empty() {
             tracing::info!(
                 submission = %lease.submission_id,
                 manifest = %lease.manifest_id,
@@ -2553,21 +2575,35 @@ where
                         "could not record that this manifest owes a search-index rebuild; a restart before it finishes will not resume it"
                     );
                 }
+                let context = DeferredReindexContext {
+                    submission_id: Some(lease.submission_id.to_string()),
+                    manifest_id: Some(lease.manifest_id.clone()),
+                };
+                // Indexed during ingest: only what the sink rejected is
+                // missing, and the sink names each resource — rebuilding
+                // their whole types would re-walk millions of rows for a
+                // handful of documents (#939).
+                if let DeferredReindexScope::Resources(resources) = scope {
+                    tracing::info!(
+                        submission = %lease.submission_id,
+                        manifest = %lease.manifest_id,
+                        resources = resources.len(),
+                        types = ?types,
+                        "bulk fast-load: rebuilding search index entries for the resources \
+                         the index rejected during ingest"
+                    );
+                    hook.reindex_resources_with_context(&lease.tenant, resources, context)
+                        .await;
+                    return;
+                }
                 tracing::info!(
                     submission = %lease.submission_id,
                     manifest = %lease.manifest_id,
                     types = ?types,
                     "bulk fast-load: rebuilding deferred search indexes"
                 );
-                hook.reindex_types_with_context(
-                    &lease.tenant,
-                    types,
-                    DeferredReindexContext {
-                        submission_id: Some(lease.submission_id.to_string()),
-                        manifest_id: Some(lease.manifest_id.clone()),
-                    },
-                )
-                .await;
+                hook.reindex_types_with_context(&lease.tenant, types, context)
+                    .await;
             }
             _ => {
                 tracing::warn!(
@@ -3139,6 +3175,56 @@ fn deferred_reindex_types(
     types.sort();
     types.dedup();
     Some(types)
+}
+
+/// What the deferred reindex after a manifest rebuilds (#939).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeferredReindexScope {
+    /// Whole resource types.
+    Types(Vec<String>),
+    /// Named resources: the ones an ingest-time sink could not index.
+    Resources(Vec<crate::search::ResourceRef>),
+}
+
+impl DeferredReindexScope {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Types(types) => types.is_empty(),
+            Self::Resources(resources) => resources.is_empty(),
+        }
+    }
+
+    /// The distinct types covered, sorted.
+    fn types(&self) -> Vec<String> {
+        match self {
+            Self::Types(types) => types.clone(),
+            Self::Resources(resources) => resources
+                .iter()
+                .map(|resource| resource.resource_type.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+        }
+    }
+}
+
+/// Like [`deferred_reindex_types`], but an ingest-time sink that named the
+/// resources it rejected gets exactly those back (#939): an index that
+/// rejected 3,372 Provenance must not cost a walk over 11.5 M rows of their
+/// types. A sink that only knew the types (an older report) keeps them.
+fn deferred_reindex_scope(
+    defer_indexing: bool,
+    output_files: &[RemoteFile],
+    sync: &IngestSyncReport,
+) -> Option<DeferredReindexScope> {
+    let types = deferred_reindex_types(defer_indexing, output_files, sync)?;
+    if sync.indexed_during_ingest && !sync.rejected.is_empty() {
+        let mut resources = sync.rejected.clone();
+        resources.sort();
+        resources.dedup();
+        return Some(DeferredReindexScope::Resources(resources));
+    }
+    Some(DeferredReindexScope::Types(types))
 }
 
 /// Records one input file that could not be ingested to its end.
@@ -4355,6 +4441,7 @@ mod tests {
     struct MockReindexHook {
         calls: std::sync::Mutex<Vec<Vec<String>>>,
         contexts: std::sync::Mutex<Vec<DeferredReindexContext>>,
+        resources: std::sync::Mutex<Vec<Vec<crate::search::ResourceRef>>>,
     }
 
     #[async_trait]
@@ -4371,6 +4458,16 @@ mod tests {
         ) {
             self.contexts.lock().unwrap().push(context);
             self.reindex_types(tenant, resource_types).await;
+        }
+
+        async fn reindex_resources_with_context(
+            &self,
+            _tenant: &TenantContext,
+            resources: Vec<crate::search::ResourceRef>,
+            context: DeferredReindexContext,
+        ) {
+            self.contexts.lock().unwrap().push(context);
+            self.resources.lock().unwrap().push(resources);
         }
     }
 
@@ -5852,6 +5949,46 @@ mod tests {
             rejected_types: vec!["Patient".to_string()],
             ..IngestSyncReport::default()
         };
+        // #939: a sink that named its rejected resources gets exactly those
+        // back, deduplicated and sorted; without names, the types.
+        let named = IngestSyncReport {
+            indexed_during_ingest: true,
+            rejected_types: vec!["Patient".to_string(), "Provenance".to_string()],
+            rejected: vec![
+                crate::search::ResourceRef::new("Provenance", "prov-2"),
+                crate::search::ResourceRef::new("Patient", "p-1"),
+                crate::search::ResourceRef::new("Provenance", "prov-2"),
+            ],
+            ..IngestSyncReport::default()
+        };
+        let scope = deferred_reindex_scope(false, &files, &named).unwrap();
+        assert_eq!(
+            scope,
+            DeferredReindexScope::Resources(vec![
+                crate::search::ResourceRef::new("Patient", "p-1"),
+                crate::search::ResourceRef::new("Provenance", "prov-2"),
+            ])
+        );
+        assert_eq!(
+            scope.types(),
+            vec!["Patient".to_string(), "Provenance".to_string()]
+        );
+        assert!(!scope.is_empty());
+        assert_eq!(
+            deferred_reindex_scope(false, &files, &rejecting_sink),
+            Some(DeferredReindexScope::Types(vec!["Patient".to_string()]))
+        );
+        assert_eq!(
+            deferred_reindex_scope(true, &files, &clean_sink),
+            Some(DeferredReindexScope::Types(vec![]))
+        );
+        assert_eq!(
+            deferred_reindex_scope(true, &files, &inline),
+            Some(DeferredReindexScope::Types(vec![
+                "Observation".to_string(),
+                "Patient".to_string()
+            ]))
+        );
         assert_eq!(
             deferred_reindex_types(false, &files, &rejecting_sink),
             Some(vec!["Patient".to_string()])
@@ -6403,6 +6540,7 @@ mod tests {
         let hook = Arc::new(MockReindexHook {
             calls: std::sync::Mutex::new(Vec::new()),
             contexts: std::sync::Mutex::new(Vec::new()),
+            resources: std::sync::Mutex::new(Vec::new()),
         });
         let worker = DefaultSubmitWorker::new(
             backend.clone(),
@@ -6967,6 +7105,7 @@ mod tests {
         let hook = Arc::new(MockReindexHook {
             calls: std::sync::Mutex::new(Vec::new()),
             contexts: std::sync::Mutex::new(Vec::new()),
+            resources: std::sync::Mutex::new(Vec::new()),
         });
         let worker = DefaultSubmitWorker::new(
             backend.clone(),
@@ -8557,6 +8696,7 @@ mod tests {
         let hook = Arc::new(MockReindexHook {
             calls: std::sync::Mutex::new(Vec::new()),
             contexts: std::sync::Mutex::new(Vec::new()),
+            resources: std::sync::Mutex::new(Vec::new()),
         });
         let output = Arc::new(LocalFsOutputStore::new(
             tmp.path().join("objects"),
