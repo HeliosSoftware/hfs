@@ -1,0 +1,72 @@
+[
+  {
+    "file": "q3-accurate-1-statement1.analyze.plan.json",
+    "execution_ms": 337.032,
+    "root_buffers": 7036,
+    "root_actual_rows": 8,
+    "indexes": [
+      "idx_search_reference_target_id",
+      "idx_search_resource",
+      "idx_search_token_code",
+      "resources_pkey"
+    ]
+  },
+  {
+    "file": "q3-accurate-1-statement0.analyze.plan.json",
+    "execution_ms": 323.472,
+    "root_buffers": 7030,
+    "root_actual_rows": 1,
+    "indexes": [
+      "idx_search_reference_target_id",
+      "idx_search_resource",
+      "idx_search_token_code",
+      "resources_pkey"
+    ]
+  },
+  {
+    "file": "q2-accurate-1-statement1.analyze.plan.json",
+    "execution_ms": 253.318,
+    "root_buffers": 1245,
+    "root_actual_rows": 3,
+    "indexes": [
+      "idx_search_reference_target_id",
+      "idx_search_resource",
+      "resources_pkey"
+    ]
+  },
+  {
+    "file": "q2-accurate-1-statement0.analyze.plan.json",
+    "execution_ms": 238.467,
+    "root_buffers": 1239,
+    "root_actual_rows": 1,
+    "indexes": [
+      "idx_search_reference_target_id",
+      "idx_search_resource",
+      "resources_pkey"
+    ]
+  },
+  {
+    "file": "q1-accurate-1-statement1.analyze.plan.json",
+    "execution_ms": 4.724,
+    "root_buffers": 2126,
+    "root_actual_rows": 6,
+    "indexes": [
+      "idx_resources_search",
+      "idx_search_reference_pattern",
+      "idx_search_resource",
+      "resources_pkey"
+    ]
+  },
+  {
+    "file": "q1-accurate-1-statement0.analyze.plan.json",
+    "execution_ms": 1820.487,
+    "root_buffers": 995108,
+    "root_actual_rows": 1,
+    "indexes": [
+      "idx_resources_search",
+      "idx_search_reference_pattern",
+      "idx_search_resource",
+      "resources_pkey"
+    ]
+  }
+]

@@ -4,13 +4,111 @@ The final change extends PR #1597's query 2 optimization with a bounded native
 query 1 reverse chain and a resource-scoped quantity fence for query 3. It avoids
 application-level Observation body enumeration for the eligible Patient `_has`
 search, preserves Q2's composite fence, and preserves Q3's complete raw/canonical
-quantity predicate. No schema migration or new index is required.
+quantity predicate. The selective-search fix itself adds no schema migration or index.
 
-The available Synthea corpus verifies the measured warm default-runtime targets
-for Q1 and Q3. Q2 still has an acceptance gap: its original patient anchor and
-indexed references are absent, so this corpus cannot verify the ticket's expected
-three matches. The isolated three-result Q2 fixture below is separate evidence.
-Cold-cache latency and opt-in generic-plan performance have explicit limits.
+The restored full corpus verifies the isolated warm default-runtime targets for
+all three query shapes. The original Q2 patient and its references are absent;
+the positive Q2 run explicitly substitutes an existing patient with exactly
+three `164.1 cm` height observations. No clinical data was added or changed.
+First-execution latency remains a separate investigation in [#1625](https://github.com/HeliosSoftware/hfs/issues/1625),
+and opt-in generic-plan performance retains the documented limits below.
+
+## Closure verification after integrating main
+
+The signed source commit `803270e4d` merges `main`'s broad Observation optimization
+without changing the three selective shapes. Debug verification passed **197
+PostgreSQL search unit tests, five issue-specific persistence tests and six HTTP
+tests**; formatting and diff checks passed. The following HTTP measurements use
+a separately built release HFS binary with R4/PostgreSQL and the default
+`force_custom_plan`, an eight-connection pool and no competing database searches.
+
+A stopped full-corpus database was copied with reflinks while its original volume
+was mounted read-only. All work used the copy; the original stayed stopped. The
+copy received main's normal schema 44→45 migration and patient-export GIN index.
+Every captured Q1/Q2/Q3 plan excludes that new index. No `ANALYZE`, clinical
+resource creation, or clinical resource updates were performed. PostgreSQL 16.15
+used `shared_buffers=4GB` and `effective_cache_size=14GB`, matching the issue's
+settings rather than the historical run's 8 GB/24 GB. The container had 14 CPUs and
+18 GB RAM; the host had 16 CPUs. Runtime settings and source/binary fingerprints
+are in the [artifact manifest](evidence/1579/restored-corpus-2026-09-30/manifest.json).
+
+Exact counts are 11,705 live Patients, 7,699,987 live Observations and 18,957,921 live
+resource rows. Subtracting the existing 1,372 SearchParameters and five
+CompartmentDefinitions gives 18,956,544, the issue's resource total. Patient and
+Observation counts match the issue directly; this does not assert byte identity
+with its unavailable original snapshot.
+
+### Q2's existing positive anchor
+
+The original `01a0e8b8-323d-7341-9bfe-81346acf0c01` has zero live Patient rows and
+zero indexed patient references. The replacement,
+`01a0d68e-81eb-7a42-975a-9c417bb5c260`, was already present in the copy and has 106
+live Observation candidates. Independently filtering those resource bodies by
+subject, top-level LOINC `8302-2` and raw `valueQuantity.value > 160` yields exactly
+three resources, each with 164.1 cm. The original issue does not specify Q2's total
+Observation candidate count; 165 belongs to its Q3 anchor. The independent
+[body ground truth](evidence/1579/restored-corpus-2026-09-30/body-ground-truth.json)
+and [matching resource fields](evidence/1579/restored-corpus-2026-09-30/selected-q2-resource-values.json)
+are preserved. Q2 changes only the patient UUID; its composite expression,
+threshold, expected cardinality and latency target are unchanged.
+
+### Clean isolated warm HTTP runs
+
+After one recorded accurate-total warmup per shape, each query ran sequentially
+twice with `_total=none` and twice with `_total=accurate`. All responses were 200,
+all ordered IDs agreed across modes/runs, and no owned statement remained active
+after a request. A 0.5 s host monitor captured 15 samples during this pass, with zero
+cargo/rustc/clang/lld processes; maximum one-minute host load was 0.177 on 16 CPUs.
+
+| Query | Total mode | Run 1 (s) | Run 2 (s) | Results / total |
+|---|---|---:|---:|---|
+| Q1 original reverse chain, count 5 | none | 0.005394 | 0.005361 | Five Patients / omitted |
+| Q1 original reverse chain, count 5 | accurate | 1.599303 | 1.605634 | Five Patients / 11,705 |
+| Q2 existing replacement + original composite | none | 0.215428 | 0.209686 | Three / omitted |
+| Q2 existing replacement + original composite | accurate | 0.412942 | 0.413372 | Three / three |
+| Q3 original patient + code + quantity in cm | none | 0.287050 | 0.280759 | Eight / omitted |
+| Q3 original patient + code + quantity in cm | accurate | 0.559771 | 0.565397 | Eight / eight |
+
+[Complete primary timings](evidence/1579/restored-corpus-2026-09-30/primary-timings.json)
+include IDs, statement counts and timestamps. An earlier twelve-request warm
+pass also met all targets and is retained separately; its monitor observed
+cargo-only activity in three of 16 samples, with no actual compiler processes.
+The clean pass was repeated to remove that host-activity uncertainty. Both passes
+captured identical SQL and typed binding bytes. Full
+[prepared SQL/bindings and EXPLAIN ANALYZE/BUFFERS plans](evidence/1579/restored-corpus-2026-09-30/plans/)
+were replayed from the first pass.
+
+The genuine pre-fence Q2 SQL from base `4427ae16c5dda7338e43032ac49d7c4e79b9875f`
+was also replayed on the same copy, changing only tenant and patient bindings.
+Unlike the small historical fixture, this corpus's old plan starts from 124,126
+global composite matches and probes resource and patient index rows 124,126 times.
+The new plan starts from 106 patient references and makes 106 scoped composite
+probes. The old count's first execution took 44,347.138 ms with uncontrolled cache
+state; a subsequent count took 5,165.257 ms, and its page took 4,206.713 ms. Both
+returned the required three matches. Old count/page root buffers were
+1,407,947/1,407,953, versus 1,239/1,245 in the new plans; new executor times were
+238.467/253.318 ms. These are SQL execution measurements, separate from full HTTP
+latency, and are not a controlled cold/warm speedup comparison. The old plans
+still read shared buffers on subsequent executions. The complete
+[baseline SQL/plans](evidence/1579/restored-corpus-2026-09-30/baseline-q2/)
+preserve that distinction.
+
+### First-execution and generic-mode boundaries
+
+The recorded first observed accurate-total executions after startup were
+Q2 **0.548858 s**, Q3 **2.645491 s**, and Q1 **37.402620 s**, in that order. They
+returned the same correct IDs/totals as the later runs. Database/filesystem cache
+state and the effect of the preceding schema migration/index build were not
+controlled: **these are not controlled cold-cache measurements**, and restarting
+HFS alone does not establish cold caches. They materially exceed the warm Q1/Q3
+targets and are preserved in [warmup.json](evidence/1579/restored-corpus-2026-09-30/warmup.json).
+[#1625](https://github.com/HeliosSoftware/hfs/issues/1625) tracks separate diagnosis
+and an explicit first-execution target; no cause is claimed here.
+
+The closure scope is isolated warm performance under the default custom-plan
+runtime, with the explicit Q2 anchor substitution above. This is not a guarantee
+for arbitrary cache states or opt-in `force_generic_plan`; the latter Q3 limit
+remains as measured in the historical supplement below.
 
 ## Final implementation
 
@@ -66,7 +164,7 @@ remain independent fields; the search is not converted into a composite. No
 contained-row filter is added to Q3. A unitless comparison keeps its existing
 raw semantics and is outside this fence.
 
-## Final corpus measurements
+## Historical corpus measurements before integrating main
 
 Before and after used the same PostgreSQL 16.15, schema 44, R4 denormalized
 snapshot, eight-connection pool, request settings, and SQL-capture proxy overhead.
@@ -166,11 +264,11 @@ risk in opt-in generic mode: there is no patient-first or candidate-work bound
 for every plan mode. The approved default custom-plan runtime meets the measured
 targets; generic Q3 does not meet them.
 
-No cold-cache latency guarantee is established. Experiments warmed corpus
+No cold-cache latency guarantee is established. These historical experiments warmed corpus
 buffers, and an earlier cold-ish Q1 fenced count took 6.649 seconds with 28,832
-read blocks. Q3's first before request also had a 55.845-second outlier. Q2's
-missing three-result acceptance case remains open, so these results do not fully
-close the ticket.
+read blocks. Q3's first before request also had a 55.845-second outlier. At the time of these measurements, Q2's
+missing three-result acceptance case remained open. The restored-corpus section
+above supplies positive evidence using the explicit existing-anchor substitution.
 
 ## Historical Q2-only synthetic evidence
 
@@ -328,7 +426,7 @@ The historical fixture also exposed a contained-only Q1 false positive. The
 final native Q1 guard corrects that case; the historical resolver timings and
 Q3 SQL are superseded by the final implementation and corpus evidence.
 
-## Automated validation of the final source
+## Historical automated validation before integrating main
 
 Final suites and checks passed; the initial combined run is annotated below.
 Persistence and REST commands used `--release`, four build jobs, and a shared
