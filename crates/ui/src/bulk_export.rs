@@ -1483,12 +1483,16 @@ pub async fn cancel(
     let snapshot = load_jobs(&state, &user_key, &rt.id).await;
     if let Some(original) = snapshot.jobs.get(&id) {
         let mut job = parse_job(original);
+        // The server's answer decides the card (#1571): a refused DELETE
+        // leaves the job running, so the card stays in progress and says
+        // why; only a landed (or already gone) one marks it cancelled.
+        let mut refused: Option<String> = None;
         if let RemoteJobIdentity::Known(remote_id) = remote_job_identity(&job, &state, &rt.id)
             && let (Ok(client), Ok(url)) =
                 (no_redirect_client(), status_url(&state, &rt.id, &remote_id))
         {
             let audience = url.to_string();
-            if let Ok(request) = forward_identity(
+            refused = match forward_identity(
                 &state,
                 client
                     .delete(url)
@@ -1499,13 +1503,29 @@ pub async fn cancel(
             )
             .await
             {
-                let _ = request.send().await;
+                Ok(request) => match request.send().await {
+                    Ok(response)
+                        if response.status().is_success()
+                            || response.status() == StatusCode::NOT_FOUND =>
+                    {
+                        None
+                    }
+                    Ok(response) => Some(cancel_refusal(response).await),
+                    Err(e) => Some(e.to_string()),
+                },
+                Err(e) => Some(e),
+            };
+        }
+        match refused {
+            Some(reason) => job.error = reason,
+            None => {
+                job.status = "cancelled".to_string();
+                job.finished_at = now_stamp();
+                job.progress = String::new();
+                job.error = String::new();
+                job.clear_types_progress();
             }
         }
-        job.status = "cancelled".to_string();
-        job.finished_at = now_stamp();
-        job.progress = String::new();
-        job.clear_types_progress();
         let _ = store_job_conditionally(
             &state,
             &user_key,
@@ -1518,6 +1538,26 @@ pub async fn cancel(
         .await;
     }
     Redirect::to("/ui/bulk-export").into_response()
+}
+
+/// The line an in-progress card shows for a DELETE the server refused: the
+/// status and the OperationOutcome text, or the status alone when the body
+/// carried none.
+async fn cancel_refusal(response: reqwest::Response) -> String {
+    let code = response.status();
+    let body = response.text().await.unwrap_or_default();
+    let detail = response_diagnostics(&body);
+    if detail.is_empty() {
+        format!(
+            "{} {}",
+            code.as_u16(),
+            code.canonical_reason().unwrap_or("")
+        )
+        .trim_end()
+        .to_string()
+    } else {
+        format!("{}: {detail}", code.as_u16())
+    }
 }
 
 /// `POST /ui/bulk-export/active/{id}/retry` — same parameters, fresh kick-off.

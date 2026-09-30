@@ -786,6 +786,7 @@ bulk-export-files = Dateien
 bulk-export-finished-in = fertig in
 bulk-export-error = Fehler
 bulk-export-cancel = Abbrechen
+bulk-export-cancel-refused = Der Server hat den Abbruch abgelehnt:
 bulk-export-retry = Erneut versuchen
 bulk-export-download-all = Alle Ressourcen herunterladen
 bulk-export-download-all-aria = Alle Ressourcen aus { $name } herunterladen
@@ -999,26 +1000,19 @@ lib-run-unknown-table-more = Unbekannte Tabelle { $name } – Zeile { $line }.
 ## Tabellenbereich (#842, beide Arten) — Reads from / Used by / Columns
 
 lib-tables-heading = Liest von
-lib-tables-col-alias = Alias
-lib-tables-col-target = Liest von
 lib-tables-no-alias = (kein Label)
 lib-tables-empty = Noch keine Tabellen deklariert.
-lib-tables-note = Jede Tabelle, die die SQL-Abfrage liest, als relatedArtifact-depends-on-Einträge: Alias links, die ViewDefinition oder SQL View, zu der es aufgelöst wird, rechts.
-lib-tables-remove = Entfernen
 lib-tables-kind-view-definition = ViewDefinition
 lib-tables-target-not-found = Nicht gefunden
 lib-tables-target-not-found-detail = Keine ViewDefinition oder SQL View entspricht { $resource }. Korrigieren Sie den kanonischen Wert in Details oder entfernen Sie die Zeile.
 lib-tables-target-not-a-table = Keine Tabelle
 lib-tables-target-not-a-table-detail = Es kann nur eine ViewDefinition oder eine SQL View gelesen werden.
-lib-tables-add-toggle = Tabelle hinzufügen
 lib-tables-add-table-label = Tabelle
-lib-tables-add-table-placeholder = View Definitions und SQL Views durchsuchen
-lib-tables-add-table-hint = Zum Suchen nach Namen tippen oder aus der Liste wählen.
+lib-tables-add-table-placeholder = Tabelle hinzufügen…
 lib-tables-add-table-fallback-placeholder = ViewDefinition/{"{"}id{"}"} oder Library/{"{"}id{"}"}
-lib-tables-add-table-fallback-hint = Geben Sie eine ViewDefinition- oder SQL-View-Referenz ein.
 lib-tables-alias-label = Alias
-lib-tables-alias-hint = Standardmäßig der Name des Artefakts
 lib-tables-add-submit = Hinzufügen
+lib-tables-add-hint = Eine View Definition oder SQL View suchen; der Alias übernimmt standardmäßig ihren Namen.
 lib-tables-add-error-required = Wählen Sie eine ViewDefinition oder eine SQL View
 lib-tables-add-error-alias-required = Alias ist erforderlich
 lib-tables-add-error-alias-invalid = Der Alias muss ^[A-Za-z][A-Za-z0-9_]*$ entsprechen
@@ -1027,6 +1021,8 @@ lib-tables-options-empty = Keine Treffer.
 lib-tables-unknown = Unbekannte Tabelle
 lib-tables-unknown-detail = Wird in der SQL-Abfrage verwendet, ist aber nicht deklariert. Wählen Sie eine ViewDefinition oder SQL View, oder korrigieren Sie den Namen.
 lib-tables-declare = { $name } deklarieren
+lib-tables-declare-short = Deklarieren
+lib-tables-remove-row = { $alias } entfernen
 
 lib-used-by-heading = Verwendet von
 lib-used-by-empty = Wird noch von nichts verwendet.
@@ -1819,3 +1815,7 @@ hts-home-chart-hint-series-all = alle Statusklassen
 hts-home-chart-hint-series-2xx = nur 2xx-Antworten
 hts-home-chart-hint-series-4xx = nur 4xx-Antworten
 hts-home-chart-hint-series-5xx = nur 5xx-Antworten
+
+## Nur-Bearer-Authentifizierung (#1560): Auth aktiv, keine Browser-Anmeldung konfiguriert
+auth-bearer-only = Die Authentifizierung ist auf diesem Server aktiviert, aber keine Browser-Anmeldung ist konfiguriert. Seiten, die die FHIR-API aus dem Browser aufrufen — Ressourcen, Batch / Transaction, gespeicherte Abfragen und Einstellungen — werden mit 401 abgewiesen. Setzen Sie HFS_UI_LOGIN_CLIENT_ID, um die Anmeldung zu aktivieren, oder verwenden Sie die API direkt mit einem Bearer-Token.
+batch-sign-in-required = Dieser Server hat keine Browser-Anmeldung konfiguriert, daher kann diese Seite die Anfrage nicht authentifizieren. Setzen Sie HFS_UI_LOGIN_CLIENT_ID, um Bundles von hier auszuführen.

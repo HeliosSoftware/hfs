@@ -1390,18 +1390,49 @@ impl PatientExportProvider for PostgresBackend {
             .collect();
         let patient_ref_list: Vec<String> = patient_refs.iter().cloned().collect();
 
-        // Membership is decided on the JSONB payload, not the search_index, so
-        // this holds when search is offloaded to a secondary backend
-        // (postgres-elasticsearch) and the local index is empty. The query only
-        // narrows to rows that mention one of the patients in some
-        // `reference` (or are the patients themselves); `matcher` then applies
-        // the compartment's own parameters to each candidate.
+        // Candidate selection reads the JSONB payload rather than search_index,
+        // which can be empty when search is offloaded. Materializing the GIN
+        // matches before applying the tenant, type and ordering predicates keeps
+        // PostgreSQL from choosing the chronological index and evaluating the
+        // JSON expression across the whole resources table. `matcher` still
+        // applies the exact compartment rules to each candidate.
         let client = self.get_client().await?;
-        let mut sql = "SELECT id, data, last_updated, version_id FROM resources
+        let indexed_candidates =
+            self.has_patient_export_index() && !(is_patient && matcher.is_empty());
+        let mut sql = if indexed_candidates {
+            let refs_idx = if is_patient { 4 } else { 3 };
+            let mut sql = format!(
+                "WITH candidates AS MATERIALIZED (
+                     SELECT tenant_id, resource_type, id, data, last_updated, version_id
+                     FROM resources
+                     WHERE is_deleted = FALSE
+                       AND hfs_patient_references_v1(data) && ${refs_idx}::text[]"
+            );
+            if is_patient {
+                // A Patient may be in its own compartment by ID even without a
+                // reference. Exclude rows already selected by the GIN branch so
+                // a self-referencing Patient cannot appear twice in the export.
+                sql.push_str(
+                    " UNION ALL
+                     SELECT tenant_id, resource_type, id, data, last_updated, version_id
+                     FROM resources
+                     WHERE tenant_id = $1 AND resource_type = $2
+                       AND is_deleted = FALSE AND id = ANY($3::text[])
+                       AND NOT (hfs_patient_references_v1(data) && $4::text[])",
+                );
+            }
+            sql.push_str(
+                ") SELECT id, data, last_updated, version_id FROM candidates
+                   WHERE tenant_id = $1 AND resource_type = $2",
+            );
+            sql
+        } else {
+            "SELECT id, data, last_updated, version_id FROM resources
              WHERE tenant_id = $1
                 AND resource_type = $2
                 AND is_deleted = FALSE"
-            .to_string();
+                .to_string()
+        };
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
             Box::new(tenant_id.to_string()),
             Box::new(resource_type.to_string()),
@@ -1412,7 +1443,14 @@ impl PatientExportProvider for PostgresBackend {
                  WHERE split_part(r #>> '{{}}', '/_history/', 1) = ANY(${idx}::text[]))"
             )
         };
-        let next_idx = if is_patient && matcher.is_empty() {
+        let next_idx = if indexed_candidates && is_patient {
+            params.push(Box::new(patient_ids.to_vec()));
+            params.push(Box::new(patient_ref_list));
+            5
+        } else if indexed_candidates {
+            params.push(Box::new(patient_ref_list));
+            4
+        } else if is_patient && matcher.is_empty() {
             sql.push_str(" AND id = ANY($3::text[])");
             params.push(Box::new(patient_ids.to_vec()));
             4

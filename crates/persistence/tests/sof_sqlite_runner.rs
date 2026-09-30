@@ -66,6 +66,81 @@ mod sqlite_runner_tests {
         );
     }
 
+    /// #1569: the first row by `last_updated, id` is a Patient without
+    /// `gender`, `birthDate` or `address`. Every row still carries every
+    /// column — a missing value is `null`, never an absent key — because the
+    /// output formatters take the column list from the first row.
+    #[tokio::test]
+    async fn a_bare_first_row_keeps_every_column_as_null() {
+        let backend = make_backend().await;
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "bare", "name": [{"family": "Bare"}]}),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed bare patient");
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient", "id": "full", "active": true, "gender": "female",
+                    "birthDate": "2015-12-29", "name": [{"family": "Parker433"}],
+                    "address": [{"city": "Everett"}]
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed full patient");
+
+        let view = json!({
+            "resourceType": "ViewDefinition", "resource": "Patient", "status": "active",
+            "select": [{"column": [
+                {"name": "id", "path": "getResourceKey()", "type": "id"},
+                {"name": "gender", "path": "gender"},
+                {"name": "birth_date", "path": "birthDate", "type": "date"},
+                {"name": "family", "path": "name.first().family"},
+                {"name": "city", "path": "address.first().city"}
+            ]}],
+            "where": [{"path": "active.exists().not() or active = true"}]
+        });
+        let runner = backend.sof_runner().expect("runner");
+        let mut stream = runner
+            .run_view(&tenant, view, ViewFilters::default())
+            .await
+            .expect("run_view");
+        let mut rows: Vec<Value> = Vec::new();
+        while let Some(row) = stream.next().await {
+            rows.push(row.expect("row"));
+        }
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let columns = ["id", "gender", "birth_date", "family", "city"];
+        for row in &rows {
+            let object = row.as_object().expect("object row");
+            for column in columns {
+                assert!(object.contains_key(column), "{column} missing from {row}");
+            }
+        }
+        let bare = rows
+            .iter()
+            .find(|r| r["family"] == "Bare")
+            .expect("bare row");
+        assert_eq!(bare["gender"], Value::Null, "{bare}");
+        assert_eq!(bare["birth_date"], Value::Null, "{bare}");
+        assert_eq!(bare["city"], Value::Null, "{bare}");
+        let full = rows
+            .iter()
+            .find(|r| r["family"] == "Parker433")
+            .expect("full row");
+        assert_eq!(full["gender"], "female", "{full}");
+        assert_eq!(full["birth_date"], "2015-12-29", "{full}");
+        assert_eq!(full["city"], "Everett", "{full}");
+    }
+
     // =========================================================================
     // 2. In-DB runner produces same results as in-process runner
     // =========================================================================
@@ -634,8 +709,8 @@ mod sqlite_runner_tests {
             by_id["o1"].get("patient_key").and_then(|v| v.as_str()),
             Some("p1")
         );
-        // Mismatched type yields NULL → key absent from the row map.
-        assert!(by_id["o2"].get("patient_key").is_none());
+        // Mismatched type yields NULL, kept in the row as JSON null (#1569).
+        assert_eq!(by_id["o2"].get("patient_key"), Some(&Value::Null));
     }
 
     #[tokio::test]

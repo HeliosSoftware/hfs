@@ -2747,11 +2747,27 @@ mod tests {
             }
         }
 
+        /// Which of the REST `DELETE /export-status` teardown steps run while
+        /// the worker is parked.
+        enum Teardown {
+            /// Cancel, sweep the outputs, delete the job row: the handler's
+            /// order.
+            Full,
+            /// Cancel and delete the job row only, as when the handler's
+            /// output sweeps both failed against a directory the worker kept
+            /// non-empty (#1549).
+            SweepsFailed,
+        }
+
         /// Runs a job over a real [`LocalFsOutputStore`], parks the worker at
         /// `at`, performs the REST `DELETE /export-status` teardown (cancel,
         /// delete the outputs, delete the job row) while it is parked, then
         /// lets it go. Returns whether the job's output directory survived.
         async fn delete_export_mid_batch(at: PausePoint) -> bool {
+            teardown_mid_batch(at, Teardown::Full).await
+        }
+
+        async fn teardown_mid_batch(at: PausePoint, teardown: Teardown) -> bool {
             let backend = Arc::new(SqliteBackend::in_memory().unwrap());
             backend.init_schema().unwrap();
             let tenant = tenant();
@@ -2816,7 +2832,9 @@ mod tests {
                 .expect("the worker should reach the pause point");
             // Exactly what the REST handler does, in its order.
             backend.cancel_export(&tenant, &job_id).await.unwrap();
-            inner.delete_job_outputs(&tenant, &job_id).await.unwrap();
+            if matches!(teardown, Teardown::Full) {
+                inner.delete_job_outputs(&tenant, &job_id).await.unwrap();
+            }
             backend.delete_export(&tenant, &job_id).await.unwrap();
             release.notify_one();
 
@@ -2852,6 +2870,28 @@ mod tests {
             assert!(
                 !delete_export_mid_batch(PausePoint::Finalize).await,
                 "a part in flight when its job was deleted must not outlive the run"
+            );
+        }
+
+        /// The cancel-path straggler (#1549): the handler's output sweeps
+        /// could not remove the directory, so nothing but the worker can. The
+        /// job row is gone by the time the worker publishes its late part, and
+        /// the run removes the directory on its way out.
+        #[tokio::test]
+        async fn test_run_job_removes_a_part_written_after_a_cancel_whose_sweeps_failed() {
+            assert!(
+                !teardown_mid_batch(PausePoint::Open, Teardown::SweepsFailed).await,
+                "a part published after a cancel must not outlive the run even when \
+                 the handler could not sweep it"
+            );
+        }
+
+        /// Same, with the cancel landing while the part is being written.
+        #[tokio::test]
+        async fn test_run_job_leaves_nothing_when_cancelled_mid_part_and_sweeps_failed() {
+            assert!(
+                !teardown_mid_batch(PausePoint::Finalize, Teardown::SweepsFailed).await,
+                "a part in flight when its job was cancelled must not outlive the run"
             );
         }
 

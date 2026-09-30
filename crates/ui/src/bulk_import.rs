@@ -1357,8 +1357,10 @@ fn severity_total(cs: &Value, codes: [&str; 2]) -> Option<u64> {
 }
 
 /// One poll of the recipient's status URL: `202` records `X-Progress`, `200`
-/// records the status manifest as the submission's result, anything else is
-/// logged and polling stops (the poll URL is cleared). Neither `200` nor a
+/// records the status manifest as the submission's result, `401`/`403` keep
+/// polling with the failure backoff (the credential is the page's, not the
+/// recipient's verdict; #1561), anything else is logged and polling stops
+/// (the poll URL is cleared). Neither `200` nor a
 /// failure changes a closed-out submission's status (#1069). `202` and `429`
 /// carry `Retry-After`; both push `next_poll_at` out so the card's refresh
 /// cadence never turns into a poll the recipient would reject (#790).
@@ -1489,6 +1491,29 @@ async fn poll_status(
                     ),
                 );
             }
+        }
+        status @ (401 | 403) => {
+            // The credential is the page's, not the recipient's verdict on
+            // the submission (#1561): the ingest goes on, so the poll URL
+            // stays and the next poll backs off like a transport failure.
+            let last = std::mem::take(&mut submission.progress);
+            submission.progress = if last.starts_with("Status unavailable") || last.is_empty() {
+                format!(
+                    "Status unavailable: the credential this page polls with was rejected ({status})"
+                )
+            } else {
+                format!(
+                    "Status unavailable: the credential this page polls with was rejected ({status}); last report: {last}"
+                )
+            };
+            push_log(
+                submission,
+                format!(
+                    "Status poll answered {status}: the credential this page polls with was rejected (expired, revoked or lacking system/bulk-submit); polling continues and the submission stays {}.",
+                    submission.status
+                ),
+            );
+            hold_polls_for(submission, STATUS_POLL_FAILURE_BACKOFF_SECS);
         }
         429 => {
             // A throttled poll is backoff bookkeeping, not a run event — it

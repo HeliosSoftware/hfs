@@ -226,7 +226,7 @@ Backend (connection management, capabilities)
 ## Features
 
 - **Multiple Backends**: SQLite, PostgreSQL, Cassandra, MongoDB, Neo4j, Elasticsearch, S3
-- **Multitenancy**: Shared-schema isolation via a `tenant_id` discriminator on every backend, with a mandatory `TenantContext` on every tenant-scoped operation (the S3 backend additionally offers a bucket-per-tenant mode)
+- **Multitenancy**: Shared-schema isolation via a `tenant_id` discriminator on every backend, with a mandatory `TenantContext` on every tenant-scoped operation (the S3 backend additionally offers a bucket-per-tenant mode to embedders; the `hfs` binary configures prefix-per-tenant only — see S3 tenancy below)
 - **Full FHIR Search**: All parameter types, modifiers, chaining, \_include/\_revinclude
 - **Versioning**: Complete resource history with optimistic locking
 - **Transactions**: ACID transactions with FHIR bundle support
@@ -251,12 +251,17 @@ backend applies the discriminator in its own idiom:
 | **PostgreSQL**    | `tenant_id` column; `PRIMARY KEY (tenant_id, resource_type, id)`          |
 | **MongoDB**       | `tenant_id` field on every document                                       |
 | **Elasticsearch** | Per-tenant index (`{prefix}_{tenant}_{type}`) **and** a `tenant_id` filter |
-| **S3**            | Tenant-scoped key prefix, or a dedicated bucket per tenant (see below)    |
+| **S3**            | Tenant-scoped key prefix (what the `hfs` binary configures); a dedicated bucket per tenant is a library mode (see below) |
 
 The S3 backend is the one place HFS offers a genuine per-tenant *physical*
 boundary: `S3TenancyMode::BucketPerTenant` gives each mapped tenant its own
 bucket, with its own IAM/policy surface (tenants absent from the bucket map
-fall back to the shared system bucket). Every other backend is shared-schema.
+fall back to the shared system bucket). The `hfs` binary does not reach that
+mode: it builds `PrefixPerTenant` from `HFS_S3_BUCKET` at every S3 wiring site
+and no `HFS_S3_*` variable selects bucket-per-tenant, so every `hfs`
+deployment is shared-schema on S3 as well; the mode is for embedders that
+construct `S3Backend` themselves (#1514). Making it configurable from the
+binary is #1598. Every other backend is shared-schema.
 Note that Elasticsearch gives each tenant its own index, but within a single
 cluster and credential, so that is a naming boundary rather than a physical
 one — the term filter is what actually isolates.
@@ -409,8 +414,10 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
   the resources table directly. Cursor (keyset) pagination is consistent with the active sort: the
   sort key value is encoded into the opaque cursor and the keyset comparison runs on it, so deep
   paging preserves the sort order. A multi-field `_sort` returns a single page (no cursor). MongoDB
-  sorts by `_id`/`_lastUpdated` only and cannot combine a custom sort with cursor pagination, hence
-  ◐ for multiple fields.
+  sorts by `_id`/`_lastUpdated`, or by up to 15 indexed search parameters (each key in its own
+  direction, a missing value last for that key, ties broken by id); it cannot combine a
+  search-parameter sort with `_id`/`_lastUpdated`/`_score` or with cursor pagination, hence ◐ for
+  multiple fields.
 - **`:above` / `:below`** — two mechanisms (◐ = both, conditional on context): (1) hierarchical
   **URI** prefix matching is native to SQLite, PostgreSQL, and Elasticsearch (no external service);
   (2) **token/code** hierarchy (e.g. `code:below=http://snomed.info/sct|73211009`) is resolved at
@@ -618,8 +625,9 @@ MongoDB provides document-centric primary storage with full FHIR capabilities in
   supported; chained/`_has` work via the REST-layer resolver)
 - `_include` and `_revinclude` resolution
 - Conditional create, update, and delete operations
-- Cursor and offset pagination; sorting by `_id`/`_lastUpdated` (a custom sort cannot be combined
-  with cursor pagination)
+- Cursor and offset pagination; sorting by `_id`/`_lastUpdated` or by up to 15 indexed search
+  parameters (a search-parameter sort is offset-paged and cannot be combined with
+  `_id`/`_lastUpdated`/`_score` or with cursor pagination)
 - Shared-schema multitenancy with strict tenant filtering
 - Optimistic locking with ETag support
 
@@ -892,7 +900,7 @@ let config = S3BackendConfig {
 | Mode | Description |
 |------|-------------|
 | **PrefixPerTenant** | All tenants share one bucket with tenant-specific key prefixes |
-| **BucketPerTenant** | Each tenant maps to a specific bucket via an explicit tenant→bucket map |
+| **BucketPerTenant** | Each tenant maps to a specific bucket via an explicit tenant→bucket map. Library mode only: the `hfs` binary has no environment for it (#1514, #1598) |
 
 ### Object Model
 
@@ -1518,6 +1526,16 @@ does not guarantee that repair: `$reindex` sends the same documents through the
 none of them. Treat a rebuild as a repair only once `GET /$reindex-status/{job_id}`
 reports `errorCount` 0 for the type. The `hfs` binary exposes the limit as
 `HFS_ELASTICSEARCH_NESTED_OBJECTS_LIMIT`.
+
+A search that pins many ids — a chained or `_has` search whose terminal hop
+resolved a wide set, sent to Elasticsearch as `_id` values — meets a second
+ceiling, `index.max_terms_count` (Elasticsearch's default 65,536 values per
+`terms` query). `ElasticsearchConfig::max_terms_count` (default 65536) is written
+into the index template, and the query builder splits an id list longer than it
+into several `terms` clauses ORed under one `bool.should`, so such a search
+succeeds instead of being refused (#1548); when Elasticsearch still refuses a
+query for a limit it names, the `400` names that limit. The `hfs` binary exposes
+it as `HFS_ELASTICSEARCH_MAX_TERMS_COUNT`.
 
 #### Bulk writes and rebuilds on Elasticsearch-backed composites
 
