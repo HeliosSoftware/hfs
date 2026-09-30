@@ -14,6 +14,7 @@ use axum_test::TestServer;
 use helios_rest::ServerConfig;
 
 const ACCEPT: HeaderName = HeaderName::from_static("accept");
+const PREFER: HeaderName = HeaderName::from_static("prefer");
 const CONTENT_TYPE: HeaderName = HeaderName::from_static("content-type");
 const FHIR_XML: HeaderValue = HeaderValue::from_static("application/fhir+xml");
 const FHIR_JSON: HeaderValue = HeaderValue::from_static("application/fhir+json");
@@ -46,6 +47,8 @@ struct Case {
     method: Method,
     path: &'static str,
     body: Option<&'static str>,
+    prefer: Option<&'static str>,
+    #[cfg_attr(not(feature = "xml"), allow(dead_code))]
     produced: StatusCode,
 }
 
@@ -55,6 +58,17 @@ fn cases() -> Vec<Case> {
         method,
         path,
         body,
+        prefer: None,
+        produced,
+    };
+    // The `Prefer: return=OperationOutcome` answers of create and update are
+    // formatted by their own call site.
+    let outcome = |label, method, path, body, produced| Case {
+        label,
+        method,
+        path,
+        body,
+        prefer: Some("return=OperationOutcome"),
         produced,
     };
     vec![
@@ -115,6 +129,20 @@ fn cases() -> Vec<Case> {
             Some(PATIENT),
             StatusCode::OK,
         ),
+        outcome(
+            "create, return=OperationOutcome",
+            Method::POST,
+            "/Patient",
+            Some(NEW_PATIENT),
+            StatusCode::CREATED,
+        ),
+        outcome(
+            "update, return=OperationOutcome",
+            Method::PUT,
+            "/Patient/p1",
+            Some(PATIENT),
+            StatusCode::OK,
+        ),
         case(
             "validate",
             Method::POST,
@@ -129,6 +157,9 @@ async fn send(server: &TestServer, case: &Case) -> axum_test::TestResponse {
     let mut request = server
         .method(case.method.clone(), case.path)
         .add_header(ACCEPT, FHIR_XML);
+    if let Some(prefer) = case.prefer {
+        request = request.add_header(PREFER, HeaderValue::from_static(prefer));
+    }
     if let Some(body) = case.body {
         request = request
             .add_header(CONTENT_TYPE, FHIR_JSON)
