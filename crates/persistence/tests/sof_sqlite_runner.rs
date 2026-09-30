@@ -1415,7 +1415,7 @@ mod sqlite_runner_tests {
         let backend = make_backend().await;
         let tenant = test_tenant();
         let other = TenantContext::new(
-            TenantId::new(&format!("other-{}", uuid::Uuid::new_v4().simple())),
+            TenantId::new(format!("other-{}", uuid::Uuid::new_v4().simple())),
             TenantPermissions::full_access(),
         );
         let since = chrono::Utc::now() - chrono::Duration::seconds(1);
