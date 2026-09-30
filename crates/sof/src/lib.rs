@@ -2065,6 +2065,7 @@ fn write_csv_chunk<W: Write>(result: &ChunkedResult, writer: &mut W) -> Result<(
             .values
             .iter()
             .map(|v| match v {
+                None | Some(serde_json::Value::Null) => String::new(),
                 Some(val) => {
                     if let serde_json::Value::String(s) = val {
                         s.clone()
@@ -2072,7 +2073,6 @@ fn write_csv_chunk<W: Write>(result: &ChunkedResult, writer: &mut W) -> Result<(
                         serde_json::to_string(val).unwrap_or_default()
                     }
                 }
-                None => String::new(),
             })
             .collect();
         wtr.write_record(&record)?;
@@ -4159,6 +4159,9 @@ pub fn format_csv(result: ProcessedResult, include_header: bool) -> Result<Vec<u
             .values
             .iter()
             .map(|v| match v {
+                // A missing value is an empty cell whether the row carried
+                // the key as JSON null or not at all (#1569).
+                None | Some(serde_json::Value::Null) => String::new(),
                 Some(val) => {
                     // For string values, extract the raw string instead of JSON serializing
                     if let serde_json::Value::String(s) = val {
@@ -4168,7 +4171,6 @@ pub fn format_csv(result: ProcessedResult, include_header: bool) -> Result<Vec<u
                         serde_json::to_string(val).unwrap_or_default()
                     }
                 }
-                None => String::new(),
             })
             .collect();
         wtr.write_record(&record)?;

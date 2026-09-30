@@ -240,6 +240,11 @@ fn invalid_number_value(
     })
 }
 
+// MongoDB allows 32 sort fields: each parameter needs a missing flag and
+// a value field, followed by the resource-id tie-breaker. Apply the same
+// limit to filtered sorts so adding a filter never changes validity.
+const MAX_SEARCH_PARAM_SORT_KEYS: usize = 15;
+
 const CANDIDATE_BATCH_SIZE: usize = 512;
 const PROBE_ROW_LIMIT: u64 = 100_000;
 // 300k × ~45 bytes/UUID ≈ 13.5 MB — safely under the 16 MB BSON document cap.
@@ -265,21 +270,34 @@ async fn collect_documents(mut cursor: Cursor<Document>) -> StorageResult<Vec<Do
     Ok(docs)
 }
 
-/// Orders `(resource_id, key)` pairs the way the server's
-/// `{ key: <order>, _id: 1 }` sort would: by key in the requested direction,
-/// ties broken by id ascending in both directions. Returns the ids.
+/// Orders `(resource_id, keys)` pairs the way the server's
+/// `{ missing0: 1, key0: <order>, missing1: 1, key1: <order>, …, _id: 1 }`
+/// sort would: key by key, each in its own direction, a missing key after
+/// every present one in either direction, ties on every key broken by id
+/// ascending. `keys` and `directions` are parallel. Returns the ids.
 fn order_sort_keys(
-    mut keyed: Vec<(String, Bson)>,
-    direction: crate::types::SortDirection,
+    mut keyed: Vec<(String, Vec<Option<Bson>>)>,
+    directions: &[crate::types::SortDirection],
 ) -> Vec<String> {
     use crate::types::SortDirection;
-    keyed.sort_by(|(id_a, key_a), (id_b, key_b)| {
-        let by_key = compare_sort_keys(key_a, key_b);
-        let by_key = match direction {
-            SortDirection::Ascending => by_key,
-            SortDirection::Descending => by_key.reverse(),
-        };
-        by_key.then_with(|| id_a.cmp(id_b))
+    use std::cmp::Ordering;
+    keyed.sort_by(|(id_a, keys_a), (id_b, keys_b)| {
+        keys_a
+            .iter()
+            .zip(keys_b)
+            .zip(directions)
+            .map(|((key_a, key_b), direction)| match (key_a, key_b) {
+                (Some(a), Some(b)) => match direction {
+                    SortDirection::Ascending => compare_sort_keys(a, b),
+                    SortDirection::Descending => compare_sort_keys(a, b).reverse(),
+                },
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            })
+            .find(|ordering| ordering.is_ne())
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| id_a.cmp(id_b))
     });
     keyed.into_iter().map(|(id, _)| id).collect()
 }
@@ -459,6 +477,69 @@ fn sort_key_expression(value_field: &str, direction: crate::types::SortDirection
     } else {
         Bson::String(format!("${value_field}"))
     }
+}
+
+/// The `search_index` field a sort directive reads. The writer stores
+/// quantities in `value_quantity_value`, not `value_number`; mapping them to
+/// the latter made every quantity sort degrade silently to id order (#1040).
+/// A missing/composite/special param type falls back to `value_string`.
+fn sort_value_field(directive: &crate::types::SortDirective) -> &'static str {
+    directive
+        .param_type
+        .and_then(value_field_for)
+        .unwrap_or("value_string")
+}
+
+/// Narrows a parameter sort's `$match` to the rows that carry a value for
+/// one of the sort keys. A single key keeps the plain
+/// `{param_name, value_field: {$ne: null}}` form, which lets the planner use
+/// that parameter's partial value index.
+fn add_sort_key_row_filter(filter: &mut Document, directives: &[crate::types::SortDirective]) {
+    let row = |directive: &crate::types::SortDirective| {
+        let value_field = sort_value_field(directive);
+        doc! {
+            "param_name": &directive.parameter,
+            value_field: { "$ne": Bson::Null },
+        }
+    };
+    if let [directive] = directives {
+        for (name, value) in row(directive) {
+            filter.insert(name, value);
+        }
+    } else {
+        let rows: Vec<Document> = directives.iter().map(row).collect();
+        filter.insert("$or", rows);
+    }
+}
+
+/// The `$group` that reduces a resource's search-index rows to one key per
+/// sort directive, `key0`, `key1`, …: `$min` for an ascending key and `$max`
+/// for a descending one, over that directive's rows only. A resource with no
+/// row for a directive gets a null key, since `$min`/`$max` ignore nulls.
+/// The parameter name is wrapped in `$literal`: `_sort` names reach the
+/// backend unvalidated, and a bare `$`-prefixed string in an aggregation
+/// expression is a field path or variable, not a value.
+fn sort_key_group(directives: &[crate::types::SortDirective]) -> Document {
+    use crate::types::SortDirection;
+    let mut group = doc! { "_id": "$resource_id" };
+    for (index, directive) in directives.iter().enumerate() {
+        let accumulator = match directive.direction {
+            SortDirection::Ascending => "$min",
+            SortDirection::Descending => "$max",
+        };
+        let value = sort_key_expression(sort_value_field(directive), directive.direction);
+        group.insert(
+            format!("key{index}"),
+            doc! { accumulator: {
+                "$cond": [
+                    { "$eq": ["$param_name", { "$literal": &directive.parameter }] },
+                    value,
+                    Bson::Null,
+                ]
+            }},
+        );
+    }
+    group
 }
 
 /// The envelope filter for a `:missing` presence check
@@ -800,23 +881,39 @@ impl SearchProvider for MongoBackend {
             .matching_resource_ids(&db, tenant_id, &query.resource_type, query)
             .await?;
 
-        // Sorting by an indexed search parameter (#881): the sort key lives
-        // in the search index, not on the resource documents, so the ordered
-        // id list is computed there and the page fetched by id. Offset-paged;
-        // it has no keyset, so a cursor is already rejected above.
-        let param_sort = query
+        // Sorting by indexed search parameters (#881, #1564): the sort keys
+        // live in the search index, not on the resource documents, so the
+        // ordered id list is computed there and the page fetched by id.
+        // Offset-paged; it has no keyset, so a cursor is already rejected above.
+        // `_id`, `_lastUpdated` and `_score` are not search-index keys, so they
+        // cannot be combined with a parameter key here.
+        if query
             .sort
             .iter()
-            .find(|d| !matches!(d.parameter.as_str(), "_id" | "_lastUpdated" | "_score"));
-        if let Some(directive) = param_sort {
-            if query.sort.len() > 1 {
+            .any(|d| !matches!(d.parameter.as_str(), "_id" | "_lastUpdated" | "_score"))
+        {
+            if let Some(other) = query
+                .sort
+                .iter()
+                .find(|d| matches!(d.parameter.as_str(), "_id" | "_lastUpdated" | "_score"))
+            {
                 return Err(StorageError::Search(SearchError::QueryParseError {
-                    message: "MongoDB supports a single _sort directive when sorting by a                               search parameter"
-                        .to_string(),
+                    message: format!(
+                        "MongoDB cannot combine _sort={} with a search-parameter sort; \
+                         sort by search parameters only",
+                        other.parameter
+                    ),
+                }));
+            }
+            if query.sort.len() > MAX_SEARCH_PARAM_SORT_KEYS {
+                return Err(StorageError::Search(SearchError::QueryParseError {
+                    message: format!(
+                        "MongoDB supports at most {MAX_SEARCH_PARAM_SORT_KEYS} search-parameter sort keys"
+                    ),
                 }));
             }
             return self
-                .search_param_sorted(tenant, query, &db, tenant_id, matched_ids, directive)
+                .search_param_sorted(tenant, query, &db, tenant_id, matched_ids, &query.sort)
                 .await;
         }
 
@@ -1909,10 +2006,11 @@ impl MongoBackend {
         crate::search::validate_value_presence(query)
     }
 
-    /// Search with `_sort` on an indexed parameter (#881): pages over the id
-    /// ordering computed in the search index, then fetches the page by id and
-    /// restores the order. Offset-paginated; no page cursors are issued —
-    /// cursor pagination with a custom sort is rejected at the entry point.
+    /// Search with `_sort` on one or more indexed parameters (#881, #1564):
+    /// pages over the id ordering computed in the search index, then fetches
+    /// the page by id and restores the order. Offset-paginated; no page
+    /// cursors are issued — cursor pagination with a custom sort is rejected
+    /// at the entry point.
     ///
     /// The rows, `has_next` and `total` of one page all derive from a single
     /// id sequence: the ordering, narrowed by the search-index matches and by
@@ -1925,7 +2023,7 @@ impl MongoBackend {
         db: &mongodb::Database,
         tenant_id: &str,
         matched_ids: Option<HashSet<String>>,
-        directive: &crate::types::SortDirective,
+        directives: &[crate::types::SortDirective],
     ) -> StorageResult<SearchResult> {
         // Any filtered sort resolves its candidate set through the resources
         // collection: that folds in the resource-level predicates (`_id`,
@@ -1954,7 +2052,7 @@ impl MongoBackend {
                 db,
                 tenant_id,
                 &query.resource_type,
-                directive,
+                directives,
                 allowed.as_ref(),
             )
             .await?
@@ -2128,44 +2226,34 @@ impl MongoBackend {
             .collect())
     }
 
-    /// Resource ids ordered by an indexed search parameter's value (#881):
-    /// grouped per resource in the search index taking the smallest value
-    /// for ascending sorts and the largest for descending (the SQL backends'
-    /// MIN/MAX), with resources that have no value for the parameter
-    /// appended last in id order.
+    /// Resource ids ordered by one or more indexed search parameters (#881,
+    /// #1564), compared key by key in the order the directives give them.
+    /// Each key is grouped per resource in the search index, taking the
+    /// smallest value for an ascending key and the largest for a descending
+    /// one (the SQL backends' MIN/MAX). A resource without a value for a key
+    /// sorts after every resource with one, for that key, in either
+    /// direction; resources that tie on every key are in id order, so those
+    /// with no value for any key come last in id order.
     ///
     /// With `allowed` — the ids the query matched — the aggregation is
     /// bounded to that set (`resource_id: {$in: chunk}`, hinted onto
-    /// `idx_search_composite`), the per-resource keys are ordered client-side
-    /// and the unkeyed tail is taken from `allowed` itself, so the cost is
-    /// proportional to the result set rather than to the resource type
-    /// (#1040). Without `allowed` (no filter at all) the ordering is still
-    /// computed over the whole type.
+    /// `idx_search_composite`) and the keys are ordered client-side, so the
+    /// cost is proportional to the result set rather than to the resource
+    /// type (#1040). Without `allowed` (no filter at all) the ordering is
+    /// still computed over the whole type.
     async fn param_sorted_ids(
         &self,
         db: &mongodb::Database,
         tenant_id: &str,
         resource_type: &str,
-        directive: &crate::types::SortDirective,
+        directives: &[crate::types::SortDirective],
         allowed: Option<&HashSet<String>>,
     ) -> StorageResult<Vec<String>> {
         use crate::types::SortDirection;
 
-        // The writer stores quantities in `value_quantity_value`, not
-        // `value_number`; mapping them to the latter made every quantity
-        // sort degrade silently to id order (#1040). `value_field_for`
-        // covers that; a missing/composite/special param type falls back to
-        // `value_string`, matching the old catch-all arm.
-        let value_field = directive
-            .param_type
-            .and_then(value_field_for)
-            .unwrap_or("value_string");
-        let (accumulator, order) = match directive.direction {
-            SortDirection::Ascending => ("$min", 1),
-            SortDirection::Descending => ("$max", -1),
-        };
-        let sort_key = sort_key_expression(value_field, directive.direction);
         let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+        let directions: Vec<SortDirection> = directives.iter().map(|d| d.direction).collect();
+        let key_names: Vec<String> = (0..directives.len()).map(|i| format!("key{i}")).collect();
 
         if let Some(allowed) = allowed {
             // Bounded path (#1040): one `$match`+`$group` per chunk of the
@@ -2174,21 +2262,19 @@ impl MongoBackend {
             // deterministic for a given query.
             let mut candidates: Vec<&String> = allowed.iter().collect();
             candidates.sort();
-            let mut keyed: Vec<(String, Bson)> = Vec::with_capacity(allowed.len());
+            let mut keys_by_id: HashMap<String, Vec<Option<Bson>>> =
+                HashMap::with_capacity(allowed.len());
             for chunk in candidates.chunks(SORT_ID_CHUNK) {
                 let ids: Vec<Bson> = chunk.iter().map(|id| Bson::String((*id).clone())).collect();
+                let mut row_filter = doc! {
+                    "tenant_id": tenant_id,
+                    "resource_type": resource_type,
+                    "resource_id": { "$in": Bson::Array(ids) },
+                };
+                add_sort_key_row_filter(&mut row_filter, directives);
                 let pipeline = vec![
-                    doc! { "$match": {
-                        "tenant_id": tenant_id,
-                        "resource_type": resource_type,
-                        "resource_id": { "$in": Bson::Array(ids) },
-                        "param_name": &directive.parameter,
-                        value_field: { "$ne": Bson::Null },
-                    }},
-                    doc! { "$group": {
-                        "_id": "$resource_id",
-                        "key": { accumulator: sort_key.clone() },
-                    }},
+                    doc! { "$match": row_filter },
+                    doc! { "$group": sort_key_group(directives) },
                 ];
                 let cursor = search_index
                     .aggregate(pipeline)
@@ -2198,41 +2284,63 @@ impl MongoBackend {
                     .await
                     .or_query_error("Failed to sort by search parameter")?;
                 for d in collect_documents(cursor).await? {
-                    if let (Ok(id), Some(key)) = (d.get_str("_id"), d.get("key")) {
-                        keyed.push((id.to_string(), key.clone()));
+                    if let Ok(id) = d.get_str("_id") {
+                        let keys = key_names
+                            .iter()
+                            .map(|name| d.get(name).filter(|key| **key != Bson::Null).cloned())
+                            .collect();
+                        keys_by_id.insert(id.to_string(), keys);
                     }
                 }
             }
-            let mut ordered = order_sort_keys(keyed, directive.direction);
-            let keyed_set: HashSet<String> = ordered.iter().cloned().collect();
-            let mut unkeyed: Vec<String> = allowed
+            // A candidate with no row for any key has no value for every
+            // key, which orders it last in id order.
+            let keyed: Vec<(String, Vec<Option<Bson>>)> = allowed
                 .iter()
-                .filter(|id| !keyed_set.contains(*id))
-                .cloned()
+                .map(|id| {
+                    let keys = keys_by_id
+                        .remove(id)
+                        .unwrap_or_else(|| vec![None; directives.len()]);
+                    (id.clone(), keys)
+                })
                 .collect();
-            unkeyed.sort();
-            ordered.extend(unkeyed);
             // `allowed` is live-only by construction — `search_param_sorted`
             // resolves every filtered candidate set through the resources
             // collection with `is_deleted: false` — so no liveness pass is
             // needed here.
-            return Ok(ordered);
+            return Ok(order_sort_keys(keyed, &directions));
         }
 
         // Unfiltered sort: the ordering is still computed over the whole
-        // type. Unchanged from #881/#1056 apart from the value-field mapping.
+        // type. `missingN` puts a resource without a value for key N after
+        // those with one in either direction; MongoDB would otherwise sort a
+        // null key first when ascending.
+        let mut row_filter = doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+        };
+        add_sort_key_row_filter(&mut row_filter, directives);
+        let mut missing = Document::new();
+        let mut sort = Document::new();
+        for (index, directive) in directives.iter().enumerate() {
+            let key = &key_names[index];
+            missing.insert(
+                format!("missing{index}"),
+                doc! { "$cond": [{ "$eq": [format!("${key}"), Bson::Null] }, 1, 0] },
+            );
+            sort.insert(format!("missing{index}"), 1);
+            let order = match directive.direction {
+                SortDirection::Ascending => 1,
+                SortDirection::Descending => -1,
+            };
+            sort.insert(key.clone(), order);
+        }
+        sort.insert("_id", 1);
         let pipeline = vec![
-            doc! { "$match": {
-                "tenant_id": tenant_id,
-                "resource_type": resource_type,
-                "param_name": &directive.parameter,
-                value_field: { "$ne": Bson::Null },
-            }},
-            doc! { "$group": {
-                "_id": "$resource_id",
-                "key": { accumulator: sort_key.clone() },
-            }},
-            doc! { "$sort": { "key": order, "_id": 1 } },
+            doc! { "$match": row_filter },
+            doc! { "$group": sort_key_group(directives) },
+            doc! { "$addFields": missing },
+            doc! { "$sort": sort },
             doc! { "$project": { "_id": 1 } },
         ];
         let cursor = search_index
@@ -2251,7 +2359,7 @@ impl MongoBackend {
         let live = self.all_resource_ids(db, tenant_id, resource_type).await?;
         ordered.retain(|id| live.contains(id));
 
-        // Resources without a value for the parameter sort last.
+        // Resources without a value for any sort key come last.
         let keyed: HashSet<String> = ordered.iter().cloned().collect();
         let mut unkeyed: Vec<String> = live.into_iter().filter(|id| !keyed.contains(id)).collect();
         unkeyed.sort();
@@ -6840,6 +6948,21 @@ mod sort_key_order_tests {
         Bson::DateTime(mongodb::bson::DateTime::from_millis(millis))
     }
 
+    fn one_key(keyed: Vec<(String, Bson)>) -> Vec<(String, Vec<Option<Bson>>)> {
+        keyed
+            .into_iter()
+            .map(|(id, key)| (id, vec![Some(key)]))
+            .collect()
+    }
+
+    fn keys(id: &str, keys: &[Option<Bson>]) -> (String, Vec<Option<Bson>>) {
+        (id.to_string(), keys.to_vec())
+    }
+
+    fn s(value: &str) -> Option<Bson> {
+        Some(Bson::String(value.to_string()))
+    }
+
     #[test]
     fn dates_ascending_order_by_instant() {
         let keyed = vec![
@@ -6848,7 +6971,7 @@ mod sort_key_order_tests {
             ("b".to_string(), dt(200)),
         ];
         assert_eq!(
-            order_sort_keys(keyed, SortDirection::Ascending),
+            order_sort_keys(one_key(keyed), &[SortDirection::Ascending]),
             vec!["a", "b", "c"]
         );
     }
@@ -6861,7 +6984,7 @@ mod sort_key_order_tests {
             ("b".to_string(), dt(200)),
         ];
         assert_eq!(
-            order_sort_keys(keyed.clone(), SortDirection::Descending),
+            order_sort_keys(one_key(keyed.clone()), &[SortDirection::Descending]),
             vec!["c", "b", "a"]
         );
 
@@ -6869,11 +6992,11 @@ mod sort_key_order_tests {
         // the server's `{key: -1, _id: 1}` semantics.
         let tied = vec![("z".to_string(), dt(100)), ("y".to_string(), dt(100))];
         assert_eq!(
-            order_sort_keys(tied.clone(), SortDirection::Ascending),
+            order_sort_keys(one_key(tied.clone()), &[SortDirection::Ascending]),
             vec!["y", "z"]
         );
         assert_eq!(
-            order_sort_keys(tied, SortDirection::Descending),
+            order_sort_keys(one_key(tied), &[SortDirection::Descending]),
             vec!["y", "z"]
         );
     }
@@ -6886,7 +7009,7 @@ mod sort_key_order_tests {
             ("id-b".to_string(), Bson::String("b".to_string())),
         ];
         assert_eq!(
-            order_sort_keys(keyed, SortDirection::Ascending),
+            order_sort_keys(one_key(keyed), &[SortDirection::Ascending]),
             vec!["id-b", "id-ba", "id-c"]
         );
 
@@ -6895,7 +7018,7 @@ mod sort_key_order_tests {
             ("id-B".to_string(), Bson::String("B".to_string())),
         ];
         assert_eq!(
-            order_sort_keys(case_sensitive, SortDirection::Ascending),
+            order_sort_keys(one_key(case_sensitive), &[SortDirection::Ascending]),
             vec!["id-B", "id-a"]
         );
     }
@@ -6908,9 +7031,76 @@ mod sort_key_order_tests {
             ("id-8".to_string(), Bson::Int64(8)),
         ];
         assert_eq!(
-            order_sort_keys(keyed, SortDirection::Ascending),
+            order_sort_keys(one_key(keyed), &[SortDirection::Ascending]),
             vec!["id-6.5", "id-7", "id-8"]
         );
+    }
+
+    #[test]
+    fn a_second_key_orders_resources_that_tie_on_the_first() {
+        let keyed = vec![
+            keys("sort-a", &[Some(dt(200)), s("Brown")]),
+            keys("sort-b", &[Some(dt(200)), s("Adams")]),
+            keys("sort-c", &[Some(dt(100)), s("Clark")]),
+        ];
+        assert_eq!(
+            order_sort_keys(
+                keyed.clone(),
+                &[SortDirection::Ascending, SortDirection::Ascending]
+            ),
+            vec!["sort-c", "sort-b", "sort-a"]
+        );
+        // Each key keeps its own direction.
+        assert_eq!(
+            order_sort_keys(
+                keyed.clone(),
+                &[SortDirection::Ascending, SortDirection::Descending]
+            ),
+            vec!["sort-c", "sort-a", "sort-b"]
+        );
+        assert_eq!(
+            order_sort_keys(
+                keyed,
+                &[SortDirection::Descending, SortDirection::Ascending]
+            ),
+            vec!["sort-b", "sort-a", "sort-c"]
+        );
+    }
+
+    #[test]
+    fn a_missing_key_sorts_after_present_ones_in_either_direction() {
+        let keyed = vec![
+            keys("no-second", &[Some(dt(200)), None]),
+            keys("both", &[Some(dt(200)), s("Adams")]),
+            keys("z-no-first", &[None, s("Aaron")]),
+            keys("a-no-first", &[None, s("Zulu")]),
+            keys("neither", &[None, None]),
+            keys("also-neither", &[None, None]),
+        ];
+        for (directions, missing_first) in [
+            (
+                [SortDirection::Ascending, SortDirection::Ascending],
+                ["z-no-first", "a-no-first"],
+            ),
+            (
+                [SortDirection::Descending, SortDirection::Descending],
+                ["a-no-first", "z-no-first"],
+            ),
+        ] {
+            let expected = vec![
+                "both",
+                "no-second",
+                missing_first[0],
+                missing_first[1],
+                "also-neither",
+                "neither",
+            ];
+            assert_eq!(
+                order_sort_keys(keyed.clone(), &directions),
+                expected,
+                "{directions:?}"
+            );
+        }
     }
 }
 
