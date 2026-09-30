@@ -1793,7 +1793,7 @@ where
 {
     let tenant = TenantContext::new(TenantId::new(tenant_base), TenantPermissions::full_access());
     let empty = TenantContext::new(
-        TenantId::new(&format!("{tenant_base}-empty")),
+        TenantId::new(format!("{tenant_base}-empty")),
         TenantPermissions::full_access(),
     );
     let mut observed = observation("top", "A", "2020-06-15", &["cat1"]);
