@@ -462,16 +462,23 @@ where
 
     let mut failures = Vec::new();
     for (index, (label, query, expected)) in cases.iter().enumerate() {
-        let resolved = resolve_chains(backend, &tenant, query)
+        let mut resolved = resolve_chains(backend, &tenant, query)
             .await
             .unwrap_or_else(|e| panic!("resolve {label} failed: {e}"));
         let mut got = matched(backend, &tenant, &resolved).await;
         if index == 0 {
+            // Elasticsearch is near-real-time on both hops: a chain resolved
+            // before the patients are visible pins the no-match sentinel, so
+            // each retry resolves the chain again rather than only re-running
+            // the rewritten search.
             for _ in 0..60 {
                 if got == ids(expected) {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                resolved = resolve_chains(backend, &tenant, query)
+                    .await
+                    .unwrap_or_else(|e| panic!("resolve {label} failed: {e}"));
                 got = matched(backend, &tenant, &resolved).await;
             }
             assert_eq!(got, ids(expected), "positive control {label}");
