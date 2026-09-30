@@ -68,12 +68,11 @@ status-only kick-off (no `manifestUrl`) they have nothing to attach to and are i
 | `HFS_BULK_SUBMIT_BATCH_SIZE` | `100` | Resources per ingestion batch, one database transaction each. Reaches the worker since #1127; before that it was parsed and ignored, and every run used `100` whatever it said. Do not raise it without measuring: with index-during-ingest on, `1000` ingested slower than `100` (382 s against 252 s, 1 % cut) |
 | `HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT` | `60` | Seconds the input-file fetcher waits for the next bytes of a response before treating the body as broken and resuming it with `Range`; connecting is capped separately at 10 s. Must be `> 0` |
 | `HFS_BULK_SUBMIT_SKIP_UNCHANGED` | `false` | SQLite and PostgreSQL: leave a stored resource untouched when the submitted one is identical to it apart from `meta.versionId`/`meta.lastUpdated`, so replaying a manifest writes no new versions, history rows or index rows. The entry's receipt still reads `success` |
-| `HFS_BULK_SUBMIT_INDEX_DURING_INGEST` | `false` | Composite deployments with an Elasticsearch secondary: index each committed batch into the secondary while ingesting, instead of leaving it to the post-manifest rebuild. The deferred reindex then runs only for resource types the secondary rejected something from. No effect without a search secondary. See Ingest performance |
 | `HFS_BULK_SUBMIT_INDEX_QUEUE` | `16` | Committed batches each index-during-ingest writer may hold queued. Measured: a queue of `32` on top of coalesce `16` made ingest a further 65 % slower |
 | `HFS_BULK_SUBMIT_INDEX_CONCURRENCY` | `4` | Index-during-ingest writer tasks. A resource always goes to the same writer, chosen by a hash of type and id, so its versions reach the secondary in order |
 | `HFS_BULK_SUBMIT_INDEX_COALESCE` | `4` | Queued batches one writer merges into a single write to the secondary. Measured: `16` made ingest 34 % slower |
 | `HFS_BULK_SUBMIT_INDEX_MAX_WAIT` | `30` | Seconds the ingest waits for room in a writer's queue. Past it the batch is marked unindexed and left to the deferred reindex, so a slow secondary never stalls the writer or starves the lease |
-| `HFS_BULK_SUBMIT_DEFER_INDEXING` | `true` | Bulk fast-load (#903): ingest without search-index/FTS writes, then rebuild with an automatic per-type reindex when each manifest finishes. Default since #946; honoured on MongoDB only since #1000, where it was silently inert. Read once at startup, not per submission. A restart before that rebuild lands leaves the data stored but unsearchable; set `false` to close that window — see Ingest performance |
+| `HFS_BULK_SUBMIT_DEFER_INDEXING` | `true` | Bulk fast-load (#903): ingest without search-index/FTS writes, then rebuild with an automatic per-type reindex when each manifest finishes. Default since #946; honoured on MongoDB only since #1000, where it was silently inert. Read once at startup, not per submission. A restart before that rebuild lands leaves the data stored but unsearchable; set `false` to close that window — see Ingest performance. On a composite with Elasticsearch, `false` selects index-during-ingest (#1127) through the `HFS_BULK_SUBMIT_INDEX_*` writers below; the former `HFS_BULK_SUBMIT_INDEX_DURING_INGEST` was folded into this switch (#1242) and a server started with it refuses to start, naming the replacement |
 | `HFS_BULK_SUBMIT_BULK_INDEX_REBUILD` | `false` | SQLite: the deferred rebuild drops the `search_index` value indexes for its duration and builds them once, sorted, at the end. 1.3x at 72k resources, 1.6x at 312k, widening with size — but search on that database is unindexed for every tenant while a rebuild runs, and the final build holds the write lock. For the initial load of a large corpus on a server not serving traffic. Self-heals at startup if a process died inside the window |
 | `HFS_REINDEX_BATCH_SIZE` | `1000` | Page size of the automatic deferred rebuild (`DEFERRED_REINDEX_BATCH_SIZE`), reaching `ReindexOnFinish`. `POST $reindex` keeps its own `batchSize` (default 100), capped at 10,000 |
 | `HFS_ELASTICSEARCH_BULK_MAX_BYTES` | `10485760` | ES composites: byte cap per `_bulk` request body (10 MiB), on top of the 500-operation cap. Applies to the ingest sync and to every rebuild |
@@ -308,14 +307,16 @@ would close the window without giving up the speed, and is not done.
 
 ### Index during ingest (#1127)
 
-`HFS_BULK_SUBMIT_INDEX_DURING_INGEST=true` is the lever for composite
-deployments with an Elasticsearch secondary, and it is **opt-in**. Under the
-default fast-load path the secondary receives nothing while the manifest
-ingests: `composite_submit_jobs` hands the worker `CompositeSubmitJobs` with its
+`HFS_BULK_SUBMIT_DEFER_INDEXING=false` is the lever for composite
+deployments with an Elasticsearch secondary (the former
+`HFS_BULK_SUBMIT_INDEX_DURING_INGEST` was folded into it in #1242; a server
+started with the old variable refuses to start and names the replacement).
+Under the default (`true`) fast-load path the secondary receives nothing while
+the manifest ingests: `composite_submit_jobs` hands the worker `CompositeSubmitJobs` with its
 ingest sync turned off (`with_ingest_sync(false)`, #1161), and search is filled
 only by the deferred rebuild that fires after the manifest is terminal. The
-wrapper stays there so rollbacks still reach the secondary. With this switch
-on, the job store wraps the primary in an indexing sink instead:
+wrapper stays there so rollbacks still reach the secondary. With deferral
+off, the job store wraps the primary in an indexing sink instead:
 
 - The ingest engine hands each batch to the sink **right after its transaction
   commits**, never before, so the secondary only ever sees what the primary
