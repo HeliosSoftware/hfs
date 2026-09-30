@@ -17762,6 +17762,207 @@ mod postgres_integration {
         assert!(exported["Organization"].is_empty());
     }
 
+    /// Both candidate queries must feed the same exact compartment matcher.
+    /// The fallback backend intentionally has search offloaded, and this tenant
+    /// has no local search_index rows after seeding.
+    #[tokio::test]
+    async fn postgres_integration_patient_export_index_and_json_fallback_agree() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let indexed = create_backend().await;
+        indexed.init_schema().await.unwrap();
+        let mut fallback = create_backend().await;
+        fallback.set_search_offloaded(true);
+        fallback.init_schema().await.unwrap();
+
+        let tenant = create_tenant("patient-index-fallback");
+        let other_tenant = create_tenant("patient-index-fallback-other");
+        let prefix = uuid::Uuid::new_v4().simple().to_string();
+        let p1 = format!("{prefix}-p1");
+        let p2 = format!("{prefix}-p2");
+        let other = format!("{prefix}-other");
+        let linked = format!("{prefix}-linked");
+        let false_positive = format!("{prefix}-focus-only");
+        let subject = format!("{prefix}-subject");
+        let performer = format!("{prefix}-performer");
+        let before = format!("{prefix}-before");
+        let after = format!("{prefix}-after");
+        let deleted = format!("{prefix}-deleted");
+        let foreign = format!("{prefix}-foreign");
+
+        for resource in [
+            json!({"resourceType": "Patient", "id": p1,
+                "link": [{"other": {"reference": format!("Patient/{p1}")}, "type": "seealso"}]}),
+            json!({"resourceType": "Patient", "id": p2}),
+            json!({"resourceType": "Patient", "id": other}),
+            json!({"resourceType": "Patient", "id": linked,
+                "link": [{"other": {"reference": format!("Patient/{p1}")}, "type": "seealso"}]}),
+            json!({"resourceType": "Observation", "id": false_positive, "status": "final",
+                "code": {"text": "x"}, "subject": {"reference": format!("Patient/{other}")},
+                "focus": [{"reference": format!("Patient/{p1}")}] }),
+            json!({"resourceType": "Observation", "id": subject, "status": "final",
+                "code": {"text": "x"}, "subject": {"reference": format!("Patient/{p1}")}}),
+            json!({"resourceType": "Observation", "id": performer, "status": "final",
+                "code": {"text": "x"}, "subject": {"reference": format!("Patient/{other}")},
+                "performer": [{"reference": format!("Patient/{p2}/_history/2")}] }),
+            json!({"resourceType": "Observation", "id": before, "status": "final",
+                "code": {"text": "x"}, "subject": {"reference": format!("Patient/{p1}")}}),
+            json!({"resourceType": "Observation", "id": after, "status": "final",
+                "code": {"text": "x"}, "subject": {"reference": format!("Patient/{p2}")}}),
+            json!({"resourceType": "Observation", "id": deleted, "status": "final",
+                "code": {"text": "x"}, "subject": {"reference": format!("Patient/{p1}")}}),
+        ] {
+            let resource_type = resource["resourceType"].as_str().unwrap().to_string();
+            indexed
+                .create(&tenant, &resource_type, resource, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+        indexed
+            .create(
+                &other_tenant,
+                "Observation",
+                json!({"resourceType": "Observation", "id": foreign, "status": "final",
+                    "code": {"text": "x"}, "subject": {"reference": format!("Patient/{p1}")}}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        indexed
+            .delete(&tenant, "Observation", &deleted)
+            .await
+            .unwrap();
+
+        // The first candidate page contains only `focus`, which is outside
+        // the Observation Patient-compartment parameters. Its empty output
+        // must still carry a cursor to the later matching rows.
+        for (id, at) in [
+            (&false_positive, "2026-01-02T00:00:00Z"),
+            (&subject, "2026-01-03T00:00:00Z"),
+            (&performer, "2026-01-04T00:00:00Z"),
+            (&before, "2025-12-31T00:00:00Z"),
+            (&after, "2026-02-02T00:00:00Z"),
+            (&p1, "2026-01-03T00:00:00Z"),
+            (&p2, "2026-01-04T00:00:00Z"),
+            (&linked, "2026-01-05T00:00:00Z"),
+        ] {
+            pin_last_updated(&indexed, id, instant(at)).await;
+        }
+
+        let mut client = indexed.get_client().await.unwrap();
+        client
+            .execute(
+                "DELETE FROM search_index WHERE tenant_id = $1",
+                &[&tenant.tenant_id().as_str()],
+            )
+            .await
+            .unwrap();
+
+        let index_ready: bool = client
+            .query_one(
+                "SELECT i.indisvalid AND i.indisready AND am.amname = 'gin'
+                 FROM pg_class c
+                 JOIN pg_index i ON i.indexrelid = c.oid
+                 JOIN pg_am am ON am.oid = c.relam
+                 WHERE c.relname = 'idx_resources_patient_refs_v1'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert!(index_ready, "indexed backend must have a usable GIN index");
+        let explain_tx = client.transaction().await.unwrap();
+        explain_tx
+            .batch_execute("SET LOCAL enable_seqscan = off; SET LOCAL enable_indexscan = off")
+            .await
+            .unwrap();
+        let refs = vec![format!("Patient/{p1}"), format!("Patient/{p2}")];
+        let plan = explain_tx
+            .query(
+                "EXPLAIN (COSTS OFF) SELECT id FROM resources
+                 WHERE is_deleted = FALSE
+                   AND hfs_patient_references_v1(data) && $1::text[]",
+                &[&refs],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            plan.contains("idx_resources_patient_refs_v1"),
+            "PostgreSQL did not plan through the patient-reference index:\n{plan}"
+        );
+        explain_tx.rollback().await.unwrap();
+
+        let request = ExportRequest::patient()
+            .with_since(instant("2026-01-01T00:00:00Z"))
+            .with_until(instant("2026-02-01T00:00:00Z"));
+        let patient_ids = vec![p1.clone(), p2.clone()];
+        let mut outputs = Vec::new();
+        for backend in [&indexed, &fallback] {
+            let mut by_type = std::collections::BTreeMap::new();
+            for resource_type in ["Patient", "Observation"] {
+                let mut cursor = None;
+                let mut lines = Vec::new();
+                loop {
+                    let batch = backend
+                        .fetch_patient_compartment_batch(
+                            &tenant,
+                            &request,
+                            resource_type,
+                            &patient_ids,
+                            cursor.as_deref(),
+                            1,
+                        )
+                        .await
+                        .unwrap();
+                    if resource_type == "Observation" && cursor.is_none() {
+                        assert!(batch.lines.is_empty(), "first candidate fails exact match");
+                        assert!(!batch.is_last, "empty candidate page must not end export");
+                    }
+                    lines.extend(batch.lines);
+                    if batch.is_last {
+                        break;
+                    }
+                    cursor = batch.next_cursor;
+                    assert!(cursor.is_some(), "non-final page must advance its cursor");
+                }
+                by_type.insert(resource_type, lines);
+            }
+            outputs.push(by_type);
+        }
+
+        assert_eq!(outputs[0], outputs[1], "indexed and JSON paths differ");
+        assert_eq!(
+            outputs[0]["Patient"]
+                .iter()
+                .filter(|line| {
+                    serde_json::from_str::<serde_json::Value>(line).unwrap()["id"].as_str()
+                        == Some(p1.as_str())
+                })
+                .count(),
+            1,
+            "an explicitly selected Patient that also matches the GIN branch appears once"
+        );
+        let ids = |resource_type| {
+            outputs[0][resource_type]
+                .iter()
+                .map(|line| {
+                    serde_json::from_str::<serde_json::Value>(line).unwrap()["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(ids("Patient"), [p1, p2, linked].into_iter().collect());
+        assert_eq!(
+            ids("Observation"),
+            [subject, performer].into_iter().collect()
+        );
+    }
+
     #[tokio::test]
     async fn postgres_integration_since_bounds_the_patient_compartment_branch() {
         let _guard = BULK_EXPORT_TEST_LOCK.lock().await;

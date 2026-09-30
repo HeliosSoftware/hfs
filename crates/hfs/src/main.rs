@@ -503,7 +503,7 @@ async fn create_audit_postgres_storage(
         create_postgres_backend(server_config).await?
     };
 
-    backend.init_schema().await?;
+    backend.init_schema_without_patient_export_index().await?;
     Ok(Arc::new(backend))
 }
 
@@ -2982,13 +2982,14 @@ async fn start_postgres_elasticsearch(
     use helios_persistence::core::BackendKind;
 
     // Create PostgreSQL backend
-    let backend = create_postgres_backend(&config).await?;
+    let mut backend = create_postgres_backend(&config).await?;
 
+    // Mark search as offloaded before schema initialization so this backend
+    // skips the large local patient export index.
+    backend.set_search_offloaded(true);
     backend.init_schema().await?;
 
     // Offload search to Elasticsearch
-    let mut backend = backend;
-    backend.set_search_offloaded(true);
     let pg = Arc::new(backend);
     attach_login_sessions(auth_state.as_ref(), pg.clone());
     info!("PostgreSQL search indexing disabled (offloaded to Elasticsearch)");
