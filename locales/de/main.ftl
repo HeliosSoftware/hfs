@@ -999,26 +999,19 @@ lib-run-unknown-table-more = Unbekannte Tabelle { $name } – Zeile { $line }.
 ## Tabellenbereich (#842, beide Arten) — Reads from / Used by / Columns
 
 lib-tables-heading = Liest von
-lib-tables-col-alias = Alias
-lib-tables-col-target = Liest von
 lib-tables-no-alias = (kein Label)
 lib-tables-empty = Noch keine Tabellen deklariert.
-lib-tables-note = Jede Tabelle, die die SQL-Abfrage liest, als relatedArtifact-depends-on-Einträge: Alias links, die ViewDefinition oder SQL View, zu der es aufgelöst wird, rechts.
-lib-tables-remove = Entfernen
 lib-tables-kind-view-definition = ViewDefinition
 lib-tables-target-not-found = Nicht gefunden
 lib-tables-target-not-found-detail = Keine ViewDefinition oder SQL View entspricht { $resource }. Korrigieren Sie den kanonischen Wert in Details oder entfernen Sie die Zeile.
 lib-tables-target-not-a-table = Keine Tabelle
 lib-tables-target-not-a-table-detail = Es kann nur eine ViewDefinition oder eine SQL View gelesen werden.
-lib-tables-add-toggle = Tabelle hinzufügen
 lib-tables-add-table-label = Tabelle
-lib-tables-add-table-placeholder = View Definitions und SQL Views durchsuchen
-lib-tables-add-table-hint = Zum Suchen nach Namen tippen oder aus der Liste wählen.
+lib-tables-add-table-placeholder = Tabelle hinzufügen…
 lib-tables-add-table-fallback-placeholder = ViewDefinition/{"{"}id{"}"} oder Library/{"{"}id{"}"}
-lib-tables-add-table-fallback-hint = Geben Sie eine ViewDefinition- oder SQL-View-Referenz ein.
 lib-tables-alias-label = Alias
-lib-tables-alias-hint = Standardmäßig der Name des Artefakts
 lib-tables-add-submit = Hinzufügen
+lib-tables-add-hint = Eine View Definition oder SQL View suchen; der Alias übernimmt standardmäßig ihren Namen.
 lib-tables-add-error-required = Wählen Sie eine ViewDefinition oder eine SQL View
 lib-tables-add-error-alias-required = Alias ist erforderlich
 lib-tables-add-error-alias-invalid = Der Alias muss ^[A-Za-z][A-Za-z0-9_]*$ entsprechen
@@ -1027,6 +1020,8 @@ lib-tables-options-empty = Keine Treffer.
 lib-tables-unknown = Unbekannte Tabelle
 lib-tables-unknown-detail = Wird in der SQL-Abfrage verwendet, ist aber nicht deklariert. Wählen Sie eine ViewDefinition oder SQL View, oder korrigieren Sie den Namen.
 lib-tables-declare = { $name } deklarieren
+lib-tables-declare-short = Deklarieren
+lib-tables-remove-row = { $alias } entfernen
 
 lib-used-by-heading = Verwendet von
 lib-used-by-empty = Wird noch von nichts verwendet.

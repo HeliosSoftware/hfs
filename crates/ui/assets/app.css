@@ -3627,6 +3627,140 @@ tr:hover .result-id__copy,
   margin-bottom: 0;
 }
 
+/* The Tables card (#842), redesigned as a flat list (#1238): a `<table>`
+   with three fixed columns never fit the left-hand track of `.editor__
+   grid`'s two `minmax(0,1fr)` tracks, forcing `.table-wrap`'s own
+   horizontal scrollbar at ordinary widths. `ul.lib-tables__list` wraps
+   instead, so a row's own alias/chip/link/remove reflow onto more than
+   one line rather than clipping or scrolling. The always-visible add row
+   (`.lib-tables__add`) reuses `combobox.html`'s shared picker unmodified —
+   its own `legend` (`.field__label`) is hidden here, from the card's own
+   CSS, the same way `.visually-hidden` hides one (#1238's decision 3: no
+   other caller of that macro wants this treatment, so the macro itself
+   stays untouched); the macro's own `hint`/`fallback-hint` spans are
+   always passed empty by this card and `:empty` hides them, since the
+   card supplies its own single help line instead. */
+.lib-tables__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.lib-tables__row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--surface-border);
+  font-size: 13px;
+  min-width: 0;
+}
+
+.lib-tables__row:last-child {
+  border-bottom: 0;
+}
+
+/* Same failing-row frame as `.data-table tr.row--alert > td:first-child`
+   (above), adapted to a row with no cells. */
+.lib-tables__row.row--alert {
+  box-shadow: inset 3px 0 0 var(--danger);
+  padding-left: 10px;
+}
+
+.lib-tables__alias {
+  min-width: 64px;
+}
+
+.lib-tables__target {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 140px;
+  min-width: 0;
+}
+
+.lib-tables__target .tag {
+  margin-left: 0;
+}
+
+.lib-tables__target a {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lib-tables__remove {
+  margin-left: auto;
+}
+
+.lib-tables__declare {
+  margin-left: auto;
+}
+
+.lib-tables__detail {
+  flex-basis: 100%;
+  margin: 0;
+}
+
+.lib-tables__add {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding-top: 10px;
+}
+
+.lib-tables__add .combobox {
+  flex: 1 1 150px;
+  margin-bottom: 0;
+}
+
+/* The picker's own `legend` (`combobox.html`'s `.field__label`) carries no
+   visible label in this card — the search field's own placeholder already
+   says what it is, and there is no room for a second line of label text
+   next to the alias/Add controls. Hidden here, from this card's own CSS,
+   rather than in the shared macro every other caller still needs it in. */
+.lib-tables__add .combobox > .field__label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.lib-tables__add .combobox .field__hint:empty {
+  display: none;
+}
+
+.lib-tables__add .field__input {
+  height: 36px;
+  font-size: 14px;
+}
+
+.lib-tables__alias-input {
+  flex: 0 1 96px;
+}
+
+/* The *Add* button keeps its own canonical 30px `.btn--primary` height
+   (`design-system.spec.ts`'s own "emphasis variants cannot declare
+   geometry" guard, #543) rather than matching the two 36px fields beside
+   it — `align-items: center` on `.lib-tables__add` still keeps it centered
+   in the row. */
+
+.lib-tables__add > .field__hint {
+  flex-basis: 100%;
+  margin-top: 0;
+}
+
+.lib-tables__add > #lib-tables-add-error {
+  flex-basis: 100%;
+}
+
 /* The Last 24 hrs sparkline (#782): the engine's half-hour delivery series,
    scaled server-side; color follows the row's state — the frame's dotted
    amber marks a listener-less websocket. */

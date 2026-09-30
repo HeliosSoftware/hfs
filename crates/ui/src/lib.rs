@@ -4957,10 +4957,14 @@ fn used_by_view(i18n: &I18n, analysis: &TablesAnalysis) -> Vec<UsedByRowView> {
     rows
 }
 
-/// The *Add table* panel's own re-submitted state (#842): the `table`/
-/// `alias` text [`sql_library_document`] echoes back into the `<details>`
+/// The always-visible add row's own re-submitted state (#842): the
+/// `table`/`alias` text [`sql_library_document`] echoes back into the row
 /// on a rejected `add-table`, and the validation message alongside them.
-/// `Default` is every other render's own state — closed, empty, no error.
+/// `open` no longer toggles any disclosure (#1238: the row has none) — it
+/// only marks a rejected submission's own state as no longer the untouched
+/// default, so [`build_tables_card`] does not clobber it with the
+/// *first* unknown table's own no-JS prefill. `Default` is every other
+/// render's own state — untouched, empty, no error.
 #[derive(Default)]
 struct AddTableFormState {
     table: String,
@@ -4971,8 +4975,8 @@ struct AddTableFormState {
 
 /// [`build_tables_card`]'s presentation-only options — mirrors
 /// [`ParamsCardOptions`] for the Tables panel: `Default` is the page's own
-/// inline render (no OOB swap, no `data_document`, the *Add table* panel
-/// closed and clean).
+/// inline render (no OOB swap, no `data_document`, the add row's own state
+/// untouched and clean).
 #[derive(Default)]
 struct TablesCardOptions {
     add: AddTableFormState,
@@ -4986,23 +4990,25 @@ struct TablesCardOptions {
     data_document: Option<String>,
 }
 
-/// Builds the Tables panel's left-hand card (#842) from an already-computed
-/// [`TablesAnalysis`] plus `options`' presentation state — mirrors
-/// [`build_params_card`]'s own role for the Parameters card.
+/// Builds the Tables panel's left-hand card (#842, redesigned as a flat
+/// list #1238) from an already-computed [`TablesAnalysis`] plus `options`'
+/// presentation state — mirrors [`build_params_card`]'s own role for the
+/// Parameters card.
 ///
 /// #842/04: on a page-level render (`!options.oob` — the page's own first
 /// paint, the `document` endpoint's own no-JS echo, or a validation-error
 /// re-render; never the `/run` fragment's own OOB companion) whose SQL
-/// reads at least one unknown table, the panel opens itself with the
-/// *first* one's own name already in the alias field whenever
-/// `options.add` is still its own untouched default (closed, empty, no
+/// reads at least one unknown table, the always-visible add row's own
+/// alias field pre-fills itself with the *first* one's own name whenever
+/// `options.add` is still its own untouched default (empty, not open, no
 /// error — never the case after a rejected *Add table* submission, which
 /// always sets at least one of those) — the no-JS half of *Declare*'s own
-/// contract: a no-JS visitor has no other way to reach the panel at
-/// all. With JavaScript, the live `/run` fragment never auto-opens it —
-/// only clicking a specific row's own *Declare {name}* button
-/// (`sql-library-panels.js`) does, so introducing a typo while typing
-/// never yanks focus into a panel the visitor did not ask for.
+/// contract: a no-JS visitor has no other way to name the target it
+/// still needs picking from the combobox. With JavaScript, the live `/run`
+/// fragment never overwrites a visitor's own typing this way — only
+/// clicking a specific row's own *Declare {name}* button
+/// (`sql-library-panels.js`) refills the alias field, so introducing a
+/// typo while typing never yanks focus away from the editor.
 fn build_tables_card(
     i18n: I18n,
     kind: &LibraryKind,
@@ -5026,10 +5032,10 @@ fn build_tables_card(
         && options.add.alias.is_empty()
         && !options.add.open
         && options.add.error.is_none();
-    let (add_alias, add_open) = if add_is_default && let Some(first) = unknown_rows.first() {
-        (first.name.clone(), true)
+    let add_alias = if add_is_default && let Some(first) = unknown_rows.first() {
+        first.name.clone()
     } else {
-        (options.add.alias, options.add.open)
+        options.add.alias
     };
     LibTablesCard {
         i18n,
@@ -5041,18 +5047,18 @@ fn build_tables_card(
         signature: analysis.signature,
         add_table: options.add.table,
         add_alias,
-        add_open,
         add_error: options.add.error,
         oob: options.oob,
         data_document: options.data_document,
     }
 }
 
-/// `partials/sql_tables_card.html`'s render surface (#842): the resolved
-/// *Reads from* rows, the *Used by* rows, the `tables_sig` signature, and
-/// the *Add table* panel — built once by [`build_tables_card`] and shared
-/// by the page's own first paint, the `/run` fragment's OOB companion, and
-/// the `document` endpoint's own response, exactly like [`LibParamsCard`].
+/// `partials/sql_tables_card.html`'s render surface (#842, redesigned as a
+/// flat list #1238): the resolved *Reads from* rows, the *Used by* rows,
+/// the `tables_sig` signature, and the always-visible add row's own state
+/// — built once by [`build_tables_card`] and shared by the page's own
+/// first paint, the `/run` fragment's OOB companion, and the `document`
+/// endpoint's own response, exactly like [`LibParamsCard`].
 #[derive(Template)]
 #[template(path = "partials/sql_tables_card.html")]
 struct LibTablesCard {
@@ -5073,7 +5079,6 @@ struct LibTablesCard {
     signature: String,
     add_table: String,
     add_alias: String,
-    add_open: bool,
     add_error: Option<String>,
     /// `true` only for the `/run` fragment's own OOB companion — see
     /// [`TablesCardOptions::oob`].
@@ -6870,7 +6875,6 @@ async fn document_whole_error_response(
                     signature: String::new(),
                     add_table: form.table.clone(),
                     add_alias: form.table_alias.clone(),
-                    add_open: true,
                     add_error: Some(message),
                     oob: false,
                     data_document: None,

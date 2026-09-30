@@ -1076,15 +1076,11 @@ lib-run-unknown-table-more = Unknown table { $name } — line { $line }.
 ## Tables panel (#842, both kinds) — Reads from / Used by / Columns
 
 lib-tables-heading = Reads from
-lib-tables-col-alias = Alias
-lib-tables-col-target = Reads from
 # The `<code>` cell's own placeholder for a `relatedArtifact[depends-on]`
 # entry with no `label` at all — a malformed document, most commonly one
 # hand-edited in Details.
 lib-tables-no-alias = (no label)
 lib-tables-empty = No tables declared yet.
-lib-tables-note = Every table the SQL reads, as relatedArtifact depends-on entries: alias on the left, the view definition or SQL view it resolves to on the right.
-lib-tables-remove = Remove
 # The resolved-target chip text. "SQL View" reuses `sql-views-chip` — the
 # same chip the title row and *Used by* already show for that kind.
 lib-tables-kind-view-definition = ViewDefinition
@@ -1092,15 +1088,15 @@ lib-tables-target-not-found = Not found
 lib-tables-target-not-found-detail = No ViewDefinition or SQL View answers to { $resource }. Fix the canonical in Details or remove the row.
 lib-tables-target-not-a-table = Not a table
 lib-tables-target-not-a-table-detail = Only a ViewDefinition or a SQL View can be read.
-lib-tables-add-toggle = Add table
 lib-tables-add-table-label = Table
-lib-tables-add-table-placeholder = Search view definitions and SQL views
-lib-tables-add-table-hint = Type to search by name, or pick from the list.
+# The always-visible add row's own search field placeholder (#1238).
+lib-tables-add-table-placeholder = Add a table…
 lib-tables-add-table-fallback-placeholder = ViewDefinition/{"{"}id{"}"} or Library/{"{"}id{"}"}
-lib-tables-add-table-fallback-hint = Enter a ViewDefinition or SQL View reference.
 lib-tables-alias-label = Alias
-lib-tables-alias-hint = Defaults to the artifact's name
 lib-tables-add-submit = Add
+# The add row's own single help line (#1238) — the only hint the row
+# carries; the combobox's own `hint`/`fallback-hint` are passed empty.
+lib-tables-add-hint = Search a view definition or SQL view; the alias defaults to its name.
 # `add-table`'s own validation messages (#842), in the order they are
 # checked.
 lib-tables-add-error-required = Pick a view definition or SQL view
@@ -1116,6 +1112,13 @@ lib-tables-options-empty = No matches.
 lib-tables-unknown = Unknown table
 lib-tables-unknown-detail = Used in the SQL but not declared. Pick a view definition or SQL view, or fix the name.
 lib-tables-declare = Declare { $name }
+# The row's own visible *Declare* button text (#1238) — the accessible
+# name carries the table's own name instead (`lib-tables-declare`).
+lib-tables-declare-short = Declare
+# The row's own icon *Remove* button's accessible name (#1238) — `$alias`
+# is the alias exactly as the `<code>` cell shows it, including the
+# `lib-tables-no-alias` placeholder when the row has none.
+lib-tables-remove-row = Remove { $alias }
 
 lib-used-by-heading = Used by
 lib-used-by-empty = Nothing uses this yet.
