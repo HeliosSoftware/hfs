@@ -5028,6 +5028,171 @@ mod postgres_integration_migrations {
             .get(0)
     }
 
+    #[tokio::test]
+    async fn postgres_integration_patient_export_index_startup_modes() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let backend = create_database(
+            shared_pg().await,
+            &format!("patient_export_modes_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+        backend
+            .init_schema_without_patient_export_index()
+            .await
+            .unwrap();
+        let client = backend.get_client().await.unwrap();
+        assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
+        assert_eq!(patient_export_index_state(&client).await.unwrap(), None);
+        assert!(!backend.has_patient_export_index());
+
+        let mut offloaded = backend.clone();
+        offloaded.set_search_offloaded(true);
+        drop(client);
+        offloaded.init_schema().await.unwrap();
+        let client = backend.get_client().await.unwrap();
+        assert_eq!(patient_export_index_state(&client).await.unwrap(), None);
+        assert!(!offloaded.has_patient_export_index());
+
+        drop(client);
+        backend.init_schema().await.unwrap();
+        let client = backend.get_client().await.unwrap();
+        assert!(backend.has_patient_export_index());
+        assert!(!offloaded.has_patient_export_index());
+        let index_oid: u32 = client
+            .query_one("SELECT 'idx_resources_patient_refs_v1'::regclass::oid", &[])
+            .await
+            .unwrap()
+            .get(0);
+        drop(client);
+        backend.init_schema().await.unwrap();
+        let client = backend.get_client().await.unwrap();
+        assert_eq!(
+            client
+                .query_one("SELECT 'idx_resources_patient_refs_v1'::regclass::oid", &[])
+                .await
+                .unwrap()
+                .get::<_, u32>(0),
+            index_oid,
+            "reinitialization must reuse the valid index"
+        );
+
+        // Audit-only initialization clears a capability already shared by clones.
+        drop(client);
+        backend
+            .init_schema_without_patient_export_index()
+            .await
+            .unwrap();
+        let client = backend.get_client().await.unwrap();
+        assert!(!backend.has_patient_export_index());
+        assert_eq!(
+            patient_export_index_state(&client).await.unwrap(),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_patient_export_index_repairs_unusable_indexes() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let backend = create_database(
+            shared_pg().await,
+            &format!("patient_export_repair_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+        backend.init_schema().await.unwrap();
+        let client = backend.get_client().await.unwrap();
+        // Simulate the catalog state left by an interrupted concurrent build.
+        client
+            .execute(
+                "UPDATE pg_index SET indisvalid = FALSE
+                 WHERE indexrelid = 'idx_resources_patient_refs_v1'::regclass",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            patient_export_index_state(&client).await.unwrap(),
+            Some(false)
+        );
+        drop(client);
+        backend.init_schema().await.unwrap();
+        let client = backend.get_client().await.unwrap();
+        assert!(backend.has_patient_export_index());
+        assert_eq!(
+            patient_export_index_state(&client).await.unwrap(),
+            Some(true)
+        );
+
+        // A valid index under the expected name must also have the right shape.
+        client
+            .batch_execute(
+                "DROP INDEX idx_resources_patient_refs_v1;
+                 CREATE INDEX idx_resources_patient_refs_v1 ON resources (id)",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            patient_export_index_state(&client).await.unwrap(),
+            Some(false)
+        );
+        drop(client);
+        backend.init_schema().await.unwrap();
+        let client = backend.get_client().await.unwrap();
+        assert!(backend.has_patient_export_index());
+        assert_eq!(
+            patient_export_index_state(&client).await.unwrap(),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_patient_export_index_build_failure_retries() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let backend = create_database(
+            shared_pg().await,
+            &format!("patient_export_retry_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+        backend
+            .init_schema_without_patient_export_index()
+            .await
+            .unwrap();
+        let client = backend.get_client().await.unwrap();
+        // A conflicting relation lets migrations succeed but rejects CREATE INDEX.
+        client
+            .batch_execute("CREATE TABLE idx_resources_patient_refs_v1 (id text)")
+            .await
+            .unwrap();
+        assert_eq!(patient_export_index_state(&client).await.unwrap(), None);
+        drop(client);
+        backend.init_schema().await.unwrap();
+        assert!(!backend.has_patient_export_index());
+        let client = backend.get_client().await.unwrap();
+        assert_eq!(patient_export_index_state(&client).await.unwrap(), None);
+        // Inspect both pool sessions, including the one used for the index build.
+        let other_client = backend.get_client().await.unwrap();
+        assert_eq!(statement_timeout(&client).await, "30s");
+        assert_eq!(statement_timeout(&other_client).await, "30s");
+        drop(other_client);
+
+        client
+            .batch_execute("DROP TABLE idx_resources_patient_refs_v1")
+            .await
+            .unwrap();
+        drop(client);
+        backend.init_schema().await.unwrap();
+        assert!(backend.has_patient_export_index());
+        let client = backend.get_client().await.unwrap();
+        assert_eq!(
+            patient_export_index_state(&client).await.unwrap(),
+            Some(true)
+        );
+        // Inspect both pool sessions, including the one used for the index build.
+        let other_client = backend.get_client().await.unwrap();
+        assert_eq!(statement_timeout(&client).await, "30s");
+        assert_eq!(statement_timeout(&other_client).await, "30s");
+        drop(other_client);
+    }
+
     async fn migrate_through_v36(client: &deadpool_postgres::Client) -> StorageResult<()> {
         assert_eq!(get_schema_version(client).await?, 0);
         create_schema_v1(client).await?;
