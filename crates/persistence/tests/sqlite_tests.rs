@@ -99,6 +99,28 @@ async fn sqlite_contained_reference_identifier_resolves_the_target() {
         .await;
 }
 
+/// #1407: equal-type contained composites are refused; mixed composites
+/// still pair within the same instance and contained resource.
+#[tokio::test]
+async fn sqlite_contained_repeated_type_composites_are_rejected() {
+    let backend = create_backend();
+    contained_suite::contained_repeated_type_composites_are_rejected(
+        &backend,
+        "contained-same-type-1407",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn sqlite_contained_composites_pair_within_one_resource() {
+    let backend = create_backend();
+    contained_suite::contained_composites_pair_within_one_resource(
+        &backend,
+        "contained-mixed-1407",
+    )
+    .await;
+}
+
 /// The backend-agnostic conditional `If-Match` suite (#1381). Same `#[path]`
 /// arrangement.
 #[path = "search/conditional_if_match_suite.rs"]

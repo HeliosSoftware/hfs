@@ -1600,11 +1600,11 @@ where
     assert_cases(backend, &tenant, &controls, &cases).await;
 }
 
-/// Strict `_contained` composite pairing for MongoDB (#1407).
+/// Strict `_contained` mixed-type composite pairing across backends (#1407).
 ///
 /// Unlike `criteria_are_applied_or_rejected`, which lets a backend refuse a
-/// composite by naming it, these cases demand the answer from
-/// `search_index_contained`.
+/// composite by naming it, these cases require successful matching against
+/// the backend's contained-resource index.
 ///
 /// Containers (DiagnosticReport → contained Observations):
 /// - `c-single`: `c1` with components A = 1 mg and B = 9 mg — a composite
@@ -1782,6 +1782,117 @@ where
     ];
 
     assert_cases(backend, &tenant, &controls, &cases).await;
+}
+
+/// SQL contained composite rows preserve instance groups but not positions
+/// for equal-type components. Refuse these criteria before pagination or data
+/// reads instead of letting A$B also satisfy B$A (#1407).
+pub async fn contained_repeated_type_composites_are_rejected<S>(backend: &S, tenant_base: &str)
+where
+    S: ResourceStorage + SearchProvider,
+{
+    let tenant = TenantContext::new(TenantId::new(tenant_base), TenantPermissions::full_access());
+    let empty = TenantContext::new(
+        TenantId::new(&format!("{tenant_base}-empty")),
+        TenantPermissions::full_access(),
+    );
+    let mut observed = observation("top", "A", "2020-06-15", &["cat1"]);
+    observed["valueCodeableConcept"] = json!({"coding": [
+        {"system": "http://example.org/value", "code": "B"}
+    ]});
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            observed.clone(),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed full top-level page");
+    observed["id"] = json!("inside");
+    seed_containers(backend, &tenant, vec![("container", vec![observed])]).await;
+
+    // Both components must be indexed; an empty index cannot be the reason
+    // a false reversed pair goes away.
+    for (name, value) in [("code", "A"), ("value-concept", "B")] {
+        let mut control = SearchQuery::new("Observation");
+        control.contained = ContainedMode::On;
+        control.parameters.push(token(name, value));
+        assert_eq!(
+            sorted_ids(&backend.search(&tenant, &control).await.unwrap()),
+            vec!["container"],
+            "{name} index control"
+        );
+        assert_eq!(backend.search_count(&tenant, &control).await.unwrap(), 1);
+    }
+    let mut pair = literal("code-value-concept", SearchParamType::Composite, "A$B");
+    pair.components = vec![
+        CompositeSearchComponent {
+            param_type: SearchParamType::Token,
+            param_name: "code".into(),
+        },
+        CompositeSearchComponent {
+            param_type: SearchParamType::Token,
+            param_name: "value-concept".into(),
+        },
+    ];
+    let mut top_level = SearchQuery::new("Observation");
+    top_level.parameters.push(pair.clone());
+    top_level.count = Some(1);
+    assert_eq!(
+        sorted_ids(&backend.search(&tenant, &top_level).await.unwrap()),
+        vec!["top"]
+    );
+    assert_eq!(backend.search_count(&tenant, &top_level).await.unwrap(), 1);
+
+    for mode in [ContainedMode::On, ContainedMode::Both] {
+        for returns in [ContainedReturn::Container, ContainedReturn::Contained] {
+            for value in ["A$B", "B$A", "A$A"] {
+                // count=1 gives Both a full top-level page for A$B; count=0
+                // and an exhausted offset must not bypass the rejection.
+                for (count, offset) in [
+                    (None, None),
+                    (Some(1), None),
+                    (Some(0), None),
+                    (Some(1), Some(100)),
+                ] {
+                    for context in [&tenant, &empty] {
+                        for no_match in [false, true] {
+                            let mut query = SearchQuery::new("Observation");
+                            query.contained = mode;
+                            query.contained_return = returns;
+                            query.count = count;
+                            query.offset = offset;
+                            query.total = Some(TotalMode::Accurate);
+                            query.parameters.push(SearchParameter {
+                                values: vec![SearchValue::eq(value)],
+                                ..pair.clone()
+                            });
+                            if no_match {
+                                query.parameters.push(token("code", "no-matching-resource"));
+                            }
+                            for result in [
+                                backend.search(context, &query).await.map(|_| ()),
+                                backend.search_count(context, &query).await.map(|_| ()),
+                            ] {
+                                let Err(StorageError::Search(SearchError::InvalidComposite {
+                                    message,
+                                })) = result
+                                else {
+                                    panic!(
+                                        "expected InvalidComposite: {mode:?} {returns:?} {value} count={count:?} offset={offset:?}, got {result:?}"
+                                    );
+                                };
+                                assert!(message.contains("'code-value-concept'"), "{message}");
+                                assert!(message.contains("_contained"), "{message}");
+                                assert!(message.contains("repeated component types"), "{message}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// A repeated-type composite keeps its declared component order on both

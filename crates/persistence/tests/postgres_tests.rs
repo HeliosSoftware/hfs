@@ -28922,6 +28922,28 @@ mod postgres_integration {
         .await;
     }
 
+    /// #1407: equal-type contained composites are refused before either
+    /// branch of Both; mixed composite pairing continues to succeed.
+    #[tokio::test]
+    async fn postgres_integration_contained_repeated_type_composites_are_rejected() {
+        let backend = create_backend().await;
+        super::contained_suite::contained_repeated_type_composites_are_rejected(
+            &backend,
+            &unique_base("contained_same_type"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_contained_composites_pair_within_one_resource() {
+        let backend = create_backend().await;
+        super::contained_suite::contained_composites_pair_within_one_resource(
+            &backend,
+            &unique_base("contained_mixed"),
+        )
+        .await;
+    }
+
     /// #1337: `1e2` is one significant figure, `[50, 150)`.
     #[tokio::test]
     async fn postgres_integration_exponent_values_use_significant_figures() {

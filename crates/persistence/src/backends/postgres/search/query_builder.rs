@@ -1319,7 +1319,26 @@ impl PostgresQueryBuilder {
             // Paired per `composite_group` by `build_contained`. Without its
             // components (the REST layer resolves them) there is nothing to
             // pair, and no modifier applies to a composite.
-            (None, SearchParamType::Composite) if !param.components.is_empty() => true,
+            (None, SearchParamType::Composite) if !param.components.is_empty() => {
+                // These rows retain the instance group, but not component
+                // positions. Equal types can therefore satisfy the wrong slot
+                // (A$B also matching B$A), even within one group (#1407).
+                if param
+                    .components
+                    .iter()
+                    .enumerate()
+                    .any(|(position, component)| {
+                        param.components[..position]
+                            .iter()
+                            .any(|earlier| earlier.param_type == component.param_type)
+                    })
+                {
+                    return Some(
+                        "composite parameters with repeated component types are".to_string(),
+                    );
+                }
+                true
+            }
             (_, SearchParamType::Composite) => {
                 return Some(
                     "composite parameters with a modifier or no components are".to_string(),
@@ -5605,6 +5624,73 @@ mod tests {
             let mut off = query.clone();
             off.contained = ContainedMode::Off;
             assert!(PostgresQueryBuilder::reject_unsupported_contained(&off).is_ok());
+        }
+    }
+
+    #[test]
+    fn contained_composite_repeated_types_are_refused_before_querying() {
+        use crate::types::CompositeSearchComponent;
+
+        let composite = |name: &str, types: &[SearchParamType]| SearchParameter {
+            name: name.to_string(),
+            param_type: SearchParamType::Composite,
+            values: vec![SearchValue::eq("A$B")],
+            components: types
+                .iter()
+                .enumerate()
+                .map(|(position, param_type)| CompositeSearchComponent {
+                    param_type: *param_type,
+                    param_name: format!("component-{position}"),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        for mode in [ContainedMode::On, ContainedMode::Both] {
+            for types in [
+                vec![SearchParamType::Token, SearchParamType::Token],
+                vec![
+                    SearchParamType::Token,
+                    SearchParamType::Quantity,
+                    SearchParamType::Token,
+                ],
+                vec![SearchParamType::Quantity, SearchParamType::Quantity],
+            ] {
+                // An arbitrary code proves this checks declarations, not names.
+                let parameter = composite("custom-pair", &types);
+                let mut query = contained_query(vec![parameter.clone()]);
+                query.contained = mode;
+                let SearchError::InvalidComposite { message } =
+                    PostgresQueryBuilder::reject_unsupported_contained(&query).unwrap_err()
+                else {
+                    panic!("expected InvalidComposite");
+                };
+                assert!(message.contains("'custom-pair'"), "{message}");
+                assert!(message.contains("_contained"), "{message}");
+                assert!(message.contains("repeated component types"), "{message}");
+                query.contained = ContainedMode::Off;
+                assert!(PostgresQueryBuilder::reject_unsupported_contained(&query).is_ok());
+
+                // Existing modifier errors take precedence over repeated types.
+                query.contained = mode;
+                query.parameters[0].modifier = Some(SearchModifier::Exact);
+                let error = PostgresQueryBuilder::reject_unsupported_contained(&query)
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("modifier or no components"), "{error}");
+            }
+            // Repeating a type across separate mixed composites is supported.
+            let mut query = contained_query(vec![
+                composite(
+                    "mixed-one",
+                    &[SearchParamType::Token, SearchParamType::Quantity],
+                ),
+                composite(
+                    "mixed-two",
+                    &[SearchParamType::Token, SearchParamType::Quantity],
+                ),
+            ]);
+            query.contained = mode;
+            assert!(PostgresQueryBuilder::reject_unsupported_contained(&query).is_ok());
         }
     }
 

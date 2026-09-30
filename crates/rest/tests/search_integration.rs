@@ -4518,6 +4518,273 @@ mod score_param {
 
 mod contained_search {
     use super::*;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use helios_persistence::composite::{
+        CompositeConfig, CompositeStorage, DynSearchProvider, DynStorage,
+    };
+    use helios_persistence::core::{BackendKind, SearchProvider, SearchResult};
+    use helios_persistence::error::StorageResult;
+    use helios_persistence::search::SearchParameterRegistry;
+    use helios_persistence::types::{SearchQuery, StoredResource};
+
+    /// A searchable backend without contained-resource indexing. Its counters
+    /// distinguish a capability refusal from executing an unfiltered search.
+    struct WithoutContainedSearch {
+        inner: Arc<SqliteBackend>,
+        search_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ResourceStorage for WithoutContainedSearch {
+        fn backend_name(&self) -> &'static str {
+            "without-contained-search"
+        }
+
+        async fn create(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            resource: Value,
+            fhir_version: FhirVersion,
+        ) -> StorageResult<StoredResource> {
+            self.inner
+                .create(tenant, resource_type, resource, fhir_version)
+                .await
+        }
+
+        async fn create_or_update(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            id: &str,
+            resource: Value,
+            fhir_version: FhirVersion,
+        ) -> StorageResult<(StoredResource, bool)> {
+            self.inner
+                .create_or_update(tenant, resource_type, id, resource, fhir_version)
+                .await
+        }
+
+        async fn read(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            id: &str,
+        ) -> StorageResult<Option<StoredResource>> {
+            self.inner.read(tenant, resource_type, id).await
+        }
+
+        async fn update(
+            &self,
+            tenant: &TenantContext,
+            current: &StoredResource,
+            resource: Value,
+        ) -> StorageResult<StoredResource> {
+            self.inner.update(tenant, current, resource).await
+        }
+
+        async fn delete(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            id: &str,
+        ) -> StorageResult<()> {
+            self.inner.delete(tenant, resource_type, id).await
+        }
+
+        async fn count(
+            &self,
+            tenant: &TenantContext,
+            resource_type: Option<&str>,
+        ) -> StorageResult<u64> {
+            self.inner.count(tenant, resource_type).await
+        }
+    }
+
+    #[async_trait]
+    impl SearchProvider for WithoutContainedSearch {
+        async fn search(
+            &self,
+            tenant: &TenantContext,
+            query: &SearchQuery,
+        ) -> StorageResult<SearchResult> {
+            self.search_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.search(tenant, query).await
+        }
+
+        async fn search_count(
+            &self,
+            tenant: &TenantContext,
+            query: &SearchQuery,
+        ) -> StorageResult<u64> {
+            self.search_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.search_count(tenant, query).await
+        }
+
+        fn search_param_registry(
+            &self,
+            tenant: &TenantContext,
+        ) -> Arc<parking_lot::RwLock<SearchParameterRegistry>> {
+            self.inner.search_param_registry(tenant)
+        }
+
+        fn supports_contained_search(&self) -> bool {
+            false
+        }
+    }
+
+    fn server_without_contained_search(
+        backend: Arc<SqliteBackend>,
+    ) -> (TestServer, Arc<WithoutContainedSearch>) {
+        let provider = Arc::new(WithoutContainedSearch {
+            inner: backend.clone(),
+            search_calls: AtomicUsize::new(0),
+        });
+        let config = CompositeConfig::builder()
+            .primary("sqlite", BackendKind::Sqlite)
+            .search_backend("search", BackendKind::Sqlite)
+            .build()
+            .unwrap();
+        let mut backends: HashMap<String, DynStorage> = HashMap::new();
+        backends.insert("sqlite".to_string(), backend.clone() as DynStorage);
+        backends.insert("search".to_string(), provider.clone() as DynStorage);
+        let mut providers: HashMap<String, DynSearchProvider> = HashMap::new();
+        providers.insert("sqlite".to_string(), backend.clone() as DynSearchProvider);
+        providers.insert("search".to_string(), provider.clone() as DynSearchProvider);
+        let composite = CompositeStorage::new(config, backends)
+            .unwrap()
+            .with_search_providers(providers)
+            .with_full_primary(backend);
+        let state = helios_rest::AppState::new(
+            Arc::new(composite),
+            ServerConfig {
+                multitenancy: MultitenancyConfig {
+                    routing_mode: TenantRoutingMode::HeaderOnly,
+                    ..Default::default()
+                },
+                base_url: "http://localhost:8080".to_string(),
+                default_tenant: "test-tenant".to_string(),
+                ..ServerConfig::for_testing()
+            },
+        );
+        let server =
+            TestServer::new(helios_rest::routing::fhir_routes::create_routes(state)).unwrap();
+        (server, provider)
+    }
+
+    /// #1407: SQL contained composite rows do not retain component positions.
+    /// Reject repeated types explicitly, even for an otherwise matching pair,
+    /// rather than allowing A$B to satisfy the swapped query B$A.
+    #[tokio::test]
+    async fn test_contained_repeated_type_composites_return_named_400() {
+        let (server, backend) = create_test_server().await;
+        let observation = |id| {
+            json!({
+                "resourceType": "Observation",
+                "id": id,
+                "status": "final",
+                "code": {"coding": [{"code": "A"}]},
+                "valueCodeableConcept": {"coding": [{"code": "B"}]}
+            })
+        };
+        backend
+            .create(
+                &test_tenant(),
+                "Observation",
+                observation("top"),
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &test_tenant(),
+                "DiagnosticReport",
+                json!({
+                    "resourceType": "DiagnosticReport",
+                    "id": "container",
+                    "status": "final",
+                    "code": {"text": "panel"},
+                    "contained": [observation("inside"), {
+                        "resourceType": "Observation",
+                        "id": "quantity",
+                        "status": "final",
+                        "code": {"coding": [{"code": "Q"}]},
+                        "valueQuantity": {"value": 10}
+                    }]
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap();
+
+        for (url, expected) in [
+            ("/Observation?code-value-concept=A%24B", "Observation/top"),
+            (
+                "/Observation?_contained=false&code-value-concept=A%24B",
+                "Observation/top",
+            ),
+            (
+                "/Observation?_contained=true&code=A",
+                "DiagnosticReport/container",
+            ),
+            (
+                "/Observation?_contained=true&_containedType=contained&code=A",
+                "Observation/inside",
+            ),
+        ] {
+            let (status, body) = get(&server, url).await;
+            assert_eq!(status, StatusCode::OK, "{url}: {body}");
+            assert_eq!(entry_ids(&body), [expected], "{url}: {body}");
+        }
+
+        for mode in ["true", "both"] {
+            for returns in ["container", "contained"] {
+                for value in ["A%24B", "B%24A", "A%24A"] {
+                    for suffix in ["", "&_summary=count", "&_count=0", "&_count=1&_offset=1"] {
+                        let url = format!(
+                            "/Observation?_contained={mode}&_containedType={returns}&code-value-concept={value}{suffix}"
+                        );
+                        let (status, body) = get(&server, &url).await;
+                        assert_eq!(status, StatusCode::BAD_REQUEST, "{url}: {body}");
+                        assert_eq!(body["resourceType"], "OperationOutcome", "{url}: {body}");
+                        let text = body["issue"][0]["details"]["text"]
+                            .as_str()
+                            .unwrap_or_default();
+                        assert!(
+                            text.contains("code-value-concept")
+                                && text.contains("_contained")
+                                && text.contains("repeated component types"),
+                            "{url}: {body}"
+                        );
+                        if mode == "true"
+                            && returns == "container"
+                            && value == "B%24A"
+                            && suffix.is_empty()
+                        {
+                            eprintln!("#1407 after HTTP {status}: GET {url}\n{body}");
+                        }
+                    }
+                }
+
+                let url = format!(
+                    "/Observation?_contained={mode}&_containedType={returns}&code-value-quantity=Q%24gt5&_total=accurate"
+                );
+                let (status, body) = get(&server, &url).await;
+                assert_eq!(status, StatusCode::OK, "{url}: {body}");
+                let expected = if returns == "container" {
+                    "DiagnosticReport/container"
+                } else {
+                    "Observation/quantity"
+                };
+                assert_eq!(entry_ids(&body), [expected], "{url}: {body}");
+                assert_eq!(body["total"], json!(1), "{url}: {body}");
+            }
+        }
+    }
 
     /// Seeds an Observation containing a Patient named "Smith".
     async fn seed_contained(backend: &SqliteBackend) {
@@ -4695,14 +4962,22 @@ mod contained_search {
 
         // Positive controls: each constraint works without `_contained`, and
         // `_contained` works without them.
-        for url in [
-            "/Observation?_list=l1",
-            "/Observation?_has:Provenance:target:_id=prov1",
-            "/Observation?subject.family=Smith",
-        ] {
-            let (status, body) = get(&server, url).await;
-            assert_eq!(status, StatusCode::OK, "{url}: {body}");
-            assert_eq!(entry_ids(&body), ["Observation/c1"], "{url}");
+        for route in ["/Observation", "/Patient/p1/Observation", "/Patient/p1/*"] {
+            for constraint in [
+                "_list=l1",
+                "_has:Provenance:target:_id=prov1",
+                "subject.family=Smith",
+            ] {
+                let url = format!("{route}?{constraint}");
+                let (status, body) = get(&server, &url).await;
+                assert_eq!(status, StatusCode::OK, "{url}: {body}");
+                let ids = entry_ids(&body);
+                if route.ends_with('*') {
+                    assert!(ids.iter().any(|id| id == "Observation/c1"), "{url}: {body}");
+                } else {
+                    assert_eq!(ids, ["Observation/c1"], "{url}: {body}");
+                }
+            }
         }
         let (status, body) = get(&server, "/Observation?_contained=true").await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -4717,17 +4992,53 @@ mod contained_search {
             ("subject.family=Smith", "subject.family"),
         ] {
             for mode in ["true", "both"] {
-                let url = format!("/Observation?_contained={mode}&{constraint}");
-                let (status, body) = get(&server, &url).await;
-                assert_eq!(status, StatusCode::BAD_REQUEST, "{url}: {body}");
-                assert_eq!(body["resourceType"], "OperationOutcome", "{url}");
-                let text = body["issue"][0]["details"]["text"]
-                    .as_str()
-                    .unwrap_or_default();
-                assert!(
-                    text.contains(named) && text.contains("_contained"),
-                    "{url}: {body}"
-                );
+                for route in ["/Observation", "/Patient/p1/Observation", "/Patient/p1/*"] {
+                    let url = format!("{route}?_contained={mode}&{constraint}");
+                    let (status, body) = get(&server, &url).await;
+                    assert_eq!(status, StatusCode::BAD_REQUEST, "{url}: {body}");
+                    assert_eq!(body["resourceType"], "OperationOutcome", "{url}");
+                    let text = body["issue"][0]["details"]["text"]
+                        .as_str()
+                        .unwrap_or_default();
+                    assert!(
+                        text.contains(named) && text.contains("_contained"),
+                        "{url}: {body}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// #1407 item 8: the capability gate must apply to both compartment route
+    /// shapes before any backend search, just as it does to type-level search.
+    #[tokio::test]
+    async fn test_contained_unsupported_backend_returns_501_before_search() {
+        let (_server, backend) = create_test_server().await;
+        seed_out_of_band(&backend).await;
+        let (server, provider) = server_without_contained_search(backend);
+
+        // This goes through the same provider and proves that ordinary search
+        // still executes instead of the fixture refusing all requests.
+        let (status, body) = get(&server, "/Patient/p1/Observation").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(entry_ids(&body), ["Observation/c1"]);
+        assert!(provider.search_calls.load(Ordering::SeqCst) > 0);
+        provider.search_calls.store(0, Ordering::SeqCst);
+
+        for route in ["/Observation", "/Patient/p1/Observation", "/Patient/p1/*"] {
+            for mode in ["true", "both"] {
+                for suffix in ["", "&_summary=count"] {
+                    let url = format!("{route}?_contained={mode}{suffix}");
+                    let (status, body) = get(&server, &url).await;
+                    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{url}: {body}");
+                    assert_eq!(body["resourceType"], "OperationOutcome", "{url}: {body}");
+                    assert_eq!(body["issue"][0]["code"], "not-supported", "{url}: {body}");
+                    let text = body["issue"][0]["details"]["text"]
+                        .as_str()
+                        .unwrap_or_default();
+                    assert!(text.contains("_contained"), "{url}: {body}");
+                    assert_eq!(provider.search_calls.load(Ordering::SeqCst), 0, "{url}");
+                }
             }
         }
     }
