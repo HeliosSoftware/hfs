@@ -2120,7 +2120,7 @@ mod conditional_entries {
     /// Beside real criteria it is dropped, as in a batch; alone it leaves
     /// nothing to match on, which is a `400` rather than "matches nothing" —
     /// a `PUT` would otherwise create, and a `_`-name once matched everything
-    /// (#866).
+    /// (#866). The refusal names the dropped parameters (#1542).
     #[tokio::test]
     async fn a_result_parameter_in_transaction_criteria_is_dropped() {
         let (server, backend) = create_test_server().await;
@@ -2138,7 +2138,7 @@ mod conditional_entries {
             assert!(
                 body["issue"][0]["details"]["text"]
                     .as_str()
-                    .is_some_and(|t| t.contains("no usable criteria")),
+                    .is_some_and(|t| t.contains("nothing to match on")),
                 "{url}: {body}"
             );
         }
