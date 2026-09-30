@@ -23,7 +23,7 @@
   function parseValues(value) {
     var seen = Object.create(null);
     return String(value || "")
-      .split(/[\n,]+/)
+      .split(/[\r\n,]+/)
       .map(function (item) { return item.trim(); })
       .filter(function (item) {
         if (!item || seen[item]) return false;
@@ -231,6 +231,18 @@
       input.focus();
     }
 
+    function commitPending(raw) {
+      // Export filters accept raw references; the single-value table picker
+      // keeps its option-only contract. Validation belongs to the server.
+      if (max !== 0 || input.disabled) return false;
+      var pending = typeof raw === "string" ? raw : input.value;
+      if (!pending.trim()) return false;
+      parseValues(pending).forEach(function (value) { add(value, value, true); });
+      input.value = "";
+      setOpen(false);
+      return true;
+    }
+
     function select(option) {
       var value = optionValue(option);
       var label = optionLabel(option);
@@ -246,6 +258,9 @@
           detail: { value: value, label: label, name: optionName(option) },
         }));
       }
+      // The search that produced this selection is consumed, not another
+      // pending reference to append when an export form is submitted.
+      if (max === 0) input.value = "";
       // Keep results open so another item can be chosen without repeating the
       // query. Escape, Tab and outside clicks remain the explicit close paths.
       setActive(-1);
@@ -253,6 +268,7 @@
     }
 
     input.addEventListener("keydown", function (event) {
+      if (event.isComposing) return;
       var items = options();
       if (event.key === "Escape") {
         // Prevent type=search from clearing itself and emitting a new `search`
@@ -263,6 +279,10 @@
       }
       if (event.key === "Tab") {
         setOpen(false);
+        return;
+      }
+      if (event.key === "Enter" && activeIndex < 0 && commitPending()) {
+        event.preventDefault();
         return;
       }
       if (!items.length) return;
@@ -286,6 +306,21 @@
         event.preventDefault();
         select(items[activeIndex]);
       }
+    });
+
+    input.addEventListener("paste", function (event) {
+      if (max !== 0 || input.disabled || !event.clipboardData) return;
+      var text = event.clipboardData.getData("text/plain");
+      // A single pasted value remains a search or pending reference. Lists
+      // must be parsed before type=search strips their line breaks.
+      if (!/[\r\n,]/.test(text)) return;
+      var start = input.selectionStart;
+      var end = input.selectionEnd;
+      if (start === null) start = input.value.length;
+      if (end === null) end = start;
+      var pending = input.value.slice(0, start) + text + input.value.slice(end);
+      event.preventDefault();
+      commitPending(pending);
     });
 
     input.addEventListener("focus", function () { setOpen(true); });
@@ -322,6 +357,11 @@
     });
 
     var form = root.closest("form");
+    // Capture precedes Bulk Export's inline submit validation, which checks
+    // these hidden selections before it performs the native submission.
+    if (form && max === 0) form.addEventListener("submit", function () {
+      commitPending();
+    }, true);
     if (form) form.addEventListener("reset", function () {
       window.setTimeout(function () {
         values = [];
