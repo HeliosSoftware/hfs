@@ -566,3 +566,65 @@ async fn test_reindex_type_route_is_reachable() {
         .await
         .assert_status(StatusCode::ACCEPTED);
 }
+
+/// Reindex `start` audit events. The start event is recorded before the
+/// kick-off returns, so its absence after a rejected request means no job was
+/// started.
+fn reindex_starts(sink: &CollectorSink) -> usize {
+    sink.by_operation("reindex")
+        .iter()
+        .filter(|e| detail_map(e).get("phase").map(String::as_str) == Some("start"))
+        .count()
+}
+
+/// A body that is not JSON, or is too large to read, must not start a reindex
+/// with the defaults.
+#[tokio::test]
+async fn test_reindex_rejects_a_malformed_or_oversized_body() {
+    let (server, backend, sink) = server_with_ops();
+    seed(&backend, "p1").await;
+
+    let truncated =
+        r#"{"resourceType":"Parameters","parameter":[{"name":"clearExisting","valueBoolean":true}"#;
+    let oversized = " ".repeat(64 * 1024 + 1);
+    let cases = [
+        (truncated, "invalid JSON in reindex request body"),
+        (oversized.as_str(), "failed to read reindex request body"),
+    ];
+    for path in ["/$reindex", "/Patient/$reindex"] {
+        for (body, message) in cases {
+            let response = server.post(path).text(body).await;
+            response.assert_status(StatusCode::BAD_REQUEST);
+            assert!(
+                response.text().contains(message),
+                "{path}: {}",
+                response.text()
+            );
+        }
+    }
+    assert_eq!(
+        reindex_starts(&sink),
+        0,
+        "a rejected body must not start a job"
+    );
+
+    // The collector does see a job that really starts.
+    server
+        .post("/Patient/$reindex")
+        .await
+        .assert_status(StatusCode::ACCEPTED);
+    assert_eq!(reindex_starts(&sink), 1);
+}
+
+/// The scope check comes before the body is read: a caller without the scope
+/// is refused with 403 whatever it sends.
+#[tokio::test]
+async fn test_reindex_scope_is_checked_before_the_body() {
+    let (server, _backend) = server_with_principal("system/Patient.cruds");
+
+    server
+        .post("/Patient/$reindex")
+        .text("{not-json")
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+}

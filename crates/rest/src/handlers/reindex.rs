@@ -111,25 +111,31 @@ where
 }
 
 /// Shared kick-off for the system- and type-scoped routes.
+///
+/// The body is read after the scope and backend checks, so a caller without
+/// the scope gets 403 and a backend without a search index gets 501 whatever
+/// the body contains.
 async fn kickoff<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
-    principal: Option<&Principal>,
     resource_types: Option<Vec<String>>,
-    body: Option<&serde_json::Value>,
+    http_request: Request,
 ) -> RestResult<Response>
 where
     S: ResourceStorage + Send + Sync + 'static,
 {
+    let principal = http_request.extensions().get::<Principal>().cloned();
+    let principal = principal.as_ref();
     check_reindex_scope(principal)?;
     let op = driver(state)?;
+    let body = read_optional_json_body(http_request).await?;
 
     let mut request = ReindexRequest::default();
     request.resource_types = resource_types;
 
     // Optional Parameters body: `clearExisting` drops the existing entries
     // before rebuilding, `batchSize` tunes the page size.
-    if let Some(params) = body {
+    if let Some(params) = &body {
         for param in params
             .get("parameter")
             .and_then(|p| p.as_array())
@@ -190,9 +196,7 @@ pub async fn reindex_system_handler<S>(
 where
     S: ResourceStorage + Send + Sync + 'static,
 {
-    let principal = request.extensions().get::<Principal>().cloned();
-    let body = read_optional_json_body(request).await;
-    kickoff(&state, &tenant, principal.as_ref(), None, body.as_ref()).await
+    kickoff(&state, &tenant, None, request).await
 }
 
 /// `POST /{resource_type}/$reindex` — reindex a single resource type.
@@ -205,16 +209,7 @@ pub async fn reindex_type_handler<S>(
 where
     S: ResourceStorage + Send + Sync + 'static,
 {
-    let principal = request.extensions().get::<Principal>().cloned();
-    let body = read_optional_json_body(request).await;
-    kickoff(
-        &state,
-        &tenant,
-        principal.as_ref(),
-        Some(vec![resource_type]),
-        body.as_ref(),
-    )
-    .await
+    kickoff(&state, &tenant, Some(vec![resource_type]), request).await
 }
 
 /// `GET /$reindex-status/{job_id}` — poll a job's progress.
@@ -263,16 +258,23 @@ where
 }
 
 /// Reads a JSON body if one was sent. A reindex kick-off with no body is valid
-/// (reindex everything with the defaults), so a missing or unparsable body is
-/// not an error.
-async fn read_optional_json_body(request: Request) -> Option<serde_json::Value> {
+/// (reindex everything with the defaults). A body that cannot be read or is not
+/// JSON is a client error: running with the defaults instead would start a
+/// different job from the one requested.
+async fn read_optional_json_body(request: Request) -> RestResult<Option<serde_json::Value>> {
     let bytes = axum::body::to_bytes(request.into_body(), 1024 * 64)
         .await
-        .ok()?;
+        .map_err(|e| RestError::BadRequest {
+            message: format!("failed to read reindex request body: {e}"),
+        })?;
     if bytes.is_empty() {
-        return None;
+        return Ok(None);
     }
-    serde_json::from_slice(&bytes).ok()
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| RestError::BadRequest {
+            message: format!("invalid JSON in reindex request body: {e}"),
+        })
 }
 
 #[cfg(test)]
@@ -315,6 +317,55 @@ mod tests {
     #[test]
     fn test_no_principal_allows_reindex() {
         assert!(check_reindex_scope(None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn empty_reindex_body_uses_defaults() {
+        let request = Request::builder().body(axum::body::Body::empty()).unwrap();
+
+        assert!(read_optional_json_body(request).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn valid_reindex_body_is_returned() {
+        let parameters = json!({
+            "resourceType": "Parameters",
+            "parameter": [{ "name": "batchSize", "valueInteger": 500 }]
+        });
+        let request = Request::builder()
+            .body(axum::body::Body::from(parameters.to_string()))
+            .unwrap();
+
+        assert_eq!(
+            read_optional_json_body(request).await.unwrap(),
+            Some(parameters)
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_reindex_body_is_rejected() {
+        let request = Request::builder()
+            .body(axum::body::Body::from("{not-json"))
+            .unwrap();
+
+        let error = read_optional_json_body(request).await.unwrap_err();
+
+        assert!(matches!(&error, RestError::BadRequest { message }
+            if message.starts_with("invalid JSON in reindex request body:")));
+        assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn oversized_reindex_body_is_rejected() {
+        let request = Request::builder()
+            .body(axum::body::Body::from(" ".repeat(1024 * 64 + 1)))
+            .unwrap();
+
+        let error = read_optional_json_body(request).await.unwrap_err();
+
+        assert!(matches!(&error, RestError::BadRequest { message }
+            if message.starts_with("failed to read reindex request body:")));
+        assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
