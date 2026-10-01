@@ -983,16 +983,30 @@ the id as `VD2`.
 
 - Type `patient` into **Filter views**: only `patient_demographics` remains.
 - With `patient_demographics` selected click **Duplicate**: a `patient_demographics_copy`
-  is created and selected. Click **Delete** → confirm
+  is created and selected, with its own canonical URL
+  `http://example.org/ViewDefinition/patient_demographics_copy`; the original's
+  URL remains unchanged. Select the original again and click **Duplicate**:
+  `patient_demographics_copy_2` receives a second distinct name and canonical
+  ending in `_copy_2`. A definition without `url` duplicates without gaining one.
+- Before deleting the copies, create a SQL View depending on the original
+  `patient_demographics` canonical (alias `pd`, SQL `SELECT id FROM pd`). Its
+  **Reads from** row still names and links to the original. Change a copy's
+  `where` to `[{"path":"false"}]` and **Save**: that copy returns zero rows,
+  while the dependent SQL View still returns the original's rows. Duplicating
+  a SQL View or SQL Query Library likewise assigns its own canonical when one
+  exists; a SQL Query depending on the original SQL View keeps reading from
+  that original after its copy is edited.
+- Select `patient_demographics_copy`, click **Delete** → confirm
   *Delete view definition "patient_demographics_copy"? This cannot be undone.* → it
-  disappears from the rail.
+  disappears from the rail. Delete `patient_demographics_copy_2` as well.
 - Negative: in a new definition set `"resource": "Nope"` — the lint panel flags it and
   the Results card shows *"Could not run the view. …"* while the previous table stays
   labelled *last successful run*. Click **Save** anyway: the prompt *"This view
   definition still has 1 error(s). Save it anyway?"* appears; choose Cancel.
 
 Pass criteria: both definitions save and run; lint, fix, and completion behave as
-described; the cross-check row matches the stored Patient; duplicate/delete work.
+described; the cross-check row matches the stored Patient; duplicate/delete work,
+copies have distinct canonicals, and dependencies continue to use their originals.
 This step is expected to pass on all eight backends.
 
 ---

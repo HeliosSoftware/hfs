@@ -1603,7 +1603,8 @@ test.describe("pending Bulk Export Patients (#1575)", () => {
       await bulkExport.patientSearch.press("ControlOrMeta+v");
       expect(await bulkExport.selectedPatients.evaluateAll((inputs) => inputs.map((input) => (input as HTMLInputElement).value))).toEqual(["p-1575-a", "p-1575-b"]);
       await expect(bulkExport.patientSearch).toHaveValue("");
-      await bulkExport.clearButton.click();
+      // Clear only affects Resource types; exercise the native form reset.
+      await bulkExport.form.evaluate((form: HTMLFormElement) => form.reset());
       await expect(bulkExport.selectedPatients).toHaveCount(0);
       await bulkExport.scopeRadio("patient").check();
     }
@@ -1612,7 +1613,8 @@ test.describe("pending Bulk Export Patients (#1575)", () => {
     await page.evaluate(() => navigator.clipboard.writeText("one,two"));
     await bulkExport.patientSearch.press("ControlOrMeta+v");
     expect(await bulkExport.selectedPatients.evaluateAll((inputs) => inputs.map((input) => (input as HTMLInputElement).value))).toEqual(["prefix-one", "two-suffix"]);
-    await bulkExport.clearButton.click();
+    await bulkExport.form.evaluate((form: HTMLFormElement) => form.reset());
+    await expect(bulkExport.selectedPatients).toHaveCount(0);
     await bulkExport.scopeRadio("patient").check();
     await bulkExport.patientSearch.focus();
     await page.evaluate(() => navigator.clipboard.writeText("single-1575"));
@@ -1642,7 +1644,8 @@ test.describe("pending Bulk Export Patients (#1575)", () => {
       await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true })));
       await bulkExport.scopeRadio("patient").check();
       await expect(bulkExport.patientSearch).toHaveValue("pending-1575");
-      await bulkExport.clearButton.click();
+      // Clear preserves Patients; reset the form itself to clear chips/text.
+      await bulkExport.form.evaluate((form: HTMLFormElement) => form.reset());
       await expect(bulkExport.selectedPatients).toHaveCount(0);
       await expect(bulkExport.patientCombobox.locator('[role="combobox"]')).toHaveValue("");
     });
