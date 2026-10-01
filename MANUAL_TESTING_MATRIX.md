@@ -1407,3 +1407,11 @@ For each backend row, attach to the release issue:
   never `git commit -a` after building.
 - Auth stays off for this pass; when auth is on, `$export`, `$bulk-submit`,
   `$sql-export`, `$purge`, and `$reindex` need their `system/*` scopes.
+- **A pass with auth on needs the browser login for T3 and the Tenants page.**
+  With `HFS_AUTH_ENABLED=true` and no `HFS_UI_LOGIN_CLIENT_ID`, the Import
+  (`/ui/bulk-import`) and Tenants (`/ui/tenants`) routes and the sidebar tenant
+  selector answer `401` (#1619). Set `HFS_UI_LOGIN_CLIENT_ID=hfs-web` and sign in
+  (see the auth README). The Import page then submits `$bulk-submit` as the
+  signed-in user, whose token must carry `system/bulk-submit`: the bundled
+  `docker/keycloak` realm grants it to `hfs-web` (#1633); on another IdP, grant
+  it to the user running the pass.
