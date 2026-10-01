@@ -936,3 +936,193 @@ test("the sidebar carries no Files entry, and /ui/sql/files redirects to the lis
   await page.goto("/ui/sql/files");
   await expect(page).toHaveURL(/\/ui\/sql\/export$/);
 });
+
+// #1575: exercise browser serialization as well as the existing server parser.
+// Each test owns its small corpus; output assertions never depend on how many
+// Patients another spec has left in the shared database.
+test.describe("pending SQL Export filters (#1575)", () => {
+  let patientIds: string[];
+  let groupId: string;
+  let reference: string;
+  let exportName: string;
+
+  test.beforeEach(async ({ page, request, sqlExport }) => {
+    patientIds = [];
+    groupId = "";
+    exportName = `e2e_pending_export_${Date.now()}`;
+    const vdId = await createResource(request, "ViewDefinition", {
+      name: exportName,
+      status: "active",
+      resource: "Patient",
+      select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+    });
+    seededViewDefinitionIds.push(vdId);
+    reference = `ViewDefinition/${vdId}`;
+    for (const family of ["PendingFirst", "PendingSecond"]) {
+      const id = await createResource(request, "Patient", {
+        name: [{ family: `${family}${Date.now()}` }],
+      });
+      patientIds.push(id);
+      await waitSearchable(request, "Patient", id);
+    }
+    groupId = await createResource(request, "Group", {
+      type: "person",
+      actual: true,
+      member: [{ entity: { reference: `Patient/${patientIds[0]}` } }],
+    });
+    await waitSearchable(request, "ViewDefinition", vdId);
+    await page.route("**/ui/lookup/*-options*", (route) =>
+      route.fulfill({ status: 200, contentType: "text/html", body: "" }),
+    );
+    await sqlExport.gotoNew();
+    await sqlExport.nameInput.fill(exportName);
+    await sqlExport.subjectCheckbox(reference).check();
+    await sqlExport.formatOption("ndjson").check();
+  });
+
+  test.afterEach(async ({ request }) => {
+    await deleteResources(request, "Group", groupId ? [groupId] : []);
+    await deleteResources(request, "Patient", patientIds);
+  });
+
+  for (const kind of ["Patient", "Group"] as const) {
+    for (const suggestions of [false, true]) {
+      test(`${kind} Enter commits pending text without an active option, ${suggestions ? "with" : "without"} suggestions (#1575)`, async ({ page, sqlExport }) => {
+        const search = kind === "Patient" ? sqlExport.patientSearch : sqlExport.groupSearch;
+        const selected = kind === "Patient" ? sqlExport.selectedPatients : sqlExport.selectedGroups;
+        const listbox = kind === "Patient" ? sqlExport.patientListbox : sqlExport.groupListbox;
+        const id = kind === "Patient" ? patientIds[0] : groupId;
+        if (suggestions) {
+          await page.route(`**/ui/lookup/${kind.toLowerCase()}-options*`, (route) =>
+            route.fulfill({ status: 200, contentType: "text/html", body:
+              `<button type="button" data-combobox-option data-value="${kind}/different" data-label="Suggestion">Suggestion</button>` }),
+          );
+        }
+        let submissions = 0;
+        page.on("request", (req) => {
+          if (req.method() === "POST" && new URL(req.url()).pathname === "/ui/sql/export") submissions++;
+        });
+        await search.fill(id);
+        if (suggestions) await expect(listbox.getByRole("option")).toHaveCount(1);
+        await expect(search).not.toHaveAttribute("aria-activedescendant", /.+/);
+        await search.press("Enter");
+        await expect(selected).toHaveValue(id);
+        await expect(search).toHaveValue("");
+        await expect(page).toHaveURL(/\/ui\/sql\/export\/new$/);
+        expect(submissions).toBe(0);
+      });
+    }
+
+    for (const entry of ["typed", "single-paste"] as const) {
+      test(`${kind} ${entry} then clicked reaches the real job, detail and restricted NDJSON (#1575)`, async ({ page, request, sqlExport }) => {
+        const id = kind === "Patient" ? patientIds[0] : groupId;
+        const search = kind === "Patient" ? sqlExport.patientSearch : sqlExport.groupSearch;
+        if (entry === "single-paste") {
+          await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+          await search.focus();
+          await page.evaluate((text) => navigator.clipboard.writeText(text), id);
+          await search.press("ControlOrMeta+v");
+          await expect(kind === "Patient" ? sqlExport.selectedPatients : sqlExport.selectedGroups).toHaveCount(0);
+          await expect(search).toHaveValue(id);
+        } else {
+          await search.fill(id);
+        }
+        const submitted = page.waitForRequest((req) => req.method() === "POST" && new URL(req.url()).pathname === "/ui/sql/export");
+        await sqlExport.startButton.click();
+        const params = new URLSearchParams((await submitted).postData() ?? "");
+        expect(params.getAll(kind.toLowerCase())).toEqual([id]);
+        await expect(page).toHaveURL(/\/ui\/sql\/export$/);
+        const card = sqlExport.card(exportName);
+        await expect(card.locator(".tag")).toHaveText("Complete", { timeout: POLL_TIMEOUT });
+        await card.getByRole("link", { name: exportName, exact: true }).click();
+        const detail = kind === "Patient" ? sqlExport.detailPatients : sqlExport.detailGroups;
+        await expect(detail).toHaveText(`${kind}/${id}`);
+        const href = await page.locator("a[download]").getAttribute("href");
+        expect(href).toBeTruthy();
+        const response = await request.get(href!);
+        expect(response.ok()).toBe(true);
+        const rows = (await response.text()).trim().split(/\r?\n/).map((line) => JSON.parse(line));
+        expect(rows.map((row) => row.id)).toEqual([patientIds[0]]);
+      });
+    }
+
+    test(`${kind} invalid pending text reaches server validation and preserves the form (#1575)`, async ({ page, request, sqlExport }) => {
+      await sqlExport.sincePreset.selectOption("custom");
+      await sqlExport.sinceCustom.fill("2020-01-01T00:00:00Z");
+      await sqlExport.openAdvanced();
+      await sqlExport.trackingIdInput.fill("pending-validation");
+      const search = kind === "Patient" ? sqlExport.patientSearch : sqlExport.groupSearch;
+      await search.fill("not a valid id!");
+      await sqlExport.startButton.click();
+      await expect(page.locator(".notice")).toContainText(`Enter only valid logical ${kind} IDs, separated by commas or new lines.`);
+      await expect(sqlExport.nameInput).toHaveValue(exportName);
+      await expect(sqlExport.subjectCheckbox(reference)).toBeChecked();
+      await expect(sqlExport.formatOption("ndjson")).toBeChecked();
+      await expect(sqlExport.sincePreset).toHaveValue("custom");
+      await expect(sqlExport.sinceCustom).toHaveValue("2020-01-01T00:00:00Z");
+      await expect(sqlExport.trackingIdInput).toHaveValue("pending-validation");
+      const selected = kind === "Patient" ? sqlExport.selectedPatients : sqlExport.selectedGroups;
+      await expect(selected).toHaveValue("not a valid id!");
+      const settings = await (await request.get("/_user/settings")).json();
+      expect(Object.keys(settings.sqlExport?.jobs ?? {})).toEqual([]);
+    });
+
+    test(`${kind} real clipboard lists preserve separators and selected text; single paste stays pending (#1575)`, async ({ page, sqlExport }) => {
+      await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+      const search = kind === "Patient" ? sqlExport.patientSearch : sqlExport.groupSearch;
+      const selected = kind === "Patient" ? sqlExport.selectedPatients : sqlExport.selectedGroups;
+      const root = kind === "Patient" ? sqlExport.patientCombobox : sqlExport.groupCombobox;
+      const values = [`${kind}/p-1575-a`, `${kind}/p-1575-b`];
+      for (const separator of [",", "\n", "\r", "\r\n"]) {
+        await search.focus();
+        await page.evaluate((text) => navigator.clipboard.writeText(text), values.join(separator));
+        await search.press("ControlOrMeta+v");
+        await expect(selected).toHaveCount(2);
+        expect(await selected.evaluateAll((inputs) => inputs.map((input) => (input as HTMLInputElement).value))).toEqual(values);
+        await expect(search).toHaveValue("");
+        // Repeated lists deduplicate, including after newline normalization.
+        await search.focus();
+        await search.press("ControlOrMeta+v");
+        await expect(selected).toHaveCount(2);
+        for (let index = 0; index < 2; index++) await root.getByRole("button", { name: /Remove/ }).first().click();
+      }
+      await search.fill("prefix-REPLACE-suffix");
+      await search.evaluate((input) => (input as HTMLInputElement).setSelectionRange(7, 14));
+      await page.evaluate(() => navigator.clipboard.writeText("one,two"));
+      await search.press("ControlOrMeta+v");
+      expect(await selected.evaluateAll((inputs) => inputs.map((input) => (input as HTMLInputElement).value))).toEqual(["prefix-one", "two-suffix"]);
+      await root.getByRole("button", { name: /Remove/ }).first().click();
+      await root.getByRole("button", { name: /Remove/ }).first().click();
+      await page.evaluate(() => navigator.clipboard.writeText("single-1575"));
+      await search.press("ControlOrMeta+v");
+      await expect(selected).toHaveCount(0);
+      await expect(search).toHaveValue("single-1575");
+      await search.press("Enter");
+      await expect(selected).toHaveValue("single-1575");
+    });
+  }
+
+  test("selecting an option consumes its search and mixed selected/pending values submit exactly once (#1575)", async ({ page, sqlExport }) => {
+    await page.route("**/ui/lookup/patient-options*", (route) => route.fulfill({
+      status: 200,
+      contentType: "text/html",
+      body: patientIds.map((id, index) => `<button type="button" data-combobox-option data-value="Patient/${id}" data-label="Patient ${index}">Patient ${index}</button>`).join(""),
+    }));
+    await sqlExport.patientSearch.fill("name search must not become a patient");
+    await expect(sqlExport.patientListbox.getByRole("option")).toHaveCount(2);
+    await sqlExport.patientSearch.press("Home");
+    await sqlExport.patientSearch.press("Enter");
+    await expect(sqlExport.patientSearch).toHaveValue("");
+    await expect(sqlExport.patientListbox).toBeVisible();
+    await sqlExport.patientSearch.press("End");
+    await sqlExport.patientSearch.press("Enter");
+    await expect(sqlExport.selectedPatients).toHaveCount(2);
+    await expect(sqlExport.patientSearch).toHaveValue("");
+    await sqlExport.patientCombobox.getByRole("button", { name: "Remove Patient 1", exact: true }).click();
+    await sqlExport.patientSearch.fill(patientIds[1]);
+    await page.route("**/ui/sql/export", (route) => route.request().method() === "POST" ? route.fulfill({ status: 204 }) : route.continue());
+    const submitted = page.waitForRequest((req) => req.method() === "POST" && new URL(req.url()).pathname === "/ui/sql/export");
+    await sqlExport.startButton.click();
+    expect(new URLSearchParams((await submitted).postData() ?? "").getAll("patient")).toEqual([`Patient/${patientIds[0]}`, patientIds[1]]);
+  });
+});

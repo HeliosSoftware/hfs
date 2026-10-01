@@ -480,6 +480,11 @@ test("the bulk export form shows the cue and leaving asks", async ({ page, bulkE
   const cue = page.locator("form.bulk-export-form .tag--unsaved");
   await expect(cue).toBeHidden();
 
+  await bulkExport.clearButton.click();
+  await expect(cue).toBeVisible();
+  await bulkExport.allResources.check();
+  await expect(cue).toBeHidden();
+
   // A no-op change — switching scope away and straight back — must never
   // leave the pill on: the page's own initial sync (All Resources checking
   // every individual type) is part of the baseline, not a user edit; the
@@ -497,6 +502,12 @@ test("the bulk export form shows the cue and leaving asks", async ({ page, bulkE
   await expect(cue).toBeHidden();
 
   await bulkExport.nameInput.fill("Nightly export");
+  await expect(cue).toBeVisible();
+
+  await bulkExport.clearButton.click();
+  await expect(bulkExport.nameInput).toHaveValue("Nightly export");
+  await expect(cue).toBeVisible();
+  await bulkExport.allResources.check();
   await expect(cue).toBeVisible();
 
   armDialog(page, "dismiss");

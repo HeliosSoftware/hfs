@@ -1039,6 +1039,13 @@ async fn the_export_page_uses_form_panels_with_name_and_all_resources_up_top() {
         "the app and server own validation feedback instead of the browser"
     );
     assert!(!html.contains("data-validation-started"));
+    assert!(
+        html.contains(
+            r#"<button type="button" data-clear-types hidden class="btn">Clear</button>"#
+        )
+    );
+    assert!(!html.contains(r#"type="reset""#));
+    assert!(!html.contains(r#"href="/ui/bulk-export/new">Clear"#));
     assert!(html.contains(
         r#"id="bulk-export-name-error" class="field__hint field__hint--error" role="alert" hidden>Enter a name for this export.</span>"#
     ));
@@ -1722,9 +1729,13 @@ async fn an_invalid_active_custom_instant_repopulates_the_representable_form() {
         "{html}"
     );
     assert!(
-        html.contains(r#"<a class="btn" href="/ui/bulk-export/new">Clear</a>"#),
+        html.contains(
+            r#"<button type="button" data-clear-types hidden class="btn">Clear</button>"#
+        ),
         "{html}"
     );
+    assert!(!html.contains(r#"type="reset""#));
+    assert!(!html.contains(r#"href="/ui/bulk-export/new">Clear"#));
     assert!(mock.kickoffs.lock().unwrap().is_empty());
     assert_no_default_user_jobs(&backend).await;
 }

@@ -669,6 +669,11 @@ mod date_precision_suite;
 #[path = "search/date_period_suite.rs"]
 mod date_period_suite;
 
+/// The backend-agnostic suite for where `_sort` puts a missing value (#1606).
+/// Same `#[path]` arrangement.
+#[path = "search/sort_missing_suite.rs"]
+mod sort_missing_suite;
+
 /// The backend-agnostic `_contained` suite (#1336, #1362, #1363). Same
 /// `#[path]` arrangement.
 #[path = "search/contained_suite.rs"]
@@ -1060,6 +1065,19 @@ mod es_integration {
     async fn es_date_period_targets_are_ranges() {
         let backend = create_backend().await;
         super::date_period_suite::period_targets_are_ranges(&backend, "date-period-1391").await;
+    }
+
+    /// #1606: a missing value came first on a descending sort. It comes last
+    /// both ways now, and a `Previous` page still mirrors a `Next` one.
+    #[tokio::test]
+    async fn es_missing_sort_values_sort_last() {
+        let backend = create_backend().await;
+        super::sort_missing_suite::missing_sort_values_sort_last(
+            &backend,
+            "sort-missing-1606",
+            true,
+        )
+        .await;
     }
 
     /// #1362: every contained resource is a document of its own here, so a

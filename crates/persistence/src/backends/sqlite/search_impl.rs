@@ -27,7 +27,7 @@ use crate::types::{
 };
 
 use super::SqliteBackend;
-use super::search::{QueryBuilder, SortValueKind, SqlParam};
+use super::search::{KeysetKey, QueryBuilder, SortValueKind, SqlParam};
 
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -119,9 +119,11 @@ fn bind_cursor_value(
     match kind {
         SortValueKind::Number => {
             let n = match value {
-                Some(CursorValue::Decimal(f)) => *f,
-                Some(CursorValue::Number(i)) => *i as f64,
-                Some(CursorValue::String(s)) => s.parse().unwrap_or(0.0),
+                Some(CursorValue::Decimal(f)) => Some(*f),
+                Some(CursorValue::Number(i)) => Some(*i as f64),
+                Some(CursorValue::String(s)) => Some(s.parse().unwrap_or(0.0)),
+                // A cursor on a resource with no value for the sort key.
+                Some(CursorValue::Null) | None => None,
                 _ => return Err(invalid_cursor(cursor)),
             };
             params.push(Box::new(n));
@@ -133,6 +135,53 @@ fn bind_cursor_value(
         },
     }
     Ok(())
+}
+
+/// Whether a cursor sits on a resource with no value for the sort key.
+fn cursor_value_is_null(cursor: &PageCursor) -> bool {
+    matches!(cursor.sort_values().first(), Some(CursorValue::Null) | None)
+}
+
+/// The keyset `WHERE` condition and `ORDER BY` list for a cursor page, with
+/// `?3` bound to the cursor's sort value and `?4` to its resource id.
+///
+/// A resource with no value for a nullable key sorts after every resource
+/// that has one, in either direction (#1606). Paging forward from a present
+/// value therefore still reaches the missing ones, and paging forward from a
+/// missing one only walks the rest of them by id. `Previous` walks the exact
+/// mirror: the reversed order puts missing values first, so from a present
+/// value none of them qualify (a comparison with NULL is never true), and
+/// from a missing one every present value lies before it.
+fn keyset_page_clauses(k: &KeysetKey, cursor_is_null: bool, backward: bool) -> (String, String) {
+    let e = &k.expr;
+    let asc = k.direction == crate::types::SortDirection::Ascending;
+    let at_missing = k.nullable && cursor_is_null;
+    if backward {
+        let condition = if at_missing {
+            format!("({e} IS NOT NULL OR ({e} IS ?3 AND id < ?4))")
+        } else {
+            let op = if asc { "<" } else { ">" };
+            format!("({e} {op} ?3 OR ({e} = ?3 AND id < ?4))")
+        };
+        let nulls = if k.nullable { " NULLS FIRST" } else { "" };
+        let dir = if asc { "DESC" } else { "ASC" };
+        (condition, format!("{e} {dir}{nulls}, id DESC"))
+    } else {
+        let condition = if at_missing {
+            format!("({e} IS ?3 AND id > ?4)")
+        } else {
+            let op = if asc { ">" } else { "<" };
+            let or_missing = if k.nullable {
+                format!(" OR {e} IS NULL")
+            } else {
+                String::new()
+            };
+            format!("({e} {op} ?3 OR ({e} = ?3 AND id > ?4){or_missing})")
+        };
+        let nulls = if k.nullable { " NULLS LAST" } else { "" };
+        let dir = if asc { "ASC" } else { "DESC" };
+        (condition, format!("{e} {dir}{nulls}, id ASC"))
+    }
 }
 
 impl SqliteBackend {
@@ -216,43 +265,19 @@ impl SqliteBackend {
 
         // Build query based on pagination mode.
         let (sql, has_previous) = if let (Some(cursor), Some(k)) = (&cursor, &keyset) {
-            let e = &k.expr;
-            let asc = k.direction == crate::types::SortDirection::Ascending;
-            match cursor.direction() {
-                CursorDirection::Next => {
-                    let e_op = if asc { ">" } else { "<" };
-                    let sql = format!(
-                        "SELECT {cols} FROM resources \
-                         WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{filter} \
-                         AND ({e} {e_op} ?3 OR ({e} = ?3 AND id > ?4)) \
-                         ORDER BY {e} {dir}, id ASC LIMIT {lim}",
-                        cols = select_cols,
-                        filter = filter_clause,
-                        e = e,
-                        e_op = e_op,
-                        dir = if asc { "ASC" } else { "DESC" },
-                        lim = count + 1,
-                    );
-                    (sql, true)
-                }
-                CursorDirection::Previous => {
-                    let e_op = if asc { "<" } else { ">" };
-                    let sql = format!(
-                        "SELECT {cols} FROM resources \
-                         WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{filter} \
-                         AND ({e} {e_op} ?3 OR ({e} = ?3 AND id < ?4)) \
-                         ORDER BY {e} {dir}, id DESC LIMIT {lim}",
-                        cols = select_cols,
-                        filter = filter_clause,
-                        e = e,
-                        e_op = e_op,
-                        dir = if asc { "DESC" } else { "ASC" },
-                        lim = count + 1,
-                    );
-                    // Placeholder: the backward branch derives has_previous from the extra row.
-                    (sql, false)
-                }
-            }
+            let backward = cursor.direction() == CursorDirection::Previous;
+            let (condition, order) = keyset_page_clauses(k, cursor_value_is_null(cursor), backward);
+            let sql = format!(
+                "SELECT {cols} FROM resources \
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{filter} \
+                 AND {condition} \
+                 ORDER BY {order} LIMIT {lim}",
+                cols = select_cols,
+                filter = filter_clause,
+                lim = count + 1,
+            );
+            // Backward: the placeholder is replaced by the extra-row check below.
+            (sql, !backward)
         } else if let Some(offset) = query.offset {
             let sql = format!(
                 "SELECT {cols} FROM resources \
@@ -377,14 +402,18 @@ impl SqliteBackend {
             (has_next, has_previous)
         };
 
-        let next_cursor = if has_next {
+        // A sort with no keyset (multi-field) pages by offset, which is what
+        // the REST layer's `next` link falls back to without a cursor. A
+        // cursor minted here would be ignored on the way back in and return
+        // the first page again (#1606, as MongoDB since #1058).
+        let next_cursor = if has_next && keyset.is_some() {
             parsed.last().map(|(r, sk)| {
                 PageCursor::new(vec![sk.clone().unwrap_or(CursorValue::Null)], r.id()).encode()
             })
         } else {
             None
         };
-        let previous_cursor = if has_previous {
+        let previous_cursor = if has_previous && keyset.is_some() {
             parsed.first().map(|(r, sk)| {
                 PageCursor::previous(vec![sk.clone().unwrap_or(CursorValue::Null)], r.id()).encode()
             })

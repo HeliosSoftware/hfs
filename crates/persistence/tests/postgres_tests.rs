@@ -88,6 +88,11 @@ mod ap_relations_suite;
 #[path = "search/date_period_suite.rs"]
 mod date_period_suite;
 
+/// The backend-agnostic suite for where `_sort` puts a missing value (#1606).
+/// Same `#[path]` arrangement.
+#[path = "search/sort_missing_suite.rs"]
+mod sort_missing_suite;
+
 /// The backend-agnostic suite for exponent-form number and quantity search
 /// values (#1337). Same `#[path]` arrangement.
 #[path = "search/number_exponent_suite.rs"]
@@ -2631,6 +2636,58 @@ mod postgres_integration {
     fn create_tenant(id: &str) -> TenantContext {
         let unique_id = format!("{}_{}", id, uuid::Uuid::new_v4().simple());
         TenantContext::new(TenantId::new(&unique_id), TenantPermissions::full_access())
+    }
+
+    /// A quote in a search parameter name — a `_revinclude` directive's, or a
+    /// criterion's — is part of the name, never SQL: the query runs and
+    /// matches nothing.
+    #[tokio::test]
+    async fn postgres_integration_a_quoted_parameter_name_is_not_spliced_into_sql() {
+        use helios_persistence::core::{RevincludeProvider, SearchProvider};
+        use helios_persistence::types::{
+            IncludeDirective, IncludeType, SearchParamType, SearchParameter, SearchQuery,
+            SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("quoted_name");
+        let patient = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p1"}),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("create patient");
+
+        let included = backend
+            .resolve_revincludes(
+                &tenant,
+                std::slice::from_ref(&patient),
+                &[IncludeDirective {
+                    include_type: IncludeType::Revinclude,
+                    source_type: "Observation".to_string(),
+                    search_param: "subj'ect".to_string(),
+                    target_type: None,
+                    iterate: false,
+                }],
+            )
+            .await
+            .expect("a quoted revinclude name is not a SQL error");
+        assert!(included.is_empty());
+
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "fam'ily".to_string(),
+            param_type: SearchParamType::String,
+            values: vec![SearchValue::eq("x")],
+            ..Default::default()
+        });
+        let result = backend
+            .search(&tenant, &query)
+            .await
+            .expect("a quoted parameter name is not a SQL error");
+        assert!(result.resources.items.is_empty());
     }
 
     #[tokio::test]
@@ -28859,6 +28916,19 @@ mod postgres_integration {
         let backend = create_backend().await;
         super::date_period_suite::period_targets_are_ranges(&backend, &unique_base("date_period"))
             .await;
+    }
+
+    /// #1606: PostgreSQL sorted a missing value as the largest, so it came
+    /// first descending. It comes last both ways now.
+    #[tokio::test]
+    async fn postgres_integration_missing_sort_values_sort_last() {
+        let backend = create_backend().await;
+        super::sort_missing_suite::missing_sort_values_sort_last(
+            &backend,
+            &unique_base("sort_missing"),
+            true,
+        )
+        .await;
     }
 
     /// #1336: a repeated parameter under `_contained` is a conjunction on one
