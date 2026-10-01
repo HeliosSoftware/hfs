@@ -16,6 +16,9 @@
   <!-- The shared busy states (#679); ahead of every page script by defer's
        document order, because page scripts call into window.hfsBusy. -->
   <script src="/ui/assets/busy.js" defer></script>
+  <!-- Shared locale number formatting, window.HfsNumber: page scripts and
+       dashboard.js call it when they write a figure into the page. -->
+  <script src="/ui/assets/number.js" defer></script>
   <!-- Shared unsaved-changes tracker (#1240), window.HfsUnsaved: addbox.js
        reads it at click time, so it must be defined before then. -->
   <script src="/ui/assets/unsaved.js" defer></script>

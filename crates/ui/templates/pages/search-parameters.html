@@ -65,13 +65,13 @@
     <div class="filter-rail__list" id="sp-rail-list">
       <a class="filter-rail__item" href="{{ view.rail_all.href }}"{% if view.rail_all.current %} aria-current="true"{% endif %}>
         <span>{{ i18n.t("sp-rail-all") }}</span>
-        <span class="count">{{ view.rail_all.count }}</span>
+        <span class="count">{{ i18n.num(view.rail_all.count) }}</span>
       </a>
       {% for item in view.rail %}
       <a class="filter-rail__item" data-type="{{ item.name }}" data-full-name="{{ item.name }}"
          href="{{ item.href }}" title="{{ item.name }}"{% if item.current %} aria-current="true"{% endif %}>
         <span class="filter-rail__label">{{ item.name }}</span>
-        <span class="count">{{ item.count }}</span>
+        <span class="count">{{ i18n.num(item.count) }}</span>
       </a>
       {% endfor %}
     </div>
@@ -82,7 +82,7 @@
       <span class="facet-label">{{ i18n.t("sp-facet-type") }}</span>
       {% for f in view.facets_type %}
       <a class="chip" href="{{ f.href }}"{% if f.pressed %} aria-current="true"{% endif %}>
-        <span>{{ f.label }}</span><span class="count">{{ f.count }}</span>
+        <span>{{ f.label }}</span><span class="count">{{ i18n.num(f.count) }}</span>
       </a>
       {% endfor %}
     </section>
@@ -90,7 +90,7 @@
       <span class="facet-label">{{ i18n.t("sp-facet-source") }}</span>
       {% for f in view.facets_source %}
       <a class="chip" href="{{ f.href }}"{% if f.pressed %} aria-current="true"{% endif %}>
-        <span>{% if f.key.is_empty() %}{{ f.label }}{% else %}{{ i18n.t(f.key.as_str()) }}{% endif %}</span><span class="count">{{ f.count }}</span>
+        <span>{% if f.key.is_empty() %}{{ f.label }}{% else %}{{ i18n.t(f.key.as_str()) }}{% endif %}</span><span class="count">{{ i18n.num(f.count) }}</span>
       </a>
       {% endfor %}
     </section>

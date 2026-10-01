@@ -66,7 +66,7 @@
         </button>
       </td>
       {% else %}
-      <td class="col-num">{{ row.resources_human() }}</td>
+      <td class="col-num">{{ row.resources_human(i18n) }}</td>
       <td>{{ row.created_date() }}</td>
       <td class="col-actions">
         <button

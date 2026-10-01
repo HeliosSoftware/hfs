@@ -1411,7 +1411,7 @@
         if (!grid) return null;
         var template =
           errorCount === 1 ? grid.dataset.msgSaveErrorsOne : grid.dataset.msgSaveErrorsOther;
-        return template ? template.replace("{count}", String(errorCount)) : null;
+        return template ? template.replace("{count}", window.HfsNumber.format(errorCount)) : null;
       };
 
       form.addEventListener("submit", function (event) {

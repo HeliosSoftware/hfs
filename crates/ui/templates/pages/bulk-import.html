@@ -68,7 +68,7 @@
   <div class="toolbar">
     <h2 class="toolbar__title">
       {{ i18n.t("bulk-import-submissions") }}
-      <span class="toolbar__count">{{ rows.len() }} {{ i18n.t("bulk-import-records") }}</span>
+      <span class="toolbar__count">{{ i18n.num(rows.len()) }} {{ i18n.t("bulk-import-records") }}</span>
     </h2>
   </div>
 

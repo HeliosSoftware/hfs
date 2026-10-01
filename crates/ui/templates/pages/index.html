@@ -76,7 +76,7 @@
   <a class="card stat stat--link" href="/ui/bulk-export">
     <span class="stat__label">{{ i18n.t("card-export-jobs") }}</span>
     {% if let Some(jobs) = metrics.export_jobs %}
-    <span class="stat__value">{{ jobs.running }}</span>
+    <span class="stat__value">{{ i18n.num(jobs.running) }}</span>
     <span class="stat__sub">{{ i18n.t_arg("card-export-jobs-sub", "queued", jobs.queued) }}</span>
     {% else %}
     <span class="stat__value stat__value--unavailable" aria-label="{{ i18n.t("card-jobs-unavailable") }}">&mdash;</span>
@@ -86,7 +86,7 @@
   <a class="card stat stat--link" href="/ui/bulk-import">
     <span class="stat__label">{{ i18n.t("card-import-jobs") }}</span>
     {% if let Some(active) = metrics.import_jobs %}
-    <span class="stat__value">{{ active }}</span>
+    <span class="stat__value">{{ i18n.num(active) }}</span>
     <span class="stat__sub">{{ i18n.t("card-import-jobs-sub") }}</span>
     {% else %}
     <span class="stat__value stat__value--unavailable" aria-label="{{ i18n.t("card-jobs-unavailable") }}">&mdash;</span>
