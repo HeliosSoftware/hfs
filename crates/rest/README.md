@@ -409,6 +409,22 @@ Configured via `HFS_BULK_SUBMIT_*` environment variables:
 | `HFS_BULK_SUBMIT_OUTBOUND_SCOPE` | `system/*.rs` | Read scope requested for file-retrieval tokens (never `system/bulk-submit`). |
 | `HFS_BULK_SUBMIT_DECRYPTION_KEY` | *(none)* | P-256/P-384 private key(s) for `ECDH-ES*` JWE key management — PEM (PKCS#8/SEC1) or a JWK / JWK Set. |
 
+**Recommended for bulk loads on an Elasticsearch composite (`pg-es`, `sqlite-es`, `mongo-es`).** Measured on the full Synthea corpus (18.96 M resources, 6 cores): 1 h 45 min until every resource is searchable, against more than 7 h with the deferred rebuild (#939).
+
+```bash
+HFS_BULK_SUBMIT_DEFER_INDEXING=false       # index each committed batch during ingest
+HFS_ELASTICSEARCH_REFRESH_INTERVAL=30s     # the biggest lever: at 1s Elasticsearch spends its CPU refreshing
+HFS_ELASTICSEARCH_REINDEX_REFRESH=false
+HFS_ELASTICSEARCH_BULK_CONCURRENCY=4
+HFS_BULK_SUBMIT_BATCH_SIZE=1000
+HFS_BULK_SUBMIT_FILE_CONCURRENCY=4
+HFS_BULK_SUBMIT_INDEX_CONCURRENCY=4        # about one core each; 8 on 8+ cores
+HFS_BULK_SUBMIT_INDEX_QUEUE=16             # bounds HFS memory
+HFS_PG_MAX_CONNECTIONS=32
+```
+
+Leave `HFS_BULK_SUBMIT_INDEX_COALESCE`, `HFS_BULK_SUBMIT_INDEX_MAX_WAIT` and `HFS_BULK_SUBMIT_INDEX_PAGE_BYTES` at their defaults. Plan for ~15 GB of HFS memory while a file of large resources (~100 KB each) is ingested. Resources the index rejects under load are marked unindexed and rebuilt one by one when the manifest completes; the log says `rebuilding search index entries for the resources the index rejected during ingest`, or `indexed every resource during ingest; no deferred reindex needed` when there were none.
+
 For protected provider files (`requiresAccessToken`), HFS acquires a read-scoped
 token via SMART Backend Services (`client_credentials` + `private_key_jwt`) when
 `HFS_BULK_SUBMIT_CLIENT_ID` and `HFS_BULK_SUBMIT_PRIVATE_KEY` are set.
