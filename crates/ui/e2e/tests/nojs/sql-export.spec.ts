@@ -48,6 +48,16 @@ let seededViewDefinitionPrefixes: string[] = [];
 // sql-query subject the failed-job detail test below seeds.
 let seededLibraryIds: string[] = [];
 
+test.beforeEach(async ({ request }) => {
+  // Other specs can leave jobs in the shared user's settings. Count assertions
+  // need an empty baseline even when this file runs after those specs.
+  const response = await request.patch("/_user/settings", {
+    headers: { "Content-Type": "application/json" },
+    data: { sqlExport: null },
+  });
+  expect(response.ok()).toBe(true);
+});
+
 test.afterEach(async ({ request }) => {
   const ids = seededViewDefinitionIds;
   seededViewDefinitionIds = [];
