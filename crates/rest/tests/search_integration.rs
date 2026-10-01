@@ -3745,6 +3745,31 @@ mod includes {
         pairs
     }
 
+    /// A quote in an `_include` / `_revinclude` parameter name is part of the
+    /// name, not SQL: the directive simply matches nothing.
+    #[tokio::test]
+    async fn a_quote_in_an_include_parameter_name_matches_nothing() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        for url in [
+            "/Patient?_revinclude=Observation:subj'ect",
+            "/Observation?_include=Observation:subj'ect",
+            "/Patient?_revinclude=Observation:subj'ect&_revinclude=Encounter:subject",
+        ] {
+            let response = server
+                .get(url)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            assert_ne!(
+                response.status_code(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{url}: {}",
+                response.text()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_include_subject() {
         let (server, backend) = create_test_server().await;

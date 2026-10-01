@@ -255,6 +255,18 @@
     ? window.HfsUnsaved.track({ root: form, cue: form.querySelector(".form-actions") })
     : null;
 
+  // Clear belongs to the Resource types card. Reveal it only once its
+  // handler is ready; without JavaScript the native checkboxes stay usable.
+  var clearTypes = form.querySelector("[data-clear-types]");
+  if (clearTypes && allTypes) {
+    clearTypes.addEventListener("click", function () {
+      allTypes.checked = false;
+      synchronizeTypes(true);
+      if (unsaved) unsaved.check();
+    });
+    clearTypes.hidden = false;
+  }
+
   if (allTypes) {
     allTypes.addEventListener("change", function () {
       synchronizeTypes(!allTypes.checked);

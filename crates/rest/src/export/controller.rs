@@ -1,5 +1,6 @@
 //! `ExportJobController` trait and associated types.
 
+use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use helios_persistence::core::sof_runner::ViewFilters;
 use helios_persistence::tenant::TenantContext;
@@ -163,6 +164,12 @@ pub enum JobStatus {
     Failed {
         /// Human-readable error message.
         message: String,
+        /// What the result endpoint answers: the 4xx `$sql-run` gives the
+        /// same failure when it is the request's own (a documented limit, a
+        /// subject the runner refuses), `500` for a fault of the server.
+        status: StatusCode,
+        /// The `OperationOutcome.issue.code` that goes with `status`.
+        code: &'static str,
         /// Time the job was submitted.
         submitted_at: DateTime<Utc>,
         /// Time the worker recorded the failure. Captured once at the
@@ -225,6 +232,17 @@ pub enum ExportError {
     /// Output serialization (NDJSON/CSV) failed.
     #[error("serialization error: {0}")]
     Serialization(String),
+    /// The request's own fault — a documented limit or a subject the runner
+    /// refuses — with the status and issue code `$sql-run` answers it with.
+    #[error("{message}")]
+    Client {
+        /// The HTTP status the result endpoint answers with.
+        status: StatusCode,
+        /// The `OperationOutcome.issue.code` that goes with `status`.
+        code: &'static str,
+        /// The wording `$sql-run` gives the same failure.
+        message: String,
+    },
 }
 
 /// Trait for managing async export jobs.

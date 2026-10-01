@@ -1892,6 +1892,12 @@ pub fn mount_with_conformance_source_and_runtime(
 
     router
         .merge(assets)
+        // With authentication on and no browser sign-in installed, nothing a
+        // browser sends can be authenticated, so the handlers that reach the
+        // tenant registry and the bulk-submit store directly refuse rather
+        // than act for an anonymous caller (#1619). Inside the locale layer
+        // so the refusal is worded in the request's language.
+        .layer(middleware::from_fn(refuse_anonymous_storage_access))
         // Emit `Vary: HX-Request` on handlers that read the header, so caches
         // don't cross a fragment response with a full-page one.
         .layer(AutoVaryLayer)
@@ -1922,6 +1928,54 @@ pub fn mount_with_conformance_source_and_runtime(
             .fallback_service(fhir_app.clone()),
         )
         .fallback_service(fhir_app)
+}
+
+/// The UI routes whose handlers act on storage themselves — the tenant
+/// registry and the bulk-submit store — rather than through the FHIR API.
+/// The API-backed pages carry the browser's credential on their self-call and
+/// so already answer `401` without one; these would act with none.
+fn acts_on_storage_directly(path: &str) -> bool {
+    path == "/ui/tenants"
+        || path.starts_with("/ui/tenants/")
+        || path == "/ui/tenant"
+        || path.starts_with("/ui/tenant/")
+        || path == "/ui/bulk-import"
+        || path.starts_with("/ui/bulk-import/")
+}
+
+/// Middleware (#1619): in the bearer-only posture — authentication enabled,
+/// no interactive login installed, so no session principal can ever be
+/// stamped — a request for a route that acts on storage directly is refused
+/// with `401` and the same notice the shell shows. With a login installed
+/// `require_session` gates every page instead, and with authentication off
+/// there is nothing to refuse.
+async fn refuse_anonymous_storage_access(
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    if bearer_only_auth()
+        && acts_on_storage_directly(request.uri().path())
+        && request
+            .extensions()
+            .get::<helios_auth::SessionPrincipal>()
+            .is_none()
+    {
+        let locale = request
+            .extensions()
+            .get::<RequestLocale>()
+            .copied()
+            .unwrap_or_default();
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )],
+            I18n::new(locale).t("auth-bearer-only"),
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 /// Redirects the bare root to the UI home (#896), mirroring HTS. Registered
