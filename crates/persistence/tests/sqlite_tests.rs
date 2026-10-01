@@ -2,6 +2,12 @@
 //!
 //! These tests verify the SQLite backend implementation against the actual API.
 
+#[path = "reindex/scoped_clear.rs"]
+mod scoped_clear;
+
+#[path = "reindex/resource_scoped_clear.rs"]
+mod resource_scoped_clear;
+
 use std::path::PathBuf;
 
 use helios_fhir::FhirVersion;
@@ -2782,6 +2788,8 @@ async fn test_reindex_operation_cancel() {
 struct SpyReindexTarget {
     written: std::sync::Mutex<Vec<String>>,
     cleared: std::sync::atomic::AtomicUsize,
+    /// The scope of every clear: `None` for the whole tenant, else the types.
+    cleared_scopes: std::sync::Mutex<Vec<Option<Vec<String>>>>,
 }
 
 #[async_trait::async_trait]
@@ -2810,8 +2818,20 @@ impl ReindexTarget for SpyReindexTarget {
 
     async fn clear_search_index(
         &self,
-        _tenant: &TenantContext,
+        tenant: &TenantContext,
     ) -> helios_persistence::error::StorageResult<u64> {
+        self.clear_search_index_for_types(tenant, None).await
+    }
+
+    async fn clear_search_index_for_types(
+        &self,
+        _tenant: &TenantContext,
+        resource_types: Option<&[String]>,
+    ) -> helios_persistence::error::StorageResult<u64> {
+        self.cleared_scopes
+            .lock()
+            .unwrap()
+            .push(resource_types.map(<[String]>::to_vec));
         self.cleared
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(0)
@@ -2875,6 +2895,11 @@ async fn test_reindex_fans_out_to_every_target() {
         secondary.cleared.load(std::sync::atomic::Ordering::SeqCst),
         1,
         "clear_existing must clear the secondary index too"
+    );
+    assert_eq!(
+        *secondary.cleared_scopes.lock().unwrap(),
+        [Some(vec!["Patient".to_string()])],
+        "a Patient-scoped run must clear only Patient in the secondary (#1624)"
     );
 }
 
@@ -4910,4 +4935,16 @@ async fn test_bulk_submit_release_after_abort_is_a_no_op() {
         &create_tenant("submit-release-abort"),
     )
     .await;
+}
+
+#[tokio::test]
+async fn sqlite_reindex_scoped_clear_preserves_other_types_and_tenants() {
+    scoped_clear::assert_scoped_clear(&create_backend()).await;
+}
+
+#[tokio::test]
+async fn sqlite_reindex_resource_scoped_clear_preserves_other_resources() {
+    let backend = Arc::new(create_backend());
+    let registries = backend.tenant_registries().clone();
+    resource_scoped_clear::assert_resource_scoped_clear(backend, registries).await;
 }

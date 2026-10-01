@@ -1022,6 +1022,12 @@ pub struct BulkProcessingOptions {
     /// versions. Off by default: a replay has always produced new versions.
     #[serde(default)]
     pub skip_unchanged: bool,
+    /// Lines of `file_url` an earlier run of the same manifest already
+    /// committed and charged, read from its per-file progress (#1610). The
+    /// stream reads past them without parsing or ingesting them: every line
+    /// at or below this number is skipped. Zero resumes nothing.
+    #[serde(default)]
+    pub resume_after_line: u64,
 }
 
 fn default_submit_batch_size() -> u32 {
@@ -1057,12 +1063,20 @@ impl BulkProcessingOptions {
             cancel: None,
             batch_observers: Vec::new(),
             skip_unchanged: false,
+            resume_after_line: 0,
         }
     }
 
     /// Names the manifest output file the entries come from (#457).
     pub fn with_file_url(mut self, file_url: impl Into<String>) -> Self {
         self.file_url = Some(file_url.into());
+        self
+    }
+
+    /// Skips the first `line` lines of the file, which an earlier run of the
+    /// manifest already committed (#1610).
+    pub fn with_resume_after_line(mut self, line: u64) -> Self {
+        self.resume_after_line = line;
         self
     }
 

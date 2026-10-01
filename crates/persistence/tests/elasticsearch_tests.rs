@@ -8,6 +8,9 @@
 
 #![cfg(feature = "elasticsearch")]
 
+#[path = "reindex/scoped_clear.rs"]
+mod scoped_clear;
+
 use helios_persistence::backends::elasticsearch::{
     ElasticsearchBackend, ElasticsearchConfig, WriteRefreshPolicy,
 };
@@ -669,6 +672,11 @@ mod date_precision_suite;
 #[path = "search/date_period_suite.rs"]
 mod date_period_suite;
 
+/// The backend-agnostic suite for where `_sort` puts a missing value (#1606).
+/// Same `#[path]` arrangement.
+#[path = "search/sort_missing_suite.rs"]
+mod sort_missing_suite;
+
 /// The backend-agnostic `_contained` suite (#1336, #1362, #1363). Same
 /// `#[path]` arrangement.
 #[path = "search/contained_suite.rs"]
@@ -913,6 +921,251 @@ mod es_integration {
         registries
     }
 
+    #[tokio::test]
+    async fn elasticsearch_reindex_scoped_clear_preserves_other_types_and_tenants() {
+        let backend = create_backend_with("1ms", WriteRefreshPolicy::WaitFor).await;
+        super::scoped_clear::assert_scoped_clear(&backend).await;
+    }
+
+    /// Contained docs are scoped by their parent type, not their own type.
+    #[tokio::test]
+    async fn elasticsearch_scoped_clear_preserves_contained_resources_of_other_types() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::search::ReindexTarget;
+        use helios_persistence::types::{
+            ContainedMode, ContainedReturn, SearchParamType, SearchParameter, SearchQuery,
+            SearchValue,
+        };
+
+        let backend = create_backend_with("1ms", WriteRefreshPolicy::WaitFor).await;
+        let tenant = create_tenant("contained-clear");
+        let other = create_tenant("contained-clear-other");
+        for tenant in [&tenant, &other] {
+            for (resource_type, resource) in [
+                (
+                    "Patient",
+                    json!({
+                        "resourceType": "Patient", "id": "parent-p", "gender": "female",
+                        "managingOrganization": {"reference": "#org"},
+                        "contained": [{"resourceType": "Organization", "id": "org", "name": "InsidePatient"}]
+                    }),
+                ),
+                (
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation", "id": "parent-o", "status": "final",
+                        "code": {"text": "scope"}, "subject": {"reference": "#p"},
+                        "contained": [{"resourceType": "Patient", "id": "p", "name": [{"family": "InsideObservation"}]}]
+                    }),
+                ),
+            ] {
+                backend
+                    .create(tenant, resource_type, resource, FhirVersion::default())
+                    .await
+                    .unwrap();
+            }
+        }
+        let query = |resource_type, name| {
+            let mut query = SearchQuery::new(resource_type).with_parameter(SearchParameter {
+                name: "name".to_string(),
+                param_type: SearchParamType::String,
+                modifier: None,
+                values: vec![SearchValue::eq(name)],
+                chain: vec![],
+                components: vec![],
+            });
+            query.contained = ContainedMode::On;
+            query.contained_return = ContainedReturn::Contained;
+            query
+        };
+        let organization = query("Organization", "InsidePatient");
+        let patient = query("Patient", "InsideObservation");
+        for tenant in [&tenant, &other] {
+            for query in [&organization, &patient] {
+                assert_eq!(
+                    backend
+                        .search(tenant, query)
+                        .await
+                        .unwrap()
+                        .resources
+                        .items
+                        .len(),
+                    1
+                );
+            }
+        }
+        // Exactly the top-level Patient and its contained Organization go.
+        assert_eq!(
+            backend
+                .clear_search_index_for_types(&tenant, Some(&["Patient".to_string()]))
+                .await
+                .unwrap(),
+            2
+        );
+        for resource_type in ["Patient", "Organization"] {
+            backend
+                .refresh_index(tenant.tenant_id().as_str(), resource_type)
+                .await
+                .unwrap();
+        }
+        assert!(
+            backend
+                .search(&tenant, &organization)
+                .await
+                .unwrap()
+                .resources
+                .items
+                .is_empty()
+        );
+        assert_eq!(
+            backend
+                .search(&tenant, &patient)
+                .await
+                .unwrap()
+                .resources
+                .items
+                .len(),
+            1
+        );
+        for query in [&organization, &patient] {
+            assert_eq!(
+                backend
+                    .search(&other, query)
+                    .await
+                    .unwrap()
+                    .resources
+                    .items
+                    .len(),
+                1
+            );
+        }
+    }
+
+    /// A named-resource rebuild must update ES without clearing its siblings.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn elasticsearch_resource_scoped_clear_through_sqlite_source_preserves_siblings() {
+        use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::search::{
+            ReindexOperation, ReindexRequest, ReindexStatus, ResourceRef,
+        };
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = SqliteBackend::with_config(
+            dir.path().join("fhir.db"),
+            SqliteBackendConfig {
+                search_offloaded: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        source.init_schema().unwrap();
+        let source = Arc::new(source);
+        let es = Arc::new(create_backend_with("1ms", WriteRefreshPolicy::WaitFor).await);
+        let tenant = create_tenant("named-es-clear");
+        let other = create_tenant("named-es-clear-other");
+        for tenant in [&tenant, &other] {
+            for (resource_type, resource) in [
+                (
+                    "Patient",
+                    json!({"resourceType":"Patient", "id":"p1", "gender":"female"}),
+                ),
+                (
+                    "Patient",
+                    json!({"resourceType":"Patient", "id":"p2", "gender":"female"}),
+                ),
+                (
+                    "Observation",
+                    json!({"resourceType":"Observation", "id":"o", "status":"final", "code":{"text":"scope"}}),
+                ),
+            ] {
+                source
+                    .create(
+                        tenant,
+                        resource_type,
+                        resource.clone(),
+                        FhirVersion::default(),
+                    )
+                    .await
+                    .unwrap();
+                es.create(tenant, resource_type, resource, FhirVersion::default())
+                    .await
+                    .unwrap();
+            }
+        }
+        // Deliberately leave ES behind the source to prove the requested
+        // resource is actually rebuilt, rather than only checking no deletion.
+        let previous = source
+            .read(&tenant, "Patient", "p1")
+            .await
+            .unwrap()
+            .unwrap();
+        source
+            .update(
+                &tenant,
+                &previous,
+                json!({"resourceType":"Patient", "id":"p1", "gender":"male"}),
+            )
+            .await
+            .unwrap();
+        let op = ReindexOperation::with_parts(
+            source.clone(),
+            vec![source.clone(), es.clone()],
+            source.tenant_registries().clone(),
+        );
+        let job = op
+            .start(
+                tenant.clone(),
+                ReindexRequest::for_resources([ResourceRef::new("Patient", "p1")]).clear_existing(),
+                None,
+            )
+            .await
+            .unwrap();
+        let progress = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let progress = op.get_progress(&job).await.unwrap();
+                if progress.status.is_finished() {
+                    break progress;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("reindex did not finish");
+        assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+        assert!(progress.errors.is_empty(), "{progress:?}");
+        assert_eq!(progress.processed_resources, 1);
+        for (tenant, resource_type, parameter, value, expected) in [
+            (&tenant, "Patient", "gender", "male", vec!["p1"]),
+            (&tenant, "Patient", "gender", "female", vec!["p2"]),
+            (&tenant, "Observation", "status", "final", vec!["o"]),
+            (&other, "Patient", "gender", "female", vec!["p1", "p2"]),
+            (&other, "Observation", "status", "final", vec!["o"]),
+        ] {
+            let query = SearchQuery::new(resource_type).with_parameter(SearchParameter {
+                name: parameter.to_string(),
+                param_type: SearchParamType::Token,
+                modifier: None,
+                values: vec![SearchValue::eq(value)],
+                chain: vec![],
+                components: vec![],
+            });
+            let result = es.search(tenant, &query).await.unwrap();
+            let mut ids: Vec<_> = result
+                .resources
+                .items
+                .iter()
+                .map(|resource| resource.id().to_string())
+                .collect();
+            ids.sort();
+            assert_eq!(ids, expected);
+        }
+    }
+
     /// Creates an ElasticsearchBackend connected to the shared testcontainers ES instance.
     ///
     /// Each call uses a unique index prefix (via UUID) so tests are fully isolated
@@ -1060,6 +1313,19 @@ mod es_integration {
     async fn es_date_period_targets_are_ranges() {
         let backend = create_backend().await;
         super::date_period_suite::period_targets_are_ranges(&backend, "date-period-1391").await;
+    }
+
+    /// #1606: a missing value came first on a descending sort. It comes last
+    /// both ways now, and a `Previous` page still mirrors a `Next` one.
+    #[tokio::test]
+    async fn es_missing_sort_values_sort_last() {
+        let backend = create_backend().await;
+        super::sort_missing_suite::missing_sort_values_sort_last(
+            &backend,
+            "sort-missing-1606",
+            true,
+        )
+        .await;
     }
 
     /// #1362: every contained resource is a document of its own here, so a

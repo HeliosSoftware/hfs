@@ -20,6 +20,21 @@ use super::registry::{
 };
 use super::types::SearchParamType;
 
+/// Whether `code` is usable as a search parameter name on this server: one or
+/// more ASCII letters, digits, `-` or `_`.
+///
+/// Every code the specification defines has this shape, and it is stricter
+/// than R6's `spd-4` (no `.`, `$`, `|` or whitespace): a code is a query-string
+/// key, is split on `:` for modifiers and `.` for chains, and names index rows,
+/// so anything else either cannot be searched on or has no business reaching
+/// a storage backend.
+pub fn is_valid_search_parameter_code(code: &str) -> bool {
+    !code.is_empty()
+        && code
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 /// Transforms FHIRPath expressions to replace `as` operator/function with `ofType`.
 ///
 /// Per FHIRPath spec, `as(type)` requires singleton input and throws an error for
@@ -494,6 +509,15 @@ impl SearchParameterLoader {
                 url: Some(url.clone()),
             })?
             .to_string();
+        if !is_valid_search_parameter_code(&code) {
+            return Err(LoaderError::InvalidResource {
+                message: format!(
+                    "SearchParameter.code {code:?} may contain only ASCII letters, digits, \
+                     '-' and '_'"
+                ),
+                url: Some(url),
+            });
+        }
 
         let type_str = resource
             .get("type")
@@ -921,6 +945,33 @@ mod tests {
         assert_eq!(param.expression, "Patient.test");
         assert!(param.base.contains(&"Patient".to_string()));
         assert_eq!(param.status, SearchParameterStatus::Active);
+    }
+
+    /// A code outside `[A-Za-z0-9_-]` is refused, so it never reaches the
+    /// registry or a storage backend's query text.
+    #[test]
+    fn test_parse_resource_rejects_an_unsafe_code() {
+        let loader = SearchParameterLoader::new(FhirVersion::default());
+        for code in ["ev'il", "a b", "a.b", "a:b", "", "a\\b"] {
+            let resource = serde_json::json!({
+                "resourceType": "SearchParameter",
+                "url": "http://example.org/sp/x",
+                "code": code,
+                "base": ["Patient"],
+                "type": "string",
+                "expression": "Patient.name.family",
+                "status": "active",
+            });
+            assert!(
+                matches!(
+                    loader.parse_resource(&resource),
+                    Err(LoaderError::InvalidResource { .. })
+                ),
+                "{code:?}"
+            );
+        }
+        assert!(is_valid_search_parameter_code("value-quantity"));
+        assert!(is_valid_search_parameter_code("_lastUpdated"));
     }
 
     #[test]

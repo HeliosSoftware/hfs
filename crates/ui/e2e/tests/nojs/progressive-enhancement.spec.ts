@@ -270,6 +270,48 @@ test("Bulk Import one-shot create and delete work without JavaScript", async ({ 
   await expect(page).toHaveURL(/\/ui\/bulk-import$/);
 });
 
+test("Bulk Export hides Clear and native type clearing preserves values without JavaScript", async ({
+  page,
+  bulkExport,
+}) => {
+  await page.goto("/ui/bulk-export/new");
+  await expect(bulkExport.clearButton).toBeHidden();
+  const typesCard = bulkExport.clearButton.locator("xpath=ancestor::section");
+  await expect(typesCard.locator('button[type="reset"], a')).toHaveCount(0);
+  await bulkExport.nameInput.fill("No-JS preserved export");
+  await bulkExport.scopeRadio("group").check();
+  await bulkExport.form.locator('input[name="group_id"]').fill("preserved-group");
+  await bulkExport.scopeRadio("patient").check();
+  await bulkExport.patientFallback.fill("Patient/p-104, Patient/p-205");
+  await bulkExport.form.locator('input[name="elements"]').fill("id,meta");
+  await bulkExport.form.locator('input[name="type_filter"]').fill("Patient?active=true");
+  await bulkExport.sincePreset.selectOption("custom");
+  await bulkExport.sinceCustom.fill("2026-08-01T00:00:00Z");
+  await bulkExport.until.fill("2099-01-01T00:00:00Z");
+  await bulkExport.typeCheckbox("Patient").check();
+  await bulkExport.typeCheckbox("Observation").check();
+
+  await bulkExport.allResources.uncheck();
+  await bulkExport.typeCheckbox("Patient").uncheck();
+  await bulkExport.typeCheckbox("Observation").uncheck();
+
+  await expect(page).toHaveURL(/\/ui\/bulk-export\/new$/);
+  await expect(bulkExport.nameInput).toHaveValue("No-JS preserved export");
+  await expect(bulkExport.nameHeading).toHaveText("Bulk Export");
+  await expect(bulkExport.scopeRadio("patient")).toBeChecked();
+  await expect(bulkExport.patientFallback).toHaveValue("Patient/p-104, Patient/p-205");
+  await expect(bulkExport.form.locator('input[name="group_id"]')).toHaveValue("preserved-group");
+  await expect(bulkExport.form.locator('input[name="elements"]')).toHaveValue("id,meta");
+  await expect(bulkExport.form.locator('input[name="type_filter"]')).toHaveValue("Patient?active=true");
+  await expect(bulkExport.sincePreset).toHaveValue("custom");
+  await expect(bulkExport.sinceCustom).toHaveValue("2026-08-01T00:00:00Z");
+  await expect(bulkExport.until).toHaveValue("2099-01-01T00:00:00Z");
+  await expect(bulkExport.allResources).not.toBeChecked();
+  expect(await bulkExport.typeCheckboxes.evaluateAll((types) => types.every((type) =>
+    !(type as HTMLInputElement).checked && !(type as HTMLInputElement).disabled,
+  ))).toBe(true);
+});
+
 test("Bulk Export can narrow through a conflicting native form without JavaScript", async ({
   page,
   bulkExport,
@@ -338,13 +380,15 @@ test("Bulk Export submits an exact custom instant without JavaScript", async ({
   expect(params.get("since_custom")).toBe(instant);
 });
 
-test("Bulk Export shows both invalid fields and Clear starts fresh without JavaScript", async ({
+test("Bulk Export preserves both invalid fields while types are cleared without JavaScript", async ({
   page,
   bulkExport,
 }) => {
   await page.goto("/ui/bulk-export/new");
   await expect(bulkExport.form).toHaveAttribute("novalidate", "");
   await bulkExport.nameInput.fill("   ");
+  await bulkExport.scopeRadio("group").check();
+  await bulkExport.form.locator('input[name="group_id"]').fill("preserved-group");
   await bulkExport.scopeRadio("patient").check();
   await bulkExport.patientFallback.fill("Patient/p-104, Patient/p-205");
   await bulkExport.allResources.uncheck();
@@ -355,6 +399,7 @@ test("Bulk Export shows both invalid fields and Clear starts fresh without JavaS
     .fill("Patient?active=true");
   await bulkExport.sincePreset.selectOption("custom");
   await bulkExport.sinceCustom.fill("not-an-instant");
+  await bulkExport.until.fill("2099-01-01T00:00:00Z");
 
   const submitted = page.waitForResponse(
     (response) =>
@@ -393,12 +438,18 @@ test("Bulk Export shows both invalid fields and Clear starts fresh without JavaS
     "Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z.",
   );
 
-  await bulkExport.clearLink.click();
-  await expect(page).toHaveURL(/\/ui\/bulk-export\/new$/);
-  await expect(bulkExport.nameInput).toHaveValue("");
-  await expect(bulkExport.scopeRadio("system")).toBeChecked();
-  await expect(bulkExport.patientFallback).toHaveValue("");
-  await expect(bulkExport.allResources).toBeChecked();
+  await expect(bulkExport.form.locator('input[name="group_id"]')).toHaveValue("preserved-group");
+  await expect(bulkExport.until).toHaveValue("2099-01-01T00:00:00Z");
+
+  await expect(bulkExport.clearButton).toBeHidden();
+  const typesCard = bulkExport.clearButton.locator("xpath=ancestor::section");
+  await expect(typesCard.locator('button[type="reset"], a')).toHaveCount(0);
+  await bulkExport.typeCheckbox("Patient").uncheck();
+  await expect(page).toHaveURL(/\/ui\/bulk-export$/);
+  await expect(bulkExport.nameInput).toHaveValue("   ");
+  await expect(bulkExport.scopeRadio("patient")).toBeChecked();
+  await expect(bulkExport.patientFallback).toHaveValue("Patient/p-104, Patient/p-205");
+  await expect(bulkExport.allResources).not.toBeChecked();
   expect(
     await bulkExport.typeCheckboxes.evaluateAll((types) =>
       types.every(
@@ -406,11 +457,17 @@ test("Bulk Export shows both invalid fields and Clear starts fresh without JavaS
       ),
     ),
   ).toBe(true);
-  await expect(bulkExport.sincePreset).toHaveValue("");
-  await expect(bulkExport.sinceCustom).toHaveValue("");
+  await expect(bulkExport.form.locator('input[name="elements"]')).toHaveValue("id,meta");
+  await expect(bulkExport.form.locator('input[name="type_filter"]')).toHaveValue("Patient?active=true");
+  await expect(bulkExport.sincePreset).toHaveValue("custom");
+  await expect(bulkExport.sinceCustom).toHaveValue("not-an-instant");
   await expect(bulkExport.sinceCustom).toBeEnabled();
-  await expect(bulkExport.nameError).toBeHidden();
-  await expect(bulkExport.sinceCustomError).toBeHidden();
+  await expect(bulkExport.nameError).toBeVisible();
+  await expect(bulkExport.nameInput).toHaveAttribute("aria-invalid", "true");
+  await expect(bulkExport.sinceCustomError).toBeVisible();
+  await expect(bulkExport.sinceCustom).toHaveAttribute("aria-invalid", "true");
+  await expect(bulkExport.form.locator('input[name="group_id"]')).toHaveValue("preserved-group");
+  await expect(bulkExport.until).toHaveValue("2099-01-01T00:00:00Z");
 });
 
 test("Bulk Export lifecycle works without JavaScript", async ({ page }) => {

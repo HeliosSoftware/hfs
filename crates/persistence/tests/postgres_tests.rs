@@ -8,6 +8,12 @@
 
 #![cfg(feature = "postgres")]
 
+#[path = "reindex/scoped_clear.rs"]
+mod scoped_clear;
+
+#[path = "reindex/resource_scoped_clear.rs"]
+mod resource_scoped_clear;
+
 use helios_persistence::backends::postgres::PostgresConfig;
 use helios_persistence::core::BackendKind;
 
@@ -87,6 +93,11 @@ mod ap_relations_suite;
 /// Same `#[path]` arrangement.
 #[path = "search/date_period_suite.rs"]
 mod date_period_suite;
+
+/// The backend-agnostic suite for where `_sort` puts a missing value (#1606).
+/// Same `#[path]` arrangement.
+#[path = "search/sort_missing_suite.rs"]
+mod sort_missing_suite;
 
 /// The backend-agnostic suite for exponent-form number and quantity search
 /// values (#1337). Same `#[path]` arrangement.
@@ -2594,6 +2605,18 @@ mod postgres_integration {
             .await
     }
 
+    #[tokio::test]
+    async fn postgres_reindex_scoped_clear_preserves_other_types_and_tenants() {
+        super::scoped_clear::assert_scoped_clear(&create_backend().await).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_reindex_resource_scoped_clear_preserves_other_resources() {
+        let backend = std::sync::Arc::new(create_backend().await);
+        let registries = backend.tenant_registries().clone();
+        super::resource_scoped_clear::assert_resource_scoped_clear(backend, registries).await;
+    }
+
     /// Creates a PostgresBackend connected to the shared testcontainers PostgreSQL instance.
     ///
     /// Schema is initialized once when the shared container starts; `init_schema()` is
@@ -2631,6 +2654,58 @@ mod postgres_integration {
     fn create_tenant(id: &str) -> TenantContext {
         let unique_id = format!("{}_{}", id, uuid::Uuid::new_v4().simple());
         TenantContext::new(TenantId::new(&unique_id), TenantPermissions::full_access())
+    }
+
+    /// A quote in a search parameter name — a `_revinclude` directive's, or a
+    /// criterion's — is part of the name, never SQL: the query runs and
+    /// matches nothing.
+    #[tokio::test]
+    async fn postgres_integration_a_quoted_parameter_name_is_not_spliced_into_sql() {
+        use helios_persistence::core::{RevincludeProvider, SearchProvider};
+        use helios_persistence::types::{
+            IncludeDirective, IncludeType, SearchParamType, SearchParameter, SearchQuery,
+            SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("quoted_name");
+        let patient = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p1"}),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("create patient");
+
+        let included = backend
+            .resolve_revincludes(
+                &tenant,
+                std::slice::from_ref(&patient),
+                &[IncludeDirective {
+                    include_type: IncludeType::Revinclude,
+                    source_type: "Observation".to_string(),
+                    search_param: "subj'ect".to_string(),
+                    target_type: None,
+                    iterate: false,
+                }],
+            )
+            .await
+            .expect("a quoted revinclude name is not a SQL error");
+        assert!(included.is_empty());
+
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "fam'ily".to_string(),
+            param_type: SearchParamType::String,
+            values: vec![SearchValue::eq("x")],
+            ..Default::default()
+        });
+        let result = backend
+            .search(&tenant, &query)
+            .await
+            .expect("a quoted parameter name is not a SQL error");
+        assert!(result.resources.items.is_empty());
     }
 
     #[tokio::test]
@@ -20764,6 +20839,110 @@ mod postgres_integration {
         assert_eq!(stored.content_with_meta()["meta"]["versionId"], "2");
     }
 
+    /// A file the worker walked to its end is recorded on the manifest and
+    /// read back by the run that reclaims it, which skips it (#1610).
+    /// Recording is fenced and idempotent. The PostgreSQL half of
+    /// `test_worker_skips_output_files_an_earlier_run_completed`.
+    #[tokio::test]
+    async fn test_completed_output_files_survive_a_reclaim() {
+        use helios_persistence::core::{
+            BulkSubmitProvider, LeaseError, SubmissionId, SubmitClaimStrategy, SubmitWorkerStorage,
+        };
+
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("bulk_submit_resume");
+        let sub_id = SubmissionId::generate("pg-resume-test");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &sub_id, Some("https://provider/m.json"), None)
+            .await
+            .unwrap();
+        let worker = helios_persistence::core::WorkerId::new(format!(
+            "pg-resume-worker-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let lease = claim_specific_manifest(
+            &backend,
+            &worker,
+            &sub_id,
+            &manifest.manifest_id,
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+
+        // A batch of file b charged its lines before the file finished; a
+        // batch of file c did too, and c stays unfinished.
+        for (url, line) in [
+            ("https://provider/b.ndjson", 2),
+            ("https://provider/c.ndjson", 3),
+        ] {
+            backend
+                .process_entries(
+                    &tenant,
+                    &sub_id,
+                    &manifest.manifest_id,
+                    vec![helios_persistence::core::NdjsonEntry::new(
+                        line,
+                        "Patient",
+                        json!({"resourceType": "Patient"}),
+                    )],
+                    &helios_persistence::core::BulkProcessingOptions::new().with_file_url(url),
+                )
+                .await
+                .unwrap();
+        }
+        for url in [
+            "https://provider/b.ndjson",
+            "https://provider/a.ndjson",
+            "https://provider/a.ndjson",
+        ] {
+            backend.record_output_file_done(&lease, url).await.unwrap();
+        }
+        let mut stale = lease.clone();
+        stale.fencing_token += 1;
+        assert!(matches!(
+            backend
+                .record_output_file_done(&stale, "https://provider/c.ndjson")
+                .await,
+            Err(LeaseError::LeaseLost { .. })
+        ));
+
+        let expected = vec![
+            "https://provider/a.ndjson".to_string(),
+            "https://provider/b.ndjson".to_string(),
+        ];
+        let view = backend.get_manifest_for_worker(&lease).await.unwrap();
+        assert_eq!(view.completed_output_files, expected);
+        assert_eq!(
+            view.file_resume_lines,
+            vec![("https://provider/c.ndjson".to_string(), 3)],
+            "a completed file is skipped whole, an unfinished one resumes after its last charged line"
+        );
+
+        assert!(SubmitClaimStrategy::release(&backend, lease).await.unwrap());
+        let reclaimed = claim_specific_manifest(
+            &backend,
+            &worker,
+            &sub_id,
+            &manifest.manifest_id,
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+        assert_eq!(
+            backend
+                .get_manifest_for_worker(&reclaimed)
+                .await
+                .unwrap()
+                .completed_output_files,
+            expected
+        );
+        let _ = SubmitClaimStrategy::release(&backend, reclaimed).await;
+    }
+
     #[tokio::test]
     async fn postgres_bulk_submit_update_uses_one_core_mutation_statement() {
         use helios_persistence::core::{BulkProcessingOptions, BulkSubmitProvider, NdjsonEntry};
@@ -28859,6 +29038,19 @@ mod postgres_integration {
         let backend = create_backend().await;
         super::date_period_suite::period_targets_are_ranges(&backend, &unique_base("date_period"))
             .await;
+    }
+
+    /// #1606: PostgreSQL sorted a missing value as the largest, so it came
+    /// first descending. It comes last both ways now.
+    #[tokio::test]
+    async fn postgres_integration_missing_sort_values_sort_last() {
+        let backend = create_backend().await;
+        super::sort_missing_suite::missing_sort_values_sort_last(
+            &backend,
+            &unique_base("sort_missing"),
+            true,
+        )
+        .await;
     }
 
     /// #1336: a repeated parameter under `_contained` is a conjunction on one

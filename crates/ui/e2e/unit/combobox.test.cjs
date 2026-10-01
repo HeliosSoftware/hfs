@@ -24,6 +24,13 @@ test("deduplicates exact fallback values", () => {
   );
 });
 
+test("parses CR and CRLF lists without losing order or duplicate handling", () => {
+  assert.deepEqual(
+    combobox.parseValues(" Patient/p-104\rPatient/p-205\r\nPatient/p-104\r\nPatient/p-306 "),
+    ["Patient/p-104", "Patient/p-205", "Patient/p-306"],
+  );
+});
+
 // #842: single-value mode (`data-combobox-max="1"`, the *Add table*
 // combobox) — `atCapacity` is the pure decision `add()` uses to know
 // whether choosing one more option must first clear the field instead of

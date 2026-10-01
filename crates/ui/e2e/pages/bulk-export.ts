@@ -108,11 +108,7 @@ export class BulkExportPage {
   }
 
   get clearButton(): Locator {
-    return this.form.getByRole("button", { name: "Clear", exact: true });
-  }
-
-  get clearLink(): Locator {
-    return this.form.getByRole("link", { name: "Clear", exact: true });
+    return this.form.locator("[data-clear-types]");
   }
 
   get startButton(): Locator {

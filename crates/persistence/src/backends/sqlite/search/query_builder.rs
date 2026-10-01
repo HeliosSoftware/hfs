@@ -3,6 +3,7 @@
 //! Translates FHIR search queries into SQL statements that can be executed
 //! against the SQLite search_index table.
 
+use crate::backends::sql_literal::sql_string_literal;
 use std::collections::HashSet;
 
 use crate::error::SearchError;
@@ -41,6 +42,19 @@ pub struct KeysetKey {
     pub direction: crate::types::SortDirection,
     /// How the value is typed for binding/reading.
     pub kind: SortValueKind,
+    /// Whether `expr` can be NULL (a resource with no value for the sort
+    /// parameter). Such a resource sorts after every resource that has one,
+    /// in either direction (#1606), and the keyset comparison must place it
+    /// there too.
+    pub nullable: bool,
+}
+
+/// Whether a sort directive's expression can be NULL: true for a parameter
+/// sorted on its indexed value, which a resource may not have. `_id`,
+/// `_lastUpdated` and the unsortable `id` fallback are never NULL.
+fn sort_is_nullable(directive: &crate::types::SortDirective) -> bool {
+    !matches!(directive.parameter.as_str(), "_id" | "_lastUpdated")
+        && directive.param_type.and_then(sort_value_column).is_some()
 }
 
 /// Determines the value kind for a sort parameter.
@@ -368,10 +382,10 @@ impl QueryBuilder {
                                 "(resource_type, resource_id, contained_local_id) IN \
                                  (SELECT resource_type, resource_id, contained_local_id \
                                  FROM search_index WHERE tenant_id = ?1 AND is_contained = 1 \
-                                 AND contained_type = ?2 AND param_name = '{}' \
+                                 AND contained_type = ?2 AND param_name = {} \
                                  GROUP BY resource_type, resource_id, contained_local_id, \
                                  composite_group HAVING {})",
-                                param.name,
+                                sql_string_literal(&param.name),
                                 havings.join(" AND ")
                             ));
                         }
@@ -400,7 +414,11 @@ impl QueryBuilder {
             }
             offset += combined.params.len();
             branches.push((
-                format!("(param_name = '{}' AND ({}))", param.name, combined.sql),
+                format!(
+                    "(param_name = {} AND ({}))",
+                    sql_string_literal(&param.name),
+                    combined.sql
+                ),
                 matches!(param.modifier, Some(SearchModifier::Not)),
             ));
             params.extend(combined.params);
@@ -769,8 +787,10 @@ impl QueryBuilder {
         };
         Some(SqlFragment::with_params(
             format!(
-                "resource_key {} (SELECT resource_key FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name = '{}' AND ({}))",
-                membership, param.name, combined.sql
+                "resource_key {} (SELECT resource_key FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name = {} AND ({}))",
+                membership,
+                sql_string_literal(&param.name),
+                combined.sql
             ),
             combined.params,
         ))
@@ -811,8 +831,8 @@ impl QueryBuilder {
                         params.extend(f.params);
                     }
                     or_conditions.push(format!(
-                        "resource_key IN (SELECT resource_key FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name = '{}' GROUP BY resource_key, composite_group HAVING {})",
-                        param.name,
+                        "resource_key IN (SELECT resource_key FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name = {} GROUP BY resource_key, composite_group HAVING {})",
+                        sql_string_literal(&param.name),
                         havings.join(" AND ")
                     ));
                 }
@@ -1150,14 +1170,10 @@ impl QueryBuilder {
     /// Each directive is processed in order, with a tie-breaker (`id ASC`) added
     /// at the end for stable pagination.
     ///
-    /// # Supported Sort Parameters
-    ///
-    /// - `_id`: Sorts by resource logical ID
-    /// - `_lastUpdated`: Sorts by last modification timestamp
-    ///
-    /// Other sort parameters are currently mapped to resource ID as a fallback.
-    /// Full support for arbitrary search parameters would require additional
-    /// SQL joins with the search_index table.
+    /// `_id` and `_lastUpdated` sort on their `resources` columns; any other
+    /// sortable parameter sorts on its indexed value (see `sort_expression`).
+    /// A resource with no value for a parameter sorts after those that have
+    /// one, ascending or descending (`NULLS LAST`, #1606).
     pub fn build_order_by(&self, query: &SearchQuery) -> String {
         if query.sort.is_empty() {
             return "ORDER BY last_updated DESC, id ASC".to_string();
@@ -1171,7 +1187,12 @@ impl QueryBuilder {
                     crate::types::SortDirection::Ascending => "ASC",
                     crate::types::SortDirection::Descending => "DESC",
                 };
-                format!("{} {}", self.sort_expression(s), dir)
+                let nulls = if sort_is_nullable(s) {
+                    " NULLS LAST"
+                } else {
+                    ""
+                };
+                format!("{} {}{}", self.sort_expression(s), dir, nulls)
             })
             .collect();
 
@@ -1193,6 +1214,7 @@ impl QueryBuilder {
                 expr: "last_updated".to_string(),
                 direction: crate::types::SortDirection::Descending,
                 kind: SortValueKind::Timestamp,
+                nullable: false,
             }),
             1 => {
                 let directive = &query.sort[0];
@@ -1200,6 +1222,7 @@ impl QueryBuilder {
                     expr: self.sort_expression(directive),
                     direction: directive.direction,
                     kind: sort_value_kind(&directive.parameter, directive.param_type),
+                    nullable: sort_is_nullable(directive),
                 })
             }
             _ => None,
@@ -1231,8 +1254,10 @@ impl QueryBuilder {
                     crate::types::SortDirection::Descending => ("MAX", col),
                 };
                 format!(
-                    "(SELECT {}({}) FROM search_index si WHERE si.tenant_id = ?1 AND si.resource_type = ?2 AND si.resource_key = resources.rowid AND si.param_name = '{}')",
-                    agg, col, directive.parameter
+                    "(SELECT {}({}) FROM search_index si WHERE si.tenant_id = ?1 AND si.resource_type = ?2 AND si.resource_key = resources.rowid AND si.param_name = {})",
+                    agg,
+                    col,
+                    sql_string_literal(&directive.parameter)
                 )
             }
             // Unsortable (composite/special/unresolved) — stable fallback.
@@ -1632,6 +1657,42 @@ mod tests {
         let order_by = builder.build_order_by(&query);
         // Should have id ASC as tie-breaker since _id is not in sort list
         assert_eq!(order_by, "ORDER BY last_updated ASC, id ASC");
+    }
+
+    /// #1606: a parameter sort puts a missing value last in both directions;
+    /// the never-NULL `resources` columns get no `NULLS` clause.
+    #[test]
+    fn test_order_by_parameter_sorts_missing_last() {
+        use crate::types::{SortDirection, SortDirective};
+
+        let builder = QueryBuilder::new("tenant1", "Patient");
+        for direction in [SortDirection::Ascending, SortDirection::Descending] {
+            let mut query = SearchQuery::new("Patient");
+            query.sort = vec![
+                SortDirective {
+                    parameter: "birthdate".to_string(),
+                    direction,
+                    param_type: Some(SearchParamType::Date),
+                },
+                SortDirective {
+                    parameter: "_lastUpdated".to_string(),
+                    direction,
+                    param_type: None,
+                },
+            ];
+
+            let order_by = builder.build_order_by(&query);
+            assert_eq!(order_by.matches(" NULLS LAST").count(), 1, "{order_by}");
+            assert!(
+                order_by.ends_with("NULLS LAST, last_updated ASC, id ASC")
+                    || order_by.ends_with("NULLS LAST, last_updated DESC, id ASC"),
+                "{order_by}"
+            );
+            let key = builder.primary_keyset_key(&query);
+            assert!(key.is_none(), "a multi-key sort has no keyset");
+            query.sort.truncate(1);
+            assert!(builder.primary_keyset_key(&query).unwrap().nullable);
+        }
     }
 
     #[test]

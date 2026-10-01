@@ -1714,6 +1714,8 @@ mod sof_export_tests {
             }
             Some(JobStatus::Failed {
                 message: "view runner exploded".to_string(),
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "processing",
                 submitted_at: self.submitted_at,
                 failed_at: self.failed_at,
             })
