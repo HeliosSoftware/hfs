@@ -44,13 +44,13 @@ use tracing::{debug, instrument, warn};
 
 use crate::core::history::HistoryParams;
 use crate::core::{
-    BundleEntry, BundleProvider, BundleResult, CapabilityProvider, ChainedSearchProvider,
-    ConditionalCreateResult, ConditionalDeleteResult, ConditionalStorage, ConditionalUpdateResult,
-    ExportDataProvider, ExportRequest, GroupExportProvider, IncludeProvider,
-    InstanceHistoryProvider, NdjsonBatch, PatchCandidateValidator, PatientExportProvider,
-    PurgableStorage, ResourceStorage, RevincludeProvider, SearchProvider, SearchResult, SofRunner,
-    StorageCapabilities, SystemHistoryProvider, TerminologySearchProvider, TextSearchProvider,
-    TypeHistoryProvider, VersionedStorage,
+    BundleEntry, BundleEntryEffect, BundleProvider, BundleResult, CapabilityProvider,
+    ChainedSearchProvider, ConditionalCreateResult, ConditionalDeleteResult, ConditionalStorage,
+    ConditionalUpdateResult, ExportDataProvider, ExportRequest, GroupExportProvider,
+    IncludeProvider, InstanceHistoryProvider, NdjsonBatch, PatchCandidateValidator,
+    PatientExportProvider, PurgableStorage, ResourceStorage, RevincludeProvider, SearchProvider,
+    SearchResult, SofRunner, StorageCapabilities, SystemHistoryProvider, TerminologySearchProvider,
+    TextSearchProvider, TypeHistoryProvider, VersionedStorage,
 };
 use crate::error::{BackendError, ResourceError, StorageError, StorageResult, TransactionError};
 use crate::search::ChainResolveOptions;
@@ -774,34 +774,27 @@ impl CompositeStorage {
     async fn sync_bundle_results(
         &self,
         tenant: &TenantContext,
+        entry_urls: &[String],
         result: &BundleResult,
         fhir_version: FhirVersion,
     ) {
         let mut by_type: Vec<(String, Vec<(String, Value)>)> = Vec::new();
-        for entry_result in &result.entries {
-            // A conditional delete answers 204 with no body but names what it
-            // deleted through `location` (#859); the secondaries must drop it
-            // too, or a deleted resource stays searchable there.
-            if entry_result.status == 204
-                && let Some(location) = entry_result.location.as_deref()
-            {
-                let mut segments = location.split('/').filter(|s| !s.is_empty());
-                if let (Some(resource_type), Some(resource_id)) = (segments.next(), segments.next())
-                    && let Err(e) = self
-                        .sync_to_secondaries(SyncEvent::Delete {
-                            resource_type: resource_type.to_string(),
-                            resource_id: resource_id.to_string(),
-                            tenant_id: tenant.tenant_id().clone(),
-                        })
-                        .await
-                {
+        let mut deletes: Vec<(String, String)> = Vec::new();
+        for (entry_url, entry_result) in entry_urls.iter().zip(&result.entries) {
+            if entry_result.effect == BundleEntryEffect::Deleted {
+                let target = parse_type_and_id(entry_url)
+                    .or_else(|| entry_result.location.as_deref().and_then(parse_type_and_id));
+                let Some((resource_type, resource_id)) = target else {
                     warn!(
-                        error = %e,
-                        resource_type = resource_type,
-                        resource_id = resource_id,
-                        "Failed to sync bundle entry delete to secondaries"
+                        url = %entry_url,
+                        "Transactional delete target not parseable; secondaries not synced"
                     );
+                    continue;
+                };
+                if let Some((_, group)) = by_type.iter_mut().find(|(t, _)| *t == resource_type) {
+                    group.retain(|(id, _)| *id != resource_id);
                 }
+                deletes.push((resource_type, resource_id));
                 continue;
             }
             // Only sync successful mutating operations that have a resource body
@@ -829,6 +822,26 @@ impl CompositeStorage {
             group
                 .1
                 .push((resource_id.to_string(), resource_json.clone()));
+        }
+        // Deletes go first, in the primary's own processing order: a create
+        // that preceded a delete of the same resource was dropped from
+        // `by_type` above, so what remains there is still live.
+        for (resource_type, resource_id) in deletes {
+            if let Err(e) = self
+                .sync_to_secondaries(SyncEvent::Delete {
+                    resource_type: resource_type.clone(),
+                    resource_id: resource_id.clone(),
+                    tenant_id: tenant.tenant_id().clone(),
+                })
+                .await
+            {
+                warn!(
+                    error = %e,
+                    resource_type = resource_type,
+                    resource_id = resource_id,
+                    "Failed to sync bundle entry delete to secondaries"
+                );
+            }
         }
         for (resource_type, resources) in by_type {
             // The bundle path has no per-entry receipt to correct on a
@@ -906,6 +919,16 @@ impl CompositeStorage {
             }
         }
     }
+}
+
+fn parse_type_and_id(url: &str) -> Option<(String, String)> {
+    let mut segments = url.split('/').filter(|s| !s.is_empty());
+    let resource_type = segments.next()?;
+    let resource_id = segments.next()?;
+    if resource_type.contains('?') || resource_id.contains('?') {
+        return None;
+    }
+    Some((resource_type.to_string(), resource_id.to_string()))
 }
 
 #[async_trait]
@@ -2177,12 +2200,13 @@ impl BundleProvider for CompositeStorage {
                     message: "BundleProvider not available on composite primary".to_string(),
                 })?;
 
+        let entry_urls: Vec<String> = entries.iter().map(|e| e.url.clone()).collect();
+
         let result = provider
             .process_transaction_with_patch_validator(tenant, entries, fhir_version, validator)
             .await?;
 
-        // Sync successful entries to secondaries by reading resources from primary
-        self.sync_bundle_results(tenant, &result, fhir_version)
+        self.sync_bundle_results(tenant, &entry_urls, &result, fhir_version)
             .await;
 
         Ok(result)
@@ -5434,6 +5458,7 @@ mod tests {
         composite
             .sync_bundle_results(
                 &make_tenant(),
+                &["Patient?identifier=x".to_string()],
                 &BundleResult {
                     bundle_type: BundleType::Transaction,
                     entries: vec![deleted_entry(Some("Patient/p1/_history/2"))],
@@ -5445,16 +5470,42 @@ mod tests {
         assert_eq!(*calls.lock(), vec!["delete Patient/p1".to_string()]);
     }
 
-    /// A `204` with nothing to name — an unconditional delete, or a delete
-    /// that matched nothing — leaves the secondaries alone.
+    /// An instance delete answers a bare `204` — no body, no `location` — so
+    /// the secondaries learn what to drop from the entry URL (#921).
     #[tokio::test]
-    async fn a_bundle_delete_without_a_location_syncs_nothing() {
+    async fn a_bundle_instance_delete_syncs_the_resource_named_by_its_url() {
         let calls = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let composite = make_composite_with_spy(SpySecondary::new(calls.clone()));
 
         composite
             .sync_bundle_results(
                 &make_tenant(),
+                &["Patient/p9".to_string()],
+                &BundleResult {
+                    bundle_type: BundleType::Transaction,
+                    entries: vec![deleted_entry(None)],
+                },
+                FhirVersion::default(),
+            )
+            .await;
+
+        assert_eq!(*calls.lock(), vec!["delete Patient/p9".to_string()]);
+    }
+
+    /// A delete whose URL and `location` both fail to name a resource leaves
+    /// the secondaries alone.
+    #[tokio::test]
+    async fn a_bundle_delete_without_a_target_syncs_nothing() {
+        let calls = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let composite = make_composite_with_spy(SpySecondary::new(calls.clone()));
+
+        composite
+            .sync_bundle_results(
+                &make_tenant(),
+                &[
+                    "Patient?identifier=x".to_string(),
+                    "Patient?identifier=y".to_string(),
+                ],
                 &BundleResult {
                     bundle_type: BundleType::Transaction,
                     entries: vec![deleted_entry(None), deleted_entry(Some("Patient"))],
@@ -5476,6 +5527,7 @@ mod tests {
         composite
             .sync_bundle_results(
                 &make_tenant(),
+                &["Patient?identifier=x".to_string(), "Patient".to_string()],
                 &BundleResult {
                     bundle_type: BundleType::Transaction,
                     entries: vec![
@@ -5515,6 +5567,7 @@ mod tests {
         composite
             .sync_bundle_results(
                 &make_tenant(),
+                &["Patient?identifier=x".to_string()],
                 &BundleResult {
                     bundle_type: BundleType::Transaction,
                     entries: vec![deleted_entry(Some("Patient/p1/_history/2"))],
