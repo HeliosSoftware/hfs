@@ -1,0 +1,40 @@
+## A1 no token
+GET /Patient (no token)                                    → HTTP 401
+    {"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"login","details":{"text":"Missing Authorization header"}}]}
+GET /health (no token)                                     → HTTP 200
+GET /metadata (no token)                                   → HTTP 200
+GET /.well-known/smart-configuration (no token)            → HTTP 200
+GET /ui (no token)                                         → HTTP 200
+## A2 full token (system/*.cruds)
+GET /Patient                                               → HTTP 501
+POST /Patient                                              → HTTP 201
+    created Patient/6f48f16e-ddbe-4ed6-b777-4411350f6a5a
+## A3 readonly token (system/Patient.rs)
+GET /Patient                                               → HTTP 501
+POST /Patient                                              → HTTP 403
+    {"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"forbidden","details":{"text":"Forbidden: insufficient scope for create on Patient"}}]}
+GET /Observation (readonly, not in scope)                  → HTTP 403
+    {"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"forbidden","details":{"text":"Forbidden: insufficient scope for search on Observation"}}]}
+## A4 tampered signature
+GET /Patient (signature last char flipped)                 → HTTP 401
+    {"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"login","details":{"text":"Token validation error: Token validation failed: Base64 error: Invalid last symbol 97, offset 341."}}]}
+## A5 smart-configuration
+    issuer = http://localhost:8180/realms/fhir
+    token_endpoint = http://localhost:8180/realms/fhir/protocol/openid-connect/token
+    authorization_endpoint = http://localhost:8180/realms/fhir/protocol/openid-connect/auth
+    jwks_uri = http://localhost:8180/realms/fhir/protocol/openid-connect/certs
+    grant_types_supported = ['client_credentials', 'authorization_code']
+    capabilities = ['permission-v2', 'client-confidential-asymmetric']
+    code_challenge_methods_supported = ['S256']
+GET /Patient (signature char 171 'D'→'A') → HTTP 401
+{"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"login","details":{"text":"Invalid signature"}}]}## A2/A3 on s3: search is 501 by design (no search backend); read by id instead
+GET /Patient?_count=1 (full token) → HTTP 501
+{"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"not-supported","details":{"text":"Feature 'search' is not implemented."}}]}
+GET /Patient/6f48f16e-ddbe-4ed6-b777-4411350f6a5a (full token) → HTTP 200
+GET /Patient/6f48f16e-ddbe-4ed6-b777-4411350f6a5a (readonly token) → HTTP 200
+GET /Observation/nope (readonly token, out of scope) → HTTP 403
+{"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"forbidden","details":{"text":"Forbidden: insufficient scope for read on Observation"}}]}
+GET /Patient/6f48f16e-ddbe-4ed6-b777-4411350f6a5a (no token) → HTTP 401
+token exp=1790693279 now=1790693369 (expired 90 s ago; minted 2026-09-29T14:42:59Z)
+GET /Patient (token past its 300 s lifetime)               → HTTP 401
+    {"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"login","details":{"text":"Token expired"}}]}

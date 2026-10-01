@@ -1,0 +1,14 @@
+list url http://localhost:8080/ui/bulk-import
+list says: True | Helios FHIR Server hfs v0.2.3 WORK Home Resources BATCH & DATA Batch / Transaction Import Export SQL ON FHIR View Definitions SQL Queries SQL Views SQL Export S
+auth radio checked: none
+detail url http://localhost:8080/ui/bulk-import/a503bf77-27dd-4ac8-8069-8e9631b8bfbe
+T3START 2026-09-29T14:52:43Z
+  Manifest URL: ?
+  Data Recipient: ?
+  Submission ID: ?
+  Submitter: ?
+  Status: : Queued - starting shortly
+  Authentication: ?
+  log head: Submission Log 2026-09-29T14:52:42.608Z Status: Queued - starting shortly 2026-09-29T14:52:42.572Z Bulk status kick-off request 2026-09-29T14:52:42.563Z Manifest accepted by the recipient (200). 2026-09-29T14:52:42.517Z Submitting manifest "http://localhost:8000/manifest.json"... 
+  status card: PROCESSING Queued - starting shortly Abort Mark completed
+console errors: 3 ['Failed to load resource: the server responded with a status of 401 (Unauthorized)', 'Failed to load resource: the server responded with a status of 401 (Unauthorized)', 'Failed to load resource: the server responded with a status of 401 (Unauthorized)']

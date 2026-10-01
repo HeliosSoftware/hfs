@@ -1,0 +1,3 @@
+PASS fixtures/not-a-bundle.json -> That JSON is not a FHIR Bundle.
+PASS fixtures/collection.json -> Only Bundles of type batch or transaction can be executed here.
+PASS build-mem.log -> That file is not valid JSON.

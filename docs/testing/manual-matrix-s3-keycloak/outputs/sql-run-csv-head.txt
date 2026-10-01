@@ -1,0 +1,3 @@
+id,gender,birth_date,family,city
+001cec08-8cfd-8d56-26b2-8dba5e2798d6,male,1917-06-11,Beatty507,Franklin
+004719be-784b-b368-60e4-8c959d68abb8,male,2001-12-14,Schaefer657,Burlington
