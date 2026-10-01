@@ -9,14 +9,16 @@ use deadpool_postgres::Client;
 use helios_fhir::FhirVersion;
 use serde_json::Value;
 
-use crate::core::{Transaction, TransactionOptions, TransactionProvider};
+use crate::core::{
+    ConditionalTransaction, Transaction, TransactionOptions, TransactionProvider, conditional_query,
+};
 use crate::error::{
     BackendError, ConcurrencyError, QueryErrorExt, ResourceError, StorageError, StorageResult,
     TransactionError,
 };
 use crate::search::SearchParameterExtractor;
 use crate::tenant::{Operation, TenantContext};
-use crate::types::StoredResource;
+use crate::types::{SearchParameter, StoredResource};
 
 use super::PostgresBackend;
 use super::cached::{execute_cached, query_cached, query_opt_cached};
@@ -42,6 +44,9 @@ fn serialization_error(message: String) -> StorageError {
 /// Wraps a deadpool_postgres Client that has an active transaction.
 /// The transaction is automatically rolled back on drop if not committed.
 pub struct PostgresTransaction {
+    /// The parent backend. Also what the transaction-scoped search
+    /// ([`ConditionalTransaction`]) runs the backend's own search body on,
+    /// against this transaction's client (#859).
     backend: PostgresBackend,
     /// The client with active transaction.
     /// Option so we can take it during commit/rollback.
@@ -1125,6 +1130,34 @@ impl Drop for PostgresTransaction {
             return;
         };
         self.backend.cleanup_tracker.settle_on_drop(client, None);
+    }
+}
+
+/// The transaction-scoped search surface (#859).
+///
+/// Runs the backend's search body on this transaction's client, so the match
+/// set includes what earlier entries of the same bundle wrote (#511).
+/// Buffered creates are flushed first, exactly as `read` does, so they are
+/// visible too; a bundle that resolves criteria on every entry therefore
+/// forfeits create batching, which is the correct trade.
+#[async_trait]
+impl ConditionalTransaction for PostgresTransaction {
+    async fn find_matching(
+        &mut self,
+        resource_type: &str,
+        criteria: &[SearchParameter],
+    ) -> StorageResult<Vec<StoredResource>> {
+        if criteria.is_empty() {
+            return Ok(Vec::new());
+        }
+        let query = conditional_query(resource_type, criteria);
+        self.flush().await?;
+        let client = self.client()?;
+        let result = self
+            .backend
+            .search_with_client(client, &self.tenant, &query, None)
+            .await?;
+        Ok(result.resources.items)
     }
 }
 

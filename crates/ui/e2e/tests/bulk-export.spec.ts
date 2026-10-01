@@ -1509,6 +1509,101 @@ test("re-checking restores All Resources and Clear empties only types", async ({
   await expect(bulkExport.sinceCustomError).toBeHidden();
 });
 
+// #1583: use the real mounted page and real card responses. Only the jobs'
+// stored lifecycle and response timing are controlled; no HTML is fabricated.
+test("terminal polls refresh the export summary and slow cards share one request slot", async ({ page, request }) => {
+  const settings = await request.get("/_user/settings");
+  const previous = (await settings.json()).bulkExport ?? null;
+  const jobs = Object.fromEntries(["summary-a", "summary-b"].map((id, index) => [id, {
+    name: id, scope: "system", status: "in-progress",
+    startedAt: `2026-01-01T09:00:0${index}Z`,
+  }]));
+  const seeded = await request.patch("/_user/settings", { data: { bulkExport: null } });
+  expect(seeded.ok()).toBe(true);
+  expect((await request.patch("/_user/settings", { data: { bulkExport: { jobs } } })).ok()).toBe(true);
+  let arrivals = 0;
+  let inFlight = 0;
+  let maxInFlight = 0;
+  let markFirst!: () => void;
+  const firstArrived = new Promise<void>((resolve) => { markFirst = resolve; });
+  let releaseFirst!: () => void;
+  const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  await page.route("**/ui/bulk-export/active/*/card", async (route) => {
+    arrivals++;
+    inFlight++;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    const first = arrivals === 1;
+    if (first) markFirst();
+    const id = new URL(route.request().url()).pathname.split("/").at(-2)!;
+    expect((await request.patch("/_user/settings", { data: { bulkExport: { jobs: {
+      [id]: { status: "complete", finishedAt: "2026-01-01T09:00:10Z", files: [{ type: "Patient", url: "ignored" }] },
+    } } } })).ok()).toBe(true);
+    const response = await route.fetch();
+    expect(response.status()).toBe(200);
+    if (first) await firstGate;
+    await route.fulfill({ response });
+    inFlight--;
+  });
+  try {
+    await page.goto("/ui/bulk-export");
+    const summary = page.locator("#bulk-export-summary");
+    await expect(summary).toHaveText("2 exports · 2 running");
+    await expect(page.locator(".job-card[hx-get]")).toHaveCount(2);
+    await firstArrived;
+    // Hold the first real response across another full 5s tick, making both
+    // same-card backlogs and overlapping sibling requests observable.
+    await page.waitForTimeout(6_200);
+    expect(arrivals).toBe(1);
+    expect(maxInFlight).toBe(1);
+    await expect(summary).toHaveText("2 exports · 2 running");
+    releaseFirst();
+    await expect(summary).toHaveText("2 exports · 1 running", { timeout: 5_000 });
+    await expect(page.locator(".job-card[hx-get]")).toHaveCount(1);
+    await expect(summary).toHaveText("2 exports · 0 running", { timeout: 20_000 });
+    await expect(page.locator(".job-card[hx-get]")).toHaveCount(0);
+    await expect(page.locator(".job-card .tag--complete")).toHaveCount(2);
+    await expect(page.locator(".job-card__meta").filter({ hasText: "1 file" })).toHaveCount(2);
+    expect(arrivals, "no queued callback may poll a replaced terminal card").toBe(2);
+    expect(maxInFlight).toBe(1);
+    await expect(page.locator(".job-card").nth(1)).toHaveCSS("margin-top", "20px");
+  } finally {
+    releaseFirst();
+    await page.unroute("**/ui/bulk-export/active/*/card");
+    await request.patch("/_user/settings", { data: { bulkExport: null } });
+    await request.patch("/_user/settings", { data: { bulkExport: previous } });
+  }
+});
+
+test("a failed fragment response leaves polling intact until the terminal summary recovers", async ({ page, request }) => {
+  const previous = (await (await request.get("/_user/settings")).json()).bulkExport ?? null;
+  await request.patch("/_user/settings", { data: { bulkExport: null } });
+  await request.patch("/_user/settings", { data: { bulkExport: { jobs: { recovery: {
+    name: "Recovery", status: "in-progress", scope: "system", startedAt: "2026-01-01T09:00:00Z",
+  } } } } });
+  let arrivals = 0;
+  await page.route("**/ui/bulk-export/active/recovery/card", async (route) => {
+    arrivals++;
+    if (arrivals === 1) return route.fulfill({ status: 503 });
+    await request.patch("/_user/settings", { data: { bulkExport: { jobs: { recovery: { status: "cancelled" } } } } });
+    await route.fulfill({ response: await route.fetch() });
+  });
+  try {
+    const failed = page.waitForResponse((response) => response.url().endsWith("/recovery/card") && response.status() === 503);
+    await page.goto("/ui/bulk-export");
+    await failed;
+    await expect(page.locator("#bulk-export-summary")).toHaveText("1 export · 1 running");
+    await expect(page.locator("#job-recovery")).toHaveAttribute("hx-trigger", "every 5s");
+    await expect(page.locator("#bulk-export-summary")).toHaveText("1 export · 0 running", { timeout: 15_000 });
+    await expect(page.locator("#job-recovery .tag")).toHaveText("Cancelled");
+    await expect(page.locator("#job-recovery")).not.toHaveAttribute("hx-get", /.+/);
+    expect(arrivals).toBe(2);
+  } finally {
+    await page.unroute("**/ui/bulk-export/active/recovery/card");
+    await request.patch("/_user/settings", { data: { bulkExport: null } });
+    await request.patch("/_user/settings", { data: { bulkExport: previous } });
+  }
+});
+
 test.describe("pending Bulk Export Patients (#1575)", () => {
   let patientIds: string[];
   let ownJobId: string;
@@ -1603,7 +1698,8 @@ test.describe("pending Bulk Export Patients (#1575)", () => {
       await bulkExport.patientSearch.press("ControlOrMeta+v");
       expect(await bulkExport.selectedPatients.evaluateAll((inputs) => inputs.map((input) => (input as HTMLInputElement).value))).toEqual(["p-1575-a", "p-1575-b"]);
       await expect(bulkExport.patientSearch).toHaveValue("");
-      await bulkExport.clearButton.click();
+      // Clear only affects Resource types; exercise the native form reset.
+      await bulkExport.form.evaluate((form: HTMLFormElement) => form.reset());
       await expect(bulkExport.selectedPatients).toHaveCount(0);
       await bulkExport.scopeRadio("patient").check();
     }
@@ -1612,7 +1708,8 @@ test.describe("pending Bulk Export Patients (#1575)", () => {
     await page.evaluate(() => navigator.clipboard.writeText("one,two"));
     await bulkExport.patientSearch.press("ControlOrMeta+v");
     expect(await bulkExport.selectedPatients.evaluateAll((inputs) => inputs.map((input) => (input as HTMLInputElement).value))).toEqual(["prefix-one", "two-suffix"]);
-    await bulkExport.clearButton.click();
+    await bulkExport.form.evaluate((form: HTMLFormElement) => form.reset());
+    await expect(bulkExport.selectedPatients).toHaveCount(0);
     await bulkExport.scopeRadio("patient").check();
     await bulkExport.patientSearch.focus();
     await page.evaluate(() => navigator.clipboard.writeText("single-1575"));
@@ -1642,7 +1739,8 @@ test.describe("pending Bulk Export Patients (#1575)", () => {
       await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true })));
       await bulkExport.scopeRadio("patient").check();
       await expect(bulkExport.patientSearch).toHaveValue("pending-1575");
-      await bulkExport.clearButton.click();
+      // Clear preserves Patients; reset the form itself to clear chips/text.
+      await bulkExport.form.evaluate((form: HTMLFormElement) => form.reset());
       await expect(bulkExport.selectedPatients).toHaveCount(0);
       await expect(bulkExport.patientCombobox.locator('[role="combobox"]')).toHaveValue("");
     });

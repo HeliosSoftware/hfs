@@ -45,7 +45,8 @@ use helios_persistence::core::sof_runner::{RowStream, SofRunner, ViewFilters};
 use helios_persistence::tenant::TenantContext;
 use helios_sof::sqlquery::engine::ColumnSchema;
 use helios_sof::sqlquery::{
-    BoundParam, DependsOnView, InMemorySqlEngine, QueryResult, SqlQueryError, TableSchema,
+    BoundParam, DependencyKind, DependsOnView, InMemorySqlEngine, QueryResult, SqlQueryError,
+    TableSchema,
 };
 use serde_json::{Value, json};
 use tracing::{debug, warn};
@@ -114,6 +115,10 @@ pub(crate) enum PlanNode {
         sql: String,
         /// This node's own `depends-on` edges, resolved.
         edges: Vec<Edge>,
+        /// The Library's `name`, or its canonical URL when it has none —
+        /// how an error (see [`SqlQueryError::DependencyRowCapExceeded`])
+        /// names this node. Not used for resolution.
+        name: String,
     },
 }
 
@@ -260,6 +265,9 @@ struct Frame {
     /// The label the parent used to reference this node. `None` for the
     /// root frame, which has no parent.
     label_for_parent: Option<String>,
+    /// Display name of this node (see [`PlanNode::SqlView::name`]). Unused
+    /// for the root frame.
+    name: String,
 }
 
 fn next_internal_name(counter: &mut usize) -> String {
@@ -334,6 +342,7 @@ pub(crate) async fn build_plan(
         sql: String::new(),
         resolved_edges: Vec::new(),
         label_for_parent: None,
+        name: String::new(),
     }];
 
     let mut nodes: Vec<PlanNode> = Vec::new();
@@ -369,6 +378,7 @@ pub(crate) async fn build_plan(
                 internal_name: internal_name.clone(),
                 sql: frame.sql,
                 edges: frame.resolved_edges,
+                name: frame.name,
             });
 
             if let Some(err) = register_label(&mut label_registry, &label, &internal_name) {
@@ -521,6 +531,7 @@ pub(crate) async fn build_plan(
                 }
                 on_stack.insert(dep.url.clone());
                 path.push(dep.url.clone());
+                let name = artifact_display_name(&artifact, &dep.url).to_string();
                 stack.push(Frame {
                     identity: dep.url.clone(),
                     depends_on: library.depends_on,
@@ -528,6 +539,7 @@ pub(crate) async fn build_plan(
                     sql: library.sql,
                     resolved_edges: Vec::new(),
                     label_for_parent: Some(dep.label.clone()),
+                    name,
                 });
             }
             SubjectKind::SqlQuery => {
@@ -646,7 +658,7 @@ pub(crate) async fn execute_plan(
             } => {
                 let schema = TableSchema::from_view_definition(view);
                 engine.create_table(internal_name, &schema)?;
-                let view_label = leaf_view_label(view, internal_name);
+                let view_label = artifact_display_name(view, internal_name);
                 let start = std::time::Instant::now();
                 let row_stream = match runner.run_view(tenant, view.clone(), filters.clone()).await
                 {
@@ -675,6 +687,24 @@ pub(crate) async fn execute_plan(
                 {
                     Ok(v) => v,
                     Err(e) => {
+                        // The engine's bare row-cap error names neither the
+                        // dependency nor the setting; name both (#1473).
+                        let e = match e {
+                            SqlQueryError::RowCapExceeded { max } => {
+                                SqlQueryError::DependencyRowCapExceeded {
+                                    label: dependency_label(
+                                        &labels_by_target,
+                                        internal_name,
+                                        view_label,
+                                    )
+                                    .to_string(),
+                                    kind: DependencyKind::ViewDefinition,
+                                    view: view_label.to_string(),
+                                    max,
+                                }
+                            }
+                            other => other,
+                        };
                         warn!(
                             table = %internal_name,
                             view = %view_label,
@@ -697,7 +727,10 @@ pub(crate) async fn execute_plan(
                 engine = materialize_labels(engine, internal_name, &labels_by_target).await?;
             }
             PlanNode::SqlView {
-                internal_name, sql, ..
+                internal_name,
+                sql,
+                name,
+                ..
             } => {
                 let start = std::time::Instant::now();
                 let (returned_engine, result) = run_select_with_timeout(
@@ -710,7 +743,10 @@ pub(crate) async fn execute_plan(
                 .await?;
                 engine = returned_engine;
                 if result.rows.len() > limits.max_source_rows_per_vd {
-                    return Err(SqlQueryError::RowCapExceeded {
+                    return Err(SqlQueryError::DependencyRowCapExceeded {
+                        label: dependency_label(&labels_by_target, internal_name, name).to_string(),
+                        kind: DependencyKind::SqlView,
+                        view: name.clone(),
                         max: limits.max_source_rows_per_vd,
                     });
                 }
@@ -740,15 +776,33 @@ pub(crate) async fn execute_plan(
     Ok((result, leaf_schemas))
 }
 
-/// Picks a human-readable label for a leaf ViewDefinition's log lines:
-/// `view.name` if it is a string, else `view.url` if it is a string, else
-/// `internal_name` (the plan's internal table name), which is always
-/// present.
-fn leaf_view_label<'a>(view: &'a Value, internal_name: &'a str) -> &'a str {
-    view.get("name")
+/// Picks a human-readable name for a dependency artifact (a ViewDefinition
+/// or a SQL View Library), for log lines and error messages: `artifact.name`
+/// if it is a string, else `artifact.url` if it is a string, else `fallback`
+/// (the plan's internal table name or the canonical URL the artifact was
+/// resolved from), which is always present.
+fn artifact_display_name<'a>(artifact: &'a Value, fallback: &'a str) -> &'a str {
+    artifact
+        .get("name")
         .and_then(|v| v.as_str())
-        .or_else(|| view.get("url").and_then(|v| v.as_str()))
-        .unwrap_or(internal_name)
+        .or_else(|| artifact.get("url").and_then(|v| v.as_str()))
+        .unwrap_or(fallback)
+}
+
+/// The label a dependency's consumer selects it by, for error messages.
+/// A node aliased by several labels (a diamond, or two names for one
+/// dependency) is named by the alphabetically first one so the message is
+/// deterministic; `fallback` covers a node no edge points at, which a plan
+/// built by [`build_plan`] never contains.
+fn dependency_label<'a>(
+    labels_by_target: &'a HashMap<String, Vec<String>>,
+    internal_name: &str,
+    fallback: &'a str,
+) -> &'a str {
+    labels_by_target
+        .get(internal_name)
+        .and_then(|labels| labels.iter().min())
+        .map_or(fallback, String::as_str)
 }
 
 /// Groups every distinct label used anywhere in the plan by the internal
@@ -902,6 +956,9 @@ fn adapt_row_stream(stream: RowStream) -> impl Stream<Item = Result<Value, Strin
 
 #[cfg(test)]
 mod tests {
+    use helios_persistence::core::sof_runner::SofError;
+    use helios_persistence::tenant::{TenantId, TenantPermissions};
+
     use super::*;
 
     /// A fixed in-memory [`ArtifactFetcher`] for dry Phase 1 tests.
@@ -1347,5 +1404,237 @@ mod tests {
             .expect("plan should resolve");
         assert!(check_max_nodes(&plan, 2).is_ok());
         assert!(check_max_nodes(&plan, 1).is_err());
+    }
+
+    /// A SQLView dependency is named by its Library `name`, falling back to
+    /// its canonical URL; the name is what a row-cap error reports (#1473).
+    #[tokio::test]
+    async fn sqlview_node_records_its_name_or_url() {
+        let named_url = "http://example.org/named-view";
+        let unnamed_url = "http://example.org/unnamed-view";
+        let leaf_url = "http://example.org/leaf";
+        let mut named = sql_view(named_url, "SELECT * FROM l", &[("l", leaf_url)]);
+        named["name"] = json!("female_patients");
+        let unnamed = sql_view(unnamed_url, "SELECT * FROM l", &[("l", leaf_url)]);
+        let fetcher = MapFetcher(HashMap::from([
+            (leaf_url.to_string(), view_definition(leaf_url)),
+            (named_url.to_string(), named),
+            (unnamed_url.to_string(), unnamed),
+        ]));
+        let deps = vec![
+            depends_on("named_t", named_url),
+            depends_on("unnamed_t", unnamed_url),
+        ];
+        let plan = build_plan(&fetcher, &[], subject_node(&deps))
+            .await
+            .expect("plan should resolve");
+        let names: Vec<&str> = plan
+            .nodes
+            .iter()
+            .filter_map(|n| match n {
+                PlanNode::SqlView { name, .. } => Some(name.as_str()),
+                PlanNode::Leaf { .. } => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["female_patients", unnamed_url]);
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 2 — the per-dependency row cap (#1473). Runs `execute_plan`
+    // against a stub `SofRunner`; no HTTP and no storage.
+    // ------------------------------------------------------------------
+
+    /// A `SofRunner` that yields `rows` rows of `{"id": "p<i>"}`, then ends.
+    struct RowsRunner {
+        rows: usize,
+    }
+
+    #[async_trait]
+    impl SofRunner for RowsRunner {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            _view_definition: Value,
+            _filters: ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            let rows = (0..self.rows).map(|i| Ok(json!({"id": format!("p{i}")})));
+            Ok(Box::pin(futures::stream::iter(rows)))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "rows-test-runner"
+        }
+    }
+
+    fn named_view_definition(name: &str) -> Value {
+        let mut view = view_definition(&format!("http://example.org/{name}"));
+        view["name"] = json!(name);
+        view
+    }
+
+    fn edge(label: &str, target: &str) -> Edge {
+        Edge {
+            label: label.to_string(),
+            target_internal_name: target.to_string(),
+        }
+    }
+
+    async fn run_plan(
+        runner_rows: usize,
+        limits: ExecLimits,
+        plan: &GraphPlan,
+        subject_sql: &str,
+    ) -> Result<(QueryResult, Vec<TableSchema>), SqlQueryError> {
+        let runner: Arc<dyn SofRunner> = Arc::new(RowsRunner { rows: runner_rows });
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        execute_plan(
+            InMemorySqlEngine::open().expect("open engine"),
+            &runner,
+            &tenant,
+            &ViewFilters::default(),
+            plan,
+            subject_sql,
+            &[],
+            limits,
+        )
+        .await
+    }
+
+    fn limits(max_source_rows_per_vd: usize, max_rows: usize) -> ExecLimits {
+        ExecLimits {
+            max_source_rows_per_vd,
+            max_rows,
+            timeout_secs: 5,
+        }
+    }
+
+    fn leaf_plan(label_edges: Vec<Edge>) -> GraphPlan {
+        GraphPlan {
+            nodes: vec![PlanNode::Leaf {
+                internal_name: "__sof_node_0".to_string(),
+                view: named_view_definition("observation_flat"),
+            }],
+            subject_edges: label_edges,
+        }
+    }
+
+    #[tokio::test]
+    async fn leaf_dependency_over_the_cap_names_label_view_cap_and_setting() {
+        let plan = leaf_plan(vec![edge("obs", "__sof_node_0")]);
+        let err = run_plan(10, limits(3, 1000), &plan, "SELECT * FROM obs")
+            .await
+            .err()
+            .expect("a 10-row dependency must exceed a cap of 3");
+        let SqlQueryError::DependencyRowCapExceeded {
+            label,
+            kind,
+            view,
+            max,
+        } = &err
+        else {
+            panic!("expected DependencyRowCapExceeded, got {err:?}");
+        };
+        assert_eq!(label, "obs");
+        assert_eq!(*kind, DependencyKind::ViewDefinition);
+        assert_eq!(view, "observation_flat");
+        assert_eq!(*max, 3);
+
+        let text = err.to_string();
+        for needle in [
+            "dependency 'obs'",
+            "(ViewDefinition observation_flat)",
+            "more than 3 rows",
+            "HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?} in: {text}");
+        }
+    }
+
+    /// The cap is inclusive: a dependency of exactly `max` rows is fine.
+    #[tokio::test]
+    async fn leaf_dependency_at_the_cap_still_runs() {
+        let plan = leaf_plan(vec![edge("obs", "__sof_node_0")]);
+        let (result, _) = run_plan(3, limits(3, 1000), &plan, "SELECT * FROM obs")
+            .await
+            .expect("a dependency of exactly the cap must run");
+        assert_eq!(result.rows.len(), 3);
+    }
+
+    /// A node reached under two labels is named by the alphabetically first,
+    /// so the message does not depend on hash order.
+    #[tokio::test]
+    async fn dependency_with_two_labels_is_named_by_the_first_alphabetically() {
+        let plan = leaf_plan(vec![
+            edge("zeta", "__sof_node_0"),
+            edge("alpha", "__sof_node_0"),
+        ]);
+        let err = run_plan(10, limits(3, 1000), &plan, "SELECT * FROM alpha")
+            .await
+            .err()
+            .expect("must exceed the cap");
+        assert!(
+            matches!(&err, SqlQueryError::DependencyRowCapExceeded { label, .. } if label == "alpha"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlview_dependency_over_the_cap_names_label_view_cap_and_setting() {
+        // `patients` yields 3 rows (within a cap of 5); the SQLView built on
+        // it cross-joins them with themselves into 9 rows (over it).
+        let plan = GraphPlan {
+            nodes: vec![
+                PlanNode::Leaf {
+                    internal_name: "__sof_node_0".to_string(),
+                    view: named_view_definition("patients"),
+                },
+                PlanNode::SqlView {
+                    internal_name: "__sof_node_1".to_string(),
+                    sql: "SELECT a.id FROM base a, base b".to_string(),
+                    edges: vec![edge("base", "__sof_node_0")],
+                    name: "pairs".to_string(),
+                },
+            ],
+            subject_edges: vec![edge("pairs_t", "__sof_node_1")],
+        };
+        let err = run_plan(3, limits(5, 1000), &plan, "SELECT * FROM pairs_t")
+            .await
+            .err()
+            .expect("the 9-row SQLView must exceed a cap of 5");
+        let SqlQueryError::DependencyRowCapExceeded {
+            label,
+            kind,
+            view,
+            max,
+        } = &err
+        else {
+            panic!("expected DependencyRowCapExceeded, got {err:?}");
+        };
+        assert_eq!(label, "pairs_t");
+        assert_eq!(*kind, DependencyKind::SqlView);
+        assert_eq!(view, "pairs");
+        assert_eq!(*max, 5);
+
+        let text = err.to_string();
+        for needle in [
+            "dependency 'pairs_t'",
+            "(SQL View pairs)",
+            "more than 5 rows",
+            "HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?} in: {text}");
+        }
+        assert!(!text.contains("(ViewDefinition pairs)"), "{text}");
+    }
+
+    /// The subject's own result is not a dependency: it is silently
+    /// truncated at `max_rows` (SoF v2 PR #353), never an error.
+    #[tokio::test]
+    async fn subject_result_over_max_rows_is_truncated_not_an_error() {
+        let plan = leaf_plan(vec![edge("obs", "__sof_node_0")]);
+        let (result, _) = run_plan(10, limits(100, 4), &plan, "SELECT * FROM obs")
+            .await
+            .expect("the subject's own cap truncates");
+        assert_eq!(result.rows.len(), 4);
     }
 }

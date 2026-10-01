@@ -18,7 +18,7 @@
   <div>
     <h1 class="page-head__title">{{ i18n.t("sql-export-active-title") }}</h1>
     {% if available %}
-    <p class="page-head__lede">{{ total }} {{ i18n.t("sql-export-exports-word") }} · {{ running }} {{ i18n.t("sql-export-running") }}</p>
+    {% include "partials/sql_export_summary.html" %}
     {% endif %}
   </div>
   {% if available %}
@@ -51,9 +51,13 @@
 <div class="card notice">{{ i18n.t("sql-export-none") }}</div>
 {% endif %}
 
+{# Keep a single request slot across card replacements so an older summary
+   cannot overtake a newer terminal response. Each dropped tick retries. #}
+<div id="sql-export-jobs" class="export-jobs" hx-sync="#sql-export-jobs:drop">
 {% for card in cards %}
 {% include "partials/sql_export_card.html" %}
 {% endfor %}
+</div>
 {% endif %}
 <script src="/ui/assets/sql-export.js" defer></script>
 {% endblock %}

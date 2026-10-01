@@ -504,6 +504,22 @@ pub(crate) fn sqlquery_err_to_rest(e: SqlQueryError) -> RestError {
         SqlQueryError::RowCapExceeded { max } => RestError::UnprocessableEntity {
             message: format!("result exceeds {max}-row limit; add a WHERE/LIMIT clause"),
         },
+        // A WHERE or LIMIT in the query cannot bound a dependency: it is
+        // materialized in full before the query runs. Name the dependency,
+        // the cap and the setting instead (#1473).
+        SqlQueryError::DependencyRowCapExceeded {
+            label,
+            kind,
+            view,
+            max,
+        } => RestError::UnprocessableEntity {
+            message: format!(
+                "dependency '{label}' ({kind} {view}) exceeds {max}-row limit: SQL queries \
+                 materialize each dependency in full before the query's WHERE runs. Narrow the \
+                 dependency with a ViewDefinition 'where', or raise \
+                 HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD."
+            ),
+        },
         SqlQueryError::Timeout { secs } => RestError::UnprocessableEntity {
             message: format!("query exceeded {secs}s timeout"),
         },
@@ -533,6 +549,8 @@ pub(crate) fn sqlquery_err_to_rest(e: SqlQueryError) -> RestError {
 
 #[cfg(test)]
 mod tests {
+    use helios_sof::sqlquery::DependencyKind;
+
     use super::*;
 
     #[test]
@@ -555,6 +573,55 @@ mod tests {
         assert_eq!(
             row_cap.client_response().0,
             StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    /// #1473: a dependency over the per-dependency cap is a 422 whose
+    /// message names the dependency, the cap and the setting, and does not
+    /// advise a WHERE/LIMIT clause (that cannot bound a dependency).
+    #[test]
+    fn dependency_row_cap_maps_to_422_naming_dependency_cap_and_setting() {
+        for (kind, expected) in [
+            (
+                DependencyKind::ViewDefinition,
+                "dependency 'obs' (ViewDefinition observation_flat)",
+            ),
+            (
+                DependencyKind::SqlView,
+                "dependency 'obs' (SQL View observation_flat)",
+            ),
+        ] {
+            let (status, code, message) =
+                sqlquery_err_to_rest(SqlQueryError::DependencyRowCapExceeded {
+                    label: "obs".to_string(),
+                    kind,
+                    view: "observation_flat".to_string(),
+                    max: 7,
+                })
+                .client_response();
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(code, "processing");
+            for needle in [
+                expected,
+                "exceeds 7-row limit",
+                "HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD",
+                "ViewDefinition 'where'",
+            ] {
+                assert!(message.contains(needle), "missing {needle:?} in: {message}");
+            }
+            assert!(!message.contains("add a WHERE/LIMIT"), "{message}");
+        }
+    }
+
+    /// The bare engine row cap keeps its own mapping and advice.
+    #[test]
+    fn bare_row_cap_keeps_the_where_limit_advice() {
+        let (status, _, message) =
+            sqlquery_err_to_rest(SqlQueryError::RowCapExceeded { max: 5 }).client_response();
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            message,
+            "result exceeds 5-row limit; add a WHERE/LIMIT clause"
         );
     }
 }

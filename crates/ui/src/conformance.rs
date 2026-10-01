@@ -353,7 +353,7 @@ pub trait ConformanceSource: Send + Sync {
     }
 
     /// Runs `GET {type}?{params}&_count={count}&_offset={offset}` and returns
-    /// the resulting page plus whether the server advertised a `next` link.
+    /// the resulting page plus whether further matches are available.
     /// Unlike [`fetch`](ConformanceSource::fetch), which pulls the whole
     /// collection into memory, this issues exactly one request per page so a
     /// page can filter and paginate server-side (#741).
@@ -402,7 +402,7 @@ pub trait ConformanceSource: Send + Sync {
 }
 
 /// One page of a server-side search (#741): the resources that page holds,
-/// plus whether the server advertised a `next` link — the UI uses this to
+/// plus whether the response indicates further matches — the UI uses this to
 /// decide whether to render a "next" control without fetching an extra page
 /// just to find out.
 #[derive(Debug, Clone, PartialEq)]
@@ -813,9 +813,18 @@ impl ConformanceSource for HttpConformanceSource {
         let mut resources = extract_bundle_resources(&bundle);
         let overflow = resources.len() > count;
         resources.truncate(count);
+        // A server may cap _count below the requested overflow size. S3's
+        // definition scans still report Bundle.total but no next link, so use
+        // the effective page length to avoid treating that partial catalog as
+        // complete. A pending total with an empty page keeps has_next true;
+        // callers collecting a full catalog can reject the lack of progress.
+        let pending_total = bundle
+            .get("total")
+            .and_then(Value::as_u64)
+            .is_some_and(|total| total > offset.saturating_add(resources.len()) as u64);
         Ok(SearchPage {
             resources,
-            has_next: overflow || next_link(&bundle).is_some(),
+            has_next: overflow || next_link(&bundle).is_some() || pending_total,
         })
     }
 
@@ -1761,7 +1770,7 @@ mod tests {
     /// `_count` (one over the page, so a further page shows up as an
     /// overflow row even from a server that issues no `next` link — MongoDB
     /// on a parameter sort) and `_offset`, and derives `has_next` from that
-    /// overflow or the response Bundle's `next` link (present or absent).
+    /// overflow, the response Bundle's `next` link, or its pending total.
     #[tokio::test]
     async fn http_search_page_sends_params_count_offset_and_reports_has_next() {
         use axum::extract::Query;
@@ -1824,6 +1833,70 @@ mod tests {
             .await
             .expect("search succeeds");
         assert!(!second.has_next, "no next link on the last page");
+    }
+
+    /// #1576: HFS_MAX_PAGE_SIZE can prevent the requested overflow row from
+    /// arriving. Bundle.total still proves that a capped, linkless page has
+    /// more matches; offsets must follow its effective length, not _count.
+    #[tokio::test]
+    async fn http_search_page_uses_total_for_capped_linkless_pages() {
+        use axum::extract::Query;
+        use axum::{Router, routing::get};
+        use std::collections::HashMap;
+
+        async fn page(Query(q): Query<HashMap<String, String>>) -> axum::Json<Value> {
+            let offset = q["_offset"].parse::<usize>().unwrap();
+            assert_eq!(q["_count"], "501");
+            let entries: Vec<Value> = if q.contains_key("empty") {
+                Vec::new()
+            } else {
+                (0..6)
+                    .skip(offset)
+                    .take(2)
+                    .map(|index| serde_json::json!({"resource": {"id": index.to_string()}}))
+                    .collect()
+            };
+            axum::Json(serde_json::json!({
+                "resourceType": "Bundle", "type": "searchset", "total": 6, "entry": entries,
+            }))
+        }
+
+        let app = Router::new().route("/ViewDefinition", get(page));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let source = HttpConformanceSource::new(
+            format!("http://{addr}"),
+            std::sync::Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
+            FhirVersion::R4,
+            None,
+        );
+
+        for (offset, has_next) in [(0, true), (2, true), (4, false), (6, false)] {
+            let page = source
+                .search_page("ViewDefinition", &[], 500, offset, FhirVersion::R4, "")
+                .await
+                .unwrap();
+            assert_eq!(page.resources.len(), if offset == 6 { 0 } else { 2 });
+            assert_eq!(page.has_next, has_next, "offset={offset}");
+        }
+        let empty = source
+            .search_page(
+                "ViewDefinition",
+                &[("empty".into(), "1".into())],
+                500,
+                0,
+                FhirVersion::R4,
+                "",
+            )
+            .await
+            .unwrap();
+        assert!(empty.resources.is_empty());
+        assert!(
+            empty.has_next,
+            "pending total must not certify an empty catalog"
+        );
+        server.abort();
     }
 
     /// #741: the tenant header rides `search_page` and `read_resource` the

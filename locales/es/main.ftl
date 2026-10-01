@@ -769,10 +769,15 @@ bulk-export-until-before-since = «Hasta» no puede ser anterior a «Desde».
 bulk-export-window-since = Desde
 bulk-export-window-until = Hasta
 bulk-export-start = Iniciar exportación
-bulk-export-running = en curso
 bulk-export-clear = Limpiar
-bulk-export-files-word = archivos
-bulk-export-exports-word = exportaciones
+bulk-export-files-count = { $count ->
+    [one] { $count } archivo
+   *[other] { $count } archivos
+}
+bulk-export-summary-count = { $count ->
+    [one] { $count } exportación
+   *[other] { $count } exportaciones
+} · { $running } en curso
 bulk-export-none = Aún no hay exportaciones. Use Nueva exportación para iniciar una.
 bulk-export-status-in-progress = En curso
 bulk-export-status-complete = Completada
@@ -879,6 +884,8 @@ vd-saved = Guardado.
 vd-run-failed = No se pudo ejecutar la vista.
 vd-save = Guardar
 vd-duplicate = Duplicar
+sql-duplicate-read-failed = No se pudieron comprobar los artefactos existentes antes de duplicar: { $reason }
+sql-duplicate-incomplete = No se pudieron comprobar todos los artefactos existentes. La copia no se guardó; inténtelo de nuevo cuando se pueda leer el catálogo completo.
 vd-delete = Eliminar
 vd-delete-confirm = ¿Eliminar la definición de vista «{ $name }»? Esta acción no se puede deshacer.
 vd-delete-failed = No se pudo eliminar la definición de vista.
@@ -1104,8 +1111,10 @@ sql-export-new = Nueva exportación SQL
 sql-export-unavailable = El backend de almacenamiento no aloja el settings store; no se pueden rastrear los trabajos de exportación SQL.
 sql-export-none = Aún no hay exportaciones SQL. Use Nueva exportación SQL para iniciar una.
 sql-export-store-error = La exportación se inició, pero no se pudo agregar a esta lista. Id del trabajo:
-sql-export-exports-word = exportaciones
-sql-export-running = en curso
+sql-export-summary-count = { $count ->
+    [one] { $count } exportación
+   *[other] { $count } exportaciones
+} · { $running } en curso
 sql-export-select-subject = Seleccione al menos un elemento.
 sql-export-unknown-subject = Uno o más elementos seleccionados ya no están disponibles. Actualice la página e inténtelo de nuevo.
 sql-export-cancelled-reason = el servidor ya no conoce este trabajo

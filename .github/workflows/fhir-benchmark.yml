@@ -1157,6 +1157,12 @@ jobs:
           IN_ES_HEAP: ${{ inputs.es_heap }}
           IN_MONGO_WT_CACHE_GB: ${{ inputs.mongo_wt_cache_gb }}
           IN_HFS_MONGO_MAX_CONNECTIONS: ${{ inputs.hfs_mongo_max_connections }}
+          # Exported as K6_SETUP_TIMEOUT for the import suite only: the env var
+          # outranks the script's own setupTimeout: '600s'. Run 36546493701's
+          # postgres-elasticsearch import setup() hit 600s (0/1000 imported);
+          # rerun 36704687935 needed ~540s. Import only, so the 150-minute leg
+          # budget keeps its margin.
+          BENCH_IMPORT_SETUP_TIMEOUT: 1200s
         run: |
           # This block must contain no inline GitHub Actions expressions
           # (the double-curly-brace substitution syntax) — GitHub caps a
@@ -1451,6 +1457,13 @@ jobs:
             # step can break latency down per query shape.
             POINTS_ARG=""
             [ "$SUITE" = "search" ] && POINTS_ARG="--out json=$RESULTS_DIR/search-points.json"
+
+            # k6 reads K6_SETUP_TIMEOUT itself; set for import, cleared otherwise.
+            if [ "$SUITE" = "import" ]; then
+              export K6_SETUP_TIMEOUT="$BENCH_IMPORT_SETUP_TIMEOUT"
+            else
+              unset K6_SETUP_TIMEOUT
+            fi
 
             k6 run \
               --no-usage-report \
