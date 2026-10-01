@@ -4623,7 +4623,7 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
         };
         let mut resp = ValueSetOperations::validate_code(state.backend(), &ctx, req)
             .await
-            .map_err(&rewrite)?;
+            .map_err(rewrite)?;
         // When force-system-version was active for this system, suppress the
         // backend's VS-pin mismatch issues — the forced version overrides the
         // VS pin entirely.
@@ -4982,7 +4982,7 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
         };
         let mut resp = ValueSetOperations::validate_code(state.backend(), &ctx, req)
             .await
-            .map_err(&rewrite)?;
+            .map_err(rewrite)?;
         // When force-system-version was active for this system, suppress the
         // backend's VS-pin mismatch issues — the forced version overrides the
         // VS pin entirely.
@@ -5317,7 +5317,7 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
             };
             let mut resp = ValueSetOperations::validate_code(state.backend(), &ctx, req)
                 .await
-                .map_err(&rewrite)?;
+                .map_err(rewrite)?;
             // When force-system-version was active for this system, suppress
             // the backend's VS-pin mismatch issues for this coding.
             if let Some(forced) = per_coding_version.as_deref() {

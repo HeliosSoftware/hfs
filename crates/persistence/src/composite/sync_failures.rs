@@ -462,6 +462,9 @@ impl SyncFailureRecorder {
         match ledger.clear_sync_failure(&key).await {
             Ok(true) => {
                 // Saturating: another process may have counted this record.
+                // `fetch_update` is deprecated from Rust 1.98 in favour of
+                // `try_update`, which is unstable on the 1.90 MSRV.
+                #[allow(deprecated)]
                 let _ = self
                     .outstanding
                     .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
